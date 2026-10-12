@@ -170,6 +170,30 @@ pub const WALLET_ONE_NODE_GATE_HEIGHT: u64 = 3_657_600;
 /// never changes (scripts/deploy-genesis.sh refuses to move a crossed gate).
 pub const FAILOVER_TENURE_BOUND_GATE_HEIGHT: u64 = 3_657_600;
 
+/// From this height the eligible-producer snapshot admits only the compiled `EMERGENCY_COMMITTEE_ALLOWLIST`
+/// (genesis_node_001..005 and the sixth node). The rule applies where that stored, certified set is built
+/// (both arms of the snapshot builder and its genesis floor), at the snapshot's own boundary. Committees,
+/// producer rosters and light clients all derive from the stored set unchanged, so they agree on one
+/// committee per window. An emergency rule after the 10.10 halt, until admission and retention rest on a
+/// voting record.
+///
+/// The boundary of macroblock 38949, the first one no node had sealed when the chain halted (sealed 38948,
+/// tip 3508200). It sits below the tip on purpose. By the old rule, heartbeats already in blocks 3505902 and
+/// 3506098 put two outside members that missed most of their slots back into snapshots 38955-38975 and
+/// 38957-38975, so windows 38957-38977 need 7 of 9 or 10 votes, which the six alone never reach. Under this rule:
+///   - window 38951 onward has the six, quorum 5;
+///   - windows 38949-38950 keep the eight sealed in macroblocks 38947-38948, quorum 6.
+/// Nothing certified changes: no snapshot at or above this boundary exists on any node. The two rules build
+/// different content at head 3505410, so they never certify it together. Six of those eight must run this
+/// binary before that head can seal: all six of ours while the two outside members stay silent. The roll uses
+/// SKIP_GATE_CHECK=1 and QNET_RECOVERY_HALTED=1, after checking by hand that every node still stops at sealed
+/// 38948.
+/// Registration follows the committee: the burn attestation quorum, the attestor check, the arm quorum and the
+/// registration door's committee lane all resolve committee_for_height. So from window 38951 only the six
+/// attest, 5 of 6. The registry and the reward roster do not consult this rule. Once any node has crossed this
+/// height, it never changes.
+pub const EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT: u64 = 3_505_410;
+
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
 const fn qnet_state_gas_metering_height() -> u64 { crate::transaction::GAS_METERING_ACTIVATION_HEIGHT }
@@ -196,6 +220,7 @@ pub mod id {
     pub const TX_TARGET_BOUND: &str = "tx_target_bound";
     pub const WALLET_ONE_NODE: &str = "wallet_one_node";
     pub const FAILOVER_TENURE_BOUND: &str = "failover_tenure_bound";
+    pub const EMERGENCY_COMMITTEE_ALLOWLIST: &str = "emergency_committee_allowlist";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -223,6 +248,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::TX_TARGET_BOUND, TX_TARGET_BOUND_GATE_HEIGHT),
     (id::WALLET_ONE_NODE, WALLET_ONE_NODE_GATE_HEIGHT),
     (id::FAILOVER_TENURE_BOUND, FAILOVER_TENURE_BOUND_GATE_HEIGHT),
+    (id::EMERGENCY_COMMITTEE_ALLOWLIST, EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -289,6 +315,7 @@ mod tests {
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
             LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR, CONTRACT_GAS_SIGNED,
             MICROBLOCK_SIG_RAW, TX_TARGET_BOUND, WALLET_ONE_NODE, FAILOVER_TENURE_BOUND,
+            EMERGENCY_COMMITTEE_ALLOWLIST,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),
@@ -362,6 +389,23 @@ mod tests {
         assert!(!super::is_active(super::id::FAILOVER_TENURE_BOUND, h - 1), "old rules below");
         assert!(super::is_active(super::id::FAILOVER_TENURE_BOUND, h), "new rules from the gate");
         assert!(super::is_active(super::id::FAILOVER_TENURE_BOUND, u64::MAX));
+    }
+
+    /// The one gate that is deliberately not an epoch boundary. It is the boundary of macroblock 38949, the first
+    /// snapshot no node had sealed at the 10.10 halt, so every snapshot already sealed (38948 and below) keeps the
+    /// set it was built with. The rule reads it only at snapshot boundaries, so a window boundary suffices. The
+    /// roll script reads gate heights as plain integers and compares them in shell arithmetic, so the value must
+    /// stay one.
+    #[test]
+    fn emergency_committee_allowlist_starts_at_the_first_unsealed_snapshot() {
+        let h = super::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT;
+        assert_eq!(h % 90, 0, "a snapshot boundary");
+        assert_eq!(h / 90, 38_949, "the first macroblock no node sealed before the 10.10 halt");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(h < i64::MAX as u64, "shell arithmetic in the roll script holds it");
+        assert!(!super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, h - 1), "old rule below");
+        assert!(super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, h), "allowlist from the gate");
+        assert!(super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, u64::MAX));
     }
 
     /// NodeActivation, the other way a wallet gained a super identity, is refused from tx_target_bound. Were

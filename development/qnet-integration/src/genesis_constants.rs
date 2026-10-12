@@ -168,6 +168,23 @@ pub fn restart_manifest_is_wellformed() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The identities the `emergency_committee_allowlist` gate admits to the eligible-producer snapshot once it is
+/// active: the five genesis nodes and the sixth node. Sorted, deduplicated. A compiled constant for the same
+/// reason as the restart manifest: a list read from an env or a file gives nodes different committees, a split
+/// of exactly the kind it exists to stop.
+pub const EMERGENCY_COMMITTEE_ALLOWLIST: &[&str] = &[
+    "genesis_node_001", "genesis_node_002", "genesis_node_003", "genesis_node_004", "genesis_node_005",
+    "super_node_c78c3017a4f93464",
+];
+
+/// Is `node_id` kept out of the snapshot built at boundary `height`? Asked only where the stored set is built.
+/// A derived committee or roster that filtered again would differ from the one light clients sample out of
+/// the same stored set. Linear over six entries, called per candidate per snapshot.
+pub fn allowlist_excludes(node_id: &str, height: u64) -> bool {
+    qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::EMERGENCY_COMMITTEE_ALLOWLIST, height)
+        && !EMERGENCY_COMMITTEE_ALLOWLIST.contains(&node_id)
+}
+
 /// Genesis node IP addresses (PRODUCTION)
 /// These IPs are authorized to run Genesis nodes
 pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[

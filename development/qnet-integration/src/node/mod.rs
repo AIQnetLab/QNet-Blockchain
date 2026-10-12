@@ -1957,12 +1957,19 @@ fn phase2a_eligible_additions(
     let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
     regs.sort();
     let mut out: Vec<qnet_state::EligibleProducer> = Vec::new();
+    let mut allowlist_dropped = 0usize;
     for reg in regs {
         if already_eligible.contains(reg) { continue; }
         // Restart bar, enforced here too: this arm re-admits any registered heartbeating identity, so
         // filtering only the carry-over would return every barred node on the next window.
         if crate::genesis_constants::restart_excludes(reg) { continue; }
         if !recent_hb.contains(reg) { continue; }
+        // The emergency allowlist, at the same boundary as the carry-over arm, for the same reason. After
+        // the heartbeat check, so the count names heartbeating identities it kept out.
+        if crate::genesis_constants::allowlist_excludes(reg, scan_end) {
+            allowlist_dropped += 1;
+            continue;
+        }
         // Buried by the activation warmup before scan_end. The pool is already height-bounded at the
         // source, so this is the warmup rule alone. Genesis (reg_height 0) is exempt.
         match storage.node_reg_height(reg) {
@@ -1977,6 +1984,9 @@ fn phase2a_eligible_additions(
             .clamp(0.0, 100.0) * 100.0).round() as u32;
         if rep < min_reputation_bp { continue; }
         out.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
+    }
+    if allowlist_dropped > 0 && is_info() {
+        println!("[INFO][SNAP] allowlist_excluded mb={} count={} arm=readmit", scan_end / 90, allowlist_dropped);
     }
     out
 }
@@ -10004,6 +10014,45 @@ mod tests {
             "post-genesis without N-2 committee must REJECT, not fall back to the genesis set");
     }
 
+    /// The emergency allowlist reaches registration through the committee. From the first window whose
+    /// committee derives from a snapshot built under the gate, only the six attest a burn, 5 of 6. An outside
+    /// member's signature no longer counts.
+    #[tokio::test]
+    async fn registration_attestation_follows_the_allowlisted_committee() {
+        let g = qnet_state::feature_gates::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT;
+        let epoch = g / 90 + 2; // its committee derives from snapshot g/90, the first built under the gate
+        let h = (epoch - 1) * 90 + 1;
+        let six: Vec<String> = crate::genesis_constants::EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect();
+        let outsider = "super_node_22020ba893c62e34".to_string();
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        let elig: Vec<qnet_state::EligibleProducer> = six.iter()
+            .map(|id| qnet_state::EligibleProducer { node_id: id.clone(), reputation: 7000 }).collect();
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.eligible_producers = Some(bincode::serialize(&elig).unwrap());
+        cd.randomness_beacon = Some([9u8; 32]);
+        storage.save_macroblock(epoch - 2, &qnet_state::MacroBlock::new(epoch - 2, 0, [0u8; 32], vec![], [1u8; 32], cd))
+            .await.expect("save");
+        let mut sorted = six.clone();
+        sorted.sort();
+        assert_eq!(BlockchainNode::committee_for_height(&storage, h), Some(sorted), "the six are the committee");
+        assert_eq!(qnet_consensus::checkpoint_bft::quorum_size(six.len()), 5);
+        let burn_tx = "solBurnAllowlist";
+        let amount = 1500u64;
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, &burn_owner().0, &burn_beneficiary(), amount, &qnet_state::NodeType::Super, amount, epoch);
+        let mut sigs: Vec<(String, String)> = Vec::new();
+        for id in six.iter().chain(std::iter::once(&outsider)) {
+            let (pk, sk) = burn_gen_genesis(id);
+            storage.save_vrf_public_key(id, &hex::encode(&pk)).unwrap();
+            sigs.push((id.clone(), burn_sign(id, &pk, &sk, &msg)));
+        }
+        let tx = burn_reg_tx_epoch("burn", burn_tx, amount, sigs[..5].to_vec(), epoch);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, h, &storage).await.is_ok(), "5 of the six attest");
+        let mixed: Vec<(String, String)> = sigs[..4].iter().cloned().chain(std::iter::once(sigs[6].clone())).collect();
+        let tx = burn_reg_tx_epoch("burn", burn_tx, amount, mixed, epoch);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, h, &storage).await.is_err(), "the outsider does not count");
+    }
+
     const TARGET_GATE: u64 = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
 
     /// A native super registration in the client form, signed by its wallet key: vrf_pk and the endpoint
@@ -11793,5 +11842,208 @@ mod slot_gap_rule_tests {
         assert!(!slot_timestamp_valid(G, Some(parent), h, parent + 1 + SLOT_GAP_MIN_SECS - 1, Some(parent + 10_000)));
         assert!(!slot_timestamp_valid(G, Some(parent), h, parent, Some(parent + 10_000)));
         assert!(!slot_timestamp_valid(G, Some(parent), h, parent - 5, Some(parent + 10_000)));
+    }
+}
+
+#[cfg(test)]
+mod emergency_allowlist_tests {
+    use super::*;
+    use crate::genesis_constants::{allowlist_excludes, EMERGENCY_COMMITTEE_ALLOWLIST};
+
+    /// Two outside supers of the 10.10 committee.
+    const OUTSIDERS: [&str; 2] = ["super_node_22020ba893c62e34", "super_node_d0590f220be03d34"];
+
+    fn gate() -> u64 { qnet_state::feature_gates::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT }
+
+    fn allowed() -> Vec<String> {
+        let mut v: Vec<String> = EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn everyone() -> Vec<String> {
+        let mut v: Vec<String> = EMERGENCY_COMMITTEE_ALLOWLIST.iter().chain(OUTSIDERS.iter()).map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn ids(v: &[qnet_state::EligibleProducer]) -> Vec<String> { v.iter().map(|p| p.node_id.clone()).collect() }
+
+    /// Every member registered and heartbeating in the subwindow before the gate's: recent for the snapshot one
+    /// window below the gate (its current subwindow) and for the one at it (its previous).
+    fn seed(storage: &crate::storage::Storage) -> Vec<String> {
+        let all = everyone();
+        for id in &all {
+            let reg_h = if id.starts_with("genesis_node_") { 0 } else { 100 };
+            storage.save_node_registration_at_height(id, "super", &format!("w_{}", id), 90.0, reg_h).unwrap();
+        }
+        let anchor = (gate() / HB_SUBWINDOW_BLOCKS - 1) * HB_SUBWINDOW_BLOCKS + 10;
+        for id in &all { storage.index_heartbeat_inclusion(id, anchor, anchor + 5).unwrap(); }
+        all
+    }
+
+    /// A sealed snapshot carrying `members`, as one built before the gate does.
+    fn snapshot_mb(idx: u64, members: &[String]) -> qnet_state::MacroBlock {
+        let elig: Vec<qnet_state::EligibleProducer> = members.iter()
+            .map(|id| qnet_state::EligibleProducer { node_id: id.clone(), reputation: 7000 }).collect();
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.eligible_producers = Some(bincode::serialize(&elig).unwrap());
+        cd.randomness_beacon = Some([idx as u8; 32]);
+        qnet_state::MacroBlock::new(idx, 0, [0u8; 32], vec![], [1u8; 32], cd)
+    }
+
+    #[test]
+    fn the_allowlist_is_the_six_and_bars_nobody_before_its_gate() {
+        let g = gate();
+        assert_eq!(g % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL, 0, "a snapshot boundary");
+        assert_eq!(g / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL, 38_949, "the first snapshot unsealed at the halt");
+        assert_eq!(allowed(), EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                   "sorted and deduplicated");
+        assert_eq!(EMERGENCY_COMMITTEE_ALLOWLIST.len(), 6);
+        for id in OUTSIDERS {
+            assert!(!allowlist_excludes(id, g - 1), "{} is untouched below the gate", id);
+            assert!(allowlist_excludes(id, g), "{} is barred from the gate", id);
+        }
+        for id in EMERGENCY_COMMITTEE_ALLOWLIST { assert!(!allowlist_excludes(id, u64::MAX)); }
+    }
+
+    /// The snapshot builder: one window below the gate it is what it always was; from the gate's own boundary it
+    /// holds only the allowlist, through both arms (the carry-over and the Phase-2A re-admission, which would
+    /// otherwise put every heartbeating outsider straight back), and every node derives the same set whatever
+    /// order it holds the participants in. The registry keeps every identity.
+    #[tokio::test]
+    async fn the_snapshot_admits_only_the_allowlist_from_its_gate() {
+        let g = gate();
+        let st = qnet_state::State::new();
+        let mut views = Vec::new();
+        for reversed in [false, true] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+            let mut all = seed(&storage);
+            if reversed { all.reverse(); }
+            let before = BlockchainNode::create_eligible_producers_snapshot(&all, g / 90 - 1, &storage, &st).await;
+            let after = BlockchainNode::create_eligible_producers_snapshot(&all, g / 90, &storage, &st).await;
+            views.push((ids(&before), ids(&after)));
+            let registry: Vec<String> = storage.super_registrations_as_of(g).expect("registry")
+                .into_iter().map(|(id, _)| id).collect();
+            for o in OUTSIDERS { assert!(registry.iter().any(|r| r == o), "the registry keeps {}", o); }
+        }
+        assert_eq!(views[0].0, everyone(), "below the gate nothing changes");
+        assert_eq!(views[0].1, allowed(), "from the gate only the allowlist");
+        assert_eq!(views[0], views[1], "every node derives the same sets");
+    }
+
+    /// Every derived set reads the stored snapshot as it is, the way a light client samples committee(j) out of
+    /// eligible(j-2). The window right above the gate derives from a snapshot sealed before it and keeps
+    /// everyone. The next derives from the first snapshot built under it and holds the six. The frozen arm
+    /// reads its anchor's set the same way. Were a derived set filtered again, the committee the node folds
+    /// into epoch_commitment would differ from the one every light client derives, and the light walk would
+    /// stop at that macroblock for good.
+    #[tokio::test]
+    async fn derived_sets_read_the_stored_snapshot_as_light_clients_do() {
+        let g = gate();
+        let w = g / 90; // the first snapshot built under the gate
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let stored = |idx: u64| if idx >= w { allowed() } else { everyone() };
+        for idx in [w - 2, w - 1, w] { storage.save_macroblock(idx, &snapshot_mb(idx, &stored(idx))).await.expect("save"); }
+        for (window, want) in [(w, everyone()), (w + 1, everyone()), (w + 2, allowed())] {
+            let light = qnet_consensus::checkpoint_bft::sample_committee(
+                &stored(window - 2), window, &[(window - 2) as u8; 32],
+                BlockchainNode::COMMITTEE_THRESHOLD, BlockchainNode::CONSENSUS_COMMITTEE_SIZE);
+            assert_eq!(light, want, "window {} as a light client derives it", window);
+            for h in [(window - 1) * 90 + 1, window * 90] {
+                assert_eq!(BlockchainNode::committee_for_height(&storage, h), Some(light.clone()), "h={}", h);
+            }
+        }
+        assert_eq!(BlockchainNode::frozen_committee(&snapshot_mb(w - 1, &everyone()), w + 3), everyone());
+        assert_eq!(BlockchainNode::frozen_committee(&snapshot_mb(w, &allowed()), w + 3), allowed());
+    }
+
+    /// The allowlist is asked only where the stored set is built: the carry-over arm and the genesis floor of
+    /// the snapshot builder, and the Phase-2A re-admission arm, which would otherwise put every heartbeating
+    /// outsider straight back. No derived committee or roster asks it.
+    #[test]
+    fn the_allowlist_lives_only_where_the_stored_set_is_built() {
+        let src = include_str!("committee.rs");
+        let start = src.find("async fn create_eligible_producers_snapshot(").expect("snapshot builder");
+        let end = start + src[start..].find("const CONSENSUS_COMMITTEE_SIZE").expect("builder end");
+        let at: Vec<usize> = src.match_indices("allowlist_excludes(").map(|(i, _)| i).collect();
+        assert_eq!(at.len(), 2, "the carry-over arm and the genesis floor");
+        assert!(at.iter().all(|i| *i > start && *i < end), "both inside the snapshot builder");
+        assert!(!include_str!("leader.rs").contains("allowlist_excludes("), "no derived roster or frozen committee");
+        assert!(!include_str!("../consensus_v2_node.rs").contains("allowlist_excludes("), "no consensus-loop committee");
+        let src = include_str!("mod.rs");
+        let f = src.find("fn phase2a_eligible_additions(").expect("Phase-2A arm");
+        let body: String = src[f..].chars().take(3000).collect();
+        assert!(body.contains("allowlist_excludes(reg, scan_end)"), "the re-admission arm applies it at its boundary");
+    }
+
+    /// Every super the chain knew at the 10.10 halt, with its registration height. The five rows at height 1
+    /// never heartbeat.
+    const REAL_REGS: [(&str, u64); 15] = [
+        ("genesis_node_001", 0), ("genesis_node_002", 0), ("genesis_node_003", 0), ("genesis_node_004", 0),
+        ("genesis_node_005", 0), ("super_node_c78c3017a4f93464", 15_534), ("super_node_2a5c3e98273eb14f", 3_246_651),
+        ("super_node_22020ba893c62e34", 3_288_127), ("super_node_ccb8e28717bfa6ec", 3_345_268),
+        ("super_node_d0590f220be03d34", 3_494_491), ("super_node_60a735f53dd87f1b", 1), ("super_node_76d638f2b358fc9f", 1),
+        ("super_node_79c06fc7b9acf713", 1), ("super_node_9c99212c8b53e7b8", 1), ("super_node_ae6902011dbf469b", 1),
+    ];
+
+    /// Every heartbeat in blocks 3503521..=3508200 as (node, anchor, block): all that snapshots 38949-38980 read
+    /// (subwindows 2433-2436). Two outside members that missed most of their producer slots heartbeat at
+    /// 3505902 and 3506098.
+    const REAL_HEARTBEATS: [(&str, u64, u64); 28] = [
+        ("super_node_d0590f220be03d34", 3_503_588, 3_503_591), ("genesis_node_003", 3_503_632, 3_503_635),
+        ("genesis_node_002", 3_503_663, 3_503_666), ("genesis_node_001", 3_503_927, 3_503_930),
+        ("super_node_22020ba893c62e34", 3_503_985, 3_504_001), ("genesis_node_005", 3_504_087, 3_504_090),
+        ("genesis_node_004", 3_504_446, 3_504_449), ("super_node_c78c3017a4f93464", 3_504_643, 3_504_646),
+        ("genesis_node_004", 3_504_969, 3_504_972), ("genesis_node_002", 3_505_124, 3_505_127),
+        ("genesis_node_001", 3_505_242, 3_505_246), ("genesis_node_003", 3_505_696, 3_505_699),
+        ("super_node_d0590f220be03d34", 3_505_720, 3_505_723), ("genesis_node_005", 3_505_814, 3_505_817),
+        ("super_node_ccb8e28717bfa6ec", 3_505_868, 3_505_902), ("super_node_22020ba893c62e34", 3_505_953, 3_505_956),
+        ("super_node_2a5c3e98273eb14f", 3_506_094, 3_506_098), ("super_node_c78c3017a4f93464", 3_506_270, 3_506_273),
+        ("genesis_node_004", 3_506_552, 3_506_555), ("genesis_node_001", 3_506_567, 3_506_570),
+        ("genesis_node_005", 3_506_616, 3_506_619), ("super_node_c78c3017a4f93464", 3_506_626, 3_506_629),
+        ("genesis_node_003", 3_506_777, 3_506_780), ("genesis_node_002", 3_506_966, 3_506_969),
+        ("super_node_22020ba893c62e34", 3_507_404, 3_507_407), ("super_node_d0590f220be03d34", 3_507_418, 3_507_421),
+        ("genesis_node_004", 3_507_990, 3_507_993), ("super_node_22020ba893c62e34", 3_508_013, 3_508_016),
+    ];
+
+    /// The halted chain's own backlog, replayed from its real heartbeats and registrations. Snapshots 38947-38948
+    /// are sealed with the eight. Each later snapshot is built from the roster of its window, the way the window
+    /// end builds it, and sealed for the next. Without the rule, the outside heartbeats at 3505902 and 3506098
+    /// would put 9-10 members into windows 38957-38977, quorum 7. With it, every backlog window up to 38981
+    /// (the first above the halted tip) has a committee the six certify alone: the eight at quorum 6 for
+    /// windows 38949-38950, then the six at quorum 5.
+    #[tokio::test]
+    async fn the_six_alone_certify_every_window_of_the_10_10_backlog() {
+        use qnet_consensus::checkpoint_bft::quorum_size;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let st = qnet_state::State::new();
+        for (id, reg_h) in REAL_REGS { storage.save_node_registration_at_height(id, "super", &format!("w_{}", id), 90.0, reg_h).unwrap(); }
+        for (id, anchor, block) in REAL_HEARTBEATS { storage.index_heartbeat_inclusion(id, anchor, block).unwrap(); }
+        // The outside heartbeats are live where the old rule would have re-admitted them.
+        let live = |mb: u64| recent_heartbeat_senders(&storage, mb * 90).expect("index intact");
+        assert!(live(38_955).contains("super_node_ccb8e28717bfa6ec"));
+        assert!(live(38_957).contains("super_node_2a5c3e98273eb14f"));
+        let eight = everyone();
+        for idx in [38_947u64, 38_948] { storage.save_macroblock(idx, &snapshot_mb(idx, &eight)).await.expect("save"); }
+        let mut sets: std::collections::BTreeMap<u64, Vec<String>> = [(38_947u64, eight.clone()), (38_948, eight.clone())].into();
+        for mb in 38_949u64..=38_979 {
+            let roster = sets[&(mb - 2)].clone();
+            let snap = ids(&BlockchainNode::create_eligible_producers_snapshot(&roster, mb, &storage, &st).await);
+            assert_eq!(snap, allowed(), "snapshot {} holds the six", mb);
+            storage.save_macroblock(mb, &snapshot_mb(mb, &snap)).await.expect("save");
+            sets.insert(mb, snap);
+        }
+        for w in 38_949u64..=38_981 {
+            let c = BlockchainNode::committee_for_height(&storage, (w - 1) * 90 + 1).expect("committee");
+            let ours = c.iter().filter(|id| EMERGENCY_COMMITTEE_ALLOWLIST.contains(&id.as_str())).count();
+            assert_eq!(ours, 6, "window {}: all six are members", w);
+            assert!(quorum_size(c.len()) <= ours, "window {}: quorum {} of {} is out of the six's reach", w, quorum_size(c.len()), c.len());
+            let want = if w <= 38_950 { (8, 6) } else { (6, 5) };
+            assert_eq!((c.len(), quorum_size(c.len())), want, "window {}", w);
+        }
     }
 }

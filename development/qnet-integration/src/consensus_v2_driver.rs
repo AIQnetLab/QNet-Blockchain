@@ -45,7 +45,7 @@ pub enum Effect {
     // Proposal refused because its parent certificate is one this node does not hold. The wire
     // carries only a QcRef (hash + index, no signatures), so the proposal cannot deliver the
     // missing certificate itself — without a pull the refusal is a dead end and the node can never
-    // rejoin the view.
+    // rejoin the view. `window` is this node's own frontier, never a head the proposal names.
     CatchUp { qc_index: u64, window: u64 },
     /// The proposer extends an older certificate than ours: send it ours with its checkpoint, as the
     /// served catch-up pair, to that one peer. Answered by three deterministic members, once per index.
@@ -78,10 +78,14 @@ pub struct ConsensusDriver {
     committee: Vec<NodeId>,
     genesis_hash: Hash,
     node_id: NodeId,
+    /// Every leader-valid proposal, by (index, checkpoint hash). Two can share an index: a vote
+    /// certificate and a timeout certificate at one index each elect a leader for the next. So every
+    /// reader that decides something - finality, the window frontier, seals - looks a checkpoint up
+    /// by the hash a certificate names, never by its index alone. Keyed by index, 10.10 finalized an
+    /// uncertified head on four nodes and split the committee for good.
     proposals: HashMap<(u64, Hash), Checkpoint>,
-    heads: HashMap<u64, u64>, // round → window_head_height (Finalize + next_window mapping)
-    state_roots: HashMap<u64, Hash>, // round → checkpoint state_root (Finalize carries it; verified locally, no macroblock body needed)
-    mb_hashes: HashMap<u64, Vec<Hash>>, // round → QC'd per-height body hashes (Finalize content-verifies local bodies against these before advancing — intra checkpoints have no stored macroblock)
+    /// The 2-chain-committed checkpoint: the parent link of the certified child that committed it.
+    committed_cp: Option<(u64, Hash)>,
     /// Seal inputs keyed by the epoch_commitment they produce: (round seen, eligible_producers,
     /// committee). A certificate names its commitment, so a lookup by it can only return inputs
     /// that ARE the certified ones. Keyed by round, a node a window behind sealed a boundary from
@@ -89,17 +93,19 @@ pub struct ConsensusDriver {
     seal_data: HashMap<Hash, (u64, Vec<u8>, Vec<NodeId>)>,
     sealed: std::collections::HashSet<u64>, // windows the node CONFIRMED durably stored (dedup)
     seal_skipped: Option<u64>,              // last window skipped for want of seal inputs (observability)
-    pending_seals: Vec<(u64, Effect)>,      // Persists built on a QC, released by the 2-chain commit
+    pending_seals: Vec<(u64, Hash, Effect)>, // Persists built on a QC, released by a 2-chain commit of their chain
     // Recent certificates, so a peer one QC behind can be served. The wire carries only a QcRef
     // (hash + index, no signatures), so a proposal cannot deliver the certificate it names and a
     // lagging node has no other way to obtain it. Bounded: the last few rounds are all a catch-up
     // can use, and an unbounded map on a consensus-hot path is a memory target.
     recent_qcs: std::collections::BTreeMap<u64, QuorumCertificate>,
     answered_stale: HashMap<NodeId, u64>,   // proposer -> highest index we already answered
+    exchanged: HashMap<NodeId, u64>,        // proposer -> highest index the pre-content exchange decided
     last_proposed_round: u64,               // one proposal per round we lead
-    high_window: u64,                       // monotonic high-water-mark of the QC'd window; next_window never
-                                            // regresses below it, so a head-less relayed QC/TC cannot collapse
-                                            // the proposal baseline to 1 (the desync seed).
+    high_window: u64,                       // monotonic high-water mark of certified heads' windows; next_window
+                                            // falls back to it only while the high certificate's checkpoint is
+                                            // not held, so a head-less relayed QC/TC cannot collapse the
+                                            // proposal baseline to 1 (the desync seed).
     cp_interval: u64,                       // finality-checkpoint cadence (blocks); divides macro_interval
     macro_interval: u64,                    // macroblock/epoch cadence (blocks); Persist fires only at its boundary
     rc: Option<(u64, Hash, u64)>,           // recovery pin (anchor_mb, anchor_hash, anchor_cp_index); participation only
@@ -111,10 +117,10 @@ impl ConsensusDriver {
         Self {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
-            proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), mb_hashes: HashMap::new(), seal_data: HashMap::new(),
+            proposals: HashMap::new(), committed_cp: None, seal_data: HashMap::new(),
             sealed: std::collections::HashSet::new(), seal_skipped: None, pending_seals: Vec::new(),
             recent_qcs: std::collections::BTreeMap::new(),
-            answered_stale: HashMap::new(),
+            answered_stale: HashMap::new(), exchanged: HashMap::new(),
             last_proposed_round: 0, high_window: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
             rc: None, rc_propose_ok: false,
@@ -170,9 +176,10 @@ impl ConsensusDriver {
     }
 
     pub fn committed_index(&self) -> u64 { self.eng.committed_index }
-    /// Head height of the highest certified checkpoint, when its checkpoint is held.
+    /// Head height of the highest certified checkpoint, when that checkpoint is held.
     pub fn high_qc_head(&self) -> Option<u64> {
-        self.eng.high_qc.as_ref().and_then(|q| self.heads.get(&q.index).copied())
+        let q = self.eng.high_qc.as_ref()?;
+        self.head_of_checkpoint(q.index, &q.checkpoint_hash)
     }
     /// True while the highest certificate has no 2-chain commit yet.
     pub fn commit_pending(&self) -> bool {
@@ -198,6 +205,97 @@ impl ConsensusDriver {
             None => false,
         }
     }
+    /// Send our high certificate with its checkpoint to the proposer of `cp`, whose proposal shows it
+    /// lacks it. Three deterministic members answer, once per proposer and index.
+    fn answer_proposer(&mut self, cp: &Checkpoint) -> Option<Effect> {
+        if !answers_stale_proposal(&self.committee, &cp.proposer, &self.node_id) { return None; }
+        if self.answered_stale.get(&cp.proposer).map_or(false, |i| *i >= cp.index) { return None; }
+        let (checkpoint, qc) = self.high_qc_pair()?;
+        self.answered_stale.insert(cp.proposer.clone(), cp.index);
+        Some(Effect::CatchUpTo { peer: cp.proposer.clone(), checkpoint, qc })
+    }
+
+    /// The certificate exchange a proposal at our current index calls for. It is decided on the parent link,
+    /// the proposer and the head against our high certificate, and never on content. Some(effects) when the
+    /// proposal is refused here: its parent is not our high certificate (we answer or pull), or its head is
+    /// not the one our certificate leads to. None when it passes on to the leader and vote checks.
+    fn certificate_exchange(&mut self, cp: &Checkpoint) -> Option<Vec<Effect>> {
+        let pinned = cp.recovery_anchor.is_some();
+        // THE PARENT LINK IS A CLAIM WE CHECK, NOT A SOURCE OF TRUTH. Leader election is
+        // SHA3(index || parent_hash), so taking that hash from the proposal lets one committee
+        // member grind 32 bytes until the function elects it, copy the honest window content
+        // and emit a second valid proposal at the same index - a vote split that is not
+        // equivocation, so nothing convicts it, repeated every round.
+        //
+        // Requiring the claim to equal what WE certified adds no honest refusal: QcRef carries
+        // no signatures, so two independently-formed QCs for one checkpoint are byte-identical,
+        // and an honest QC at one index is unique. Logged, so if it ever fires on the live
+        // network it is visible immediately.
+        //
+        // Checked BEFORE the window gate. A proposal on another certificate names the head that
+        // follows from THAT certificate, so the gate refuses it whenever the two certificates
+        // place different windows - and a refusal there sends nothing. Two groups apart in
+        // bookkeeping then refuse each other for good (10.10). The exchange decides on the
+        // certificates, whatever head the proposal names. A pinned proposal names its own parent.
+        if !pinned {
+            let ours = self.eng.high_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from);
+            if cp.parent_qc != ours {
+                let claimed = cp.parent_qc.as_ref().map(|q| q.index).unwrap_or(0);
+                let held = ours.as_ref().map(|q| q.index).unwrap_or(0);
+                if crate::node::is_warn() {
+                    println!("[WARN][BFT2] proposal_parent_mismatch idx={} claimed={} ours={} action={}",
+                             cp.index, claimed, held, if held > claimed { "send_justify" } else { "pull" });
+                }
+                // The proposer is the one behind. Three members answer it, once per index,
+                // with our certificate and its checkpoint; the next round extends it.
+                if held > claimed { return Some(self.answer_proposer(cp).into_iter().collect()); }
+                // We are behind: ask for the certificate by its own index (a window number is
+                // a different counter and would never match the serve store). The window to
+                // repair is our own frontier: the proposal's head has passed no gate yet.
+                return Some(vec![Effect::CatchUp { qc_index: claimed, window: self.next_window() }]);
+            }
+        }
+        // Contiguity invariant: a checkpoint's head MUST be the CONTIGUOUS next window (build_proposal
+        // enforces head = next_window()*cp_interval on the sign side). A non-contiguous / inflated head
+        // (reachable via drain_pending, which routes to handle() past the node's content gate, and
+        // verify_msg checks only the proposer signature on a Proposal) draws no vote and is not stored.
+        // One other head is legal: a re-proposal of our own highest certificate (same head, same
+        // content, parent = that certificate, still uncommitted).
+        if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval)
+            && !self.recertifies_high(cp)
+        {
+            if crate::node::is_warn() {
+                println!("[WARN][BFT2] proposal_dropped reason=window idx={} head={} want_head={}",
+                         cp.index, cp.window_head_height,
+                         self.next_window().saturating_mul(self.cp_interval));
+            }
+            // Our own certificate, and a head it does not lead to: the proposer's frontier is off
+            // (a checkpoint it does not hold, a stale latch). Answer it with the certified pair.
+            // The certificate's own head is a re-certification that failed its content pin.
+            if !pinned && self.high_qc_head().map_or(false, |h| h != cp.window_head_height) {
+                return Some(self.answer_proposer(cp).into_iter().collect());
+            }
+            return Some(Vec::new());
+        }
+        None
+    }
+
+    /// The certificate exchange for a proposal the node's content gate holds back, because its window is not
+    /// derived here yet or its tail is being reconciled. Such a proposal never reaches `handle`, and the
+    /// exchange reads no content. Without this, a node one certificate behind, or a proposer with a stale
+    /// frontier, waits for the timer pulls. Runs once per proposer and index, since the node replays a held
+    /// proposal on every drain.
+    pub fn pre_content_exchange(&mut self, cp: &Checkpoint) -> Vec<Effect> {
+        if cp.index != self.eng.current_index || cp.recovery_anchor.is_some() { return Vec::new(); }
+        if self.exchanged.get(&cp.proposer).map_or(false, |i| *i >= cp.index) { return Vec::new(); }
+        match self.certificate_exchange(cp) {
+            Some(effs) => {
+                self.exchanged.insert(cp.proposer.clone(), cp.index);
+                effs
+            }
+            None => Vec::new(),
+        }
+    }
     /// Newest certificate this node holds, as a wire message — what a lagging peer pulls.
     #[cfg(test)]
     pub fn high_qc_msg(&self) -> Option<ConsensusMsg> {
@@ -212,16 +310,48 @@ impl ConsensusDriver {
     /// at commit time — so without a re-attempt, finality could stick behind the committed window
     /// until the NEXT window commits. Re-emitting is safe: `try_advance_finality` is monotonic and
     /// guarded (chain_h ≥ head, state match), so it is a no-op once caught up.
-    /// (head, state_root) of the highest 2-chain-committed checkpoint we hold locally — the run loop
-    /// re-emits a deferred Finalize from this. None if nothing committed OR we lack that checkpoint's
-    /// head/state (⇒ finality WAITS for §4.5 macroblock sync rather than finalizing a head=0 placeholder).
+    /// (head, state_root, body hashes) of the 2-chain-committed checkpoint — the one its certified
+    /// child names by hash — when held locally. The run loop re-emits a deferred Finalize from this.
+    /// None if nothing committed OR that checkpoint is not held (⇒ finality WAITS for §4.5 macroblock
+    /// sync rather than finalizing a placeholder or another proposal at the same index).
     pub fn committed_finalize(&self) -> Option<(u64, Hash, Vec<Hash>)> {
-        let ci = self.eng.committed_index;
-        if ci == 0 { return None; }
-        let head = self.heads.get(&ci).copied().filter(|h| *h > 0)?;
-        Some((head, self.state_roots.get(&ci).copied()?, self.mb_hashes.get(&ci).cloned().unwrap_or_default()))
+        let cp = self.committed_checkpoint()?;
+        Some((cp.window_head_height, cp.state_root, cp.window_mb_hashes.clone()))
     }
-    pub fn committed_head(&self) -> Option<u64> { self.committed_finalize().map(|(h, _, _)| h) }
+    pub fn committed_head(&self) -> Option<u64> { self.committed_checkpoint().map(|cp| cp.window_head_height) }
+
+    fn committed_checkpoint(&self) -> Option<&Checkpoint> {
+        let (ci, ch) = self.committed_cp?;
+        if ci == 0 || ci != self.eng.committed_index { return None; }
+        self.proposals.get(&(ci, ch)).filter(|cp| cp.window_head_height > 0)
+    }
+
+    /// The checkpoint a commit at `idx` finalized: the parent link of the certified child whose
+    /// certificate committed it (`cause`), else of the child certified at `idx + 1`. The index alone
+    /// can name two checkpoints.
+    fn committed_link(&self, idx: u64, cause: Option<(u64, Hash)>) -> Option<(u64, Hash)> {
+        let parent_of = |child: (u64, Hash)| self.proposals.get(&child)
+            .and_then(|c| c.parent_qc.as_ref())
+            .filter(|p| p.index == idx)
+            .map(|p| (p.index, p.checkpoint_hash));
+        cause.and_then(parent_of)
+            .or_else(|| self.eng.qc_hash_at(idx + 1).and_then(|h| parent_of((idx + 1, h))))
+    }
+
+    /// Whether checkpoint `target` lies on the chain ending at `top`, walking parent links. None while
+    /// a link on the way is not held: unproven is neither sealed nor dropped.
+    fn on_chain(&self, target: (u64, Hash), top: (u64, Hash)) -> Option<bool> {
+        let mut cur = top;
+        for _ in 0..=CONSENSUS_STATE_RETAIN {
+            if cur.0 == target.0 { return Some(cur.1 == target.1); }
+            if cur.0 < target.0 { return Some(false); }
+            match self.proposals.get(&cur)?.parent_qc.as_ref() {
+                Some(p) => cur = (p.index, p.checkpoint_hash),
+                None => return Some(false),
+            }
+        }
+        None
+    }
 
     fn parent_hash(&self) -> Hash {
         self.eng.high_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
@@ -266,9 +396,24 @@ impl ConsensusDriver {
         self.proposals.keys().any(|(i, _)| *i == index)
     }
 
-    /// Window head of the proposal held at `index`. A certificate names no head of its own, so
-    /// this is how the node places one in a window.
-    pub fn head_of(&self, index: u64) -> Option<u64> { self.heads.get(&index).copied() }
+    /// Window head of the checkpoint certified at `index`; with no certificate held there, of the
+    /// proposals held at it when they all name one head. A certificate names no head of its own, so
+    /// this is how the node places one in a window; two heads at one index place nothing.
+    pub fn head_of(&self, index: u64) -> Option<u64> {
+        if let Some(head) = self.eng.qc_hash_at(index).and_then(|h| self.head_of_checkpoint(index, &h)) {
+            return Some(head);
+        }
+        let mut heads = self.proposals.iter()
+            .filter(|((i, _), _)| *i == index)
+            .map(|(_, cp)| cp.window_head_height);
+        let first = heads.next()?;
+        if heads.all(|h| h == first) { Some(first) } else { None }
+    }
+
+    /// Window head of checkpoint `hash` at `index`, if held.
+    pub fn head_of_checkpoint(&self, index: u64, hash: &Hash) -> Option<u64> {
+        self.proposals.get(&(index, *hash)).map(|cp| cp.window_head_height)
+    }
 
     /// Does the engine hold a verified certificate for exactly this checkpoint? A relayed copy
     /// needs no second O(committee) check: adopting it again is a no-op on what is already held.
@@ -280,7 +425,7 @@ impl ConsensusDriver {
 
     /// Entry counts of the driver's per-round maps, for the memory census.
     pub fn census(&self) -> [(&'static str, u64); 6] {
-        [("drv_proposals", self.proposals.len() as u64), ("drv_heads", self.heads.len() as u64),
+        [("drv_proposals", self.proposals.len() as u64), ("drv_answered_stale", self.answered_stale.len() as u64),
          ("drv_seal_data", self.seal_data.len() as u64), ("drv_recent_qcs", self.recent_qcs.len() as u64),
          ("drv_pending_seals", self.pending_seals.len() as u64), ("drv_sealed", self.sealed.len() as u64)]
     }
@@ -329,22 +474,22 @@ impl ConsensusDriver {
     /// window). Decoupled from the round: a round skip (timeout) does NOT advance it, so the
     /// next round re-proposes the same checkpoint (both extend the same high_qc) ⇒ contiguous heads.
     pub fn next_window(&self) -> u64 {
-        // Bounded by the monotonic high-water-mark: a head-less relayed QC/TC (heads has no entry for
-        // high_qc.index ⇒ .unwrap_or(0)) can no longer collapse this to 1 and desync the driver.
-        let hq_idx = self.eng.high_qc.as_ref()
-            .and_then(|q| self.heads.get(&q.index))
-            .map(|h| h / self.cp_interval)
-            .unwrap_or(0);
-        hq_idx.max(self.high_window) + 1
+        // The certified checkpoint's own head, found by the hash its certificate names - never a
+        // value another proposal at the same index supplied (on 10.10 that latched 116846 on four
+        // nodes). While that checkpoint is not held, the high-water mark of certified heads stands in,
+        // so a head-less relayed QC/TC cannot collapse the baseline to 1. Never at or below the
+        // committed head's window.
+        let k = self.cp_interval;
+        let high = self.high_qc_head().map(|h| h / k).unwrap_or(self.high_window);
+        let committed = self.committed_head().map(|h| h / k).unwrap_or(0);
+        high.max(committed) + 1
     }
 
-    /// Raise the monotonic window high-water-mark from the current high_qc once its head is known
-    /// (proposal/sync-carried). Called after every engine step; never lowers ⇒ safe.
+    /// Raise the high-water mark from the certified high checkpoint once it is held. Called after
+    /// every engine step; never lowers.
     fn refresh_high_window(&mut self) {
-        if let Some(idx) = self.eng.high_qc.as_ref().map(|q| q.index) {
-            if let Some(&head) = self.heads.get(&idx) {
-                self.high_window = self.high_window.max(head / self.cp_interval);
-            }
+        if let Some(head) = self.high_qc_head() {
+            self.high_window = self.high_window.max(head / self.cp_interval);
         }
     }
 
@@ -454,9 +599,6 @@ impl ConsensusDriver {
             recovery_anchor: if pinned { self.rc.map(|(a, ah, _)| (a, ah)) } else { None },
         };
         self.last_proposed_round = round;
-        self.heads.insert(round, head_height);
-        self.state_roots.insert(round, state_root);
-        self.mb_hashes.insert(round, cp.window_mb_hashes.clone());
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         vec![Effect::Propose(cp)]
     }
@@ -467,25 +609,39 @@ impl ConsensusDriver {
         committee.sort();
         self.eng.set_committee(committee.clone());
         self.answered_stale.retain(|id, _| committee.binary_search(id).is_ok());
+        self.exchanged.retain(|id, _| committee.binary_search(id).is_ok());
         self.committee = committee;
     }
 
-    /// Local view timer fired.
+    /// Local view timer fired. The engine adds a helper timeout for a past view when a reboot after a
+    /// vote left this node ahead of members that cannot otherwise leave that view.
     pub fn on_timeout(&mut self) -> Vec<Effect> {
         let acts = self.eng.on_local_timeout();
-        self.translate(acts)
+        if crate::node::is_info() {
+            for a in &acts {
+                if let Action::BroadcastTimeout(tm) = a {
+                    if tm.index < self.eng.current_index {
+                        println!("[INFO][BFT2] helper_timeout view={} round={}", tm.index, self.eng.current_index);
+                    }
+                }
+            }
+        }
+        self.translate(acts, None)
     }
 
     /// The index of a certified checkpoint whose HEAD this node never learned, if any.
     ///
     /// Votes are counted against a checkpoint HASH, not against a checkpoint, so a node that misses
-    /// one proposal but receives the quorum's votes certifies an index it cannot place. heads[index]
-    /// stays empty, refresh_high_window has nothing to raise, and the window frontier stops there
+    /// one proposal but receives the quorum's votes certifies an index it cannot place. The certified
+    /// checkpoint is absent, refresh_high_window has nothing to raise, and the window frontier stops there
     /// for good: every later proposal fails the contiguity gate and the node never votes again.
     /// Reported so the node can ask for what it is missing instead of sitting blind.
     pub fn frontier_blind(&self) -> Option<u64> {
-        let idx = self.eng.high_qc.as_ref()?.index;
-        if self.heads.contains_key(&idx) { return None; }
+        let q = self.eng.high_qc.as_ref()?;
+        let idx = q.index;
+        // Blind unless the CERTIFIED checkpoint is held: another proposal at the same index names
+        // another head.
+        if self.proposals.contains_key(&(idx, q.checkpoint_hash)) { return None; }
         // A head prune() dropped is not a blind spot. prune keeps the last CONSENSUS_STATE_RETAIN
         // indices, and current_index advances on a TC while high_qc does not, so an old high_qc can
         // fall below the floor with nothing wrong. A wedged node is the opposite case: its
@@ -507,12 +663,12 @@ impl ConsensusDriver {
     /// Catch-up: ingest a VERIFIED committed checkpoint + QC.
     pub fn sync(&mut self, cp: &Checkpoint, qc: &QuorumCertificate) -> Vec<Effect> {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }
-        self.heads.insert(cp.index, cp.window_head_height);
-        self.state_roots.insert(cp.index, cp.state_root);
-        self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
+        // A verified pair is a certificate this node holds, servable like one adopted live: a rebooted
+        // driver serves what the running one did.
+        self.remember_qc(qc);
         let acts = self.eng.sync_checkpoint(cp, qc);
-        self.translate(acts)
+        self.translate(acts, Some((qc.index, qc.checkpoint_hash)))
     }
 
     /// Handle an ALREADY-VERIFIED wire message (node checked sigs first).
@@ -520,33 +676,14 @@ impl ConsensusDriver {
         let mut commit: Option<VoteCommitment> = None;
         // Effects produced beside the engine's own actions (a certificate adopted from a TC).
         let mut extra: Vec<Effect> = Vec::new();
+        // The certificate this message hands the engine, if any: a commit it causes names its
+        // checkpoint through that certificate's own checkpoint.
+        let mut cause: Option<(u64, Hash)> = None;
         let acts = match msg {
             ConsensusMsg::Proposal(cp) => {
-                // Contiguity invariant: a checkpoint's head MUST be the CONTIGUOUS next window (build_proposal
-                // enforces head = next_window()*cp_interval on the sign side). Reject any other head BEFORE it
-                // touches the index-keyed heads map — else a non-contiguous / inflated head (reachable via
-                // drain_pending, which routes to handle() past the node's content gate, and verify_msg checks
-                // only the proposer signature on a Proposal) lands in heads[idx] and refresh_high_window latches
-                // it into the MONOTONIC high_window forever (a poison-up liveness wedge). Honest lagging nodes
-                // never false-trip: the node loop routes a Proposal to handle() only once msg_index <=
-                // current_index (frontier caught up ⇒ next_window == this proposal's window); stale/forged is refused.
-                // One other head is legal: a re-proposal of our own highest certificate (same head,
-                // parent = that certificate, still uncommitted). It cannot inflate high_window and
-                // the parent check below holds for it by construction.
-                if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval)
-                    && !self.recertifies_high(cp)
-                {
-                    if crate::node::is_warn() {
-                        println!("[WARN][BFT2] proposal_dropped reason=window idx={} head={} want_head={}",
-                                 cp.index, cp.window_head_height,
-                                 self.next_window().saturating_mul(self.cp_interval));
-                    }
-                    return Vec::new();
-                }
-                // Same doctrine for the INDEX. The engine refuses any index but its current one
-                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
-                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
-                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
+                // The engine refuses any index but its current one (checkpoint_consensus on_proposal), so a
+                // proposal at another index can draw no vote and is not stored. One that is merely early
+                // is buffered and replayed by the node loop, so nothing is lost.
                 if cp.index != self.eng.current_index {
                     if crate::node::is_warn() {
                         println!("[WARN][BFT2] proposal_dropped reason=index idx={} ours={} head={}",
@@ -564,57 +701,18 @@ impl ConsensusDriver {
                     let parent_ok = cp.parent_qc.as_ref().map(|p| p.index < cp.index).unwrap_or(false);
                     if !step_ok || !parent_ok { return Vec::new(); }
                 }
-                // THE PARENT LINK IS A CLAIM WE CHECK, NOT A SOURCE OF TRUTH. Leader election is
-                // SHA3(index || parent_hash), so taking that hash from the proposal lets one committee
-                // member grind 32 bytes until the function elects it, copy the honest window content
-                // and emit a second valid proposal at the same index - a vote split that is not
-                // equivocation, so nothing convicts it, repeated every round.
-                //
-                // Requiring the claim to equal what WE certified adds no honest refusal: QcRef carries
-                // no signatures, so two independently-formed QCs for one checkpoint are byte-identical,
-                // and the head gate above already passes only when our next_window equals the
-                // proposer's - which pins high_qc to the same index, where an honest QC is unique.
-                // Logged, so if it ever fires on the live network it is visible immediately.
+                // The parent link and the head, against our certificates; refused here, the proposal
+                // goes no further.
+                if let Some(effs) = self.certificate_exchange(cp) { return effs; }
                 let ph = if cp.recovery_anchor.is_some() {
                     // Pinned: bound by the span's positional clauses above, and refused outright by
                     // the node content gate while the relaxation is off.
                     cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
                 } else {
-                    let ours = self.eng.high_qc.as_ref()
-                        .map(qnet_consensus::checkpoint_bft::QcRef::from);
-                    if cp.parent_qc != ours {
-                        let claimed = cp.parent_qc.as_ref().map(|q| q.index).unwrap_or(0);
-                        let held = ours.as_ref().map(|q| q.index).unwrap_or(0);
-                        if crate::node::is_warn() {
-                            println!("[WARN][BFT2] proposal_parent_mismatch idx={} claimed={} ours={} action={}",
-                                     cp.index, claimed, held, if held > claimed { "send_justify" } else { "pull" });
-                        }
-                        // The proposer is the one behind. Three members answer it, once per index,
-                        // with our certificate and its checkpoint; the next round extends it.
-                        if held > claimed {
-                            if answers_stale_proposal(&self.committee, &cp.proposer, &self.node_id)
-                                && self.answered_stale.get(&cp.proposer).map_or(true, |i| *i < cp.index)
-                            {
-                                if let Some((pc, pq)) = self.high_qc_pair() {
-                                    self.answered_stale.insert(cp.proposer.clone(), cp.index);
-                                    return vec![Effect::CatchUpTo { peer: cp.proposer.clone(), checkpoint: pc, qc: pq }];
-                                }
-                            }
-                            return Vec::new();
-                        }
-                        // We are behind: ask for the certificate by its own index (a window number is
-                        // a different counter and would never match the serve store).
-                        return vec![Effect::CatchUp {
-                            qc_index: claimed,
-                            window: cp.window_head_height / self.cp_interval.max(1) }];
-                    }
                     self.parent_hash()
                 };
-                // Only the ELECTED proposal writes the index maps. The engine refuses to vote for
-                // anyone else, so recording their checkpoint writes rows nothing acts on - and those
-                // rows are the finality inputs and the window frontier. With one head per index that
-                // was harmless; a re-certification adds a second legal head, so any member could
-                // regress next_window and finalize the wrong head by re-proposing off-turn.
+                // Only the ELECTED proposal is stored. The engine refuses to vote for anyone else, and a
+                // member re-proposing off-turn must not plant a second checkpoint at the index.
                 // Mirror of the engine's own rule: a pin frees the proposer, nothing else does.
                 let proposer_ok = if cp.recovery_anchor.is_some() {
                     self.committee.iter().any(|c| c == &cp.proposer)
@@ -628,9 +726,10 @@ impl ConsensusDriver {
                     }
                     return Vec::new();
                 }
-                self.heads.insert(cp.index, cp.window_head_height);
-                self.state_roots.insert(cp.index, cp.state_root);
-                self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
+                // Stored under its own hash. A vote certificate and a timeout certificate at one index
+                // each elect a leader for the next, so two leader-valid checkpoints can share an index;
+                // finality, the frontier and the seals read a checkpoint by the hash a certificate names,
+                // so one this node does not vote for changes nothing they read.
                 self.proposals.insert((cp.index, cp.hash()), cp.clone());
                 let (pi, phh) = cp.parent_qc.as_ref().map(|q| (q.index, q.checkpoint_hash))
                     .unwrap_or((0, [0u8; 32]));
@@ -682,6 +781,7 @@ impl ConsensusDriver {
             }
             ConsensusMsg::Qc(qc) => {
                 self.remember_qc(qc);
+                cause = Some((qc.index, qc.checkpoint_hash));
                 self.eng.adopt_qc(qc)
             }
             ConsensusMsg::Timeout(tm) => {
@@ -715,10 +815,11 @@ impl ConsensusDriver {
                         extra.extend(self.seal_if_ready(hq));
                     }
                 }
+                cause = tc.high_qc.as_ref().map(|q| (q.index, q.checkpoint_hash));
                 self.eng.on_timeout_cert(tc)
             }
         };
-        let mut out = self.translate(acts);
+        let mut out = self.translate(acts, cause);
         out.append(&mut extra);
         if let Some(c) = commit {
             for e in out.iter_mut() {
@@ -768,13 +869,18 @@ impl ConsensusDriver {
         // not one slot: at a 1:1 cadence the next boundary QC arrives in the same translate pass as
         // the commit that would release this one, and a single slot would lose it.
         let effect = Effect::Persist { checkpoint: cp, qc: qc.clone(), eligible_producers, committee };
-        // Already 2-chain committed: emit now. This is also the RETRY path - a re-delivered
-        // certificate for a window the node failed to store must produce Persist again, and no
-        // new Commit action will fire for an index the frontier has already passed.
-        if self.eng.committed_index >= qc.index { return vec![effect]; }
+        // Already 2-chain committed: emit now, for a checkpoint ON the committed chain only - a
+        // certified sibling at an index the commit passed never commits, and a seal from it stores a
+        // body the chain did not keep. This is also the RETRY path - a re-delivered certificate for a
+        // window the node failed to store must produce Persist again, and no new Commit action will
+        // fire for an index the frontier has already passed.
+        if self.eng.committed_index >= qc.index {
+            let kept = self.committed_cp.and_then(|top| self.on_chain((qc.index, qc.checkpoint_hash), top));
+            return if kept == Some(true) { vec![effect] } else { Vec::new() };
+        }
         const MAX_PENDING_SEALS: usize = 4;
-        self.pending_seals.retain(|(i, _)| *i != qc.index);
-        self.pending_seals.push((qc.index, effect));
+        self.pending_seals.retain(|(i, h, _)| (*i, *h) != (qc.index, qc.checkpoint_hash));
+        self.pending_seals.push((qc.index, qc.checkpoint_hash, effect));
         if self.pending_seals.len() > MAX_PENDING_SEALS { self.pending_seals.remove(0); }
         Vec::new()
     }
@@ -786,7 +892,9 @@ impl ConsensusDriver {
     /// Drain the last window skipped for want of seal inputs (the driver itself stays pure).
     pub fn take_seal_skipped(&mut self) -> Option<u64> { self.seal_skipped.take() }
 
-    fn translate(&mut self, actions: Vec<Action>) -> Vec<Effect> {
+    /// `cause` is the certificate the caller handed the engine, if any; a certificate formed here
+    /// replaces it. A commit names its checkpoint through that certificate's checkpoint.
+    fn translate(&mut self, actions: Vec<Action>, mut cause: Option<(u64, Hash)>) -> Vec<Effect> {
         let mut out = Vec::new();
         for a in actions {
             match a {
@@ -795,6 +903,7 @@ impl ConsensusDriver {
                 Action::Vote(v) => out.push(Effect::Vote {
                     index: v.index, checkpoint_hash: v.checkpoint_hash, commit: VoteCommitment::default() }),
                 Action::FormedQc(qc) => {
+                    cause = Some((qc.index, qc.checkpoint_hash));
                     // Serve store must be filled by the node that BUILDS the certificate: the
                     // self-routed copy comes back below its own index and the staleness filter
                     // drops it, so relying on the inbound path leaves every frontier node empty.
@@ -808,22 +917,34 @@ impl ConsensusDriver {
                     // commits and therefore never seals - which is the safety property: two
                     // byte-different contents at one window head can each reach a 1-chain QC
                     // across rounds, but only the branch that continues can commit.
+                    //
+                    // The committed checkpoint is the parent link of the certified child that
+                    // committed it: the index alone can name two checkpoints (10.10: a timeout
+                    // certificate and a vote certificate at 125964 elected two leaders for 125965).
+                    let top = self.committed_link(idx, cause);
+                    if top.is_some() { self.committed_cp = top; }
                     // Released when the commit frontier REACHES the held index, not only when the
-                    // commit lands exactly on it: a skipped round commits r+2 whose parent is r, so
-                    // an equality test would strand that window unsealed for good.
-                    let (released, kept): (Vec<_>, Vec<_>) = self.pending_seals
-                        .drain(..).partition(|(i, _)| *i <= idx);
-                    self.pending_seals = kept;
-                    for (_, e) in released { out.push(e); }
-                    // Finalize with the committed checkpoint's OWN QC'd head + state_root — NEVER a
-                    // head=0 placeholder (that defers forever and freezes the finality marker, which
-                    // is what wedged the chain). Missing locally ⇒ we committed via a relayed QC
-                    // without holding the checkpoint; skip — §4.5 macroblock sync provides it, so
-                    // finality waits but never wedges.
-                    let head = self.heads.get(&idx).copied().unwrap_or(0);
-                    if let (true, Some(sr)) = (head > 0, self.state_roots.get(&idx).copied()) {
-                        let mbh = self.mb_hashes.get(&idx).cloned().unwrap_or_default();
-                        out.push(Effect::Finalize { index: idx, head_height: head, state_root: sr, mb_hashes: mbh });
+                    // commit lands exactly on it (a skipped round commits r+2 whose parent is r), and
+                    // only for a checkpoint on the committed chain: a certified sibling never commits.
+                    // A seal whose chain cannot be walked yet stays held.
+                    for (i, h, e) in std::mem::take(&mut self.pending_seals) {
+                        if i > idx { self.pending_seals.push((i, h, e)); continue; }
+                        match top.and_then(|t| self.on_chain((i, h), t)) {
+                            Some(true) => out.push(e),
+                            Some(false) => if crate::node::is_info() {
+                                println!("[INFO][BFT2] seal_dropped idx={} committed={} reason=off_committed_chain", i, idx);
+                            },
+                            None => self.pending_seals.push((i, h, e)),
+                        }
+                    }
+                    // Finalize with the committed checkpoint's OWN certified head + state_root — NEVER
+                    // a head=0 placeholder (that defers forever and freezes the finality marker, which
+                    // is what wedged the chain) and never another proposal at the same index. Missing
+                    // locally ⇒ we committed via a relayed QC without holding the checkpoint; skip —
+                    // §4.5 macroblock sync provides it, so finality waits but never wedges.
+                    if let Some(cp) = top.and_then(|t| self.proposals.get(&t)).filter(|cp| cp.window_head_height > 0) {
+                        out.push(Effect::Finalize { index: idx, head_height: cp.window_head_height,
+                                                    state_root: cp.state_root, mb_hashes: cp.window_mb_hashes.clone() });
                     }
                 }
                 Action::EnterView(_) => {}
@@ -862,9 +983,6 @@ impl ConsensusDriver {
         let ci = self.eng.committed_index;
         let keep = |idx: u64| idx >= floor || Some(idx) == hq || idx == ci;
         self.proposals.retain(|(idx, _), _| keep(*idx));
-        self.heads.retain(|idx, _| keep(*idx));
-        self.state_roots.retain(|idx, _| keep(*idx));
-        self.mb_hashes.retain(|idx, _| keep(*idx));
         self.seal_data.retain(|_, (round, _, _)| keep(*round));
         // `sealed` is keyed by macroblock window; map the index floor to a window floor. A pruned
         // window that a late relayed QC re-seals is idempotent (storage.save_macroblock skips an
@@ -1753,8 +1871,8 @@ mod tests {
 
     // Wrapper-level catch-up (§4.5) — the liveness gap this driver hit in production: a node whose
     // consensus round fell behind the live quorum, fed VERIFIED committed (checkpoint, QC) via
-    // sync(), must fast-forward BOTH its view AND next_window(). next_window() is derived from
-    // heads[high_qc.index]; sync() populates heads from the checkpoint's window_head_height, so a
+    // sync(), must fast-forward BOTH its view AND next_window(). next_window() is derived from the
+    // certified high checkpoint's head; sync() stores that checkpoint under its hash, so a
     // far-behind node re-joins pointing at the correct contiguous window (and the liveness watchdog,
     // which compares next_window to the applied chain tip, then reads a correct value). A bare-QC
     // adopt could NOT do this — it advances high_qc with no head, collapsing next_window to 1 — which
@@ -1901,8 +2019,30 @@ mod tests {
         assert_eq!(d.next_window(), 6, "head-less QC adopt must not regress next_window below the known floor");
     }
 
+    /// The window frontier never sits at or below the committed head's window, even while the high
+    /// certificate's checkpoint is not held and the high-water mark knows less than the commit.
+    #[test]
+    fn next_window_never_sits_at_or_below_the_committed_head() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let mut d = ConsensusDriver::new("n9".into(), c.clone(), [7u8; 32]);
+        d.set_intervals(90, 90);
+        let mut prev: Option<QuorumCertificate> = None;
+        for i in 1..=5u64 {
+            let cp = mk_cp(i, prev.as_ref().map(QcRef::from), i * 90, "n0");
+            let qc = mk_qc(&c, &cp, 3);
+            let _ = d.sync(&cp, &qc);
+            prev = Some(qc);
+        }
+        assert_eq!((d.committed_head(), d.next_window()), (Some(360), 6));
+        d.high_window = 0;
+        let unseen = mk_cp(6, prev.as_ref().map(QcRef::from), 540, "n0");
+        let _ = d.handle(&ConsensusMsg::Qc(mk_qc(&c, &unseen, 3)));
+        assert_eq!(d.frontier_blind(), Some(6));
+        assert_eq!(d.next_window(), 5, "one past the committed head's window, never the stale mark");
+    }
+
     // Poison-up regression (adversarial audit): a Proposal carrying a NON-CONTIGUOUS / inflated head must be
-    // REJECTED by handle() (the contiguity guard) so it never lands in the index-keyed heads map, and a later
+    // REJECTED by handle() (the contiguity guard) so it is never stored, and a later
     // QC for that index must NOT latch the monotonic high_window. Without the guard, the buffered-replay path
     // (drain_pending, past the content gate; verify_msg on a Proposal is proposer-signature only) could let a
     // single malicious head permanently wedge next_window too-high.
@@ -1939,7 +2079,7 @@ mod tests {
         };
         let effs = d.handle(&ConsensusMsg::Proposal(poison.clone()));
         assert!(effs.is_empty(), "non-contiguous head must yield no effects (no vote, no state written)");
-        // A QC certifying that poisoned checkpoint must NOT latch high_window (heads[6] was never written).
+        // A QC certifying that poisoned checkpoint must NOT latch high_window (it was never stored).
         let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
         let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
         let qc6 = QuorumCertificate { checkpoint_hash: poison.hash(), index: 6, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs };
@@ -1967,8 +2107,6 @@ mod tests {
                 proposer: "n0".into(), proposer_sig: Vec::new(), recovery_anchor: None,
             };
             d.proposals.insert((i, cp.hash()), cp);
-            d.heads.insert(i, i * 90);
-            d.state_roots.insert(i, [i as u8; 32]);
             d.seal_data.insert([i as u8; 32], (i, Vec::new(), Vec::new()));
             d.sealed.insert(i);
         }
@@ -1976,12 +2114,10 @@ mod tests {
         d.eng.current_index = total + 1;
         d.prune();
         let floor = total + 1 - CONSENSUS_STATE_RETAIN; // 11
-        assert!(d.heads.keys().all(|k| *k >= floor), "heads pruned below floor");
         assert!(d.proposals.keys().all(|(idx, _)| *idx >= floor), "proposals pruned below floor");
-        assert!(d.state_roots.keys().all(|k| *k >= floor), "state_roots pruned below floor");
         assert!(d.seal_data.values().all(|(r, _, _)| *r >= floor), "seal_data pruned below floor");
         assert!(d.sealed.iter().all(|w| *w >= floor), "sealed windows pruned below floor");
-        assert!(d.heads.len() <= CONSENSUS_STATE_RETAIN as usize + 1, "bounded, not O(chain length)");
+        assert!(d.proposals.len() <= CONSENSUS_STATE_RETAIN as usize + 1, "bounded, not O(chain length)");
         assert_eq!(d.eng.committed_index, total, "prune never regresses committed_index");
     }
 
@@ -1996,18 +2132,18 @@ mod tests {
         d.set_intervals(90, 90);
         // 2000 views, no commit — 15x the retention window.
         for i in 1..=2000u64 {
-            d.heads.insert(i, 90);
-            d.state_roots.insert(i, [1u8; 32]);
-            d.mb_hashes.insert(i, vec![[1u8; 32]]);
+            // Two leader-valid proposals per view, as a vote and a timeout certificate at one index make.
+            for tag in [1u8, 2] {
+                let cp = mk_cp(i, None, 90, if tag == 1 { "n0" } else { "n1" });
+                d.proposals.insert((i, cp.hash()), cp);
+            }
             d.seal_data.insert([(i % 251) as u8; 32].map(|b| b ^ ((i >> 8) as u8)), (i, Vec::new(), Vec::new()));
             d.eng.current_index = i + 1;
             d.prune();
         }
         assert_eq!(d.eng.committed_index, 0, "nothing committed during the halt");
         let bound = CONSENSUS_STATE_RETAIN as usize + 2;
-        assert!(d.heads.len() <= bound, "heads unbounded during halt: {}", d.heads.len());
-        assert!(d.state_roots.len() <= bound, "state_roots unbounded during halt: {}", d.state_roots.len());
-        assert!(d.mb_hashes.len() <= bound, "mb_hashes unbounded during halt: {}", d.mb_hashes.len());
+        assert!(d.proposals.len() <= 2 * bound, "proposals unbounded during halt: {}", d.proposals.len());
         assert!(d.seal_data.len() <= bound, "seal_data unbounded during halt: {}", d.seal_data.len());
     }
 
@@ -2436,8 +2572,8 @@ mod tests {
     }
 
     // OFF-INDEX PROPOSAL. A proposal whose head is contiguous but whose INDEX the engine has left
-    // must touch nothing: heads/state_roots/mb_hashes are the finality inputs, and the engine refuses
-    // that index anyway, so recording it only lets a committee member write state nobody will act on.
+    // must touch nothing: the engine refuses that index anyway, so storing it only lets a committee
+    // member plant a checkpoint nobody will act on.
     #[test]
     fn a_proposal_at_an_index_the_view_has_left_records_nothing() {
         let (c, mut nodes, mut tails) = five_node_harness();
@@ -2457,11 +2593,8 @@ mod tests {
         };
         assert!(d.handle(&ConsensusMsg::Proposal(stale)).is_empty(),
                 "an off-index proposal must produce no effect");
-        // The maps are what matter: a later certificate at that index would read them back as the
-        // head and state to finalize, so the write itself is the defect, not the missing vote.
-        assert!(!d.heads.contains_key(&99), "off-index proposal wrote heads");
-        assert!(!d.state_roots.contains_key(&99), "off-index proposal wrote state_roots");
-        assert!(!d.mb_hashes.contains_key(&99), "off-index proposal wrote mb_hashes");
+        assert!(!d.has_proposal_at(99), "off-index proposal was stored");
+        assert_eq!(d.head_of(99), None, "and places nothing at that index");
         assert_eq!(d.next_window(), before_window, "and must not move the window");
         assert_eq!(d.committed_index(), before_committed, "nor the committed frontier");
     }
@@ -2805,6 +2938,645 @@ mod tests {
         assert!(nodes.iter().all(|n| n.d.next_window() > 4),
                 "a failed window must recover through the view change: {:?}",
                 nodes.iter().map(|n| n.d.next_window()).collect::<Vec<_>>());
+    }
+
+    // ── THE 10.10 RACE (chain halted at 3508200) ─────────────────────────────────────────────────
+    // Replayed with the live committee, indices and heads, each node hearing the messages in the
+    // order its own log shows. Eight members, quorum six. A vote certificate and a timeout
+    // certificate both form at 125964; 005 leads 125965 under QC_125963 (head 3505320) and 003 under
+    // QC_125964 (head 3505350); QC_125965 certifies 005's checkpoint; 22020ba8 re-certifies it at
+    // 125966 and QC_125966 commits 125965. The deployed driver finalized 3505350 on 002-005, a head
+    // no certificate covers, latched window 116846 there, and the two halves refused each other's
+    // proposals until production parked.
+
+    const RACE_IDS: [&str; 8] = [
+        "genesis_node_001", "genesis_node_002", "genesis_node_003", "genesis_node_004", "genesis_node_005",
+        "super_node_22020ba893c62e34", "super_node_c78c3017a4f93464", "super_node_d0590f220be03d34",
+    ];
+    // Positions in the sorted committee.
+    const R001: usize = 0;
+    const R002: usize = 1;
+    const R003: usize = 2;
+    const R004: usize = 3;
+    const R005: usize = 4;
+    const R220: usize = 5;
+    const R6TH: usize = 6;
+    const RD05: usize = 7;
+    /// The members still voting: genesis 001-005 and the sixth node.
+    const RACE_OURS: [usize; 6] = [R001, R002, R003, R004, R005, R6TH];
+
+    struct RaceNode {
+        d: ConsensusDriver,
+        id: NodeId,
+        finals: Vec<(u64, u64)>,                          // (index, head) of every Finalize
+        seals: Vec<(u64, Checkpoint, QuorumCertificate)>, // per macroblock window; the first save stands
+        votes: Vec<VoteCommitment>,                       // durable before each vote leaves
+        wal: std::collections::BTreeMap<u64, (Checkpoint, QuorumCertificate)>,
+        content: std::collections::BTreeSet<u64>,         // checkpoint windows this node derived
+        deferred: Option<u64>,                            // window its builder refused (anchor unsealed)
+    }
+
+    #[derive(Clone, Copy)]
+    struct RaceSalts { s843: u64, s844: u64 }
+
+    fn race_salt(s: RaceSalts, w: u64) -> u64 {
+        match w { 116843 => s.s843, 116844 => s.s844, _ => 0 }
+    }
+
+    /// Content of checkpoint window `w`, identical on every node that derives it. The salt moves only
+    /// hashes: it is what lets the replay run the leader schedule the live network ran.
+    fn race_content(w: u64, salt: u64) -> (Vec<Hash>, Hash, Hash, u64, Vec<u8>) {
+        let mut base = [0u8; 32];
+        base[..8].copy_from_slice(&w.to_le_bytes());
+        base[8..16].copy_from_slice(&salt.to_le_bytes());
+        let (mut state_root, mut beacon) = (base, base);
+        state_root[31] = 1;
+        beacon[31] = 2;
+        let boundary = (w * CHECKPOINT_INTERVAL) % MACROBLOCK_INTERVAL == 0;
+        let eligible = if boundary { vec![0xE1, 0xE2, w as u8] } else { Vec::new() };
+        (vec![base], state_root, beacon, w * CHECKPOINT_INTERVAL * 1000, eligible)
+    }
+
+    /// The checkpoint `propose_window` builds for window `w` at `index`, field for field.
+    fn race_cp(c: &[NodeId], index: u64, parent: Option<QcRef>, w: u64, salt: u64, proposer: &str) -> Checkpoint {
+        let (mb, state_root, beacon, ts, eligible) = race_content(w, salt);
+        Checkpoint {
+            index, parent_qc: parent, window_head_height: w * CHECKPOINT_INTERVAL, window_mb_hashes: mb,
+            state_root, beacon, epoch_commitment: epoch_commitment(&eligible, c, &[]),
+            reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
+            reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: ts,
+            proposer: proposer.to_string(), proposer_sig: Vec::new(), recovery_anchor: None,
+        }
+    }
+
+    /// The two certified checkpoints below the race, and the salts under which the leader rule elects
+    /// who led live: 004 at 125964 and 005 at 125965 under QC_125963, 003 at 125965 under QC_125964,
+    /// 22020ba8 at 125966 under QC_125965, d0590f22 at 125967 under QC_125966.
+    fn race_prelude(c: &[NodeId]) -> (RaceSalts, [(Checkpoint, QuorumCertificate); 2]) {
+        let n = c.len();
+        let cp62 = race_cp(c, 125962, None, 116842, 0, RACE_IDS[R002]);
+        let qc62 = mk_qc(c, &cp62, 6);
+        let under62 = Some(QcRef::from(&qc62));
+        let s843 = (0..100_000u64).find(|s| {
+            let h = race_cp(c, 125963, under62.clone(), 116843, *s, RACE_IDS[R003]).hash();
+            leader_index(125964, &h, n) == R004 && leader_index(125965, &h, n) == R005
+        }).expect("a salt electing 004 and 005");
+        let cp63 = race_cp(c, 125963, under62, 116843, s843, RACE_IDS[R003]);
+        let qc63 = mk_qc(c, &cp63, 6);
+        let under63 = Some(QcRef::from(&qc63));
+        let s844 = (0..1_000_000u64).find(|s| {
+            let p4 = race_cp(c, 125964, under63.clone(), 116844, *s, RACE_IDS[R004]);
+            let p5 = race_cp(c, 125965, under63.clone(), 116844, *s, RACE_IDS[R005]);
+            let mut p6 = p5.clone();
+            p6.index = 125966;
+            p6.parent_qc = Some(QcRef { checkpoint_hash: p5.hash(), index: 125965 });
+            p6.proposer = RACE_IDS[R220].to_string();
+            leader_index(125965, &p4.hash(), n) == R003
+                && leader_index(125966, &p5.hash(), n) == R220
+                && leader_index(125967, &p6.hash(), n) == RD05
+        }).expect("a salt electing 003, 22020ba8 and d0590f22");
+        (RaceSalts { s843, s844 }, [(cp62, qc62), (cp63, qc63)])
+    }
+
+    fn race_node(c: &[NodeId], k: usize, base: &[(Checkpoint, QuorumCertificate); 2]) -> RaceNode {
+        let mut d = ConsensusDriver::new(c[k].clone(), c.to_vec(), [7u8; 32]);
+        let mut wal = std::collections::BTreeMap::new();
+        for (cp, qc) in base.iter() {
+            let _ = d.sync(cp, qc);
+            wal.insert(qc.index, (cp.clone(), qc.clone()));
+        }
+        // 22020ba8's builder refused window 116845 for an unsealed anchor: that is why it re-certified
+        // the high checkpoint instead of proposing the next window.
+        let (content, deferred): (std::collections::BTreeSet<u64>, Option<u64>) = if k == R220 {
+            ((116842..=116844).collect(), Some(116845))
+        } else {
+            ((116842..=116850).collect(), None)
+        };
+        RaceNode { d, id: c[k].clone(), finals: Vec::new(), seals: Vec::new(), votes: Vec::new(), wal, content, deferred }
+    }
+
+    fn race_exec(n: &mut RaceNode, e: Effect) -> Vec<ConsensusMsg> {
+        match e {
+            Effect::Propose(mut cp) => { cp.proposer_sig = sign(&n.id, &cp.hash()); vec![ConsensusMsg::Proposal(cp)] }
+            Effect::Vote { index, checkpoint_hash, commit } => {
+                n.votes.push(commit);
+                vec![ConsensusMsg::Vote(Vote { checkpoint_hash, index, voter: n.id.clone(), signature: sign(&n.id, &checkpoint_hash) })]
+            }
+            Effect::Timeout { index, high_qc_index } => vec![ConsensusMsg::Timeout(TimeoutMsg {
+                index, voter: n.id.clone(), high_qc_index, signature: sign(&n.id, &timeout_bytes(index, high_qc_index)),
+            })],
+            Effect::CatchUp { .. } | Effect::CatchUpTo { .. } => vec![],
+            Effect::Relay(m) => vec![m],
+            Effect::Persist { checkpoint, qc, .. } => {
+                let w = checkpoint.window_head_height / MACROBLOCK_INTERVAL;
+                if !n.seals.iter().any(|(s, _, _)| *s == w) { n.seals.push((w, checkpoint, qc)); }
+                n.d.mark_sealed(w);
+                vec![]
+            }
+            Effect::Finalize { index, head_height, .. } => { n.finals.push((index, head_height)); vec![] }
+        }
+    }
+
+    /// The run loop's write-ahead log: the newest certified pair, whenever the frontier moves.
+    fn race_wal(n: &mut RaceNode) {
+        if let Some((idx, pair)) = n.d.newest_catchup_bundle() {
+            if let (Some(cp), Some(qc)) = (race_proposal(&pair), race_qc(&pair)) { n.wal.insert(idx, (cp, qc)); }
+        }
+    }
+
+    /// `try_propose` after every handled message: the next window if this node holds it, else the
+    /// re-certification its refused frontier calls for.
+    fn race_try_propose(net: &mut [RaceNode], c: &[NodeId], s: RaceSalts, k: usize) -> Vec<ConsensusMsg> {
+        let n = &mut net[k];
+        let w = n.d.next_window();
+        let effs = if n.content.contains(&w) {
+            let (mb, sr, bc, ts, el) = race_content(w, race_salt(s, w));
+            n.d.build_proposal(w, mb, sr, bc, ts, c.to_vec(), el, Vec::new(),
+                               [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0)
+        } else if n.deferred == Some(w) && n.d.commit_pending() && !n.d.high_head_committed() {
+            let (_, _, _, _, el) = race_content(w - 1, race_salt(s, w - 1));
+            n.d.build_recertify_proposal(c.to_vec(), el, Vec::new())
+        } else {
+            Vec::new()
+        };
+        let mut out = Vec::new();
+        for e in effs { out.extend(race_exec(n, e)); }
+        out
+    }
+
+    /// Node `k` handles `m` as the run loop does: wire check, driver, effects, WAL, propose attempt.
+    /// What it sends is handed back: the script decides who hears it, and when.
+    fn race_hear(net: &mut [RaceNode], c: &[NodeId], s: RaceSalts, k: usize, m: &ConsensusMsg) -> Vec<ConsensusMsg> {
+        assert!(verify_msg(c, m), "the replay sends only well-formed messages");
+        let mut out = Vec::new();
+        for e in net[k].d.handle(m) { out.extend(race_exec(&mut net[k], e)); }
+        race_wal(&mut net[k]);
+        out.extend(race_try_propose(net, c, s, k));
+        out
+    }
+
+    fn race_timeout(net: &mut [RaceNode], k: usize) -> Vec<ConsensusMsg> {
+        let mut out = Vec::new();
+        for e in net[k].d.on_timeout() { out.extend(race_exec(&mut net[k], e)); }
+        out
+    }
+
+    fn race_proposal(out: &[ConsensusMsg]) -> Option<Checkpoint> {
+        out.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None })
+    }
+
+    fn race_qc(out: &[ConsensusMsg]) -> Option<QuorumCertificate> {
+        out.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None })
+    }
+
+    fn race_tc(out: &[ConsensusMsg]) -> Option<TimeoutCertificate> {
+        out.iter().find_map(|m| match m { ConsensusMsg::Tc(t) => Some(t.clone()), _ => None })
+    }
+
+    fn race_votes(out: Vec<ConsensusMsg>) -> Vec<ConsensusMsg> {
+        out.into_iter().filter(|m| matches!(m, ConsensusMsg::Vote(_))).collect()
+    }
+
+    /// Every message reaches every live member, the sender included, until nothing new is sent.
+    fn race_flood(net: &mut [RaceNode], c: &[NodeId], s: RaceSalts, live: &[usize], seed: Vec<ConsensusMsg>,
+                  wire: &mut Vec<ConsensusMsg>) {
+        let mut queue = seed;
+        let mut rounds = 0;
+        while !queue.is_empty() && rounds < 64 {
+            rounds += 1;
+            let mut next = Vec::new();
+            for m in queue.drain(..) {
+                wire.push(m.clone());
+                for &k in live { next.extend(race_hear(net, c, s, k, &m)); }
+            }
+            queue = next;
+        }
+    }
+
+    struct RaceRun {
+        c: Vec<NodeId>,
+        net: Vec<RaceNode>,
+        salts: RaceSalts,
+        base: [(Checkpoint, QuorumCertificate); 2],
+        p4: Checkpoint,
+        p5: Checkpoint,
+        p6: Checkpoint,
+        qc64: QuorumCertificate,
+        qc65: QuorumCertificate,
+        qc66: QuorumCertificate,
+        windows66: Vec<u64>, // every node's next window once QC_125966 reached it
+        p7: Option<Checkpoint>,
+        voters7: Vec<NodeId>,
+        qc67: Option<QuorumCertificate>,
+    }
+
+    /// The race, in the per-node arrival order of the 10.10 logs.
+    fn race_replay() -> RaceRun {
+        let c: Vec<NodeId> = RACE_IDS.iter().map(|s| s.to_string()).collect();
+        let (s, base) = race_prelude(&c);
+        let mut net: Vec<RaceNode> = (0..c.len()).map(|k| race_node(&c, k, &base)).collect();
+        assert!(net.iter().all(|n| n.d.current_index() == 125964 && n.d.next_window() == 116844));
+        assert_eq!(quorum_size(c.len()), 6);
+        let qc63 = base[1].1.clone();
+
+        // 125964. d0590f22, 005 and 003 time out before 004's proposal reaches 005.
+        let mut early = Vec::new();
+        for k in [RD05, R005, R003] { early.extend(race_timeout(&mut net, k)); }
+        for m in &early { race_hear(&mut net, &c, s, R005, m); }
+        // 004 leads 125964 and proposes on its window end; six members vote it, 005 among them.
+        let p4 = race_proposal(&race_try_propose(&mut net, &c, s, R004)).expect("004 leads 125964");
+        let mp4 = ConsensusMsg::Proposal(p4.clone());
+        let mut v4 = Vec::new();
+        for k in [R004, R003, R002, R6TH, R001, R005] { v4.extend(race_votes(race_hear(&mut net, &c, s, k, &mp4))); }
+        assert_eq!(v4.len(), 6);
+        // 001, 004 and 002 time out too: at 005 that is six, a timeout certificate at the same index,
+        // and 005 leads 125965 under QC_125963 at once.
+        let mut late = Vec::new();
+        for k in [R001, R004, R002] { late.extend(race_timeout(&mut net, k)); }
+        let (mut tc64, mut p5) = (None, None);
+        for m in &late {
+            let out = race_hear(&mut net, &c, s, R005, m);
+            tc64 = tc64.or(race_tc(&out));
+            p5 = p5.or(race_proposal(&out));
+        }
+        let tc64 = tc64.expect("a timeout certificate forms at 125964");
+        let p5 = p5.expect("005 leads 125965 under QC_125963");
+        let mtc = ConsensusMsg::Tc(tc64);
+        for k in [R001, R002, R003, R004, R220, R6TH, RD05] { race_hear(&mut net, &c, s, k, &mtc); }
+        let mp5 = ConsensusMsg::Proposal(p5.clone());
+        let mut v5 = Vec::new();
+        for k in [R005, R004, R003, R002, R6TH, R001, R220, RD05] { v5.extend(race_votes(race_hear(&mut net, &c, s, k, &mp5))); }
+        assert_eq!(v5.len(), 8, "every member is at 125965 and votes 005's checkpoint");
+
+        // QC_125964 forms at 004 from the six votes and reaches 001, then 003 - which now leads 125965
+        // under QC_125964 and proposes the next window - then 002 and 005.
+        let mut qc64 = None;
+        for v in &v4 { qc64 = qc64.or(race_qc(&race_hear(&mut net, &c, s, R004, v))); }
+        let qc64 = qc64.expect("QC_125964");
+        let m64 = ConsensusMsg::Qc(qc64.clone());
+        race_hear(&mut net, &c, s, R001, &m64);
+        let p3 = race_proposal(&race_hear(&mut net, &c, s, R003, &m64)).expect("003 leads 125965 under QC_125964");
+        race_hear(&mut net, &c, s, R002, &m64);
+        race_hear(&mut net, &c, s, R005, &m64);
+        // QC_125965 forms at 001, which therefore leaves 125965 before 003's proposal arrives.
+        let mut qc65 = None;
+        for v in &v5 { qc65 = qc65.or(race_qc(&race_hear(&mut net, &c, s, R001, v))); }
+        let qc65 = qc65.expect("QC_125965");
+        // 003's proposal: 003 itself, 002, 004, the sixth node (still on QC_125963), 005, then 001.
+        let mp3 = ConsensusMsg::Proposal(p3.clone());
+        let mut v3 = Vec::new();
+        for k in [R003, R002, R004, R6TH, R005, R001] { v3.extend(race_votes(race_hear(&mut net, &c, s, k, &mp3))); }
+        // QC_125965 reaches everyone else; 22020ba8 then leads 125966 and re-certifies.
+        let m65 = ConsensusMsg::Qc(qc65.clone());
+        for k in [R002, R003, R004, R005] { race_hear(&mut net, &c, s, k, &m65); }
+        for k in [R6TH, RD05] {
+            race_hear(&mut net, &c, s, k, &m64);
+            race_hear(&mut net, &c, s, k, &m65);
+        }
+        race_hear(&mut net, &c, s, R220, &m64);
+        let p6 = race_proposal(&race_hear(&mut net, &c, s, R220, &m65)).expect("22020ba8 re-certifies at 125966");
+        for k in [R220, RD05] { v3.extend(race_votes(race_hear(&mut net, &c, s, k, &mp3))); }
+        // The re-certification: every member votes it and QC_125966 commits 125965.
+        let mp6 = ConsensusMsg::Proposal(p6.clone());
+        let mut v6 = Vec::new();
+        for k in [R220, R001, R002, R003, R004, R005, R6TH, RD05] { v6.extend(race_votes(race_hear(&mut net, &c, s, k, &mp6))); }
+        let (mut qc66, mut p7) = (None, None);
+        for v in &v6 {
+            let out = race_hear(&mut net, &c, s, R220, v);
+            qc66 = qc66.or(race_qc(&out));
+            p7 = p7.or(race_proposal(&out));
+        }
+        let qc66 = qc66.expect("QC_125966");
+        let m66 = ConsensusMsg::Qc(qc66.clone());
+        for k in [R001, R002, R003, R004, R005, R6TH, RD05] {
+            p7 = p7.or(race_proposal(&race_hear(&mut net, &c, s, k, &m66)));
+        }
+        let windows66: Vec<u64> = net.iter().map(|n| n.d.next_window()).collect();
+
+        // The race is the live one: both certificates at 125964, two leader-valid proposals at 125965
+        // (heads 3505320 and 3505350), 005's certified and re-certified at 125966, 003's unvoted.
+        assert_eq!(qc64.checkpoint_hash, p4.hash());
+        assert_eq!((p5.index, p5.window_head_height, p5.parent_qc.as_ref().map(|q| q.index)), (125965, 3505320, Some(125963)));
+        assert_eq!((p3.index, p3.window_head_height, p3.parent_qc.as_ref().map(|q| q.index)), (125965, 3505350, Some(125964)));
+        assert_eq!(c[leader_index(125965, &qc63.checkpoint_hash, c.len())], p5.proposer);
+        assert_eq!(c[leader_index(125965, &qc64.checkpoint_hash, c.len())], p3.proposer);
+        assert_eq!(qc65.checkpoint_hash, p5.hash(), "QC_125965 certifies 005's checkpoint");
+        assert!(v3.is_empty(), "003's checkpoint draws no vote");
+        assert_eq!((p6.index, p6.window_head_height), (125966, 3505320));
+        assert_eq!(checkpoint_content_digest(&p6), checkpoint_content_digest(&p5), "125966 re-certifies 005's content");
+        assert_eq!(qc66.checkpoint_hash, p6.hash());
+
+        // 125967: the next window, by d0590f22.
+        let (mut voters7, mut qc67) = (Vec::new(), None);
+        if let Some(p7) = &p7 {
+            let mp7 = ConsensusMsg::Proposal(p7.clone());
+            let mut v7 = Vec::new();
+            for k in [RD05, R001, R002, R003, R004, R005, R220, R6TH] { v7.extend(race_votes(race_hear(&mut net, &c, s, k, &mp7))); }
+            voters7 = v7.iter().filter_map(|m| match m { ConsensusMsg::Vote(v) => Some(v.voter.clone()), _ => None }).collect();
+            for v in &v7 { qc67 = qc67.or(race_qc(&race_hear(&mut net, &c, s, RD05, v))); }
+            if let Some(q) = &qc67 {
+                let m67 = ConsensusMsg::Qc(q.clone());
+                for k in [R001, R002, R003, R004, R005, R220, R6TH] { race_hear(&mut net, &c, s, k, &m67); }
+            }
+        }
+        RaceRun { c, net, salts: s, base, p4, p5, p6, qc64, qc65, qc66, windows66, p7, voters7, qc67 }
+    }
+
+    /// THE 10.10 DEFECT. Finality follows the certificate: 125965 finalizes the head QC_125965
+    /// certifies on every node, every node keeps one next window, the macroblock seals from the
+    /// committed checkpoint and not from its certified sibling at 125964, and the next window
+    /// certifies with every member.
+    #[test]
+    fn the_10_10_race_finalizes_the_certified_head_on_every_node() {
+        let r = race_replay();
+        let name = |n: &RaceNode| n.id.rsplit('_').next().unwrap_or("").chars().take(8).collect::<String>();
+        let finals: Vec<(String, Vec<u64>)> = r.net.iter()
+            .map(|n| (name(n), n.finals.iter().filter(|(i, _)| *i == 125965).map(|(_, h)| *h).collect()))
+            .collect();
+        assert!(finals.iter().all(|(_, h)| h.as_slice() == [3505320]),
+                "125965 must finalize the head its certificate covers (3505320) on every node: {:?}", finals);
+        let windows: Vec<(String, u64)> = r.net.iter().zip(&r.windows66).map(|(n, w)| (name(n), *w)).collect();
+        assert!(windows.iter().all(|(_, w)| *w == 116845),
+                "one next window on every node once QC_125966 lands: {:?}", windows);
+        let seals: Vec<(String, Option<u64>)> = r.net.iter()
+            .map(|n| (name(n), n.seals.iter().find(|(w, _, _)| *w == 38948).map(|(_, cp, _)| cp.index)))
+            .collect();
+        assert!(seals.iter().all(|(_, i)| *i == Some(125965)),
+                "macroblock 38948 seals from the committed checkpoint, never its sibling at 125964: {:?}", seals);
+        let p7 = r.p7.as_ref().expect("d0590f22 leads 125967 under QC_125966");
+        assert_eq!(p7.window_head_height, 3505350);
+        assert_eq!(r.voters7.len(), 8, "every member votes head 3505350: {:?}", r.voters7);
+        assert_eq!(r.qc67.as_ref().map(|q| q.checkpoint_hash), Some(p7.hash()), "and it certifies");
+        assert!(r.net.iter().all(|n| n.d.committed_index() == 125966));
+    }
+
+    /// The boot path rebuilds what live operation holds: a fresh driver fed the vote commitments, the
+    /// certified pairs of the WAL and the sealed macroblock's pair lands on the same certificate,
+    /// commit, finality inputs and next window as the node that never stopped.
+    #[test]
+    fn a_restart_after_the_race_rebuilds_the_live_state() {
+        let r = race_replay();
+        for n in &r.net {
+            let mut d = ConsensusDriver::new(n.id.clone(), r.c.clone(), [7u8; 32]);
+            d.restore_vote_commitments(&n.votes);
+            for (cp, qc) in n.wal.values() { let _ = d.sync(cp, qc); }
+            if let Some((_, cp, qc)) = n.seals.last() { let _ = d.sync(cp, qc); }
+            let live = (n.d.next_window(), n.d.committed_index(), n.d.committed_finalize(),
+                        n.d.high_qc_pair().map(|(cp, q)| (cp.hash(), q.index)));
+            let booted = (d.next_window(), d.committed_index(), d.committed_finalize(),
+                          d.high_qc_pair().map(|(cp, q)| (cp.hash(), q.index)));
+            assert_eq!(booted, live, "{} rebuilds a different state from its disk", n.id);
+            assert!(d.current_index() > n.votes.iter().map(|v| v.index).max().unwrap_or(0));
+        }
+    }
+
+    /// The network today: 002-005 hold the poisoned row and hours of votes for head 3505380, 001 and
+    /// the sixth node for 3505350, the two outside members are silent, and macroblock 38948 was sealed
+    /// from QC_125964. A restart rebuilds window 116845 from the certified pairs, and the six - exactly
+    /// the quorum of eight - vote and certify head 3505350 and finalize it.
+    #[test]
+    fn after_a_restart_the_six_certify_and_finalize_head_3505350() {
+        let r = race_replay();
+        let c = r.c.clone();
+        let wal = vec![r.base[0].clone(), r.base[1].clone(), (r.p4.clone(), r.qc64.clone()),
+                       (r.p5.clone(), r.qc65.clone()), (r.p6.clone(), r.qc66.clone())];
+        let under66 = Some(QcRef::from(&r.qc66));
+        let split_vote = |index: u64, w: u64| VoteCommitment {
+            index, window_head: w * CHECKPOINT_INTERVAL,
+            content_digest: checkpoint_content_digest(&race_cp(&c, index, under66.clone(), w, 0, RACE_IDS[R001])),
+            pinned: false, parent_index: 125966, parent_hash: r.qc66.checkpoint_hash,
+        };
+        let mut net: Vec<RaceNode> = (0..c.len()).map(|k| race_node(&c, k, &r.base)).collect();
+        for &k in RACE_OURS.iter() {
+            let group_a = (R002..=R005).contains(&k);
+            // What the deployed binary left on disk: the race votes, then the split views.
+            let mut votes: Vec<VoteCommitment> = r.net[k].votes.iter().filter(|v| v.index <= 125966).cloned().collect();
+            let (first, step, w) = if group_a { (125969u64, 7u64, 116846u64) } else { (125967, 5, 116845) };
+            votes.extend((0..30u64).map(|j| split_vote(first + j * step, w)));
+            let mut d = ConsensusDriver::new(c[k].clone(), c.clone(), [7u8; 32]);
+            d.restore_vote_commitments(&votes);
+            for (cp, qc) in &wal { let _ = d.sync(cp, qc); }
+            let _ = d.sync(&r.p4, &r.qc64); // the eager startup sync, from the sealed macroblock
+            assert_eq!(d.next_window(), 116845, "{} reboots on window 116845", c[k]);
+            assert_eq!(d.committed_finalize().map(|f| f.0), Some(3505320), "{} holds the certified commit", c[k]);
+            net[k].d = d;
+            net[k].votes = votes;
+        }
+        let live = RACE_OURS;
+        let mut wire = Vec::new();
+        for _ in 0..64 {
+            if live.iter().all(|&k| net[k].finals.iter().any(|(_, h)| *h >= 3505350)) { break; }
+            let qcs_before = wire.iter().filter(|m| matches!(m, ConsensusMsg::Qc(_))).count();
+            let mut seed = Vec::new();
+            for &k in live.iter() { seed.extend(race_try_propose(&mut net, &c, r.salts, k)); }
+            race_flood(&mut net, &c, r.salts, &live, seed, &mut wire);
+            if wire.iter().filter(|m| matches!(m, ConsensusMsg::Qc(_))).count() == qcs_before {
+                let mut tmo = Vec::new();
+                for &k in live.iter() { tmo.extend(race_timeout(&mut net, k)); }
+                race_flood(&mut net, &c, r.salts, &live, tmo, &mut wire);
+            }
+        }
+        assert!(live.iter().all(|&k| net[k].finals.iter().any(|(_, h)| *h >= 3505350)),
+                "the six finalize head 3505350: {:?}",
+                live.iter().map(|&k| (net[k].id.clone(), net[k].finals.clone())).collect::<Vec<_>>());
+        let props: Vec<Checkpoint> = wire.iter().filter_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None }).collect();
+        let qc = wire.iter().filter_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None })
+            .find(|q| props.iter().any(|p| p.hash() == q.checkpoint_hash && p.window_head_height == 3505350))
+            .expect("a certificate for head 3505350");
+        let mut ours: Vec<NodeId> = live.iter().map(|&k| c[k].clone()).collect();
+        ours.sort();
+        assert_eq!(qc.signers, ours, "exactly the six sign head 3505350");
+        for &k in live.iter() {
+            assert!(net[k].votes.iter().any(|v| v.index == qc.index && v.window_head == 3505350),
+                    "{} votes head 3505350", c[k]);
+        }
+    }
+
+    /// Two honest groups one certificate apart, both in view 13: each group's proposal names a head
+    /// the other's window gate refuses. The certificate exchange must not sit behind that gate - the
+    /// group behind pulls the certificate it lacks, the group ahead sends it - or neither ever moves.
+    #[test]
+    fn two_groups_one_certificate_apart_exchange_it_whatever_head_the_proposal_names() {
+        let (c, _) = byz_net(4);
+        let base = mk_cp(10, None, 90, "n0");
+        let qc10 = mk_qc(&c, &base, 3);
+        let ahead = mk_cp(11, Some(QcRef::from(&qc10)), 180, "n1");
+        let qc11 = mk_qc(&c, &ahead, 3);
+        let at_view_13 = |id: &NodeId, pairs: &[(&Checkpoint, &QuorumCertificate)]| -> Node {
+            let mut n = node(id, &c);
+            for (p, q) in pairs { let _ = n.d.sync(p, q); }
+            // Views meet at 13 through the timeouts of f+1 members.
+            for v in c.iter().filter(|m| *m != id).take(2) {
+                let tm = TimeoutMsg { index: 13, voter: v.clone(), high_qc_index: 11, signature: sign(v, &timeout_bytes(13, 11)) };
+                let _ = n.d.handle(&ConsensusMsg::Timeout(tm));
+            }
+            assert_eq!(n.d.current_index(), 13);
+            n
+        };
+        // The group ahead proposes the window after QC_11; a member of the group behind wants 180.
+        let py = mk_cp(13, Some(QcRef::from(&qc11)), 270, &c[leader_index(13, &ahead.hash(), c.len())]);
+        let x_id = c.iter().find(|m| **m != py.proposer).expect("a receiver").clone();
+        let mut x = at_view_13(&x_id, &[(&base, &qc10)]);
+        assert_eq!(x.d.next_window(), 2);
+        let effs = x.d.handle(&ConsensusMsg::Proposal(py.clone()));
+        assert!(matches!(effs.as_slice(), [Effect::CatchUp { qc_index: 11, .. }]),
+                "the group behind pulls the certificate it lacks: {:?}", effs);
+        let _ = x.d.sync(&ahead, &qc11);
+        assert!(x.d.handle(&ConsensusMsg::Proposal(py)).iter().any(|e| matches!(e, Effect::Vote { .. })),
+                "and votes the same proposal once it holds it");
+        // The group behind proposes the window after QC_10; a member of the group ahead wants 270.
+        let px = mk_cp(13, Some(QcRef::from(&qc10)), 180, &c[leader_index(13, &base.hash(), c.len())]);
+        let y_id = c.iter().find(|m| **m != px.proposer).expect("a receiver").clone();
+        let mut y = at_view_13(&y_id, &[(&base, &qc10), (&ahead, &qc11)]);
+        assert_eq!(y.d.next_window(), 3);
+        let effs = y.d.handle(&ConsensusMsg::Proposal(px.clone()));
+        let (peer, pc, pq) = effs.iter().find_map(|e| match e {
+            Effect::CatchUpTo { peer, checkpoint, qc } => Some((peer.clone(), checkpoint.clone(), qc.clone())), _ => None })
+            .unwrap_or_else(|| panic!("the group ahead sends the certificate to the proposer: {:?}", effs));
+        assert_eq!((peer.as_str(), pq.index), (px.proposer.as_str(), 11));
+        let mut p = at_view_13(&px.proposer, &[(&base, &qc10)]);
+        let _ = p.d.sync(&pc, &pq);
+        assert_eq!(p.d.next_window(), y.d.next_window(), "the proposer behind lands on the same window");
+    }
+
+    /// The 10.10 halves as one member saw the other: the same parent certificate, a head that
+    /// certificate does not lead to. The proposer's frontier is what is wrong, so the member answers
+    /// with the certified pair, and a proposer that lacks the checkpoint realigns on it. A re-proposal
+    /// of the parent's own head with other content is a failed re-certification, not a gap: nothing.
+    #[test]
+    fn a_head_its_own_parent_certificate_does_not_allow_is_answered_with_the_pair() {
+        let (c, _) = byz_net(4);
+        let base = mk_cp(10, None, 90, "n0");
+        let qc10 = mk_qc(&c, &base, 3);
+        let ahead = mk_cp(11, Some(QcRef::from(&qc10)), 180, "n1");
+        let qc11 = mk_qc(&c, &ahead, 3);
+        let proposer = c[leader_index(12, &ahead.hash(), c.len())].clone();
+        let me_id = c.iter().find(|m| **m != proposer).expect("a receiver").clone();
+        let mut me = node(&me_id, &c);
+        let _ = me.d.sync(&base, &qc10);
+        let _ = me.d.sync(&ahead, &qc11);
+        assert_eq!((me.d.current_index(), me.d.next_window()), (12, 3));
+        let far = mk_cp(12, Some(QcRef::from(&qc11)), 360, &proposer);
+        let effs = me.d.handle(&ConsensusMsg::Proposal(far));
+        let pair = effs.iter().find_map(|e| match e {
+            Effect::CatchUpTo { checkpoint, qc, .. } => Some((checkpoint.clone(), qc.clone())), _ => None });
+        let (pc, pq) = pair.unwrap_or_else(|| panic!("a head QC_11 does not lead to is answered with the pair: {:?}", effs));
+        assert_eq!(pq.index, 11);
+        // A proposer holding QC_11 without its checkpoint realigns on the pair.
+        let mut p = node(&proposer, &c);
+        let _ = p.d.sync(&base, &qc10);
+        let _ = p.d.handle(&ConsensusMsg::Qc(qc11.clone()));
+        assert_eq!(p.d.frontier_blind(), Some(11));
+        let _ = p.d.sync(&pc, &pq);
+        assert_eq!((p.d.frontier_blind(), p.d.next_window()), (None, 3));
+        // The parent's own head with other content, from another member: nothing to send.
+        let other = c.iter().find(|m| **m != me_id && **m != proposer).expect("a third member").clone();
+        let mut same_head = mk_cp(12, Some(QcRef::from(&qc11)), 180, &other);
+        same_head.state_root = [0xAB; 32];
+        assert!(me.d.handle(&ConsensusMsg::Proposal(same_head)).is_empty());
+    }
+
+    // ── ZERO SLACK: A RESTART BETWEEN A VOTE AND ITS OWN TIMEOUT ─────────────────────────────────
+    // Committee 8, quorum 6, six live: the recovery roll and windows 38949-38950. A member that votes
+    // at view V and stops before its own timer fires reboots past V (its vote commitment) and never
+    // signs V. The five left at V are one timeout short of TC(V), and one member ahead is two short
+    // of the f+1 jump. Only the helper timeout moves them.
+
+    /// Runs the shape: the leader of V proposes to itself and `voters` (offsets from the leader), the
+    /// members in `restarted` reboot, then every live timer fires `rounds` times.
+    fn zero_slack_restart_after_vote(voters: &[usize], restarted: &[usize], rounds: usize) -> (u64, Vec<u64>) {
+        let (_, nodes, v) = zero_slack_net(voters, restarted, rounds);
+        (v, nodes.iter().map(|n| n.d.current_index()).collect())
+    }
+
+    fn zero_slack_net(voters: &[usize], restarted: &[usize], rounds: usize) -> (Vec<NodeId>, Vec<Node>, u64) {
+        let c: Vec<NodeId> = (0..8).map(|i| format!("n{}", i)).collect();
+        let mut nodes: Vec<Node> = c[..6].iter().map(|id| node(id, &c)).collect();
+        assert_eq!(quorum_size(c.len()), 6);
+        let base = mk_cp(10, None, 90, "n0");
+        let qc10 = mk_qc(&c, &base, 6);
+        for n in nodes.iter_mut() {
+            let _ = n.d.sync(&base, &qc10);
+            n.wal.push((base.clone(), qc10.clone()));
+        }
+        // Views meet on one the live members lead.
+        let mut guard = 0;
+        let leader = loop {
+            let l = nodes[0].d.leader_of(nodes[0].d.current_index()).cloned().expect("a committee");
+            if let Some(k) = nodes.iter().position(|n| n.id == l) { break k; }
+            view_change(&mut nodes, &c);
+            guard += 1;
+            assert!(guard < 32, "no live leader reached");
+        };
+        let v = nodes[0].d.current_index();
+        assert!(nodes.iter().all(|n| n.d.current_index() == v));
+        // The leader proposes window 2; only it and `voters` hear the proposal, so no certificate forms.
+        let mut props = Vec::new();
+        for e in nodes[leader].d.build_proposal(2, vec![[2u8; 32]], [2u8; 32], [0u8; 32], 2000, c.clone(),
+                                                 Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32],
+                                                 [0u8; 32], [0u8; 32], 0) {
+            props.extend(exec(&mut nodes[leader], e));
+        }
+        let prop = props.into_iter().find(|m| matches!(m, ConsensusMsg::Proposal(_))).expect("the leader proposes");
+        let mut votes = Vec::new();
+        let hearers: Vec<usize> = std::iter::once(leader).chain(voters.iter().map(|k| (leader + k) % 6)).collect();
+        for &k in &hearers {
+            for e in nodes[k].d.handle(&prop) { votes.extend(exec(&mut nodes[k], e)); }
+        }
+        assert_eq!(votes.len(), hearers.len(), "each hearer votes");
+        deliver(&mut nodes, &c, votes);
+        assert!(nodes.iter().all(|n| n.d.current_index() == v), "a minority of votes certifies nothing");
+        // Stopped before the own timer at V: the vote commitment survives, nothing else does.
+        for &r in restarted {
+            let k = (leader + r) % 6;
+            restart(&mut nodes[k], &c);
+            assert_eq!(nodes[k].d.current_index(), v + 1, "a restored voter reboots past its vote");
+        }
+        for _ in 0..rounds {
+            let mut seed = Vec::new();
+            for k in 0..nodes.len() {
+                for e in nodes[k].d.on_timeout() { seed.extend(exec(&mut nodes[k], e)); }
+            }
+            deliver(&mut nodes, &c, seed);
+        }
+        (c, nodes, v)
+    }
+
+    /// A voter restarts and the other five stay at V: its helper timeout for V completes TC(V), and the
+    /// six time out together from then on.
+    #[test]
+    fn a_voter_restarted_before_its_own_timeout_still_lets_the_view_move() {
+        let (v, views) = zero_slack_restart_after_vote(&[1], &[1], 12);
+        assert!(views.iter().all(|w| *w >= v + 2), "the views must pass V+1 (V={}): {:?}", v, views);
+        // Two voters restarted: still within reach of the helper.
+        let (v, views) = zero_slack_restart_after_vote(&[1, 2], &[1, 2], 12);
+        assert!(views.iter().all(|w| *w >= v + 2), "two restarted voters (V={}): {:?}", v, views);
+    }
+
+    /// The leader self-votes, nobody else votes, and the leader restarts: none of the five ever voted
+    /// at V, so restarting any of them cannot help. The leader's own helper timeout does.
+    #[test]
+    fn the_only_voter_at_a_view_restarted_still_lets_the_view_move() {
+        let (v, views) = zero_slack_restart_after_vote(&[], &[0], 12);
+        assert!(views.iter().all(|w| *w >= v + 2), "the views must pass V+1 (V={}): {:?}", v, views);
+    }
+
+    /// After the views meet again the six certify window 2: the restarted voter votes the same content
+    /// at a later index, and every member holds the certificate.
+    #[test]
+    fn after_the_helper_timeout_the_six_certify_again() {
+        let (c, mut nodes, v) = zero_slack_net(&[1], &[1], 3);
+        let views: Vec<u64> = nodes.iter().map(|n| n.d.current_index()).collect();
+        assert!(views.iter().all(|w| *w == views[0] && *w > v), "one view past V={}: {:?}", v, views);
+        for _ in 0..32 {
+            if nodes.iter().all(|n| n.d.next_window() == 3) { break; }
+            let before = nodes[0].d.next_window();
+            strict_round(&mut nodes, &c, 2);
+            if nodes[0].d.next_window() == before { view_change(&mut nodes, &c); }
+        }
+        assert!(nodes.iter().all(|n| n.d.next_window() == 3 && n.d.high_qc_head() == Some(180)),
+                "window 2 certifies on all six: {:?}",
+                nodes.iter().map(|n| (n.d.current_index(), n.d.next_window())).collect::<Vec<_>>());
     }
 
 }

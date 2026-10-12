@@ -54,6 +54,7 @@ branch on `is_active`, and deploy the binary everywhere before that height.
 | `tx_target_bound` | every field a transaction's apply acts on is covered by a signature bound to the account it acts on, and a system transaction's unsigned envelope fields hold the one value its builder writes ([Transactions](../developers/transactions.md#system-transactions)) | 2,851,200 |
 | `wallet_one_node` | one wallet, one node of either type: a non-genesis `NodeRegistration` is refused when its wallet already has another node registered on chain below the block (its genesis, super or light id), and a block may not carry two registrations of one wallet under different node ids; a light registration's owner bind may take its form without a time ([light node messages](../protocols/light-node-messages.md#4-wallet-key-and-ping-key-messages)) | 2,851,200 |
 | `failover_tenure_bound` | a failover round belongs to the 30-block tenure it was certified for ([timeout votes](#timeout-votes)); fork choice compares two blocks only where their branches part and never rolls back toward a branch that contradicts this node's finality ([fork choice](#fork-choice)); a producer may sign a (height, round) it never signed at that round or above ([producer self-checks](#producer-self-checks)) | 2,851,200 |
+| `emergency_committee_allowlist` | the eligible-producer snapshot admits only the compiled `EMERGENCY_COMMITTEE_ALLOWLIST` (`genesis_node_001`…`005` and `super_node_c78c3017a4f93464`), applied only where the stored set is built (see [the allowlist](#emergency-committee-allowlist)) | 3,505,410 |
 
 The five gates at height 0 run from the genesis block. The two light gates share the epoch boundary 691,200
 (48 × 14,400): the bitmap-owner rule reads the block height while the commit-window rule reads the epoch start, and only
@@ -208,6 +209,18 @@ does a genesis node wait, before producing, until all five genesis nodes are in 
 reads the same static list; above them the candidates come from macroblock `N-2` and a restarted genesis produces at once. A separate gate applies to newcomers: `ACTIVATION_WARMUP_BLOCKS
 = 180` (two epochs). A registered Super node becomes producer-eligible only once its registration height is buried that
 deep, so a fresh joiner syncs as an observer before it can be elected. Genesis nodes (registration height 0) are exempt.
+
+### Emergency committee allowlist
+
+From height 3,505,410 (`emergency_committee_allowlist`) the snapshot builder admits only the identities in the compiled
+`EMERGENCY_COMMITTEE_ALLOWLIST`: `genesis_node_001`…`005` and `super_node_c78c3017a4f93464`. The rule is evaluated at
+each snapshot's own boundary, in the carry-over arm, the heartbeat re-admit arm and the genesis floor, and nowhere else;
+the roster, the committee and light clients read the stored set as before. So from window 38951 the committee is those
+six, quorum 5, and a registered Super node outside the list keeps its registry row and its heartbeat rewards but gets no
+producer or committee seat however long its warmup is buried. Exclusions are logged per arm as
+`[INFO][SNAP] allowlist_excluded mb=<M> count=<n> arm=carry|readmit`. The gate sits below the tip on purpose: it is the
+boundary of macroblock 38949, the first snapshot no node had sealed when the chain halted at 3,508,200. Lifting it
+needs another gate.
 
 ### Cap and uniform sortition
 
@@ -705,7 +718,11 @@ trigger a Bracha-style jump to that index. Restarts scatter views, which then ra
 also keeps each member's latest announced view and, once `f+1` members announce views above its own, jumps to the
 `(f+1)`-th highest of them; a timeout more than `CONSENSUS_STATE_RETAIN` indices ahead is recorded there but never enters
 the per-index tally. A restarted node enters its first votable view, one past its restored vote ceiling, and proposes
-only once it has heard the live view or three view timeouts have passed since boot. The view timer is built from
+only once it has heard the live view or three view timeouts have passed since boot. Such a node never signs the view it
+left, so its view timer also signs a helper timeout, ahead of its own: for the highest past view at which at least `f+1`
+other committee members timed out, that it has not signed itself and that no timeout certificate it holds covers. With
+exactly a quorum live, the members still at that view would otherwise stay one timeout short of its certificate while
+one member ahead is short of the `f+1` jump. No equivocation proof reads timeouts. The view timer is built from
 `VIEW_TIMEOUT_MS` with an adaptive backoff driven by consecutive timeouts without a commit.
 
 ### Proposal and evidence hygiene

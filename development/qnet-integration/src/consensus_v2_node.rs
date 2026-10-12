@@ -185,7 +185,10 @@ fn process_authenticated(
             if crate::node::is_info() {
                 println!("[INFO][BFT2] tail_reconcile idx={} diverged_heights={}", msg_index(msg), heights.len());
             }
+            // The certificate exchange reads no content, so it does not wait for the reconcile.
+            let mut effs = Vec::new();
             if let ConsensusMsg::Proposal(cp) = msg {
+                effs = driver.pre_content_exchange(cp);
                 evict_superseded_proposal(pending, cp.index, &cp.proposer);
             }
             if let Ok(bytes) = bincode::serialize(msg) { buffer_pending(pending, max_pending, bytes, true); }
@@ -193,16 +196,20 @@ fn process_authenticated(
                 let p = p2p.clone();
                 tokio::spawn(async move { let _ = p.request_block_repair_priority(h).await; });
             }
-            Vec::new()
+            effs
         }
         ContentCheck::Defer => {
             // Not caught up to this checkpoint's window yet — buffer for replay (drain_pending re-runs the
             // gate once our window is derived) instead of permanently rejecting. Bounded ⇒ no unbounded growth.
+            // The certificate exchange reads no content, so it runs now: a node one certificate behind
+            // holds no window for the head that certificate leads to.
+            let mut effs = Vec::new();
             if let ConsensusMsg::Proposal(cp) = msg {
+                effs = driver.pre_content_exchange(cp);
                 evict_superseded_proposal(pending, cp.index, &cp.proposer);
             }
             if let Ok(bytes) = bincode::serialize(msg) { buffer_pending(pending, max_pending, bytes, true); }
-            Vec::new()
+            effs
         }
         ContentCheck::Reject(reason) => {
             let first = CONTENT_REJECTS.fetch_add(1, Ordering::Relaxed) == 0;
@@ -1148,6 +1155,10 @@ fn drain_pending(
                         // Repair is NOT re-fired here (the live path re-fires it at round cadence via the
                         // re-proposal after TC) so a drain-per-inbound-message can never flood repair.
                         ContentCheck::TailDiverged(_) | ContentCheck::Defer => {
+                            // A proposal buffered early reaches its index here first; the driver runs
+                            // the exchange once per proposer and index, so a drain per message cannot
+                            // repeat it.
+                            if let ConsensusMsg::Proposal(cp) = &m { effs.extend(driver.pre_content_exchange(cp)); }
                             if retained_gated < MAX_RETAINED_GATED && still.len() < max {
                                 retained_gated += 1;
                                 still.push(data);
@@ -1609,10 +1620,11 @@ pub(crate) fn committee_for_window_cached(storage: &Storage, w: u64) -> Option<V
 #[derive(Debug, PartialEq)]
 enum CertWindow { Known(u64), Current, Unplaced }
 
-/// The window a certificate at `index` certifies, as this node can place it.
-fn window_of_index(driver: &ConsensusDriver, index: u64) -> CertWindow {
+/// The window a certificate at `index` certifies, as this node can place it: by the checkpoint the
+/// certificate names when that is held, since two proposals at one index can name two heads.
+fn window_of_index(driver: &ConsensusDriver, index: u64, hash: Option<&Hash>) -> CertWindow {
     let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-    match driver.head_of(index) {
+    match hash.and_then(|h| driver.head_of_checkpoint(index, h)).or_else(|| driver.head_of(index)) {
         Some(h) => CertWindow::Known(h / k),
         None if index == driver.current_index() => CertWindow::Current,
         None => CertWindow::Unplaced,
@@ -1655,14 +1667,14 @@ fn cert_plan_with(msg: &ConsensusMsg, driver: &ConsensusDriver, committee: &[Str
                   lookup: impl Fn(u64) -> Option<Vec<String>>) -> (Vec<String>, HighQcCheck) {
     match msg {
         ConsensusMsg::Qc(qc) => (
-            committee_for(window_of_index(driver, qc.index), committee, committee_window, &lookup).into_owned(),
+            committee_for(window_of_index(driver, qc.index, Some(&qc.checkpoint_hash)), committee, committee_window, &lookup).into_owned(),
             HighQcCheck::Held),
         ConsensusMsg::Tc(tc) => {
             let hq_idx = tc.high_qc.as_ref().map(|q| q.index).unwrap_or(0);
             let own = committee_for(window_of_view(driver, tc.index, hq_idx), committee, committee_window, &lookup).into_owned();
             let hq = match &tc.high_qc {
                 Some(hq) if !driver.holds_qc(hq.index, &hq.checkpoint_hash) => HighQcCheck::Over(
-                    committee_for(window_of_index(driver, hq.index), committee, committee_window, &lookup).into_owned()),
+                    committee_for(window_of_index(driver, hq.index, Some(&hq.checkpoint_hash)), committee, committee_window, &lookup).into_owned()),
                 _ => HighQcCheck::Held,
             };
             (own, hq)
@@ -3301,9 +3313,9 @@ mod cert_window_tests {
     fn a_certificate_is_placed_by_the_proposal_at_its_index() {
         let (d, _) = driver_at_100();
         assert_eq!(d.current_index(), 101);
-        assert_eq!(window_of_index(&d, 100), CertWindow::Known(90));
-        assert_eq!(window_of_index(&d, 101), CertWindow::Current);
-        assert_eq!(window_of_index(&d, 105), CertWindow::Unplaced);
+        assert_eq!(window_of_index(&d, 100, None), CertWindow::Known(90));
+        assert_eq!(window_of_index(&d, 101, None), CertWindow::Current);
+        assert_eq!(window_of_index(&d, 105, None), CertWindow::Unplaced);
     }
 
     // A view-change message belongs to the window right after its sender's high QC.
@@ -3365,5 +3377,95 @@ mod cert_window_tests {
         assert!(guard.contains("driver.current_index() == last_index"));
         assert!(guard.contains("driver.next_window() <= last_signaled || frontier_deferred(driver.next_window())"));
         assert!(!guard.contains("is_leader_now"));
+    }
+}
+
+#[cfg(test)]
+mod pre_content_exchange_tests {
+    use super::*;
+    use qnet_consensus::checkpoint_bft::{leader_index, Checkpoint, QcRef};
+
+    const K: u64 = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+
+    fn cp(index: u64, parent: Option<&QuorumCertificate>, window: u64, proposer: &str) -> Checkpoint {
+        Checkpoint {
+            index, parent_qc: parent.map(QcRef::from), window_head_height: window * K, window_mb_hashes: vec![[window as u8; 32]],
+            state_root: [0u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32],
+            registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32],
+            total_supply: 0, timestamp: 0, proposer: proposer.to_string(), proposer_sig: Vec::new(), recovery_anchor: None,
+        }
+    }
+
+    fn qc_of(c: &Checkpoint) -> QuorumCertificate {
+        QuorumCertificate { checkpoint_hash: c.hash(), index: c.index, signers: Vec::new(), sig_merkle_root: [0u8; 32], sigs: Vec::new() }
+    }
+
+    /// A driver for `me` holding `pairs`, brought to view 13 by the timeouts of f+1 other members.
+    fn at_view_13(me: &str, c: &[String], pairs: &[(&Checkpoint, &QuorumCertificate)]) -> ConsensusDriver {
+        let mut d = ConsensusDriver::new(me.to_string(), c.to_vec(), [7u8; 32]);
+        for (p, q) in pairs { let _ = d.sync(p, q); }
+        for v in c.iter().filter(|m| m.as_str() != me).take(2) {
+            let tm = TimeoutMsg { index: 13, voter: v.clone(), high_qc_index: 11, signature: Vec::new() };
+            let _ = d.handle(&ConsensusMsg::Timeout(tm));
+        }
+        assert_eq!(d.current_index(), 13);
+        d
+    }
+
+    /// The live inbound path with no window derived: the content gate defers every proposal.
+    fn feed(d: &mut ConsensusDriver, storage: &Arc<Storage>, p2p: &Arc<SimplifiedP2P>, c: &[String],
+            msg: &ConsensusMsg, pending: &mut Vec<Vec<u8>>) -> Vec<Effect> {
+        let empty: std::collections::HashMap<u64, WindowContent> = std::collections::HashMap::new();
+        let mut committee = c.to_vec();
+        let mut heard = std::collections::HashMap::new();
+        process_authenticated(msg, d, storage, &empty, p2p, &mut committee, 0, pending, 64, &mut heard)
+    }
+
+    /// A proposal whose window this node has not derived never reaches the driver's vote path, and the
+    /// certificates still move. A node one certificate behind pulls the one it lacks. A member ahead answers a
+    /// proposer that extends an older certificate, or names a head its parent does not lead to. A replay of the
+    /// held proposal repeats neither.
+    #[tokio::test]
+    async fn a_proposal_held_for_content_still_moves_the_certificates() {
+        let c: Vec<String> = (0..4).map(|i| format!("n{}", i)).collect();
+        let base = cp(10, None, 90, "n0");
+        let qc10 = qc_of(&base);
+        let ahead = cp(11, Some(&qc10), 91, "n1");
+        let qc11 = qc_of(&ahead);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Arc::new(Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let p2p = Arc::new(SimplifiedP2P::new("test_pre_content".into(), crate::unified_p2p::NodeType::Super,
+                                              crate::unified_p2p::Region::Europe, 8121));
+
+        // Behind: the proposal extends QC_11, this node holds QC_10 and no window for head 92.
+        let py = cp(13, Some(&qc11), 92, &c[leader_index(13, &ahead.hash(), c.len())]);
+        let x_id = c.iter().find(|m| **m != py.proposer).expect("a receiver").clone();
+        let mut x = at_view_13(&x_id, &c, &[(&base, &qc10)]);
+        let mut pending = Vec::new();
+        let effs = feed(&mut x, &storage, &p2p, &c, &ConsensusMsg::Proposal(py.clone()), &mut pending);
+        assert!(matches!(effs.as_slice(), [Effect::CatchUp { qc_index: 11, .. }]),
+                "the node behind pulls the certificate it lacks: {:?}", effs);
+        assert_eq!(pending.len(), 1, "and holds the proposal for replay");
+        let effs = feed(&mut x, &storage, &p2p, &c, &ConsensusMsg::Proposal(py), &mut pending);
+        assert!(effs.is_empty(), "a second copy pulls nothing more: {:?}", effs);
+        assert_eq!(pending.len(), 1);
+
+        // Ahead: the proposer extends QC_10, this node holds QC_11 and no window for head 91.
+        let px = cp(13, Some(&qc10), 91, &c[leader_index(13, &base.hash(), c.len())]);
+        let y_id = c.iter().find(|m| **m != px.proposer).expect("a receiver").clone();
+        let mut y = at_view_13(&y_id, &c, &[(&base, &qc10), (&ahead, &qc11)]);
+        let effs = feed(&mut y, &storage, &p2p, &c, &ConsensusMsg::Proposal(px.clone()), &mut Vec::new());
+        match effs.as_slice() {
+            [Effect::CatchUpTo { peer, qc, .. }] => assert_eq!((peer.as_str(), qc.index), (px.proposer.as_str(), 11)),
+            _ => panic!("the member ahead answers the stale proposer: {:?}", effs),
+        }
+
+        // Our certificate, a head it does not lead to (a stale latch): answered with the certified pair.
+        let far = cp(13, Some(&qc11), 95, &c[leader_index(13, &ahead.hash(), c.len())]);
+        let z_id = c.iter().find(|m| **m != far.proposer).expect("a receiver").clone();
+        let mut z = at_view_13(&z_id, &c, &[(&base, &qc10), (&ahead, &qc11)]);
+        assert_eq!(z.next_window(), 92);
+        let effs = feed(&mut z, &storage, &p2p, &c, &ConsensusMsg::Proposal(far), &mut Vec::new());
+        assert!(matches!(effs.as_slice(), [Effect::CatchUpTo { .. }]), "the latched proposer is answered: {:?}", effs);
     }
 }
