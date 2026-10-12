@@ -12,6 +12,8 @@ export const VECTORS = JSON.parse(readFileSync(new URL('qnet-link-v1.vectors.jso
 export const LIGHT = JSON.parse(readFileSync(new URL('light-node.vectors.json', PROTOCOLS), 'utf8'));
 export const LINK = LIGHT.link;
 export const LINK_CONSTANTS = LIGHT.constants.link;
+// The `claim` request that names the node, the wallet's light or super node (node-claim.vectors.json; owner, 12.10).
+export const CLAIM = JSON.parse(readFileSync(new URL('node-claim.vectors.json', PROTOCOLS), 'utf8'));
 
 const PKCS8_X25519 = Buffer.from('302e020100300506032b656e04220420', 'hex');
 const SPKI_X25519 = Buffer.from('302a300506032b656e032100', 'hex');

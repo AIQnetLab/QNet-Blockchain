@@ -13,6 +13,8 @@ mod state_apply;
 
 mod rewards;
 mod device;
+// N2: the super node's public IPv4, 443 probe, certificate schedule, ServeCert and endpoint commit.
+pub(crate) mod public_rpc;
 
 /// Concatenated source of every file in this module. Source-scanning invariant tests use it
 /// so a method moving between submodules cannot silently disarm them.
@@ -22,7 +24,7 @@ mod device;
 #[cfg(test)]
 pub(crate) fn node_sources_manifest() -> &'static [&'static str] {
     &["mod.rs", "activation.rs", "committee.rs", "consensus.rs", "device.rs", "leader.rs", "lifecycle.rs",
-      "monitoring.rs", "production.rs", "registration.rs", "rewards.rs", "state_apply.rs",
+      "monitoring.rs", "production.rs", "public_rpc.rs", "registration.rs", "rewards.rs", "state_apply.rs",
       "sync.rs", "transactions.rs"]
 }
 
@@ -38,6 +40,7 @@ pub(crate) fn node_sources() -> String {
         include_str!("lifecycle.rs"),
         include_str!("monitoring.rs"),
         include_str!("production.rs"),
+        include_str!("public_rpc.rs"),
         include_str!("registration.rs"),
         include_str!("rewards.rs"),
         include_str!("state_apply.rs"),
@@ -158,9 +161,13 @@ pub const MAX_MACROBLOCK_DECOMPRESSED: usize = 16 * 1024 * 1024;
 /// runtime, and `setenv`/`unsetenv` are not thread-safe against a concurrent `getenv`, so
 /// removing it would be undefined behaviour in a live process. Nothing is cached either — the
 /// secret is read on demand and dropped, rather than held in a process-lifetime map.
+///
+/// The buffers this function reads into are wiped before they are freed; the caller owns (and wipes)
+/// only the trimmed copy it returns. The file itself, and the variable in the process environment,
+/// stay as they are.
 pub fn load_wallet_seed(var: &str) -> Option<String> {
     if let Ok(path) = std::env::var(format!("{}_FILE", var)) {
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(&path).map(zeroize::Zeroizing::new) {
             Ok(s) => {
                 let seed = s.trim().to_string();
                 if !seed.is_empty() {
@@ -173,7 +180,7 @@ pub fn load_wallet_seed(var: &str) -> Option<String> {
             }
         }
     }
-    match std::env::var(var) {
+    match std::env::var(var).map(zeroize::Zeroizing::new) {
         Ok(seed) if !seed.trim().is_empty() => {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5904,7 +5911,10 @@ mod tests {
         assert!(include_str!("production.rs").contains("mempool.mark_commitment_finalized(key, height_for_storage);"));
         assert_eq!(include_str!("transactions.rs").matches("crate::node::refuse_held_commitment(&self.state, &tx)").count(), 2,
                    "the gossip door and the RPC submit both refuse what the state holds");
-        for (name, src) in [("registration_api.rs", include_str!("../rpc/registration_api.rs")),
+        // The reactivation door is `submit_self_reactivation` (registration.rs), which the operator route
+        // (registration_api.rs) and the automatic endpoint commit both call.
+        assert!(include_str!("../rpc/registration_api.rs").contains("blockchain.submit_self_reactivation("));
+        for (name, src) in [("registration.rs", include_str!("registration.rs")),
                             ("activation_validation.rs", include_str!("../activation_validation.rs")),
                             ("activation.rs", include_str!("activation.rs")), ("lifecycle.rs", include_str!("lifecycle.rs"))] {
             assert!(src.contains("refuse_held_commitment(") || src.contains("commitment_backed_by_state("),
@@ -12044,6 +12054,346 @@ mod emergency_allowlist_tests {
             assert!(quorum_size(c.len()) <= ours, "window {}: quorum {} of {} is out of the six's reach", w, quorum_size(c.len()), c.len());
             let want = if w <= 38_950 { (8, 6) } else { (6, 5) };
             assert_eq!((c.len(), quorum_size(c.len())), want, "window {}", w);
+        }
+    }
+}
+
+#[cfg(test)]
+mod super_reward_admission_tests {
+    use super::*;
+    use super::registration::SuperRewardAdmission;
+    use crate::genesis_constants::EMERGENCY_COMMITTEE_ALLOWLIST;
+
+    const EPOCH: u64 = 14_400;
+    const ALL_SLOTS: u16 = 0x03FF;
+
+    /// The six with their real registration heights, and four outside supers that heartbeat on the live chain.
+    const REGS: [(&str, u64); 10] = [
+        ("genesis_node_001", 0), ("genesis_node_002", 0), ("genesis_node_003", 0), ("genesis_node_004", 0),
+        ("genesis_node_005", 0), ("super_node_c78c3017a4f93464", 15_534), ("super_node_2a5c3e98273eb14f", 3_246_651),
+        ("super_node_22020ba893c62e34", 3_288_127), ("super_node_ccb8e28717bfa6ec", 3_345_268),
+        ("super_node_d0590f220be03d34", 3_494_491),
+    ];
+
+    fn gate() -> u64 { qnet_state::feature_gates::SUPER_REWARD_ADMISSION_GATE_HEIGHT }
+    /// The first epoch the rule governs, and the last one it does not.
+    fn on() -> u64 { gate() / EPOCH }
+    fn off() -> u64 { on() - 1 }
+    fn settle(epoch: u64) -> u64 { (epoch + 1) * EPOCH + HB_ANCHOR_MAX_LAG }
+    fn reward_key(epoch: u64) -> u64 { (epoch + 1) * crate::reward_epoch::MB_PER_EPOCH }
+    fn wallet(id: &str) -> String { format!("w_{}", id) }
+    fn admitted(id: &str) -> bool { EMERGENCY_COMMITTEE_ALLOWLIST.contains(&id) }
+
+    fn storage() -> (tempfile::TempDir, crate::storage::Storage) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        for (id, h) in REGS { storage.save_node_registration_at_height(id, "super", &wallet(id), 90.0, h).unwrap(); }
+        (dir, storage)
+    }
+
+    fn acct(epoch: u64, slots: u16) -> qnet_state::Account {
+        let mut a = qnet_state::Account::default();
+        a.heartbeat_final_epoch = epoch;
+        a.heartbeat_final_slots = slots;
+        a
+    }
+
+    /// Every super with all ten subwindows of `epoch`, `tweak` overriding some.
+    fn accounts(epoch: u64, tweak: &[(&str, qnet_state::Account)]) -> Vec<(String, qnet_state::Account)> {
+        REGS.iter().map(|(id, _)| {
+            let a = tweak.iter().find(|(t, _)| t == id).map(|(_, a)| a.clone()).unwrap_or_else(|| acct(epoch, ALL_SLOTS));
+            (id.to_string(), a)
+        }).collect()
+    }
+
+    fn state_with(accts: &[(String, qnet_state::Account)]) -> qnet_state::State {
+        let st = qnet_state::State::new();
+        for (id, a) in accts { st.accounts.insert(id.clone(), a.clone()); }
+        st
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> { v.sort(); v }
+
+    /// The rule before this gate, spelled out: registered by the settle point, not banned, at least nine.
+    fn reference(storage: &crate::storage::Storage, accts: &[(String, qnet_state::Account)], epoch: u64) -> Vec<String> {
+        let regs = storage.super_registrations_as_of(settle(epoch)).expect("regs");
+        sorted(regs.into_iter().map(|(id, _)| id).filter(|id| {
+            accts.iter().find(|(a, _)| a == id).map_or(false, |(_, a)| a.banned_at_height == 0
+                && BlockchainNode::account_heartbeat_count(a, epoch) >= 9)
+        }).collect())
+    }
+
+    fn pairs(ids: &[String]) -> Vec<(String, String)> { ids.iter().map(|id| (id.clone(), wallet(id))).collect() }
+
+    fn six() -> Vec<String> { sorted(EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect()) }
+    fn everyone() -> Vec<String> { sorted(REGS.iter().map(|(id, _)| id.to_string()).collect()) }
+
+    fn settle_block(h: u64) -> qnet_state::MicroBlock {
+        qnet_state::MicroBlock {
+            height: h, timestamp: 0, transactions: vec![], producer: "genesis_node_001".to_string(),
+            signature: vec![0u8; 64], merkle_root: [0u8; 32], previous_hash: [0u8; 32],
+            vrf_output: None, vrf_proof: None, fees_collected: 0,
+            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        }
+    }
+
+    /// Below the gate the set and the reward root are exactly what the old rule gives, outside supers included.
+    #[test]
+    fn gate_off_epoch_is_byte_identical() {
+        let (_d, storage) = storage();
+        let accts = accounts(off(), &[]);
+        let st = state_with(&accts);
+        let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, off()).expect("set");
+        assert_eq!(sorted(set.clone()), reference(&storage, &accts, off()));
+        assert_eq!(sorted(set.clone()), everyone(), "outside supers earn below the gate");
+        storage.save_super_eligible_batch(off(), &set).unwrap();
+        let k = reward_key(off());
+        let total = crate::reward_epoch::canonical_total(k);
+        let (_, _, root) = BlockchainNode::compute_epoch_reward_root(&storage, k, total, None).expect("root");
+        let (_, want) = BlockchainNode::distribute_split_rewards(&pairs(&everyone()), &[], total, k);
+        assert_eq!(root, want, "the same reward root as before the rule");
+    }
+
+    /// From the gate the set is the admitted members that cleared the bar, and nobody else.
+    #[test]
+    fn gate_on_epoch_is_the_intersection() {
+        let (_d, storage) = storage();
+        let n = on();
+        let accts = accounts(n, &[
+            ("super_node_2a5c3e98273eb14f", acct(n, 0x01FF)), // outside, 9
+            ("genesis_node_001", acct(n, 0x00FF)),            // admitted, 8
+            ("genesis_node_002", acct(n, 0x01FF)),            // admitted, exactly 9
+        ]);
+        let st = state_with(&accts);
+        let set = sorted(BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set"));
+        let want: Vec<String> = six().into_iter().filter(|id| id != "genesis_node_001").collect();
+        assert_eq!(set, want);
+        let old: Vec<String> = reference(&storage, &accts, n).into_iter().filter(|id| admitted(id)).collect();
+        assert_eq!(set, old, "the old set intersected with the admitted set");
+    }
+
+    #[test]
+    fn banned_admitted_super_earns_nothing() {
+        let (_d, storage) = storage();
+        for n in [off(), on()] {
+            let mut banned = acct(n, ALL_SLOTS);
+            banned.banned_at_height = 1_000;
+            let st = state_with(&accounts(n, &[("genesis_node_003", banned)]));
+            let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set");
+            assert!(!set.iter().any(|id| id == "genesis_node_003"), "epoch {}", n);
+        }
+    }
+
+    /// The epoch below the gate settles above it and keeps the old rule: the rule is keyed on the epoch's first
+    /// block, never on the height asking.
+    #[test]
+    fn epoch_straddling_the_gate_is_keyed_on_its_first_block() {
+        let (_d, storage) = storage();
+        assert_eq!(BlockchainNode::super_reward_admission(&storage, off()), SuperRewardAdmission::Open);
+        assert_eq!(BlockchainNode::super_reward_admission(&storage, on()), SuperRewardAdmission::Allowlist { at: gate() });
+        let st = state_with(&accounts(off(), &[]));
+        let (e, set) = BlockchainNode::compute_super_eligible_at_settle(&st, &storage, gate() + HB_ANCHOR_MAX_LAG).expect("settle");
+        assert_eq!((e, sorted(set)), (off(), everyone()), "settled above the gate, filed under the old rule");
+        let st = state_with(&accounts(on(), &[]));
+        let (e, set) = BlockchainNode::compute_super_eligible_at_settle(&st, &storage, gate() + EPOCH + HB_ANCHOR_MAX_LAG).expect("settle");
+        assert_eq!((e, sorted(set)), (on(), six()));
+    }
+
+    /// The producer, a replica and a snapshot joiner deriving anywhere in the next epoch file the same rows and
+    /// the same reward root, on both sides of the gate.
+    #[test]
+    fn producer_replica_and_snapshot_joiner_file_the_same_rows() {
+        for n in [off(), on()] {
+            let accts = accounts(n, &[]);
+            let h = settle(n);
+            let k = reward_key(n);
+            let total = crate::reward_epoch::canonical_total(k);
+            // Producer: the settle set, filed by the single writer.
+            let (_dp, producer) = storage();
+            let st = state_with(&accts);
+            let side = BlockSideIndices {
+                super_eligible: BlockchainNode::compute_super_eligible_at_settle(&st, &producer, h),
+                ..Default::default()
+            };
+            BlockchainNode::flush_block_side_indices(&producer, h, &side);
+            let want = producer.load_super_eligible(n).unwrap();
+            assert_eq!(sorted(want.clone()), if n >= on() { six() } else { everyone() }, "epoch {}", n);
+            let root = BlockchainNode::compute_epoch_reward_root(&producer, k, total, None);
+            assert!(root.is_some());
+            // Replica: the apply path of the settle block.
+            let (_dr, replica) = storage();
+            let st = state_with(&accts);
+            let r = BlockchainNode::apply_block_to_state(&st, &settle_block(h), &replica, None);
+            BlockchainNode::flush_block_side_indices(&replica, h, &r.side_indices);
+            assert_eq!(replica.load_super_eligible(n).unwrap(), want, "replica, epoch {}", n);
+            assert_eq!(BlockchainNode::compute_epoch_reward_root(&replica, k, total, None), root, "replica root");
+            // Joiners: registrations and on-disk accounts only, nothing resident, no rows.
+            for at in [h + 7_000, (n + 2) * EPOCH - 1] {
+                let (_dj, joiner) = storage();
+                joiner.mirror_block_delta(1, accts.clone(), Vec::new());
+                joiner.mirror_barrier();
+                assert!(joiner.load_super_eligible(n).unwrap().is_empty());
+                assert_eq!(BlockchainNode::backfill_settle_indices(&qnet_state::State::new(), &joiner, at), 1);
+                assert_eq!(joiner.load_super_eligible(n).unwrap(), want, "joiner at {}, epoch {}", at, n);
+                assert_eq!(BlockchainNode::compute_epoch_reward_root(&joiner, k, total, None), root, "joiner root at {}", at);
+            }
+        }
+    }
+
+    /// An outside super's leaf in the last epoch below the gate stays provable and creditable after the rule
+    /// excludes it, also once its shards are pruned and rebuilt. The next epoch simply has no leaf for it.
+    #[test]
+    fn earned_rewards_of_an_excluded_super_stay_claimable() {
+        let (_d, storage) = storage();
+        let outsider = "super_node_22020ba893c62e34";
+        let w = wallet(outsider);
+        let mut roots = Vec::new();
+        for n in [off(), on()] {
+            let st = state_with(&accounts(n, &[]));
+            let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set");
+            storage.save_super_eligible_batch(n, &set).unwrap();
+            let k = reward_key(n);
+            let (_, _, root) = BlockchainNode::compute_epoch_reward_root(
+                &storage, k, crate::reward_epoch::canonical_total(k), Some(k)).expect("root");
+            let mut rb = [0u8; 32];
+            rb.copy_from_slice(&hex::decode(&root).unwrap());
+            storage.seed_epoch_root_for_test(k, rb);
+            roots.push((k, root));
+        }
+        let (k_off, root_off) = roots[0].clone();
+        let (k_on, root_on) = roots[1].clone();
+        let proven = |storage: &crate::storage::Storage| match BlockchainNode::reward_proof_from_shard(storage, k_off, &root_off, &w, true) {
+            ShardClaim::Proof(amount, proof) => {
+                assert!(qnet_core::crypto::merkle::verify_merkle_proof(
+                    &BlockchainNode::reward_leaf_hash_hex(&w, k_off, amount), &root_off, &proof), "the proof verifies");
+                amount
+            }
+            other => panic!("the earned epoch must stay provable, got {:?}", other),
+        };
+        let amount = proven(&storage);
+        assert!(amount > 0);
+        assert!(matches!(BlockchainNode::reward_proof_from_shard(&storage, k_on, &root_on, &w, false), ShardClaim::NotRecipient),
+                "no leaf from the gate, and the quote loop continues past it");
+        storage.prune_epoch_reward_shards(k_on + 1).unwrap();
+        assert!(matches!(BlockchainNode::reward_proof_from_shard(&storage, k_off, &root_off, &w, false), ShardClaim::Absent));
+        assert_eq!(BlockchainNode::backfill_reward_shards(&storage), 2, "both epochs rebuild to their certified roots");
+        assert_eq!(proven(&storage), amount, "the rebuild serves the same amount");
+        let sg = qnet_state::State::new();
+        sg.credit_rewards_pool(amount);
+        assert!(sg.claim_reward(&w, k_off, amount), "the claim credits it");
+        assert_eq!(sg.get_account(&w).map(|a| a.balance), Some(amount));
+    }
+
+    /// A reorg into the settle window clears the epoch's rows, and the forward re-apply files the admitted set again.
+    #[test]
+    fn reorg_reconcile_re_derives_the_filtered_set() {
+        let (_d, storage) = storage();
+        let n = on();
+        let h = settle(n);
+        let st = state_with(&accounts(n, &[]));
+        let file = |storage: &crate::storage::Storage| {
+            let side = BlockSideIndices {
+                super_eligible: BlockchainNode::compute_super_eligible_at_settle(&st, storage, h),
+                ..Default::default()
+            };
+            BlockchainNode::flush_block_side_indices(storage, h, &side);
+        };
+        file(&storage);
+        assert_eq!(sorted(storage.load_super_eligible(n).unwrap()), six());
+        assert!(storage.reconcile_reward_indices_above_epoch(h - 1).unwrap() > 0);
+        assert!(storage.load_super_eligible(n).unwrap().is_empty(), "cleared");
+        file(&storage);
+        assert_eq!(sorted(storage.load_super_eligible(n).unwrap()), six(), "no outside super comes back");
+    }
+
+    /// The light share is untouched: from the gate an outside super's wallet that also holds a light id still
+    /// receives its light share, and the leaf set is the split of the admitted supers and every eligible light.
+    #[test]
+    fn light_branch_is_untouched() {
+        let (_d, storage) = storage();
+        let outsider = "super_node_ccb8e28717bfa6ec";
+        let mut lights: Vec<(String, String)> = Vec::new();
+        for w in ["wl_a".to_string(), "wl_b".to_string(), wallet(outsider)] {
+            let id = crate::rpc::generate_light_node_pseudonym(&w);
+            storage.save_node_registration_at_height_burn(&id, "light", &w, 1.0, 100, "b").unwrap();
+            lights.push((id, w));
+        }
+        for n in [off(), on()] {
+            for (id, _) in &lights {
+                storage.save_light_bitmap(n, light_shard_of(id), n * EPOCH + 1, &[0xFF; 4]).unwrap();
+            }
+            let st = state_with(&accounts(n, &[]));
+            let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set");
+            storage.save_super_eligible_batch(n, &set).unwrap();
+            let k = reward_key(n);
+            let total = crate::reward_epoch::canonical_total(k);
+            let supers = if n >= on() { six() } else { everyone() };
+            let want = BlockchainNode::distribute_split_rewards(&pairs(&supers), &lights, total, k);
+            let got = BlockchainNode::compute_epoch_reward_distribution(&storage, k, total).expect("distribution");
+            assert_eq!(got, want, "epoch {}", n);
+            let paid = got.0.iter().find(|(w, _)| *w == wallet(outsider)).map(|(_, a)| *a).unwrap_or(0);
+            let light_only = got.0.iter().find(|(w, _)| w == "wl_a").map(|(_, a)| *a).unwrap_or(0);
+            assert!(light_only > 0);
+            if n >= on() {
+                assert!(paid.abs_diff(light_only) <= 1, "light share only (one unit of remainder apart), epoch {}", n);
+            } else {
+                assert!(paid > light_only + 1, "both shares below the gate");
+            }
+        }
+    }
+
+    /// The status label: nothing required below the gate, admitted for the six and waiting for an outside super
+    /// from it.
+    #[test]
+    fn the_status_label_follows_the_admitted_set() {
+        let (_d, storage) = storage();
+        for (id, _) in REGS {
+            assert_eq!(BlockchainNode::super_admission_label(&storage, id, off()), "not_required");
+            assert_eq!(BlockchainNode::super_admission_label(&storage, id, on()),
+                       if admitted(id) { "admitted" } else { "waiting" }, "{}", id);
+        }
+    }
+
+    fn body<'a>(src: &'a str, sig: &str, close: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{} not found", sig));
+        let end = start + src[start..].find(close).unwrap_or_else(|| panic!("end of {} not found", sig));
+        &src[start..end]
+    }
+
+    /// Reward membership is decided once, where super_elig_{N} is computed. Every reader, the claim path and the
+    /// light code read the filed rows; producer eligibility keeps the snapshot rule alone.
+    #[test]
+    fn the_reward_admission_is_asked_once_at_the_settle_writer() {
+        const ASK: &str = "super_reward_admission(";
+        const LIST: &str = "allowlist_excludes(";
+        // Line ends as checked out: a Windows checkout reads CRLF.
+        let lf = |s: &str| s.replace("\r\n", "\n");
+        let reg = lf(include_str!("registration.rs"));
+        let reg = reg.as_str();
+        assert!(body(reg,"pub(crate) fn compute_super_eligible_for_epoch(", "\n    }\n").contains(ASK));
+        assert_eq!(reg.matches(LIST).count(), 1, "only SuperRewardAdmission::admits asks the allowlist");
+        assert!(body(reg, "impl SuperRewardAdmission {", "\n}\n").contains(LIST));
+        for sig in ["pub(super) fn apply_merkle_claims(", "pub(super) fn claim_proofs_admissible(",
+                    "pub(crate) fn backfill_reward_shards(", "pub(crate) fn backfill_settle_indices("] {
+            let b = body(reg, sig, "\n    }\n");
+            assert!(!b.contains(ASK) && !b.contains(LIST), "{}", sig);
+        }
+        let rewards = include_str!("rewards.rs");
+        assert!(!rewards.contains(ASK) && !rewards.contains(LIST), "no reward reader asks again");
+        let api = lf(include_str!("../rpc/rewards_api.rs"));
+        let api = api.as_str();
+        let claim = body(api, "pub(super) async fn handle_claim_rewards(", "\n}\n");
+        assert!(!claim.contains(ASK) && !claim.contains("super_admission_label("), "the claim path never asks");
+        for (name, src) in [("committee.rs", include_str!("committee.rs")), ("leader.rs", include_str!("leader.rs")),
+                            ("consensus_v2_node.rs", include_str!("../consensus_v2_node.rs"))] {
+            assert!(!src.contains(ASK), "{} keeps producer eligibility on the snapshot rule", name);
+        }
+        let node = include_str!("mod.rs");
+        let f = node.find("fn phase2a_eligible_additions(").expect("Phase-2A arm");
+        assert!(!node[f..].chars().take(3000).collect::<String>().contains(ASK));
+        for (name, src) in [("rpc/rewards_api.rs", api), ("rpc/light_nodes.rs", include_str!("../rpc/light_nodes.rs")),
+                            ("rpc/light_status.rs", include_str!("../rpc/light_status.rs"))] {
+            assert!(!src.contains(LIST), "{} does not ask the allowlist", name);
         }
     }
 }

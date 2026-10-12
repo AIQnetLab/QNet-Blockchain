@@ -1,15 +1,16 @@
-# QNet mobile wallet
+# QNet Wallet mobile app
 
-React Native wallet and light client for QNet, one app for iPhone, iPad, Android phones and tablets. It holds keys,
+React Native wallet and light client for QNet Blockchain, one app for iPhone, iPad, Android phones and tablets. It holds keys,
 sends transactions, verifies account state against committee quorum certificates, and runs this wallet's Light node on
-one device. A super node is set up only with the QNet browser extension on a computer and runs on its own server, which
-registers it; the Node tab only shows it. A light node is registered on aiqnet.io/node (the site's cabinet burns with a one-time payment key it creates
-in the browser, once the app has confirmed that the site may prepare the wallet's light node) or by the QNet browser
-extension. The app gives the wallet's consent to that registration and links the node to this device, or moves the node
-balance, on a sheet that a verified `https://link.aiqnet.io/l` link opens
-([QNet Link](../../docs/protocols/qnet-link-v1.md) section 14); its Node tab runs the node on this device ("Use this
-device", after the system's device check), stops it, and moves the node balance. One device runs one node. Its Browser
-tab opens websites that can connect the wallet through the same provider as the QNet browser extension; every connection, signature and send is
+one device. A super node is set up only with the QNet Wallet browser extension on a computer and runs on its own server, which
+registers it; the Node tab only shows it and moves its balance. A light node is registered on aiqnet.io/node (the site's cabinet burns with a one-time payment key it creates
+in the browser, once the app has confirmed that the site may prepare the wallet's light node) or by the QNet Wallet browser
+extension. The app gives the wallet's consent to that registration and links the node to this device, unlinks it, or
+moves the balance of the node the request names (the wallet's light or super node), on a sheet that a verified
+`https://link.aiqnet.io/l` link opens ([QNet Link](../../docs/protocols/qnet-link-v1.md) section 14); its Node tab
+shows the light node only on the device it is bound to, keeps it running there ("Use this device" where the card offers
+it, after the system's device check) and moves the node balance. One device runs one node. Its Browser
+tab opens websites that can connect the wallet through the same provider as the QNet Wallet browser extension; every connection, signature and send is
 confirmed on the app's own sheet. The WebView library is pinned and patched
 (`patches/react-native-webview+14.0.1.patch`, applied by `patch-package` on install) so that only a page's top
 frame can reach the wallet and its origin always comes from the platform.
@@ -42,10 +43,17 @@ npm run audit:prod
 
 The script only reads: HTTPS GETs to `node1`…`node5.aiqnet.io`. It proves the new pin from the committed one:
 every macroblock in between verifies exactly as the phone verifies it (committee, registry-bound keys, quorum of
-ML-DSA-65 votes, epoch commitment), and every genesis node that answers (at least four) must serve identical data
-for each. Whoever answers for those names at release time therefore cannot root the pin in keys of their own. The
-new pin records the pin it was proven from (`provenFrom`). It walks every macroblock in between, so refresh the pin
-for every release and at least every two weeks, while the nodes still keep the signatures to walk.
+ML-DSA-65 votes, epoch commitment), and every genesis node that answers (at least four) must serve identical content
+for each (a window certified again at another index is the same content; each checkpoint served is verified). Whoever
+answers for those names at release time therefore cannot root the pin in keys of their own. The new pin records the
+pin it was proven from (`provenFrom`). It walks every macroblock in between, so refresh the pin for every release and
+at least every two weeks, while the nodes still keep the signatures to walk. `--index N` pins macroblock N instead of
+one four below the head: the site's pin (`applications/qnet-explorer/frontend/src/server/light/pin.ts`), so the two
+agree; the tests keep them on one lineage. Reads stay within each node's limit for one address (`--rate`, default 240
+a minute), and a rate-limit answer or a timeout is asked again. The same block carries `NETWORK_ID`, the hash of block 0
+that every answering genesis node must serve alike (a pin proven from the committed one refuses another), and
+`GALC_V2_MINT_INTERVAL` (`--galc-interval`), the cadence of the genesis-signed capsules a device far behind roots its
+walk at ([GALC v2 capsule](../../docs/protocols/galc-capsule-v2.md)).
 
 `npm run check:release` (scripts/release-check.js) refuses a release whose pin is more than 14 days old, was not
 proven from a previous pin, or (with `--online`) lies further below the head than the nodes keep signatures for.

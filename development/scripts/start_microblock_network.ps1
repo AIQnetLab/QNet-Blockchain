@@ -6,7 +6,7 @@ param(
     [int]$StartPort = 9876
 )
 
-Write-Host "=== Starting QNet Network with Microblocks ===" -ForegroundColor Cyan
+Write-Host "=== Starting QNet Blockchain with Microblocks ===" -ForegroundColor Cyan
 Write-Host "Microblocks: Every 1 second" -ForegroundColor Green
 Write-Host "Macroblocks: Every 90 seconds" -ForegroundColor Green
 

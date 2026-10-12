@@ -1,7 +1,7 @@
 # Command-line tool
 
 This document describes the small Python tool in `applications/qnet-cli`: a thin HTTP client that
-prints node, wallet, reward and network information fetched from a QNet node. For development
+prints node, wallet, reward and network information fetched from a QNet Blockchain node. For development
 (keys, transfers, contract deploys and calls) use the `qnet` command of `@aiqnet/sdk`
 ([CLI](../developers/cli.md)), the [SDK](../developers/sdk.md) or the [RPC API](../developers/rpc-api.md)
 directly.

@@ -14,6 +14,7 @@ import { useArmedConfirm } from '../utils/useArmedConfirm';
 import { SEND_ARM_MS } from '../browser/dappProvider';
 import { looksLikeKnownAddress } from '../browser/DappSheet';
 import { groupAddress } from '../utils/addressDisplay';
+import { InfoField, InfoRow } from './InfoRow';
 
 /**
  * The recipient warnings for `to` (lowercase EON), from the sealed list of addresses this wallet signed transfers to
@@ -38,28 +39,21 @@ export default function SendReview({ review, t, onCancel, onConfirm }) {
     onConfirm();
   };
 
-  const row = (label, value) => (
-    <View style={s.row} key={label}>
-      <Text style={s.rowLabel}>{label}</Text>
-      <Text style={s.mono}>{value}</Text>
-    </View>
-  );
-
   return (
     <SafeAreaView style={s.overlay} edges={['top', 'bottom', 'left', 'right']} testID="send-review" onTouchStart={onTouchStart}>
       <ScrollView contentContainerStyle={s.scroll}>
         <View style={s.card}>
           <Text style={s.title}>{t('send_review_title')}</Text>
-          <View style={s.row}>
-            <Text style={s.rowLabel}>{t('send_review_to')}</Text>
+          <InfoField label={t('send_review_to')} divider={false} t={t}>
             <Text style={s.recipient} testID="send-review-to">{groupAddress(review.to)}</Text>
-          </View>
-          {row(t('send_review_network'), review.network)}
-          {row(t('send_review_amount'), review.amount)}
-          {row(t('send_review_fee'), review.fee)}
-          {review.account ? row(t('send_review_account'), review.account) : null}
-          {review.memo ? row(t('send_review_memo'), review.memo) : null}
-          {row(t('send_review_total'), review.total)}
+          </InfoField>
+          {/* Each figure beside its label (components/InfoRow); a total in two currencies takes a line for each. */}
+          <InfoRow label={t('send_review_network')} value={review.network} />
+          <InfoRow label={t('send_review_amount')} value={review.amount} ltr fit />
+          <InfoRow label={t('send_review_fee')} value={review.fee} ltr fit />
+          {review.account ? <InfoRow label={t('send_review_account')} value={review.account} ltr fit /> : null}
+          {review.memo ? <InfoField label={t('send_review_memo')} value={review.memo} t={t} /> : null}
+          <InfoRow label={t('send_review_total')} value={review.total} ltr fit total />
           {w.lookAlike ? <Text style={s.alert}>{t('dapp_send_lookalike')}</Text> : null}
           {w.incomingOnly ? <Text style={s.alert}>{t('dapp_send_incoming_only')}</Text> : null}
           {w.firstTime ? <Text style={s.warning}>{t('dapp_send_first_time')}</Text> : null}
@@ -93,17 +87,14 @@ const s = StyleSheet.create({
   },
   scroll: { flexGrow: 1, justifyContent: 'center', padding: 16 },
   card: {
-    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 20,
+    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 16,
     borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
   },
   title: { color: '#00d4ff', fontSize: 18, fontWeight: '700', textAlign: 'center', marginBottom: 12 },
-  row: { marginBottom: 10 },
-  rowLabel: { color: '#888888', fontSize: 12, marginBottom: 2 },
-  // Addresses and amounts stay left-to-right in every language.
-  mono: { color: '#ffffff', fontSize: 14, fontFamily: 'monospace', writingDirection: 'ltr', textAlign: 'left' },
+  // The whole recipient over the rows, under its label (components/InfoRow), left to right in groups.
   recipient: {
     color: '#ffffff', fontSize: 16, lineHeight: 24, fontFamily: 'monospace', writingDirection: 'ltr', textAlign: 'left',
-    backgroundColor: '#11131f', borderRadius: 8, padding: 10,
+    backgroundColor: '#11131f', borderRadius: 8, padding: 10, marginTop: 6,
   },
   hint: { color: '#888888', fontSize: 12, lineHeight: 17, marginTop: 6, marginBottom: 4 },
   warning: { color: '#ffaa00', fontSize: 13, lineHeight: 19, marginTop: 6, marginBottom: 6 },

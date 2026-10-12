@@ -1,6 +1,6 @@
-# QNet protocol whitepaper
+# QNet Blockchain protocol whitepaper
 
-This document specifies the QNet protocol as implemented in this repository: its node model and fault assumptions, its
+This document specifies the QNet Blockchain protocol as implemented in this repository: its node model and fault assumptions, its
 two-tier block production and deterministic leader election, its Checkpoint-BFT finality rule, the post-quantum
 cryptography used on every authenticated path, the account and state-commitment model, the emission and reward
 economics, and the security properties that follow from those choices. Every constant, domain-separation tag and rule
@@ -9,14 +9,14 @@ below is taken from the source tree. Subsystem-level detail lives in
 
 ## Status and risk note
 
-QNet is experimental software. There are no warranties of correctness, availability or economic outcome, and anyone
+QNet Blockchain is experimental software. There are no warranties of correctness, availability or economic outcome, and anyone
 operating a node or holding value on the network bears the full risk of doing so.
 
 ---
 
 ## 1. Abstract
 
-QNet is an account-based blockchain in which every signature on every authenticated path — block production, consensus
+QNet Blockchain is an account-based blockchain in which every signature on every authenticated path — block production, consensus
 voting, view change, peer handshake, transactions, registration, reward claims — is CRYSTALS-Dilithium3 / ML-DSA-65
 (FIPS 204). The chain runs two cadences over one linear microblock sequence: a single elected producer streams
 microblocks on a fixed one-second slot and is rotated every 30 blocks, while a separate consensus object, the
@@ -635,7 +635,9 @@ Eligibility is proven on-chain, not self-attested. A **super or genesis** node n
 heartbeat sub-window popcount of at least 9 for the epoch, read from committed account state: the 14,400-block epoch
 is divided into ten sub-windows of 1440 blocks, a heartbeat transaction sets its sub-window's bit, and it is
 admissible only within `HB_ANCHOR_MAX_LAG = 90` blocks of its anchor — which is also why the eligible set is sampled
-90 blocks past the epoch boundary rather than at it. A **light** node is eligible if its bit is set in the per-epoch
+90 blocks past the epoch boundary rather than at it. From the `super_reward_admission` gate (epoch 254) it must also be
+in the epoch's consensus-admitted set, decided at the epoch's first block; while the emergency committee allowlist is in
+force that set is the allowlist. Rewards already earned stay claimable whatever the admission. A **light** node is eligible if its bit is set in the per-epoch
 bitmaps published by the genesis nodes, indexed by its permanent registration index: each of the five hash shards is
 owned by three genesis nodes, each owner's bitmap is recorded separately, and a shard's bitmaps are bit-ORed, so a bit
 any owner sets counts and no owner can clear another's. A node that
@@ -685,7 +687,7 @@ floor to the gas price of a non-system transaction — `MIN_GAS_PRICE` below 5,0
 
 | | Phase 1 (active) | Phase 2 |
 | --- | --- | --- |
-| Payment | Burn of the external 1DEV token on Solana | QNC transferred on QNet |
+| Payment | Burn of the external 1DEV token on Solana | QNC transferred on QNet Blockchain |
 | On-chain `amount` | Must be 0 | Chain floor: 3,750 QNC (Super) / 5,000 QNC (Light) |
 | Price | Universal across node types: `max(1500 − 150 × floor(burn% / 10), 300)` whole 1DEV | Base 10,000 QNC (Light) / 7,500 QNC (Super) × a network-size multiplier of 0.5 / 1.0 / 2.0 / 3.0 |
 | Destination of funds | Destroyed on the external chain | Deducted from the payer |

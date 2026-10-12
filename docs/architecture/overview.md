@@ -1,13 +1,13 @@
 # System overview
 
-This document describes how QNet is put together: the two-tier block structure, the path a transaction
+This document describes how QNet Blockchain is put together: the two-tier block structure, the path a transaction
 takes from submission to irreversibility, what each node type does, the concurrent processes inside a
 running node, which crate owns which part of the protocol, and the data flows that connect them. Each
 section links to the reference document that covers the subject in full.
 
 ## The two-tier chain
 
-QNet separates *ordering* from *agreement*. A single elected producer appends microblocks on a fixed
+QNet Blockchain separates *ordering* from *agreement*. A single elected producer appends microblocks on a fixed
 slot with no vote round, which is what keeps the chain appending while peers are partitioned or slow.
 Agreement is then reached periodically by a committee that certifies a whole window of microblocks at
 once with a quorum certificate. The two layers have independent failure modes: a stalled producer is
@@ -157,6 +157,18 @@ transition is to 0 on a cryptographically proven equivocation recorded as a writ
 
 Details: [node activation](../economics/node-activation.md), [mobile wallet](../applications/mobile-wallet.md).
 
+A Super node that is not a genesis identity also serves wallets over HTTPS on `https://<its IPv4>`
+(host port 443): only the certified reads a wallet verifies against checkpoints it verified itself, and
+transaction submits, on a runtime of its own with fixed connection, rate and egress caps. Its certificate
+for the bare IPv4 comes from a public ACME certificate authority, obtained and renewed by the node, and the
+node proves who it is by a serving certificate its wallet signed. It commits `https://<IPv4>` as its
+endpoint through the ordinary reactivation transaction; no consensus rule or block-validity rule changes,
+and peers read only the IP. For a node that had committed no endpoint before (every installer-set-up node
+so far), that first commit binds its peer-to-peer identity to the IP two genesis nodes see as its TCP
+source, as an operator-committed endpoint always has
+([operator guide](../operators/running-a-node.md#public-rpc-port-443),
+[RPC reference](../developers/rpc-api.md#wallet-plane)).
+
 ## Processes inside a running node
 
 A Super node runs these concurrently; each owns a distinct module.
@@ -195,6 +207,11 @@ A Super node runs these concurrently; each owns a distinct module.
   hourly cleanup pass that applies the per-artifact retention rules. See [state and storage](./state.md).
 - **RPC and WebSocket server** (`rpc/`) — the HTTP API, rate limiting, and event subscriptions. See
   [RPC API](../developers/rpc-api.md).
+- **Wallet plane and public RPC task** (`rpc/wallet_plane.rs`, `node/public_rpc.rs`) — on a Super node that is
+  not a genesis identity and does not set `QNET_HIDE_IP`: the HTTPS listener for wallets on its own runtime
+  (`qnet-wallet-rt`, 2 to 4 threads), and a 30-second task that resolves the public IPv4, asks genesis for the
+  443 probe, runs the certificate schedule, keeps the ServeCert current and commits the endpoint. See
+  [wallet plane](../developers/rpc-api.md#wallet-plane).
 - **Liveness loops** (`node/lifecycle.rs`) — periodic anchored Heartbeat transactions for Super nodes
   and the light-node eligibility bitmap, both of which feed reward eligibility.
 - **Reward machinery** (`reward_epoch.rs`, `reward_sharding.rs`) — epoch roots, shard maintenance and

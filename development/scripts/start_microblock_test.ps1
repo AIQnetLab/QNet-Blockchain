@@ -1,6 +1,6 @@
 # Start QNet test network with microblock architecture
 
-Write-Host "=== QNet Microblock Test Network ===" -ForegroundColor Green
+Write-Host "=== QNet Blockchain Microblock Test Network ===" -ForegroundColor Green
 Write-Host "Starting 2-node network to test micro/macro blocks..."
 
 # Clean up old data
@@ -8,7 +8,7 @@ Write-Host "Cleaning up old data..." -ForegroundColor Yellow
 Remove-Item -Path "node1_data", "node2_data" -Recurse -Force -ErrorAction SilentlyContinue
 
 # Build the project
-Write-Host "Building QNet..." -ForegroundColor Yellow
+Write-Host "Building QNet Blockchain..." -ForegroundColor Yellow
 cargo build --release
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red

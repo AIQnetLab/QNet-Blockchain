@@ -76,6 +76,36 @@ describe('setup', () => {
     assert.deepEqual(page.$$('link').map((node) => [node.getAttribute('rel'), node.getAttribute('href')]), [['stylesheet', 'setup.css']]);
   });
 
+  // Owner, 11.10: the popup's two buttons open setup straight at their step (?flow=create, ?flow=import).
+  it('opened with ?flow=create or ?flow=import starts at that step with no choice screen; Back leads to the choice', async () => {
+    page = await openPage('setup', { handlers: handlers(), search: '?flow=create' });
+    assert.match(page.text(), /Write down your recovery phrase/);
+    assert.ok(page.$('[data-action="reveal-words"]'));
+    assert.equal(page.$('[data-action="create"]'), null, 'no choice screen first');
+    await page.click('[data-action="back"]');
+    assert.match(page.text(), /Set up QNet Wallet/);
+    assert.ok(page.$('[data-action="create"]') && page.$('[data-action="import"]'));
+    assert.deepEqual(page.violations, []);
+    page.close();
+    page = await openPage('setup', { handlers: handlers(), search: '?flow=import' });
+    assert.match(page.text(), /Type or paste your 12 or 24 words/);
+    assert.ok(page.$('textarea[name="phrase"]'));
+    assert.equal(page.$('[data-action="create"]'), null, 'no choice screen first');
+  });
+
+  it('without a step, or with another one, starts at the choice screen; a wallet that exists still closes setup', async () => {
+    for (const search of ['', '?flow=migrate', '?flow=', '?step=create']) {
+      page = await openPage('setup', { handlers: handlers(), search });
+      assert.ok(page.$('[data-action="create"]') && page.$('[data-action="import"]'), search);
+      assert.equal(page.$('[data-action="reveal-words"]'), null, search);
+      assert.deepEqual(page.violations, []);
+      page.close();
+    }
+    page = await openPage('setup', { handlers: handlers({ 'vault.status': () => ({ ...noVault(), exists: true }) }), search: '?flow=create' });
+    assert.match(page.text(), /A wallet already exists/);
+    assert.equal(page.$('[data-action="reveal-words"]'), null);
+  });
+
   it('create: words only after Show, typed check of 3 words, the shown phrase sent once, then forgotten; Done closes the tab', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
     let created = null;

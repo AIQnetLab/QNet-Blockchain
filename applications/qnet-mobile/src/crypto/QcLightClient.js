@@ -27,6 +27,8 @@ import {
   GENESIS_NODE_IDS,
   GENESIS_ERA_MAX_INDEX,
   WS_CHECKPOINT,
+  NETWORK_ID,
+  GALC_V2_MINT_INTERVAL,
 } from '../config/genesisConsensus';
 import { boundedGetJson } from '../utils/boundedFetch';
 
@@ -38,7 +40,7 @@ const DILITHIUM_SIG_LEN = 3309;  // detached ML-DSA-65 signature bytes
 const LANES = 1024;              // LtHash lanes (u16)
 const STATE_BYTES = LANES * 2;   // serialized LtHash state
 
-// In-memory cache of verified macroblock proofs, keyed by index → { stateRoot, checkpointHash }.
+// In-memory cache of verified macroblock proofs, keyed by index → its verified entry (entryOf).
 // Immutable per index; bounds inductive work across repeated balance checks. Bounded (M13): a catch-up walk from an old
 // pin verifies thousands of macroblocks, each with its epoch's eligible set, so at most VERIFIED_CACHE_MAX are kept, the
 // least recently used going first, never the highest one of either parity chain (later walks start from it). A walk
@@ -78,10 +80,11 @@ const _failedCache = new Map();
 const FAIL_TTL_MS = 60_000;
 
 // Macroblocks this device verified in an earlier session (importVerifiedAnchors): index →
-// { eligibleIds, beacon, registryRoot }. Like the pin they root a walk; like the pin they carry no
-// state_root, so a query at such an index itself is verified again.
+// { eligibleIds, beacon, registryRoot } and, when kept with them, { stateRoot, logsRoot, checkpointHash }. Like the pin
+// they root a walk; one kept with its roots also answers queries at its own index, one without is verified again.
 const _resumeAnchors = new Map();
 const HEX32 = /^[0-9a-f]{64}$/;
+const ZERO32 = '0'.repeat(64);
 
 // ── weak-subjectivity pin ───────────────────────────────────────────────────
 // A non-zero pin MUST carry the derivation anchors for BOTH K and K-1 (one per parity chain). A
@@ -111,14 +114,25 @@ function pinnedAnchor(j) {
   return { eligibleIds: ids, beacon: e.beacon, registryRoot: e.registry_root, pinned: true };
 }
 
-// THE anchor lookup: a macroblock this device verified itself (now or in an earlier session), else a
-// binary-pinned one.
+// THE anchor lookup: a macroblock this device verified itself (now or in an earlier session), else a root of the held
+// capsule, else a binary-pinned one.
 function anchorFor(j) {
-  return verifiedAt(j) || _resumeAnchors.get(j) || pinnedAnchor(j);
+  return verifiedAt(j) || _resumeAnchors.get(j) || capsuleEntry(j) || pinnedAnchor(j);
 }
 
-// The highest index below `idx` on idx's parity chain that a walk to idx can start from, or -1.
-function walkRoot(idx) {
+// A macroblock whose certified roots this device holds: verified in this session, kept from an earlier one with its
+// roots, or a root of the held capsule. A look, not a use: the LRU order stays.
+function certifiedEntry(j) {
+  const v = _verifiedCache.get(j);
+  if (v) return v;
+  const r = _resumeAnchors.get(j);
+  if (r && r.stateRoot) return r;
+  return capsuleEntry(j);
+}
+
+// The highest index below `idx` on idx's parity chain that this device's own data roots a walk at (a macroblock verified
+// now or in an earlier session, or the pin), or -1.
+function ownWalkRoot(idx) {
   let best = -1;
   const consider = (j) => {
     if (j < idx && j > best && (idx - j) % 2 === 0 && anchorFor(j)) best = j;
@@ -130,9 +144,38 @@ function walkRoot(idx) {
   return best;
 }
 
+// The root of the held capsule below `idx` on idx's parity chain (K or K-1), or -1.
+function capsuleWalkRoot(idx) {
+  if (!_capsule) return -1;
+  for (const j of [_capsule.index, _capsule.index - 1]) if (j < idx && (idx - j) % 2 === 0) return j;
+  return -1;
+}
+
+const stepsFrom = (root, idx) => (root < 0 ? Infinity : (idx - root) / 2);
+
+// The highest index below `idx` on idx's parity chain that a walk to idx starts from, or -1. The capsule's root only when
+// it is higher than this device's own and the walk from its own takes more than OWN_ROOT_WALK_STEPS steps.
+function walkRoot(idx) {
+  const own = ownWalkRoot(idx);
+  const held = capsuleWalkRoot(idx);
+  return held > own && stepsFrom(own, idx) > OWN_ROOT_WALK_STEPS ? held : own;
+}
+
 /**
- * The derivation data of the highest macroblock this device has verified on each parity chain, for the
- * caller to keep across sessions under its own integrity protection and hand back to importVerifiedAnchors.
+ * How many walk steps verifying macroblock `idx` takes from what this device holds (0: its roots are held), or Infinity.
+ * The progress a wallet shows while a walk is long.
+ */
+export function stepsToVerify(idx) {
+  if (!Number.isSafeInteger(idx) || idx < 0) return Infinity;
+  if (certifiedEntry(idx)) return 0;
+  return stepsFrom(walkRoot(idx), idx);
+}
+
+/**
+ * The derivation data and roots of the highest macroblock this device has verified on each parity chain, for the caller
+ * to keep across sessions under its own integrity protection and hand back to importVerifiedAnchors:
+ * { [index]: { eligible_ids, beacon, registry_root, state_root, logs_root, checkpoint_hash } }, the last three only for an
+ * anchor whose roots are known (one kept by a build before them carries none).
  */
 export function exportVerifiedAnchors() {
   const best = new Map();
@@ -142,15 +185,22 @@ export function exportVerifiedAnchors() {
   }
   const out = {};
   for (const [j, e] of best.values()) {
-    out[j] = { eligible_ids: e.eligibleIds.slice(), beacon: e.beacon, registry_root: e.registryRoot };
+    const a = { eligible_ids: e.eligibleIds.slice(), beacon: e.beacon, registry_root: e.registryRoot };
+    if ([e.stateRoot, e.logsRoot, e.checkpointHash].every((h) => HEX32.test(String(h)))) {
+      Object.assign(a, { state_root: e.stateRoot, logs_root: e.logsRoot, checkpoint_hash: e.checkpointHash });
+    }
+    out[j] = a;
   }
   return out;
 }
 
+const ANCHOR_ROOTS = ['state_root', 'logs_root', 'checkpoint_hash'];
+
 /**
  * Roots later walks at macroblocks this device verified before (exportVerifiedAnchors), so a restart does
- * not walk again from the pin. Only for anchors the caller kept integrity-protected: an anchor is trusted
- * exactly like the pin. Anything malformed or at or below the pin is ignored. Returns how many were taken.
+ * not walk again from the pin; one kept with its roots also answers at its own index. Only for anchors the caller kept
+ * integrity-protected: an anchor is trusted exactly like the pin. Anything malformed or at or below the pin is ignored,
+ * and so is an anchor with only some of the roots. Returns how many were taken.
  */
 export function importVerifiedAnchors(anchors) {
   const k = WS_CHECKPOINT.index || 0;
@@ -161,31 +211,68 @@ export function importVerifiedAnchors(anchors) {
     if (!e || !Array.isArray(e.eligible_ids) || e.eligible_ids.length === 0
         || !e.eligible_ids.every((id) => typeof id === 'string' && id.length > 0)) continue;
     if (!HEX32.test(String(e.beacon)) || !HEX32.test(String(e.registry_root))) continue;
-    _resumeAnchors.set(j, { eligibleIds: e.eligible_ids.slice(), beacon: e.beacon, registryRoot: e.registry_root });
+    const roots = ANCHOR_ROOTS.filter((f) => e[f] !== undefined);
+    if (roots.length > 0 && (roots.length < ANCHOR_ROOTS.length || !roots.every((f) => HEX32.test(String(e[f]))))) continue;
+    const anchor = { eligibleIds: e.eligible_ids.slice(), beacon: e.beacon, registryRoot: e.registry_root };
+    if (roots.length > 0) Object.assign(anchor, { stateRoot: e.state_root, logsRoot: e.logs_root, checkpointHash: e.checkpoint_hash });
+    _resumeAnchors.set(j, anchor);
+    if (anchor.checkpointHash) capsuleConflicts(j, anchor.checkpointHash);
     taken += 1;
   }
   return taken;
 }
 
 /**
- * The chain this build trusts, as a short fingerprint of its pinned genesis identities (node id and consensus key of
- * each). Anything kept on the device from chain reads (verified anchors, the last verified balance) carries it, so data
- * of another chain is never taken for this one's.
+ * The chain this build trusts, as a short fingerprint of its network identity (NETWORK_ID, the hash of block 0) and its
+ * pinned genesis identities (node id and consensus key of each). Anything kept on the device from chain reads (verified
+ * anchors, the capsule, the last verified balance) carries it, so data of another chain is never taken for this one's.
  */
 let _chainIdentity = null;
 export function chainIdentity() {
   if (!_chainIdentity) {
     const ids = [...GENESIS_NODE_IDS].sort();
-    _chainIdentity = sha3_256(utf8(ids.map((id) => `${id}:${GENESIS_CONSENSUS_PKS[id]}`).join('|'))).slice(0, 32);
+    const parts = [`network:${NETWORK_ID}`, ...ids.map((id) => `${id}:${GENESIS_CONSENSUS_PKS[id]}`)];
+    _chainIdentity = sha3_256(utf8(parts.join('|'))).slice(0, 32);
   }
   return _chainIdentity;
 }
 
-/** The highest macroblock index this device trusts: the pin, or above it one it verified itself. */
+/**
+ * When macroblock `index` was certified, by the time its checkpoint names (Unix ms), for one whose checkpoint this device
+ * holds (verified in this session, or a capsule root); null otherwise. Display only: Assets names it when the network
+ * stopped certifying (WalletManager.networkPause).
+ */
+export function verifiedCheckpointTime(index) {
+  const e = certifiedEntry(index);
+  const ts = e ? Number(e.timestamp) : NaN;
+  if (!Number.isSafeInteger(ts) || ts <= 0) return null;
+  return ts < 1e12 ? ts * 1000 : ts;
+}
+
+/**
+ * The certified checkpoint fields this device holds for macroblock `index` (verified by the walk, kept from an earlier
+ * session with its roots, or a capsule root), or null: { index, stateRoot, logsRoot, checkpointHash, registryRoot, beacon,
+ * timestamp, windowMbHashes, rewardRoot, rewardEpochRoot }, null for a field an anchor kept from an earlier session does
+ * not carry. Every field is inside the checkpoint hash the committee (or the genesis capsule) signed.
+ */
+export function verifiedCheckpoint(index) {
+  const e = Number.isSafeInteger(index) ? certifiedEntry(index) : null;
+  if (!e) return null;
+  const or = (v) => (v === undefined ? null : v);
+  return {
+    index, stateRoot: or(e.stateRoot), logsRoot: or(e.logsRoot), checkpointHash: or(e.checkpointHash),
+    registryRoot: or(e.registryRoot), beacon: or(e.beacon), timestamp: or(e.timestamp),
+    windowMbHashes: Array.isArray(e.windowMbHashes) ? e.windowMbHashes.slice() : null,
+    rewardRoot: or(e.rewardRoot), rewardEpochRoot: or(e.rewardEpochRoot),
+  };
+}
+
+/** The highest macroblock index this device trusts: the pin, or above it one it verified itself or the capsule's K. */
 export function highestVerifiedIndex() {
   let best = WS_CHECKPOINT.index || 0;
   for (const j of _verifiedCache.keys()) if (j > best) best = j;
   for (const j of _resumeAnchors.keys()) if (j > best) best = j;
+  if (_capsule && _capsule.index > best) best = _capsule.index;
   return best;
 }
 
@@ -220,6 +307,12 @@ function nodesFrom(provider) {
   try { v = provider(); } catch (_) { return []; }
   const list = Array.isArray(v) ? v : [v];
   return list.filter((u, i) => typeof u === 'string' && u.length > 0 && list.indexOf(u) === i);
+}
+
+// Calls a caller's hook, if any; a hook that throws never stops the walk.
+function notify(hook, ...args) {
+  if (typeof hook !== 'function') return;
+  try { hook(...args); } catch (_) { /* reporting never stops the walk */ }
 }
 
 // ── node reads: a budget per node, and the node's own rate limit ─────────────
@@ -569,6 +662,10 @@ const isU64 = (v) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 && 
 const isOptU64 = (v) => v === undefined || v === null || isU64(v);
 const isOptString = (v) => v === undefined || v === null || typeof v === 'string';
 const isStringList = (v) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+const HEX_BYTES = /^(?:[0-9a-f]{2})*$/;
+// The checkpoint's 32-byte hashes (checkpointHash), and those an older checkpoint may leave out (hashed as zeros).
+const CHECKPOINT_HASHES = ['state_root', 'beacon', 'epoch_commitment', 'reward_root', 'registry_root'];
+const OPT_CHECKPOINT_HASHES = ['logs_root', 'dilithium_pk_root', 'reward_epoch_root'];
 
 /** Why a served registry entry cannot be hashed, or null: every field the row hash reads, of the type it reads. */
 function registryEntryProblem(e) {
@@ -594,18 +691,20 @@ export function proofShapeProblem(proof) {
   for (const k of ['index', 'window_head_height', 'total_supply', 'timestamp']) if (!isOptU64(cp[k])) return k;
   if (cp.parent_qc !== undefined && cp.parent_qc !== null) {
     const p = cp.parent_qc;
-    if (typeof p !== 'object' || Array.isArray(p) || typeof p.checkpoint_hash !== 'string' || !isOptU64(p.index)) return 'parent_qc';
+    if (typeof p !== 'object' || Array.isArray(p) || !HEX32.test(String(p.checkpoint_hash)) || !isOptU64(p.index)) return 'parent_qc';
   }
-  if (!(cp.window_mb_hashes === undefined || cp.window_mb_hashes === null || isStringList(cp.window_mb_hashes))) return 'window_mb_hashes';
-  for (const k of ['state_root', 'beacon', 'epoch_commitment', 'reward_root', 'registry_root', 'logs_root',
-    'dilithium_pk_root', 'reward_epoch_root', 'proposer']) {
-    if (!isOptString(cp[k])) return k;
-  }
+  if (!(cp.window_mb_hashes === undefined || cp.window_mb_hashes === null
+      || (Array.isArray(cp.window_mb_hashes) && cp.window_mb_hashes.every((h) => HEX32.test(String(h)))))) return 'window_mb_hashes';
+  // Every hash is lowercase hex of 32 bytes, as nodes serve it: the checkpoint hash decodes hex loosely (any case, a
+  // trailing non-hex tail ignored), so another spelling would verify and then be kept, and compared, as served.
+  for (const k of CHECKPOINT_HASHES) if (!HEX32.test(String(cp[k]))) return k;
+  for (const k of OPT_CHECKPOINT_HASHES) if (!(cp[k] === undefined || cp[k] === null || HEX32.test(String(cp[k])))) return k;
+  if (!isOptString(cp.proposer)) return 'proposer';
   const ra = cp.recovery_anchor;
-  if (!(ra === undefined || ra === null || (Array.isArray(ra) && ra.length === 2 && isU64(ra[0]) && typeof ra[1] === 'string'))) {
+  if (!(ra === undefined || ra === null || (Array.isArray(ra) && ra.length === 2 && isU64(ra[0]) && HEX32.test(String(ra[1]))))) {
     return 'recovery_anchor';
   }
-  if (!isOptString(proof.eligible_raw)) return 'eligible_raw';
+  if (!(proof.eligible_raw === undefined || proof.eligible_raw === null || HEX_BYTES.test(String(proof.eligible_raw)))) return 'eligible_raw';
   if (!(proof.banned === undefined || proof.banned === null || isStringList(proof.banned))) return 'banned';
   const pks = proof.committee_pubkeys;
   if (!(pks === undefined || pks === null || (typeof pks === 'object' && !Array.isArray(pks)
@@ -847,6 +946,18 @@ function fetchJson(url, maxBytes, timeoutMs = 10000) {
   return boundedGetJson(url, { timeoutMs, maxBytes });
 }
 
+// The verified entry of a macroblock whose checkpoint `cp` hashes to `cpHash`: what j+2 derives its committee from (the
+// eligible set, the beacon, the registry root) and what queries at j are answered from (its roots, its window's block
+// hashes, the reward roots; its time for display only). Every field is inside the hash the committee, or the genesis
+// capsule, signed; logs_root and reward_epoch_root as that hash folds them when a checkpoint omits them.
+function entryOf(cp, cpHash, eligibleIds) {
+  return {
+    stateRoot: cp.state_root, logsRoot: cp.logs_root || ZERO32, checkpointHash: cpHash, eligibleIds, beacon: cp.beacon,
+    registryRoot: cp.registry_root, timestamp: cp.timestamp, windowMbHashes: (cp.window_mb_hashes || []).slice(),
+    rewardRoot: cp.reward_root, rewardEpochRoot: cp.reward_epoch_root || ZERO32,
+  };
+}
+
 // Verify a single macroblock j from its fetched proof. Committee = genesis-pinned (genesis era) OR
 // sample_committee over the VERIFIED j-2 eligible+beacon from cache (NOT server-supplied). Verify the
 // QC in full, then anchor j's OWN eligible+banned via the QC-signed epoch_commitment. Caches
@@ -924,7 +1035,7 @@ async function verifyOne(j, proof, registryFetch) {
   }
   // registryRoot is retained because j+2 binds its committee's pubkeys to it. It is certified: the QC
   // over cpHash, which folds registry_root, has just been verified.
-  const entry = { stateRoot: cp.state_root, logsRoot: cp.logs_root, checkpointHash: cpHash, eligibleIds: decodeEligibleNodeIds(eligibleBytes), beacon: cp.beacon, registryRoot: cp.registry_root };
+  const entry = entryOf(cp, cpHash, decodeEligibleNodeIds(eligibleBytes));
   rememberVerified(j, entry);
   console.log('[INFO][LIGHT] macroblock_verified j=' + j + ' committee=' + committee.length);
   return { entry };
@@ -1059,9 +1170,8 @@ async function verifyStep(j, nodesProvider, hooks, tally = null, ahead = null, t
     }
     if (r.entry) {
       _notCertified.delete(j);
-      if (hooks && typeof hooks.onProgress === 'function') {
-        try { hooks.onProgress(j); } catch (_) { /* keeping progress never stops the walk */ }
-      }
+      if (capsuleConflicts(j, r.entry.checkpointHash)) notify(hooks && hooks.onCapsuleDropped);
+      notify(hooks && hooks.onProgress, j);
       return STEP.VERIFIED;
     }
     if (r.transient) return STEP.TRANSIENT;
@@ -1146,11 +1256,13 @@ export const LINEAGE_REFUSALS = 2;
 
 async function verifyMacroblockAt(idx, nodesProvider, hooks = {}) {
   if (_verifiedCache.has(idx)) return verifiedAt(idx);
+  const held = certifiedEntry(idx);
+  if (held) return held;
   const parity = idx % 2;
   const running = _walks.get(parity);
   if (running) {
     await running.catch(() => null);
-    return _verifiedCache.get(idx) || null;
+    return certifiedEntry(idx) || null;
   }
   const walk = walkTo(idx, nodesProvider, hooks);
   _walks.set(parity, walk);
@@ -1166,9 +1278,9 @@ async function verifyMacroblockAt(idx, nodesProvider, hooks = {}) {
 // each step's j-2 anchor is already cached. Cached across calls.
 async function walkTo(idx, nodesProvider, hooks) {
   // Walk root: the highest anchor below idx on its parity chain — a macroblock verified in this or an
-  // earlier session, or the pin. WS=K roots this parity at K or K-1 (the pair the pin embeds), bounding
-  // the walk to (idx - K)/2 steps instead of idx/2 on a mature chain. WS=0 with nothing verified yet ⇒
-  // genesis era (committee pinned, first two indices use the embedded genesis set).
+  // earlier session, the pin, or a root of the held capsule (walkRoot). WS=K roots this parity at K or K-1 (the pair
+  // the pin embeds), bounding the walk to (idx - K)/2 steps instead of idx/2 on a mature chain. WS=0 with nothing
+  // verified yet ⇒ genesis era (committee pinned, first two indices use the embedded genesis set).
   const k = WS_CHECKPOINT.index || 0;
   if (k > 0 && !wsPinIsWellformed()) {
     console.warn('[ERR][LIGHT] ws_pin_malformed index=' + k + ' — refusing to verify');
@@ -1178,12 +1290,16 @@ async function walkTo(idx, nodesProvider, hooks) {
   const depth = hooks && Number.isSafeInteger(hooks.prefetch) && hooks.prefetch >= 1 ? hooks.prefetch : WALK_PREFETCH;
   const byteBudget = hooks && Number.isSafeInteger(hooks.prefetchBytes) && hooks.prefetchBytes >= 1
     ? hooks.prefetchBytes : WALK_INFLIGHT_BYTES;
+  // The steps of this call: WALK_STEPS_PER_CALL, or fewer when the caller asks (hooks.maxSteps: a follow tick).
+  const budget = hooks && Number.isSafeInteger(hooks.maxSteps) && hooks.maxSteps >= 1
+    ? Math.min(hooks.maxSteps, WALK_STEPS_PER_CALL) : WALK_STEPS_PER_CALL;
   let largestSeen = 0;
-  // Two passes at most: the second only after the first found its root, an anchor kept from an earlier session, to be
-  // of another lineage, and rooted the walk lower instead (see below).
-  for (let pass = 0; pass < 2; pass++) {
+  // Three passes at most: a later one only after the one before found its root (anchors kept from an earlier session,
+  // or the capsule's root) to be of another lineage and rooted the walk lower instead (see below).
+  for (let pass = 0; pass < 3; pass++) {
     const root = walkRoot(idx);
     const resumed = root >= 0 && _resumeAnchors.has(root) && !_verifiedCache.has(root);
+    const capsuleRooted = root >= 0 && !resumed && !_verifiedCache.has(root) && capsuleEntry(root) !== undefined;
     const start = root >= 0
       ? root + 2
       : k > 0
@@ -1206,13 +1322,13 @@ async function walkTo(idx, nodesProvider, hooks) {
     for (let j = start; j <= idx; j += 2) {
       if (_verifiedCache.has(j)) continue;
       // The budget of this call is spent: what was verified is kept (hooks.onProgress), the next call goes on.
-      if (steps >= WALK_STEPS_PER_CALL) {
+      if (steps >= budget) {
         console.warn('[WARN][LIGHT] walk_budget_spent j=' + j + ' target=' + idx);
         return null;
       }
       // This step and the next ones, up to `depth`, never past this call's budget nor the walk's byte bound, are
       // fetched now; the step itself always is.
-      for (let s = j, n = 0, used = steps; s <= idx && n < depth && used < WALK_STEPS_PER_CALL; s += 2) {
+      for (let s = j, n = 0, used = steps; s <= idx && n < depth && used < budget; s += 2) {
         if (_verifiedCache.has(s)) continue;
         if (!ahead.has(s)) {
           const inFlight = held();
@@ -1237,14 +1353,19 @@ async function walkTo(idx, nodesProvider, hooks) {
       // anchor (its committee's signatures, its keys, its registry): the anchor is not this chain's lineage (a chain
       // that started again), and the walk would never get past it. The kept anchors go, the failures they caused are
       // forgotten, and the walk roots at the pin (or a lower anchor) at once. The pin and macroblocks verified in this
-      // session are never dropped, so at worst this costs a longer walk, never trust.
-      if (resumed && j === start && tally.refused >= LINEAGE_REFUSALS) {
-        console.warn('[WARN][LINEAGE] resume_anchor_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
-        _resumeAnchors.clear();
-        for (const key of [..._failedCache.keys()]) if (key.startsWith(j + '|')) _failedCache.delete(key);
-        if (hooks && typeof hooks.onLineageReset === 'function') {
-          try { hooks.onLineageReset(); } catch (_) { /* the walk goes on */ }
+      // session are never dropped, so at worst this costs a longer walk, never trust. A capsule whose root is refused
+      // the same way goes the same way (hooks.onCapsuleDropped); the kept anchors stay.
+      if ((resumed || capsuleRooted) && j === start && tally.refused >= LINEAGE_REFUSALS) {
+        if (resumed) {
+          console.warn('[WARN][LINEAGE] resume_anchor_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
+          _resumeAnchors.clear();
+          notify(hooks && hooks.onLineageReset);
+        } else {
+          console.warn('[WARN][GALC] capsule_root_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
+          dropCapsule();
+          notify(hooks && hooks.onCapsuleDropped);
         }
+        for (const key of [..._failedCache.keys()]) if (key.startsWith(j + '|')) _failedCache.delete(key);
         reset = true;
         break;
       }
@@ -1263,10 +1384,12 @@ async function walkTo(idx, nodesProvider, hooks) {
  * @param {string} stateRoot  hex state_root from the balance/reward proof
  * @param {number} blockHeight microblock height the proof was anchored at
  * @param {function} getRandomBootstrapNode () => base URL string, or the list of base URLs to try in order
- * @param {object} [hooks] { onNodeFailure(base, reason), onProgress(index), registryNodes(), onLineageReset(), prefetch }:
- *   a node whose answer failed a step; a lineage step verified (so the caller can keep the progress); the nodes registry
- *   snapshots are read from; the anchors kept from an earlier session were found to be of another lineage and dropped
- *   (so the caller can drop its stored copy); the proofs a walk keeps in flight (WALK_PREFETCH)
+ * @param {object} [hooks] { onNodeFailure(base, reason), onProgress(index), registryNodes(), onLineageReset(),
+ *   onCapsuleDropped(), prefetch, maxSteps }: a node whose answer failed a step; a lineage step verified (so the caller
+ *   can keep the progress); the nodes registry snapshots are read from; the anchors kept from an earlier session were
+ *   found to be of another lineage and dropped (so the caller can drop its stored copy); the held capsule was found to be
+ *   of another lineage than what the walk verified and dropped (likewise); the proofs a walk keeps in flight
+ *   (WALK_PREFETCH); the steps of one walk call (WALK_STEPS_PER_CALL at most)
  * @returns {Promise<boolean>} true ONLY if the state_root is QC-certified
  */
 export async function verifyMacroblockStateRoot(stateRoot, blockHeight, getRandomBootstrapNode, hooks = {}) {
@@ -1323,7 +1446,7 @@ export async function certifiedStateRootIndex(stateRoot, blockHeight, getRandomB
   const idx = Math.floor((blockHeight || 0) / MACROBLOCK_INTERVAL);
   const floor = trustFloorIndex();
   const candidates = [idx, idx - 1, idx - 2].filter((c) => c >= floor);
-  const matches = (c) => candidates.includes(c) && !!_verifiedCache.get(c) && _verifiedCache.get(c).stateRoot === stateRoot;
+  const matches = (c) => candidates.includes(c) && !!certifiedEntry(c) && certifiedEntry(c).stateRoot === stateRoot;
   const certified = (c) => {
     verifiedAt(c);
     console.log('[INFO][LIGHT] state_root_certified idx=' + c + ' tip=' + idx);
@@ -1345,7 +1468,7 @@ export async function certifiedStateRootIndex(stateRoot, blockHeight, getRandomB
     }
     if (candidates.includes(idx - 1)) await verifyMacroblockAt(idx - 1, getRandomBootstrapNode, hooks);
     if (matches(idx - 1)) return certified(idx - 1);
-    if (candidates.includes(idx - 2) && !_verifiedCache.has(idx - 2)) await verifyMacroblockAt(idx - 2, getRandomBootstrapNode, hooks);
+    if (candidates.includes(idx - 2) && !certifiedEntry(idx - 2)) await verifyMacroblockAt(idx - 2, getRandomBootstrapNode, hooks);
     if (matches(idx - 2)) return certified(idx - 2);
     return null;
   } catch (e) {
@@ -1405,7 +1528,9 @@ async function nodeFrontier(base) {
     }
     return top;
   }
-  if (got.limited) return null;
+  // The older route only for a node that answered (an HTTP error, another body): one that timed out or could not be
+  // reached would hold the head read for a second timeout.
+  if (got.limited || (got.error && !/^HTTP \d{3}$/.test(String(got.error.message)))) return null;
   const old = await nodeGet(base, '/api/v1/debug/consensus-position', HEAD_HINT_MAX_BYTES, HEAD_HINT_TIMEOUT_MS);
   return old.body && typeof old.body === 'object' ? frontierOf(old.body.last_sealed_mb_index) : null;
 }
@@ -1509,7 +1634,439 @@ export async function verifyMacroblockLogsRoot(logsRoot, windowEnd, getRandomBoo
   }
 }
 
-/** Drop the in-memory verified-proof cache (e.g. on network switch). */
+// ── GALC v2: a genesis-signed capsule as a walk root ────────────────────────
+// A capsule (docs/protocols/galc-capsule-v2.md) names macroblock K, a multiple of GALC_V2_MINT_INTERVAL, and the
+// checkpoint hashes of K and K-1, signed by at least quorum_size(5) = 4 of the embedded genesis consensus keys over a
+// preimage this device builds itself. Once those signatures verify and CAPSULE_ROOT_NODES nodes serve proofs of K and of
+// K-1 whose checkpoints hash to the signed values (with their epoch commitments), K and K-1 root walks as the pin does,
+// and their roots answer queries: a device far behind walks at most ceil(interval / 2) + 1 steps instead of from a pin
+// days old. It is a faster root, never a replacement of what this device verified: a walk of at most
+// OWN_ROOT_WALK_STEPS steps from this device's own anchor is taken instead (walkRoot), a capsule naming another
+// checkpoint than one verified here is refused (or dropped when the walk finds it), and the trust floor stays at the pin,
+// so log proofs below K keep verifying. Without a capsule (today's nodes answer 405) everything is as before.
+export const CAPSULE_VERSION = 2;
+const CAPSULE_DOMAIN = 'QNET_GENESIS_CHECKPOINT_v2';
+export const CAPSULE_PATH = '/api/v1/galc/capsule';
+export const CAPSULE_MAX_BYTES = 64 * 1024;
+// A kept capsule record (exportCapsule): the capsule and the parts of the proofs of K and K-1 that bind it.
+const CAPSULE_RECORD_MAX_BYTES = 1024 * 1024;
+// A node that answered no capsule (404, 405), an unusable one or one not newer than the held one, is not asked again for
+// this long: probing costs at most one request per node per TTL. A node that did not answer at all waits FAIL_TTL_MS.
+export const CAPSULE_MISS_TTL_MS = 10 * 60_000;
+// A walk from this device's own anchor of at most this many steps (about 16 s at today's speed) is taken even when the
+// capsule roots higher: the capsule shortens long walks, it never stands in for a lineage the device can still follow.
+export const OWN_ROOT_WALK_STEPS = 16;
+// Distinct nodes whose proofs of K, and of K-1, must hash to the capsule's checkpoint hashes; as many whose proofs hash
+// to other checkpoints drop it (no node is blamed).
+export const CAPSULE_ROOT_NODES = 2;
+
+// The held capsule: { index: K, cpA, wire, roots: { [j]: proof parts }, entries: { [j]: verified entry } } for j = K, K-1.
+// Not in the LRU, not dropped by the lineage reset of kept anchors; replaced only by a higher K; cleared by clearCapsule.
+let _capsule = null;
+let _capsuleRefused = null; // { index, cpA, at }: a capsule dropped for a conflict, not taken again within the TTL
+const _capsuleMiss = new Map(); // base -> until when it is not asked for a capsule
+let _capsuleRefresh = null;
+
+// The entry of a root of the held capsule, or undefined.
+function capsuleEntry(j) {
+  return _capsule && (j === _capsule.index || j === _capsule.index - 1) ? _capsule.entries[j] : undefined;
+}
+
+function dropCapsule() {
+  if (!_capsule) return;
+  _capsuleRefused = { index: _capsule.index, cpA: _capsule.cpA, at: Date.now() };
+  _capsule = null;
+}
+
+// Macroblock j verified here (or kept with its roots) as the checkpoint `cpHash`, while the held capsule names another
+// for it: the capsule is of another lineage than what this device verified and goes; the verified data stays.
+function capsuleConflicts(j, cpHash) {
+  const e = capsuleEntry(j);
+  if (!e || e.checkpointHash === cpHash) return false;
+  console.warn('[ERR][GALC] capsule_conflict j=' + j);
+  dropCapsule();
+  return true;
+}
+
+const capsuleRefusedNow = (c) => !!_capsuleRefused && _capsuleRefused.index === c.mb_index
+  && _capsuleRefused.cpA === c.cp_hash_anchor && Date.now() - _capsuleRefused.at < CAPSULE_MISS_TTL_MS;
+
+/** The text the genesis keys sign for a capsule (docs/protocols/galc-capsule-v2.md section 3). */
+export function capsulePreimage(c) {
+  return [CAPSULE_DOMAIN, c.version, c.network_id, c.mb_index, c.mb_hash, c.committee_digest_anchor,
+    c.committee_digest_pred, c.minted_at_height, c.cp_hash_anchor, c.cp_hash_pred].join(':');
+}
+
+const CAPSULE_HASHES = ['mb_hash', 'committee_digest_anchor', 'committee_digest_pred', 'cp_hash_anchor', 'cp_hash_pred'];
+
+/**
+ * Why a capsule is refused before any signature is checked, or null: 'shape', 'version', 'network_id', 'index' (below 2),
+ * 'interval' (not a multiple of GALC_V2_MINT_INTERVAL), 'minted_at_height' (not K*90), 'signature_count' (not 4 or 5
+ * entries), 'below_pin' (K at or below the pin) or 'above_head' (K more than 2 above `headHint`, the certified head; the
+ * check is left out when `headHint` is null, as for a kept capsule).
+ */
+export function capsuleProblem(c, headHint = null) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return 'shape';
+  if (c.version !== CAPSULE_VERSION) return 'version';
+  if (c.network_id !== NETWORK_ID) return 'network_id';
+  const k = c.mb_index;
+  if (!Number.isSafeInteger(k) || k < 2) return 'index';
+  if (k % GALC_V2_MINT_INTERVAL !== 0) return 'interval';
+  if (c.minted_at_height !== k * MACROBLOCK_INTERVAL) return 'minted_at_height';
+  if (!CAPSULE_HASHES.every((f) => HEX32.test(String(c[f])))) return 'shape';
+  const n = GENESIS_NODE_IDS.length;
+  if (!Array.isArray(c.sigs) || c.sigs.length < quorumSize(n) || c.sigs.length > n) return 'signature_count';
+  if (!c.sigs.every((s) => Array.isArray(s) && s.length === 2 && typeof s[0] === 'string' && typeof s[1] === 'string')) {
+    return 'shape';
+  }
+  if (k <= (WS_CHECKPOINT.index || 0)) return 'below_pin';
+  if (headHint !== null && headHint !== undefined && !(Number.isSafeInteger(headHint) && k <= headHint + 2)) return 'above_head';
+  return null;
+}
+
+// The node id a "dilithium_sig_<id>_<base64>" string names, or null.
+function sigNodeId(sig) {
+  if (typeof sig !== 'string' || !sig.startsWith('dilithium_sig_')) return null;
+  const part = sig.slice('dilithium_sig_'.length);
+  const sep = part.lastIndexOf('_');
+  return sep > 0 ? part.slice(0, sep) : null;
+}
+
+/**
+ * The genesis signatures of a capsule that passed capsuleProblem: { ok, valid: [ids] }. Each entry [id, signature]
+ * counts for an embedded genesis id only, when the id its signature string names is the same, and when its ML-DSA-65
+ * signature verifies over the preimage built here with that id's embedded key; an id counts once. ok with at least
+ * quorum_size(5) = 4 distinct ids.
+ */
+export async function verifyCapsuleSignatures(c) {
+  const need = quorumSize(GENESIS_NODE_IDS.length);
+  const message = capsulePreimage(c);
+  const valid = new Set();
+  for (const [gid, sig] of c.sigs) {
+    if (valid.size >= need) break;
+    if (valid.has(gid) || !Object.prototype.hasOwnProperty.call(GENESIS_CONSENSUS_PKS, gid) || sigNodeId(sig) !== gid) continue;
+    const detached = parseDilithiumSig(sig);
+    if (!detached) continue;
+    let ok = false;
+    try { ok = await verifyDilithium(message, detached, GENESIS_CONSENSUS_PKS[gid]); } catch (_) { ok = false; }
+    if (ok) valid.add(gid);
+  }
+  if (valid.size < need) console.warn('[WARN][GALC] capsule_signatures valid=' + valid.size + ' need=' + need);
+  return { ok: valid.size >= need, valid: [...valid] };
+}
+
+// The fields checkpointHash reads; a kept root carries these only, never what else a node put in its answer.
+const HASHED_CHECKPOINT_FIELDS = ['index', 'parent_qc', 'window_head_height', 'window_mb_hashes', ...CHECKPOINT_HASHES,
+  ...OPT_CHECKPOINT_HASHES, 'total_supply', 'timestamp', 'proposer', 'recovery_anchor'];
+
+function hashedCheckpointOf(cp) {
+  const out = {};
+  for (const k of HASHED_CHECKPOINT_FIELDS) if (cp[k] !== undefined) out[k] = cp[k];
+  if (cp.parent_qc) out.parent_qc = { checkpoint_hash: cp.parent_qc.checkpoint_hash, index: cp.parent_qc.index };
+  return out;
+}
+
+// The parts of a served proof of macroblock j that bind it to a capsule (a proof that passed proofShapeProblem).
+const rootPartsOf = (p) => ({
+  index: p.index, checkpoint: hashedCheckpointOf(p.checkpoint), eligible_raw: p.eligible_raw, committee: p.committee,
+  banned: p.banned || [],
+});
+
+// Whether `root` (rootPartsOf) is the checkpoint a capsule signed for macroblock j as `cpHash`: { entry } (its verified
+// entry), or { problem }: 'root_shape', 'root_index', 'cp_hash' (another checkpoint), 'recovery_anchor' (the signed
+// checkpoint carries one: refused as every node refuses it), 'epoch_commitment', 'eligible' (no eligible producers).
+function capsuleRootOf(j, root, cpHash) {
+  if (proofShapeProblem(root) || !isStringList(root.committee)) return { problem: 'root_shape' };
+  const cp = root.checkpoint;
+  if (root.index !== j || Math.floor((cp.window_head_height || 0) / MACROBLOCK_INTERVAL) !== j) return { problem: 'root_index' };
+  const hash = checkpointHash(cp);
+  if (hash !== cpHash) return { problem: 'cp_hash' };
+  if (cp.recovery_anchor) return { problem: 'recovery_anchor' };
+  if (!HEX32.test(String(cp.beacon)) || !HEX32.test(String(cp.registry_root))) return { problem: 'root_shape' };
+  const eligibleBytes = hexToBytes(root.eligible_raw || '');
+  if (epochCommitment(eligibleBytes, root.committee, root.banned || []) !== cp.epoch_commitment) return { problem: 'epoch_commitment' };
+  const ids = decodeEligibleNodeIds(eligibleBytes);
+  if (!ids.length) return { problem: 'eligible' };
+  return { entry: entryOf(cp, hash, ids) };
+}
+
+// The root parts of macroblock j from CAPSULE_ROOT_NODES distinct nodes of `nodes` whose proofs hash to `cpHash`
+// (asked two at a time, in order): { root, entry }; { conflict: true } once as many nodes' proofs of j hash to other
+// checkpoints; { problem } when the signed checkpoint itself is refused; else { unrooted: true } (too few answered).
+async function confirmCapsuleRoot(j, cpHash, nodes) {
+  const confirmed = [];
+  const others = new Set();
+  const queue = nodes.slice();
+  while (confirmed.length < CAPSULE_ROOT_NODES && queue.length > 0) {
+    const batch = queue.splice(0, CAPSULE_ROOT_NODES - confirmed.length);
+    const answers = await Promise.all(batch.map((base) => nodeGet(base, proofPath(j), PROOF_MAX_BYTES).then((got) => ({ base, got }))));
+    for (const { base, got } of answers) {
+      const p = got.body;
+      if (!p || typeof p !== 'object' || Array.isArray(p) || notCertifiedYet(p) || proofShapeProblem(p)) continue;
+      const parts = rootPartsOf(p);
+      const r = capsuleRootOf(j, parts, cpHash);
+      if (r.entry) confirmed.push({ root: parts, entry: r.entry });
+      else if (r.problem === 'cp_hash') others.add(base);
+      else if (r.problem === 'recovery_anchor') return { problem: r.problem };
+    }
+    if (others.size >= CAPSULE_ROOT_NODES) {
+      console.warn('[ERR][GALC] capsule_root_mismatch j=' + j + ' nodes=' + others.size);
+      return { conflict: true };
+    }
+  }
+  if (confirmed.length < CAPSULE_ROOT_NODES) return { unrooted: true };
+  return confirmed[0];
+}
+
+function adoptCapsule(c, roots, entries) {
+  const wire = {
+    version: c.version, network_id: c.network_id, mb_index: c.mb_index, mb_hash: c.mb_hash,
+    committee_digest_anchor: c.committee_digest_anchor, committee_digest_pred: c.committee_digest_pred,
+    minted_at_height: c.minted_at_height, cp_hash_anchor: c.cp_hash_anchor, cp_hash_pred: c.cp_hash_pred,
+    sigs: c.sigs.map(([gid, sig]) => [gid, sig]),
+  };
+  _capsule = { index: c.mb_index, cpA: c.cp_hash_anchor, wire, roots, entries };
+  console.log('[INFO][GALC] capsule_adopted k=' + c.mb_index);
+}
+
+// Why the capsule's K or K-1 conflicts with what this device verified (or kept with its roots), or null.
+function verifiedConflict(c) {
+  const want = { [c.mb_index]: c.cp_hash_anchor, [c.mb_index - 1]: c.cp_hash_pred };
+  for (const j of [c.mb_index, c.mb_index - 1]) {
+    const mine = _verifiedCache.get(j) || _resumeAnchors.get(j);
+    if (mine && mine.checkpointHash && mine.checkpointHash !== want[j]) return 'conflict';
+  }
+  return null;
+}
+
+// Roots a signed capsule from proofs of K and K-1 fetched from `nodes`, and holds it: { ok: true } or { ok: false,
+// reason: 'conflict' | 'recovery_anchor' | 'unrooted' | 'stale' }.
+async function rootCapsule(c, nodes) {
+  if (verifiedConflict(c)) return { ok: false, reason: 'conflict' };
+  const k = c.mb_index;
+  const want = { [k]: c.cp_hash_anchor, [k - 1]: c.cp_hash_pred };
+  const roots = {};
+  const entries = {};
+  for (const j of [k, k - 1]) {
+    const r = await confirmCapsuleRoot(j, want[j], nodes);
+    if (r.conflict) return { ok: false, reason: 'conflict' };
+    if (r.problem) return { ok: false, reason: r.problem };
+    if (!r.entry) return { ok: false, reason: 'unrooted' };
+    roots[j] = r.root;
+    entries[j] = r.entry;
+  }
+  if (_capsule && _capsule.index >= k) return { ok: false, reason: 'stale' }; // a higher one came meanwhile
+  if (verifiedConflict(c)) return { ok: false, reason: 'conflict' };
+  adoptCapsule(c, roots, entries);
+  return { ok: true };
+}
+
+function missCapsule(base, ms = CAPSULE_MISS_TTL_MS) {
+  _capsuleMiss.set(base, Date.now() + ms);
+}
+
+function capsuleMissed(base, now) {
+  const until = _capsuleMiss.get(base);
+  if (until === undefined) return false;
+  if (until <= now) { _capsuleMiss.delete(base); return false; }
+  return true;
+}
+
+// The wait a failed capsule read puts its node on: the TTL for "no capsule here" (404, 405) and an oversized answer,
+// FAIL_TTL_MS for a timeout, a server error or a dropped connection.
+const capsuleErrorWait = (e) => (/^HTTP 40[45]$/.test(String(e && e.message)) || (e && e.code === 'RESPONSE_TOO_LARGE')
+  ? CAPSULE_MISS_TTL_MS : FAIL_TTL_MS);
+
+// Whether the walk from this device's own data to the head, on either parity, is long enough for a capsule to help.
+const capsuleWanted = (head) => [head, head - 1].some((idx) => idx >= 1 && !certifiedEntry(idx) && stepsFrom(ownWalkRoot(idx), idx) > OWN_ROOT_WALK_STEPS);
+
+async function refreshCapsuleNow(nodesProvider, { headHint, proofNodes = null, force = false } = {}) {
+  const head = headHint === undefined ? await certifiedHeadHint(nodesProvider) : headHint;
+  if (!Number.isSafeInteger(head)) return { ok: false, reason: 'no_head' };
+  const held = _capsule ? _capsule.index : 0;
+  if (held > 0 && head < held + GALC_V2_MINT_INTERVAL) return { ok: false, reason: 'current' };
+  if (!force && !capsuleWanted(head)) return { ok: false, reason: 'not_needed' };
+  const now = Date.now();
+  const ask = nodesFrom(nodesProvider).filter((u) => !capsuleMissed(u, now) && readWait(u, now) === 0).slice(0, CAPSULE_ROOT_NODES);
+  if (ask.length === 0) return { ok: false, reason: 'no_capsule' };
+  const answers = await Promise.all(ask.map((base) => nodeGet(base, CAPSULE_PATH, CAPSULE_MAX_BYTES).then((got) => ({ base, got }))));
+  let reason = 'no_capsule';
+  const offers = [];
+  for (const { base, got } of answers) {
+    if (got.limited) continue;
+    if (got.error) {
+      missCapsule(base, capsuleErrorWait(got.error));
+      continue;
+    }
+    const problem = capsuleProblem(got.body, head);
+    if (problem) {
+      console.warn('[WARN][GALC] capsule_refused base=' + base + ' reason=' + problem);
+      missCapsule(base);
+      reason = 'invalid';
+      continue;
+    }
+    offers.push({ base, c: got.body });
+  }
+  // The highest offer that roots is taken: one that does not (its proofs not served yet, a conflict) leaves the next.
+  offers.sort((a, b) => b.c.mb_index - a.c.mb_index);
+  const seen = new Set();
+  let failed = null;
+  for (const { base, c } of offers) {
+    if (c.mb_index <= (_capsule ? _capsule.index : held)) {
+      missCapsule(base);
+      if (reason === 'no_capsule') reason = 'stale';
+      continue;
+    }
+    const id = c.mb_index + ':' + c.cp_hash_anchor + ':' + c.cp_hash_pred;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (capsuleRefusedNow(c)) {
+      missCapsule(base);
+      reason = 'conflict';
+      continue;
+    }
+    if (!(await verifyCapsuleSignatures(c)).ok) {
+      missCapsule(base);
+      reason = 'invalid';
+      continue;
+    }
+    const r = await rootCapsule(c, nodesFrom(proofNodes || nodesProvider));
+    if (r.ok) return { ok: true, index: c.mb_index };
+    if (r.reason === 'conflict' || r.reason === 'recovery_anchor') {
+      _capsuleRefused = { index: c.mb_index, cpA: c.cp_hash_anchor, at: Date.now() };
+      missCapsule(base);
+    }
+    if (failed === null) failed = r.reason === 'recovery_anchor' ? 'invalid' : r.reason;
+  }
+  return { ok: false, reason: failed ?? reason };
+}
+
+/**
+ * Asks up to CAPSULE_ROOT_NODES nodes of `nodesProvider` (the genesis names) at once for their capsule
+ * (GET /api/v1/galc/capsule) and holds the highest one that passes capsuleProblem and verifyCapsuleSignatures and roots
+ * at proofs of K and K-1 from `proofNodes` (default: the same nodes); one that does not root leaves the next. A node
+ * answering 404 or 405 (no route yet), an unusable capsule or none newer than the held one is not asked again for
+ * CAPSULE_MISS_TTL_MS; with no capsule the walks go on from the pin and the anchors exactly as before. One refresh runs
+ * at a time.
+ * `headHint`: the certified head (certifiedHeadHint is read when it is not given). `force`: ask even while the walk from
+ * this device's own anchors is short (at most OWN_ROOT_WALK_STEPS steps), when a capsule is not needed otherwise.
+ * @returns {Promise<{ ok: true, index: number } | { ok: false, reason: string }>} reasons: 'no_head', 'current' (no newer
+ *   capsule can exist yet), 'not_needed', 'no_capsule', 'stale', 'invalid', 'conflict' (the nodes' proofs, or what this
+ *   device verified, name other checkpoints), 'unrooted' (too few nodes served the proofs now)
+ */
+export function refreshCapsule(nodesProvider, opts = {}) {
+  if (_capsuleRefresh) return _capsuleRefresh;
+  const run = refreshCapsuleNow(nodesProvider, opts)
+    .catch((e) => {
+      console.warn('[ERR][GALC] refresh_threw err=' + (e && e.message));
+      return { ok: false, reason: 'unrooted' };
+    })
+    .finally(() => { if (_capsuleRefresh === run) _capsuleRefresh = null; });
+  _capsuleRefresh = run;
+  return run;
+}
+
+/** The K of the held capsule, or 0. */
+export function heldCapsuleIndex() {
+  return _capsule ? _capsule.index : 0;
+}
+
+/**
+ * The held capsule, for the caller to keep across sessions (no integrity protection is needed: importCapsule verifies it
+ * again): { capsule, roots: { [K]: proof parts, [K-1]: proof parts } }, or null.
+ */
+export function exportCapsule() {
+  return _capsule ? JSON.parse(JSON.stringify({ capsule: _capsule.wire, roots: _capsule.roots })) : null;
+}
+
+/**
+ * Holds a capsule kept by exportCapsule after verifying it again, with no network: capsuleProblem (but the head), the
+ * genesis signatures, and the kept proof parts of K and K-1 against the signed checkpoint hashes and epoch commitments.
+ * Refused when not above the held capsule or when it conflicts with what this device verified.
+ * @returns {Promise<{ ok: true, index: number } | { ok: false, reason: string }>}
+ */
+export async function importCapsule(record) {
+  try {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return { ok: false, reason: 'shape' };
+    if (JSON.stringify(record).length > CAPSULE_RECORD_MAX_BYTES) return { ok: false, reason: 'shape' };
+    const c = record.capsule;
+    const problem = capsuleProblem(c, null);
+    if (problem) return { ok: false, reason: problem };
+    if (JSON.stringify(c).length > CAPSULE_MAX_BYTES) return { ok: false, reason: 'shape' };
+    const k = c.mb_index;
+    if (_capsule && k <= _capsule.index) return { ok: false, reason: 'stale' };
+    if (capsuleRefusedNow(c) || verifiedConflict(c)) return { ok: false, reason: 'conflict' };
+    const want = { [k]: c.cp_hash_anchor, [k - 1]: c.cp_hash_pred };
+    const kept = record.roots && typeof record.roots === 'object' ? record.roots : {};
+    const roots = {};
+    const entries = {};
+    for (const j of [k, k - 1]) {
+      const parts = kept[j];
+      const r = parts && typeof parts === 'object' ? capsuleRootOf(j, parts, want[j]) : { problem: 'root_shape' };
+      if (!r.entry) return { ok: false, reason: r.problem };
+      roots[j] = JSON.parse(JSON.stringify(rootPartsOf(parts)));
+      entries[j] = r.entry;
+    }
+    if (!(await verifyCapsuleSignatures(c)).ok) return { ok: false, reason: 'signatures' };
+    if (_capsule && k <= _capsule.index) return { ok: false, reason: 'stale' };
+    adoptCapsule(c, roots, entries);
+    return { ok: true, index: k };
+  } catch (e) {
+    console.warn('[WARN][GALC] import_threw err=' + (e && e.message));
+    return { ok: false, reason: 'shape' };
+  }
+}
+
+/** Forgets the held capsule (the chain went back: another chain), and which nodes had none. */
+export function clearCapsule() {
+  _capsule = null;
+  _capsuleRefused = null;
+  _capsuleMiss.clear();
+}
+
+// ── follow: a wallet's tick keeps a verified checkpoint at the head ─────────
+/**
+ * One tick of a wallet's follow (a foreground timer, an extension alarm): the certified head as `headNodes` report it
+ * (certifiedHeadHint, default `nodesProvider`), then one walk call toward it on its parity, of at most `maxSteps` steps
+ * (1 by default, WALK_STEPS_PER_CALL at most), from the nodes `nodesProvider` names. While that walk is longer than
+ * OWN_ROOT_WALK_STEPS, the capsule is refreshed first (refreshCapsule, from `headNodes`), unless `capsule` is false.
+ * `both`: the newest macroblock of the other parity (head - 1) too, as after the wallet's own send. `hooks` as for
+ * verifyMacroblockStateRoot.
+ * @returns {Promise<{ ok: true, head: number, verified: boolean, stepsLeft: number,
+ *   targets: Array<{ index: number, verified: boolean, stepsLeft: number }>, capsule: object|null }
+ *   | { ok: false, reason: 'no_head' }>} `verified`: every target's roots are held now; `stepsLeft`: the most steps a target
+ *   still takes (stepsToVerify; Infinity when it cannot be walked to); `capsule`: refreshCapsule's answer, null when not asked
+ */
+export async function followStep(nodesProvider, { headNodes = null, hooks = {}, maxSteps = 1, both = false, capsule = true } = {}) {
+  const heads = headNodes || nodesProvider;
+  const head = await certifiedHeadHint(heads);
+  if (!Number.isSafeInteger(head) || head < 1) return { ok: false, reason: 'no_head' };
+  const floor = trustFloorIndex();
+  const indices = (both ? [head, head - 1] : [head]).filter((t) => t >= floor);
+  let refreshed = null;
+  if (capsule && indices.some((t) => stepsToVerify(t) > OWN_ROOT_WALK_STEPS)) {
+    refreshed = await refreshCapsule(heads, { headHint: head, proofNodes: nodesProvider });
+  }
+  const walkHooks = { ...(hooks || {}), maxSteps };
+  const targets = [];
+  for (const index of indices) {
+    try {
+      await verifyMacroblockAt(index, nodesProvider, walkHooks);
+    } catch (e) {
+      console.warn('[ERR][LIGHT] follow_threw err=' + (e && e.message));
+    }
+    targets.push({ index, verified: !!certifiedEntry(index), stepsLeft: stepsToVerify(index) });
+  }
+  const stepsLeft = targets.length > 0 ? Math.max(...targets.map((t) => t.stepsLeft)) : Infinity;
+  return {
+    ok: true, head, verified: targets.length > 0 && targets.every((t) => t.verified), stepsLeft, targets, capsule: refreshed,
+  };
+}
+
+/**
+ * Drop the in-memory verified-proof cache (e.g. on network switch). The held capsule stays (clearCapsule forgets it): it
+ * is bound to this build's network and checked against everything verified later.
+ */
 export function clearQcCache() {
   _verifiedCache.clear();
   // Both, or a network switch would keep refusing the walk on the OLD network's failures.
@@ -1524,6 +2081,8 @@ export function clearQcCache() {
   _headHint = null;
   _headHintMissAt = 0;
   _headHintRead = null;
+  _capsuleMiss.clear();
+  _capsuleRefresh = null;
 }
 
 /*

@@ -2,8 +2,8 @@ import { query } from '../../../../../../../lib/db';
 import { createEpochArchive } from '@/server/cabinet/epoch-archive';
 import { nodeProxy } from '@/server/cabinet/node-proxy';
 
-// The node cabinet: a light node's epochs one by one, counted or not, with the explorer archive's dates and moves to
-// the wallet (src/server/cabinet/node-proxy.ts, epoch-archive.ts).
+// The node cabinet: a light or a super node's epochs one by one, a page at a time, counted or not, with the explorer
+// archive's dates and moves to the wallet (src/server/cabinet/node-proxy.ts, epoch-archive.ts).
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 

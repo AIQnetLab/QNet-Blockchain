@@ -45,6 +45,9 @@ async function eonOf(publicKey) {
 
 test('the vectors carry the revision 2 constants the cabinet relies on', () => {
   assert.equal(C.prefix, 'https://link.aiqnet.io/l#v1.');
+  // The vectors keep revision 2's earlier `claim` request, which named no node, shared with QNet Wallet's tests; the
+  // cabinet's `claim` request names the node (node-claim.vectors.json) and its relay refuses the earlier one
+  // (qnet-link.test.mjs).
   assert.deepEqual(C.intents, ['connect', 'link', 'claim', 'reserve', 'unlink']);
   assert.equal(C.androidPackage, 'io.aiqnet.wallet');
   assert.equal(C.sessionBodyMaxBytes, 2048);

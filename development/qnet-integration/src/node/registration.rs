@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Who may earn the super share of a finalized epoch: the one membership decision for super rewards, built by
+/// `BlockchainNode::super_reward_admission`. Asked by the settle writer of super_elig_{N} and the status routes,
+/// never by the claim path. Earned membership adds its arm here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SuperRewardAdmission {
+    /// No membership rule governs the epoch: every qualifying super earns (the rule below the gate).
+    Open,
+    /// The emergency allowlist, asked at the epoch's first block.
+    Allowlist { at: u64 },
+}
+
+impl SuperRewardAdmission {
+    pub(crate) fn admits(&self, node_id: &str) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Allowlist { at } => !crate::genesis_constants::allowlist_excludes(node_id, *at),
+        }
+    }
+}
+
 impl BlockchainNode {
     /// Create NodeRegistration transaction for on-chain binding
     /// This TX is included in blocks and visible to all nodes
@@ -203,6 +223,43 @@ impl BlockchainNode {
 
         println!("[INFO][REACTIVATION] signed dilithium3={} node={}",
             tx.dilithium_signature.is_some(), node_id);
+    }
+
+    /// Build, sign with this node's consensus key, admit and broadcast a NodeReactivation for this node:
+    /// the one path the operator route and the automatic endpoint commit (node/public_rpc.rs) share, so
+    /// both produce the same transaction. Ok(tx hash); Err(the reason, as the route answers it).
+    pub(crate) async fn submit_self_reactivation(
+        &self,
+        node_id: &str,
+        current_height: u64,
+        last_macroblock_hash: &str,
+        last_macroblock_index: u64,
+        api_endpoint: &str,
+    ) -> Result<String, String> {
+        // The block-validity check's own validator, so a bad address is refused here instead of being
+        // signed, gossiped and rejected network-wide.
+        qnet_state::transaction::validate_public_api_endpoint(api_endpoint)?;
+        let mut react_tx = Self::create_node_reactivation_tx(
+            node_id, current_height, last_macroblock_hash, last_macroblock_index, api_endpoint);
+        // Pure ML-DSA-65: the node's registered post-quantum identity key.
+        let wallet_identity = self.get_wallet_identity();
+        Self::sign_reactivation_tx(&mut react_tx, node_id, wallet_identity.as_deref());
+        let tx_hash = react_tx.hash.clone();
+        let tx_bytes = bincode::serialize(&react_tx).unwrap_or_default();
+        let state = self.get_state_manager();
+        super::refuse_held_commitment(&state, &react_tx).await?;
+        if !self.get_mempool().add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), react_tx.gas_price) {
+            return Err("Failed to add TX to mempool (duplicate or mempool full)".to_string());
+        }
+        if is_info() {
+            println!("[INFO][NODE-REACTIVATION] tx_added node={} h={} mb={} hash={}",
+                     node_id, current_height, last_macroblock_index, qnet_state::char_prefix(&tx_hash, 16));
+        }
+        // Broadcast to all peers for fast inclusion.
+        if let Some(p2p) = self.get_unified_p2p() {
+            let _ = p2p.broadcast_transaction(tx_bytes);
+        }
+        Ok(tx_hash)
     }
 
     /// v12.0: Get consensus hash of macroblock from storage.
@@ -988,9 +1045,36 @@ impl BlockchainNode {
             .map(|e| (finalized_epoch, e))
     }
 
-    /// The popcount>=9 super set for a FINALIZED epoch, read from committed account tallies. Valid at
-    /// any height inside epoch `finalized_epoch + 1`: the account keeps the finalized epoch's count
-    /// until the next roll, which is what lets a snapshot-joined node reproduce the row it never saw.
+    /// The admitted set governing the super share of `finalized_epoch`. Both gates are read at the epoch's first
+    /// block, never at the height asking, so the producer, replicas and a snapshot joiner deriving anywhere inside
+    /// the next epoch get one answer.
+    /// Total on purpose: there is no abstain here. A node with no answer would file no super_elig_{N} rows, and
+    /// gather_epoch_reward_sets reads an empty index on a from-genesis node as "no super cleared the bar", a root
+    /// every peer rejects. So an arm may use only what every node holds at the settle point: a compiled list keyed
+    /// on height, or committed rows bounded by it. Earned membership adds its arm here; if its read can fail, it
+    /// first needs an explicit "cannot reproduce" marker that the settle writer files and gather abstains on.
+    pub(crate) fn super_reward_admission(_storage: &crate::storage::Storage, finalized_epoch: u64) -> SuperRewardAdmission {
+        let epoch_start = finalized_epoch.saturating_mul(14_400);
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::SUPER_REWARD_ADMISSION, epoch_start) {
+            return SuperRewardAdmission::Open;
+        }
+        SuperRewardAdmission::Allowlist { at: epoch_start }
+    }
+
+    /// A super's reward admission for `epoch`, as the status routes report it: "not_required" when no membership
+    /// rule governs the epoch, else "admitted" or "waiting". Display only.
+    pub(crate) fn super_admission_label(storage: &crate::storage::Storage, node_id: &str, epoch: u64) -> &'static str {
+        match Self::super_reward_admission(storage, epoch) {
+            SuperRewardAdmission::Open => "not_required",
+            a if a.admits(node_id) => "admitted",
+            _ => "waiting",
+        }
+    }
+
+    /// The popcount>=9 super set for a FINALIZED epoch, read from committed account tallies, within the
+    /// epoch's admitted set (super_reward_admission). Valid at any height inside epoch `finalized_epoch + 1`:
+    /// the account keeps the finalized epoch's count until the next roll, which is what lets a snapshot-joined
+    /// node reproduce the row it never saw.
     pub(crate) fn compute_super_eligible_for_epoch(
         state_guard: &StateManager,
         storage: &crate::storage::Storage,
@@ -1000,13 +1084,18 @@ impl BlockchainNode {
         // which are committed in reward_root, so it must not include a registration applied after the
         // epoch it is settling. Registrations land at most at the settle height of epoch+1.
         let settle_end = (finalized_epoch + 1) * 14_400 + HB_ANCHOR_MAX_LAG;
+        // The only place reward membership is decided: every reader takes the rows filed here.
+        let admission = Self::super_reward_admission(storage, finalized_epoch);
         let supers = match storage.super_registrations_as_of(settle_end) { Ok(s) => s, Err(_) => return None };
         let mut eligible: Vec<String> = Vec::new();
+        let mut not_admitted = 0usize;
         // Resident supers: read the committed tally from RAM (authoritative). Evicted (inactive) ones:
         // collect for ONE batched disk read below — avoids N sequential cold reads stalling the
         // boundary block at scale. That read is the raw mirror: the leaf gate of warm_* does not cover it.
         let mut evicted: Vec<String> = Vec::new();
         for (node_id, _wallet) in &supers {
+            // Outside the admitted set: no share, and no account read.
+            if !admission.admits(node_id) { not_admitted += 1; continue; }
             match state_guard.accounts.get(node_id) {
                 Some(acct) => {
                     // A banned identity earns nothing. The ban is read from ACCOUNT state — which the
@@ -1030,6 +1119,9 @@ impl BlockchainNode {
                     }
                 }
             }
+        }
+        if not_admitted > 0 && is_info() {
+            println!("[INFO][REWARDS] super_elig_not_admitted epoch={} count={}", finalized_epoch, not_admitted);
         }
         Some(eligible)
     }

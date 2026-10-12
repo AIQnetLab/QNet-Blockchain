@@ -190,9 +190,18 @@ pub const FAILOVER_TENURE_BOUND_GATE_HEIGHT: u64 = 3_657_600;
 /// 38948.
 /// Registration follows the committee: the burn attestation quorum, the attestor check, the arm quorum and the
 /// registration door's committee lane all resolve committee_for_height. So from window 38951 only the six
-/// attest, 5 of 6. The registry and the reward roster do not consult this rule. Once any node has crossed this
-/// height, it never changes.
+/// attest, 5 of 6. The registry does not consult this rule; from SUPER_REWARD_ADMISSION_GATE_HEIGHT the super
+/// reward roster does (super_reward_admission). Once any node has crossed this height, it never changes.
 pub const EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT: u64 = 3_505_410;
+
+/// From the epoch whose first block is this height a super earns an epoch's operator share only when it is in that
+/// epoch's consensus-admitted set (`super_reward_admission`): today EMERGENCY_COMMITTEE_ALLOWLIST, later earned
+/// membership. Asked at the epoch's first block by the settle writer of super_elig_{N}, so producer, replicas and
+/// snapshot joiners file one set; the claim path never asks it, so earned rewards stay claimable. Below it every
+/// qualifying super earns and stored rows replay unchanged. A consensus rule (the set feeds reward_root): every node
+/// must run the binary before this epoch settles. Provisional: epoch 254, the height of the three gates above, until
+/// scripts/gate-height.sh sets it at push time; once any node has crossed it, the height never changes.
+pub const SUPER_REWARD_ADMISSION_GATE_HEIGHT: u64 = 3_657_600;
 
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
@@ -221,6 +230,7 @@ pub mod id {
     pub const WALLET_ONE_NODE: &str = "wallet_one_node";
     pub const FAILOVER_TENURE_BOUND: &str = "failover_tenure_bound";
     pub const EMERGENCY_COMMITTEE_ALLOWLIST: &str = "emergency_committee_allowlist";
+    pub const SUPER_REWARD_ADMISSION: &str = "super_reward_admission";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -249,6 +259,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::WALLET_ONE_NODE, WALLET_ONE_NODE_GATE_HEIGHT),
     (id::FAILOVER_TENURE_BOUND, FAILOVER_TENURE_BOUND_GATE_HEIGHT),
     (id::EMERGENCY_COMMITTEE_ALLOWLIST, EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT),
+    (id::SUPER_REWARD_ADMISSION, SUPER_REWARD_ADMISSION_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -315,7 +326,7 @@ mod tests {
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
             LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR, CONTRACT_GAS_SIGNED,
             MICROBLOCK_SIG_RAW, TX_TARGET_BOUND, WALLET_ONE_NODE, FAILOVER_TENURE_BOUND,
-            EMERGENCY_COMMITTEE_ALLOWLIST,
+            EMERGENCY_COMMITTEE_ALLOWLIST, SUPER_REWARD_ADMISSION,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),
@@ -406,6 +417,20 @@ mod tests {
         assert!(!super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, h - 1), "old rule below");
         assert!(super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, h), "allowlist from the gate");
         assert!(super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, u64::MAX));
+    }
+
+    /// The reward admission rule is asked at an epoch's first block, so only an epoch boundary keeps every epoch on one
+    /// rule. It sits above the allowlist gate, so the allowlist is active at every gated epoch start.
+    #[test]
+    fn super_reward_admission_is_epoch_aligned_above_the_allowlist() {
+        let h = super::SUPER_REWARD_ADMISSION_GATE_HEIGHT;
+        assert_eq!(h % 14_400, 0, "an epoch boundary");
+        assert!(h > super::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT, "the allowlist governs every gated epoch");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(h < i64::MAX as u64, "shell arithmetic in the roll script holds it");
+        assert!(!super::is_active(super::id::SUPER_REWARD_ADMISSION, h - 1), "old rule below");
+        assert!(super::is_active(super::id::SUPER_REWARD_ADMISSION, h), "admitted set from the gate");
+        assert!(super::is_active(super::id::SUPER_REWARD_ADMISSION, u64::MAX));
     }
 
     /// NodeActivation, the other way a wallet gained a super identity, is refused from tx_target_bound. Were

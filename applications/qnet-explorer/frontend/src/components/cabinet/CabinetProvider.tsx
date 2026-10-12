@@ -4,7 +4,7 @@
 // it (src/lib/cabinet/wallet-choice.ts). Remembered in this browser only, until Disconnect; nothing goes into a URL.
 // With no wallet chosen, the QNet extension's wallet is taken up by itself once the extension's silent qnet_accounts
 // shows it approved this site, unless Disconnect was the last word here (extensionReconnect).
-// Also whether the cabinet sends QNet Wallet its `link` and `claim` requests yet (src/server/phone-flows.ts, read by
+// Also whether the cabinet sends QNet Wallet its `link`, `reserve`, `unlink` and `claim` requests yet (src/server/phone-flows.ts, read by
 // the layout), the activation the QNet extension reported here for a wallet (src/lib/cabinet/kept-activation.ts), and
 // where the wallet's activation stands from every source (src/lib/cabinet/wallet-activation.ts, unified plan R1 and R6):
 // the network (its node of either type), the server's activation record with the search of the wallet's own Solana
@@ -35,7 +35,7 @@ interface CabinetValue {
   walletHash: string | null;
   // An address typed on the page: shown, never acted for.
   viewOnly: boolean;
-  // The site's CABINET_PHONE_FLOWS: `link` and `claim` requests to QNet Wallet are offered.
+  // The site's CABINET_PHONE_FLOWS: `link`, `reserve`, `unlink` and `claim` requests to QNet Wallet are offered.
   phoneFlows: boolean;
   // The activation the QNet extension reported in this browser for the shown wallet, or null.
   activation: KeptActivation | null;

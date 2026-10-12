@@ -113,7 +113,7 @@ export default function TestnetPage() {
     <div className="page-testnet">
       <section className="explorer-section" data-section="testnet">
         <div className="explorer-header">
-          <h2 className="section-title">QNet Testnet</h2>
+          <h2 className="section-title">QNet Blockchain testnet</h2>
           <p className="section-subtitle">
             Test network for development and experimentation
           </p>
@@ -124,7 +124,7 @@ export default function TestnetPage() {
             <div className="card-header" style={{ marginBottom: '2rem', textAlign: 'center', flexDirection: 'column', alignItems: 'center' }}>
               <h3 style={{ fontSize: '1.8rem', marginBottom: '1rem' }}>Token Faucet</h3>
               <div className="faucet-heading" style={{ fontSize: '1.1rem', color: '#e5e5e5', lineHeight: '1.5' }}>
-                Get 1,500 1DEV tokens + {FAUCET_SOL} SOL for QNet node activation testing
+                Get 1,500 1DEV tokens + {FAUCET_SOL} SOL to test node activation on QNet Blockchain testnet
               </div>
             </div>
 

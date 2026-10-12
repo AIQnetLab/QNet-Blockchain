@@ -11,6 +11,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Keyboard, KeyboardAvoidingView, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import styles from './WalletScreen.styles';
 import { ScanIcon } from '../components/QrScanSheet';
+import { InfoRow } from '../components/InfoRow';
 import { looksLikeKnownAddress } from '../browser/DappSheet';
 import { errorText } from '../i18n';
 import { decodeKey, fromBaseUnits, toBaseUnits, SOL_DECIMALS } from '../crypto/SolanaTx';
@@ -53,7 +54,7 @@ export async function runSolanaSend({
     fee: solText(fee),
     account: q.createDestination ? solText(rent) : null,
     memo: q.memo,
-    total: q.mint ? `${q.amountText} ${q.symbol} + ${solText(fee + rent)}` : solText(BigInt(q.amountBase) + fee),
+    total: q.mint ? [`${q.amountText} ${q.symbol}`, `+ ${solText(fee + rent)}`] : solText(BigInt(q.amountBase) + fee),
     warnings,
   });
   if (!reviewed) return { outcome: 'cancelled' };
@@ -161,8 +162,9 @@ export default function SolanaSendForm({
 
   let amountBase = null;
   try { amountBase = amount ? toBaseUnits(amount, token.decimals) : null; } catch (_) { amountBase = null; }
+  // A token's total in two currencies: a line for each (components/InfoRow).
   const total = amountBase === null ? null
-    : (token.mint ? `${fromBaseUnits(amountBase, token.decimals)} ${token.symbol} + ${solText(BASE_FEE_LAMPORTS)}`
+    : (token.mint ? [`${fromBaseUnits(amountBase, token.decimals)} ${token.symbol}`, `+ ${solText(BASE_FEE_LAMPORTS)}`]
       : solText(amountBase + BASE_FEE_LAMPORTS));
 
   const setMax = async () => {
@@ -226,9 +228,16 @@ export default function SolanaSendForm({
           ))}
         </View>
 
+        {/* The balance beside its label, as every figure (components/InfoRow). */}
         <View style={styles.sendBalanceInfo}>
-          <Text style={styles.sendBalanceLabel}>{t('send_available')}</Text>
-          <Text style={styles.sendBalanceAmount}>{mask(balance === null || balance === undefined ? '—' : String(balance))} {token.symbol}</Text>
+          <InfoRow
+            label={t('send_available')}
+            value={`${mask(balance === null || balance === undefined ? '—' : String(balance))} ${token.symbol}`}
+            tone="accent"
+            ltr
+            fit
+            divider={false}
+          />
         </View>
 
         {/* The recipient; the scan icon at the field's end reads a Solana address or a payment request from a QR code. */}
@@ -277,18 +286,11 @@ export default function SolanaSendForm({
           </View>
         </View>
 
-        {/* The fee of a one-signature transfer; the review shows the exact one the network charges. */}
-        <View style={styles.sendFeeContainer}>
-          <Text style={styles.sendFeeLabel}>{t('send_network_fee')}</Text>
-          <Text style={styles.sendFeeValue}>{solText(BASE_FEE_LAMPORTS)}</Text>
+        {/* The fee of a one-signature transfer (the review shows the exact one the network charges), and the total. */}
+        <View style={styles.sendFigures}>
+          <InfoRow label={t('send_network_fee')} value={solText(BASE_FEE_LAMPORTS)} ltr fit />
+          {total ? <InfoRow label={t('send_total')} value={total} ltr fit total /> : null}
         </View>
-
-        {total ? (
-          <View style={styles.sendTotalContainer}>
-            <Text style={styles.sendTotalLabel}>{t('send_total')}</Text>
-            <Text style={styles.sendTotalValue}>{total}</Text>
-          </View>
-        ) : null}
 
         <TouchableOpacity
           style={[styles.button, (!address || !amount || busy) && styles.buttonDisabled]}

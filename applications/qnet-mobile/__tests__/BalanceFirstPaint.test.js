@@ -2,7 +2,9 @@
  * The owner's 06.10 question "can balances load faster?", on the real wallet screen: the last verified figures show the
  * moment the wallet opens, with no line under them while this session's first read runs; each figure lands as
  * soon as its own source answers (QNC as soon as its proof folded, before the lineage walk); one read serves the unlock
- * and the Assets tab; a figure nobody read is a dash, never 0; a first read that finds nothing says so.
+ * and the Assets tab; a figure nobody read is a dash, and a wallet with nothing in it shows 0; the line under the figures
+ * never flashes with the reads (owner, 11.10): it comes after reads failed for a sustained time, or says the network
+ * stopped certifying.
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
@@ -49,6 +51,8 @@ jest.mock('../src/components/WalletManager', () => {
     async saveBalanceSnapshot(s) { mockState.saved.push(s); return true; }
     getBalance() { mockState.calls.sol += 1; return mockState.gate('sol'); }
     getTokenBalance() { mockState.calls.oneDev += 1; return mockState.gate('oneDev'); }
+    // Whether the network stopped certifying (WalletManager.networkPause): what the test says.
+    async networkPause() { return mockState.pause; }
     getQNCBalanceWithProof(addr, verify, opts) {
       mockState.calls.qnc += 1;
       mockState.onFigure = opts && opts.onFigure;
@@ -161,6 +165,7 @@ beforeEach(async () => {
   resolvers = { sol: [], oneDev: [], qnc: [] };
   Object.assign(mockState, {
     snapshot: null,
+    pause: null,
     saved: [],
     calls: { sol: 0, oneDev: 0, qnc: 0 },
     onFigure: null,
@@ -211,21 +216,130 @@ it('an unverified lower figure does not lower the kept verified one', async () =
   expect(mockState.saved).toHaveLength(0); // nothing a proof did not certify is kept
 });
 
-it('with nothing kept, a figure nobody read is a dash; a first read that finds nothing says so', async () => {
+// One read of every source, each answered: the read is over, so the next call starts a new one.
+const pullOf = (tree) => tree.root.findAll((n) => n.props.refreshControl && n.props.refreshControl.props
+  && typeof n.props.refreshControl.props.onRefresh === 'function')[0].props.refreshControl.props.onRefresh;
+const readOnce = async (tree, qnc, { pull = true } = {}) => {
+  if (pull) { await act(async () => { pullOf(tree)(); }); await flush(2); }
+  await answer('sol', 0.5);
+  await answer('oneDev', 4);
+  await answer('qnc', qnc);
+};
+const FAILED = { ok: false, balance: null, verified: false, reason: 'unanswered' };
+
+it('with nothing kept, a figure nobody read is a dash, and one read that finds nothing says nothing yet', async () => {
   const tree = await unlocked();
   expect(qncFigure(tree)).toBe('—');
   expect(statusLine(tree)).toBeNull();
-  await answer('qnc', { ok: false, balance: null, verified: false });
+  await answer('qnc', FAILED);
   expect(qncFigure(tree)).toBe('—');
-  expect(statusLine(tree)).toBe(t('balance_unavailable'));
+  expect(statusLine(tree)).toBeNull();
 });
 
-it('kept figures and a first read that finds nothing: the figures stay, with when they were read', async () => {
-  mockState.snapshot = SNAP;
+// Owner, 11.10: a wallet with nothing in it shows 0, never a dash, as soon as a folded 0 comes (WalletManager now
+// gives it: CertifiedProofs.test.js), with no line, verified or not.
+it('a wallet with nothing in it shows 0 as soon as its folded 0 comes, with no line', async () => {
   const tree = await unlocked();
-  await answer('qnc', { ok: false, balance: null, verified: false });
-  expect(qncFigure(tree)).toBe('12.5');
-  expect(statusLine(tree)).toBe(t('balance_stale', { time: dateTime(SNAP.at) }));
+  await act(async () => { mockState.onFigure({ balance: 0, balanceNano: '0', nonce: '0', blockHeight: 9090, folded: true, figureClaimedEpoch: 0 }); });
+  await flush(2);
+  expect(qncFigure(tree)).toBe('0');
+  expect(statusLine(tree)).toBeNull();
+  await answer('qnc', { ok: true, balance: 0, balanceNano: '0', verified: false, blockHeight: 9090, exists: false, reason: 'unconfirmed' });
+  expect(qncFigure(tree)).toBe('0');
+  expect(statusLine(tree)).toBeNull();
+});
+
+// Owner, 11.10: the "Not updated" line never flashes. Before, it went with every read that started and came back with
+// every one that found nothing (a wallet whose reads kept failing saw it blink at each read); now it comes only after
+// two failures in a row over two minutes at least, stays through the reads that follow, and goes with the first that
+// lands.
+describe('the line under the figures, over reads that keep failing', () => {
+  const clock = { offset: 0 };
+  let nowSpy;
+  beforeEach(async () => {
+    clock.offset = 0;
+    const real = Date.now.bind(Date);
+    nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => real() + clock.offset);
+    // The clock jumps minutes ahead here: the wallet must not lock itself meanwhile.
+    await AsyncStorage.setItem('qnet_autolock_time', 'never');
+  });
+  afterEach(() => { nowSpy.mockRestore(); });
+
+  it('comes only after two failures over two minutes, stays while reads start and fail, and goes with the first that lands', async () => {
+    mockState.snapshot = SNAP;
+    const tree = await unlocked();
+    const seen = [];
+    const look = () => { seen.push(statusLine(tree)); return seen[seen.length - 1]; };
+    await readOnce(tree, FAILED, { pull: false });
+    expect(look()).toBeNull(); // one failure
+    await act(async () => { pullOf(tree)(); });
+    await flush(2);
+    expect(look()).toBeNull(); // a read that starts says nothing
+    await readOnce(tree, FAILED, { pull: false });
+    expect(look()).toBeNull(); // two in a row, but not two minutes yet
+    clock.offset = 2 * 60_000 + 1000;
+    await readOnce(tree, FAILED);
+    const stale = t('balance_stale', { time: dateTime(SNAP.at) });
+    expect(look()).toBe(stale);
+    expect(qncFigure(tree)).toBe('12.5'); // the kept figures stay under it
+    // Steady: a read that starts, and one more that fails, change nothing.
+    await act(async () => { pullOf(tree)(); });
+    await flush(2);
+    expect(look()).toBe(stale);
+    await readOnce(tree, FAILED, { pull: false });
+    expect(look()).toBe(stale);
+    // The first read that lands takes it away, a 0 not verified as well as any other figure.
+    await readOnce(tree, { ok: true, balance: 0, balanceNano: '0', verified: false, blockHeight: 9180, reason: 'unconfirmed' });
+    expect(look()).toBeNull();
+    // Over the whole run the line came once and went once: it never blinked.
+    const changes = seen.filter((v, i) => i > 0 && v !== seen[i - 1]).length;
+    expect(changes).toBe(2);
+  });
+
+  it('with nothing kept, the sustained failure says the figures could not be read', async () => {
+    const tree = await unlocked();
+    await readOnce(tree, FAILED, { pull: false });
+    clock.offset = 2 * 60_000 + 1000;
+    await readOnce(tree, FAILED);
+    expect(statusLine(tree)).toBe(t('balance_unavailable'));
+    expect(qncFigure(tree)).toBe('—');
+  });
+
+});
+
+// Owner, 11.10: when the network itself stopped certifying, the line says so with the time of its last certified state,
+// steadily, whatever the reads give; it goes once the certified head moves again.
+it('a network that stopped certifying: one steady line with the time of its last certified state', async () => {
+  const since = Date.UTC(2026, 9, 10, 19, 23);
+  mockState.pause = { index: 38948, since };
+  const tree = await unlocked();
+  await readOnce(tree, { ok: true, balance: 2, balanceNano: '2000000000', verified: true, blockHeight: 3505320 }, { pull: false });
+  const paused = t('balance_network_paused', { time: dateTime(since) });
+  expect(statusLine(tree)).toBe(paused);
+  expect(qncFigure(tree)).toBe('2');
+  await readOnce(tree, FAILED);
+  expect(statusLine(tree)).toBe(paused);
+  // A head that cannot be read now keeps what was known.
+  mockState.pause = undefined;
+  await readOnce(tree, FAILED);
+  expect(statusLine(tree)).toBe(paused);
+  mockState.pause = null;
+  await readOnce(tree, { ok: true, balance: 2, balanceNano: '2000000000', verified: true, blockHeight: 3505410 });
+  expect(statusLine(tree)).toBeNull();
+});
+
+// The time named is the one the head's checkpoint names once this device verified it; before that no time is named,
+// never the time this device first saw the head (WalletManager.networkPause `since` null).
+it('a network that stopped certifying, its last certified time not verified here: the line names no time', async () => {
+  mockState.pause = { index: 38948, since: null };
+  const tree = await unlocked();
+  await readOnce(tree, { ok: true, balance: 2, balanceNano: '2000000000', verified: true, blockHeight: 3505320 }, { pull: false });
+  expect(statusLine(tree)).toBe(t('balance_network_paused_untimed'));
+  // Verified since: the time comes, once.
+  const since = Date.UTC(2026, 9, 10, 19, 23);
+  mockState.pause = { index: 38948, since };
+  await readOnce(tree, FAILED);
+  expect(statusLine(tree)).toBe(t('balance_network_paused', { time: dateTime(since) }));
 });
 
 it('a figure this session read is never replaced by the kept one arriving later', async () => {

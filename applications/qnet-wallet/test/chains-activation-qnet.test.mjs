@@ -59,14 +59,16 @@ const accountText = (address, balance, nonce, pk = false) => (
  * The certified network (helpers/certified-net.mjs, installed: a fresh light client rooted at its anchors) with this
  * wallet's account at `balance` and `nonce` in its certified state, and every pinned node reporting the same account on
  * GET /api/v1/account/{a}, the chain's nonce now (perNode: node → {balance, nonce, pk} | null: that node's answer, null
- * for a node down). `accounts` and `tokens` add to the certified state; `net` tunes the nodes (helpers/certified-net.mjs).
+ * for a node down). `accounts` and `tokens` add to the certified state, `logsRoot` is its checkpoint's logs_root; `net`
+ * tunes the nodes (helpers/certified-net.mjs).
  */
 function chain({
   balance = '5000000000000', nonce = '0', pk = false, perNode = null, onPost = null, sent = null, accounts = {}, tokens = {},
+  logsRoot = undefined,
 } = {}) {
   if (!NOBLE_INSTALLED) throw new Error('run npm run bundle:install: the test committee signs with the bundle\'s ML-DSA-65');
   const log = { posts: [], sentReads: 0 };
-  const net = certifiedNet({ accounts: { [ME]: { balance, nonce }, ...accounts }, tokens }).install();
+  const net = certifiedNet({ accounts: { [ME]: { balance, nonce }, ...accounts }, tokens, logsRoot }).install();
   const route = nodeRoute(async ({ node, path: p, request }) => {
     // this wallet's applied sends, each with its nonce (resubmitPending decides a passed nonce by them)
     if (p.startsWith('/api/v1/transactions/history?')) {
@@ -1032,7 +1034,8 @@ describe('chains-activation qnet: recipient check (ES-01)', () => {
     assert.equal((await qnet.recipientCheck(forged)).known, false);
     // ...but what it lists as paid still widens the look-alike search
     assert.equal((await qnet.recipientCheck(lookalikeOf(PAYEE))).lookalike, true);
-    // without the archive the vault still decides
+    // without the archive the vault still decides (a fresh worker: a page read a moment ago is used again for 30 s)
+    qnet = await import(`../dist/background/qnet.js?noArchive=${Date.now()}`);
     installFetch(chain().route);
     assert.deepEqual(await qnet.recipientCheck(lookalikeOf(PAYEE)),
       { known: false, lookalike: true, incomingOnly: false, historyRead: false, recentSame: false });
@@ -1226,6 +1229,8 @@ describe('chains-activation qnet: bounded answers (R4-EXTQ-03)', () => {
 describe('chains-activation qnet: dApp token transfers and contract calls', () => {
   const TOKEN = core.deriveContractAddress(ME, 1);
   const GAME = core.deriveContractAddress(ME, 3);
+  // GAME's account in a certified state: a contract that is no token
+  const GAME_ACCOUNT = { is_contract: true, contract_code_hash: 'ab'.repeat(32), storage_root: 'cd'.repeat(32) };
   const tokenInfo = (decimals = 6, name = 'Gold Coin', symbol = 'GOLD') => ({
     success: true, source: 'blockchain_state',
     token: { contract_address: TOKEN, standard: 'qrc20', name, symbol, decimals, logo: '', total_supply: '100000000000000' },
@@ -1463,15 +1468,21 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
   it('a recipient that is a contract is never previewed or signed for: QNC or token, the token itself included (EXT-R2A-01)', async () => {
     const env = installEnv();
     const notToken = { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: GAME };
-    const { route, log } = callChain({ balance: '1000000000000', contracts: { [TOKEN]: tokenInfo(), [GAME]: notToken }, balances: { [ME]: '7000000' } });
+    const { route, log, net } = callChain({
+      balance: '1000000000000', contracts: { [TOKEN]: tokenInfo(), [GAME]: notToken }, balances: { [ME]: '7000000' },
+      accounts: { [GAME]: GAME_ACCOUNT },
+    });
     installFetch(route);
     const payee = eonOf(56);
+    // what a recipient is comes from its certified account leaf (is_contract), never from what nodes say of it
     await qnet.assertPayableRecipient(payee);
     await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
     await rejectsWith(qnet.assertPayableRecipient(TOKEN), 'RECIPIENT_IS_CONTRACT');
-    const reads = log.tokenReads;
+    assert.equal(log.tokenReads, 0, 'no node is asked what the recipient is');
+    const proofReads = () => net.requests.filter((r) => r.includes(`/api/v1/account/${ME}/balance/proof`)).length;
+    const own = proofReads();
     await qnet.assertPayableRecipient(ME, ME);
-    assert.equal(log.tokenReads, reads, "the wallet's own address is no contract and is not read");
+    assert.equal(proofReads(), own, "the wallet's own address is no contract and is not read");
     // the popup's review and send, and a dApp's transfer
     await rejectsWith(qnet.preview({ to: GAME, amount: '100' }), 'RECIPIENT_IS_CONTRACT');
     await rejectsWith(qnet.prepareTransfer({ to: TOKEN, amountNano: '1' }), 'RECIPIENT_IS_CONTRACT');
@@ -1493,19 +1504,42 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     assert.equal(call.contract, GAME);
   });
 
-  it('a recipient no two nodes agree on is not signed for: RECIPIENT_UNCHECKED (EXT-R2A-01)', async () => {
+  it('a recipient whose certified leaf cannot be had is not signed for: RECIPIENT_UNCHECKED, whatever nodes say (EXT-R2A-01)', async () => {
     const env = installEnv();
     const payee = eonOf(57);
-    const notToken = { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: payee };
     const none = { success: false, error: 'Token not found', contract_address: payee };
-    // one node reads a contract, one reads none, the rest cannot read it: no two alike
-    const split = (node) => [notToken, none][QNET.NODES.indexOf(node)] ?? { success: false, error: 'Failed to query token' };
-    installFetch(callChain({ balance: '1000000000000', contracts: { [payee]: split } }).route);
+    // every node says the address holds no contract, and none serves its account proof
+    const { route } = callChain({ balance: '1000000000000', contracts: { [payee]: none } });
+    installFetch(async (request) => (request.url.includes(`/api/v1/account/${payee}/balance/proof`)
+      ? { status: 503, body: '{"error":"busy"}' } : route(request)));
     await rejectsWith(qnet.assertPayableRecipient(payee), 'RECIPIENT_UNCHECKED');
     await rejectsWith(qnet.preview({ to: payee, amount: '1' }), 'RECIPIENT_UNCHECKED');
     await rejectsWith(qnet.send({ to: payee, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }), 'RECIPIENT_UNCHECKED');
     assert.equal(env.calls.signQnetTransfer, 0);
     assert.deepEqual(env.state().pendingTransfers, []);
+    // every node says a certified contract holds none: still a contract
+    const game = callChain({ balance: '1000000000000', contracts: { [GAME]: { ...none, contract_address: GAME } }, accounts: { [GAME]: GAME_ACCOUNT } });
+    installFetch(game.route);
+    await rejectsWith(qnet.preview({ to: GAME, amount: '1' }), 'RECIPIENT_IS_CONTRACT');
+  });
+
+  it('a recipient\'s certified leaf stands while its macroblock does, and a contract stays one', async () => {
+    installEnv();
+    const payee = eonOf(58);
+    const { route, net } = callChain({ balance: '1000000000000', accounts: { [GAME]: GAME_ACCOUNT } });
+    installFetch(route);
+    const reads = (address) => net.requests.filter((r) => r.includes(`/api/v1/account/${address}/balance/proof`)).length;
+    await qnet.assertPayableRecipient(payee);
+    await qnet.assertPayableRecipient(payee);
+    assert.equal(reads(payee), 1, 'read once while its macroblock stands');
+    await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
+    // three macroblocks on, the leaf read before no longer stands; a contract still is one
+    for (let i = 0; i < 3; i++) net.certify({ [ME]: { balance: '1000000000000', nonce: '0' }, [GAME]: GAME_ACCOUNT });
+    net.install();
+    await qnet.assertPayableRecipient(payee);
+    assert.equal(reads(payee), 2, 'read again at a macroblock that stands');
+    await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
+    assert.equal(reads(GAME), 1, 'a contract is not read again');
   });
 
   it('transactionStatus: pending while this wallet sends one there, in a block with the hash two nodes list, else unknown', async () => {
@@ -1822,11 +1856,15 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [pendingRecord('7'), pendingRecord('8')] } });
     env.chainCache = { headIndex: 50_000, views: { qnetBalance: { balanceNano: '1' } } };
     env.anchors = { 49_998: { eligible_ids: ['node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) } };
+    env.sendProofs = { [ME]: { balanceNano: '1', nonce: '0', index: 49_998 } };
     installFetch(heightRoute(1000 * 90 + 5));
     const fresh = await import(`../dist/background/qnet.js?chain=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'changed');
     assert.deepEqual(env.state().pendingTransfers, [], 'the old chain\'s sends can be decided on no chain the nodes serve');
     assert.deepEqual(env.anchors, {}, 'the kept anchors are dropped');
+    assert.deepEqual(env.sendProofs, {}, 'and the proofs kept for a send');
+    assert.equal(env.capsule, null, 'and the capsule');
+    assert.equal(env.capsuleWrites, 1);
     assert.deepEqual(env.forgotten, ['qnetBalance', 'qnetTokens', 'qnetHistory']);
     assert.equal(env.chainCache.headIndex, 1000, 'the new chain\'s head is the one followed now');
     assert.equal(await fresh.followChain(), 'unknown', 'checked at most once a minute');
@@ -1855,6 +1893,27 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     assert.equal(await fresh.followChain(), 'same');
     assert.deepEqual(env.anchors, {});
     assert.equal(env.state().pendingTransfers.length, 1, 'only the anchors go');
+    core.clearQcCache();
+  });
+
+  it('a chain cache an earlier build kept under the genesis identities alone is this chain: nothing goes, the identity is renamed', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [pendingRecord('7')] } });
+    const { GENESIS_NODE_IDS, GENESIS_CONSENSUS_PKS } = core.genesisConsensus;
+    const legacy = core.sha3_256Hex(core.utf8Encode([...GENESIS_NODE_IDS].sort().map((id) => `${id}:${GENESIS_CONSENSUS_PKS[id]}`).join('|')))
+      .slice(0, 32);
+    assert.notEqual(legacy, core.chainIdentity(), 'the identity now folds the network identity');
+    env.chainCache = { chain: legacy, headIndex: 1000 };
+    installFetch(heightRoute(1004 * 90));
+    const fresh = await import(`../dist/background/qnet.js?renamed=${Date.now()}`);
+    assert.equal(await fresh.followChain(), 'same');
+    assert.equal(env.state().pendingTransfers.length, 1);
+    assert.deepEqual(env.forgotten, []);
+    assert.deepEqual(env.chainCache, { chain: core.chainIdentity(), headIndex: 1004 });
+    // another identity is another chain's
+    env.chainCache = { chain: 'ff'.repeat(16), headIndex: 1000 };
+    const other = await import(`../dist/background/qnet.js?otherChain=${Date.now()}`);
+    assert.equal(await other.followChain(), 'changed');
+    assert.deepEqual(env.state().pendingTransfers, []);
     core.clearQcCache();
   });
 
@@ -1962,25 +2021,75 @@ describe('chains-activation qnet: a pending row resolves (owner, 06.10)', () => 
 });
 
 describe('chains-activation qnet: token rows and blocks in the history (owner, 06.10)', () => {
-  it('maps an archive token row with its token and amount, a block number, and calls it included by its hash', async () => {
+  it('maps an archive token row with its token and amount, a block number, and calls it included by its own logs proof', async () => {
     installEnv();
     const TOKEN = core.deriveContractAddress(ME, 1);
+    const block = FIRST_INDEX * 90 - 5;
     const tokenRow = {
-      source: 'token', hash: 'cd'.repeat(32), idx: 0, block: 2068700, timestamp: 1790219000000, from: TO, to: ME, amount: '340282366920938463463374607431768211455',
+      source: 'token', hash: 'cd'.repeat(32), idx: 0, block, timestamp: 1790219000000, from: TO, to: ME, amount: '340282366920938463463374607431768211455',
       tx_type: 'Transfer', fee: '0', contract: TOKEN, kind: 'transfer', std: 'qrc20', token_id: null, symbol: 'GOLD', decimals: 6, logo: '',
     };
     const nftRow = { ...tokenRow, hash: 'ef'.repeat(32), std: 'qrc721' };
-    installFetch(routes(
-      (request) => (request.url.startsWith(`${QNET.EXPLORER_API}/api/address/`)
-        ? { body: { success: true, address: ME, items: [tokenRow, nftRow], next_cursor: null } } : undefined),
-      chain({ sent: [{ hash: 'cd'.repeat(32), from: TO, to: TOKEN, amount: 0, type: 'contract_call', nonce: 3 }] }).route,
-    ));
+    // the transfer's event leaf alone in its block, that block alone in the window the certified checkpoint closes
+    const leaf = core.transferLogLeaf({ tx_hash: tokenRow.hash, log_index: 0, contract: TOKEN, from: TO, to: ME, amount: tokenRow.amount,
+      kind: 'transfer', std: 'qrc20', token_id: null });
+    const tagged = (tag, hex) => core.sha3_256Hex(core.concatBytes(core.utf8Encode(tag), core.hexToBytes(hex)));
+    const blockRoot = tagged('log-leaf', leaf);
+    const logsRoot = tagged('logw-leaf', blockRoot);
+    const logProofs = [];
+    const proof = { leaf, proof: [], block_root: blockRoot, window_proof: [], logs_root: logsRoot, window_end: FIRST_INDEX * 90 };
+    let served = proof;
+    const sent = [{ hash: 'cd'.repeat(32), from: TO, to: TOKEN, amount: 0, type: 'contract_call', nonce: 3 }];
+    const archive = (request) => (request.url.startsWith(`${QNET.EXPLORER_API}/api/address/`)
+      ? { body: { success: true, address: ME, items: [tokenRow, nftRow], next_cursor: null } } : undefined);
+    const logs = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname !== '/api/v1/logs/proof') return undefined;
+      logProofs.push(url.search);
+      return { body: served };
+    };
+    installFetch(routes(archive, logs, chain({ sent, logsRoot }).route));
     const { items } = await qnet.getHistory({});
     assert.deepEqual(items, [{
       hash: 'cd'.repeat(32), direction: 'in', from: TO, to: ME, amountNano: '0', feeNano: '0', timestamp: 1790219000000, status: 'included',
-      nonce: null, kind: 'token', block: 2068700, token: { contract: TOKEN, symbol: 'GOLD', decimals: 6, reserved: false },
+      nonce: null, kind: 'token', block, token: { contract: TOKEN, symbol: 'GOLD', decimals: 6, reserved: false },
       amountBase: '340282366920938463463374607431768211455',
     }], 'a non-QRC-20 row is left out');
+    assert.deepEqual(logProofs, [`?tx_hash=${'cd'.repeat(32)}&log_index=0`]);
+    await qnet.getHistory({});
+    assert.equal(logProofs.length, 1, 'a proven row is not asked for again');
+
+    // two nodes listing the call is no proof of the token row: another row's leaf, a proof that does not fold, or a root
+    // that folds but is not the one the committee certified leaves it unverified
+    const otherLeaf = '11'.repeat(32);
+    const cases = [
+      [{ ...proof, leaf: otherLeaf, block_root: tagged('log-leaf', otherLeaf), logs_root: tagged('logw-leaf', tagged('log-leaf', otherLeaf)) }, logsRoot],
+      [{ ...proof, window_proof: [{ hash: '33'.repeat(32), right: true }] }, logsRoot],
+      [proof, '44'.repeat(32)],
+    ];
+    for (const [forged, certifiedRoot] of cases) {
+      qnet = await import(`../dist/background/qnet.js?forgedRow=${Math.random()}`);
+      served = forged;
+      installFetch(routes(archive, logs, chain({ sent, logsRoot: certifiedRoot }).route));
+      assert.deepEqual((await qnet.getHistory({})).items.map((item) => item.status), ['unverified']);
+    }
+  });
+
+  it('a token row whose macroblock is far below what the wallet verified is left unverified, with no proof asked', async () => {
+    installEnv();
+    const TOKEN = core.deriveContractAddress(ME, 1);
+    const row = {
+      source: 'token', hash: 'ce'.repeat(32), idx: 1, block: 2068700, timestamp: 1790219000000, from: TO, to: ME, amount: '5',
+      tx_type: 'Transfer', fee: '0', contract: TOKEN, kind: 'transfer', std: 'qrc20', token_id: null, symbol: 'GOLD', decimals: 6, logo: '',
+    };
+    const asked = [];
+    installFetch(routes(
+      (request) => (request.url.startsWith(`${QNET.EXPLORER_API}/api/address/`) ? { body: { success: true, address: ME, items: [row], next_cursor: null } } : undefined),
+      (request) => (request.url.includes('/api/v1/logs/proof') ? (asked.push(request.url), { body: {} }) : undefined),
+      chain({ sent: [{ hash: 'ce'.repeat(32), from: TO, to: TOKEN, amount: 0, type: 'contract_call', nonce: 3 }] }).route,
+    ));
+    assert.deepEqual((await qnet.getHistory({})).items.map((item) => item.status), ['unverified']);
+    assert.deepEqual(asked, []);
   });
 
   // M-5: a token row whose symbol is QNet's own, in any spelling or behind a hidden character, says so (reserved), and a
@@ -2043,5 +2152,251 @@ describe('chains-activation qnet: token rows and blocks in the history (owner, 0
       { ...base, hash: '3c'.repeat(32), direction: 'in', from: 'system_rewards_pool', to: ME, amountNano: '5000000000', status: 'included', kind: 'reward' },
       { ...base, hash: '4d'.repeat(32), feeNano: '1000', status: 'unverified', kind: 'deploy' },
     ]);
+  });
+});
+
+// Plan 2.5 / 2.7: a kept QNC proof stands by its macroblock (also for a worker woken from sleep: the session keeps it), the
+// follow alarm keeps a verified checkpoint at the head while unlocked, and the genesis capsule is loaded, refused and
+// forgotten as docs/protocols/galc-capsule-v2.md says. Today's nodes serve no capsule (405): every read goes on from the
+// pin and the anchors exactly as before, each node asked for one at most once per TTL.
+describe('chains-activation qnet: kept send proofs, the follow and the capsule (GALC v2)', () => {
+  const ownProofReads = (net) => net.requests.filter((r) => r.includes(`/api/v1/account/${ME}/balance/proof`)).length;
+  const waitFor = async (ready) => {
+    for (let i = 0; i < 200 && !ready(); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+
+  it('a kept QNC proof stands by its macroblock, also in a fresh worker of the same session; three behind, it is read again', async () => {
+    const env = installEnv();
+    const { route, net } = chain({ balance: '100000000000' });
+    installFetch(route);
+    assert.equal((await qnet.readAccount(ME)).verified, true);
+    assert.deepEqual(env.sendProofs[ME], { balanceNano: '100000000000', nonce: '0', index: FIRST_INDEX }, 'kept in the session');
+    const read = ownProofReads(net);
+    const woken = await import(`../dist/background/qnet.js?woken=${Date.now()}`);
+    const preview = await woken.prepareTransfer({ to: TO, amountNano: '1' });
+    assert.deepEqual([preview.verification, preview.balanceNano], ['proof', '100000000000']);
+    assert.equal(ownProofReads(net), read, 'the kept proof stood: no proof read');
+    // three macroblocks on, the kept proof's macroblock no longer stands: the send reads again
+    for (let i = 0; i < 3; i++) net.certify({ [ME]: { balance: '90000000000', nonce: '0' } });
+    const kept = env.sendProofs;
+    net.install();
+    env.sendProofs = kept;
+    const later = await import(`../dist/background/qnet.js?later=${Date.now()}`);
+    assert.equal((await later.prepareTransfer({ to: TO, amountNano: '1' })).balanceNano, '90000000000');
+    assert.ok(ownProofReads(net) > read);
+    assert.equal(env.sendProofs[ME].index, FIRST_INDEX + 3);
+  });
+
+  it('a kept proof never stands for a nonce the nodes moved past, whatever its macroblock', async () => {
+    const env = installEnv();
+    const { route, net } = chain({ balance: '100000000000', perNode: () => ({ balance: '1', nonce: '1', pk: false }) });
+    env.sendProofs = { [ME]: { balanceNano: '999999999999', nonce: '0', index: FIRST_INDEX } };
+    installFetch(route);
+    await rejectsWith(qnet.prepareTransfer({ to: TO, amountNano: '1' }), 'BALANCE_FOREIGN_PENDING');
+    assert.ok(ownProofReads(net) >= 1, 'read again');
+  });
+
+  it('a follow tick walks toward the certified head and keeps the wallet\'s own proof; the alarm runs only while unlocked', async () => {
+    const env = installEnv();
+    const alarms = new Map();
+    const cleared = [];
+    globalThis.chrome = {
+      alarms: {
+        get: async (name) => alarms.get(name),
+        create: async (name, info) => {
+          alarms.set(name, { name, ...info });
+        },
+        clear: async (name) => {
+          cleared.push(name);
+          return alarms.delete(name);
+        },
+      },
+    };
+    try {
+      const { route, net } = chain({ balance: '100000000000' });
+      net.certify({ [ME]: { balance: '100000000000', nonce: '0' } });
+      installFetch(route);
+      await qnet.startFollow();
+      await qnet.startFollow();
+      assert.deepEqual([...alarms.values()], [{ name: 'qnet-follow', periodInMinutes: 0.5 }]);
+      const tick = await qnet.followTick();
+      assert.deepEqual(tick, { ok: true, head: FIRST_INDEX + 1, verified: true, proof: true });
+      assert.deepEqual(env.sendProofs[ME], { balanceNano: '100000000000', nonce: '0', index: FIRST_INDEX + 1 });
+      assert.ok(env.anchorWrites >= 1, 'what the tick verified is kept');
+      const reads = net.requests.length;
+      assert.deepEqual(await qnet.followTick(), { ok: true, head: FIRST_INDEX + 1, verified: true, proof: false });
+      assert.equal(net.requests.length, reads, 'nothing new: no walk, no proof read');
+      await qnet.onAlarm({ name: 'qnet-register' });
+      assert.deepEqual(cleared, [], 'another module\'s alarm');
+      env.locked = true;
+      await qnet.onAlarm({ name: 'qnet-follow' });
+      assert.deepEqual(cleared, ['qnet-follow'], 'a locked session stops the alarm');
+      assert.deepEqual(await qnet.followTick(), { ok: false, reason: 'locked' });
+    } finally {
+      delete globalThis.chrome;
+    }
+  });
+
+  it('a kept capsule that does not verify again is deleted, and the reads go on from the anchors', async () => {
+    const env = installEnv();
+    const { route } = chain({ balance: '100000000000' });
+    env.capsule = {
+      capsule: {
+        version: 2, network_id: '00'.repeat(32), mb_index: FIRST_INDEX + 10, mb_hash: '01'.repeat(32), committee_digest_anchor: '02'.repeat(32),
+        committee_digest_pred: '03'.repeat(32), minted_at_height: (FIRST_INDEX + 10) * 90, cp_hash_anchor: '04'.repeat(32), cp_hash_pred: '05'.repeat(32),
+        sigs: [],
+      },
+      roots: {},
+    };
+    installFetch(route);
+    assert.equal((await qnet.readAccount(ME)).verified, true);
+    assert.equal(env.capsule, null);
+    assert.equal(env.capsuleWrites, 1);
+    assert.equal(core.heldCapsuleIndex(), 0);
+  });
+
+  it('no capsule route (405): a walk from the pin goes on as before, and each node is asked for a capsule at most once', async () => {
+    installEnv();
+    core.clearQcCache();
+    core.clearCapsule();
+    const index = core.trustFloorIndex() + 1000;
+    const proofText = raw('chains-activation-proof-g1.json');
+    const proof = JSON.parse(proofText);
+    const lowProof = proofText.replace(`"block_height":${proof.block_height}`, `"block_height":${index * 90 + 5}`);
+    const capsuleAsks = new Map();
+    installFetch(nodeRoute(({ node, path: p }) => {
+      if (p === '/api/v1/galc/capsule') {
+        capsuleAsks.set(node, (capsuleAsks.get(node) ?? 0) + 1);
+        return { status: 405, body: 'HTTP method not allowed' };
+      }
+      if (/^\/api\/v1\/macroblock\/[0-9]+\/proof$/.test(p)) return { status: 404, body: '{"error":"not found"}' };
+      if (p.startsWith(`/api/v1/account/${G1}/balance/proof`)) return { body: lowProof };
+      if (p === '/api/v1/state/certified') return { body: { proof_format: 2, views: [], newest_certified_index: index, capture: 'ok' } };
+      return undefined;
+    }));
+    for (let i = 0; i < 3; i++) {
+      const fresh = await import(`../dist/background/qnet.js?noCapsule=${i}-${Date.now()}`);
+      assert.equal((await fresh.readAccount(G1)).verification, 'none', 'the walk failed here (404): not verified');
+    }
+    assert.ok(capsuleAsks.size >= 1, 'a long walk asks for a capsule first');
+    assert.ok([...capsuleAsks.values()].every((n) => n === 1), `at most one ask per node: ${[...capsuleAsks.values()]}`);
+    assert.equal(core.heldCapsuleIndex(), 0);
+    core.clearQcCache();
+  });
+
+  // decision 49: what a woken worker takes over (chrome.storage.session, qnet_light_hints_v1)
+  const sessionStore = () => {
+    const store = {};
+    globalThis.chrome = {
+      storage: {
+        session: {
+          get: async (key) => ({ [key]: structuredClone(store[key]) }),
+          set: async (items) => {
+            Object.assign(store, structuredClone(items));
+          },
+        },
+      },
+    };
+    return store;
+  };
+
+  it('a woken worker takes over the head it saw: its first proof read asks for the macroblock it verified, no walk', async () => {
+    const env = installEnv();
+    const store = sessionStore();
+    try {
+      const { route, net } = chain({ balance: '5' });
+      installFetch(route);
+      assert.equal((await qnet.readAccount(ME)).index, FIRST_INDEX);
+      await waitFor(() => store.qnet_light_hints_v1?.headSeen?.index === FIRST_INDEX);
+      // the worker sleeps: its memory and the light client's go; the vault keeps the anchors, the session the head seen
+      const anchors = env.anchors;
+      net.install();
+      env.anchors = anchors;
+      net.requests.length = 0;
+      const woken = await import(`../dist/background/qnet.js?wokenHead=${Date.now()}`);
+      const account = await woken.readAccount(ME);
+      assert.deepEqual([account.index, account.verification], [FIRST_INDEX, 'proof']);
+      const asked = net.requests.filter((r) => r.includes('/balance/proof'));
+      assert.ok(asked[0].endsWith(`?mb=${FIRST_INDEX}`), asked.join(' '));
+      assert.ok(!net.requests.some((r) => r.includes('/macroblock/')), 'no walk');
+    } finally {
+      delete globalThis.chrome;
+    }
+  });
+
+  it('a refresh that found no capsule is not made again by the next worker within the TTL', async () => {
+    installEnv();
+    const store = sessionStore();
+    core.clearQcCache();
+    core.clearCapsule();
+    const index = core.trustFloorIndex() + 1000;
+    const proofText = raw('chains-activation-proof-g1.json');
+    const proof = JSON.parse(proofText);
+    const lowProof = proofText.replace(`"block_height":${proof.block_height}`, `"block_height":${index * 90 + 5}`);
+    let capsuleAsks = 0;
+    installFetch(nodeRoute(({ path: p }) => {
+      if (p === '/api/v1/galc/capsule') {
+        capsuleAsks += 1;
+        return { status: 405, body: 'HTTP method not allowed' };
+      }
+      if (/^\/api\/v1\/macroblock\/[0-9]+\/proof$/.test(p)) return { status: 404, body: '{"error":"not found"}' };
+      if (p.startsWith(`/api/v1/account/${G1}/balance/proof`)) return { body: lowProof };
+      if (p === '/api/v1/state/certified') return { body: { proof_format: 2, views: [], newest_certified_index: index, capture: 'ok' } };
+      return undefined;
+    }));
+    try {
+      for (let i = 0; i < 3; i++) {
+        core.clearCapsule(); // a new worker's light client: which nodes had none is forgotten with it
+        const fresh = await import(`../dist/background/qnet.js?quietCapsule=${i}-${Date.now()}`);
+        const view = await fresh.readAccount(G1);
+        assert.equal(view.verification, 'none');
+        // a long walk is why: the view says how far it is
+        assert.ok(Number.isSafeInteger(view.walkSteps) && view.walkSteps > 2, `${view.walkSteps}`);
+      }
+      const { toUiError } = await import('../dist/background/errors.js');
+      assert.deepEqual(toUiError(new WalletError('BALANCE_UNCONFIRMED', { walkSteps: 7 })),
+        { code: 'BALANCE_UNCONFIRMED', message: 'The balance is not confirmed yet', walkSteps: 7 });
+      assert.equal(capsuleAsks, 2, 'the first worker asked two nodes; the next ones asked nobody');
+      assert.ok(store.qnet_light_hints_v1.capsuleQuietUntil > Date.now());
+    } finally {
+      delete globalThis.chrome;
+      core.clearQcCache();
+    }
+  });
+
+  it('a walk of a few steps from the anchors asks for no capsule', async () => {
+    installEnv();
+    const { route, net } = chain({ balance: '100000000000' });
+    const asked = [];
+    installFetch(async (request) => {
+      if (!request.url.includes('/api/v1/galc/capsule')) return route(request);
+      asked.push(request.url);
+      return { status: 405, body: '' };
+    });
+    assert.equal((await qnet.readAccount(ME)).verified, true);
+    assert.deepEqual(asked, []);
+    assert.ok(ownProofReads(net) >= 1);
+  });
+
+  it('sendWarm starts the wallet\'s own certified read and a typed recipient\'s checks, and the review finds them done', async () => {
+    const env = installEnv();
+    const { route, net } = chain({ balance: '100000000000' });
+    const archiveReads = [];
+    installFetch(routes(async (request) => {
+      if (!request.url.startsWith(`${QNET.EXPLORER_API}/api/address/`)) return undefined;
+      archiveReads.push(request.url);
+      return { body: { success: true, address: ME, items: [], next_cursor: null } };
+    }, route));
+    const recipientReads = () => net.requests.filter((r) => r.includes(`/api/v1/account/${TO}/balance/proof`)).length;
+    assert.deepEqual(await qnet.sendWarm({}), { started: true });
+    assert.deepEqual(await qnet.sendWarm({ to: TO }), { started: true });
+    await rejectsWith(qnet.sendWarm({ to: 'x' }), 'INVALID_ADDRESS');
+    await waitFor(() => env.sendProofs[ME] !== undefined && archiveReads.length > 0 && recipientReads() > 0);
+    await flush(20);
+    assert.equal(env.sendProofs[ME].index, FIRST_INDEX);
+    const before = [ownProofReads(net), recipientReads(), archiveReads.length];
+    const preview = await qnet.preview({ to: TO, amount: '1' });
+    assert.equal(preview.recipient.historyRead, true);
+    assert.deepEqual([ownProofReads(net), recipientReads(), archiveReads.length], before, 'nothing read again');
   });
 });

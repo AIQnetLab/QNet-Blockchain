@@ -416,15 +416,36 @@ impl BlockchainNode {
     /// This node's announced public API endpoint, or "" when it hides its IP or is Light. Deployment
     /// configuration, NOT a consensus parameter — the announcement is validated on-chain either way.
     /// ONE resolver so registration and reactivation always announce the same address.
+    ///
+    /// While the node serves the wallet plane (a valid certificate for its public IPv4 X) it is
+    /// `https://X`; otherwise `http://<configured ip>:8001` as before. Either form passes through the
+    /// on-chain validator first: one it refuses would make a registration fail forever, so "" is
+    /// announced instead and the node stays reachable by its peers' other paths.
     pub(crate) fn self_public_api_endpoint(node_type: NodeType) -> String {
         if node_type != NodeType::Super || std::env::var("QNET_HIDE_IP").is_ok() {
             return String::new();
         }
-        let public_ip = std::env::var("QNET_PUBLIC_IP")
-            .or_else(|_| std::env::var("EXTERNAL_IP"))
-            .or_else(|_| std::env::var("HOST_IP"))
-            .unwrap_or_default();
-        if public_ip.is_empty() { String::new() } else { format!("http://{}:8001", public_ip) }
+        let endpoint = super::public_rpc::serving_endpoint(crate::rpc::wallet_plane::unix_now()).unwrap_or_else(|| {
+            match super::public_rpc::configured_public_ip() {
+                Some(ip) => format!("http://{}:8001", ip),
+                None => String::new(),
+            }
+        });
+        Self::endpoint_or_empty(endpoint)
+    }
+
+    /// `endpoint` when the on-chain validator accepts it, else "" with a WARN.
+    pub(crate) fn endpoint_or_empty(endpoint: String) -> String {
+        match qnet_state::transaction::validate_public_api_endpoint(&endpoint) {
+            Ok(()) => endpoint,
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][WALLETRPC] endpoint_refused_by_validator ip={} err={}",
+                             crate::genesis_constants::endpoint_ip_only(&endpoint), e);
+                }
+                String::new()
+            }
+        }
     }
 
     /// Canonical sign-preimage BODY a returning node's identity key signs (the chain tag is added by

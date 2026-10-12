@@ -13,5 +13,16 @@ export async function register() {
     } catch (err) {
       console.error(`[ERR][WEB] head_hub_start_failed err=${err instanceof Error ? err.message : String(err)}`);
     }
+    // The balance check's light client walks to the certified head in the background, from where its store left off, so
+    // the first Verify Balance after a restart finds the newest checkpoint verified. LIGHT_FOLLOW=0 turns it off.
+    if (process.env.LIGHT_FOLLOW !== '0' && process.env.NEXT_PHASE !== 'phase-production-build') {
+      try {
+        const { sharedLightClient } = await import('./server/light/balance-proof');
+        sharedLightClient().follow();
+        console.log('[INFO][WEB] light_follow_started');
+      } catch (err) {
+        console.error(`[ERR][WEB] light_follow_start_failed err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 }

@@ -177,8 +177,9 @@ pub const EMERGENCY_COMMITTEE_ALLOWLIST: &[&str] = &[
     "super_node_c78c3017a4f93464",
 ];
 
-/// Is `node_id` kept out of the snapshot built at boundary `height`? Asked only where the stored set is built.
-/// A derived committee or roster that filtered again would differ from the one light clients sample out of
+/// Is `node_id` kept out of the snapshot built at boundary `height`? Asked where the stored snapshot set is
+/// built, and by super_reward_admission at an epoch's first block for the super reward roster. No derived
+/// committee or roster asks it: one that filtered again would differ from the one light clients sample out of
 /// the same stored set. Linear over six entries, called per candidate per snapshot.
 pub fn allowlist_excludes(node_id: &str, height: u64) -> bool {
     qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::EMERGENCY_COMMITTEE_ALLOWLIST, height)

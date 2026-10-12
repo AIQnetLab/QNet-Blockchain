@@ -5,7 +5,7 @@
  */
 import {
   historyRowKey, splitExplorerItems, tokenRowFromEvent, mergeHistory, appendHistory, cacheableHistory, fmtTokenBaseUnits,
-  txDirection, nodeNativeRow,
+  txDirection, nodeNativeRow, withListing, listingKey, listingKeysOfNodeRow, checkedCachedRows, historyBadge, historyEntries,
 } from '../src/utils/txHistory';
 
 const ME = 'aaaaaaaaaaaaaaaaaaaeonaaaaaaaaaaaaaaaaaaaaaa';
@@ -27,7 +27,10 @@ describe('tx history', () => {
     expect(native[1]).toMatchObject({ type: 'receive', fee: 0 });
     expect(tokenEvents).toHaveLength(1);
     const token = tokenRowFromEvent(tokenEvents[0], ME, new Map());
-    expect(token).toMatchObject({ status: 'confirmed', type: 'receive', tokenAmountDisplay: '50', tokenMetaTrusted: false });
+    // The archive's word alone: unverified until two genesis nodes list a native row, or a logs proof a token transfer.
+    expect(native.map((r) => r.status)).toEqual(['unverified', 'unverified']);
+    expect(native.map((r) => r.amountNano)).toEqual(['2500000000', '1000000000']);
+    expect(token).toMatchObject({ status: 'unverified', type: 'receive', tokenAmountDisplay: '50', tokenMetaTrusted: false });
     expect(historyRowKey(token)).toBe('h3:t1');
   });
 
@@ -212,5 +215,77 @@ describe('a landed send is never left "Not found" (L-10)', () => {
     expect(src).toMatch(/\}, settle\);/);
     const poll = src.slice(src.indexOf('const settleByNonce = async'), src.indexOf('const settleLater = '));
     expect(poll.match(/unsettledRow\(r\) && r\.hash === txHash/g)).toHaveLength(2);
+  });
+});
+
+// Receive labels (wallet-galc plan, P1; the extension's rule): the archive's row is unverified, a row two genesis nodes
+// list alike is in a block, and received QNC is credited only once the certified balance covers its block.
+describe('receive labels', () => {
+  const [sent, received] = splitExplorerItems([
+    { source: 'tx', hash: 'h1', idx: 0, block: 900, timestamp: NOW - 1000, from: ME, to: OTHER, amount: '2500000000', tx_type: 'Transfer', fee: '150000' },
+    { source: 'tx', hash: 'h2', idx: 0, block: 1800, timestamp: NOW - 2000, from: OTHER, to: ME, amount: '1000000000', tx_type: 'Transfer', fee: '0' },
+  ], ME).native;
+  // As a genesis node's history lists them (GET /api/v1/transactions/history).
+  const listedBy = (...rows) => new Set(rows.flatMap((r) => listingKeysOfNodeRow(r)));
+  const nodeRow = (r, over = {}) => ({ hash: r.hash, from: r.from, to: r.to, amount: Number(r.amountNano), type: 'transfer', ...over });
+
+  it('an archive row is unverified; listed alike it is confirmed, received QNC only once the certified balance covers it', () => {
+    expect([sent, received].map(historyBadge)).toEqual(['unverified', 'unverified']);
+    const listed = listedBy(nodeRow(sent), nodeRow(received));
+    const below = withListing([sent, received], listed, 1799);
+    expect(below.map((r) => [r.status, r.listed])).toEqual([['confirmed', true], ['included', true]]);
+    expect(below.map(historyBadge)).toEqual(['confirmed', 'included']);
+    // The certified read covers its block: credited, and it stays so whatever comes after.
+    const covered = withListing(below, null, 1800);
+    expect(covered.map((r) => r.status)).toEqual(['confirmed', 'confirmed']);
+    expect(withListing(covered, null, null)[1].status).toBe('confirmed');
+    // Unchanged rows are the same objects (the screen does not render again).
+    expect(withListing(covered, null, 1800).every((r, i) => r === covered[i])).toBe(true);
+    // Not listed, or listed with another amount or party: unverified as before; a token row is never listed this way.
+    expect(withListing([sent, received], listedBy(nodeRow(received, { amount: 999 })), 5000).map((r) => r.status)).toEqual(['unverified', 'unverified']);
+    expect(withListing([sent, received], null, 5000).map((r) => r.status)).toEqual(['unverified', 'unverified']);
+    const token = tokenRowFromEvent({ tx_hash: 'h3', log_index: 0, contract: 'C1', from: OTHER, to: ME, amount: '5', archived: true }, ME, new Map());
+    expect(listingKey(token)).toBe(null);
+    expect(withListing([token], listedBy(nodeRow({ hash: 'h3', from: OTHER, to: ME, amountNano: '0' })), 5000)[0].status).toBe('unverified');
+  });
+
+  it('a reported row of one node is settled the same way; a contract call matches by its hash', () => {
+    const reported = nodeNativeRow({ hash: 'h4', tx_type: 'Transfer', from: OTHER, to: ME, amount: 7, timestamp: 1, block_height: 50 }, ME);
+    expect(reported.status).toBe('reported');
+    expect(withListing([reported], listedBy(nodeRow(reported)), 90)[0].status).toBe('confirmed');
+    const call = { hash: 'h5', txType: 'ContractCall', from: ME, to: 'c'.repeat(64), amountNano: '0', status: 'unverified', type: 'send' };
+    expect(withListing([call], listedBy({ hash: 'h5', from: ME, to: null, amount: 0, type: 'contract_call' }), null)[0].status).toBe('confirmed');
+  });
+
+  it('a refresh keeps what was listed while the archive returns the row unverified; the cache keeps every archive row', () => {
+    const listed = withListing([sent, received], listedBy(nodeRow(sent), nodeRow(received)), 5000);
+    const merged = mergeHistory(listed, [sent, received], { myAddress: ME, coveredFromMs: 0, nowMs: NOW, nodeEventsOk: true });
+    expect(merged.map((r) => [r.hash, r.status])).toEqual([['h1', 'confirmed'], ['h2', 'confirmed']]);
+    // Another amount under the same hash is another row's word: not kept.
+    const changed = mergeHistory(listed, [{ ...sent, amountNano: '1' }], { myAddress: ME, coveredFromMs: 0, nowMs: NOW, nodeEventsOk: true });
+    expect(changed.find((r) => r.hash === 'h1').status).toBe('unverified');
+    expect(cacheableHistory([...listed, { ...sent, hash: 'h9' }, { hash: 'p', status: 'pending' }]).map((r) => r.hash)).toEqual(['h1', 'h2', 'h9']);
+    // A node's reported row goes beside the archive's row for it, unverified or not.
+    const reported = { ...nodeNativeRow({ hash: 'h2', from: OTHER, to: ME, amount: 1000000000, timestamp: 1 }, ME) };
+    expect(mergeHistory([], [sent, received, reported], { myAddress: ME, coveredFromMs: 0, nowMs: NOW, nodeEventsOk: true })
+      .filter((r) => r.hash === 'h2').map((r) => r.status)).toEqual(['unverified']);
+  });
+
+  it('a row an older build cached as confirmed on the word of the archive reads as unverified; proven rows stay', () => {
+    const rows = checkedCachedRows([
+      { hash: 'a', status: 'confirmed', type: 'receive' },
+      { hash: 'b', status: 'confirmed', type: 'receive', listed: true },
+      { hash: 'c', status: 'confirmed', tokenContract: 'C1', verified: false },
+      { hash: 'd', status: 'confirmed', tokenContract: 'C1', verified: true },
+      { hash: 'node:x', status: 'confirmed', nodeEvent: true },
+      { hash: 'e', status: 'pending' },
+    ]);
+    expect(rows.map((r) => r.status)).toEqual(['unverified', 'confirmed', 'unverified', 'confirmed', 'confirmed', 'pending']);
+  });
+
+  it('a registration the registry holds is settled, the unverified row of the archive too', () => {
+    const reg = { hash: 'r1', txType: 'NodeRegistration', from: ME, to: '', amount: 0, status: 'unverified', timestamp: NOW, type: 'send', block: 7 };
+    const ev = { hash: 'node:n1', nodeEvent: true, nodeId: 'n1', nodeType: 'light', height: 7, status: 'confirmed', timestamp: NOW };
+    expect(historyEntries([reg, ev])).toEqual([expect.objectContaining({ hash: 'r1', nodeRegistration: true, status: 'confirmed' })]);
   });
 });

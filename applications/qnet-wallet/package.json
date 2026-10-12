@@ -1,7 +1,7 @@
 {
   "name": "qnet-wallet",
-  "version": "3.1.0",
-  "description": "QNet Wallet browser extension: post-quantum (ML-DSA-65) QNet wallet with the Solana account that activates nodes",
+  "version": "3.1.2",
+  "description": "QNet Wallet browser extension: post-quantum (ML-DSA-65) wallet for QNet Blockchain with the Solana account that activates nodes",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",

@@ -1235,7 +1235,7 @@ impl BlockchainActivationRegistry {
     async fn fetch_recent_activations(&self) -> Result<Vec<ActivationRecord>, IntegrationError> {
         // PRODUCTION: Query QNet blockchain for recent activation records
         
-        println!("📡 Querying QNet blockchain for recent activations...");
+        println!("📡 Querying QNet Blockchain for recent activations...");
         
         match self.consensus_get_recent_activations().await {
             Ok(activations) => {
@@ -1444,7 +1444,7 @@ impl BlockchainActivationRegistry {
     async fn submit_activation_to_blockchain(&self, record: ActivationRecord) -> Result<(), IntegrationError> {
         // PRODUCTION: Submit real activation transaction to QNet blockchain
         
-        println!("🔗 Submitting activation to QNet blockchain...");
+        println!("🔗 Submitting activation to QNet Blockchain...");
         
         // Validate activation record before submission (now using hash)
         if record.code_hash.is_empty() {
@@ -2038,7 +2038,7 @@ impl BlockchainActivationRegistry {
     
     /// Broadcast replacement via blockchain (scalable for millions of nodes)
     async fn broadcast_replacement_via_blockchain(&self, existing_node: &NodeInfo) -> Result<(), IntegrationError> {
-        println!("🔗 Broadcasting node replacement via quantum blockchain");
+        println!("🔗 Broadcasting node replacement on QNet Blockchain");
         
         // PRODUCTION: Create blockchain transaction that notifies the replaced node
         // This is much more scalable than HTTP requests to millions of nodes
@@ -2052,7 +2052,7 @@ impl BlockchainActivationRegistry {
     
     /// Mark node as replaced in blockchain (immediate effect)
     async fn mark_node_replaced_in_blockchain(&self, existing_node: &NodeInfo) -> Result<(), IntegrationError> {
-        println!("🔗 Marking node as replaced in quantum blockchain");
+        println!("🔗 Marking node as replaced on QNet Blockchain");
         
         // PRODUCTION: Update blockchain state to mark node as inactive
         // This is the authoritative source of truth for node status

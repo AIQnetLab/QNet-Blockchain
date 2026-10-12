@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import ExplorerLink from '@/components/ExplorerLink';
+import Link from 'next/link';
 import TokenIcon from '@/components/TokenIcon';
 import { useActivationContent } from '@/contexts/AppContext';
 import { txPartyLabel } from '@/lib/tx-labels';
@@ -66,7 +66,7 @@ const AddrLink = ({ addr }: { addr: string }) => {
   const full = useActivationContent();
   const isValid = addr && addr.length > 10 && addr.includes('eon');
   return isValid ? (
-    <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">{truncate(addr)}</ExplorerLink>
+    <Link href={`/explorer/address/${addr}`} className="address-link">{truncate(addr)}</Link>
   ) : (
     <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
   );
@@ -253,7 +253,7 @@ export default function QncPage() {
               {transfers.map((t, idx) => (
                 <tr key={`${t.hash}-${idx}`}>
                   <td>
-                    <ExplorerLink href={`/explorer/tx/${t.hash}`} className="address-link">{truncate(t.hash)}</ExplorerLink>
+                    <Link href={`/explorer/tx/${t.hash}`} className="address-link">{truncate(t.hash)}</Link>
                   </td>
                   <td><AddrLink addr={t.from} /></td>
                   <td><AddrLink addr={t.to} /></td>
@@ -264,7 +264,7 @@ export default function QncPage() {
                     </span>
                   </td>
                   <td>
-                    <ExplorerLink href={`/explorer/block/${t.block}`} className="address-link">{t.block}</ExplorerLink>
+                    <Link href={`/explorer/block/${t.block}`} className="address-link">{t.block}</Link>
                   </td>
                   <td>{formatTimeAgo(t.timestamp)}</td>
                 </tr>

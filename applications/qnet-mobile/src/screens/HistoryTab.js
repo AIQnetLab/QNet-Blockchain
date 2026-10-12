@@ -16,15 +16,20 @@
 import React from 'react';
 import { Image, Text, TouchableOpacity, View } from 'react-native';
 import Svg, { Circle, Path } from 'react-native-svg';
+import { InfoField, InfoRow } from '../components/InfoRow';
 import { tokenIconSource } from '../components/TokenIcons';
 import { historyBadge, txNodeId, txTypeName } from '../utils/txHistory';
 import { contractShortId, destroysTokens, tokenLabel, usesReservedName } from '../utils/tokenSafety';
 import styles from './WalletScreen.styles';
 
+// unverified: only the explorer archive lists it (or no logs proof anchors a token transfer); included: received QNC in a
+// block as two genesis nodes list it, not in the certified balance yet (utils/txHistory historyBadge).
 const BADGE_KEY = {
   pending: 'hist_status_pending', confirmed: 'hist_status_confirmed', failed: 'hist_status_failed', dropped: 'hist_status_dropped',
+  moving: 'hist_status_moving', unverified: 'hist_status_unverified', included: 'hist_status_included',
 };
 const SUFFIXES = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+
 // The sender of a node balance moved into the wallet (core is_merkle_reward_claim).
 export const NODE_BALANCE_SENDER = 'system_rewards_pool';
 
@@ -232,7 +237,8 @@ const iconOf = (tx) => {
 export function describeTx(tx) {
   const kind = txKind(tx);
   const spec = KINDS[kind];
-  const status = tx.nodeEvent ? 'confirmed' : historyBadge(tx);
+  // A move of a node balance in transit (services/ClaimTransit withMoveStates) says so until the wallet holds it.
+  const status = tx.nodeEvent ? 'confirmed' : (tx.moving ? 'moving' : historyBadge(tx));
   const settled = status !== 'failed' && status !== 'dropped';
   const rows = Array.isArray(tx.legs) && tx.legs.length > 1 ? tx.legs : [tx];
   // A single transfer shows its amount even at 0; a node or contract action, and a leg among several, only when not 0.
@@ -426,21 +432,6 @@ export const HistoryRow = React.memo(function HistoryRow({ tx, t, hideAmounts, o
   );
 });
 
-// One field of the detail screen: its label, and its value (an address or a hash stays left to right and copies).
-function Field({ label, value, mono = false, onCopy = null, copied = false, t }) {
-  const body = (
-    <>
-      <Text style={styles.txDetailLabel}>{copied ? t('common_copied') : label}</Text>
-      <Text style={[styles.txDetailValue, mono && styles.txDetailMono]} selectable>{value}</Text>
-    </>
-  );
-  return onCopy ? (
-    <TouchableOpacity style={styles.txDetailField} onPress={onCopy} accessibilityRole="button" accessibilityHint={t('common_tap_to_copy')}>
-      {body}
-    </TouchableOpacity>
-  ) : <View style={styles.txDetailField}>{body}</View>;
-}
-
 /**
  * The detail screen of one row: the icon and badge, what happened, the exact amounts, the status, the fee, both parties
  * (a sender that is the network itself in words: systemSenderKey), the node (a node row), the time, the hash, the
@@ -453,26 +444,30 @@ function Field({ label, value, mono = false, onCopy = null, copied = false, t })
 export function TxDetail({ tx, t, hideAmounts = false, onBack, onCopy, onExplorer, copied = '', backArrow = '←' }) {
   const d = describeTx(tx);
   const badge = d.status;
+  // Each field as every screen draws one (components/InfoRow): a figure, a time or a word beside its label; an id or an
+  // address whole on one line under it, a hash shortened in its middle, each copied whole on a tap; a memo wrapping.
+  const copyable = (key, label, value, more = {}) => (
+    <InfoField key={key} t={t} label={label} value={value} mono fit onCopy={() => onCopy(value, `detail-${key}`)}
+      copied={copied === `detail-${key}`} {...more} />
+  );
   const fields = [];
   if (d.node && (tx.nodeTypeTitle || tx.nodeType)) {
-    fields.push(<Field key="type" t={t} label={t('node_type')} value={tx.nodeTypeTitle || String(tx.nodeType || '')} />);
+    fields.push(<InfoRow key="type" label={t('node_type')} value={tx.nodeTypeTitle || String(tx.nodeType || '')} />);
   }
-  if (d.node && tx.nodeId) {
-    fields.push(<Field key="node" t={t} label={t('node_name')} value={tx.nodeId} mono onCopy={() => onCopy(tx.nodeId, 'detail-node')} copied={copied === 'detail-node'} />);
-  }
-  if (d.fee) fields.push(<Field key="fee" t={t} label={t('tx_detail_fee')} value={hideAmounts ? '••••' : d.fee} />);
+  if (d.node && tx.nodeId) fields.push(copyable('node', t('node_name'), tx.nodeId));
+  if (d.fee) fields.push(<InfoRow key="fee" label={t('tx_detail_fee')} value={hideAmounts ? '••••' : d.fee} ltr fit />);
   if (!tx.nodeEvent) {
     const system = systemSenderKey(tx, d.kind);
-    if (system) fields.push(<Field key="from" t={t} label={t('tx_detail_from')} value={t(system)} />);
-    else if (tx.from) fields.push(<Field key="from" t={t} label={t('tx_detail_from')} value={tx.from} mono onCopy={() => onCopy(tx.from, 'detail-from')} copied={copied === 'detail-from'} />);
-    if (tx.to) fields.push(<Field key="to" t={t} label={t('tx_detail_to')} value={tx.to} mono onCopy={() => onCopy(tx.to, 'detail-to')} copied={copied === 'detail-to'} />);
+    if (system) fields.push(<InfoRow key="from" label={t('tx_detail_from')} value={t(system)} />);
+    else if (tx.from) fields.push(copyable('from', t('tx_detail_from'), tx.from));
+    if (tx.to) fields.push(copyable('to', t('tx_detail_to'), tx.to));
   }
-  if (hasTime(tx.timestamp)) fields.push(<Field key="time" t={t} label={t('tx_detail_time')} value={dateTime(tx.timestamp)} />);
-  if (tx.hash && !tx.nodeEvent) fields.push(<Field key="hash" t={t} label={t('tx_label')} value={tx.hash} mono onCopy={() => onCopy(tx.hash, 'detail-hash')} copied={copied === 'detail-hash'} />);
+  if (hasTime(tx.timestamp)) fields.push(<InfoRow key="time" label={t('tx_detail_time')} value={dateTime(tx.timestamp)} ltr />);
+  if (tx.hash && !tx.nodeEvent) fields.push(copyable('hash', t('tx_label'), tx.hash, { fit: false, middle: true }));
   const block = Number.isSafeInteger(tx.block) ? tx.block : (d.node && Number.isSafeInteger(tx.height) ? tx.height : null);
-  if (block !== null) fields.push(<Field key="block" t={t} label={t('tx_detail_block')} value={String(block)} />);
-  if (Number.isSafeInteger(tx.slot)) fields.push(<Field key="slot" t={t} label={t('tx_detail_slot')} value={String(tx.slot)} />);
-  if (typeof tx.memo === 'string' && tx.memo) fields.push(<Field key="memo" t={t} label={t('tx_detail_memo')} value={tx.memo} />);
+  if (block !== null) fields.push(<InfoRow key="block" label={t('tx_detail_block')} value={String(block)} ltr fit />);
+  if (Number.isSafeInteger(tx.slot)) fields.push(<InfoRow key="slot" label={t('tx_detail_slot')} value={String(tx.slot)} ltr fit />);
+  if (typeof tx.memo === 'string' && tx.memo) fields.push(<InfoField key="memo" t={t} label={t('tx_detail_memo')} value={tx.memo} />);
   if (d.reserved) fields.push(<Text key="reserved" style={styles.txDetailWarning}>{t('tok_reserved_warning')}</Text>);
   // A transaction no source reported (not found) has no explorer page either: its hash is copied instead. A Solana send
   // that expired unrun (no fee charged) never reached the cluster's ledger, so it has none either.

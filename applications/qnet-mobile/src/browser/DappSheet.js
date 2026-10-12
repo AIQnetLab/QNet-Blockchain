@@ -18,6 +18,7 @@ import {
 } from './dappProvider';
 import { formatUnits } from './dappRequests';
 import { refusalReason } from '../utils/txRefusal';
+import { InfoField, InfoRow } from '../components/InfoRow';
 
 // A send moves money: a longer untouched look before it arms (the times live with the provider, which also counts
 // a page that leaves under an armed sheet as a rejection).
@@ -114,6 +115,16 @@ export function unreadKey(type, preview) {
   if (problems.includes('foreign')) return 'balance_foreign_pending';
   if (problems.includes('unconfirmed')) return 'balance_unconfirmed';
   return 'dapp_send_preview_failed';
+}
+
+/**
+ * unreadKey said: while a long lineage walk is why a balance is not confirmed, how far it is (wallet-galc plan, Part 3
+ * item 6).
+ */
+export function unreadText(t, type, preview) {
+  const key = unreadKey(type, preview);
+  const steps = preview && preview.walkSteps;
+  return key === 'balance_unconfirmed' && Number.isSafeInteger(steps) && steps > 0 ? t('balance_verifying_steps', { steps }) : t(key);
 }
 
 /**
@@ -229,21 +240,13 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
 
   const site = describeOrigin(view.origin);
 
-  const row = (label, value, key) => (
-    <View style={s.row} key={key || label}>
-      <Text style={s.rowLabel}>{label}</Text>
-      <Text style={s.mono} selectable>{value}</Text>
-    </View>
-  );
-
-  // A whole address on one line: the font shrinks to fit the sheet before anything would wrap or be cut. A larger
-  // system text size counts up to 1.2 times, so half of that size still holds the address on a 320 dp screen.
-  const addressRow = (label, value) => (
-    <View style={s.row} key={label}>
-      <Text style={s.rowLabel}>{label}</Text>
-      <Text style={s.mono} selectable numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5} maxFontSizeMultiplier={1.2} testID="dapp-address">{value}</Text>
-    </View>
-  );
+  // What the sheet shows, label by label (components/InfoRow): a figure beside its label on one line; under it an
+  // address, a contract, a name or a text that is read whole. A whole address to share sits on one line, the font
+  // shrinking to fit the sheet before anything would wrap or be cut: a larger system text size counts up to 1.2 times,
+  // so half of that size still holds the address on a 320 dp screen.
+  const figureRow = (label, value, extra = {}) => <InfoRow label={label} value={value} ltr fit {...extra} />;
+  const wholeField = (label, value, mono = true) => <InfoField label={label} value={value} mono={mono} t={t} />;
+  const addressField = (label, value) => <InfoField label={label} value={value} mono fit t={t} testID="dapp-address" />;
 
   const button = (label, onPress, primary, disabled = false, pressIn = undefined) => (
     <TouchableOpacity
@@ -317,8 +320,8 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
   const connectBody = () => (
     <>
       <Text style={s.text}>{t('dapp_connect_body')}</Text>
-      {addressRow(t('dapp_qnet_address'), accounts ? accounts.qnet : '—')}
-      {addressRow(t('dapp_solana_address'), accounts ? accounts.solana : '—')}
+      {addressField(t('dapp_qnet_address'), accounts ? accounts.qnet : '—')}
+      {addressField(t('dapp_solana_address'), accounts ? accounts.solana : '—')}
     </>
   );
 
@@ -371,7 +374,7 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
   const walletRows = () => (
     <>
       {needsPick || inFlight ? pendingBlock() : null}
-      {preview.balanceNano !== null ? row(t('dapp_send_balance'), `${formatNano(preview.balanceNano)} QNC`) : null}
+      {preview.balanceNano !== null ? figureRow(t('dapp_send_balance'), `${formatNano(preview.balanceNano)} QNC`) : null}
     </>
   );
 
@@ -402,18 +405,18 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     const repeatMin = preview ? repeatedPaymentMinutes(d.to, d.amountNano, pending, preview.recent) : null;
     return (
       <>
-        {row(t('dapp_send_to'), d.to)}
+        {wholeField(t('dapp_send_to'), d.to)}
         {d.destroys ? <Text style={s.alert} testID="qnc-destroyed">{t('dapp_qnc_destroyed')}</Text> : null}
-        {row(t('dapp_send_amount'), `${formatNano(d.amountNano)} QNC`)}
-        {row(t('dapp_send_fee'), `${formatNano(d.feeNano)} QNC`)}
-        {row(t('dapp_send_total'), `${formatNano(d.totalNano)} QNC`)}
+        {figureRow(t('dapp_send_amount'), `${formatNano(d.amountNano)} QNC`)}
+        {figureRow(t('dapp_send_fee'), `${formatNano(d.feeNano)} QNC`)}
+        {figureRow(t('dapp_send_total'), `${formatNano(d.totalNano)} QNC`, { total: true })}
         {preview ? (
           <>
             {repeatMin !== null ? <Text style={s.alert}>{t('send_repeat_body', { minutes: repeatMin })}</Text> : null}
             {walletRows()}
             {d.destroys ? null : recipientWarnings(d.to)}
             {shortLine(d.totalNano)}
-            {sendUnread(type, preview) ? <Text style={s.alert}>{t(unreadKey(type, preview))}</Text> : null}
+            {sendUnread(type, preview) ? <Text style={s.alert}>{unreadText(t, type, preview)}</Text> : null}
           </>
         ) : reading()}
       </>
@@ -429,26 +432,26 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     const tokenShort = !!preview && tokenBelow(preview, d, needsPick ? pick : null);
     return (
       <>
-        {row(t('dapp_token'), d.name ? `${d.symbol} · ${d.name}` : d.symbol)}
-        {row(t('dapp_token_contract'), d.token)}
+        {wholeField(t('dapp_token'), d.name ? `${d.symbol} · ${d.name}` : d.symbol, false)}
+        {wholeField(t('dapp_token_contract'), d.token)}
         {d.reservedName ? <Text style={s.alert}>{t('tok_reserved_warning')}</Text> : null}
-        {row(t('dapp_send_to'), d.to)}
+        {wholeField(t('dapp_send_to'), d.to)}
         {d.destroys ? <Text style={s.alert}>{t('dapp_token_destroyed')}</Text> : null}
-        {row(t('dapp_send_amount'), `${d.amount} ${d.symbol}`)}
-        {row(t('dapp_token_base'), d.amountBase)}
-        {row(t('dapp_send_fee'), `${formatNano(d.feeNano)} QNC`)}
+        {figureRow(t('dapp_send_amount'), `${d.amount} ${d.symbol}`)}
+        {figureRow(t('dapp_token_base'), d.amountBase)}
+        {figureRow(t('dapp_send_fee'), `${formatNano(d.feeNano)} QNC`)}
         {preview ? (
           <>
-            {depositNano !== null && depositNano !== '0' ? row(t('dapp_token_deposit'), `${formatNano(depositNano)} QNC`) : null}
-            {row(t('dapp_send_total'), `${formatNano(totalNano)} QNC`)}
+            {depositNano !== null && depositNano !== '0' ? figureRow(t('dapp_token_deposit'), `${formatNano(depositNano)} QNC`) : null}
+            {figureRow(t('dapp_send_total'), `${formatNano(totalNano)} QNC`, { total: true })}
             {preview.listed ? null : <Text style={s.warning}>{t('dapp_token_unlisted')}</Text>}
             {walletRows()}
             {preview.tokenBalanceBase !== null
-              ? row(t('dapp_token_balance'), `${formatTokenUnits(preview.tokenBalanceBase, d.decimals)} ${d.symbol}`) : null}
+              ? figureRow(t('dapp_token_balance'), `${formatTokenUnits(preview.tokenBalanceBase, d.decimals)} ${d.symbol}`) : null}
             {d.destroys ? null : recipientWarnings(d.to)}
             {tokenShort ? <Text style={s.alert}>{t('dapp_token_insufficient')}</Text> : null}
             {shortLine(totalNano)}
-            {sendUnread(type, preview) ? <Text style={s.alert}>{t(unreadKey(type, preview))}</Text> : null}
+            {sendUnread(type, preview) ? <Text style={s.alert}>{unreadText(t, type, preview)}</Text> : null}
           </>
         ) : reading()}
       </>
@@ -462,23 +465,22 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     const d = view.details;
     return (
       <>
-        {row(t('dapp_call_contract'), d.contract)}
+        {wholeField(t('dapp_call_contract'), d.contract)}
         <Text style={s.alert}>{t('dapp_call_unknown')}</Text>
-        {row(t('dapp_call_method'), d.method)}
-        <View style={s.row}>
-          <Text style={s.rowLabel}>{t('dapp_call_input', { bytes: d.argsBytes })}</Text>
+        {wholeField(t('dapp_call_method'), d.method)}
+        <InfoField label={t('dapp_call_input', { bytes: d.argsBytes })} t={t}>
           <ScrollView style={s.inputBox} nestedScrollEnabled testID="call-input">
             <Text style={s.mono} selectable>{d.args || '—'}</Text>
           </ScrollView>
-        </View>
-        {d.argsText ? row(t('dapp_call_input_text'), d.argsText) : null}
-        {row(t('dapp_call_gas'), d.gasLimit)}
-        {row(t('dapp_call_max_fee'), `${formatNano(d.feeNano)} QNC`)}
+        </InfoField>
+        {d.argsText ? wholeField(t('dapp_call_input_text'), d.argsText, false) : null}
+        {figureRow(t('dapp_call_gas'), d.gasLimit)}
+        {figureRow(t('dapp_call_max_fee'), `${formatNano(d.feeNano)} QNC`)}
         {preview ? (
           <>
             {walletRows()}
             {shortLine(d.feeNano)}
-            {sendUnread(type, preview) ? <Text style={s.alert}>{t(unreadKey(type, preview))}</Text> : null}
+            {sendUnread(type, preview) ? <Text style={s.alert}>{unreadText(t, type, preview)}</Text> : null}
           </>
         ) : reading()}
       </>
@@ -510,7 +512,7 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     return (
       <>
         <Text style={s.text}>{said}</Text>
-        {outcome.txHash ? row(t('dapp_send_hash'), outcome.txHash) : null}
+        {outcome.txHash ? wholeField(t('dapp_send_hash'), outcome.txHash) : null}
       </>
     );
   };
@@ -561,7 +563,7 @@ const s = StyleSheet.create({
   },
   scroll: { flexGrow: 1, justifyContent: 'center', padding: 16 },
   card: {
-    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 20,
+    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 16,
     borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
   },
   originBox: { alignItems: 'center', marginBottom: 12 },
@@ -575,9 +577,7 @@ const s = StyleSheet.create({
   hint: { color: '#888888', fontSize: 12, lineHeight: 17, marginTop: 4, marginBottom: 4 },
   warning: { color: '#ffaa00', fontSize: 13, lineHeight: 19, marginTop: 6, marginBottom: 6 },
   alert: { color: '#ff5555', fontSize: 13, lineHeight: 19, fontWeight: '600', marginTop: 6, marginBottom: 6 },
-  row: { marginBottom: 10 },
-  rowLabel: { color: '#888888', fontSize: 12, marginBottom: 2 },
-  // Addresses, amounts and hashes stay left-to-right in every language.
+  // The input and the unconfirmed transactions stay left-to-right in every language.
   mono: { color: '#ffffff', fontSize: 13, fontFamily: 'monospace', writingDirection: 'ltr', textAlign: 'left' },
   messageBox: {
     maxHeight: 220, backgroundColor: '#11131f', borderRadius: 8, borderWidth: MESSAGE_BORDER, borderColor: 'rgba(0, 212, 255, 0.2)',
@@ -585,8 +585,10 @@ const s = StyleSheet.create({
   // Inside the scrolled content, so the content height the fit check compares is the whole text with its padding.
   messageContent: { padding: 10 },
   message: { color: '#ffffff', fontSize: 14, lineHeight: 20 },
+  // A call's input, under its label (components/InfoRow).
   inputBox: {
-    maxHeight: 140, backgroundColor: '#11131f', borderRadius: 8, borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.2)', padding: 8,
+    maxHeight: 140, marginTop: 6, backgroundColor: '#11131f', borderRadius: 8, borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.2)',
+    padding: 8,
   },
   busy: { alignItems: 'center', paddingVertical: 10, gap: 8 },
   pendingBox: {

@@ -15,7 +15,6 @@ const CLIENT_FILES = [
   'components/cabinet/NodeClaim.tsx',
   'components/cabinet/LinkDevice.tsx',
   'components/cabinet/UnlinkDevice.tsx',
-  'components/cabinet/WakePanel.tsx',
   'app/l/LinkButtons.tsx',
   'hooks/useLinkSession.ts',
   'lib/link-client.ts',
@@ -58,7 +57,7 @@ test('link-store.ts keeps one record per page in its own database: a non-extract
 
 test('the pages call only this origin', () => {
   let calls = 0;
-  for (const file of ['components/cabinet/ExtensionActivate.tsx', 'components/cabinet/WakePanel.tsx', 'lib/link-client.ts']) {
+  for (const file of ['components/cabinet/ExtensionActivate.tsx', 'components/cabinet/NodeDetails.tsx', 'lib/link-client.ts']) {
     for (const m of code(file).matchAll(/fetch(?:Fn)?\(\s*[`']([^`']*)[`']/g)) {
       assert.match(m[1], /^(\$\{base\})?\/api\//, `${file}: ${m[1]}`);
       calls += 1;

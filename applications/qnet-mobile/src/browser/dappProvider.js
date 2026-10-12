@@ -32,7 +32,8 @@
  *     IN_FLIGHT_RECHECK_MS, and the user may only replace the one unconfirmed transaction at `confirmed` + 1
  *     (`replaceNonce`); nothing is ever sent in addition. `balanceNano` is the committee-certified balance less what
  *     this wallet's transactions settled since its checkpoint took, `spends` ([{ nonce, amount }]) what its unsettled
- *     ones may still take, `balanceProblem` why no balance could be read ('foreign', 'unconfirmed', 'unanswered'). A
+ *     ones may still take, `balanceProblem` why no balance could be read ('foreign', 'unconfirmed', 'unanswered'), and
+ *     `walkSteps` the steps a long lineage walk still takes when that is why it is not confirmed (or null). A
  *     token transfer adds tokenBalanceBase, tokenSpends, tokenProblem, tokenVerified, depositNano and listed (in the
  *     user's token list),
  *   recheckSend(details): { balanceNano, tokenBalanceBase, depositNano, spends, tokenSpends, balanceProblem, tokenProblem }
@@ -697,6 +698,7 @@ export function createDappProvider(deps) {
         transferFeeNano: String(deps.feeNano()),
         spends: spendsOf(p.spends),
         balanceProblem: problemOf(p.balanceProblem),
+        walkSteps: Number.isSafeInteger(p.walkSteps) && p.walkSteps > 0 ? p.walkSteps : null,
         ...typePreview(a.payload.type, p),
       });
       a.previewError = null;

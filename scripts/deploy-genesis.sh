@@ -11,7 +11,7 @@
 # server and no option can be silently dropped. One node is taken down at a time and the next is not
 # touched until the previous one answers.
 #
-#   ./deploy-genesis.sh                                  # all five, in order
+#   ./deploy-genesis.sh                                  # all six, in order; image = the checked-out commit
 #   ./deploy-genesis.sh 001 003                          # only these
 #   QNET_ROLLBACK_TO_LAST_SEALED=1 ./deploy-genesis.sh   # recover to each node's certified floor
 #   QNET_ROLLBACK_TO_HEIGHT=627483 ./deploy-genesis.sh   # or to an exact height, refused below that floor
@@ -35,8 +35,9 @@
 # 604,800 blocks above the fleet tip. Host checks before a roll: docs/operators/genesis-host-checks.md.
 set -uo pipefail
 
-# A commit tag rolls, or rolls back, one exact build without moving :latest, which community nodes follow.
-IMAGE="${QNET_IMAGE:-ghcr.io/aiqnetlab/qnet-production:latest}"
+# A commit tag rolls, or rolls back, one exact build. By default it is the checked-out commit: a push publishes
+# only :<sha>, and :latest, which community nodes follow, moves after the whole fleet runs a build (below).
+IMAGE="${QNET_IMAGE:-ghcr.io/aiqnetlab/qnet-production:$(git -C "$(dirname "$0")/.." rev-parse HEAD 2>/dev/null)}"
 if ! [[ "$IMAGE" =~ ^ghcr\.io/aiqnetlab/qnet-production:(latest|[0-9a-f]{40})$ ]]; then
   echo "[ERR] QNET_IMAGE must be ghcr.io/aiqnetlab/qnet-production:latest or :<40-hex commit>"; exit 1
 fi
@@ -245,7 +246,22 @@ if [ -n "$FLEET_GATE_ONLY" ]; then
     [ -n "${NODE_IP[$id]:-}" ] || { echo "[ERR] unknown node id: $id"; exit 1; }
   done
   echo "=== QNET_FLEET_GATE_ONLY: fleet M3/M4 only — nothing is pulled, stopped or recreated ==="
-  fleet_gate "$RECOVERY_RESTART_H" "${TARGETS[@]}"; exit $?
+  fleet_gate "$RECOVERY_RESTART_H" "${TARGETS[@]}" || exit 1
+  # Reads only, so :latest is not moved here; it is named for the operator when all six passed on one build.
+  fb=""
+  for n in $(printf '%s\n' "${!NODE_IP[@]}" | sort); do
+    nb=$(rsh "${NODE_IP[$n]}" "$(port_of "$n")" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r' \
+      | sed -n 's/^ok .*build=\([^ ]*\).*/\1/p')
+    if [ -z "$nb" ] || { [ -n "$fb" ] && [ "$nb" != "$fb" ]; }; then fb=""; break; fi
+    fb=$nb
+  done
+  if [ ${#TARGETS[@]} -eq ${#NODE_IP[@]} ] && [[ "$fb" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "=== :latest not moved by a gate-only run: unless this was a rollback, run"
+    echo "    gh workflow run deploy.yml --ref testnet -f promote_sha=$fb ==="
+  else
+    echo "=== :latest not moved: a gate-only run names it only when all six passed on one build ==="
+  fi
+  exit 0
 fi
 
 # ── Gate check, before any node is touched. A consensus rule ships dormant behind an activation height
@@ -747,23 +763,37 @@ done
 
 echo "=== rolled: ${TARGETS[*]} ==="
 
+# Which nodes do not report the build just rolled, and which targets this run moved back to an ancestor of the
+# build they ran (a rollback). Both the fleet gate and the :latest promotion read them.
+behind=""; back=""
+for n in $(printf '%s\n' "${!NODE_IP[@]}" | sort); do
+  nb=$(rsh "${NODE_IP[$n]}" "$(port_of "$n")" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r' \
+    | sed -n 's/^ok .*build=\([^ ]*\).*/\1/p')
+  [ -n "$NEW_BUILD" ] && [ "$nb" = "$NEW_BUILD" ] || behind="$behind $n=${nb:0:7}"
+done
+for n in "${TARGETS[@]}"; do
+  ob="${ROLLED_FROM[$n]:-}"
+  if [ -n "$NEW_BUILD" ] && [ -n "$ob" ] && [ "$ob" != "$NEW_BUILD" ] \
+     && git -C "$REPO" merge-base --is-ancestor "$NEW_BUILD" "$ob" 2>/dev/null; then
+    back="$back $n=${ob:0:7}"
+  fi
+done
+
+# :latest follows the genesis fleet: it moves to a build only once all six run it and passed their gates, so an
+# auto-updating node never runs code the fleet has not taken first (deploy.yml, promote job). Never after a rollback.
+promote_latest() {
+  if command -v gh >/dev/null 2>&1 \
+     && gh workflow run deploy.yml -R AIQnetLab/QNet-Blockchain --ref testnet -f promote_sha="$NEW_BUILD" >/dev/null 2>&1; then
+    echo "=== :latest promotion started for ${NEW_BUILD:0:7} (deploy.yml promote job) ==="
+  else
+    echo "=== :latest NOT moved: run  gh workflow run deploy.yml --ref testnet -f promote_sha=$NEW_BUILD ==="
+  fi
+}
+
 # The fleet gate of a halted chain runs here once all six report the build just rolled; until then the
 # roll that brings the last of them runs it. Not after a rollback: a target moved back to an ancestor of the
 # build it ran leaves the chain as parked as before, and the gate would only time out on it.
 if [ -n "${QNET_RECOVERY_HALTED:-}" ]; then
-  behind=""; back=""
-  for n in $(printf '%s\n' "${!NODE_IP[@]}" | sort); do
-    nb=$(rsh "${NODE_IP[$n]}" "$(port_of "$n")" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r' \
-      | sed -n 's/^ok .*build=\([^ ]*\).*/\1/p')
-    [ -n "$NEW_BUILD" ] && [ "$nb" = "$NEW_BUILD" ] || behind="$behind $n=${nb:0:7}"
-  done
-  for n in "${TARGETS[@]}"; do
-    ob="${ROLLED_FROM[$n]:-}"
-    if [ -n "$NEW_BUILD" ] && [ -n "$ob" ] && [ "$ob" != "$NEW_BUILD" ] \
-       && git -C "$REPO" merge-base --is-ancestor "$NEW_BUILD" "$ob" 2>/dev/null; then
-      back="$back $n=${ob:0:7}"
-    fi
-  done
   if [ -n "$back" ]; then
     echo "=== fleet gate not run: this run moved$back back to its ancestor ${NEW_BUILD:0:7}; the chain stays as it was ==="
   elif [ -z "$NEW_BUILD" ]; then
@@ -776,5 +806,10 @@ if [ -n "${QNET_RECOVERY_HALTED:-}" ]; then
   else
     # The parked height defaults to the highest height a node of this roll answered with at M1.
     fleet_gate "${RECOVERY_RESTART_H:-$ROLL_MAX_H}" $(printf '%s\n' "${!NODE_IP[@]}" | sort) || exit 1
+    promote_latest
   fi
+elif [ -n "$NEW_BUILD" ] && [ -z "$back" ] && [ -z "$behind" ]; then
+  promote_latest
+else
+  echo "=== :latest left as it is:${back:+ moved back$back;}${behind:+ not on ${NEW_BUILD:0:7}:$behind} ==="
 fi

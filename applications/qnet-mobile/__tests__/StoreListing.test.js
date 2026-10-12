@@ -42,8 +42,12 @@ it('the review notes name the five QNet Link sheets, what they sign, where a nod
   for (const k of ['link_title_connect', 'link_title_reserve', 'link_title_link', 'link_title_claim', 'link_title_unlink']) {
     expect([k, notes.includes(`"${translations.en[k]}"`)]).toEqual([k, true]);
   }
-  // A super node comes only from the extension and runs on a server; the app shows it and nothing more (A4).
-  expect(notes).toMatch(/A super node is registered with the QNet browser extension on a computer and runs on the user's own server with the QNet node software; the app only shows it\./);
+  // A super node comes only from the extension and runs on a server; the app shows it and moves its balance, nothing
+  // more (A4; owner, 12.10: a super node's balance moves in the app too).
+  expect(notes).toMatch(/A super node is registered with the QNet Wallet extension on a computer and runs on the user's own server with QNet Blockchain node software; the app shows it and moves its balance\./);
+  // The review notes name the system "QNet Blockchain" (owner, 12.10; every store text: the test below).
+  expect(listing).not.toMatch(/QNet('s)? (test )?network/i);
+  expect(notes).toMatch(/a non-custodial wallet for the QNet Blockchain testnet/);
   // The demo walks the payment way: the reservation sheet first, the consent after the burn.
   expect(notes).toMatch(/"Make a payment address" > "Open QNet Wallet" \(sheet 2\), send the amounts, "Burn", "Continue in QNet Wallet" > "Open QNet Wallet" \(sheet 3 with consent\)/);
   expect(notes).toMatch(/never burns or buys anything/);
@@ -89,9 +93,9 @@ it('the Play texts describe the same build: no code, no reward, the device check
   expect(whatsNew).not.toMatch(/code|aiqnet|website|cabinet|activat|reward|burn/i);
 });
 
-// CROSS-R2-08: every link the store builds and the App Store listing give to the site carries the site's app marker,
-// so the site shows its app view (explorer and policies only): no activation page, extension or APK a few taps away.
-it('the listing\'s URLs and the app\'s legal links open the site in its app view', () => {
+// Every link the store builds and the App Store listing give to the site carries the same `from=app` query, which only
+// names where the visit came from: the site shows the same pages with or without it (its ?from=app rule is gone, 11.10).
+it('the listing\'s URLs and the app\'s legal links carry the same query', () => {
   for (const label of ['Support URL', 'Marketing URL', 'Privacy Policy']) {
     const m = new RegExp(`${label}:\\s+(\\S+)`).exec(listing);
     expect([label, m && /^https:\/\/aiqnet\.io\/[a-z]+\?from=app$/.test(m[1])]).toEqual([label, true]);
@@ -102,17 +106,11 @@ it('the listing\'s URLs and the app\'s legal links open the site in its app view
   const urls = [...links.matchAll(/'(https:[^']+)'/g)].map((m) => m[1]);
   expect(urls).toHaveLength(3);
   for (const u of urls) expect([u, u.endsWith('?from=app')]).toEqual([u, true]);
-  const site = path.join(ROOT, '..', 'qnet-explorer', 'frontend', 'src', 'lib', 'activate-view.ts');
-  if (fs.existsSync(site)) {
-    const view = fs.readFileSync(site, 'utf8');
-    expect(view).toMatch(/export const FROM_APP_PARAM = 'from';/);
-    expect(view).toMatch(/export const FROM_APP_VALUE = 'app';/);
-  }
 });
 
-// R4-XPD-05: the public description itself (what a reviewer or user taps inside the store) opens the site in its app
-// view too, and names the languages the app ships in full.
-it('every aiqnet.io link in the public texts carries the app marker, and the listing names all 11 languages', () => {
+// R4-XPD-05: the public description itself (what a reviewer or user taps inside the store) carries the same query, and
+// names the languages the app ships in full.
+it('every aiqnet.io link in the public texts carries the same query, and the listing names all 11 languages', () => {
   const publicPart = listing.slice(0, listing.indexOf('APP REVIEW INFORMATION'));
   const play = fs.readFileSync(path.join(ROOT, 'store-listing', 'google-play-description.txt'), 'utf8');
   for (const [name, text] of [['app-store-listing', publicPart], ['google-play-description', play]]) {
@@ -131,7 +129,7 @@ it('every aiqnet.io link in the public texts carries the app marker, and the lis
 
 // R5-XPD-02: the Play texts that are uploaded are the ones under fastlane/metadata (google-play-description.txt only
 // points there): the full description, the short one and every "What's new" follow the same rules.
-it('the uploaded Play texts link the site only in its app view and name all 11 languages', () => {
+it('the uploaded Play texts link the site with the same query and name all 11 languages', () => {
   const dir = path.join(ROOT, '..', '..', 'fastlane', 'metadata', 'android', 'en-US');
   const full = fs.readFileSync(path.join(dir, 'full_description.txt'), 'utf8');
   const texts = [['full_description', full], ['short_description', fs.readFileSync(path.join(dir, 'short_description.txt'), 'utf8')],
@@ -172,7 +170,7 @@ it('the privacy manifest declares what the store answers: device ID, user ID, fi
   const appPrivacy = readme.slice(readme.indexOf('**App Store — App Privacy**'), readme.indexOf('## Export compliance'));
   const rows = appPrivacy.split('\n').filter((l) => /^\| [^-|]/.test(l) && !l.startsWith('| Data type |'));
   expect(rows).toEqual([
-    '| Identifiers → User ID (QNet and Solana addresses) | Yes | No | App Functionality |',
+    '| Identifiers → User ID (QNet Blockchain and Solana addresses) | Yes | No | App Functionality |',
     '| Identifiers → Device ID (push token and the device check, only while a node is linked) | Yes | No | App Functionality |',
     '| Financial Info → Other Financial Info (transactions the user signs) | Yes | No | App Functionality |',
     '| Other Data → Other Data Types (the device\'s platform and model name, only while a node is linked) | Yes | No | App Functionality |',
@@ -286,4 +284,49 @@ it('the review notes say a node is counted also when the app is opened, and clai
   expect(notes).toMatch(/offers nothing for downloads, referrals, posts, reviews or any promotional action/);
   const push = fs.readFileSync(path.join(ROOT, 'src', 'services', 'PushService.js'), 'utf8');
   expect(push).toMatch(/app open is a wakeup/); // the behaviour the sentence describes
+});
+
+// The system is named "QNet Blockchain" in every store text (owner, 12.10), and each field keeps its store limit:
+// App Store name and subtitle 30, promotional text 170, keywords 100, description 4000; Play title 30, short
+// description 80, full description 4000.
+it('every store text names the system QNet Blockchain, each field within its store limit', () => {
+  const dir = path.join(ROOT, '..', '..', 'fastlane', 'metadata', 'android', 'en-US');
+  const play = (f) => fs.readFileSync(path.join(dir, f), 'utf8').replace(/\n+$/, '');
+  const lines = listing.split('\n');
+  const field = (name) => {
+    const at = lines.findIndex((l) => l.startsWith(`${name} (`));
+    const end = lines.findIndex((l, i) => i > at + 1 && /^=+$/.test(l));
+    return lines.slice(at + 2, end).join('\n').replace(/\n+$/, '');
+  };
+  const fields = [
+    ['name', field('NAME'), 30], ['subtitle', field('SUBTITLE'), 30], ['promotional text', field('PROMOTIONAL TEXT'), 170],
+    ['keywords', field('KEYWORDS'), 100], ['description', field('DESCRIPTION'), 4000],
+    ['Play title', play('title.txt'), 30], ['Play short description', play('short_description.txt'), 80],
+    ['Play full description', play('full_description.txt'), 4000],
+  ];
+  for (const [name, text, limit] of fields) {
+    expect([name, text.length > 0 && [...text].length <= limit]).toEqual([name, true]);
+  }
+  for (const [name, text] of fields.filter(([n]) => !['name', 'Play title'].includes(n))) {
+    expect([name, text.includes('QNet Blockchain')]).toEqual([name, true]);
+  }
+  // No other name for the system in any store file; in the public texts no bare "QNet" either, only the product
+  // names QNet Wallet and QNet Link.
+  const changelogs = fs.readdirSync(path.join(dir, 'changelogs')).map((f) => [`changelogs/${f}`, play(path.join('changelogs', f))]);
+  const publicTexts = [['App Store public part', listing.slice(0, listing.indexOf('APP REVIEW INFORMATION'))],
+    ...fields.slice(5).map(([n, t]) => [n, t]), ...changelogs];
+  const all = [['app-store-listing', listing], ['README', readme],
+    ['google-play-description', fs.readFileSync(path.join(ROOT, 'store-listing', 'google-play-description.txt'), 'utf8')],
+    ...publicTexts];
+  const others = [/QNet('s)? (test )?network/i, /QNet blockchain/, /(?<!\/)QNet-Blockchain/i, /QNet chain/i,
+    /Quantum (Blockchain|Network)/i, /\bthe QNet Blockchain\b(?! (testnet|Explorer))/i];
+  for (const [name, text] of all) {
+    const flat = text.replace(/\s+/g, ' ');
+    expect([name, others.map((re) => re.exec(flat)).filter(Boolean).map((m) => m[0])]).toEqual([name, []]);
+  }
+  for (const [name, text] of publicTexts) {
+    const flat = text.replace(/\s+/g, ' ');
+    const bare = [...flat.matchAll(/\bQNet\b(?! (Blockchain|Wallet|Link)\b)/g)];
+    expect([name, bare.map((m) => flat.slice(m.index, m.index + 30))]).toEqual([name, []]);
+  }
 });

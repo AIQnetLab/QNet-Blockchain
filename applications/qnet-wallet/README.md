@@ -1,15 +1,16 @@
-# QNet browser wallet
+# QNet Wallet browser extension
 
-Manifest V3 browser extension for QNet. One recovery phrase gives the same post-quantum QNet account
-(ML-DSA-65) and the same Solana account as the QNet mobile app. The extension keeps one encrypted
-vault, signs QNC transfers and transfers of the built-in QNet tokens it holds, sends SOL and 1DEV, exports either
+Manifest V3 browser extension for QNet Blockchain. One recovery phrase gives the same post-quantum account
+on QNet Blockchain (ML-DSA-65) and the same Solana account as the QNet Wallet mobile app. The extension keeps one encrypted
+vault, signs QNC transfers and transfers of the built-in QNet Blockchain tokens it holds, sends SOL and 1DEV, exports either
 account's private key behind the password as it shows the recovery phrase, burns 1DEV for a node's activation code (one code per
-wallet), records the wallet's light node on the QNet network after that burn, and connects to aiqnet.io and
+wallet), records the wallet's light node on QNet Blockchain after that burn, and connects to aiqnet.io and
 games.aiqnet.io through a per-site, approval-gated provider that lets a page ask for QNC transfers, built-in token
-transfers and contract calls, and lets aiqnet.io ask for the burn, for a move of the node balance into the wallet and
-for the unlink of the light node's device, each shown and confirmed in the wallet's own window. It never runs a node: a
-light node runs in QNet Wallet on a phone or tablet, a super node on your own server with the QNet node software; the
-wallet key can end the light node on whatever device runs it.
+transfers and contract calls, and lets aiqnet.io ask for the burn, for a move of the balance of the wallet's light or
+super node into the wallet and for the unlink of the light node's device, each shown and confirmed in the wallet's own
+window. Its own popup has no move of a node balance: aiqnet.io's My node and QNet Wallet's Node tab offer it. It never
+runs a node: a light node runs in QNet Wallet on a phone or tablet, a super node on your own server with the QNet Blockchain
+node software; the wallet key can end the light node on whatever device runs it.
 
 Full documentation: [docs/applications/browser-wallet.md](../../docs/applications/browser-wallet.md)
 
@@ -19,9 +20,9 @@ Full documentation: [docs/applications/browser-wallet.md](../../docs/application
 npm run bundle:install   # npm ci in tools/crypto-bundle (pinned lockfile)
 npm run build            # dist/lib/qnet-core.js
 npm test                 # offline tests: bundle, modules, pages, the whole extension, the package
-npm run test:live        # read-only checks against Solana devnet and the QNet nodes
+npm run test:live        # read-only checks against Solana devnet and the QNet Blockchain nodes
 npm run build:dev        # dist-dev/: dist plus localhost content-script matches (git-ignored); again after every dist change, npm test refuses a stale one
-npm run package          # qnet-wallet-3.1.0.zip: the store package (git-ignored)
+npm run package          # qnet-wallet-3.1.2.zip: the store package (git-ignored)
 npm run check:overflow   # headless Chrome: every screen in every language, nothing overflows
 ```
 

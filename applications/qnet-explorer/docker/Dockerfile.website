@@ -16,7 +16,7 @@ RUN mkdir -p logs
 # Environment variables (can be overridden at runtime)
 ENV NODE_API_URL=http://qnet-node:8000
 ENV SITE_NAME="QNet Blockchain"
-ENV EXPLORER_NAME="QNet Explorer"
+ENV EXPLORER_NAME="QNet Blockchain Explorer"
 ENV PORT=8080
 ENV ENABLE_CACHING=true
 ENV CACHE_TIMEOUT=60

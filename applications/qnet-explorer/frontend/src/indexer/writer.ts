@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
-import { insertBlocks, insertTransactions, insertBatchTransfers, deltaOf, negate, mergeDelta, applyStatsDelta, emptyDelta, type StatsDelta, type InsertedTx } from './sql';
+import { insertBlocks, insertTransactions, insertBatchTransfers, deltaOf, negate, mergeDelta, applyStatsDelta, emptyDelta, TOP_BLOCK_SQL, type StatsDelta, type InsertedTx } from './sql';
 import type { ShapedBlock, BlockRow, TxRow } from './transform';
 import { log } from './log';
 
@@ -152,8 +152,7 @@ export class Writer {
       const removed = await deleteRows(client, txWhere, params);
       const blocks = await client.query<{ n: string }>(`WITH d AS (DELETE FROM blocks WHERE ${blockWhere} RETURNING 1) SELECT count(*)::text AS n FROM d`, params);
       removed.blocks_total = Number(blocks.rows[0]?.n || 0);
-      const top = (await client.query<{ height: string; hash: string | null; timestamp: string }>(
-        'SELECT height::text, hash, timestamp::text FROM blocks ORDER BY height DESC LIMIT 1')).rows[0];
+      const top = (await client.query<{ height: string; hash: string | null; timestamp: string }>(TOP_BLOCK_SQL)).rows[0];
       const headHeight = top ? Number(top.height) : -1;
       const head = { height: headHeight, hash: top?.hash ?? null, timestamp: top ? Number(top.timestamp) : 0 };
       const st = applyStatsDelta(negate(removed), head);
@@ -204,8 +203,7 @@ export class Writer {
     try {
       await client.query('BEGIN');
       await lockHead(client);
-      const top = (await client.query<{ height: string; hash: string | null; timestamp: string }>(
-        'SELECT height::text, hash, timestamp::text FROM blocks ORDER BY height DESC LIMIT 1')).rows[0];
+      const top = (await client.query<{ height: string; hash: string | null; timestamp: string }>(TOP_BLOCK_SQL)).rows[0];
       const head = top ? Number(top.height) : -1;
       await client.query('UPDATE sync_state SET last_height = $1, indexed_prefix = LEAST(indexed_prefix, $1) WHERE id = 1', [head]);
       await client.query('UPDATE explorer_stats SET head_height = $1, head_hash = $2, head_timestamp = $3, updated_at = now() WHERE id = 1',

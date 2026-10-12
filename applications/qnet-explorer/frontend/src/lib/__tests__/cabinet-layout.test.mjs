@@ -38,7 +38,7 @@ test('every section is a page of its own, and /node?tab= opens it', () => {
   for (const other of ['overview', undefined, '', 'x', ['devices'], 'constructor', 'hasOwnProperty', '__proto__', '/node/claim']) assert.equal(tabRoute(other), null, String(other));
   assert.deepEqual(Object.keys(MOVED_TABS).sort(), ['balance', 'code', 'devices', 'guide']);
   const page = code('app/node/page.tsx');
-  // The rest of the query goes along (the app's ?from=app marker, the guide's ?way=; LD-07).
+  // The rest of the query goes along (the guide's ?way=; LD-07).
   assert.match(page, /const \{ tab, \.\.\.rest \} = await searchParams;\s*const route = tabRoute\(tab\);\s*if \(route\) \{/);
   assert.match(page, /redirect\(kept \? `\$\{route\}\$\{route\.includes\('\?'\) \? '&' : '\?'\}\$\{kept\}` : route\);/);
   assert.match(page, /return <NodeHome explicit=\{tab === 'overview'\} \/>;/);
@@ -78,7 +78,8 @@ test('the sections of before lead to their new places', async () => {
   // Links inside the site name the new places.
   assert.match(code('components/cabinet/GuideSummary.tsx'), /<Link href=\{GUIDE_HREF\} className="qnet-button secondary">\{t\('guide_full'\)\}<\/Link>/);
   assert.match(code('components/cabinet/NodeActivate.tsx'), /<Link href=\{`\$\{GUIDE_HREF\}\?way=computer`\} className="qnet-button secondary">/);
-  assert.match(read('app/support/page.tsx'), /<a href="\/node\?tab=overview">\{t\('support_epochs_wake_link'\)\}<\/a>/);
+  // Owner, 11.10: Support sends nobody to an I'm back the site no longer has.
+  assert.doesNotMatch(read('app/support/page.tsx'), /support_epochs_wake/);
   for (const file of ['components/cabinet/NextSteps.tsx', 'components/cabinet/NodeDetails.tsx', 'components/cabinet/NodeHistory.tsx', 'components/cabinet/NodeStatus.tsx', 'components/cabinet/ActivateSteps.tsx', 'components/cabinet/NodeActivate.tsx', 'app/support/page.tsx']) {
     assert.doesNotMatch(code(file), /\/node\/(claim|code|devices|guide)\b/, file);
   }
@@ -160,8 +161,7 @@ test('the dashboard: the whole address copied by a tap, how it was connected, Di
   assert.match(code('components/cabinet/CabinetProgress.tsx'), /aria-current=\{at === 'now' \? 'step' : undefined\}/);
 });
 
-// A typed address only views: every action the wallet itself confirms asks to connect it first; I'm back, which asks
-// nothing of the wallet, stays.
+// A typed address only views: every action the wallet itself confirms asks to connect it first.
 test('a typed address views: the actions the wallet confirms ask to connect first', () => {
   assert.match(code('components/cabinet/CabinetProvider.tsx'), /viewOnly: current\?\.source === 'entered',/);
   assert.match(code('components/cabinet/NodeDevices.tsx'), /\{viewOnly \? <div className="activate-card"><ConnectFirst \/><\/div> : \(\s*<>\s*<UnlinkDevice status=\{status\} onUnlinked=\{reread\} \/>\s*<LinkDevice onLinked=\{reread\} move \/>\s*<\/>\s*\)\}/);
@@ -177,37 +177,55 @@ test('a typed address views: the actions the wallet confirms ask to connect firs
   assert.equal(TEXTS.action_activate_light, 'Activate a light node');
   assert.equal(TEXTS.action_activate_super, 'Activate a super node');
   for (const file of ['components/cabinet/NodeDevices.tsx', 'components/cabinet/NodeHistory.tsx']) {
-    assert.match(code(file), /if \(s === 'none' \|\| s === 'pending'\) return <NoNode pending=\{s === 'pending'\} \/>;/, file);
     assert.match(code(file), /if \(view\.state !== 'node'\) return <NoNode pending=\{view\.state === 'recording'\} \/>;/, file);
   }
+  // History lists the wallet's epochs whatever the light node's status read says; the Device tab follows that status.
+  assert.match(code('components/cabinet/NodeDevices.tsx'), /if \(s === 'none' \|\| s === 'pending'\) return <NoNode pending=\{s === 'pending'\} \/>;/);
   // Link your phone: the numbered steps, then Link a device in place while the site sends link requests.
   assert.match(home, /\{state === 'no_device' && <LinkPhone onLinked=\{reread\} \/>\}/);
   assert.match(steps, /\{onLinked && phoneFlows && \(viewOnly \? <div className="activate-card"><ConnectFirst \/><\/div> : <LinkDevice onLinked=\{onLinked\} \/>\)\}/);
-  assert.match(home, /\{!wake && movable && viewOnly && <ConnectFirst \/>\}/);
-  assert.match(home, /\{!wake && \(movable \|\| moved\) && !viewOnly && choice && \(/);
+  // The node balance of either type moves from here too (owner, 12.10): a typed address is asked to connect first.
+  assert.equal(home.match(/\{movable && viewOnly && <ConnectFirst \/>\}/g)?.length, 2);
+  assert.equal(home.match(/\{\(movable \|\| moved\) && !viewOnly && choice && \(/g)?.length, 2);
   // Connecting leaves the typed address (no Disconnect); the connect screen, or the extension's wallet, follows.
   assert.match(code('components/cabinet/ConnectFirst.tsx'), /<button type="button" className="qnet-button activate-primary" onClick=\{leaveView\}>\{t\('connect_first_button'\)\}<\/button>/);
 });
 
-test('the Overview offers the one next step in place: activate, link a device, I\'m back, or move the balance', () => {
+test('the Overview offers the one next step in place: activate, link a device, or run the node on the phone again', () => {
   const home = code('components/cabinet/NodeHome.tsx');
-  assert.match(home, /const wake = state === 'offline' && canWake\(status\);/);
-  // Owner, 04.10: I'm back in one place only, inside the status card right under the device rows; the Device tab leads
-  // there from an Offline device's row and shows no copy of its own.
-  assert.match(home, /<h3 className="activate-step">\{t\('overview_title'\)\}<\/h3>\s*<DeviceRows status=\{status\} viewOnly=\{viewOnly\} \/>\s*\{wake && <WakePanel nodeId=\{nodeId\} status=\{status\} refresh=\{refresh\} \/>\}/);
-  assert.equal(home.match(/<WakePanel/g)?.length, 1);
-  for (const file of ['components/cabinet/NodeDevices.tsx', 'components/cabinet/NodeHistory.tsx', 'components/cabinet/NodeActivate.tsx', 'components/cabinet/NextSteps.tsx']) {
-    assert.doesNotMatch(code(file), /WakePanel/, file);
+  // Owner, 11.10: no I'm back. The network wakes a phone that holds the node every epoch, an app that is alive answers
+  // once it is opened, and a phone whose push address is gone cannot be woken: the Offline card's one action, right
+  // under the device rows, is to run the node on the phone again, the link request (the app's Node tab while the site
+  // sends no link requests). Nothing says the network has not agreed.
+  assert.match(home, /<h3 className="activate-step">\{t\('overview_title'\)\}<\/h3>\s*<DeviceRows status=\{status\} viewOnly=\{viewOnly\} \/>\s*\{\}\s*\{state === 'offline' && !viewOnly && <LinkDevice onLinked=\{reread\} relink \/>\}/);
+  for (const file of ['components/cabinet/NodeHome.tsx', 'components/cabinet/NodeDevices.tsx', 'components/cabinet/NodeHistory.tsx', 'components/cabinet/NodeActivate.tsx', 'components/cabinet/NextSteps.tsx', 'components/cabinet/NodeStatus.tsx']) {
+    assert.doesNotMatch(code(file), /WakePanel|canWake|cabinet\/wake|device_wake_overview/, file);
   }
-  assert.match(code('components/cabinet/NodeDevices.tsx'), /\{s === 'offline' && canWake\(status\) && <p><Link href=\{TAB_HREF\.overview\}>\{t\('device_wake_overview'\)\}<\/Link><\/p>\}/);
-  const panel = code('components/cabinet/WakePanel.tsx');
-  assert.doesNotMatch(panel, /activate-card|activate-step|wake_title/);
-  // A move the wallet answered keeps its report once the balance, read again, falls below 1 QNC (as on Node balance).
-  assert.match(home, /<Move\s+qnet=\{choice\.qnet\}\s+movable=\{movable\}\s+onAnswer=\{\(\) => \{\s+setMoved\(true\);\s+reread\(\);\s+\}\}\s+\/>/);
-  // The balance moves with the Node balance page's own component, never a copy of its logic.
+  for (const file of ['components/cabinet/WakePanel.tsx', 'lib/cabinet/wake.ts', 'server/cabinet/wake.ts', 'app/api/cabinet/wake/route.ts']) {
+    assert.equal(existsSync(new URL(file, SRC)), false, file);
+  }
+  assert.equal(Object.keys(TEXTS).some((k) => k.startsWith('wake_') || k === 'device_wake_overview'), false);
+  for (const [key, text] of Object.entries(TEXTS)) assert.doesNotMatch(text, /I'm back|not agreed|has not agreed/, key);
+  const link = code('components/cabinet/LinkDevice.tsx');
+  assert.match(link, /if \(!phoneFlows && relink\) return <p className="activate-note">\{t\('relink_closed'\)\}<\/p>;/);
+  // On a computer the same request shows a QR code for the phone: the button names that phone, not "this phone".
+  assert.match(link, /const label: MessageKey = relink \? \(device && !device\.phone \? 'relink_button_qr' : 'relink_button'\) : title;/);
+  assert.match(link, /if \(device\.phone\) void button\.start\('link', request\(false\)\);\s*else void qr\.start\('link', request\(true\)\);/);
+  assert.match(link, /if \(relink\) return <div className="cabinet-choice">\{body\}<\/div>;/);
+  assert.equal(TEXTS.relink_button, 'Run the node on this phone');
+  assert.equal(TEXTS.relink_button_qr, 'Run the node on that phone');
+  // A phone that no longer holds the node shows none in QNet Wallet (no binding of its own), so it is linked again
+  // from this page.
+  assert.match(TEXTS.relink_closed, /running it there again from this page opens soon\.$/);
+  // "Answered this epoch" never makes the node Running: step 4 follows the device's state alone (tabs.ts).
+  assert.doesNotMatch(code('lib/cabinet/tabs.ts'), /answeredThisEpoch/);
+  // A move the wallet answered keeps its report once the balance, read again, falls below 1 QNC (owner, 12.10: for a
+  // light and a super node).
+  assert.match(home, /<Move\s+qnet=\{choice\.qnet\}\s+nodeId=\{nodeId\}\s+movable=\{movable\}\s+onAnswer=\{\(\) => \{\s+setMoved\(true\);\s+reread\(\);\s+\}\}\s+\/>/);
+  // The balance moves with the one component that asks the wallets, never a copy of its logic.
   assert.match(home, /import \{ Move \} from '\.\/NodeClaim';/);
   assert.match(code('components/cabinet/NodeClaim.tsx'), /export function Move\(/);
-  assert.equal(TEXTS.epoch_note, 'The network checks each node once per epoch, a period of about 4 hours.');
+  assert.equal(TEXTS.epoch_note, 'QNet Blockchain checks each node once per epoch, a period of about 4 hours.');
 });
 
 test('one connect logic: the header connects the extension or leads to My node, and shows the wallet My node remembers', () => {
@@ -330,26 +348,59 @@ test('a phone without QNet Wallet is told where to get it, and a node read is ne
   assert.match(code('components/Header.tsx'), /aria-label="Toggle menu" aria-expanded=\{isMenuOpen\}/);
 });
 
-// Owner, 29.09: real epochs everywhere, no placeholders; a wallet without a node is told so, with the way on.
-test('the epochs: every one on History with the ones still in the node balance, the newest on the Overview', () => {
+// Owner, 29.09 and 11.10: real epochs everywhere, no placeholders and no count over a window of recent epochs; History
+// is one list of the epochs themselves, a page at a time; a wallet without a node is told so, with the way on.
+test('the epochs: one list on History, a page at a time with Show more, the newest on the Overview, no count of the last epochs', () => {
   const history = code('components/cabinet/NodeHistory.tsx');
-  for (const key of ['history_col_epoch', 'history_col_ended', 'history_col_result', 'history_col_amount', 'history_col_moved']) assert.ok(history.includes(`t('${key}')`), key);
-  for (const result of ['counted', 'moved', 'missed', 'joined', 'unchecked', 'unknown']) assert.ok(TEXTS[`history_${result}`], result);
-  assert.match(history, /<Link href=\{`\/explorer\/tx\/\$\{row\.claimTx\}`\} className="activate-mono">/);
-  assert.match(history, /const waiting = view\.rows\.filter\(\(r\) => r\.result === 'counted'\);/);
-  // Without the registration's epoch, epochs from before the node may be listed: one not counted is not called missed.
-  assert.match(history, /const startKnown = view\.registeredEpoch !== null;/);
-  assert.match(history, /\{t\(row\.result === 'missed' && !startKnown \? 'history_not_counted' : RESULT_TEXT\[row\.result\]\)\}/);
-  assert.equal(history.match(/<Table rows=\{[^}]+\} startKnown=\{startKnown\} \/>/g)?.length, 4);
-  assert.equal(TEXTS.history_not_counted, 'Not counted');
-  assert.match(history, /\{!startKnown && <p className="activate-note">\{t\('history_no_start'\)\}<\/p>\}/);
-  assert.match(history, /\{!view\.archived && <p className="activate-note">\{t\('history_no_archive'\)\}<\/p>\}/);
-  assert.match(code('components/cabinet/NodeHome.tsx'), /<Epochs nodeId=\{nodeId\} show="recent" \/>/);
-  assert.match(history, /<h3 className="activate-step">\{t\('claim_epochs_title'\)\}<\/h3>\s*<Epochs nodeId=\{nodeId\} show="balance" \/>/);
+  for (const key of ['history_col_epoch', 'history_col_time', 'history_col_result', 'history_col_amount']) assert.ok(history.includes(`t('${key}')`), key);
+  assert.equal(history.match(/<th scope="col">/g)?.length, 4);
+  for (const result of ['counted', 'moved', 'missed', 'joined', 'unchecked', 'not_admitted', 'unknown']) assert.ok(TEXTS[`history_${result}`], result);
+  // A super node outside the network's admission: "Not admitted", never "Not counted", with the note that says why.
+  assert.equal(TEXTS.history_not_admitted, 'Not admitted');
+  assert.match(history, /not_admitted: 'history_not_admitted',/);
+  assert.match(history, /\{has\('not_admitted'\) && <p className="activate-note">\{t\('history_not_admitted_note'\)\}<\/p>\}/);
+  assert.match(TEXTS.history_not_admitted_note, /That is the network's admission, not missed heartbeats\.$/);
+  // "Missed" and "Not counted" are one word.
+  assert.equal(TEXTS.history_missed, 'Not counted');
+  assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'history_not_counted'), false);
+  // An epoch's time is its start and end; a moved epoch's result links to the move.
+  assert.match(history, /<td>\{span\(row\)\}<\/td>/);
+  assert.equal(TEXTS.history_span, '{start} – {end}');
+  assert.match(history, /\{row\.claimTx \? <Link href=\{`\/explorer\/tx\/\$\{row\.claimTx\}`\}>\{t\(RESULT_TEXT\[row\.result\]\)\}<\/Link> : t\(RESULT_TEXT\[row\.result\]\)\}/);
+  // One table on History: the first page (the Overview's shared read), then the older pages on Show more, joined.
+  assert.equal(history.match(/<Table rows=\{[^}]+\} \/>/g)?.length, 2);
+  assert.match(history, /const list = useEpochList\(nodeId, first\);/);
+  assert.match(history, /if \(!list\.more\) return null;/);
+  assert.match(history, /<button type="button" className="qnet-button secondary" onClick=\{list\.showMore\} disabled=\{list\.phase === 'reading'\}>\{t\(label\)\}<\/button>/);
+  assert.match(history, /list\.phase === 'reading' \? 'history_more_loading' : list\.phase === 'failed' \? 'try_again' : 'history_more'/);
+  assert.match(history, /\{list\.phase === 'failed' && <p className="activate-error" role="alert">\{t\('history_more_failed'\)\}<\/p>\}/);
+  // The notes the rows call for.
+  assert.match(history, /\{has\('unchecked'\) && <p className="activate-note">\{t\('history_unchecked_note'\)\}<\/p>\}/);
+  // An unreadable epoch: "kept about six weeks" only for one at least EPOCHS_KEPT behind the newest listed (a recent one
+  // is one the nodes did not give now).
+  assert.match(history, /\{unknown\.some\(\(r\) => newest - r\.epoch < EPOCHS_KEPT\) && <p className="activate-note">\{t\('history_unknown_note'\)\}<\/p>\}/);
+  assert.match(history, /\{unknown\.some\(\(r\) => newest - r\.epoch >= EPOCHS_KEPT\) && <p className="activate-note">\{t\('history_retention_note'\)\}<\/p>\}/);
+  assert.match(code('lib/cabinet/node-view.ts'), /export const EPOCHS_KEPT = 256;/);
+  assert.doesNotMatch(TEXTS.history_unknown_note, /six weeks/);
+  assert.match(history, /\{first\.registeredEpoch === null && <p className="activate-note">\{t\('history_no_start'\)\}<\/p>\}/);
+  assert.match(history, /\{!first\.archived && <p className="activate-note">\{t\('history_no_archive'\)\}<\/p>\}/);
+  // A light and a super node alike, one list for a wallet with both, read by whichever id it has, whatever the light
+  // node's status read says.
+  assert.match(history, /const id = view\.nodes\.includes\('light'\) && nodeId \? nodeId : view\.nodes\.includes\('super'\) \? superId : null;/);
+  assert.match(history, /return id \? <EpochCard key=\{id\} nodeId=\{id\} \/> : null;/);
+  assert.doesNotMatch(history, /useNodeStatus\(|StatusGate|LightHistory/);
   assert.match(history, /<Epochs nodeId=\{nodeId\} show="all" \/>/);
+  // The Overview: the newest rows of the same read, and the way to every epoch.
+  assert.equal(code('components/cabinet/NodeHome.tsx').match(/<Epochs nodeId=\{nodeId\} show="recent" \/>/g)?.length, 2);
+  assert.match(history, /<Table rows=\{view\.rows\.slice\(0, 6\)\} \/>/);
   assert.match(history, /<Link href=\{TAB_HREF\.history\} className="qnet-button secondary">\{t\('history_see_all'\)\}<\/Link>/);
+  // No count over the last epochs, on History or the Overview, for a light or a super node; no separate lists of the
+  // epochs waiting to be moved or of earlier ones.
+  for (const file of ['components/cabinet/NodeHistory.tsx', 'components/cabinet/NodeHome.tsx', 'components/cabinet/NodeStatus.tsx', 'components/cabinet/NodeDevices.tsx']) {
+    assert.doesNotMatch(code(file), /CountedRow|SuperEpochCounts|t\('counted'|super_epochs|claim_epochs|history_earlier|sinceRegistration|counted\.counted/, file);
+  }
   // No text speaks of earnings here either.
-  for (const key of Object.keys(TEXTS).filter((k) => /^(history|claim_epochs|next)_/.test(k))) assert.doesNotMatch(TEXTS[key], /reward|\bearn/i, key);
+  for (const key of Object.keys(TEXTS).filter((k) => /^(history|next)_/.test(k))) assert.doesNotMatch(TEXTS[key], /reward|\bearn/i, key);
 });
 
 // Owner, 30.09, 04.10 and 06.10: the Device tab shows the linked device from the public status (its state, its model
@@ -367,7 +418,7 @@ test('the Device tab: the linked device\'s rows, unlink signed by the wallet, mo
   assert.match(rows, /\? <p>\{last === null \? t\('device_no_answer'\) : t\('device_last_answer', \{ epoch: number\(last\) \}\)\}<\/p>/);
   assert.match(rows, /const DAY = new Intl\.DateTimeFormat\('en', \{ year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' \}\);/);
   for (const [key, words] of [['device_platform_android', 'Android'], ['device_platform_ios', 'iPhone or iPad'], ['device_platform_unknown', 'Unknown device'],
-    ['device_no_answer', 'No answer yet'], ['badge_waiting', 'Waiting'], ['unlink_title_wallet', 'Unlink the device'], ['device_wake_overview', 'Wake it from Overview']]) {
+    ['device_no_answer', 'No answer yet'], ['badge_waiting', 'Waiting'], ['unlink_title_wallet', 'Unlink the device']]) {
     assert.equal(TEXTS[key], words, key);
   }
   const unlink = code('components/cabinet/UnlinkDevice.tsx');
@@ -387,7 +438,7 @@ test('the Device tab: the linked device\'s rows, unlink signed by the wallet, mo
   assert.doesNotMatch(unlink, /fetch\(|\/api\/cabinet/);
   const link = code('components/cabinet/LinkDevice.tsx');
   assert.match(link, /const title: MessageKey = move \? 'devices_move_title' : 'action_link_device';/);
-  assert.match(link, /\{t\(move \? 'devices_move_lead' : 'devices_link_lead'\)\}/);
+  assert.match(link, /\{t\(relink \? 'relink_lead' : move \? 'devices_move_lead' : 'devices_link_lead'\)\}/);
   for (const key of ['unlink_title', 'unlink_lead', 'unlink_button', 'unlink_lost', 'unlink_closed', 'unlink_answer_ok', 'unlink_answer_unconfirmed',
     'link_error_NOT_LINKED', 'link_error_UNLINK_REFUSED', 'unlink_error_NOT_LINKED', 'unlink_error_NETWORK', 'unlink_error_UNLINK_REFUSED',
     'devices_move_title', 'devices_move_lead', 'devices_last_counted', 'devices_not_counted']) {

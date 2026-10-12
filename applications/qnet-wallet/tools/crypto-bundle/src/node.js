@@ -1,5 +1,6 @@
 // The light node messages the extension builds and signs (docs/protocols/light-node-messages.md): the app's builders,
-// one copy for both wallets. The extension never runs a node, so the device and ping-key builders stay out.
+// one copy for both wallets. The extension never runs a node, so the device and ping-key builders stay out. The claim
+// quote names the wallet's light or super node (the node a site's move names: QNet Link v1 section 14.4).
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 import {
   claimPayloadPreimage,
@@ -9,6 +10,7 @@ import {
   ownerBindPreimage,
   registrationProof,
   statusPreimage,
+  superNodeId,
   walletUnbindPreimage,
 } from '../../../../qnet-mobile/src/crypto/NodePreimages.js';
 import { eonFromPublicKeyBytes } from '../../../../qnet-mobile/src/crypto/WalletIdentity.js';
@@ -17,6 +19,8 @@ import { fail } from './errors.js';
 import { ML_DSA65, signChecked } from './signing.js';
 import { signSolanaMessage, verifySolanaSignature } from './solana.js';
 
+// `superNodeId`: the wallet's super node id as the node names it (generate_super_node_pseudonym), whose claim quote the
+// signer below also takes.
 export {
   claimPayloadPreimage,
   claimQuotePreimage,
@@ -26,6 +30,7 @@ export {
   publicKeySha3,
   registrationProof,
   statusPreimage,
+  superNodeId,
   walletUnbindPreimage,
 } from '../../../../qnet-mobile/src/crypto/NodePreimages.js';
 
@@ -73,13 +78,20 @@ export function signOwnerBind({ nodeId, wallet, burnTx, ts }, walletPublicKey, b
   return { preimage, signature };
 }
 
+// The claim quote of one of the wallet's own nodes, its light or its super node, computed here from the wallet: never a
+// node a caller names otherwise. The shared builder takes either id.
+function ownClaimQuote(nodeId, wallet) {
+  if (nodeId !== built(() => lightNodeId(wallet)) && nodeId !== built(() => superNodeId(wallet))) fail('INVALID_NODE_MESSAGE');
+  return built(() => claimQuotePreimage(nodeId, wallet));
+}
+
 /**
- * Step 1 of moving the node balance: ML-DSA-65 over q1337|claim_rewards:{N}:{W}. Self-verified.
+ * Step 1 of moving the node balance: ML-DSA-65 over q1337|claim_rewards:{N}:{W}, N the wallet's light or super node id.
+ * Self-verified.
  * @returns {{preimage: string, signature: Uint8Array}}
  */
 export function signClaimQuote({ nodeId, wallet }, secretKey, publicKey) {
-  ownNode(nodeId, wallet);
-  const preimage = built(() => claimQuotePreimage(nodeId, wallet));
+  const preimage = ownClaimQuote(nodeId, wallet);
   return { preimage, signature: signChecked(wallet, preimage, secretKey, publicKey) };
 }
 

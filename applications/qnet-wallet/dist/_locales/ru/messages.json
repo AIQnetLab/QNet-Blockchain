@@ -1,10 +1,10 @@
 {
   "extName": {
-    "message": "QNet Кошелёк",
+    "message": "QNet Wallet",
     "description": "Extension name in the browser and the store."
   },
   "extDescription": {
-    "message": "Постквантовый кошелёк QNet (ML-DSA-65) с аккаунтом Solana. Активирует Light- или Super-ноду QNet и записывает Light-ноду.",
+    "message": "Постквантовый кошелёк для QNet Blockchain (ML-DSA-65) с аккаунтом Solana. Активирует Light- или Super-ноду и записывает Light-ноду.",
     "description": "Store and extensions-page description, at most 132 characters."
   }
 }

@@ -1,4 +1,4 @@
-# QNet Wallet extension 3.1.0: contracts
+# QNet Wallet extension 3.1.2: contracts
 
 This file is the single agreement between the modules of the rebuilt extension. The rebuild spec and the
 three audit reports (ext-secrets, ext-surface, ext-crypto) are normative; this file turns them into
@@ -24,7 +24,7 @@ Implementation areas:
 | Area | Files |
 |---|---|
 | A. Vault and session | `background/vault.js`, `session.js`, `keys.js` |
-| B. Chains and activation | `background/qnet.js`, `solana.js`, `activation.js`, `nodes.js` (the light node on the QNet network: its registration and the move of its node balance, section 4.10) |
+| B. Chains and activation | `background/qnet.js`, `solana.js`, `activation.js`, `nodes.js` (the wallet's nodes on QNet Blockchain: the light node's registration and the unlink of its device, and the move of the balance of the light or super node a site names, section 4.10) |
 | C. dApp | `background/provider.js`, `content/relay.js`, `inject/provider.js` |
 | D. Pages | `ui/popup.*`, `ui/setup.*`, `ui/approve.*`, `ui/kit.js`, `ui/i18n/*`, `ui/qr.js`, the area-D functions of `ui/common.js`, `_locales/*` |
 
@@ -43,7 +43,7 @@ short comments only for a non-obvious why. Never `innerHTML`, `outerHTML`, `inse
 `CoreError` from qnet-core passes through with its code when that code is in `ERROR_MESSAGES`. Any
 other error becomes `INTERNAL`. The router sends a fixed message per code, never the thrown text, so
 an error can never carry a secret, address, amount or code. Extras: `BACKOFF` carries `retryAfterMs`;
-`INVALID_PARAMS` carries `field`. The provider maps errors with `toProviderError` (section 4.5). A new
+`INVALID_PARAMS` carries `field`; `BALANCE_UNCONFIRMED` carries `walkSteps` while a long walk is why (decision 49). The provider maps errors with `toProviderError` (section 4.5). A new
 code is a contract change (add it to `ERROR_MESSAGES` in one small edit).
 
 **Numbers and bytes.**
@@ -70,8 +70,7 @@ secret is ever put in `chrome.storage.local`, `localStorage`, `sessionStorage`, 
 error, a notification or a badge. A JS string cannot be wiped, so a derivation never turns a secret into
 one: `core.entropyToSeed` builds the phrase's UTF-8 in a buffer and `core.walletXi` the seed string's
 hex, both zeroized after use. The phrase exists as a string only where it must: setup's words, the
-`vault.create` / `vault.import` / `vault.restore` params (the popup's restore field is emptied as the
-request leaves), the `vault.reveal` result, the words the Copy button of setup or of the reveal puts on the
+`vault.create` / `vault.import` params, the `vault.reveal` result, the words the Copy button of setup or of the reveal puts on the
 clipboard after an explicit click (section 8), and, in the worker only, the phrase `vault.migrate` reads out of the
 earlier version's record or its pages' copy (its bytes decoded alone, never the keys beside it, the decrypted bytes
 zeroized; section 5, Earlier version). `test/vault-session-heap.test.mjs` checks a heap snapshot after lock (R24).
@@ -84,7 +83,7 @@ newPassword, code`. The only exceptions: `vault.reveal` may return `mnemonic`, `
 `privateKey` (decision 40), `activation.burn` and `activation.copy` may return `code`
 (`RESULT_KEY_EXCEPTIONS`), and the dApp results of `qnet_activateNode` and `qnet_getActivation` may carry `code`
 (`PROVIDER_RESULT_KEY_EXCEPTIONS`). The router enforces this and answers `INTERNAL` (UI) or `-32603` (dApp) instead
-of an unsafe result. The light node's results (`activation.register`, `activation.registration`, `qnet_claimNodeBalance`, `node.unlinkView`,
+of an unsafe result. The node results (`activation.register`, `activation.registration`, `qnet_claimNodeBalance`, `node.unlinkView`,
 `node.unlink`, `qnet_unlinkNodeDevice`) carry only public values (node id, states, amounts, hashes, the device's platform and
 day) and need no exception.
 
@@ -135,7 +134,7 @@ when marked activity (a failed touch is only logged).
 Pages: P popup, S setup, A approve. U: requires unlocked. T: a success extends the auto-lock deadline.
 Field types: `password` string 1..1024; `mnemonic` string 1..1024; `qnetAddress` EON with valid
 checksum; `solanaAddress` canonical base58 of 32 bytes; `qnc` canonical decimal > 0, at most 9
-decimals, <= u64 nano; `u64` canonical u64 decimal string; `uuid` lowercase v4; `restoreToken` 64
+decimals, <= u64 nano; `u64` canonical u64 decimal string; `uuid` lowercase v4; `resetToken` 64
 lowercase hex characters.
 
 | Type | Pages | U | T | Params | Result | Errors (besides router errors) |
@@ -151,8 +150,8 @@ lowercase hex characters.
 | `vault.reveal` | P | U | T | `{password}` | `{mnemonic}` (the only response with this vault's phrase) | `BACKOFF, BAD_PASSWORD` |
 | `vault.exportKey` | P | U | T | `{password, network: 'qnet'\|'solana'}` (decision 40) | `{network, address, privateKey}`: QNet the 32-byte ML-DSA-65 KeyGen seed as 64 lowercase hex characters, Solana the 64-byte secret key (private seed, then public key) in base58; derived and checked against the session's address after a fresh password check (the only response with a private key) | `BACKOFF, BAD_PASSWORD, SIGNING_DISABLED, ADDRESS_MISMATCH, NO_VAULT` |
 | `vault.wipe` | P | | | `{password, confirm: 'DELETE'}` | `{wiped: true}` | `NO_VAULT, BACKOFF, BAD_PASSWORD, INTERNAL` |
-| `vault.restoreBegin` | P | | | `{}` | `{token: restoreToken, expiresAt}` (section 5, Restore) | `NO_VAULT` |
-| `vault.restore` | P | | | `{token: restoreToken, mnemonic, password, confirm?: 'ERASE', replaceOther?: boolean}` (phrase canonicalized; `confirm`: the user confirmed the reset; `replaceOther`: the phrase is another wallet's, as the check answered) | `{status: 'restored', qnet, solana, lockDeadline: number\|null}` (`lockDeadline` null: the screen locked meanwhile and the new vault stays locked) or `{status: 'confirm', erased: {qnet, solana}\|null, restored: {qnet, solana}, otherWallet: boolean}` (no `confirm`, or another wallet without `replaceOther`: nothing erased, the token stays valid; `erased` null: the stored record does not parse) | `RESTORE_EXPIRED, WEAK_PASSWORD, INVALID_MNEMONIC, NO_VAULT, SIGNING_DISABLED, VAULT_CORRUPT, ADDRESS_MISMATCH, INTERNAL` |
+| `vault.resetBegin` | P | | | `{}` | `{token: resetToken, expiresAt}` (section 5, Reset) | `NO_VAULT, UNLOCKED` |
+| `vault.reset` | P | | | `{token: resetToken, confirm: 'ERASE'}` (no password: it is forgotten; `confirm`: the user pressed Reset wallet, never typed) | `{wiped: true}`: everything `vault.wipe` erases, erased only while locked (section 5, Reset) | `RESET_EXPIRED, NO_VAULT, UNLOCKED, INTERNAL` |
 | `wallet.addresses` | PA | U | | none | `{qnet, solana}` | |
 | `wallet.cached` | P | U | | none | `{qnetBalance: QnetBalance\|null, qnetHistory: {items, cursor, pending}\|null, solanaBalances: SolanaBalances\|null, solanaHistory: {items, cursor}\|null, qnetTokens: TokenList\|null}`: the last answer of each this session served (decision 39: `qnet.balance`, `qnet.tokens`, `solana.balances`, and `qnet.history` / `solana.history` without a cursor), null for one not read yet; dropped by every lock and every new session. A balance view (`qnetBalance` when verified, `qnetTokens`, `solanaBalances`) not read in this session comes from the vault's chain cache, where the last one is kept across sessions (decision 40) | |
 | `qnet.balance` | P | U | | none | `QnetBalance` | `NETWORK, BALANCE_UNCONFIRMED` |
@@ -162,6 +161,7 @@ lowercase hex characters.
 | `qnet.tokenSend` | P | U | T | `{token, to, amount, expectedFeeNano: u64, expectedDepositNano: u64, expectedNonce?: u64}` | `{txHash: string\|null, status: 'submitted'\|'unknown', nonce, from}` (`qnet.sendCall`, a site's token transfer's path and checks) | those of `qnet.sendCall`, `INVALID_PARAMS, INVALID_AMOUNT` |
 | `qnet.txLookup` | P | U | | `{hash}` (16..128 letters and digits) | `{status: 'in_block'\|'unknown', blockHeight: number\|null}`: whether two pinned nodes list the transaction in a block at the same height (the History detail of an unverified row) | |
 | `qnet.preview` | P | U | | `{to: qnetAddress, amount: qnc, replaceNonce?: u64}` (`replaceNonce`: review a transfer that replaces the outstanding one of that nonce) | `TransferPreview` with `recipient: RecipientCheck\|null`; a recipient that is a contract gets no review (`qnet.assertPayableRecipient`, EXT-R2A-01) | `NETWORK, BALANCE_UNCONFIRMED, BALANCE_FOREIGN_PENDING, NONCE_UNAVAILABLE, NONCE_CHANGED, INVALID_AMOUNT, RECIPIENT_IS_CONTRACT, RECIPIENT_UNCHECKED` |
+| `qnet.sendWarm` | P | U | | `{to?: qnetAddress}` | `{started: true}`: starts, without waiting, what a QNC review reads (decision 48): the wallet's own certified balance unless a kept one stands, and with `to` that recipient's certified account leaf and the archive page the recipient check reads | `INVALID_ADDRESS` |
 | `qnet.send` | P | U | T | `{to, amount: qnc, expectedFeeNano: u64, expectedNonce?: u64, replaceNonce?: u64}` | `{txHash: string\|null, status: 'submitted'\|'unknown', nonce}` (`txHash`: what one node returned, not shown or linked: R2-EXTQ-06) | `SIGNING_DISABLED, FEE_CHANGED, NONCE_CHANGED, NONCE_UNAVAILABLE, BALANCE_UNCONFIRMED, BALANCE_FOREIGN_PENDING, INSUFFICIENT_FUNDS, TOO_MANY_PENDING, NODE_REJECTED, NETWORK, RECIPIENT_IS_CONTRACT, RECIPIENT_UNCHECKED` |
 | `solana.balances` | P | U | | none | `SolanaBalances` | `SOLANA_UNAVAILABLE` |
 | `solana.history` | P | U | | `{cursor?: string\|null (printable ASCII <= 512), limit?: 1..LIMITS.SOLANA_HISTORY_PAGE_MAX (25)}` (decision 39) | `{items: SolanaHistoryItem[], cursor: string\|null}`: the wallet's own Solana transactions, newest first, at confirmed (section 2.5) | `SOLANA_UNAVAILABLE`, `INVALID_PARAMS` (a cursor it did not give) |
@@ -169,13 +169,13 @@ lowercase hex characters.
 | `solana.send` | P | U | T | quote params (the same `references` and `memo`) + `{expectedFeeLamports: u64, expectedRentLamports: u64}` | `{signature, status: 'finalized'\|'confirmed'\|'submitted', lastValidBlockHeight: number\|null}`: sent, and its status read once (`submitted`: not confirmed at that read; the popup follows it with `solana.status`); `lastValidBlockHeight` of its blockhash | `SIGNING_DISABLED, FEE_CHANGED, INSUFFICIENT_SOL, INSUFFICIENT_TOKENS, AMOUNT_BELOW_RENT, SOL_BELOW_RENT, BLOCKHASH_EXPIRED` (simulation found the blockhash gone: nothing sent, review again), `SIMULATION_FAILED, TX_FAILED, SOLANA_UNAVAILABLE, TX_TOO_LARGE` |
 | `solana.max` | P | U | | `{asset: 'sol'\|'1dev', to?: solanaAddress}` (the send form's Max; `to`: the recipient typed so far) | `{amount, amountRaw}`: SOL, the balance at confirmed less this transfer's fee (the account ends empty); a token, its whole balance | `SOLANA_UNAVAILABLE, INVALID_ADDRESS, INSUFFICIENT_SOL, INSUFFICIENT_TOKENS, SOL_BELOW_RENT, AMOUNT_BELOW_RENT` |
 | `solana.status` | P | U | | `{signature: base58 of 64 bytes, lastValidBlockHeight?: safe integer >= 0 \| null}` (from `solana.send`) | `{status: 'pending'\|'confirmed'\|'finalized'\|'failed'\|'expired'}`: `failed` only at confirmed or finalized; `expired`: no trace of it once the finalized height passed its `lastValidBlockHeight`, looked up again after that height was read (nothing spent) | `SOLANA_UNAVAILABLE` |
-| `activation.status` | P | U | | none | `{activation: PublicActivation\|null, pending: PendingBurn\|null, busy: boolean, superseded: PublicBurn\|null, registration: RegistrationView\|null}` (`registration`: the light activation's record on the QNet network, section 4.10; null for none, a Super activation, or an activation of an earlier build) | |
-| `activation.lookup` | P | U | | none | `ActivationLookup` (section 2.5; decision 35): the Activate tab's one view of the vault, aiqnet.io's record of the wallet's burn, the QNet network and the shared search of the wallet's own address; never a code | |
+| `activation.status` | P | U | | none | `{activation: PublicActivation\|null, pending: PendingBurn\|null, busy: boolean, superseded: PublicBurn\|null, registration: RegistrationView\|null}` (`registration`: the light activation's record on QNet Blockchain, section 4.10; null for none, a Super activation, or an activation of an earlier build) | |
+| `activation.lookup` | P | U | | none | `ActivationLookup` (section 2.5; decision 35): the Activate tab's one view of the vault, aiqnet.io's record of the wallet's burn, QNet Blockchain and the shared search of the wallet's own address; never a code | |
 | `activation.price` | P | U | | none | `PriceQuote` | `PRICE_UNAVAILABLE` |
-| `activation.burn` | P | U | T | `{nodeType: 'light'\|'super', expectedPrice: 1..1e9 integer}` (no password: the unlocked session and the popup's acknowledged press, decision 33) | `{status: 'finalized', code, activation: PublicActivation}` or `{status: 'pending', burnTx}` | `BURN_IN_PROGRESS, ALREADY_ACTIVATED, BURN_EXISTS, BURN_UNUSABLE, ACTIVATION_RECORDED, ACTIVATION_RESERVED, RECORD_UNAVAILABLE` (aiqnet.io's record of the wallet's burn, its reservation, or no answer from it: nothing signed or sent, decision 35), `NODE_EXISTS, NETWORK` (the QNet network could not vouch that the wallet has no node: nothing signed), `PRICE_UNAVAILABLE, PRICE_CHANGED, PHASE_UNSUPPORTED, INSUFFICIENT_SOL, INSUFFICIENT_TOKENS, SIMULATION_FAILED, TX_FAILED, SOLANA_UNAVAILABLE, HISTORY_TOO_LONG, SIGNING_DISABLED` |
+| `activation.burn` | P | U | T | `{nodeType: 'light'\|'super', expectedPrice: 1..1e9 integer}` (no password: the unlocked session and the popup's acknowledged press, decision 33) | `{status: 'finalized', code, activation: PublicActivation}` or `{status: 'pending', burnTx}` | `BURN_IN_PROGRESS, ALREADY_ACTIVATED, BURN_EXISTS, BURN_UNUSABLE, ACTIVATION_RECORDED, ACTIVATION_RESERVED, RECORD_UNAVAILABLE` (aiqnet.io's record of the wallet's burn, its reservation, or no answer from it: nothing signed or sent, decision 35), `NODE_EXISTS, NETWORK` (QNet Blockchain could not vouch that the wallet has no node: nothing signed), `PRICE_UNAVAILABLE, PRICE_CHANGED, PHASE_UNSUPPORTED, INSUFFICIENT_SOL, INSUFFICIENT_TOKENS, SIMULATION_FAILED, TX_FAILED, SOLANA_UNAVAILABLE, HISTORY_TOO_LONG, SIGNING_DISABLED` |
 | `activation.recover` | P | U | T | none | `{found, complete, activation: PublicActivation\|null}` (no burn of the phrase's addresses and no pending burn: the burn the node's registration record names for the wallet's light node, section 4.10, then aiqnet.io's record of a burn of the wallet's own address, decision 35) | `BURN_IN_PROGRESS, SOLANA_UNAVAILABLE, HISTORY_TOO_LONG, BURN_UNUSABLE` (only burns of this wallet no code derives from were found: R4-ESA-01) |
 | `activation.copy` | P | U | T | none (no password: decision 33) | `{code}`: the code Settings shows (decision 43: the vault's, or that of aiqnet.io's record `activation.lookup` showed as the wallet's code) | `NOT_FOUND` |
-| `activation.register` | P | U | T | none (no password: decision 33) | `{registration: RegistrationView\|null}`: Record on the network (`nodes.requestRecord`): the vault's light activation gets its registration queued (again, when it stopped: refused, the clock, or past the attempt cap), and one attempt runs now (section 4.10); a network answer is the record's state, never an error | `NOT_FOUND` (no light activation), `SIGNING_DISABLED` |
+| `activation.register` | P | U | T | none (no password: decision 33) | `{registration: RegistrationView\|null}`: Record on QNet Blockchain (`nodes.requestRecord`): the vault's light activation gets its registration queued (again, when it stopped: refused, the clock, or past the attempt cap), and one attempt runs now (section 4.10); a network answer is the record's state, never an error | `NOT_FOUND` (no light activation), `SIGNING_DISABLED` |
 | `activation.registration` | PA | U | | none | `{registration: RegistrationView\|null}` (`nodes.getRegistration`): the popup's status line and the activation window after its answer read it; a due step starts in the background (an activation of an earlier build is looked up on chain, at most every `TIMINGS.REGISTRATION_CHECK_MS`) | |
 | `node.unlinkView` | P | U | | none | `UnlinkView` (section 2.5; decision 38): the light node's device; nothing signed. No page sends it since decision 41 (the Activate tab has no Device card; the device is unlinked at aiqnet.io's request, `qnet_unlinkNodeDevice`, whose approval shows the same view); the entry stays in the frozen table | |
 | `node.unlink` | P | U | T | none (no password: the unlocked session and the armed press, decision 33) | `{status: 'ok', qnet, nodeId, unbound: true}` (`nodes.unlinkForSite`, section 4.10). No page sends it since decision 41; the entry stays in the frozen table | `NOT_LINKED, NETWORK, UNLINK_REFUSED, SIGNING_DISABLED` |
@@ -184,7 +184,7 @@ lowercase hex characters.
 | `settings.get` | PSA | | | none | `{autoLockMinutes: 5\|15\|30\|60\|'never'\|null, language}` (null while locked); `language` is the stored one, else the browser's UI language (`chrome.i18n.getUILanguage()` through `config.languageForTag`) when the UI has it, else `'en'` | |
 | `settings.set` | P | U | T | `{autoLockMinutes?: 5\|15\|30\|60\|'never', language?: SUPPORTED_LANGUAGES}`, at least one (`'never'`: no inactivity timer) | same as get | `VAULT_CORRUPT` |
 | `approval.get` | A | | | `{id: uuid}` | `ApprovalView` | `NOT_FOUND` |
-| `approval.resolve` | A | | T | `{id: uuid, approved: boolean, revision?: integer}` (no password for any kind: a `password` field is `INVALID_PARAMS`, the unlocked session and the armed press in the approval's own window confirm, section 4.8; `revision`: the `ApprovalView.revision` the page drew, required by a transaction's (`sendTransaction`, `tokenTransfer`, `contractCall`), an `activateNode`, a `claimNodeBalance` or an `unlinkNodeDevice` confirm: another one is `NONCE_CHANGED` / `PRICE_CHANGED` and the window reviews again) | `{resolved: true}`; for `activateNode` also `{status: 'ok'\|'exists'\|'pending'\|'error', error: code\|null}`, `nodeType: 'light'\|'super'` for `ok` and `exists` (the node type of the code the site received: the window adds the server's next step for a Super code, decision 36), and `registration: {nodeId, state, automatic, deferred}` after a light answer while the node has a record on the QNet network; for `claimNodeBalance` also `{status: 'ok'\|'empty'\|'error', error: code\|null}` and, for `ok`, `{amountNano, partial}`; for `unlinkNodeDevice` also `{status: 'ok'\|'error', error: code\|null}` (the wallet's own code, for the window's text) | `NOT_FOUND, LOCKED, INVALID_PARAMS`, errors of the approved action; `activateNode`: `LOCKED, PRICE_CHANGED` (the approval stays open) |
+| `approval.resolve` | A | | T | `{id: uuid, approved: boolean, revision?: integer}` (no password for any kind: a `password` field is `INVALID_PARAMS`, the unlocked session and the armed press in the approval's own window confirm, section 4.8; `revision`: the `ApprovalView.revision` the page drew, required by a transaction's (`sendTransaction`, `tokenTransfer`, `contractCall`), an `activateNode`, a `claimNodeBalance` or an `unlinkNodeDevice` confirm: another one is `NONCE_CHANGED` / `PRICE_CHANGED` and the window reviews again) | `{resolved: true}`; for `activateNode` also `{status: 'ok'\|'exists'\|'pending'\|'error', error: code\|null}`, `nodeType: 'light'\|'super'` for `ok` and `exists` (the node type of the code the site received: the window adds the server's next step for a Super code, decision 36), and `registration: {nodeId, state, automatic, deferred}` after a light answer while the node has a record on QNet Blockchain; for `claimNodeBalance` also `{status: 'ok'\|'empty'\|'error', error: code\|null}` and, for `ok`, `{amountNano, partial}`; for `unlinkNodeDevice` also `{status: 'ok'\|'error', error: code\|null}` (the wallet's own code, for the window's text) | `NOT_FOUND, LOCKED, INVALID_PARAMS`, errors of the approved action; `activateNode`: `LOCKED, PRICE_CHANGED` (the approval stays open) |
 `LOCKED` can come from every U type. A dApp never reaches any of these types.
 
 ### 2.5 Result shapes
@@ -244,7 +244,10 @@ lowercase hex characters.
   (`VaultState.registration.txHash`) recorded. An archive row of a built-in
   QRC-20 token (`source: 'token'`, decision 40) is `kind: 'token'` with `token: {contract, symbol, decimals, reserved}` (as
   the archive names it, shown only: the symbol as `TokenList` shows one, `reserved` as it marks one), `amountBase` (u128,
-  the token's units) and `amountNano: '0'`; it is `included` when two pinned nodes list a contract call with its hash. `dropped` (decision 40): a transaction this wallet no longer sends
+  the token's units) and `amountNano: '0'`; it is `included` only when its own logs proof verifies (`GET
+  /api/v1/logs/proof`: the row's own event leaf, `core.transferLogLeaf`, folds to the window's logs_root, and that root is
+  the one the committee certified, `core.verifyMacroblockLogsRoot`), else `unverified`, whatever the nodes list (decision
+  48); its detail asks no node (`qnet.txLookup` is not called for it). `dropped` (decision 40): a transaction this wallet no longer sends
   (stale, or refused) whose nonce the last verified read shows free, past the node's mempool lifetime after it last went
   out (`max(createdAt, lastSubmitAt)` + 30 min + 5 min, the mobile `mayLandUntil`): no node can hold it, so it did not go
   through and never will by itself; the next transfer takes its nonce by default, its amount is no longer kept back from
@@ -321,11 +324,11 @@ lowercase hex characters.
 - `RegistrationView` (`nodes.publicRegistration`): `{nodeId, state: 'queued'|'admitted'|'onchain'|'other_burn'|'refused'|'clock',
   attempts, lastError: string|null, txHash: string|null, updatedAt, automatic, deferred}`; `lastError` a short code (never
   shown as text); `automatic`: queued below `LIMITS.REGISTRATION_MAX_ATTEMPTS`, or admitted (its chain is read until the
-  hold ends, past the cap too), so the wallet still tries on its own (otherwise the popup offers Record on the network);
+  hold ends, past the cap too), so the wallet still tries on its own (otherwise the popup offers Record on QNet Blockchain);
   `deferred`: queued and automatic, its next attempt more than `TIMINGS.REGISTRATION_SOON_MS` away, which the popup shows
-  as not recorded with Record on the network (the wallet keeps trying meanwhile). `other_burn`: the chain lists the node
+  as not recorded with Record on QNet Blockchain (the wallet keeps trying meanwhile). `other_burn`: the chain lists the node
   with a registration of another burn (section 4.10), so this burn recorded nothing; the popup and the activation window
-  say so, never "Recorded", and offer no Record on the network.
+  say so, never "Recorded", and offer no Record on QNet Blockchain.
 - `PendingBurn`: `{burnTx, nodeType, burnAmount, solanaAddress, cluster, createdAt}`.
 - `ActivationLookup` (`activation.lookup`, decision 35): `activation.status`'s fields and `{view, reason, record: RecordView|null,
   keptBurn: PublicBurn|null, network: 'none'|'exists'|'unknown'|null, search: 'none'|'found'|'pending'|'searching'|'unknown'|'unusable'|null}`.
@@ -333,7 +336,7 @@ lowercase hex characters.
   is the wallet's code and the vault holds none of it: a light burn aiqnet.io's payment key made, or the other burn a record
   keeps instead of the vault's, whose burn is then `keptBurn`); `pending`; `busy` (an activation runs here); `checking`
   (the shared search runs); `elsewhere` (aiqnet.io holds a reservation or a burn on its way, of the extension or of a payment
-  address, decision 36); `node` (the QNet network knows a node of this wallet, or aiqnet.io's record names a burn Solana does not
+  address, decision 36); `node` (QNet Blockchain knows a node of this wallet, or aiqnet.io's record names a burn Solana does not
   show as it: no code known here); `unusable` (a burn no code derives from); `unavailable` (`reason` names the source that
   could not answer: `RECORD_UNAVAILABLE`, `NETWORK`, `SOLANA_UNAVAILABLE`, `HISTORY_TOO_LONG`); `none`, every source's
   "none", the only view that offers a burn. A record of a burn of the wallet's own address is stored as the activation
@@ -355,8 +358,8 @@ only from this extension's worker (`sender.url === getURL('background/sw.js')`, 
 | Event | When | data | Page reaction |
 |---|---|---|---|
 | `locked` | any lock | null | clear every input `.value`, drop secrets, show the lock screen |
-| `unlocked` | unlock | null | refresh |
-| `wiped` | wipe, restore | null | clear localStorage/sessionStorage of the page, drop the view, empty the clipboard (best effort), reload once (the popup running a `vault.restore` only clears, then shows the result). sw.js sends it when the wipe starts, before `vault.wipe` answers: the popup that asked for the delete reloads here, so the clipboard is emptied here, never after the answer (R16, R4-ESM-01) |
+| `unlocked` | unlock | null | refresh (the popup's lock and reset screens give way to the wallet) |
+| `wiped` | wipe, reset | null | clear localStorage/sessionStorage of the page, drop the view, empty the clipboard (best effort), reload once. sw.js sends it when the wipe starts, before `vault.wipe` or `vault.reset` answers: the popup that asked for the delete or the reset reloads here, so the clipboard is emptied here, never after the answer (R16, R4-ESM-01) |
 | `activation` | activation record, pending burn or the state of the light node's registration changed | null | refresh the Activate tab |
 | `approval` | approval queue changed | null | approve page refreshes |
 | `balance` | a send, token transfer, contract call, activation or claim a site asked for ran after its confirm (sent, burned, moved, or failed on the way) | null | the popup reads the balances, the token list or the history on screen again at once (section 9, Pages) |
@@ -433,10 +436,10 @@ Shared with the future mobile in-app browser: the same page API, methods, result
 | `qnet_signMessage` | `{message: string}` | `{signature, publicKey, address}` (hex, hex, EON) | grant required (else 4100); message rejected by `core.buildOffchainMessage` (protocol prefixes including `register:` and `migrate:`, the payment key's owner bind `qnet_burn_owner_v2:` and aiqnet.io's records of a wallet, a burn record and a node reservation, however written: decision 36; hidden controls and format characters, a carriage return not followed by a line feed and the typographic spaces U+2000-U+200A, U+202F, U+205F that the approval draws as nothing or a sliver: R5-EXT-UI-01, lone surrogates, empty, > 4096 UTF-8 bytes) → -32602 before any window; approval shows the exact text; signature = `core.signOffchainMessage(origin, message, …)`: ML-DSA-65 with FIPS 204 context `QNET_OFFCHAIN_MSG_v1` over `"QNet Signed Message:\n" + origin + "\n" + byteLength + "\n" + message` |
 | `qnet_sendTransaction` | `{to: qnetAddress, amount: qnc}`, the same with `type: 'transfer'`, `{type: 'tokenTransfer', token: qnetAddress, to: qnetAddress, amount}` or `{type: 'contractCall', contract: qnetAddress, method, args, gasLimit?}` (`router.normalizeTransaction`) | `{status: 'submitted'\|'unknown', from, to, amount, nonce, txHash: string\|null}`; a token transfer `{status, from, token, to, amount, nonce, txHash}`; a call `{status, from, contract, method, nonce, txHash}` (a transaction's identity is (`from`, `nonce`): at most one transaction of `from` applies at a nonce, so a dApp matches it by them; `txHash` is the hash one node gave its own copy, and another node's copy of the same signed transaction, with another hash, may be the one that lands: R2-EXTQ-06, R5-EXTQ-03; `submitted` only when a node took it and named its copy, as the mobile in-app browser answers, and never says a call succeeded: the node keeps no outcome, decision 25) | grant required; any other field → -32602; the wallet sets fee (`core.fees`), gas and nonce and builds every byte with the shared builders (`core.buildTokenTransfer`, `core.buildContractCall`); section 4.9 |
 | `qnet_getTransactionStatus` | `{from: qnetAddress, nonce: u64 > 0}` | `{status: 'pending'\|'in_block'\|'unknown', blockHeight: number\|null, txHash: string\|null}` (height and hash only for `in_block`) | the connected, unlocked account only (anything else 4100); no window; `qnet.transactionStatus`, a failed read or an answer about another (`from`, `nonce`) is `unknown`; an answer is given again for 3 s without a read, and an origin starts at most 20 reads a minute (more: 4001), the mobile in-app browser's shape and limits; section 4.9 |
-| `qnet_activateNode` | `{nodeType: 'light'\|'super'}` | `SiteActivationResult` (below), keys unchanged | `router.isActivationOrigin` only: exactly `https://aiqnet.io`, the dev build also plain-HTTP localhost / 127.0.0.1; any other origin → 4100 before the params are read (PROVIDER_METHODS `origins`), checked again in provider.js. No grant read or created, no `accountsChanged`. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise an `activateNode` approval (cooldown and queue as 4.8), its armed confirm (no password), then `activation.activateForSite`; a light activation is then recorded on the QNet network (section 4.10: queued with the burn's activation, or with the wallet's existing one not recorded yet), so the site reads the chain for "Registered" |
-| `qnet_getActivation` | none | `SiteActivationRead` (below) | Decision 35. `router.isActivationOrigin` only (4100 for any other origin before the params). Read-only and never a window: no approval queue, budget or cooldown, no grant read-or-written besides the check, no `accountsChanged`, nothing signed for the site or burned; a burn the kept search finds is stored as `activation.recover` stores it (a Light activation's record on the QNet network then starts, as after Recover), and the vault's own burn may be recorded on aiqnet.io (`syncRecord`). At most `LIMITS.ACTIVATION_READS_PER_MINUTE` (30) a minute per origin (more: 4001). `{status: 'no_wallet'}` without a vault, `{status: 'locked'}`, `{status: 'not_connected'}` while this origin holds no valid grant of the session's wallet; otherwise `activation.siteActivation`, checked by provider.js before it leaves (the wallet's own addresses, a known status with exactly its keys, a well-formed burn, the code the node's derivation of it; anything else -32603) |
+| `qnet_activateNode` | `{nodeType: 'light'\|'super'}` | `SiteActivationResult` (below), keys unchanged | `router.isActivationOrigin` only: exactly `https://aiqnet.io`, the dev build also plain-HTTP localhost / 127.0.0.1; any other origin → 4100 before the params are read (PROVIDER_METHODS `origins`), checked again in provider.js. No grant read or created, no `accountsChanged`. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise an `activateNode` approval (cooldown and queue as 4.8), its armed confirm (no password), then `activation.activateForSite`; a light activation is then recorded on QNet Blockchain (section 4.10: queued with the burn's activation, or with the wallet's existing one not recorded yet), so the site reads the chain for "Registered" |
+| `qnet_getActivation` | none | `SiteActivationRead` (below) | Decision 35. `router.isActivationOrigin` only (4100 for any other origin before the params). Read-only and never a window: no approval queue, budget or cooldown, no grant read-or-written besides the check, no `accountsChanged`, nothing signed for the site or burned; a burn the kept search finds is stored as `activation.recover` stores it (a Light activation's record on QNet Blockchain then starts, as after Recover), and the vault's own burn may be recorded on aiqnet.io (`syncRecord`). At most `LIMITS.ACTIVATION_READS_PER_MINUTE` (30) a minute per origin (more: 4001). `{status: 'no_wallet'}` without a vault, `{status: 'locked'}`, `{status: 'not_connected'}` while this origin holds no valid grant of the session's wallet; otherwise `activation.siteActivation`, checked by provider.js before it leaves (the wallet's own addresses, a known status with exactly its keys, a well-formed burn, the code the node's derivation of it; anything else -32603) |
 | `qnet_unlinkNodeDevice` | none | `SiteUnlinkResult` (below) | Decision 38. `router.isActivationOrigin` only (4100 for any other origin before the params). No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise an `unlinkNodeDevice` approval (cooldown and queue as 4.8) showing `nodes.unlinkView`; its armed confirm (no password, like every approval) runs `nodes.unlinkForSite` (section 4.10). The wallet's own light node only; an extension without the method answers 4200 |
-| `qnet_claimNodeBalance` | none | `SiteClaimResult` (below) | `router.isActivationOrigin` only (4100 for any other origin before the params). No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `claimNodeBalance` approval (cooldown and queue as 4.8) showing `nodes.claimView`; its armed confirm (no password, like every approval) runs `nodes.claimForSite` (section 4.10). The wallet's own light node only |
+| `qnet_claimNodeBalance` | `{nodeId}`: a light (`light_mobile_` + 16 hex) or super (`super_node_` + 16 hex) node id | `SiteClaimResult` (below) | Decision 47. `router.isActivationOrigin` only (4100 for any other origin before the params); another form of `nodeId`, a genesis node's among them, or none → -32602 before any window. No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `claimNodeBalance` approval (cooldown and queue as 4.8) showing `nodes.claimView` of that node; its armed confirm (no password, like every approval) runs `nodes.claimForSite` (section 4.10). Only this wallet's own light or super node (`core.lightNodeId`, `core.superNodeId` of its address): any other is `WALLET_MISMATCH`, shown in the window and answered as an error, nothing signed. The popup offers no move of its own |
 
 `SiteActivationResult` (QNet Link v1 sections 7 and 10): `ok` and `exists` `{status, qnet, solana, nodeType,
 burnTx, burnAmount, code}`; `pending` `{status, qnet, solana, nodeType, burnTx, burnAmount}`; `exists` may add
@@ -444,7 +447,7 @@ burnTx, burnAmount, code}`; `pending` `{status, qnet, solana, nodeType, burnTx, 
 older burn of the phrase beat; only when its signature is not `burnTx` and both burns are the wallet's own address's);
 `error` `{status: 'error', error}` with one of `PRICE_UNAVAILABLE, PHASE_UNSUPPORTED, PRICE_CHANGED, INSUFFICIENT_SOL,
 INSUFFICIENT_TOKENS, SIMULATION_FAILED, TX_FAILED, SOLANA_UNAVAILABLE, HISTORY_TOO_LONG, NODE_EXISTS, BURN_UNUSABLE,
-BURN_IN_PROGRESS, NO_WALLET, INTERNAL` (any other wallet code is sent as `INTERNAL`, `NETWORK` among them: the QNet network could not vouch that the wallet has no node, EXT-R1-01; `BURN_UNUSABLE`: the wallet already
+BURN_IN_PROGRESS, NO_WALLET, INTERNAL` (any other wallet code is sent as `INTERNAL`, `NETWORK` among them: QNet Blockchain could not vouch that the wallet has no node, EXT-R1-01; `BURN_UNUSABLE`: the wallet already
 burned in a form no code derives from, and burns no second time, R4-ESA-01, now a code of QNet Link v1 section 7:
 XP-R5-01; `HISTORY_TOO_LONG`: a burn search its time budget cut short, which the next request continues, for the
 signed-transactions search too: SRA-R2-02, R5-ESA-01). Before a result leaves,
@@ -467,14 +470,15 @@ the approval window (`approval.resolve`'s `superseded`) and on the Activate tab,
 that settles as such while this one is answered (`activation.activateForSite` compares `supersededBurn` before and after
 the pending burn's check).
 
-`SiteClaimResult` (QNet Link v1 section 14.10: the `claim` answer of section 14.7 without `v` and `intent`): `ok`
-`{status, qnet, nodeId, amountNano, txHash, stoppedAtEpoch}` (`amountNano` decimal nano, at least `CLAIM_MIN_NANO`, or
-above zero for a part of the balance; `txHash` 64 lowercase hex; `stoppedAtEpoch` the epoch the node's quote stopped at
-when the move took part of the balance, decimal, or null);
+`SiteClaimResult` (QNet Link v1 section 14.10: the `claim` answer of section 14.7 without `v` and `intent`; decision 47): `ok`
+`{status, qnet, nodeId, amountNano, txHash, stoppedAtEpoch}` (`nodeId` the node the site named; `amountNano` decimal nano, at
+least `CLAIM_MIN_NANO`, or above zero for a part of the balance; `txHash` 64 lowercase hex; `stoppedAtEpoch` the epoch the
+node's quote stopped at when the move took part of the balance, decimal, or null);
 `empty` `{status, qnet, nodeId}` (a balance below 1 QNC, or none); `error` `{status: 'error', error}` with one of
-`NO_WALLET, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY, INTERNAL` (`CLAIM_ERRORS`; any other code is `INTERNAL`). A
-reject or a closed window is 4001. Before a result leaves, provider.js checks it once more: this wallet's address and
-light node id, the amount, the hash and the stop epoch; anything else becomes `INTERNAL`.
+`NO_WALLET, WALLET_MISMATCH, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY, INTERNAL` (`CLAIM_ERRORS`; any other code is
+`INTERNAL`). A reject or a closed window is 4001. Before a result leaves, provider.js checks it once more: this wallet's
+address, the node the site named and that it is this wallet's light or super node, the amount, the hash and the stop epoch;
+anything else becomes `INTERNAL`.
 
 `SiteUnlinkResult` (decision 38: the `unlink` answer of QNet Link v1 section 14.7 without `v` and `intent`): `ok` `{status, qnet,
 nodeId, unbound: true}` (the network took the wallet key's unbind); `error` `{status: 'error', error}` with one of `NO_WALLET,
@@ -623,20 +627,21 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   until unlocked and until a certified balance was read; `verification` proof or none, not shown on screen (owner,
   28.09): only a committee-certified proof verifies a balance, EXT-CHAINS-04; `balanceProblem`: why no balance a send is
   decided by was read yet, `'NETWORK'`, `'BALANCE_UNCONFIRMED'` or `'BALANCE_FOREIGN_PENDING'` (the preview's refusal,
-  decision 44), else null: the window says it in place of "Reading the account from the network…", keeps Confirm off
+  decision 44), else null: the window says it in place of "Reading the account from QNet Blockchain…", keeps Confirm off
   and reads again; `tokenProblem` likewise for a null `tokenBalance`; `recipient` is
   `qnet.recipientCheck(to)` (`RecipientCheck`), read once per approval, null while locked or
   unreadable), activateNode `{nodeType, mode: 'burn'|'exists'|'pending'|'unavailable'|'checking'|null, reason,
   cost, activation: PublicActivation|null, pending: PendingBurn|null, balances: {lamports,
   oneDevRaw}|null, recorded: boolean|null, otherBurn: boolean|null, solanaAddress, mint, tokenProgram, cluster}`
   (`activation.siteView`, read on every `approval.get` while not busy; `mode`, `recorded` and `otherBurn` null while
-  locked or before a first read; `recorded`: the QNet network lists the wallet's light activation's node with its
+  locked or before a first read; `recorded`: QNet Blockchain lists the wallet's light activation's node with its
   registration of this burn (`onchain`), `otherBurn`: with a registration of another burn (`other_burn`, EXT-R2A-03),
   the only parts of the registration the window draws, so the registration's other steps never bump the revision nor
-  redraw the window: EXT-FA1-02), claimNodeBalance `{mode:
-  'claim'|'empty'|'unavailable'|null, reason: 'NO_NODE'|'NETWORK'|'SIGNING_DISABLED'|null, nodeId, wallet, amountNano}`
-  (`nodes.claimView`, read on every `approval.get` while not busy, checked against this wallet's own light node; null
-  while locked or before a first read), unlinkNodeDevice `{mode: 'confirm'|'unavailable'|null, reason, nodeId, wallet, platform,
+  redraw the window: EXT-FA1-02), claimNodeBalance `{mode: 'claim'|'empty'|'unavailable'|null, reason:
+  'WALLET_MISMATCH'|'NO_NODE'|'NETWORK'|'SIGNING_DISABLED'|null, nodeId, nodeType: 'light'|'super'|null, wallet, amountNano}`
+  (`nodes.claimView` of the node the site named, read on every `approval.get` while not busy, checked against this
+  wallet's light and super node ids; `nodeType` null only for `WALLET_MISMATCH`; null while locked or before a first
+  read), unlinkNodeDevice `{mode: 'confirm'|'unavailable'|null, reason, nodeId, wallet, platform,
   linkedSince}` (`nodes.unlinkView`, read on every `approval.get` while not busy, checked against this wallet's own light node;
   null while locked or before a first read). The worker signs exactly the last preview it served, and only when the page
   names that preview's revision.
@@ -653,11 +658,11 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   dApp's result (failures included, as `{status: 'error'}`), the page shows it (progress while it runs, with a
   `vault.status` keepalive every 20 s) and the window stays until closed, at most 30 s, titled by what happened (the code, a
   burn waiting for Solana, or no code; never "Done": EXT-F5). `checking` (decision 35: the shared search of the wallet's own
-  address runs) shows "Checking this wallet: the QNet network, Solana and aiqnet.io…" with only Reject, and the page reads the
+  address runs) shows "Checking this wallet: QNet Blockchain, Solana and aiqnet.io…" with only Reject, and the page reads the
   view again every 3 s until another mode comes; a confirm then is `PRICE_CHANGED` (review again), and its close counts like an
   unavailable window's. `unavailable` shows the reason (`err_<reason>`) and one Close button
   that sends `approved: false`: the dApp gets `{status: 'error', error: reason}`. After a light `ok` or `exists` whose
-  node is being recorded on the QNet network the window says so (the burn view before the confirm: "Then the wallet
+  node is being recorded on QNet Blockchain the window says so (the burn view before the confirm: "Then the wallet
   records its light node..."; an `exists` view of a light activation not listed yet: it is recorded too; one listed with
   another burn's registration: that, and that this burn recorded nothing) and, after the
   answer, reads `activation.registration` every `TIMINGS.REGISTRATION_POLL_MS`; the worker keeps it up to
@@ -676,14 +681,15 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   `TIMINGS.APPROVAL_HEARTBEAT_MS` and closes the window on `NOT_FOUND`. Locked: unlock first, then the request with its
   armed confirm and no password; a connect with `alreadyGranted` resolves right after the unlock.
 
-- `claimNodeBalance`: the page shows the wallet's light node id, the node balance two pinned nodes agree on (labelled
-  so), "Moves at 1 QNC or more" with the note that a large balance may move in parts below it, and the fee note; its
-  confirm arms after `CONFIRM_ARM_VALUE_MS` like a transaction, names
-  the revision it shows (`REVISIONED`; another one is `NONCE_CHANGED`: review again) and, like every approval, takes no
-  password (refused with `INVALID_PARAMS`). A balance below 1 QNC (`empty`) or an `unavailable` view offers one Close that sends
-  `approved: false`: the dApp gets `{status: 'empty', qnet, nodeId}` or `{status: 'error', error: reason}`
-  (`SIGNING_DISABLED` as `INTERNAL`), counted like an unavailable activation (the first close counts nothing). The outcome
-  (the amount moved, a part of the balance, or the error) stays until closed, at most 30 s.
+- `claimNodeBalance` (decision 47): the page shows the node the site named with its type ("Light node" or "Super node")
+  and the node balance two pinned nodes agree on, with one line that the site asks to move the balance of this wallet's
+  light (or super) node into this wallet and that no tokens leave it; its confirm arms after `CONFIRM_ARM_VALUE_MS` like a
+  transaction, names the revision it shows (`REVISIONED`; another one is `NONCE_CHANGED`: review again) and, like every
+  approval, takes no password (refused with `INVALID_PARAMS`). A balance below 1 QNC (`empty`) or an `unavailable` view
+  (another wallet's node among them) offers one Close that sends `approved: false`: the dApp gets `{status: 'empty', qnet,
+  nodeId}` or `{status: 'error', error: reason}` (`SIGNING_DISABLED` as `INTERNAL`), counted like an unavailable activation
+  (the first close counts nothing). The outcome (the amount moved, a part of the balance, or the error) stays until
+  closed, at most 30 s.
 - `unlinkNodeDevice` (decision 38): the page shows what happens (the node stops running on the device it runs on now; the node
   and its balance stay with the wallet, and it can run on any device later), the wallet's light node id, the device the network
   names (Android, iPhone or iPad, or an unknown device) and the day it was linked; its confirm arms after `CONFIRM_ARM_MS`,
@@ -707,9 +713,11 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   contract that is no token. Anything else is -32602, an unreadable contract -32603.
 - **A recipient that is a contract** (EXT-R2A-01, the SDK's `--to-contract` rule without an override): a contract
   account has no key and no contract can send QNC or a built-in token on, and the node credits such a transfer today, so
-  what reaches one stays there for good. `qnet.assertPayableRecipient(to)` (`readContract`: `kind` other than `none`)
+  what reaches one stays there for good. `qnet.assertPayableRecipient(to)` (the recipient's certified account leaf,
+  `is_contract`, from its account proof folded to a verified certified root, never what nodes say of it: decision 48)
   refuses it: before the window of a `transfer` or a `tokenTransfer` (its `to`; the token contract itself included) with
-  -32602 (`RECIPIENT_IS_CONTRACT`), a recipient no two nodes agree on with -32603 (`RECIPIENT_UNCHECKED`); and again in
+  -32602 (`RECIPIENT_IS_CONTRACT`), a recipient whose leaf no recent certified state gives with -32603
+  (`RECIPIENT_UNCHECKED`); and again in
   `prepareTransfer` / `sendTransfer` / `prepareCall` / `sendCall` for a token transfer, so neither the popup's review
   (`qnet.preview`: no review, the error in the form) nor any confirm signs one. The wallet's own address is not read.
 - **What the wallet builds** (`qnet.prepareCall` for the view, `qnet.sendCall` for the confirm): `core.buildTokenTransfer`
@@ -746,21 +754,22 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   `{status, blockHeight, txHash}` (`provider.js` `statusAnswer`): a failed read, or an answer about another (`from`,
   `nonce`), is `unknown`, and height and hash leave only with `in_block`.
 
-### 4.10 The light node on the QNet network (`nodes.js`)
+### 4.10 The wallet's nodes on QNet Blockchain (`nodes.js`)
 
 The messages are those of docs/protocols/light-node-messages.md section 4, built and signed by the core
-(`core.signNodeConsent`, `signOwnerBind`, `signClaimQuote`, `signClaimPayload`, `signNodeStatus`: the node id and the proof are the
-wallet's own, computed inside; ML-DSA-65 with an empty context, Ed25519 for the owner bind; and `signNodeUnbind`, decision
-38). The extension never runs a node, never answers pings and sends no device evidence: after a light activation the
-Activate tab names no next step, and its one line leads to aiqnet.io/node, where the node is linked to a phone or tablet
-with the same recovery phrase (decision 41).
+(`core.signNodeConsent`, `signOwnerBind`, `signClaimQuote`, `signClaimPayload`, `signNodeStatus`: the node id and the proof
+are the wallet's own, computed inside, and the claim quote names its light or its super node, `core.superNodeId`: decision
+47; ML-DSA-65 with an empty context, Ed25519 for the owner bind; and `signNodeUnbind`, decision 38). The extension never
+runs a node, never answers pings and sends no device evidence: after a light activation the Activate tab names no next
+step, and its one line leads to aiqnet.io/node, where the node is linked to a phone or tablet with the same recovery
+phrase (decision 41) and its balance is moved with this extension's approval window (decision 47).
 
 - **Registration record** (`VaultState.registration`, section 5): written in the same vault update as the light
   activation it records (`settleBurn`, `storeCanonical`), queued again by a confirmed `qnet_activateNode` for an existing
   light activation that stopped or has none, and by `activation.register`. A Super activation has none. An activation of
   an earlier build (no record) is never registered unasked: a read of `activation.registration` looks it up on chain at
   most every `TIMINGS.REGISTRATION_CHECK_MS` and records `onchain` when the chain lists it; otherwise the popup offers
-  Record on the network. Recover stores the activation it finds with its registration queued; its card is its title
+  Record on QNet Blockchain. Recover stores the activation it finds with its registration queued; its card is its title
   ("Already burned?") and its button ("Recover my code"), with no text on how it works (owner, 28.09), and the registration
   shows on the Activate tab once the activation is stored, until the chain lists the node (decision 41).
 - **Whose burn** (EXT-R2A-03): two nodes listing the node say that a registration holds it, not whose burn it names.
@@ -781,7 +790,7 @@ with the same recovery phrase (decision 41).
   the chain first (two nodes listing the node end it: `onchain`, no submit); an admitted registration waits
   `TIMINGS.REGISTRATION_ADMIT_HOLD_MS` (10 min) for a block, the chain read at most every
   `TIMINGS.REGISTRATION_ADMIT_CHECK_MS` meanwhile, past the attempt cap too (a hold that ends without a block at the cap
-  stops it: `queued`, `lastError: 'not_in_block'`, Record on the network); then
+  stops it: `queued`, `lastError: 'not_in_block'`, Record on QNet Blockchain); then
   `keys.signNodeRegistration` with `T` = now (seconds) and `POST /api/v1/node-registration/submit` to ONE pinned node
   (never hedged: the node builds and hashes the transaction itself) within `TIMINGS.REGISTRATION_SUBMIT_TIMEOUT_MS`, the
   body in the app's field order: `from, node_id, node_type: 'light', wallet_address, registration_proof, timestamp,
@@ -796,25 +805,29 @@ with the same recovery phrase (decision 41).
   unreadable one → a retry after 15 s, 30 s, 60 s, then 2, 4, 8 ... minutes up to `TIMINGS.REGISTRATION_BACKOFF_MAX_MS`
   (6 h); `wallet_has_node` (the network's one-node rule: this wallet has a node of either type already; its text "wallet
   already has a node" when a node sends no code) → `refused` for good, never `onchain` and never retried; the popup says so
-  (`recordRefusedWalletHasNode`) with no Record on the network, and so does the activation window's record line, which
+  (`recordRefusedWalletHasNode`) with no Record on QNet Blockchain, and so does the activation window's record line, which
   reads a registration the answer shows as `refused` once more (`activation.registration`: the answer's `registration`
   names no `lastError`) and polls one being made, decision 36; anything else (an
   HTTP refusal included) → `refused` (stops; the code is logged, never shown). After
-  `LIMITS.REGISTRATION_MAX_ATTEMPTS` (12) automatic submits only the user's Record on the network tries again.
+  `LIMITS.REGISTRATION_MAX_ATTEMPTS` (12) automatic submits only the user's Record on QNet Blockchain tries again.
 - **When it runs**: right after the activation is stored (`activation.setRegistrationHook`, wired by sw.js), after every
   unlock, on the `REGISTRATION_ALARM` (`qnet-register`, every minute while a record waits for an automatic attempt, and
   cleared otherwise and while the wallet is locked), on a page's `activation.registration`, and on `activation.register` (at once, whatever is due).
-- **Moving the node balance** (`qnet_claimNodeBalance`, as the app moves it): the view reads `onchain_registered` for N
-  (else `NO_NODE`; unknown `NETWORK`) and `GET /api/v1/rewards/pending/{N}` until two pinned nodes report the same
-  `pending_rewards_nano` (else `NETWORK`); below `CLAIM_MIN_NANO` it is `empty`. The confirm signs the quote
-  (`q1337|claim_rewards:{N}:{W}`) and posts `/api/v1/rewards/claim` (hedged; a node answering that it cannot serve an
+- **Moving a node balance** (`qnet_claimNodeBalance`, decision 47, as the app moves it): the site names the node, N, and
+  `ownNodeType(N, W)` must call it this wallet's light node (`core.lightNodeId(W)`) or super node (`core.superNodeId(W)`),
+  else `WALLET_MISMATCH` before any read or signature. The view reads whether the chain lists it, two pinned nodes alike: a
+  light node's `onchain_registered` (public status), a super node's `onchain_registered` (else `registered`) of
+  `GET /api/v1/node/status?node_id=N` (else `NO_NODE`; unknown `NETWORK`), and `GET /api/v1/rewards/pending/{N}` until two
+  pinned nodes report the same `pending_rewards_nano` (else `NETWORK`); below `CLAIM_MIN_NANO` it is `empty`. The confirm
+  signs the quote (`q1337|claim_rewards:{N}:{W}`) and posts `/api/v1/rewards/claim` with `node_id` N (hedged; a node
+  answering that it cannot serve an
   epoch, `stopped_reason` without a quote, hands over to the next pinned node, EXT-R1-07); the quote must parse, list
   claims strictly ascending above `last_claimed_epoch` with amounts summing to `amount_nano` (at least `CLAIM_MIN_NANO`
   for a full batch; above zero for a part, since the node caps a quote by size and a balance of many small epochs moves
   whole only in several claims: EXT-R1-03, decision 29),
   carry a `claim_timestamp`, a `stopped_at_epoch` (a part of the balance) above its last epoch, and name no other
-  `sign_message` than the one the wallet builds. A part of the balance is quoted again by another pinned node with the
-  same request (the claim_rewards signature carries no time; EXT-R3-01): both quotes pass the same checks and name the
+  `sign_message` than the one the wallet builds. Every batch is quoted again by another pinned node with the
+  same request (the claim_rewards signature carries no time; EXT-R3-01, decision 48): both quotes pass the same checks and name the
   same `last_claimed_epoch`, and the one whose last epoch is lower is signed only when the other lists exactly its
   epochs and amounts up to that epoch (the other covers every epoch below its own stop, so an epoch left out between
   the first and last one shows); any difference is `CLAIM_REFUSED`, no second quote its refusal (`NETWORK` when no
@@ -825,7 +838,8 @@ with the same recovery phrase (decision 41).
   answering, or for a full batch no two alike: `NETWORK`.
   Then the payload is signed over `q1337|qnet_claim_v1:{W}:{ts}:{sha3(claims_data)}` and sent back to the node that
   quoted the signed quote with `claims_data`, `claims_signature` and `claim_timestamp`. "Claim already in progress" is `CLAIM_BUSY`,
-  "No claimable rewards" `empty`, "not registered on-chain" `NO_NODE`, any other refusal `CLAIM_REFUSED`.
+  "No claimable rewards" `empty`, "not registered on-chain" `NO_NODE`, any other refusal `CLAIM_REFUSED`. The rewards
+  are the wallet's (the node checks that N is registered to W), so N decides only which registration vouches for W.
 - **Unlinking the node's device** (decision 38; light-node-messages.md section 4, the wallet form of the unbind): the wallet
   key ends the node on whatever device runs it, at aiqnet.io's request (`qnet_unlinkNodeDevice`; the popup offers it no
   longer, decision 41). `unlinkView` reads the public status (`UnlinkView`, section 2.5).
@@ -855,11 +869,14 @@ with the same recovery phrase (decision 41).
 
 ## 5. Vault (`vault.js`, worker only)
 
-- IndexedDB `qnet-vault-v3`, version 1, object store `vault`: the record under key `main` (and, only while a
-  Restore writes the new vault, its staged copy `restoreStaging`, gone with the replace); next to it
-  `lightAnchors` = `{v: 1, anchors, mac}`, the light client's verified anchors with an
-  HMAC-SHA256 under a key derived from the vault key (EXT-CHAINS-04: a program that can write the profile
-  cannot make a walk start elsewhere; a new password invalidates them), and `burnScans` = `{v: 1, scans:
+- IndexedDB `qnet-vault-v3`, version 1, object store `vault`: the record under key `main` (a copy `restoreStaging`
+  that the Forgot-password restore of 3.0.0 and 3.1.0 staged goes wherever it is found); next to it
+  `lightAnchors` = `{v: 2, chain, anchors, mac}`, the light client's verified anchors (each with its three certified
+  roots `state_root`, `logs_root`, `checkpoint_hash`, all or none) and the chain identity they were verified under, with an
+  HMAC-SHA256 over both under a key derived from the vault key (EXT-CHAINS-04: a program that can write the profile
+  cannot make a walk start elsewhere; a new password invalidates them; a v1 record or another chain identity reads as
+  none, decision 48), `galcCapsule` = `{v: 1, chain, record}`, the genesis capsule the light client holds (no MAC:
+  `core.importCapsule` verifies it again in full), and `burnScans` = `{v: 1, scans:
   {[owner or owner + ':signed']: state}, mac}`, what the burn searches of the wallet's Solana address listed
   and checked (`solana.findWalletBurns` over the 1DEV associated account: the valid burns found, the wallet's own burns no
   code derives from as `unusable` since search version 3, R4-ESA-01; `solana.findSignedBurns` over the owner's own
@@ -882,7 +899,7 @@ with the same recovery phrase (decision 41).
 ```
 
   A record of an earlier 3.0.0 build (no `legacy` key) opens as it is and the next unlock rewrites it; any other value
-  of `aad.legacy` does not parse (`VAULT_CORRUPT`; Restore replaces such a record).
+  of `aad.legacy` does not parse (`VAULT_CORRUPT`; Reset removes such a record).
 
   `salt` is base64 of 16..32 fresh random bytes on every password set or change. AES-GCM
   `additionalData = UTF-8(canonicalJson(aad))`; `record.v` and `record.kdf` must equal `aad.v` and
@@ -913,7 +930,7 @@ with the same recovery phrase (decision 41).
   Settings offer to remove them behind one confirmation that says the earlier wallet then opens only with its own
   phrase (`vault.removeEarlier`, while a vault of this version exists and is unlocked). What 2.x left with nothing it
   can open (a placeholder, a copy without the phrase, or no wallet) goes with the first vault written; Delete wallet and
-  a Forgot-password restore remove the pages' database with the rest of `chrome.storage.local`. Every extension page empties its own
+  a Forgot-password reset remove the pages' database with the rest of `chrome.storage.local`. Every extension page empties its own
   `localStorage` and `sessionStorage` when it starts (`common.clearPageStorage`). No secret of the earlier version is
   ever written anywhere by this version.
 - KDF: Argon2id (`core.argon2idAsync`, dkLen 32) by default; `assertKdfFloor` refuses anything below
@@ -949,7 +966,7 @@ with the same recovery phrase (decision 41).
   - `PendingRegistration = {nodeId, burnTx, burner, state: 'queued'|'admitted'|'onchain'|'other_burn'|'refused'|'clock', attempts,
     nextAt, txHash: string|null, admittedAt: number|null, lastError: string|null (a short code), updatedAt}`: public values
     only, no signature (every attempt signs afresh, section 4.10). It exists only next to a light activation whose burn
-    and burner it names, for the wallet's own light node (`core.lightNodeId` of the AAD's QNet address); a restore and a
+    and burner it names, for the wallet's own light node (`core.lightNodeId` of the AAD's QNet address); a reset and a
     wipe drop it with the activation.
   - `legacy` (always null) and `exposedAdvice` (a boolean nothing reads, false in every vault written now) are keys of
     the state format: a vault written by an earlier 3.x build opens unchanged.
@@ -992,43 +1009,40 @@ with the same recovery phrase (decision 41).
     this transfer → dropped, another one → replaced; its nonce passed but no such row yet → `passed` (not resent,
     not reserved, shown as outcome unknown; decided on a later run, or dropped a day after it was seen).
 - Password: NFKC. A new password (`vault.normalizeNewPassword`, on every path that sets a vault password: create,
-  import, restore, change) needs at least `core.PASSWORD_MIN_LENGTH` (8) characters as typed (`core.passwordTooShort`,
+  import, change) needs at least `core.PASSWORD_MIN_LENGTH` (8) characters as typed (`core.passwordTooShort`,
   the rule the app uses, compiled from the same source), nothing else; the pages show the rule live (the line
   "At least 8 characters" turns from × to ✓) and check that it was typed twice before sending. The password of an
   existing vault is only normalized (`normalizePassword`), so a vault opens with whatever password it was made with.
   Never stored, hashed or logged; verification = successful decrypt. Unlock always decrypts, even when already
   unlocked, then re-derives both addresses and compares them with the AAD (`ADDRESS_MISMATCH`).
-- Create/import: 12 or 24 words and a password, nothing else; refuse when a vault exists (a vault is replaced only by
-  wipe or Restore); write, read back, decrypt with the entered password, re-derive and compare addresses, only then
+- Create/import: 12 or 24 words and a password, nothing else; refuse when a vault exists (a vault goes only by
+  wipe or reset); write, read back, decrypt with the entered password, re-derive and compare addresses, only then
   start the session (EXT-SEC-M2).
 - Reveal: `vault.reveal` decrypts with the password and answers the phrase (section 8 for its Copy button).
 - Wipe: password check; then `session.lock('wipe')`, close connections, await `deleteDatabase` (success,
   blocked, error), reset the password backoff (memory and storage; only once the database is deleted),
   clear `chrome.storage.local` and `session`, verify the vault is gone (only the self-test pass, which is
   not wallet data, may be written again meanwhile).
-- Restore ("Forgot password?" on the popup lock screen → Reset wallet): the popup says the extension cannot recover the
-  password, gives one warning (the reset removes the wallet from this browser; only its recovery phrase brings it
-  back) and takes the recovery phrase and a new password (checked in the page). No word is typed. On Continue,
-  `vault.restoreBegin` issues a one-time token (32 random bytes, hex) bound to that popup document
-  (`sender.url`, `sender.documentId`, `sender.tab.id`) for `TIMINGS.RESTORE_TOKEN_TTL_MS`, in worker
-  memory only (a newer token replaces it). `vault.restore` takes the token first (any call spends it;
-  wrong, expired, foreign or missing → `RESTORE_EXPIRED`), then checks the new password and the phrase
-  (canonicalized, validated) and derives both addresses. It compares them with the replaced record's AAD
-  (no password needed). Without `confirm: 'ERASE'` it only answers `{status: 'confirm', erased, restored, otherWallet}`,
-  erases nothing and hands the token back: the popup's one confirmation names the wallet in this browser by its
-  addresses (the same phrase: it opens again with the new password at the same addresses; another wallet
-  (EXT-VAULT-R2-04): a danger notice and both wallets, the one removed and the one that takes its place) and one
-  checkbox ("I understand the wallet in this browser will be replaced") arms Reset wallet, which repeats the call with
-  the same token, `confirm: 'ERASE'` and, for another wallet, `replaceOther` (without it another wallet is only named
-  again). A record that does not parse cannot be compared (`erased` null, said on the confirmation) and is replaced
-  once confirmed (it cannot be opened: R2-ESM-05). Then the key
-  and the sealed record, written BEFORE the old vault goes (EXT-VAULT-R3-04): staged under `restoreStaging` and
-  read back, then one strict transaction clears the store (the old record, anchors, burn searches) and puts the new
-  record, so the old vault or the new one is there whatever fails or crashes; then
-  `session.lock('wipe')`, the final record read back, decrypted and its addresses compared (EXT-SEC-M2), the
-  backoff reset, the old wallet's `chrome.storage` entries cleared (best effort: they open nothing of the new
-  wallet), and the session started unless the screen locked meanwhile. Only the popup may send either type
-  (router), and the handlers refuse any other page too. The popup checks the phrase and passwords before sending.
+- Reset ("Forgot password?" on the popup lock screen → Reset wallet; decision 45): the popup says the extension cannot
+  recover the password and that a new one takes a reset, gives one danger warning (the reset removes the wallet from this
+  browser; only its recovery phrase brings it back) and offers Back and Reset wallet; nothing is typed, no phrase and no
+  password (it is forgotten). The press sends `vault.resetBegin`, which issues a one-time token (32 random bytes, hex)
+  bound to that popup document (`sender.url`, `sender.documentId`, `sender.tab.id`) for `TIMINGS.RESET_TOKEN_TTL_MS`
+  (one minute), in worker memory only (a newer token replaces it), then at once `vault.reset` with the token and
+  `confirm: 'ERASE'`. `vault.reset` refuses any page but the popup, takes the token (any call spends it; wrong,
+  expired, foreign or missing → `RESET_EXPIRED`), requires the confirmation, and erases as Wipe does after its password
+  check (`session.lock('wipe')`, the database deleted, the backoff reset, `chrome.storage.local` and `session` cleared,
+  the earlier version's database deleted, nothing left), whatever the record holds (one that does not parse goes too:
+  R2-ESM-05), and only while the wallet is locked: an unlocked one (its password is known; Delete wallet takes it) is
+  refused with `UNLOCKED` by both types, `vault.reset` checking in the same queue as unlock, so an unlock that finishes
+  first is seen and the wallet just unlocked stays (the popup then opens it; its "Forgot password?" waits while its own
+  unlock runs, and its reset screen gives way to the wallet on an `unlocked` event). Only the popup may send either
+  type (router), and the handlers refuse any other page too; no provider method reaches them. After a reset the popup
+  reloads to its first screen, where Import with the recovery phrase brings the wallet back (the activation record went
+  with the vault; Recover finds the burn again).
+- A staged record `restoreStaging` that the Forgot-password restore of 3.0.0 and 3.1.0 wrote and its stopped worker left
+  (R5-ESM-03) is deleted at every worker start (`vault.discardRestoreStaging`, sw.js) and every unlock; this version never
+  writes one.
 - Only `vault.js` opens `qnet-vault-v3`. `updateState` calls are serialized.
 
 ## 6. Session, lock and backoff (`session.js`)
@@ -1048,11 +1062,11 @@ with the same recovery phrase (decision 41).
   stored boolean. A session whose password check (Argon2id, about a second) began before a `user`, `idle` or
   `startup` lock, or that would start while `chrome.idle.queryState` reports `locked`, never starts
   (`session.lockMark()` taken before the KDF, `startSession({since})`: R3-ESM-03); an unlock then fails with
-  `LOCKED`, and a vault just written (create, import, restore) stays locked (`lockDeadline` null).
+  `LOCKED`, and a vault just written (create, import) stays locked (`lockDeadline` null).
 - Backoff: `chrome.storage.session['qnet_backoff_v3'] = {failures, until}`; shared by every password
   check (unlock, reveal, wipe, change password; the burn and the code take none: decision 33); first 3 failures free, then 1 s
   doubling up to 5 min (`backoffDelayMs`); `BACKOFF` with `retryAfterMs`. The failures belong to the
-  vault: a wipe or a restore resets them after the database is deleted, a refused restore keeps them.
+  vault: a wipe or a reset resets them after the database is deleted, a refused one keeps them.
 - Crypto self-test (R18, `keys.startKeys` at worker start, after `initSession`): a pass is cached for the
   browser session in `chrome.storage.session['qnet_selftest_v3'] = {v: 1, bundle, passedAt}`, where
   `bundle` is `CORE_VERSION + ':' + SHA-256 hex` of the shipped `lib/qnet-core.js` (the worker fetches
@@ -1066,29 +1080,31 @@ with the same recovery phrase (decision 41).
 | Area | Key | Content | Writer | Trust |
 |---|---|---|---|---|
 | IndexedDB `qnet-vault-v3` / `vault` | `main` | `VaultRecord` | vault.js | authenticated by decrypt; `sitesKey` by origin isolation |
-| IndexedDB `qnet-vault-v3` / `vault` | `lightAnchors` | `{v: 1, anchors, mac}` verified light-client anchors | vault.js (for qnet.js) | HMAC under a key derived from the vault key; ignored when it does not verify |
+| IndexedDB `qnet-vault-v3` / `vault` | `lightAnchors` | `{v: 2, chain, anchors, mac}` verified light-client anchors with their certified roots, all or none (decision 48) | vault.js (for qnet.js) | HMAC over the chain identity and the anchors under a key derived from the vault key; ignored when it does not verify, for another chain identity, and for a v1 record |
+| IndexedDB `qnet-vault-v3` / `vault` | `galcCapsule` | `{v: 1, chain, record}` the genesis capsule (`core.exportCapsule`: the capsule and the proof parts of its K and K-1, docs/protocols/galc-capsule-v2.md) | vault.js (for qnet.js) | none needed: `core.importCapsule` verifies the genesis signatures and the proof parts again; ignored for another chain identity |
 | IndexedDB `qnet-vault-v3` / `vault` | `chainCache` | `{v: 1, cache: {chain?, headIndex?, views?: {qnetBalance?, qnetTokens?, solanaBalances?}}, mac}`: the build's chain identity (`core.chainIdentity`), the highest network head (macroblock index) the wallet saw, kept in steps of 10, and the last verified balances kept across sessions (decision 40) | vault.js (`updateChainCache`, for qnet.js and session.js) | HMAC under a key derived from the vault key; ignored when it does not verify; public data only; its read or write never locks the session |
 | IndexedDB `qnet-vault-v3` / `vault` | `burnScans` | `{v: 1, scans: {[owner or owner + ':signed']: state}, mac}` the kept burn searches (both kinds of the wallet's Solana address; a state of an earlier search version is listed again) | vault.js (for activation.js) | HMAC under a key derived from the vault key; ignored when it does not verify |
-| IndexedDB `qnet-vault-v3` / `vault` | `restoreStaging` | the new `VaultRecord` of a Restore, only between its write and the replacing transaction (EXT-VAULT-R3-04) | vault.js | read back before the replace; the replace clears it; a restore that fails before the replace deletes it, and one a stopped worker left goes at the next worker start or unlock (R5-ESM-03) |
+| IndexedDB `qnet-vault-v3` / `vault` | `restoreStaging` | the new `VaultRecord` the Forgot-password restore of 3.0.0 and 3.1.0 staged before it replaced the vault | never written by this version | never read; one a stopped 3.0.0 or 3.1.0 worker left goes at the next worker start or unlock (R5-ESM-03) |
 | `chrome.storage.session` | `qnet_session_v3` | stored session | session.js | trusted contexts only |
 | `chrome.storage.session` | `qnet_backoff_v3` | `{failures, until}` | session.js | trusted contexts only |
 | `chrome.storage.session` | `qnet_selftest_v3` | `{v: 1, bundle, passedAt}` crypto self-test pass | keys.js | trusted contexts only; used only for the same bundle bytes |
 | `chrome.storage.session` | `qnet_approval_cooldown_v3` | `{[origin]: {rejections, until, windows}}` | provider.js | trusted contexts only; shape-checked, capped |
 | `chrome.storage.session` | `qnet_view_cache_v3` | `{walletId, values: {qnetBalance?, qnetHistory?, solanaBalances?, solanaHistory?, qnetTokens?}}` the popup's view cache (decision 39) | session.js (for the router) | trusted contexts only; public answers of the session's wallet only, read only for that wallet; removed by every lock and every new session |
+| `chrome.storage.session` | `qnet_light_hints_v1` | `{headSeen, capsuleQuietUntil}` (`headSeen`: `{index, at}` or null) the certified head the worker saw last and until when no node is asked for a capsule (decision 49) | qnet.js | trusted contexts only; hints only (a proof stands only by the certified head read with it; a quiet probe costs a longer walk); chain data, kept across locks; a wipe clears it, and a read still running may write it again after |
+| `chrome.storage.session` | `qnet_send_proofs_v3` | `{walletId, proofs: {[address]: {balanceNano, nonce, index}}}` the certified QNC figures a send may stand on (decision 48) | session.js (for qnet.js) | trusted contexts only; written only from a proof folded to a verified certified root; judged by its index against the certified head; removed by every lock and every new session |
 | `chrome.storage.local` | `qnet_sites_v3` | grants with MAC | provider.js | untrusted until the MAC verifies |
 | `chrome.storage.local` | `qnet_settings_v3` | `{language}`, a UI preference (`SUPPORTED_LANGUAGES`) | session.js | untrusted, allow-list validated; the worst a writer can do is change the UI language |
-| IndexedDB `QNetWallet` / `vault` | `main` | what the store's 2.1.x pages kept: the recovery phrase and two keys, each sealed under its password (section 5, Earlier version) | never written by this version; never created (a read opens it only when `indexedDB.databases()` lists it, and aborts an upgrade from version 0) | read only by `vault.status` (`earlier`) and `vault.migrate`; deleted with the earlier keys (after a migration read its vault back, by `vault.removeEarlier`, with the first vault when it holds no phrase and no readable record is there, by Delete wallet and by a restore) |
+| IndexedDB `QNetWallet` / `vault` | `main` | what the store's 2.1.x pages kept: the recovery phrase and two keys, each sealed under its password (section 5, Earlier version) | never written by this version; never created (a read opens it only when `indexedDB.databases()` lists it, and aborts an upgrade from version 0) | read only by `vault.status` (`earlier`) and `vault.migrate`; deleted with the earlier keys (after a migration read its vault back, by `vault.removeEarlier`, with the first vault when it holds no phrase and no readable record is there, by Delete wallet and by a reset) |
 | `chrome.storage.local` | `earlier.EARLIER_KEYS` (`encryptedWallet`, `walletExists`, `walletData`, `encryptedActivationCodes`, `wallet`, `isUnlocked`, `lastUnlockTime`, `currentNetwork`, `mainnet`, `auto_lock_timer`, `connected_sites`) | what the store's 2.1.x left: its encrypted wallet and the keys beside it (section 5, Earlier version) | never written by this version | read only by `vault.migrate` (a record that does not open moves nothing); removed after a migration read its vault back, by `vault.removeEarlier`, or with the first vault when no readable record is there |
 
 Nothing else is stored: pages keep nothing in `localStorage` or `sessionStorage`, and empty both when they start (the
 light node's registration lives
-in the vault state; its alarm `qnet-register` holds no data). Approvals, the restore token, the burn single-flight, the registration's one-at-a-time lane,
+in the vault state; its alarm `qnet-register` holds no data, nor does the follow alarm `qnet-follow`). Approvals, the reset token, the burn single-flight, the registration's one-at-a-time lane,
 the shared search's last verdict, what the last sync learnt of aiqnet.io's record, the `qnet_getActivation` read counts and the
 Solana History's rows read so far (at most 500) live in worker memory (aiqnet.io keeps the record itself, decision 35); a
-worker restart drops them (the relay answers 4900, the approve window closes on `NOT_FOUND`, a restore
-answers `RESTORE_EXPIRED` before erasing anything, a sent burn survives as `pendingBurn`). The popup keeps
-the worker up while a restore token exists, from Continue to the reset confirmation (`vault.status` every `TIMINGS.RESTORE_KEEPALIVE_MS`,
-R2-ESM-06), as the approve window does with its heartbeat.
+worker restart drops them (the relay answers 4900, the approve window closes on `NOT_FOUND`, a reset
+answers `RESET_EXPIRED` before erasing anything, a sent burn survives as `pendingBurn`). The popup asks for a reset
+token only when Reset wallet is pressed and spends it at once, so no keepalive holds the worker up for it.
 
 ## 8. The recovery phrase on screen and on the clipboard (`ui/setup.js`, `ui/popup.js`)
 
@@ -1113,7 +1129,7 @@ R2-ESM-06), as the approve window does with its heartbeat.
 - One line on the setup screen: anyone with the words controls the wallet (`setupWordsWarn`); the reveal has one line
   before its password (`revealWarn`), and the setup screen's copy line is `phraseCopyWarn` (owner, 28.09: one short line
   where an action is irreversible).
-- Import and Restore take the 12 or 24 words and a new password, nothing else; a pasted phrase leaves the clipboard
+- Import takes the 12 or 24 words and a new password, nothing else; a pasted phrase leaves the clipboard
   at once and again on every way out of the step (R3-EXT-UI-02).
 
 ## 9. Module APIs
@@ -1125,7 +1141,7 @@ NODES, EXPLORER_API, EXPLORER_TX_PATH}, SOLANA {CLUSTER, RPC_URLS, ONE_DEV_MINT,
 NODE_TYPE_MEMO, FEE_BUFFER_LAMPORTS, EXPLORER_TX_URL, EXPLORER_CLUSTER_QUERY, TRANSACTION_MAX_BYTES}, PAYMENT_REQUEST
 {REFERENCES_MAX, MEMO_MAX_BYTES}, DECIMALS, UI_PAGES, PROVIDER, VIEW_EVENT_CHANNEL, VIEW_EVENTS, STORAGE_KEYS, VAULT_DB,
 AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, RTL_LANGUAGES, LIMITS, TIMINGS,
-AUTO_LOCK_ALARM, REGISTRATION_ALARM, CLAIM_MIN_NANO`, pure `languageForTag(tag) → code|null` and
+AUTO_LOCK_ALARM, REGISTRATION_ALARM, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, CLAIM_MIN_NANO`, pure `languageForTag(tag) → code|null` and
 `isPaymentRequestMemo(text) → boolean` (decision 34). `PROVIDER` includes `CHANNEL`
 (`'extension'`) and `ACTIVATION_ORIGIN`. `LIMITS` includes `REGISTRATION_MAX_ATTEMPTS`; `TIMINGS` includes
 `REGISTRATION_SUBMIT_TIMEOUT_MS`, `REGISTRATION_ADMIT_HOLD_MS`, `REGISTRATION_ADMIT_CHECK_MS`, `REGISTRATION_SOON_MS`,
@@ -1139,17 +1155,19 @@ s), `WALLET_SEARCH_FRESH_MS` (60 s), `ACTIVATE_RECHECK_MS` (5 s).
 `APPROVAL_COOLDOWN_ORIGINS_MAX`, `APPROVAL_BUDGET_SHORT`, `APPROVAL_BUDGET_LONG`, `BURN_SCAN_PAGE_SIZE`,
 `BURN_SCAN_MAX_PAGES`, `BURN_SCAN_MAX_UNCHECKED`, `BURN_SCAN_DEADLINE_MS`; `TIMINGS` includes `APPROVAL_COOLDOWN_MS`,
 `APPROVAL_COOLDOWN_LONG_MS`, `APPROVAL_COOLDOWN_WINDOW_MS`, `APPROVAL_BUDGET_SHORT_MS`, `CONFIRM_ARM_VALUE_MS`,
-`RESTORE_TOKEN_TTL_MS`, `RESTORE_KEEPALIVE_MS`, `CLIPBOARD_CLEAR_MS`, `PHRASE_CLIPBOARD_CLEAR_MS` (section 8),
+`RESET_TOKEN_TTL_MS`, `CLIPBOARD_CLEAR_MS`, `PHRASE_CLIPBOARD_CLEAR_MS` (section 8),
 `POPUP_REFRESH_MS` (section 9, Pages).
 
 **errors.js**: `ERROR_MESSAGES`, `PROVIDER_ERROR_CODES`, `class WalletError(code, {retryAfterMs?, field?})`,
 `class ProviderError(code)`, `toUiError(error) → {code, message, …}`, `toProviderError(error) → {code,
 message}` (`APPROVAL_COOLDOWN` → `{code: 4001, message: ERROR_MESSAGES.APPROVAL_COOLDOWN}`; `UNSUPPORTED_PARAM` of a
 `UNSUPPORTED_CALL_FIELDS` field → `{code: -32602, message: UNSUPPORTED_PARAM_MESSAGE, data: {reason: 'UNSUPPORTED_PARAM'}}`). Codes added
-with the restore and the cooldown: `RESTORE_EXPIRED`, `APPROVAL_COOLDOWN`; with the resumable burn search: `HISTORY_TOO_LONG`; with the burns no code derives from: `BURN_UNUSABLE` (R4-ESA-01); with the
+with the reset and the cooldown: `RESET_EXPIRED` (decision 45: it replaced the restore's `RESTORE_EXPIRED`), `UNLOCKED` (decision 45: a reset of an unlocked wallet), `APPROVAL_COOLDOWN`; with the resumable burn search: `HISTORY_TOO_LONG`; with the burns no code derives from: `BURN_UNUSABLE` (R4-ESA-01); with the
 sites' token transfers and contract calls: `UNSUPPORTED_PARAM`, `INVALID_METHOD`, `INVALID_ARGS`, `INVALID_GAS_LIMIT`
 (the last three are the shared builders' codes, `UNSUPPORTED_CALL_FIELDS` the fields of the first); with the light
-node (section 4.10): `NO_NODE`, `CLAIM_REFUSED`, `CLAIM_BUSY`; with aiqnet.io's record (decision 35): `ACTIVATION_RECORDED`,
+node (section 4.10): `NO_NODE`, `CLAIM_REFUSED`, `CLAIM_BUSY`, and `WALLET_MISMATCH` for a node a site names that is not this
+wallet's (decision 47); with the light node's unlink (decision 38): `NOT_LINKED`, `UNLINK_REFUSED`; with aiqnet.io's record
+(decision 35): `ACTIVATION_RECORDED`,
 `ACTIVATION_RESERVED`, `RECORD_UNAVAILABLE`. Every other code the
 builders throw (`INVALID_NONCE`, `INVALID_GAS_PRICE`, `REQUEST_TOO_LARGE`, ...) cannot come from what the wallet passes
 them and reads as `INTERNAL`.
@@ -1175,12 +1193,13 @@ may be a normalizer (`normalizeTransaction(raw)` for `qnet_sendTransaction`, sec
 `canonicalJson(value)`, `normalizePassword(pw, {isNew})`, `assertKdfFloor(kdf)`,
 `encodePlaintext(entropy, state) → Uint8Array`, `decodePlaintext(bytes) → {entropy, state}`,
 `deriveVaultKey(normalizedPw, kdf) → Promise<Uint8Array(32)>`, `vaultExists()`, handlers `getStatus()`,
-`unlock(p)`, `changePassword(p)`, `reveal(p)`, `wipe(p)`, `beginRestore(p, meta) → {token, expiresAt}`,
-`restoreVault(p, meta)`, `createVault(p)`, `importVault(p)`, `migrateEarlier(p)` (`vault.migrate`), `removeEarlier()`
+`unlock(p)`, `changePassword(p)`, `reveal(p)`, `wipe(p)`, `beginReset(p, meta) → {token, expiresAt}`,
+`resetVault(p, meta)` (decision 45), `createVault(p)`, `importVault(p)`, `migrateEarlier(p)` (`vault.migrate`), `removeEarlier()`
 (`vault.removeEarlier`); internal API `verifyPassword(pw)`, `readEntropy() →
 Uint8Array`, `readState() → VaultState`, `updateState(mutator) → VaultState`, `writeNewVault(entropy, pw)`,
 `withRecipient(state, address) → VaultState`,
-`RECIPIENTS_MAX`, `readLightAnchors() / writeLightAnchors(anchors)`, `readChainCache() / updateChainCache(mutator)`
+`RECIPIENTS_MAX`, `readLightAnchors() / writeLightAnchors(anchors)`, `readCapsule() / writeCapsule(record|null)` (decision
+48), `readChainCache() / updateChainCache(mutator)`
 (decision 40; never lock the session) and `readBurnScan(owner) / writeBurnScan(owner, scan)` (MAC under the vault key;
 need the session), `PENDING_OUTCOMES`, `PENDING_KINDS`, `readSiteBinding() → {walletId, sitesKey}|null`, `rotateSitesKey() → {walletId, sitesKey}|null` (works
 while locked), `deleteVaultDatabase()`.
@@ -1199,7 +1218,8 @@ lockDeadline}`, `isUnlocked()`, `withVaultKey(fn)` (vault.js only), `replaceVaul
 `getAddresses()`, `getSettings()`, `setSettings(patch)`, `cachedViews()` (`wallet.cached`), the view cache's
 `rememberView(name, value)` (the router, decision 39; nothing while locked; a verified QNet balance, the token list and
 the Solana balances also into the vault's chain cache, decision 40) and `forgetViews(names)` (qnet.js, a chain the wallet
-no longer follows), listeners `onAlarm(alarm)`, `onIdleState(state)`,
+no longer follows), the send proofs' `keepSendProof(address, figure)`, `keptSendProof(address) → figure|null` and
+`forgetSendProofs()` (qnet.js, decision 48), listeners `onAlarm(alarm)`, `onIdleState(state)`,
 backoff `checkBackoff()`, `recordPasswordFailure()`, `recordPasswordSuccess()`, `getBackoffUntil()`,
 pure `backoffDelayMs(failures)`, `isAutoLockChoice(minutes)`.
 
@@ -1215,7 +1235,8 @@ and `signQnetContractCall({from, contract, method, args, nonce, gasLimit})` → 
 `getQnetPublicKey() → Uint8Array(1952)`; the light node (section 4.10): `signNodeRegistration({nodeId, wallet, burnTx, burner,
 timestamp}) → {proof, consentSignature, ownerSignature, publicKey}` (`burnTx` and `burner` must be those of the vault's
 light activation, burned from the wallet's Solana address, whose key signs the owner bind), `signNodeClaim({nodeId,
-wallet}) → {signature, publicKey}`, `signClaimPayload({wallet, timestamp, claimsData}) → {signature, publicKey}`,
+wallet}) → {signature, publicKey}` (`nodeId` the wallet's light or super node id, decision 47), `signClaimPayload({wallet,
+timestamp, claimsData}) → {signature, publicKey}`,
 `signNodeStatus({nodeId, wallet, timestamp}) → {signature, publicKey}` (the signed status request of the wallet's own
 light node), `signNodeUnbind({nodeId, wallet, seq, timestamp}) → {signature, publicKey}` (the wallet key's unbind of its own
 node's device binding `seq`, decision 38: `core.signNodeUnbind` over `q1337|light_unbind_wallet:{N}:{seq}:{timestamp}`); decision 35: pure `burnRecordMessage({wallet, nodeType, burner, burnTx, burnAmount})` and `signBurnRecord(same) →
@@ -1257,11 +1278,14 @@ index}` (decision 44: the certified account proof; `display`: the popup's balanc
 1.5 s once a figure is read, then shows it as not verified while the walk goes on), pure `certifiedIndexStands(index,
 head)` (R2-EXTQ-01); the wallet's tokens and the popup's token send (decision 40): `listTokens() →
 TokenList` (`qnet.tokens`), `tokenPreview(p)` (`qnet.tokenPreview`), `tokenSend(p)` (`qnet.tokenSend`, through
-`sendCall`), `txLookup({hash})` (`qnet.txLookup`); `followChain() → 'same'|'changed'|'unknown'` (decision 40). Every body a node, the archive or the RPC answers is read through `core.readBoundedText`: the
+`sendCall`), `txLookup({hash})` (`qnet.txLookup`); `followChain() → 'same'|'changed'|'unknown'` (decision 40); the
+follow and the Send tab's reads ahead (decision 48): `followTick() → {ok, head, verified, proof}|{ok: false, reason}`,
+`startFollow()`, `stopFollow()`, `onAlarm(alarm)` (sw.js: `FOLLOW_ALARM`), `sendWarm({to?})` (`qnet.sendWarm`). Every body a node, the archive or the RPC answers is read through `core.readBoundedText`: the
 stream is cut once more than its cap (1 MiB for nodes and the archive, the RPC's own cap) has arrived, whatever the
 headers say, so a chunked or compressed answer is never held whole (R4-EXTQ-03). Proofs walk from the
-nearest trusted root on the index's parity chain (the pin, or anchors kept with `vault.writeLightAnchors` and
-imported once per worker; EXT-CHAINS-04), at most the light client's `WALK_STEPS_PER_CALL` (64) steps per call,
+nearest trusted root on the index's parity chain (the pin, anchors kept with `vault.writeLightAnchors` and
+imported once per worker, EXT-CHAINS-04, or a root of the genesis capsule when the walk from those would be longer than
+16 steps, decision 48), at most the light client's `WALK_STEPS_PER_CALL` (64) steps per call,
 each verified step kept at once (`hooks.onProgress`), so a walk longer than one call goes on over the next reads
 instead of never starting (R3-EXTQ-02). Balance and token proofs are the certified form and the send rule of decision
 44; a proof answer is capped at 64 KB.
@@ -1332,7 +1356,7 @@ burn search of the wallet's Solana address, with the confirmed page (`BURN_EXIST
 from, in its search or from another of its token accounts (`findSignedBurns`; `BURN_UNUSABLE`: the node counts it for
 an activation, so no second burn; Recover answers `BURN_UNUSABLE` rather than "no burn" when that is all it found;
 R4-ESA-01, R5-ESA-01; the valid burns are looked at before a search that is incomplete refuses) →
-the QNet network vouches that the wallet has no node (`refuseExistingNodes`, fail closed, EXT-R1-01: the searches of the
+QNet Blockchain vouches that the wallet has no node (`refuseExistingNodes`, fail closed, EXT-R1-01: the searches of the
 phrase's addresses are no complete evidence, since a light burn aiqnet.io's one-time payment key made for the wallet
 leaves no trace there): `GET /api/v1/verify-activation` with header `x-qnet-wallet` for the wallet's QNet address, two
 pinned nodes first and then one more at a time (`verified: true` → `NODE_EXISTS`; one
@@ -1340,7 +1364,7 @@ authoritative "no" goes on; a non-authoritative "no" is no proof, and no authori
 `NETWORK`), then `nodes.lightNodeKnown(lightNodeId(W))`: every pinned node's public status at once, any one listing
 the light node or holding its registration (`onchain_registered`, `registration_pending`) → `NODE_EXISTS`, fewer than
 two answers → `NETWORK` (aiqnet.io's record is asked first, decision 35: `ACTIVATION_RECORDED`, `ACTIVATION_RESERVED`,
-`RECORD_UNAVAILABLE`) → re-fetch price (phase 1,
+`RECORD_UNAVAILABLE`) → re-fetch price (every pinned node that answers, at least two, quoting alike: decision 48; phase 1,
 integer, equal to `expectedPrice`) → 1DEV >= price → aiqnet.io's reservation → SOL >= `FEE_BUFFER_LAMPORTS` + fee → build, sign
 (only with `SIGN_MARGIN_MS` of the reservation left), simulate, the announce with the burn record's proof (nothing is sent
 without its 200; a failure before the send releases the reservation), the pending record with the blockhash's
@@ -1384,9 +1408,11 @@ aiqnet.io paid (`paidOnSite`), which `activateForSite` answers `NODE_EXISTS` and
 registration → true, at least two answering and none → false); `registeredBurn() →
 string|null` (the burn the registration record names, two pinned nodes alike; throws `LOCKED`, `SIGNING_DISABLED`);
 `resumeRegistration({recheck?})` (never throws), handlers `requestRecord()` (`activation.register`), `getRegistration()` (`activation.registration`); listener
-`onAlarm(alarm)`; for the provider `claimView() → {mode, reason, nodeId, amountNano}` and `claimForSite() →
-{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}|{status: 'empty', qnet, nodeId}` (throws `NO_NODE`,
-`NETWORK`, `CLAIM_REFUSED`, `CLAIM_BUSY`, `LOCKED`, `SIGNING_DISABLED`); for the provider and the popup (decision 38)
+`onAlarm(alarm)`; for the provider (decision 47) pure `ownNodeType(nodeId, wallet) → 'light'|'super'|null`,
+`claimView(nodeId) → {mode, reason, nodeId, nodeType, amountNano}` and `claimForSite(nodeId) →
+{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}|{status: 'empty', qnet, nodeId}` (throws
+`WALLET_MISMATCH`, `NO_NODE`, `NETWORK`, `CLAIM_REFUSED`, `CLAIM_BUSY`, `LOCKED`, `SIGNING_DISABLED`); for the provider
+and the popup (decision 38)
 `unlinkView() → UnlinkView` (`node.unlinkView`; throws `LOCKED`) and `unlinkForSite() → {status: 'ok', qnet, nodeId,
 unbound: true}` (`node.unlink`; throws `NOT_LINKED`, `NETWORK`, `UNLINK_REFUSED`, `LOCKED`, `SIGNING_DISABLED`).
 
@@ -1406,7 +1432,8 @@ area D: `loadLocale(language)` (the table of `ui/i18n`, `<html lang dir>`), `cur
 (with `clearAfterMs` the page empties the clipboard after that delay if nothing was copied from it since and it has
 the focus; with `untilFocused` too, a page without the focus then does it when it gets the focus back),
 `clearCopiedNow()` (empties such a copy at once), `holdToReveal(control, target, secret, {autoHideMs, onExpire,
-placeholder})` (no page uses it since decision 43), `openSetup()`, `clearPageStorage()` (decision 43: every page at start).
+placeholder})` (no page uses it since decision 43), `openSetup(flow)` (`'create'` or `'import'`: setup opens at that
+step, `?flow=`; decision 45), `clearPageStorage()` (decision 43: every page at start).
 `ui/kit.js` adds `earlierRemoval({onRemoved})`: what an earlier version left, with Remove behind one confirmation
 (setup's last screen and Settings).
 
@@ -1414,9 +1441,9 @@ placeholder})` (no page uses it since decision 43), `openSetup()`, `clearPageSto
 tabs are Assets · Send · Receive · History · Activate · Settings with a QNet / Solana switch; no Node
 tab. Once the wallet has its code (the vault's, or aiqnet.io's record's), the Activate tab shows only this (decisions 41
 and 43; the code itself is in Settings, one plain row: masked, Show and Copy, no warning, no timer): for a light
-activation of the vault, its record on the QNet network while the chain does not list the node: its node id, one line (read again every
+activation of the vault, its record on QNet Blockchain while the chain does not list the node: its node id, one line (read again every
 `TIMINGS.REGISTRATION_POLL_MS` while it is being recorded) and, when the record waits for the user (none, refused, the
-clock, past the attempt cap), Record on the network with one press (`activation.register`, no password: decision 33); the
+clock, past the attempt cap), Record on QNet Blockchain with one press (`activation.register`, no password: decision 33); the
 card goes once the chain lists the node (`onchain`) and stays, with its line, in every other state (`other_burn` and the
 one-node rule's refusal included); one line, "Manage the node at aiqnet.io/node", the tab's only link (`RECORD_ORIGIN/node`,
 a new tab, `rel="noopener noreferrer"`); and a warning only when another burn is involved (this device's burn another
@@ -1424,19 +1451,22 @@ device's older burn beat, XP-R5-03; the vault's burn aiqnet.io's record of anoth
 Solana Explorer button. It shows no burn details (node type, amount, burn transaction, network, date) or their buttons, no
 success banner, no paid-on-site line, no next step, no server settings and no Device card: aiqnet.io/node shows the node,
 its device and its balance, and the device is unlinked on its Device tab, which asks this wallet through
-`qnet_unlinkNodeDevice` (decision 38); the popup sends neither `node.unlinkView` nor `node.unlink`. Its lock screen offers "Forgot password?" (section 5, Restore): Reset wallet with one
-warning, the phrase and a new password (checked in the page), `vault.restoreBegin` and a checking `vault.restore`, one
-confirmation naming the wallet that is replaced with one checkbox (no typed word), the confirmed `vault.restore`, and the
-resulting addresses with a pointer to Recover. Setup generates entropy in the page with
+`qnet_unlinkNodeDevice` (decision 38); the popup sends neither `node.unlinkView` nor `node.unlink`. With no wallet its first screen offers Create a new wallet and Import an existing wallet, each opening setup straight at
+that step (`openSetup('create')`, `openSetup('import')`; decision 45); while the earlier version's wallet is there it
+offers only Unlock your earlier wallet. Its lock screen offers "Forgot password?" (section 5, Reset): Reset wallet with one
+lead, one danger warning, Back and Reset wallet, nothing typed; the press sends `vault.resetBegin` and `vault.reset`, and
+the popup starts over at its first screen ("Forgot password?" waits while an unlock runs; a wallet unlocked meanwhile
+opens instead). Setup opens at the step its address names (`?flow=create` or
+`?flow=import`, taken once `vault.status` answered), else at its choice of the two. Setup generates entropy in the page with
 `core.generateEntropy(12)`, shows the words for writing down with the Copy button and its warning (section 8; no
 download), verifies typed words, sends the phrase once, then drops every reference; its success screen stays until the
 user presses Done, which closes the tab (no timer: owner, 28.09). Every seed, word, password and code input goes through
 `hardenSecretInput`. The receive QR is drawn locally (no remote QR service); Receive says in one line what the address
 takes (QNC and QNet tokens; SOL and Solana tokens), with no warning box. Every screen that shows this wallet's own QNet or
-Solana address (the Assets card, Receive, a review's From, the setup and restore results) shows it whole,
+Solana address (the Assets card, Receive, a review's From, the setup result) shows it whole,
 on one line and never cut, and the address is itself the copy control (`kit.addressCopy`: a button, "Click to
 copy" on hover, "Copied" after; the Assets card has no separate Copy button). Every other whole address (a review's To,
-the 1DEV mint, the reset confirmation, the approval window's blocks) stays on one line too: in a list (`kit.kvList`) it
+the 1DEV mint, the approval window's blocks) stays on one line too: in a list (`kit.kvList`) it
 takes the row below its label, and its box is a size container whose address type is `clamp(10.5px, 100cqi / 27.2,
 13px)`, the size at which 45 characters of the widest monospace advance (0.602 em) fill it (310 px boxes in the popup:
 11.4 px, 10.8 px beside a 17 px scrollbar; a setup tab narrower than about 400 px wraps it). A size container gives its column
@@ -1464,7 +1494,7 @@ above, one way or the other alike; the lead that invites a burn only while the w
 its title, a progress bar and the time, no list of the steps inside, and its code screen has no Done button (EXT-F5): it is
 the overview's, titled "Your activation code" (the warning of a burn another device beat above the code, the light node's
 record, read at once and then once per poll, and the line). The popup's burn waits for its one acknowledgement, the activation code comes with one press (Show or
-copy the code), and Record on the network with one; none asks for the password (decision 33). The Solana send: the token
+copy the code), and Record on QNet Blockchain with one; none asks for the password (decision 33). The Solana send: the token
 (SOL or a listed SPL token, 1DEV), the recipient (a Solana address, or a payment request `solana:<address>?<parts>` pasted
 or typed in: `kit.parseSolanaRecipient` reads it with the app's grammar, limits and decoding (decision 34): `amount`,
 `spl-token` and `memo` once each, up to four distinct `reference` addresses, `label` and `message`, form-encoded, any
@@ -1498,8 +1528,8 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
 - `router` → `keys.exportPrivateKey` (`vault.exportKey`).
 - `keys` → `session.requireUnlocked`, `vault.readEntropy`, `vault.readState` (the light activation a registration
   signs for), core. Nothing else derives keys.
-- `qnet` → `session` (and its `forgetViews`, decision 40), `vault.readState`/`updateState`/`withRecipient` (pending
-  transfers, recipients), `vault.readLightAnchors`/`writeLightAnchors`, `vault.readChainCache`/`updateChainCache`, `keys.signQnetTransfer`, `keys.signQnetTokenTransfer`,
+- `qnet` → `session` (and its `forgetViews`, decision 40, and the send proofs, decision 48), `vault.readState`/`updateState`/`withRecipient` (pending
+  transfers, recipients), `vault.readLightAnchors`/`writeLightAnchors`, `vault.readCapsule`/`writeCapsule`, `vault.readChainCache`/`updateChainCache`, `keys.signQnetTransfer`, `keys.signQnetTokenTransfer`,
   `keys.signQnetContractCall`, `keys.getQnetPublicKey`, core light client and transaction builders.
 - `solana` → `session` (and its `cachedViews`, decision 39), `keys.signSolanaMessage`, core.
 - `activation` → `session`, `vault` (state), `solana`, `qnet.nodeRequest`, `qnet.siteRequest`, `keys.signingEnabled`,
@@ -1524,18 +1554,19 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
 ## 11. Tests each area adds (`test/<area>.test.mjs`, offline, `npm test`)
 
 - A (round 2): strict durability of every write, an earlier record without the key `legacy` and any other value of it
-  refused (`vault-session-vault`); restore only checks and names both wallets until it is confirmed, asks again before
-  replacing another wallet without `replaceOther`, keeps the old vault through a failed write, replaces a malformed
-  record (`vault-session-restore`); from the lock screen against the real worker, another wallet's phrase is named and
-  Back keeps the old vault, and only the ticked checkbox replaces it (`integration`); the MAC'd burn searches.
+  refused (`vault-session-vault`); the reset erases a malformed record too and refuses an unlocked wallet, an unlock
+  that finishes first among them (`vault-session-reset`); from the lock screen
+  against the real worker, Back keeps the vault and Reset wallet erases it, and the phrase imported again brings it back
+  (`integration`); the MAC'd burn searches.
 - A: KDF floor refused; tampered AAD, ciphertext, IV or `record.kdf` → fail; wrong password →
   `BAD_PASSWORD` and backoff; create refuses an existing vault; whitespace/case import variants give the
   KAT addresses; one-activation invariant in `updateState`; lock clears memory and the mirror; the
   stored session restores only before its deadline; wipe leaves every storage empty; a V8 heap snapshot after lock
   holds no phrase, seed,
-  entropy, password or vault key (`vault-session-heap`); the restore needs the popup's one-time token,
-  leaves the old vault (and its password backoff) intact on an invalid phrase and replaces it on success
-  without the old backoff, from the popup only (`vault-session-restore`); the self-test pass is cached per bundle and a failure never
+  entropy, password or vault key (`vault-session-heap`); the reset needs the popup's one-time token and the
+  confirmation, leaves the vault intact without them, erases it locked and without a password as a wipe does (its backoff
+  with it), from the popup only and never from a site, and a staged record of an earlier version's restore goes at worker
+  start and unlock (`vault-session-reset`); the self-test pass is cached per bundle and a failure never
   (`vault-session-selftest`); the WebAssembly Argon2id equals noble's (`vault-session-kdf`); the MAC'd light anchors and
   the recipients list (`vault-session-vault`). Use
   `test/helpers/chrome-mock.mjs` and the in-memory
@@ -1611,11 +1642,14 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
 - The light node (3.1.0, section 4.10): the registration machine against simulated nodes, every submit verified as the
   node verifies it (the fields in order, the id and proof, the consent under the wallet key with the empty context, the
   owner bind under the burner), the answers row by row, the hold, the cap, the
-  lock, the lane, an earlier build's activation, the queueing by activation.js; the claim view and the quote checks
-  (`nodes-registration`); `qnet_claimNodeBalance` through the router and the provider, its results against the shared
-  vectors, its window on the fake DOM, and the activation window's record line and longer stay (`provider-node-claim`);
+  lock, the lane, an earlier build's activation, the queueing by activation.js; the claim view and the quote checks, for
+  the light and the super node, and another wallet's node refused before any read (`nodes-registration`);
+  `qnet_claimNodeBalance` through the router and the provider, the node it names, its results against the shared vectors
+  of `docs/protocols/node-claim.vectors.json`, its window on the fake DOM (`provider-node-claim`); the core's super node id
+  and claim quote against those vectors (`node-claim-vectors`); the activation window's record line and longer stay
+  (`provider-activate-record`);
   the method and the two UI types (`router`); the record's shape and consistency (`vault-session-vault`); the status line
-  and Record on the network (`ui-popup`); the burn recorded end to end (`integration`); the core's node signers against
+  and Record on QNet Blockchain (`ui-popup`); the burn recorded end to end (`integration`); the core's node signers against
   the shared vectors and the self-test's light node id (`light-node-vectors`). A burn aiqnet.io paid: Recover through
   the signed status (the request verified as the node verifies it), the wallet's code, the refusals of anything but a
   finalized light burn two nodes name alike, `NODE_EXISTS` to the site (`chains-activation-activation`); the vault's
@@ -1626,7 +1660,7 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   reserved or signed; a source that cannot answer (aiqnet.io down, busy or answering nonsense, Solana, the network) refusing
   it; two browsers of one wallet, one reservation and one burn; the order reserve → sign → simulate → announce → send, an
   announce refused or unanswered sending nothing and giving the reservation back, the sign margin; the announce's proof
-  verified with the audited libraries over the contract's bytes; a reset and restore of the same phrase finding the old burn
+  verified with the audited libraries over the contract's bytes; a reset and an import of the same phrase finding the old burn
   (the record, then the search); the sync of a vault activation, a payment record kept as the wallet's code, an older burn of the
   same address replacing a younger one; the window's `checking` view; every `qnet_getActivation` read; the Activate tab's views
   (`chains-activation-activation`, against `test/helpers/cabinet-server.mjs`); the proof signer (`vault-session-keys`);
@@ -1643,7 +1677,7 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   refusing a burn, `parseRecord` refusing `burned` (`chains-activation-activation`, with `test/helpers/cabinet-server.mjs`
   checking the request as the site does); `signReservation`'s bytes and checks (`vault-session-keys`); the new prefixes, the
   site-record signer and its refusals of any other text (`core`); `wallet_has_node` refused for good and never retried, by its
-  code and by its text, and `bind_v2_pending` a retry by its code and by its text (`nodes-registration`); the popup's `wallet_has_node` line without Record on the network and the
+  code and by its text, and `bind_v2_pending` a retry by its code and by its text (`nodes-registration`); the popup's `wallet_has_node` line without Record on QNet Blockchain and the
   Super code's copy warnings (`ui-popup`; its server-steps link and the paid-on-site line went with decision 41); the approval window's Super line
   and, before a burn, where the node runs, a Light node in QNet Wallet on a phone or tablet, a Super node on a server, and
   after the answer a record the one-node rule refused said as that refusal although the answer's registration names no
@@ -1758,7 +1792,7 @@ These follow the audits where the spec text was silent or looser; each is small 
 6. The password backoff lives in `chrome.storage.session`, so a browser restart resets it; the KDF cost
    is the real barrier.
 7. Only 12- and 24-word phrases are accepted (Core stage), as by the mobile app's import (XC-M2).
-8. Import and Restore take the 12 or 24 words and a new password, nothing else. The premise of 2026-09-28 that no wallet
+8. Import (and, until decision 45, Restore) takes the 12 or 24 words and a new password, nothing else. The premise of 2026-09-28 that no wallet
    of an earlier extension version exists was wrong: the store's 2.1.x has about 47 users, who update into this version
    under the same item. Their wallet is moved by `vault.migrate` (decision 43, section 5, Earlier version), and its
    phrase can still be imported.
@@ -1766,7 +1800,8 @@ These follow the audits where the spec text was silent or looser; each is small 
    an address that only appears as a sender in the history is shown as "never sent to", and one that shares
    its first and last characters with a known one is a look-alike warning (ES-01). The popup review and the
    dApp approval show the same check; the history read is a hint, the vault list the authority.
-10. The restore token is spent by any `vault.restore` call except one that answers `confirm` (nothing erased), so a
+10. (Superseded by decision 45: the reset token is spent by any `vault.reset` call.) The restore token is spent by any
+    `vault.restore` call except one that answers `confirm` (nothing erased), so a
     refused restore (which the popup's own checks make rare) starts again from the lock screen.
     A restore with the same phrase also drops the activation record, a pending burn and unconfirmed transfers
     of the old vault, as a wipe does.
@@ -1786,7 +1821,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     The approval window is 400 px wide (it was 380) to match the width the layouts are checked at.
 13. Languages: tab labels that are one long word carry a soft hyphen (`\u00ad`) and may take two lines;
     language names are shown in their own language; the typed confirmation `DELETE` stays English (a protocol value
-    of `vault.wipe`; `ERASE`, the confirmation of `vault.restore`, is never shown or typed); dates follow the UI
+    of `vault.wipe`; `ERASE`, the confirmation of `vault.reset`, is never shown or typed); dates follow the UI
     language; the choice is stored only after an unlock (`settings.set`), and before that the browser's
     UI language is used.
 14. The recovery phrase may be copied by its Copy button, on the setup screen of a new wallet and in Settings →
@@ -1795,7 +1830,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     section 8).
 15. The vault record keeps the keys `aad.legacy` (always null) and `state.exposedAdvice` of its format, so a vault an
     earlier 3.x build wrote opens unchanged; a record with anything but null in `aad.legacy` or `state.legacy` does not
-    open (`VAULT_CORRUPT`: Restore replaces it).
+    open (`VAULT_CORRUPT`: Reset removes it, decision 45).
 16. Approvals confirm only on a real pointer click (mouse, pen or touch); a keyboard press does not
     confirm (ES-02). This trades keyboard-only use for resistance to a page that times a key press.
 17. A new password needs at least 8 characters and is typed twice, nothing else, as in the app (owner decision of
@@ -1854,7 +1889,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     `UNSUPPORTED_CALL_FIELDS`, `UNSUPPORTED_PARAM_MESSAGE`, the error data), `test/router.test.mjs`, `test/skeleton.test.mjs`.
 
 26. Unified direction (owner decisions of 2026-09-26, 3.1.0): the extension records the wallet's light node on the QNet
-    network right after its own light burn and for a burn made earlier (Record on the network), so the activation code is
+    network right after its own light burn and for a burn made earlier (Record on QNet Blockchain), so the activation code is
     a receipt. The cabinet's signer on a desktop is `qnet_activateNode` (burns and records, result keys unchanged) and
     `qnet_claimNodeBalance` (moves the node balance of the wallet's own light node, no password, the claim answer of QNet
     Link v1 section 14.7). No device linking, ping key, push token or "I'm back" here: that is the phone's. The consent
@@ -1872,11 +1907,11 @@ These follow the audits where the spec text was silent or looser; each is small 
     wallet, the signed status the wallet key reads), keeps it as the wallet's one activation with its registration on
     chain, and never records or burns on top of it (`NODE_EXISTS` to the site). A desktop burn of the extension keeps
     the burner's code, as before. No frozen file changed.
-28. Final audit, extension round 1 (2026-09-27): no burn until the QNet network vouches that the wallet has no node,
+28. Final audit, extension round 1 (2026-09-27): no burn until QNet Blockchain vouches that the wallet has no node,
     since a burn the cabinet's payment key made leaves no trace in the phrase's history (EXT-R1-01: fail closed,
     `NETWORK`, which a site learns as `INTERNAL`); the chain's word on the registration is two pinned nodes', and a
     record on chain is read again on request and on a throttled resume (EXT-R1-02); an admitted record is read on chain
-    past the attempt cap, and a far retry shows Record on the network (EXT-R1-04); Recover's card says it records the
+    past the attempt cap, and a far retry shows Record on QNet Blockchain (EXT-R1-04); Recover's card says it records the
     light node (EXT-R1-05); a full claim batch must reach the balance two other nodes agree on, and a node that cannot
     serve an epoch hands the quote over (EXT-R1-06, EXT-R1-07); the Super card and its burn warning say the server then
     holds this wallet's keys (EXT-R1-08; no text of the extension says it since decision 41 took the Super server card,
@@ -1912,9 +1947,9 @@ These follow the audits where the spec text was silent or looser; each is small 
     what is signed and the result guards are unchanged, and the window binding of section 4.8 (the approve page, the
     approval's id, its window, the revision, once) is what ties a confirm to its request. `activation.activateForSite`
     takes no password. The popup keeps the password for its own actions that are no site's request: Reveal recovery
-    phrase, Change password, Delete wallet, and also its own burn, showing the activation code and Record on the
-    network (`activation.burn`, `activation.copy`, `activation.register`; until decision 33); Reset wallet takes the
-    recovery phrase. The
+    phrase, Change password, Delete wallet, and also its own burn, showing the activation code and Record on
+    QNet Blockchain (`activation.burn`, `activation.copy`, `activation.register`; until decision 33); Reset wallet takes the
+    recovery phrase (until decision 45: Reset wallet now takes nothing and removes the wallet). The
     popup has no Refresh button: balances, the token list and the history read themselves again (section 9, Pages;
     event `balance`). Frozen files changed: `config.js` (`VIEW_EVENTS` gains `balance`, `TIMINGS.POPUP_REFRESH_MS`),
     `events.js` (the event name in its JSDoc), `router.js` (`approval.resolve` without `password`),
@@ -1922,9 +1957,10 @@ These follow the audits where the spec text was silent or looser; each is small 
 33. Owner decisions of 2026-09-29, later the same day. (a) No password while unlocked for a site-independent popup action
     that is no high-risk secret action: the popup's own burn (`activation.burn`: its acknowledgement "I understand that
     … 1DEV will be destroyed…" stays, it had no arm delay), showing the activation code (`activation.copy`: one press,
-    the code in the page only while shown, as before) and Record on the network (`activation.register`: one press, no fee,
+    the code in the page only while shown, as before) and Record on QNet Blockchain (`activation.register`: one press, no fee,
     nothing burned). A `password` sent with any of them is `INVALID_PARAMS`. The password stays for Reveal recovery phrase,
-    Change password and Delete wallet; Reset wallet keeps taking the recovery phrase. This replaces that part of decision 32.
+    Change password and Delete wallet; Reset wallet keeps taking the recovery phrase (until decision 45: Reset wallet now
+    takes nothing and removes the wallet). This replaces that part of decision 32.
     (b) The extension sends on the Solana side as it does on the QNet side: SOL and the listed SPL tokens (1DEV), with
     `solana.max` for the form's Max and `solana.status` to follow a send the popup shows as pending (`solana.send` no longer
     waits up to a minute: it reads the status once). A send is exactly a System Transfer, or TransferChecked at the mint's
@@ -1966,10 +2002,10 @@ These follow the audits where the spec text was silent or looser; each is small 
     `references` and `memo` of `solana.quote` and `solana.send`), `test/router.test.mjs`.
 35. Owner decisions of 2026-09-29 (R1, R6): one wallet, one code, for a Light or a Super node, chosen once; a received code is
     always shown; a second burn is impossible through the payment address, the popup, a site, two browsers at once or a reset
-    and restore. aiqnet.io keeps a verified record of every burn (both ways, both node types) keyed by the QNet wallet and at
+    and an import of the phrase. aiqnet.io keeps a verified record of every burn (both ways, both node types) keyed by the QNet wallet and at
     most one reservation per wallet (`/api/cabinet/activation/`, implemented by the site). The extension builds a burn only when
     every source answered "none": the vault, its pending burn, the kept search of the wallet's own address, aiqnet.io's record
-    and the QNet network; a source that is loading, locked or unreachable means no burn, said so with a retry. It signs only
+    and QNet Blockchain; a source that is loading, locked or unreachable means no burn, said so with a retry. It signs only
     under aiqnet.io's reservation (`reserve`, one atomic insert, 10 min, signed only with at least 2 min of it left), announces the burn
     with the wallet's proof before it is sent (`announce`: nothing is sent without its 200), gives a reservation back when
     anything fails before the send, and records a burn the vault holds (`record`, `activation.syncRecord`: after every unlock, a
@@ -1983,7 +2019,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     `ACTIVATION_RECORDED`, a reservation or a burn on its way elsewhere → `ACTIVATION_RESERVED`, a node → `NODE_EXISTS`, the
     network unavailable → `NETWORK`, no answer, 429 or any other 503 → `RECORD_UNAVAILABLE`, 400 → `INTERNAL`; a site learns them
     as `NODE_EXISTS`, `BURN_IN_PROGRESS` and `INTERNAL`. A record of a burn of the wallet's own address is stored as its
-    activation once Solana shows the burn (a restore finds its code at once); a payment burn (light) is shown with the wallet's
+    activation once Solana shows the burn (the phrase imported again finds its code at once); a payment burn (light) is shown with the wallet's
     code and never stored or registered here; a record of another burn is the wallet's code and the vault's burn is shown as
     one that gives none. New provider method `qnet_getActivation` (section 4.4): aiqnet.io reads what the extension knows
     without an approval window and without a burn button. EXT-F1: the Activate tab offers its Light and Super cards only when
@@ -2025,7 +2061,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     on its way reads as an activation elsewhere (`ACTIVATION_RESERVED`), a recorded one as the wallet's code, never replaced by
     `syncRecord`. (A3, C7) The network's one-node rule (gate `wallet_one_node`) refuses a second node of either type for a
     wallet: the node's submit code `wallet_has_node` (its text "wallet already has a node") is `refused` for good, never
-    `onchain` and never retried, with its own line (`recordRefusedWalletHasNode`) and no Record on the network. (A4) A Super
+    `onchain` and never retried, with its own line (`recordRefusedWalletHasNode`) and no Record on QNet Blockchain. (A4) A Super
     node is activated only here, in the extension, and runs on the user's own server with the QNet node software: the Super
     card says so (`activateAbout_super`); the Super code's copy warning says that the code and the burn start nothing without
     the wallet's recovery phrase (the node checks the code against the phrase's own address) and that aiqnet.io shows the
@@ -2114,7 +2150,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     a walk, never trust. (c) A
     pending row resolves: `dropped` (section 2.5) reads as Not found, is replaced by default, frees its amount and leaves
     the list a day later; an archive row no two pinned nodes list reads as Unverified, no longer Pending. (d) Any token of
-    the QNet network can be sent: Assets lists the built-in QRC-20 tokens (`qnet.tokens`), the QNet send ("Send on QNet")
+    QNet Blockchain can be sent: Assets lists the built-in QRC-20 tokens (`qnet.tokens`), the QNet send ("Send on QNet Blockchain")
     picks QNC or a token, and a token goes through `qnet.tokenPreview` / `qnet.tokenSend`, the path and checks of a site's
     token transfer, with the approval window's warnings; archive token rows are listed in History. (e) A history row opens
     its detail (type, status, amount, token, both sides as copy controls, block, time, fee, nonce, hash or signature as a
@@ -2131,8 +2167,8 @@ These follow the audits where the spec text was silent or looser; each is small 
     `qnet.tokens`, `qnet.tokenPreview`, `qnet.tokenSend`, `qnet.txLookup`, `RESULT_KEY_EXCEPTIONS`), `test/router.test.mjs`.
 41. Owner command of 2026-10-06 ("cut the extension's Activate tab after activation, no extra information, no banners"):
     once the wallet has its code, the vault's or aiqnet.io's record's, of either node type, the Activate tab shows the code
-    panel (masked, Show or copy the code, hold to show, Copy with its warning: unchanged), the light node's record on the
-    QNet network only while the chain does not list the node (the card goes once it is `onchain`; Record on the network is
+    panel (masked, Show or copy the code, hold to show, Copy with its warning: unchanged), the light node's record on QNet
+    Blockchain only while the chain does not list the node (the card goes once it is `onchain`; Record on QNet Blockchain is
     still offered when it waits for the user), one line, "Manage the node at aiqnet.io/node" (`activateManage`, a link to
     `RECORD_ORIGIN/node` in a new tab), and a warning only when another burn is involved (`supersededNotice`,
     `keptBurnNotice`); the code screen right after a burn is the same, titled "Your activation code". A node with no code
@@ -2237,7 +2273,8 @@ These follow the audits where the spec text was silent or looser; each is small 
     next node is asked. An absence counts only with its proof; a 0 nothing verified is never shown. (b) There is no
     `agreement` tier: a balance is verified (`'proof'`) or not (`'none'`), and a send is never decided by one that is
     not. (c) The send rule (`qnet.transferSnapshot`, the app's `certifiedQncForSend` and `spendableFrom`): the certified
-    base (a proof verified in the last 30 s is used again when its nonce is at least the nodes' nonce now, else one fresh
+    base (a proof verified in the last 30 s is used again when its nonce is at least the nodes' nonce now, by its index since
+    decision 48, else one fresh
     verified read within `QC_VERIFY_BUDGET_MS`), and the account nonce the wallet's own transactions are counted up to:
     the highest nonce at least two pinned nodes report on `GET /api/v1/account/{a}` (by the nonce alone, as the app),
     never below the certified nonce nor the highest certified nonce
@@ -2245,7 +2282,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     in between must be one of this wallet's own known transactions (its kept transactions and `VaultState.spends`), else
     `BALANCE_FOREIGN_PENDING`: a transaction from another device is not confirmed yet; those took the most each could, the
     unconfirmed ones above it stay reserved, and anything received after the checkpoint never counts. The token side is
-    section 4.9. (d) Messages, split as the app's: no node answered `NETWORK` ("The QNet nodes could not be reached. Try
+    section 4.9. (d) Messages, split as the app's: no node answered `NETWORK` ("QNet Blockchain could not be reached. Try
     again."), `BALANCE_UNCONFIRMED` ("The balance is not confirmed yet. Try again in a minute."), `BALANCE_FOREIGN_PENDING`
     ("A transaction from another device is not confirmed yet. Try again in a minute."), in the popup's send and token
     review and in the approval window, which keeps a request open on either refusal and reads again; the Assets line
@@ -2254,6 +2291,107 @@ These follow the audits where the spec text was silent or looser; each is small 
     `err_BALANCE_UNCONFIRMED`, `err_BALANCE_FOREIGN_PENDING`; changed: `assetsUnverified`, `revealWarn`. Frozen files
     changed: `errors.js` (the two codes), `config.js` (`LIMITS.SPENDS_MAX`), `vault.js` (`spends`), the bundle's
     mobile sources (`utils/strictJson.js` joins them).
+
+45. Owner command of 2026-10-11 (3.1.1, after the store accepted 3.1.0). (a) First open: with no wallet in this browser
+    the popup shows two buttons, "Create a new wallet" (primary) and "Import an existing wallet", in place of the one
+    "Create or import a wallet"; each opens setup straight at that step (`ui/setup.html?flow=create` or `?flow=import`,
+    `common.openSetup(flow)`), with no choice screen first. Setup opened without a step keeps its choice screen, and the
+    popup's screen for an earlier version's wallet (Unlock your earlier wallet) stays as it was. (b) Forgot password asks
+    for no recovery phrase and no new password: one screen says the extension cannot recover the password and that a new
+    one takes a reset, which removes the wallet from this browser so that only its recovery phrase brings it back, with
+    Reset wallet (danger) and Back. The reset runs only while locked (an unlocked wallet is `UNLOCKED`: its password is
+    known) and without a password through `vault.resetBegin` (the restore's one-time token, bound to the popup document,
+    now for one minute) and `vault.reset` (`{token, confirm: 'ERASE'}`), popup only, which erases what `vault.wipe`
+    erases (section 5, Reset); the popup then shows its first
+    screen, and Import brings the wallet back. The phrase-based restore is gone: `vault.restoreBegin`, `vault.restore`
+    and its confirmation, done and failed screens, `RESTORE_EXPIRED`, `TIMINGS.RESTORE_TOKEN_TTL_MS` and
+    `RESTORE_KEEPALIVE_MS`, and its texts in every language; a staged record 3.0.0 or 3.1.0 left still goes at worker
+    start and unlock. Frozen files changed: `dist/manifest.json` (3.1.1), `config.js` (`WALLET_VERSION`,
+    `TIMINGS.RESET_TOKEN_TTL_MS`), `errors.js` (`RESET_EXPIRED`, `UNLOCKED`), `router.js` (`vault.resetBegin`, `vault.reset`), `sw.js`
+    (its comment), `test/router.test.mjs`, `test/skeleton.test.mjs`; the export list of `ui/common.js` is unchanged
+    (`openSetup` takes `flow`).
+46. (Superseded by decision 47 the same day.) Owner decision of 2026-10-12: a node balance, a light or a super node's, is
+    moved into the wallet only in QNet Wallet's Node tab (Move to wallet). The extension offers no `qnet_claimNodeBalance`: the method is off the allow-list
+    (4200 from every origin, aiqnet.io included), and its approval kind, window, view, result checks and texts in every
+    language are gone, with `nodes.claimView`, `nodes.claimForSite`, `keys.signNodeClaim`, `keys.signClaimPayload`,
+    `CLAIM_MIN_NANO`, `CLAIM_ERROR_CODES` and the codes `NO_NODE`, `CLAIM_REFUSED` and `CLAIM_BUSY`, which only the move
+    used. The site shows the balance and says in one sentence that QNet Wallet on the phone moves it, and its relay
+    refuses a QNet Link `claim` session. The core's claim message builders and signers stay, untouched, under the
+    shared vectors (`light-node-vectors`), and its protocol prefixes `claim_rewards:` and `qnet_claim_v1:` still keep a
+    site's `qnet_signMessage` from obtaining such a signature. History still names a move the app made ("From: node
+    balance"). Frozen files changed: `config.js` (`CLAIM_MIN_NANO`), `errors.js` (the three codes), `router.js`
+    (`qnet_claimNodeBalance`), `test/router.test.mjs`, `test/skeleton.test.mjs`.
+47. Owner decision of 2026-10-12, replacing decision 46: a node balance, a light or a super node's, is moved through
+    aiqnet.io's My node too, whichever way the wallet is connected there, and in QNet Wallet's own Node tab. On a computer
+    with this extension My node's Move to wallet asks `qnet_claimNodeBalance` and this extension's approval window
+    confirms it; in a phone browser My node sends QNet Wallet a QNet Link `claim` request. The extension's popup gets no
+    move of its own. The request names the node: `qnet_claimNodeBalance {nodeId}` with the wallet's light or super node id
+    (section 4.4), and the QNet Link `claim` request `{walletHash, nodeId}` (QNet Link v1 section 14.4); both wallets sign
+    the claim quote of that node only when it is the wallet's own (`q1337|claim_rewards:{nodeId}:{W}`), else
+    `WALLET_MISMATCH`. The core gains `superNodeId` (`super_node_` + the first 16 hex of BLAKE3(`SUPER_NODE_PRIVACY_` ‖
+    W), the node's own derivation) and `signClaimQuote` takes the super id too; a genesis node's id is no node a site's
+    move names. A super node's listing is read from `GET /api/v1/node/status`. Restored from before decision 46, with the
+    named node: the method, the approval kind, window, view and result checks, `nodes.claimView` / `claimForSite`,
+    `keys.signNodeClaim` / `signClaimPayload`, `CLAIM_MIN_NANO`, `CLAIM_ERROR_CODES` and the codes `NO_NODE`,
+    `CLAIM_REFUSED`, `CLAIM_BUSY`, with the new code `WALLET_MISMATCH` and the texts `apClaimIntroSuper` and
+    `err_WALLET_MISMATCH` in every language (`err_NO_NODE` now names no node type). Known answers:
+    `docs/protocols/node-claim.vectors.json`. Frozen files changed: `config.js` (`CLAIM_MIN_NANO`), `errors.js` (the four
+    codes), `router.js` (`qnet_claimNodeBalance` with `nodeId`), the bundle's `node.js` (`superNodeId`, the super id's
+    claim quote), `test/router.test.mjs`, `test/skeleton.test.mjs`. The mobile `NodePreimages.js` the bundle compiles
+    holds `superNodeId` and its `claimQuotePreimage` takes a light or a super node id: the app and the core build both
+    quotes with one builder (`signClaimQuote` checks the id is the wallet's own first).
+48. Plan of 2026-10-12 (wallet verification and GALC wiring, extension part; docs/protocols/galc-capsule-v2.md): the
+    certified base of a send is at hand, its recipient is judged by certified data only, and a long walk roots at the
+    genesis capsule once nodes serve one. (a) **Anchors and capsule.** `lightAnchors` is record v2 `{v: 2, chain, anchors,
+    mac}`: each anchor carries its `state_root`, `logs_root` and `checkpoint_hash` (all or none), so a new worker answers
+    at its index without a walk, and the MAC covers the chain identity (`core.chainIdentity`, which now folds
+    `NETWORK_ID`); a v1 record reads as none once. `galcCapsule` keeps the capsule the light client holds, with no MAC
+    (`core.importCapsule` verifies it again). `qnet.loadAnchors` imports the anchors, then the capsule (one that does not
+    verify is deleted); before a walk of more than 16 steps (the light client's `OWN_ROOT_WALK_STEPS`), a follow tick's
+    included, `core.refreshCapsule` asks the pinned nodes, and a newer capsule is kept. A node without one (today's 405) is
+    not asked again for 10 minutes; without a capsule everything is as before. `dropAnchors` keeps the capsule; the
+    chain going back (`forgetChain`), a capsule above the network head, and the walk finding it of another lineage
+    (`onCapsuleDropped`) forget it. A chain cache kept under the identity of a build before `NETWORK_ID` (the genesis
+    identities alone) is this chain's: nothing is dropped, the identity is written again. (b) **Follow.** The alarm
+    `qnet-follow` (`FOLLOW_ALARM`, every 30 s) runs while the session is unlocked (sw.js starts it on unlock, stops it on
+    lock; a tick that finds the session locked stops it): `qnet.followTick` walks at most 16 steps toward the certified
+    head on one parity (both newest macroblocks for 10 minutes after the wallet's own transaction), keeps the anchors,
+    and reads the wallet's own QNC proof at what is newly verified. (c) **Send base by index.** A kept QNC proof
+    (`{balanceNano, nonce, index}`, in worker memory and `chrome.storage.session` `qnet_send_proofs_v3`, so a worker woken
+    from sleep sends at once) stands while its macroblock is within 2 of the certified head and its nonce is at least the
+    nodes' nonce, never by age; token balances are always read fresh at its macroblock. (d) **Recipient kind.**
+    `assertPayableRecipient` reads the recipient's certified account leaf (`is_contract`), never `GET /api/v1/token/{a}`;
+    a leaf stands while its macroblock does, a contract stays one, and no recent certified leaf is `RECIPIENT_UNCHECKED`. A
+    send's base error is said before its recipient's. (e) **Reads ahead.** `qnet.sendWarm {to?}`: the Send tab starts the
+    wallet's own certified read when it opens and a recipient's leaf and archive page once a whole address is typed; the
+    recipient check reuses a page read in the last 30 s. (f) **Send UX.** The form's button says Send (`sendReview`) and the
+    review's Confirm (`sendConfirm`); while a review is read the button is busy and `sendChecking` shows; a review that
+    finishes after the form went is kept and drawn the next time the Send tab opens on QNet Blockchain, with the toast
+    `sendReviewReady`. (g) **Token rows** of the archive are `included` only by their own logs proof (at most 8 checked per
+    read, walks of at most 4 steps; `historyTokenUnverifiedLead` in their detail). (h) **Activation price**: every pinned
+    node that answers (at least two) must quote it alike, and the Activate tab, the burn confirmation and the approval
+    window say it is node-reported (`activatePriceReported`). (i) The header shows the logo alone (`appShortName` is
+    gone), so the QNet Blockchain | Solana switch fits at 360 px; the lock screen says QNet Wallet. Frozen files changed:
+    `config.js` (`STORAGE_KEYS.SEND_PROOFS`, `FOLLOW_ALARM`, `FOLLOW_ALARM_MINUTES`), `router.js` (`qnet.sendWarm`), `sw.js`
+    (the follow alarm), `test/router.test.mjs`.
+49. Review of 2026-10-12 (the wiring of decision 48 checked and measured against the live nodes): (a) **Claims.** Every
+    batch is held to a second pinned node's quote (`nodes.corroborated`), a whole one too: the pending totals other nodes
+    report stop at the first epoch whose shard they lack, so a whole batch that left out a middle epoch could still reach
+    them. (b) **A woken worker.** `qnet_light_hints_v1` in `chrome.storage.session` keeps the certified head the worker saw
+    last and until when no node is asked for a capsule (a refresh that found none: 10 minutes, the light client's TTL,
+    which its worker memory alone forgot on every restart). A read waits for the kept anchors and these hints, reads the
+    certified head beside the proof, and asks for the newest verified macroblock first while the head was seen in the last
+    minute, or with no head seen while that macroblock's checkpoint is at most 4 minutes old; whatever comes back stands
+    only by the certified head. (c) **Progress.** While a long walk (more than 2 steps to a macroblock that can stand) is
+    why a balance is not certified, the balance view carries `walkSteps`, `BALANCE_UNCONFIRMED` carries it, and Assets and
+    every error text say `balanceVerifyingSteps` in place of "not confirmed"; a read whose figure waits only for that walk
+    ends there instead of asking every other node for its own 20 s. (d) **Send review.** A review that finishes while the
+    Send tab on QNet Blockchain shows (it was opened again meanwhile) is drawn at once; a new review drops one held from
+    before, and one that finishes after a newer one started is dropped. (e) **Activation price.** Each node's quote is
+    waited for 4 s at most (`PRICE_TIMEOUT_MS`): every node is asked and all are awaited. The release with decisions 45
+    to 49 is 3.1.2. Frozen files changed: `dist/manifest.json` and `config.js` `WALLET_VERSION` (3.1.2), `config.js`
+    (`STORAGE_KEYS.LIGHT_HINTS`), `errors.js` (`walkSteps` on `WalletError` and in `toUiError`), the `UiError` of
+    `ui/common.js` (keeps `walkSteps`; its export list is unchanged), `test/skeleton.test.mjs` (3.1.2).
 
 ## 13. Languages (`ui/i18n`, `_locales`)
 
@@ -2267,14 +2405,15 @@ These follow the audits where the spec text was silent or looser; each is small 
   tests forbid shipping. In a right-to-left language every substitution is wrapped in U+2068/U+2069, and
   addresses, codes, hashes, amounts and words are left-to-right isolates in CSS; inputs for addresses,
   amounts, words and phrases are `dir=ltr`.
-- Never translated: the recovery phrase words, codes, addresses, hashes, the digits of amounts, QNet,
+- Never translated: the recovery phrase words, codes, addresses, hashes, the digits of amounts, QNet Blockchain, QNet,
   Solana, 1DEV, QNC, SOL, SPL, Light, Super, aiqnet.io, `QNET_*` names, `DELETE` (checked).
 - Pages: `popup`, `setup` and `approve` read `settings.get` at start (the approve window too) and set
   `document.title` from the table; Settings → Language is a `<select>` that stores the choice with
   `settings.set` and re-renders the popup.
 - `_locales/<chrome locale>/messages.json` (`en, zh_CN, ru, es, ko, ja, pt_BR, pt_PT, fr, de, ar, it`) carry the
   manifest's `extName` and `extDescription` only (name at most 45, description at most 132 characters).
-- The light node's texts say "record on the QNet network", "node balance" and "Move to wallet"; no text of the extension
+- The node texts say "record on QNet Blockchain", "node balance" and "Move to wallet" (the approval window of a site's
+  move, decision 47; the popup has no such button; a History row "From: node balance"), and no text of the extension
   says mining, earn, reward or income. "Burn" and "activation code" stay: the extension is the desktop burn channel.
 - Tests: `test/i18n.test.mjs` (languages equal the mobile app's, completeness, placeholder parity,
   tokens kept, the mobile terms for recovery phrase / activation code / node, error texts for every code,

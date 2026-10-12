@@ -52,9 +52,11 @@ export interface NodeStatusView {
 }
 
 // One epoch of the node (src/lib/cabinet/epochs.ts numbers them): counted and still in the node balance, counted and
-// moved to the wallet, missed, the epoch the node was registered in and not counted, not checked (the network
-// published no check of the node's group that epoch, so the node is not blamed), or not readable from the network now.
-export const HISTORY_RESULTS = ['counted', 'moved', 'missed', 'joined', 'unchecked', 'unknown'] as const;
+// moved to the wallet, not counted, the epoch the node was registered in and not counted, not checked (the network
+// published no check of the node's group that epoch, so the node is not blamed), not admitted (a super node outside the
+// set the network admitted to the super node share that epoch: the network's admission, not missed heartbeats), or not
+// readable from the network now.
+export const HISTORY_RESULTS = ['counted', 'moved', 'missed', 'joined', 'unchecked', 'not_admitted', 'unknown'] as const;
 export type HistoryResult = (typeof HISTORY_RESULTS)[number];
 
 export interface HistoryRow {
@@ -62,27 +64,33 @@ export interface HistoryRow {
   result: HistoryResult;
   // QNC added to the node balance; null where nothing was added or the amount is not known.
   amountQnc: number | null;
-  // When the epoch ended (its last block's successor, ms), from the explorer's archive; null when not known.
+  // When the epoch began and ended (its first block and its successor's, ms), from the explorer's archive; null when
+  // not known.
+  startedAt: number | null;
   endedAt: number | null;
   // The transaction that moved it to the wallet, from the explorer's archive; null when not moved or not known.
   claimTx: string | null;
 }
 
+// One page of the node's epochs (GET /api/cabinet/node/:id/history?page=N), newest first.
 export interface HistoryView {
-  // The epoch of the node's registration, from the explorer's archive; null when not known (earlier epochs may then
-  // show as missed).
+  // The epoch of the wallet's first node registration, where its epochs start, from the explorer's archive; null when
+  // not known (epochs from before it may then be listed).
   registeredEpoch: number | null;
   // Whether the explorer's archive answered (dates, the moves' transactions, the registration).
   archived: boolean;
-  // The epochs the network reports one by one, newest first.
   rows: HistoryRow[];
-  // Older epochs the archive knows only as moved to the wallet, newest first.
-  earlier: HistoryRow[];
+  // Older epochs of the node follow on the next page.
+  more: boolean;
 }
 
-// The node proxy reads up to 4 pages of 100 epochs (node-proxy.ts HISTORY_PAGE, HISTORY_PAGES_MAX).
-export const HISTORY_ROWS_MAX = 400;
-export const EARLIER_ROWS_MAX = 200;
+// The epochs of a page; a page after the first repeats the epoch before it (node-proxy.ts historyPath), so a page read
+// a moment apart from the one before skips none.
+export const HISTORY_PAGE_ROWS = 30;
+export const HISTORY_PAGE_MAX = 1_000;
+// The epochs a node keeps the details of to serve their results (development/qnet-integration/src/node/rewards.rs
+// SHARD_CACHE_RETAIN_EPOCHS): 256, about six weeks.
+export const EPOCHS_KEPT = 256;
 
 // `device_pending`: a device linked less than an epoch ago that has not answered yet, while nothing counted the node in
 // this epoch or the two before.
@@ -132,10 +140,20 @@ export function parseStatusView(body: unknown): NodeStatusView | null {
   return body as unknown as NodeStatusView;
 }
 
+// A super node's admission as the node's status names it (development/qnet-integration/src/node/registration.rs
+// super_admission_label): in the set the network admits to the super node share this epoch, outside it (no super node
+// share while outside), or no admission rule this epoch.
+export const SUPER_ADMISSIONS = ['admitted', 'waiting', 'not_required'] as const;
+export type SuperAdmission = (typeof SUPER_ADMISSIONS)[number];
+
 // A super node as the site's super route reads it from the nodes (src/server/cabinet/node-proxy.ts superStatus):
 // registered on the chain; online (the node's peer view or its on-chain heartbeat); when it was last seen (ms), from the
 // nodes or the explorer archive's newest heartbeat, null when neither knows; its heartbeats this epoch against the number
-// needed; barred by the network (a reputation below its floor); and the node balance in decimal nano QNC.
+// needed; barred by the network (a reputation below its floor); the node balance in decimal nano QNC; its admission as
+// the node names it (null from a node that does not name it); for a node whose answer names none, whether the network's
+// eligible set, the nodes its consensus admits, lists it (eligible-set.ts; null when that was not read or could not be);
+// whether it is on pace to be counted this epoch (null when the node does not say); the network's height and the
+// server's own (null when not known); and for a node not registered yet, whether the network sees its server.
 export interface SuperStatusView {
   registered: boolean;
   online: boolean;
@@ -143,47 +161,86 @@ export interface SuperStatusView {
   heartbeats: { current: number; required: number } | null;
   banned: boolean;
   balanceNano: string | null;
+  admission: SuperAdmission | null;
+  admitted: boolean | null;
+  onPace: boolean | null;
+  networkHeight: number | null;
+  serverHeight: number | null;
+  connected: boolean;
 }
 
-export type SuperState = 'none' | 'online' | 'offline';
+// `waiting`: registered, its server answers, and outside the network's admission (the node's `admission`, else outside
+// the eligible set): registered, waiting for the network to admit it (owner, 11.10).
+export type SuperState = 'none' | 'online' | 'offline' | 'waiting';
 
-const SUPER_KEYS = ['registered', 'online', 'lastSeenAt', 'heartbeats', 'banned', 'balanceNano'];
+// The server is in step with the network within this many blocks (the node's own rule for a synced peer,
+// development/qnet-integration/src/node/registration.rs get_all_public_api_nodes).
+export const SERVER_SYNC_BLOCKS = 5;
+
+const SUPER_KEYS = ['registered', 'online', 'lastSeenAt', 'heartbeats', 'banned', 'balanceNano', 'admission', 'admitted', 'onPace', 'networkHeight', 'serverHeight',
+  'connected'];
+const isFlag = (v: unknown): v is boolean | null => v === null || typeof v === 'boolean';
+export const isSuperAdmission = (v: unknown): v is SuperAdmission => (SUPER_ADMISSIONS as readonly unknown[]).includes(v);
 
 // GET /api/cabinet/super/:id, exactly.
 export function parseSuperStatus(body: unknown): SuperStatusView | null {
   if (!isObject(body) || !hasKeys(body, SUPER_KEYS)) return null;
-  if (typeof body.registered !== 'boolean' || typeof body.online !== 'boolean' || typeof body.banned !== 'boolean') return null;
+  if (typeof body.registered !== 'boolean' || typeof body.online !== 'boolean' || typeof body.banned !== 'boolean' || typeof body.connected !== 'boolean') return null;
   if (body.lastSeenAt !== null && !isCount(body.lastSeenAt)) return null;
   const h = body.heartbeats;
   if (h !== null && (!isObject(h) || !hasKeys(h, ['current', 'required']) || !isCount(h.current) || !isCount(h.required) || h.required < 1)) return null;
   if (body.balanceNano !== null && (typeof body.balanceNano !== 'string' || !NANO_RE.test(body.balanceNano))) return null;
-  if (!body.registered && (body.online || body.lastSeenAt !== null || h !== null || body.banned || body.balanceNano !== null)) return null;
+  if (!isFlag(body.admitted) || !isFlag(body.onPace)) return null;
+  if (body.admission !== null && !isSuperAdmission(body.admission)) return null;
+  if ((body.networkHeight !== null && !isCount(body.networkHeight)) || (body.serverHeight !== null && !isCount(body.serverHeight))) return null;
+  if (!body.registered && (body.online || body.lastSeenAt !== null || h !== null || body.banned || body.balanceNano !== null || body.admission !== null
+    || body.admitted !== null || body.onPace !== null || body.networkHeight !== null || body.serverHeight !== null)) return null;
+  if (body.registered && body.connected) return null;
   return body as unknown as SuperStatusView;
 }
 
+// Whether the network has not admitted the node: its own `admission` when the node names one, else outside the
+// eligible set; null when neither is known.
+const outsideAdmission = (s: Pick<SuperStatusView, 'admission' | 'admitted'>): boolean | null =>
+  (s.admission !== null ? s.admission === 'waiting' : s.admitted === null ? null : !s.admitted);
+
+// Offline first: the network also drops an admitted node from its eligible set once it misses the heartbeats of a
+// window or its reputation falls below the floor (committee.rs inactivity shrink), so outside the set alone does not
+// mean waiting, and a stopped server is the thing to fix before its admission; a barred node is told so by its own row.
 export function superState(s: SuperStatusView): SuperState {
   if (!s.registered) return 'none';
-  return s.online ? 'online' : 'offline';
+  if (!s.online) return 'offline';
+  return outsideAdmission(s) === true && !s.banned ? 'waiting' : 'online';
 }
 
 const TX_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
 function isHistoryRow(r: unknown): boolean {
-  if (!isObject(r) || !hasKeys(r, ['epoch', 'result', 'amountQnc', 'endedAt', 'claimTx']) || !isCount(r.epoch)) return false;
+  if (!isObject(r) || !hasKeys(r, ['epoch', 'result', 'amountQnc', 'startedAt', 'endedAt', 'claimTx']) || !isCount(r.epoch)) return false;
   if (!(HISTORY_RESULTS as readonly unknown[]).includes(r.result)) return false;
   if (r.amountQnc !== null && (typeof r.amountQnc !== 'number' || !Number.isFinite(r.amountQnc) || r.amountQnc < 0)) return false;
+  if (r.startedAt !== null && !isCount(r.startedAt)) return false;
   if (r.endedAt !== null && !isCount(r.endedAt)) return false;
   return r.claimTx === null || (typeof r.claimTx === 'string' && TX_RE.test(r.claimTx));
 }
 
-// GET /api/cabinet/node/:id/history, exactly.
+// GET /api/cabinet/node/:id/history[?page=N], exactly.
 export function parseHistoryView(body: unknown): HistoryView | null {
-  if (!isObject(body) || !hasKeys(body, ['registeredEpoch', 'archived', 'rows', 'earlier'])) return null;
+  if (!isObject(body) || !hasKeys(body, ['registeredEpoch', 'archived', 'rows', 'more'])) return null;
   if (body.registeredEpoch !== null && !isCount(body.registeredEpoch)) return null;
-  if (typeof body.archived !== 'boolean') return null;
-  if (!Array.isArray(body.rows) || body.rows.length > HISTORY_ROWS_MAX || !body.rows.every(isHistoryRow)) return null;
-  if (!Array.isArray(body.earlier) || body.earlier.length > EARLIER_ROWS_MAX || !body.earlier.every(isHistoryRow)) return null;
+  if (typeof body.archived !== 'boolean' || typeof body.more !== 'boolean') return null;
+  if (!Array.isArray(body.rows) || body.rows.length > HISTORY_PAGE_ROWS + 1 || !body.rows.every(isHistoryRow)) return null;
   return body as unknown as HistoryView;
+}
+
+// The pages read so far as one list, newest first, each epoch once (a page repeats the epoch before it, and one read
+// after a new epoch settled repeats more); the first page's row wins.
+export function joinPages(pages: readonly HistoryView[]): HistoryRow[] {
+  const byEpoch = new Map<number, HistoryRow>();
+  for (const page of pages) {
+    for (const row of page.rows) if (!byEpoch.has(row.epoch)) byEpoch.set(row.epoch, row);
+  }
+  return [...byEpoch.values()].sort((a, b) => b.epoch - a.epoch);
 }
 
 // The node's state: the device's own state when the node names it, else read from the binding and the network's ask

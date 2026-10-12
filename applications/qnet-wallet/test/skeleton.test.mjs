@@ -47,9 +47,9 @@ const ORIGINS = [...config.QNET.NODES, config.QNET.EXPLORER_API, ...config.SOLAN
 const DAPP_MATCHES = ['https://aiqnet.io/*', 'https://games.aiqnet.io/*'];
 
 describe('skeleton: store manifest', () => {
-  it('is MV3 3.1.0 on Chrome 111+ with the module worker and the popup', () => {
+  it('is MV3 3.1.2 on Chrome 111+ with the module worker and the popup', () => {
     assert.equal(MANIFEST.manifest_version, 3);
-    assert.equal(MANIFEST.version, '3.1.0');
+    assert.equal(MANIFEST.version, '3.1.2');
     assert.equal(MANIFEST.version, PACKAGE.version);
     assert.equal(MANIFEST.version, config.WALLET_VERSION);
     assert.equal(MANIFEST.minimum_chrome_version, '111');
@@ -250,7 +250,7 @@ describe('skeleton: shipped files', () => {
     assert.equal(config.STORAGE_KEYS.SITES, 'qnet_sites_v3');
     assert.equal(LIMITS.APPROVAL_QUEUE_PER_ORIGIN, 3);
     assert.equal(config.TIMINGS.CONFIRM_ARM_MS, 1000);
-    // the light node's registration and the smallest move of its balance (1 QNC)
+    // the light node's registration and the smallest move of a node balance (1 QNC)
     assert.equal(config.REGISTRATION_ALARM, 'qnet-register');
     assert.notEqual(config.REGISTRATION_ALARM, config.AUTO_LOCK_ALARM);
     assert.equal(LIMITS.REGISTRATION_MAX_ATTEMPTS, 12);
@@ -280,7 +280,7 @@ const EXPORTS = {
   'background/keys.js': ['burnRecordMessage', 'deriveAddresses', 'getQnetPublicKey', 'initKeys', 'signBurnRecord', 'signClaimPayload',
     'signNodeClaim', 'signNodeRegistration', 'signNodeStatus', 'signNodeUnbind', 'signOffchain', 'signQnetTransfer', 'signSolanaMessage',
     'signingEnabled', 'startKeys'],
-  'background/nodes.js': ['claimForSite', 'claimView', 'getRegistration', 'onAlarm', 'onChain', 'publicRegistration',
+  'background/nodes.js': ['claimForSite', 'claimView', 'getRegistration', 'onAlarm', 'onChain', 'ownNodeType', 'publicRegistration',
     'registeredBurn', 'registrationFor', 'requestRecord', 'resumeRegistration', 'unlinkForSite', 'unlinkView'],
   'background/log.js': ['log'],
   'background/provider.js': ['displayOrigin', 'eventSink', 'getApproval', 'handleRequest', 'listSites', 'notifyLockChanged',
@@ -297,8 +297,8 @@ const EXPORTS = {
     'createAtaIdempotentInstruction', 'findWalletBurns', 'getBalances', 'getHistory', 'historyItem', 'memoInstruction', 'quote', 'rpc', 'send',
     'sendAndConfirm', 'serializeTransaction', 'signatureStatus', 'simulate', 'systemTransferInstruction',
     'transferCheckedInstruction', 'validateBurnTx'],
-  'background/vault.js': ['KDF_DEFAULT', 'KDF_FLOOR', 'PLAINTEXT_VERSION', 'VAULT_DB', 'assertKdfFloor', 'beginRestore',
-    'canonicalJson', 'changePassword', 'createVault', 'restoreVault', 'decodePlaintext', 'deleteVaultDatabase', 'deriveVaultKey', 'emptyState',
+  'background/vault.js': ['KDF_DEFAULT', 'KDF_FLOOR', 'PLAINTEXT_VERSION', 'VAULT_DB', 'assertKdfFloor', 'beginReset',
+    'canonicalJson', 'changePassword', 'createVault', 'resetVault', 'decodePlaintext', 'deleteVaultDatabase', 'deriveVaultKey', 'emptyState',
     'encodePlaintext', 'getStatus', 'importVault', 'normalizePassword', 'readEntropy', 'readLightAnchors',
     'readSiteBinding', 'readState', 'RECIPIENTS_MAX', 'reveal', 'unlock', 'updateState', 'vaultExists', 'verifyPassword', 'wipe',
     'withRecipient', 'writeLightAnchors', 'writeNewVault'],
@@ -370,7 +370,7 @@ describe('skeleton: dev overlay', () => {
       await rm(path.join(target, 'ui/i18n/ar.js'));
       await writeFile(path.join(target, 'ui/extra.js'), '');
       const manifestPath = path.join(target, 'manifest.json');
-      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.0"', '"version": "3.0.9"'));
+      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.2"', '"version": "3.0.9"'));
       const configPath = path.join(target, 'background/config.js');
       await writeFile(configPath, (await readFile(configPath, 'utf8')).replace('DEV_BUILD = true', 'DEV_BUILD = false'));
       assert.deepEqual((await checkDevBuild(DIST, target)).sort(), [

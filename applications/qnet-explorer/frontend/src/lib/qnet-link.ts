@@ -3,11 +3,12 @@
 // runs it, there or, once the network takes the wallet's own unbind, from any device): the link, the request and its
 // hash, the relay bodies and the app's answer (a `reserve` answer's signature through a verifier the page supplies,
 // burn-record.ts verifyReserveAnswer); and the extension's qnet_activateNode, qnet_claimNodeBalance and
-// qnet_unlinkNodeDevice (sections 10 and 14.10). Pure
+// qnet_unlinkNodeDevice (sections 10 and 14.10). A `claim` request and qnet_claimNodeBalance name the node whose balance
+// moves, the wallet's light or super node (owner, 12.10). Pure
 // and framework-free, shared by the cabinet, the relay routes and the tests; the key exchange and decryption are
 // in qnet-link-crypto.ts.
-// Checked against docs/protocols/light-node.vectors.json (revision 2) and qnet-link-v1.vectors.json (the
-// extension's activation answers).
+// Checked against docs/protocols/light-node.vectors.json (revision 2), node-claim.vectors.json (the `claim` request that
+// names the node) and qnet-link-v1.vectors.json (the extension's activation answers).
 
 import jsSha3 from 'js-sha3';
 import bs58 from 'bs58';
@@ -32,6 +33,8 @@ const CODE_RE = /^QNET-[LS][0-9A-F]{5}-[0-9A-F]{6}-[0-9A-F]{6}$/;
 const WALLET_HASH_RE = /^[0-9a-f]{16}$/;
 const NODE_ID_RE = /^light_mobile_[0-9a-f]{16}$/;
 const SUPER_ID_RE = /^(?:super_node_[0-9a-f]{16}|genesis_node_00[1-5])$/;
+// The node a `claim` request names: a wallet's light or super node id; a genesis node's is none.
+const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 const TX_HASH_RE = /^[0-9a-f]{64}$/;
 const U64_RE = /^(?:0|[1-9][0-9]{0,19})$/;
 const U64_MAX = 18_446_744_073_709_551_615n;
@@ -107,8 +110,10 @@ export interface LinkDeviceRequest {
   burner?: string;
 }
 
+// The wallet the page shows and the node of it whose balance moves: its light node or its super node (section 14.4).
 export interface ClaimRequest {
-  walletHash: string | null;
+  walletHash: string;
+  nodeId: string;
 }
 
 // A light node for the wallet the page names, paid from the one-time payment address `burner`: the wallet signs its
@@ -243,6 +248,8 @@ export const isWalletHash = (value: unknown): value is string => typeof value ==
 export const isLightNodeId = (value: unknown): value is string => typeof value === 'string' && NODE_ID_RE.test(value);
 // A super node's id: the one a wallet's super node gets (superNodeId), or a genesis node's.
 export const isSuperNodeId = (value: unknown): value is string => typeof value === 'string' && SUPER_ID_RE.test(value);
+// The form of the node a `claim` request names: a light node id or a wallet's super node id.
+export const isClaimNodeId = (value: unknown): value is string => typeof value === 'string' && CLAIM_NODE_ID_RE.test(value);
 
 // A Solana transaction signature is the base58 of 64 bytes (64 to 88 characters).
 export function isSolanaSignature(value: unknown): value is string {
@@ -360,7 +367,7 @@ export function activationCode(nodeType: NodeType, solana: string, burnTx: strin
 // ---------------------------------------------------------------- requests
 
 const REQUEST_KEYS = {
-  link: ['burnTx', 'walletHash', 'check'], claim: ['walletHash'], reserve: ['walletHash', 'burner'], unlink: ['walletHash'],
+  link: ['burnTx', 'walletHash', 'check'], claim: ['walletHash', 'nodeId'], reserve: ['walletHash', 'burner'], unlink: ['walletHash'],
 } as const;
 // A `link` request for a burn made from the wallet's own Solana address: the keys above, then that address.
 export const OWN_BURN_REQUEST_KEYS = ['burnTx', 'walletHash', 'check', 'burner'] as const;
@@ -372,8 +379,8 @@ export type RequestIntent = Exclude<LinkIntent, 'connect'>;
 
 const needsRequest = (intent: LinkIntent): intent is RequestIntent => intent !== 'connect';
 
-// The request's exact keys and value forms, or null. A `reserve` and an `unlink` request always name a wallet; a `link`
-// request with `burner` names the wallet and the burn too.
+// The request's exact keys and value forms, or null. A `claim`, a `reserve` and an `unlink` request always name a wallet,
+// a `claim` request also its light or super node; a `link` request with `burner` names the wallet and the burn too.
 export function checkRequest(intent: LinkIntent, value: unknown): LinkRequest | null {
   if (!needsRequest(intent) || !isPlainObject(value)) return null;
   const ownBurn = intent === 'link' && hasExactKeys(value, OWN_BURN_REQUEST_KEYS);
@@ -384,7 +391,10 @@ export function checkRequest(intent: LinkIntent, value: unknown): LinkRequest | 
     return { walletHash: value.walletHash as string, burner: value.burner };
   }
   if (intent === 'unlink') return value.walletHash === null ? null : { walletHash: value.walletHash as string };
-  if (intent === 'claim') return { walletHash: value.walletHash as string | null };
+  if (intent === 'claim') {
+    if (value.walletHash === null || !isClaimNodeId(value.nodeId)) return null;
+    return { walletHash: value.walletHash as string, nodeId: value.nodeId };
+  }
   if (value.burnTx !== null && !isSolanaSignature(value.burnTx)) return null;
   if (typeof value.check !== 'boolean') return null;
   const request = { burnTx: value.burnTx as string | null, walletHash: value.walletHash as string | null, check: value.check };
@@ -395,7 +405,7 @@ export function checkRequest(intent: LinkIntent, value: unknown): LinkRequest | 
 
 // The request bytes: its keys in the order of section 14.4, no whitespace.
 export function requestText(intent: RequestIntent, request: LinkRequest): string {
-  const r = request as Partial<LinkDeviceRequest & ReserveRequest>;
+  const r = request as Partial<LinkDeviceRequest & ReserveRequest & ClaimRequest>;
   const keys = intent === 'link' && r.burner !== undefined ? OWN_BURN_REQUEST_KEYS : REQUEST_KEYS[intent];
   return JSON.stringify(Object.fromEntries(keys.map((k) => [k, r[k]])));
 }
@@ -533,8 +543,12 @@ export function validateAnswer(plaintext: string, ctx: AnswerContext): AnswerChe
     }
     return verified ? { ok: true, answer: r as unknown as LinkAnswer } : fail('sig');
   }
-  const nodeId = lightNodeId(qnet);
-  if (r.nodeId !== nodeId) return fail('nodeId');
+  // A `claim` answer names the node the request named, and that node is the light or the super node of `qnet`; every
+  // other answer names the light node of `qnet`.
+  const claimed = intent === 'claim' ? (ctx.request as ClaimRequest | null)?.nodeId ?? null : null;
+  const nodeId = intent === 'claim' ? claimed : lightNodeId(qnet);
+  if (nodeId === null || r.nodeId !== nodeId) return fail('nodeId');
+  if (intent === 'claim' && nodeId !== lightNodeId(qnet) && nodeId !== superNodeId(qnet)) return fail('nodeId');
   const wanted = ctx.request?.walletHash ?? null;
   if (wanted !== null && walletHash(qnet) !== wanted) return fail('walletHash');
   if (intent === 'link' && status === 'ok') {
@@ -797,18 +811,20 @@ const CLAIM_TIMEOUT_MS = 5 * 60_000;
 export type ClaimFailure = ExtensionFailure | 'other_wallet';
 export type ExtensionClaim = { ok: true; answer: LinkAnswer } | { ok: false; failure: ClaimFailure };
 
-// The extension moves the node balance of its own wallet's light node; its result is the `claim` answer of
-// section 14.7 without v and intent, checked like the app's for the wallet the page shows.
-export async function claimWithExtension(provider: QNetProvider, wallet: string, nowS: number): Promise<ExtensionClaim> {
+// The extension moves the node balance of the node the page names, its own wallet's light or super node (`nodeId`); its
+// result is the `claim` answer of section 14.7 without v and intent, checked like the app's for the wallet the page shows
+// and that node.
+export async function claimWithExtension(provider: QNetProvider, wallet: string, nodeId: string, nowS: number): Promise<ExtensionClaim> {
   let result: unknown;
   try {
-    result = await callProvider(provider, 'qnet_claimNodeBalance', CLAIM_TIMEOUT_MS);
+    result = await callProvider(provider, 'qnet_claimNodeBalance', CLAIM_TIMEOUT_MS, { nodeId });
   } catch (err) {
-    return { ok: false, failure: providerFailure(err) };
+    // An extension from before the named node takes no params and refuses them (-32602): an older version, as 4200 is.
+    return { ok: false, failure: errorCode(err) === -32602 ? 'unsupported' : providerFailure(err) };
   }
   const text = extensionAnswerText(result, 'claim');
   if (text === null) return { ok: false, failure: 'unverifiable' };
-  const checked = validateAnswer(text, { intent: 'claim', request: { walletHash: walletHash(wallet) }, nowS, consent24h: false });
+  const checked = validateAnswer(text, { intent: 'claim', request: { walletHash: walletHash(wallet), nodeId }, nowS, consent24h: false });
   if (checked.ok) return { ok: true, answer: checked.answer };
   return { ok: false, failure: checked.reason === 'walletHash' ? 'other_wallet' : 'unverifiable' };
 }

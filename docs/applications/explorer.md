@@ -1,6 +1,6 @@
 # Block explorer
 
-This document describes the QNet block explorer in `applications/qnet-explorer`: a Next.js 16
+This document describes QNet Blockchain Explorer, the block explorer in `applications/qnet-explorer`: a Next.js 16
 application that serves block, transaction, address and token views from a PostgreSQL index that a
 separate indexer process writes. It covers what the explorer shows,
 how the three parts fit together, how chain data is ingested, which environment variables the
@@ -16,10 +16,10 @@ deployment needs, and how to run it locally.
 | `frontend/src/lib/` | Client and shared helpers: the node client, caching, token formatting, transaction mapping, the wallet-extension provider client (`qnet-provider.ts`) |
 | `frontend/src/indexer/` | The indexer process: node client, chain follower, writer, migration runner |
 | `frontend/src/server/head-hub.ts` | The per-process head snapshot the web tier serves |
-| `frontend/src/server/light/` | The balance check: the light client that verifies macroblocks' committee certificates from the pin, the state-tree proof checks, and the certified balance proof with the old-node fallback |
+| `frontend/src/server/light/` | The balance check: the light client that verifies macroblocks' committee certificates from the pin, its checkpoint store and the build-time walk (`store.ts`, `refresh.ts`, run by `scripts/light-pin.mjs`), the GALC v2 capsule as a faster walk root (`galc.ts`, the genesis keys in `genesis-keys.ts`), the state-tree proof checks, and the certified balance proof with the old-node fallback |
 | `frontend/src/server/link-relay.ts` | The per-process QNet Link relay store behind `/api/link/*` |
-| `frontend/src/server/cabinet/` | The node cabinet's server side: `node-proxy.ts` (a light node's status, balance and history, and a super node's status, from the genesis nodes), `wallet-node.ts` (whether a wallet has a node of either type), `solana-proxy.ts` (the activation's price, payment address, blockhash and transaction reads, and the one door its burn and refund go through), `burn-parse.ts` and `burn-scan.ts` (an activation burn read from Solana, and the search of a wallet's Solana address for one), `activation-registry.ts` and `activation-api.ts` (the activation registry: one record per wallet, below), `register.ts` (the registration submit), `registration-record.ts` (a registration's burn from the archive), `wake.ts` ("I'm back") and `limits.ts` (the origin checks and per-client limits of every `/api/cabinet` route) |
-| `frontend/src/server/phone-flows.ts` | `CABINET_PHONE_FLOWS`: whether the cabinet sends QNet Wallet its `link` and `claim` requests |
+| `frontend/src/server/cabinet/` | The node cabinet's server side: `node-proxy.ts` (a light node's status, balance and history, and a super node's status, from the genesis nodes), `wallet-node.ts` (whether a wallet has a node of either type), `solana-proxy.ts` (the activation's price, payment address, blockhash and transaction reads, and the one door its burn and refund go through), `burn-parse.ts` and `burn-scan.ts` (an activation burn read from Solana, and the search of a wallet's Solana address for one), `activation-registry.ts` and `activation-api.ts` (the activation registry: one record per wallet, below), `register.ts` (the registration submit), `registration-record.ts` (a registration's burn from the archive), `eligible-set.ts` (the network's eligible set, from the newest certified macroblock's proof) and `limits.ts` (the origin checks and per-client limits of every `/api/cabinet` route) |
+| `frontend/src/server/phone-flows.ts` | `CABINET_PHONE_FLOWS`: whether the cabinet sends QNet Wallet its `link`, `claim`, `reserve` and `unlink` requests |
 | `frontend/src/server/wallet-apk.ts` | `WALLET_APK_URL`: the Android file `/wallet` offers, if any |
 | `frontend/src/lib/cabinet/`, `frontend/src/components/cabinet/`, `frontend/src/lib/texts.ts` | The node cabinet's shared logic (the wallet choice, the reading of a node's state, the wallet's activation from every source in `wallet-activation.ts`, the record proof in `burn-record.ts`, the tabs, the activation's stages and payment requests), its components, and the site's English texts |
 | `frontend/src/lib/faucet-handover.ts` | The connected wallet's Solana address and the faucet pass handed from the cabinet's payment card to the Testnet page's faucet, in the tab's session storage, each read once; the request for the pass |
@@ -30,7 +30,7 @@ deployment needs, and how to run it locally.
 | `frontend/src/server/faucet-cooldown.ts` | The faucet's per-(address, token) and per-(wallet, token) cooldown in process memory, each entry dropped after its 24 hours |
 | `frontend/src/server/logo-proxy.ts` | Token logos fetched by the server and served from the site (`/api/token/[contract]/logo`) |
 | `frontend/migrations/` | Ordered schema migrations: `001_init.sql`, `002_batch_transfers.sql`, `003_indexer_v2.sql`, `004_address_history.sql`, `005_cabinet_activations.sql`, `006_cabinet_activations_reservation.sql`, `007_cabinet_activations_burner.sql` |
-| `frontend/scripts/` | Timestamp backfill, PostgreSQL install/backup/restore helpers, and `run-migrations.ts` behind `npm run db:migrate`, which reads only `001_init.sql` |
+| `frontend/scripts/` | Timestamp backfill, PostgreSQL install/backup/restore helpers, `run-migrations.ts` behind `npm run db:migrate`, which reads only `001_init.sql`, and `light-pin.mjs`, the balance check's build-time walk and pin refresh |
 | `frontend/ecosystem.config.example.js` | PM2 layout running the web tier and the indexer side by side, as the unprivileged app user |
 | `deployment/deploy-aiqnet.sh` | Provisioning of the aiqnet.io host: Node.js 22, the `aiqnet` user, pm2, nginx, TLS |
 
@@ -57,7 +57,7 @@ delegate into `frontend/`.
   `src/lib/app-links.ts`); the App Store listing is in preparation. The
   Terms carry the Device rules of a light node and the privacy policy its device check; Support says what to do
   when the Node tab says the node is paused on a device or that the device can't run one: run it on another phone
-  or tablet (install QNet Wallet from the app store, restore the wallet, Use this device), with no review step; and,
+  or tablet (install QNet Wallet from the app store, restore the wallet, link the node to that device), with no review step; and,
   outside the app's view, the move from the older Android app installed from a file (install QNet Wallet, restore
   with the recovery phrase). Its section on what delays or skips a node's answers says that every answer belongs to
   its own epoch: the network repeats its requests during the epoch, an answer counts only before that epoch's check
@@ -68,10 +68,13 @@ delegate into `frontend/`.
   Testnet (its own tab on a testnet release, where the faucet is) and a Docs menu (Documentation, How it works, DAO,
   Support), and the wallet control. On a
   window 860 px wide or narrower the links, the Docs menu (its list in place) and the wallet control move into the
-  menu button's panel. The footer (`src/components/Footer.tsx`) links Privacy, Terms and Support on every page, and,
-  outside the app's view, the Google Play listing.
+  menu button's panel. The footer (`src/components/Footer.tsx`) carries, on every page, a small line under it with the
+  copyright, Privacy and Terms (Support is in the Docs menu), and, outside the app's view, the repository, X and
+  Telegram icons and the two official store badges served from `/public/badges`: the App Store badge, a link only once
+  `IOS_APP_STORE_URL` (`src/lib/app-links.ts`) names the listing and until then the badge alone, and the Google Play
+  badge linking the listing.
 - `/node`, `/node/activate`, `/node/device`, `/node/history` — the node cabinet, My node. The visitor chooses a
-  wallet: the QNet extension (`qnet_requestAccounts`), an address typed there (only to look: every action the wallet
+  wallet: the QNet Wallet extension (`qnet_requestAccounts`), an address typed there (only to look: every action the wallet
   itself confirms asks to connect it first), or QNet Wallet asked with a QNet Link `connect` request ([QNet Link
   v1](../protocols/qnet-link-v1.md) section 14: a button on a phone or tablet, on Android an `intent:` URL naming
   `io.aiqnet.wallet`, and a QR code drawn in the page on a computer or for another device). The choice, with how it
@@ -90,13 +93,13 @@ delegate into `frontend/`.
   connected and in whichever browser or device (`src/lib/cabinet/wallet-activation.ts`), from every source: the
   network (`GET /api/cabinet/wallet-node/{wallet}`, the light node's status and the super node's status: "no node" and
   "registered" only when the nodes settle it), the site's activation record of the wallet with its search of the
-  wallet's own Solana address (`GET /api/cabinet/activation/{wallet}`, below), the QNet extension that holds the wallet
+  wallet's own Solana address (`GET /api/cabinet/activation/{wallet}`, below), the QNet Wallet extension that holds the wallet
   (`qnet_getActivation`, read without a window: its activation, its burn on the way or its search), and on top what
   this browser keeps: the activation the extension reported for the wallet (`qnet.cabinet.activations`, at most five
   wallets) and the activations made here with a payment address. Every page shows one state: checking; the extension
   locked (or this site not approved), with nothing offered until it answers; a check that did not answer, named, with
   Try again and a read again every half minute; no node and nothing known (the only state that offers an activation,
-  of either node type, the super node through the QNet extension only); another browser's or device's reservation
+  of either node type, the super node through the QNet Wallet extension only); another browser's or device's reservation
   (until when); a burn on its way; a known burn, whose code comes first with its next step (the record on the network
   and then Link a device for a light node, which any browser where the wallet is connected, a phone included, finishes
   with QNet Wallet whichever way the burn was made, `src/lib/cabinet/burn-next.ts`; every server step for a super
@@ -109,7 +112,7 @@ delegate into `frontend/`.
   the step's start or the page's return (then the half-minute round alone); the watch stops once nothing is awaited.
   The cabinet's reads of a node stay modest: the node's status, a super node's status and the wallet's node on the
   network every 30 s while the page is shown and when it is shown again, one read shared by every part of the page;
-  the watch above; and after "I'm back" sent a wake, the same status read every 10 s for 2 minutes. The site serves
+  and the watch above. The site serves
   every status read from its cache per node, kept about the page's poll interval (25 s; a settled "not registered" 30
   s), so a node's genesis nodes see at most one round of reads per node in that time, whatever the visitors do, and
   each genesis node at most 20 page reads a second, 4 of them for ids nobody was seen registered with; a page that
@@ -117,14 +120,14 @@ delegate into `frontend/`.
   without a device, "Link your phone"; a node that one node lists before two agree on its status shows as recorded
   with no device yet, never as an empty section.
   A bare `/node` opens Activate only for a connected wallet in the state "nothing known", else the Overview.
-  The cabinet never renders in the QNet app's view (below). Its texts are English (`src/lib/texts.ts`), and the words
+  The cabinet never renders in the QNet Wallet app's view (below). Its texts are English (`src/lib/texts.ts`), and the words
   it shares with the app and the extension are theirs. Every cabinet page says that a light node runs on one phone or
-  tablet at a time, in QNet Wallet, and a super node on a server with the QNet node software. The site's matrix rain
+  tablet at a time, in QNet Wallet, and a super node on a server with the QNet Blockchain node software. The site's matrix rain
   runs behind the cabinet as behind every other page; its cards, the way, the sections and any line outside a card
   sit on opaque, blurred panels over it.
   - Overview (`/node?tab=overview`): without a node, the state above and its next step; with nothing known, both node
     types ("Activate a light node", "Activate a super node": `/node/activate?type=light` or `?type=super`), with the
-    note that a super node is activated only in the QNet extension on a computer and runs on the user's own server.
+    note that a super node is activated only in the QNet Wallet extension on a computer and runs on the user's own server.
     A payment address's final burn with no node yet shows its code and, in a browser that does not hold its record,
     "Continue in QNet Wallet" on a phone ("Show the QR code" on a computer): a `link` request for that burn naming the
     wallet, whose verified consent the page posts to `POST /api/cabinet/register`, which adds the burner and the owner
@@ -133,33 +136,40 @@ delegate into `frontend/`.
     found by the search of that address) shows its code and the same "Continue in QNet Wallet", on a phone as anywhere:
     the `link` request also names that address (`burner`, [QNet Link](../protocols/qnet-link-v1.md) section 14.4), QNet
     Wallet answers it only from the wallet whose own address it is, with that Solana key's owner bind beside the
-    consent, and the page posts the whole body to `POST /api/cabinet/register`. Only in the browser whose QNet extension
+    consent, and the page posts the whole body to `POST /api/cabinet/register`. Only in the browser whose QNet Wallet extension
     just made the burn does the page wait for the extension, which records the node itself; no other light burn sends
     to the extension. For a super node's burn, every
-    server step: the ports, the node software's build, the recovery phrase in a file only the user reads, the start
-    with its settings and the `docker run` command, and the health check. For a
+    server step with its commands (`NextSteps.tsx` `SuperNext`), run as root: the server's memory and clock, the
+    hosting provider's firewall for its ports, the recovery phrase typed into a file only root reads (kept out of the
+    shell's history; the wallet kept for the node alone), the server's public IPv4 address (its own addresses listed,
+    asked again until a public one is typed: the node writes it on the network at registration), the public image
+    `ghcr.io/aiqnetlab/qnet-production:latest` pulled and started with the code, the burn, its amount, that address and a
+    storage limit of 80% of the free space and the chain data, the check (`/healthz`, `/api/v1/sync/status` and the
+    log's activation and registration lines, with the super node's id when known and what each failure means), the
+    update for a new release, and how long catching up takes and what downtime costs; while the network sees the server
+    before its registration lands, the card says it is catching up. For a
     light node on the network: its state and the next step (while the network records a registration, how far it
     got, a note when the network does not answer, for an activation the extension made the phone's first steps that
     need no record (QNet Wallet installed, the same wallet imported) and after a few minutes, in a browser with the
-    extension, "Record on the network": `qnet_activateNode` again, which for a wallet with an activation queues the
+    extension, "Record on QNet Blockchain": `qnet_activateNode` again, which for a wallet with an activation queues the
     record of the burn it has; once
     recorded with no device, "Next: link your phone or tablet" first on the page, with the steps so far (burned,
     recorded, the phone's now) and Link a device in numbered steps); the status card with the device's state (Online,
-    Offline, or a new device waiting for its first answer; else no device), whether it answered this epoch and the
-    counted epochs; beside the Offline state, the latest epoch the node was not counted in (below), and, in that card
-    right under the device rows and nowhere else, "I'm back" only while the public
-    status names the device Offline and it has not answered this epoch (never for an Online device, a device linked
-    less than an epoch ago that has not answered yet, or no device; for a node of an earlier version, a linked device
-    the network asks to come back). Pressed, the site asks the owners of the node's light shard in rank order for one
-    silent push to the device (`POST /api/cabinet/wake`, below); after a push the page says that it waits for the
-    device's answer and reads the status again every 10 s for 2 minutes, and once the status says the device answered
-    this epoch the card shows it Online and I'm back goes; with no answer by then, that QNet Wallet should be opened
-    on the device. Any other answer is said as it is: already answered, no device answers, or that the network cannot
-    wake the device right now, with the minutes until it can when the network names them; then, for every registered node (with a device linked or not), the node balance:
-    each counted epoch adds to it, the network keeps it for the wallet, and from 1 QNC Move to wallet puts it in the
-    wallet, through the extension of this computer for its own wallet (`qnet_claimNodeBalance`), otherwise a `claim`
-    request to QNet Wallet; the answer is the wallet's report and the balance is read again from the network. While
-    I'm back shows, the move waits. Then Node details: the activation code with Copy, the node type, the node
+    Offline, or a new device waiting for its first answer; else no device) and whether it answered this epoch;
+    beside the Offline state, the latest epoch the node was not counted in (below), and, in that card right under the
+    device rows, its one action: QNet Wallet open on that phone answers by itself (the network wakes a phone that holds
+    the node every epoch from then on), and a phone that no longer holds the node runs it again with "Run the node on
+    this phone" ("that phone", with its QR code, on a computer), the `link` request of Link a device (while the site
+    sends no link requests, the card says that running it there again from this page opens soon). The site sends no
+    wake of its own: a phone whose push address is gone cannot be woken, only linked
+    again. Then, for every registered node (with a device linked or not), the node balance: each counted epoch adds to
+    it, the network keeps it for the wallet, and from 1 QNC Move to wallet puts it in the wallet, whichever way the
+    wallet is connected here (owner, 12.10): through the extension of this computer for its own wallet
+    (`qnet_claimNodeBalance` with the node's id, confirmed in the extension's own window), and a `claim` request to QNet
+    Wallet that names the wallet and the node (beside the extension's, or alone), its button on a phone or tablet and its
+    QR code on a computer; the answer is the wallet's report and the balance is read again from the network. A typed
+    address is asked to connect the wallet first. Then Node
+    details: the activation code with Copy, the node type, the node
     id, the burn with its link and amount and the block the node was recorded at, from the archive's registration
     record, else the site's record, the extension, the burn found on the wallet's Solana address, the extension's
     answer kept here, else an activation of this browser. The code encodes the wallet the burn is for: the wallet's
@@ -173,9 +183,20 @@ delegate into `frontend/`.
     route is read again every 30 s while the page is shown (a read that fails keeps the answer before it). The
     code is shown by itself, and the page never asks for it: a light node never needs it, a super node's server takes
     it in its settings. Last, the newest epochs. For a super node on the network: online or offline (the nodes' peer
-    view or its on-chain heartbeat), when it was last seen (the nodes', else the archive's newest heartbeat), its
-    heartbeats this epoch against the number needed, whether the network bars it, its counted and missed epochs, its
-    node balance (moved from QNet Wallet's Node tab), its details with the server's settings, and its newest epochs.
+    view or its on-chain heartbeat), or "Registered, waiting for network admission" when it is online, not barred and
+    outside the network's admission: as the node's status names it (`admission` `waiting`; the note then says its
+    epochs add nothing to the node balance and show as not admitted), or, from a node that does not name it, when the
+    network's eligible set (the newest certified macroblock's eligible producers, read from its proof and kept 5
+    minutes) does not list it; offline wins, since the network also drops an admitted node that stopped sending
+    heartbeats from the set; when it was last seen (the nodes', else the archive's newest heartbeat while the archive keeps up:
+    none once it wrote nothing for 120 s), its heartbeats this epoch against the number needed and whether they keep
+    pace for the epoch to count (`is_reward_eligible`), the network's height and, when the network reports it
+    (`peer_block_height`, which no node sends yet), the server's own against it, whether the network bars it, its node
+    balance with Move to wallet as a light node's (the request names the wallet's super node; a genesis node's balance is
+    only shown), its details with the server's steps and the block it was recorded at,
+    and its newest epochs. Before its registration lands, the page says so, and that the network sees its server
+    when a node's peer view holds it (status `onboarding` with `is_online`). Neither node type shows a count
+    of its epochs over a window of recent ones; History lists the epochs themselves.
     A wallet with both shows both.
   - Device (`/node/device`): for a light node, the linked device from the public status's `device` ([light node
     messages](../protocols/light-node-messages.md) section 7): its state (Online, Offline, or a new device waiting
@@ -199,39 +220,48 @@ delegate into `frontend/`.
     QNet Wallet run in the background on that device with its battery use unrestricted (Background App Refresh on, on
     an iPhone or iPad) and do not swipe it away (woken without an answer, wake never arrived, answered late), run the
     node on that device again from QNet Wallet (answer refused), open QNet Wallet on that device once (no way to wake
-    it), open QNet Wallet on that device or press "I'm back" (stopped waking it; "on the Overview" on this tab, and the
-    I'm back part only while I'm back is offered), and for the last two, that it was the network's miss and nothing
+    it), open QNet Wallet on that device (stopped waking it), and for the last two, that it was the network's miss and nothing
     needs changing on that device or in QNet Wallet. Those two (`not_sent`, `not_committed`) never count toward the
     network's stopping to wake a device: two missed epochs stop it only when both are proven misses of the device,
     where the shard's check was committed without the node and the owner's own record shows the device was reached
     (the push service took the push, the device fetched its challenge, or the push service said its address is gone);
     a push the service took that the phone's system then held counts as reached, alike on iPhone, iPad and Android.
     Every answer belongs to its own epoch: no line says an answer counts for another, and an answer after an
-    epoch's check counts for none. An Offline device's card leads to
-    the Overview, where "I'm back" is. With a device linked, "Unlink the device" and "Move the node to another
+    epoch's check counts for none. With a device linked, "Unlink the device" and "Move the node to another
     device". Once both genesis nodes list `unbind_wallet`, the wallet signs the unlink with its own key, so a lost
-    device is unlinked from here too: the QNet extension of this computer when it holds the chosen wallet
+    device is unlinked from here too: the QNet Wallet extension of this computer when it holds the chosen wallet
     (`qnet_unlinkNodeDevice`), otherwise an `unlink` request naming the wallet, its QR code or its button, which QNet
     Wallet with that wallet on any device confirms; before that, the same request goes to QNet Wallet on the device
     that runs the node, whose own key signs its unbind, and a lost device leaves when the node moves to another device.
     The page unlinks nothing alone; the answer is the wallet's report (taken by the network, or not confirmed) and the
     rows follow the network. "Move the node to another device" is the `link` request without a burn: the device that
     confirms it runs the node and the one before it stops. With none linked, Link a device in numbered steps. For a
-    super node, that it runs on its server with no device to link, and the server's status.
-  - History (`/node/history`): the counted epochs out of the last ones a genesis indexed, the counted epochs still in
-    the node balance, and every epoch since the registration one by one, up to the newest 400 (a node from before the
-    cabinet included: its id derives from the wallet): when it ended, counted, moved to the wallet, missed, not checked
-    by the network or not readable, the node balance it added and the transaction that moved it; older epochs the
-    archive knows only as moved. A super node's epochs the same way, from its registration's epoch
-    (the archive's `NodeRegistration` row sent from the super node's id).
+    super node, that it runs on its server with no device to link, and the server's status, or that it is not on the
+    network yet.
+  - History (`/node/history`): one list of the node's epochs, newest first, from its registration's epoch on, 30 at
+    a time with "Show more" (off while it reads; a page that fails keeps the rows and offers Try again): each epoch's
+    number, when it began and ended (in the viewer's own time zone), its result (counted; counted and moved to the
+    wallet, linked to the transaction that moved it; not counted; the registration's own epoch; not checked by the
+    network; or not readable) and the node balance it added (a moved epoch's amount exact from its move). A light and a
+    super node alike, from the archive's `NodeRegistration` rows, which the wallet sends for both (one from before the
+    indexer kept its fields is read by its `client_node_reg:<node id>:` memo, a genesis node's by its
+    `node_registration:<node id>:` one); the network keeps the epochs per wallet, so a wallet with both has one list,
+    read by its light node's id, else its super node's, whatever the light node's status read says, starting at the
+    wallet's first registration, and an epoch after its super node registered that paid the wallet nothing is not
+    counted even when the light node's group was not checked. The nodes serve an epoch's result for about six weeks
+    (256 epochs); an older one shows as moved when the archive holds its move, else as not readable, with a note saying
+    so; a newer one not readable is one the nodes asked did not return just then, with a note saying that.
+    An epoch the nodes report as `not_admitted` (a super node outside that epoch's admitted set) shows as not admitted,
+    never as not counted, its registration's own epoch too, with a note that it is the network's admission, not
+    missed heartbeats.
   - Activate (`/node/activate`): an activation is offered only while every source of the wallet says it has
     nothing (the state "nothing known"); otherwise the page shows the wallet's state and next step instead (for a
     wallet whose node the network lists, the step it is on: "Link your phone" with Link a device one tap away on the
-    Device tab, or the Overview, where "I'm back" is for an Offline device). One
-    wallet, one node: a light node or a super node, chosen once. A super node is activated only in the QNet extension
-    on a computer; without the extension the page shows its card ("Super node: only in the QNet extension", with the
+    Device tab, or the Overview, where an Offline device's phone runs the node again). One
+    wallet, one node: a light node or a super node, chosen once. A super node is activated only in the QNet Wallet extension
+    on a computer; without the extension the page shows its card ("Super node: only in the QNet Wallet extension", with the
     extension's install link on a computer and the super node guide on a phone), first when `?type=super` asked for it.
-    On a computer with the QNet extension that holds the chosen wallet (the wallet the cabinet took from it, or the one
+    On a computer with the QNet Wallet extension that holds the chosen wallet (the wallet the cabinet took from it, or the one
     it answers with) the page offers both node types (`?type=super` preselects the super node); an extension that holds
     another wallet is never offered for this one, since it burns for its own wallet only, and the page says so. The
     extension holds the wallet's reservation, burns
@@ -256,9 +286,9 @@ delegate into `frontend/`.
     reservation, and only then does the page show the address; a decline, an error, another wallet's answer or a
     request that expired deletes the record, whose address was never shown. The
     user sends the activation price in 1DEV and 0.001 SOL (the burn's fee and the address's rent-exempt minimum,
-    rounded up) to it from their own wallet: the card says which QNet wallet the node is registered to, and shows a QR
+    rounded up) to it from their own wallet: the card says which QNet Blockchain wallet the node is registered to, and shows a QR
     code of a payment request
-    `solana:<address>?amount=<price>&spl-token=<1DEV mint>&label=QNet%20activation` that fills in the address, the
+    `solana:<address>?amount=<price>&spl-token=<1DEV mint>&label=QNet%20Blockchain%20node%20activation` that fills in the address, the
     token and the amount in the wallet that scans it, and a second, small one for the SOL, each with "Copy payment
     request"; on a phone it says to copy the address and send both amounts from QNet Wallet; on testnet it links the
     Testnet page's faucet ("Get them to your wallet"), handing over the connected wallet's Solana address without a
@@ -298,20 +328,24 @@ delegate into `frontend/`.
       the phone's own browser and the connect, QNet Wallet's confirmation, the payment address and its funding (Copy,
       then send from QNet Wallet), the burn and its code, QNet Wallet's second confirmation, which registers and runs
       the node, and the move of the node balance on QNet Wallet's Node tab (or with QNet Wallet from My node).
-    - From a computer (13 steps): the QNet extension and its "Create or import a wallet" ("Create a new wallet" or
-      "Import a wallet" in its setup tab), the 12 words, their check and the password, the Solana address and the
-      tokens, the connect, the burn in the extension, the same wallet imported in QNet Wallet on the phone, Link a
-      device on the Overview (or the app's Node tab, Use this device), and the move of the node balance.
-    - Super node (14 steps), activated only in the QNet extension on a computer: the same first eight steps, the burn,
+    - From a computer (13 steps): the QNet Wallet extension and its "Create a new wallet" (or "Import an existing wallet"),
+      each opening its setup tab straight at that step, the 12 words, their check and the password, the Solana address
+      and the tokens, the connect, the burn in the extension, the same wallet imported in QNet Wallet on the phone (its
+      Node tab says the wallet has no node until the phone is linked), Link a device on My node with the phone's camera
+      on its QR code (or on the phone itself, in its own browser; while the site sends no link requests, the step shows
+      the Device tab saying linking opens soon), and the move of the node balance with My node's Move to wallet and the
+      extension's window (or on QNet Wallet's Node tab).
+    - Super node (15 steps), activated only in the QNet Wallet extension on a computer: the same first eight steps, the burn,
       the code and every server step on the page right after it and on the Overview later in any browser, the server
-      with the node software (linked to Running a node), what the Overview shows, and the move of the node balance on
-      QNet Wallet's Node tab with the same wallet imported.
+      with the node software (linked to Running a node), the check that it runs and catches up, what the Overview
+      shows, and the move of the node balance with My node's Move to wallet and the extension's window (or on QNet
+      Wallet's Node tab with the same wallet imported).
     No step asks to keep the app running or names a phone setting (Support keeps those), and no answer sends the
     reader to write to anyone or to a button only the phone flows show. The connect screen's short version shows the
     three ways in three steps (phone) or four (computer, super node), each starting with create or import.
   - With `CABINET_PHONE_FLOWS` off (the deploy default) the cabinet sends QNet Wallet no `link`, `claim`, `reserve`
-    or `unlink` request and the relay opens only `connect` sessions: the read pages, "I'm back" and the
-    extension's paths stay (the extension's unlink among them), and the payment address is not offered. Without the
+    or `unlink` request and the relay opens only `connect` sessions: the read pages and the
+    extension's paths stay (the extension's move of a node balance and its unlink among them), and the payment address is not offered. Without the
     extension, Unlink then says the node leaves a device when another device takes it over or when the wallet is
     deleted in QNet Wallet on it.
 - The site has one origin, `https://aiqnet.io` (`src/lib/hosts.ts`, `src/proxy.ts`): the relay's and
@@ -337,34 +371,29 @@ delegate into `frontend/`.
   all are set.
 - The header's wallet control (`src/components/wallet/connect-wallet-button.tsx`) shows, on every page, the
   wallet the node cabinet shows (the one it remembers, or the extension's it takes up) and leads to `/node`.
-  Without one, **Connect wallet** on a computer with the QNet extension asks the extension at once
+  Without one, **Connect wallet** on a computer with the QNet Wallet extension asks the extension at once
   (`qnet_requestAccounts`, the connect card's call), and My node keeps that wallet and opens; on a phone or tablet, or
   without the extension, it leads to the cabinet's connect screen (on a page that shows the connect card it brings the
-  card into view). In the QNet app's view (below) it connects the page's wallet provider instead
+  card into view). In the QNet Wallet app's view (below) it connects the page's wallet provider instead
   (`src/lib/qnet-provider.ts`, state in `src/contexts/AppContext.tsx`). Connecting gives the site the approved QNet
-  and Solana addresses only; it asks the wallet for no signature and no transaction.
+  Blockchain and Solana addresses only; it asks the wallet for no signature and no transaction.
 - Every page response carries a Content-Security-Policy with a per-request script nonce
   (`src/proxy.ts`, the Next.js 16 proxy), prefetch and router requests included; the cabinet's pages add
   `worker-src 'none'`, `frame-src 'none'`, `manifest-src 'self'` and, in production, `upgrade-insecure-requests`.
   API responses carry their own restrictive policy (`next.config.js`). Pages load images only from the site and `data:`: a token's on-chain logo is
   fetched by the server and served from `/api/token/[contract]/logo`, so a visitor's browser never contacts
   the host a token's deployer chose.
-- The QNet app's store builds show no activation, payment, other-platform or sideload text, and the site
-  holds to that wherever those builds show it (`src/lib/activate-view.ts`): in the app's in-app browser
-  (provider `channel` `mobile`), and on a page the app opens in the system browser with the marker
-  `?from=app` (kept for the visit, in memory, on the header's links and on every link and navigation
-  between explorer pages, `src/components/ExplorerLink.tsx`, so a reload or a new tab stays in that view). There, and in the server's render
-  and before the wallet is detected, the header links only the explorer, Privacy, Terms and Support (no Docs menu),
-  the logo leads to the explorer, and the footer links no place off the site (no repository, Telegram, X or store; its
-  Privacy, Terms and Support keep the marker);
-  Support hides the documentation, the repository's issues and the Telegram channel, so its only way off
-  the site is the support address. In a browser without a wallet the header's wallet control offers no install target there (it would
-  lead to the wallet pages and drop the marker). `/`, `/docs`, `/dao`, `/testnet`,
-  `/qnet-wallet-extension`, `/wallet`, `/activate` and the node cabinet `/node` show nothing in the app's view and go to `/explorer`
-  (`src/components/InAppGuard.tsx`); before the wallet is detected, the server's render included, their
-  markup is in the page but hidden. Privacy and Terms describe activation without pointing
-  to a page that performs it. `npm run check:release` fails until the app opens its policy, support and
-  explorer links, and the App Store listing its Marketing URL, with that marker.
+- The QNet Wallet app's store builds show no activation, payment, other-platform or sideload text, and the site
+  holds to that in the app's in-app browser (provider `channel` `mobile`, `src/lib/activate-view.ts`). A page
+  the app opens in the system browser is an ordinary visit there; the `?from=app` its links carry changes
+  nothing. In the in-app browser, and in the server's render and before the wallet is detected, the header
+  links only the explorer, Privacy, Terms and Support (no Docs menu), the logo leads to the explorer, and the
+  footer links no place off the site (no repository, Telegram, X or store); Support hides the documentation,
+  the repository's issues and the Telegram channel, so its only way off the site is the support address.
+  `/`, `/docs`, `/dao`, `/testnet`, `/qnet-wallet-extension`, `/wallet`, `/activate` and the node cabinet
+  `/node` show nothing in the in-app browser and go to `/explorer` (`src/components/InAppGuard.tsx`); before
+  the wallet is detected, the server's render included, their markup is in the page but hidden. Privacy and
+  Terms describe activation without pointing to a page that performs it.
 
 ## Architecture
 
@@ -374,7 +403,7 @@ Three parts, each its own process:
    `src/app/api/` are the explorer's own HTTP API. They read the PostgreSQL index through
    `lib/db.ts`, which issues only reads, and proxy the node directly for anything that must be live
    (rich list, search fallback, balance checks). `src/instrumentation.ts` runs once per server start
-   in the Node.js runtime and starts the head hub.
+   in the Node.js runtime and starts the head hub and the balance check's background walk.
 2. **Indexer** — `src/indexer/`, compiled by `npm run build:indexer` into `dist-indexer/` and run by
    `npm run start:indexer`. It is the only writer: at start it takes the session advisory lock
    `pg_try_advisory_lock(hashtext('qnet-explorer-indexer'))`, exits if another indexer holds it,
@@ -428,13 +457,24 @@ honest endpoint.
   root, producer and agreed time come from the header; the body supplies the transactions.
 - **Realtime.** One WebSocket at a time on `/ws/subscribe?channels=blocks` (the HTTP URL with
   `http`/`https` rewritten to `ws`/`wss`); a `NewBlock` event schedules the quorum read of its height.
-  Reconnection backs off from 1 s to 30 s, and a socket that delivers no tip block for 45 s, or more
-  than 500 events a second, is dropped so the subscription rotates to the next endpoint.
+  A socket that delivers no tip block for 45 s, or more than 500 events a second, is dropped so the
+  subscription rotates to the next endpoint. Every socket a node accepts holds one of its subscription
+  slots until the node sees the close, so retries never hammer: the retries since a socket last
+  delivered a tip block wait 1 s, 2 s, 4 s and so on, capped at 5 minutes, each wait drawn between half
+  and all of its step (jitter, so indexers restarted together do not reconnect in step); a socket that
+  opens and is dropped as silent, as every socket is on a halted chain, does not reset the steps. An
+  endpoint that refuses the upgrade with 429 or 503 is not asked again for 30 to 60 s, doubling with
+  each refusal in a row up to 15 minutes, and never sooner than its `Retry-After` (itself capped at 15
+  minutes), while the other endpoints are tried; when every endpoint is refusing, the next attempt
+  waits for the first refusal to lapse. The height poll below keeps the archive moving meanwhile.
 - **Network height.** `GET /api/v1/height` is asked of every healthy endpoint every 2 s while the
   socket is down, every 10 s while it is up but silent and every 30 s while blocks arrive. The network
   height is the quorum-th highest answer, and a single source may lead it by at most 600 blocks.
 - **Gaps.** `sync_state.last_height` is the highest stored block and `indexed_prefix` the last height
-  below the first hole; every hole is a `sync_gaps` range. Each second the catch-up claims the lowest
+  below the first hole; every hole is a `sync_gaps` range. At start, and after a rollback, the head is re-read from
+  the block rows ordered by the height column, never by its text (`ORDER BY blocks.height`: as text, 999,999 sorted
+  above every seven-digit height; `src/lib/__tests__/sql-order.test.mjs` scans every query of the indexer and the site
+  for that pattern). Each second the catch-up claims the lowest
   due range and the highest due range inside the body retention window, ingests up to 1,000 heights
   of it in commits of at most 200 blocks or 150,000 estimated recipient rows, and requeues what is
   still missing with a backoff of `min(600, 15 × 2^min(tries, 6))` seconds.
@@ -480,7 +520,7 @@ and `005_cabinet_activations.sql` adds `cabinet_activations`, the node cabinet's
 | `explorer_stats` | single row, `id = 1` | transaction totals overall and per type, block and batch-recipient totals, emission total, head height, hash and time |
 | `sync_state` | single row, `id = 1` | `last_height`, `indexed_prefix`, `genesis_hash`, and the node height, subscription state, endpoint and heal backlog the indexer publishes every 5 s |
 | `sync_gaps` | `start_h` | height ranges still to fetch, with a try count and the next retry time |
-| `cabinet_activations` | `wallet` | one QNet wallet's activation: `state` (`reserved`, `sending`, `recorded`), `node_type`, `way` (`extension` or `payment`), `burner`, `burn_amount`, the reservation and its times, `burn_tx` (unique), `burn_slot`, the burn's and the record's times, and the proof (JSONB: the wallet's signed reservation, then the extension's burn proof, or for a payment burn the signed reservation with the payment key's owner bind); no IP address |
+| `cabinet_activations` | `wallet` | one QNet Blockchain wallet's activation: `state` (`reserved`, `sending`, `recorded`), `node_type`, `way` (`extension` or `payment`), `burner`, `burn_amount`, the reservation and its times, `burn_tx` (unique), `burn_slot`, the burn's and the record's times, and the proof (JSONB: the wallet's signed reservation, then the extension's burn proof, or for a payment burn the signed reservation with the payment key's owner bind); no IP address |
 
 `tx_skipped` counts the transactions of a block that have no row of their own: genesis prefund
 transfers, transactions from or to `EON1benchmark` accounts, transactions whose hash or addresses fail
@@ -522,21 +562,20 @@ own, so explorer traffic never crowds it out.
 | `GET /api/network/stats` | Head, totals and emission from the head snapshot, plus Super nodes (distinct `Heartbeat` senders in the last complete 14,400-block epoch) and Light nodes (the largest per-epoch sum of bitmap `eligible_count` over the last three complete epochs), cached 60 s |
 | `GET /api/search`, `GET /api/search/suggest` | Search and type-ahead |
 | `POST /api/faucet/claim` | Testnet faucet dispatch (see Faucet) |
-| `POST /api/faucet/pass` | The faucet pass for the QNet wallet the node cabinet activates (see Faucet) |
+| `POST /api/faucet/pass` | The faucet pass for the QNet Blockchain wallet the node cabinet activates (see Faucet) |
 | `GET /api/head` | The head snapshot as JSON, the poll fallback for `/api/stream` |
 | `GET /api/stream` | Server-sent `head` event on each new head snapshot; at most 6 streams per client, 15 s heartbeat |
 | `GET /api/sync/start` | The indexer's published state: head, prefix, node height, lag, subscription, heal backlog, and `healthy` when the lag is at most 600 blocks and the last commit is under 120 s old; `POST` answers 410 |
 | `GET /api/monitoring/health`, `GET /api/monitoring/alerts` | Health (database, indexer lag and freshness, monitoring) and alerting; health reports `degraded` when the last commit is over 120 s old or the lag exceeds 600 blocks |
 | `GET /api/activation/price?type=light\|super` | The activation price from the pinned nodes `https://node1..5.aiqnet.io` (`/api/v1/activation/price`): `{type, phase: 1, cost, currency: '1DEV'}` or `{type, phase: 2}`, 503 when no node gives a valid quote (no fallback numbers); cached 15 s. A node's answer is read as a stream and dropped past 8 KiB (a larger declared length is not read at all), 4 s per node |
-| `POST /api/link/sessions`, `GET /api/link/sessions/[id]`, `GET`/`POST /api/link/sessions/[id]/response` | The QNet Link relay (`src/server/link-relay.ts`, protocol sections 5 and 14.5): the intents `connect`, `link`, `claim`, `reserve` and `unlink` (an `activate` session is refused), a session of any of them but `connect` with its request and the request's hash, which the relay computes; sessions in process memory (at most 100,000, at most 60 per creating IP, of them at most 5,000 `link` sessions and 10 per creating IP, 600 s each), one encrypted answer per session, body caps per intent (a `link` answer up to 12,288 bytes, the others 4,096), per-IP limits with a limiter store of its own (120 creates per 10 min; 120, 60 and 600 per minute for the other routes, for many phones or computers behind one NAT address), foreign `Origin` refused, and any `Sec-Fetch-Site` but `same-origin` (a browser request another page made, a GET by `<img>` included) refused before a limit counts it, in the app and in nginx, whose relay location has a rate-limit zone of its own; nothing logged by the relay or by nginx (`access_log off` for `/api/link/`) |
-| `GET /api/cabinet/node/[id]`, `GET /api/cabinet/node/[id]/history` | The node cabinet's reads of a node (`src/server/cabinet/node-proxy.ts`), the status for a light node id only, the history for a light or a super node id: the public status from two genesis nodes `https://node1..5.aiqnet.io`, asked in the order of the node's light shard (the genesis that wakes its device, then the shard's two other owners, then the other two genesis nodes, each group shuffled), which must agree whether the node is registered (503 otherwise), with the features both list, the node balance and the linked device (`device`: `{platform, model, linkedSince, lastAnswerEpoch, state, lastMiss}`, the first five from the first settling answer, or null; a node's malformed `device` refuses its answer, one without the field names none, and a field of it the site does not read is ignored). `answeredThisEpoch` and `needsReactivation` are the word of the shard's owners that list the node (those at the network's height when any is, a node behind reading an older epoch; with no owner's answer, the settling pair's): answered when any of them says so, needs reactivation only when every one of them does, since an answer reaches the other owners by one relay that an owner down or restarting misses; when that word differs from the first answer's own, the device's `state` follows it by the node's rule (Online unless the node needs reactivation; then an owner's Offline or new-device state), and `lastAnswerEpoch` is the latest those owners name. `lastMiss` (`{epoch, reason, delivered}`: whether the wake of that epoch reached the device by the device's own account, true, false, or null when not known) is the shard owners' `device.last_miss` ([light node messages](../protocols/light-node-messages.md) section 7) as a reader takes it: among the answers, the miss of the highest epoch, at equal epochs the most specific reason (`not_committed`: no committed check of the shard, so no node of it counted whatever the device did; `answered_late`, `not_delivered`, `answer_refused`, `woken_no_answer`, `no_push_address`; `not_sent`: a wake the network did not get out, below any record of an owner that reached the device; `not_woken_inactive`), at equal reasons the one that knows whether the wake reached the device (the owner that took the device's account of it); a reason the site does not know, or a record it cannot read, is passed over, and a node without the field gives null. The keyless status names no exact time, delay or app outcome; a node of an earlier version that still sends them (`last_answer_at`, `last_answer`, a miss's times, delay, refusal code and `app_outcome`) is read for whether the wake reached the device alone, and nothing else of it is kept, neither in the answer nor in the shared per-node cache. When the answers name a miss newer than the node's last counted epoch with no later answer (but a shard with no committed check, the same at every owner), or a wake with no answer whose record lacks the device's account (only the owner that took the device's next answer keeps it), or the owners asked call the device Offline, a page's read also asks the shard's owners not asked yet, once (a reservation's read does not); and the node's epochs one by one from its registration on (up to 4 pages of 100 a node reports, the older pages only for a node that names the wallet the id derives from, a second node filling the ones the first could not serve): counted and still in the node balance, moved to the wallet, missed, the registration's own epoch, not checked by the network, or not readable, with the explorer archive's facts (`src/server/cabinet/epoch-archive.ts`: the registration's epoch, each epoch's end time, and the transaction that moved it to the wallet) and the older epochs the archive knows only as moved; without the archive the epochs come undated. Exact answer shapes, cached per node 25 s, about the page's poll interval (a settled "not registered, not being recorded" 30 s; history 30 s), one upstream round per node at a time, 4 s and 64 KiB per node answer; foreign `Origin` and any `Sec-Fetch-Site` but `same-origin` refused before a limit counts it, then 120 requests per minute per client with a limiter store of the cabinet's own, and apart from it 30 reads a minute per client that miss the cache and go to the genesis nodes, shared with the super node and wallet-node routes (`limits.ts` `CLIENT_BUDGETS.upstreamMiss`, 429 past it). Each genesis node is asked at most 16 of these reads a second for ids the site has seen the network list as registered (kept in process memory a day after it was last seen registered, with nothing of who read it, `src/server/cabinet/known-nodes.ts`) and 4 for any other id (`upstream.ts` `readKnown`, `readUnknown`), so made-up ids, which cost nothing, cannot starve the owners of registered nodes |
-| `GET /api/cabinet/super/[id]` | A super node's status (`node-proxy.ts` `superStatus`), for a super node id (`super_node_` and 16 hex, or a genesis node's): `{registered, online, lastSeenAt, heartbeats, banned, balanceNano}` from the genesis nodes' `/api/v1/node/status` (one node that lists it registered answers "yes", two that do not are needed for "no"), the balance from `/api/v1/rewards/pending`, and when the nodes know no last-seen time the archive's newest heartbeat of the node; cached 25 s ("not registered" 30 s), 120 per client per minute, its reads that go upstream on the client's and the genesis nodes' read budgets as the light status's |
+| `POST /api/link/sessions`, `GET /api/link/sessions/[id]`, `GET`/`POST /api/link/sessions/[id]/response` | The QNet Link relay (`src/server/link-relay.ts`, protocol sections 5 and 14.5): the intents `connect`, `link`, `claim`, `reserve` and `unlink` (an `activate` session is refused; a `claim` session names the wallet and its light or super node, and the earlier one, which named no node, is refused as an invalid body), a session of any of them but `connect` with its request and the request's hash, which the relay computes; sessions in process memory (at most 100,000, at most 60 per creating IP, of them at most 5,000 `link` sessions and 10 per creating IP, 600 s each), one encrypted answer per session, body caps per intent (a `link` answer up to 12,288 bytes, the others 4,096), per-IP limits with a limiter store of its own (120 creates per 10 min; 120, 60 and 600 per minute for the other routes, for many phones or computers behind one NAT address), foreign `Origin` refused, and any `Sec-Fetch-Site` but `same-origin` (a browser request another page made, a GET by `<img>` included) refused before a limit counts it, in the app and in nginx, whose relay location has a rate-limit zone of its own; nothing logged by the relay or by nginx (`access_log off` for `/api/link/`) |
+| `GET /api/cabinet/node/[id]`, `GET /api/cabinet/node/[id]/history` | The node cabinet's reads of a node (`src/server/cabinet/node-proxy.ts`), the status for a light node id only, the history for a light or a super node id: the public status from two genesis nodes `https://node1..5.aiqnet.io`, asked in the order of the node's light shard (the genesis that wakes its device, then the shard's two other owners, then the other two genesis nodes, each group shuffled), which must agree whether the node is registered (503 otherwise), with the features both list, the node balance and the linked device (`device`: `{platform, model, linkedSince, lastAnswerEpoch, state, lastMiss}`, the first five from the first settling answer, or null; a node's malformed `device` refuses its answer, one without the field names none, and a field of it the site does not read is ignored). `answeredThisEpoch` and `needsReactivation` are the word of the shard's owners that list the node (those at the network's height when any is, a node behind reading an older epoch; with no owner's answer, the settling pair's): answered when any of them says so, needs reactivation only when every one of them does, since an answer reaches the other owners by one relay that an owner down or restarting misses; when that word differs from the first answer's own, the device's `state` follows it by the node's rule (Online unless the node needs reactivation; then an owner's Offline or new-device state), and `lastAnswerEpoch` is the latest those owners name. `lastMiss` (`{epoch, reason, delivered}`: whether the wake of that epoch reached the device by the device's own account, true, false, or null when not known) is the shard owners' `device.last_miss` ([light node messages](../protocols/light-node-messages.md) section 7) as a reader takes it: among the answers, the miss of the highest epoch, at equal epochs the most specific reason (`not_committed`: no committed check of the shard, so no node of it counted whatever the device did; `answered_late`, `not_delivered`, `answer_refused`, `woken_no_answer`, `no_push_address`; `not_sent`: a wake the network did not get out, below any record of an owner that reached the device; `not_woken_inactive`), at equal reasons the one that knows whether the wake reached the device (the owner that took the device's account of it); a reason the site does not know, or a record it cannot read, is passed over, and a node without the field gives null. The keyless status names no exact time, delay or app outcome; a node of an earlier version that still sends them (`last_answer_at`, `last_answer`, a miss's times, delay, refusal code and `app_outcome`) is read for whether the wake reached the device alone, and nothing else of it is kept, neither in the answer nor in the shared per-node cache. When the answers name a miss newer than the node's last counted epoch with no later answer (but a shard with no committed check, the same at every owner), or a wake with no answer whose record lacks the device's account (only the owner that took the device's next answer keeps it), or the owners asked call the device Offline, a page's read also asks the shard's owners not asked yet, once (a reservation's read does not); and the node's epochs, which are its wallet's, one by one from the wallet's first registration on, a page at a time (`?page=N`, a whole number 0 to 1,000, else 400; `{registeredEpoch, archived, rows, more}`: page 0 the newest 30 epochs a node reports, page N the 31 from offset 30 N − 1 (the (30 N)th epoch on), so a page read from a node one epoch behind, or kept from before an epoch settled, skips none and the page drops the repeat; one node, a second filling the ones the first could not serve; `more` while the node has older epochs, names a wallet (a made-up id names none) and the page did not reach the registration's epoch): counted and still in the node balance, moved to the wallet, not counted (also an epoch after the wallet's super node registered that paid the wallet nothing, though the light node's group was not checked), the registration's own epoch, not checked by the network, or not readable, each with when it began and ended and the transaction that moved it, from the explorer archive for the wallet the nodes name (`src/server/cabinet/epoch-archive.ts`: the wallet's registrations, read by the wallet oldest first, at most 4, those naming its light or super node, or the id asked for, by their fields, their `client_node_reg:<node id>:` memo or a genesis node's `node_registration:<node id>:` one, the lowest block the start and the super node's apart, kept a day once found with the super node's, 5 minutes without; the wallet's moves from the end of the page's oldest epoch on, at most 32, with each epoch's exact amount; the block times of the page's epoch boundaries); an epoch the nodes can no longer read shows as moved when the archive holds its move; without the archive the epochs come undated. Exact answer shapes, cached per node 25 s, about the page's poll interval (a settled "not registered, not being recorded" 30 s; history 30 s per page, an older page as well, since a move to the wallet changes it), one upstream round per node at a time, 4 s and 64 KiB per node answer; foreign `Origin` and any `Sec-Fetch-Site` but `same-origin` refused before a limit counts it, then 120 requests per minute per client with a limiter store of the cabinet's own, and apart from it 30 reads a minute per client that miss the cache and go to the genesis nodes, shared with the super node and wallet-node routes (`limits.ts` `CLIENT_BUDGETS.upstreamMiss`, 429 past it). Each genesis node is asked at most 16 of these reads a second for ids the site has seen the network list as registered (kept in process memory a day after it was last seen registered, with nothing of who read it, `src/server/cabinet/known-nodes.ts`) and 4 for any other id (`upstream.ts` `readKnown`, `readUnknown`), so made-up ids, which cost nothing, cannot starve the owners of registered nodes |
+| `GET /api/cabinet/super/[id]` | A super node's status (`node-proxy.ts` `superStatus`), for a super node id (`super_node_` and 16 hex, or a genesis node's): `{registered, online, lastSeenAt, heartbeats, banned, balanceNano, admission, admitted, onPace, networkHeight, serverHeight, connected}` from the genesis nodes' `/api/v1/node/status` (one node that lists it registered answers "yes", two that do not are needed for "no", and `connected` says one of those saw its server), the balance from `/api/v1/rewards/pending`, when the nodes know no last-seen time the archive's newest heartbeat of the node (none while the archive is 120 s behind), `admission`, the answering node's word on the node's admission (`admitted`, `waiting` or `not_required`; null from a node that does not send it), and, only when it is null, `admitted`, whether the newest certified macroblock's eligible set lists the node (`src/server/cabinet/eligible-set.ts`: `/api/v1/state/certified`, then that macroblock's `/api/v1/macroblock/{index}/proof` and its `eligible_raw`, from one genesis node, the next when one gives no usable answer, kept 5 minutes for every reader and then served at once while one read refreshes it, also while refreshes fail, up to 30 minutes old, read on the budget of known ids; null when no node gave a usable answer, when the proof is over 8 MB, or when the set is not read within 3 s, whose read then goes on and serves the next status read); cached 25 s ("not registered" 30 s), 120 per client per minute, its reads that go upstream on the client's and the genesis nodes' read budgets as the light status's |
 | `GET /api/cabinet/wallet-node/[wallet]` | Whether a wallet has a node of either type (`src/server/cabinet/wallet-node.ts`): the genesis nodes' `/api/v1/verify-activation` with the wallet in the `x-qnet-wallet` header, two first then one more at a time (any `verified: true` is a node; a "no" needs a node at the network's height), then the light node's settled status: `{"state":"registered","nodeId","nodeType"}`, `{"state":"none"}`, or 503; cached 25 s (`none` 30 s), 60 per client per minute, its reads that go upstream on the client's and the genesis nodes' read budgets as the light status's (the budget of known ids for a wallet whose node was seen registered). A reservation (below) asks the same with a 5 s cache and an upstream budget of its own (`src/server/cabinet/upstream.ts` `reserve`, 10 calls a second per genesis node beside the reads' 16 and 4), so no flood of anonymous reads makes it answer `network_unavailable` |
 | `GET /api/cabinet/price`, `GET /api/cabinet/payment/[address]`, `GET /api/cabinet/blockhash`, `GET /api/cabinet/tx/[sig]`, `POST /api/cabinet/send` | The activation's Solana side (`src/server/cabinet/solana-proxy.ts`): the light price two genesis nodes agree on (15 s), a payment address's SOL and 1DEV (3 s), the latest blockhash (2 s), a transaction's state and the light burn it holds (its status by signature 2 s, the block height, one for all, 2 s, and a finalized transaction's burn a day, since it never changes; the state that depends on the page's `lvh`, pending or expired, is worked out from them on the server, so a new `lvh` costs no Solana read). A page reads its own burn and refund with the read pass `send` gave for that signature; those reads that go to Solana share 10 a second for the whole server, and reads of any other signature 2 a second, each client at most 12 a minute of them; past either the route answers 503 without asking Solana; `send` forwards only the cabinet's burn or refund, validly signed by its payment address (`src/lib/cabinet/burn-tx.ts`), anything else 400: a burn only as exactly `{"tx","reservation","ownerSig"}`, announced under that reservation in the activation registry before it leaves (the reservation's payer and whole amount must be the burn's; 409 `{"error":"reservation"}` and nothing forwarded otherwise), with the payment key's owner bind v2 of the reserved wallet's light node, 128 hex, which must verify against the key of the wallet's signed reservation (400 `{"error":"invalid_proof"}` and nothing forwarded otherwise); a refund exactly `{"tx"}`. A burn sent earns its read pass; a refund only when its payer is a payment address a reservation of this site named (`007_cabinet_activations_burner.sql` indexes them), since any funded key can send one. Per client 60, 120, 60, 120 and 10 per minute; `send` also 5 per payment address per 10 min |
 | `POST /api/cabinet/register` | The registration of a light burn from any browser (`src/server/cabinet/register.ts`), in one of two bodies. A payment address's burn: exactly the wallet's consent (`from`, `node_id`, `node_type`, `wallet_address`, `registration_proof`, `timestamp`, `burn_tx_hash`, `burn_amount`, `dilithium_signature`, `dilithium_public_key`), checked as the node checks it; then the wallet's row in the activation registry: its own payment burn, recorded, of this burn and amount, whose signed reservation carries this very wallet key; the body completed with that burn's payment address (`burn_wallet`) and the owner bind v2 the row keeps (`owner_signature`), which is verified again. A burn made from the wallet's own Solana address: the consent with `burn_wallet` (that address) and `owner_signature`, its owner bind v1 at the consent's `timestamp` (128 hex, which QNet Wallet signed with the wallet's Solana key), in the node's field order, checked as the node checks it (400 `invalid_request` with the field otherwise); then the wallet's row when it has a burn (that very burn, of that burner, a light one of this amount, recorded), else the search of `burn_wallet` (the kept one of the activation reads, in the reservation's lane, a new one charged to the register client and to the node, each its share of the lane: its first burn must be this light burn of this amount; `scan_incomplete` is a retry); then the network's one-node rule (the wallet's own light node already listed answers `registered`, any other node `wallet_has_node`, a network that cannot answer a retry). Either is then sent to one genesis node, one submit in flight per node; 30 per client per 10 min and 6 per node. Nothing is relayed for a burn not final yet (`{"result":"retry","code":"not_final"}`), another burn (`other_burn`), no such burn of the wallet or burner (`no_record`), another amount or node type (`invalid_burn`) or a key, bind or burner that does not match (`owner_bind`); the node's `wallet_has_node` (one wallet, one node) comes back refused |
-| `GET /api/cabinet/registration/[wallet]` | The block, burn, burner and amount of a wallet's light node registration from the archive, or with `?type=super` of its super node's (the row sent from its super node id), for Node details (30 s cache, 30 per client per minute): exactly `{"found","record":{"height","burnTx","burner","amount"},"burnBy"}` or `{"found":false}`. `burnBy` says whose burn it is, so the page shows one code: `payment` (a one-time payment address of the site: the wallet's code) or `own` (the wallet's own Solana address: the burner's code; always so for a super node). For a light node: the wallet's row in the activation registry that holds this burn names it (`payment` for a payment address's, `own` for the extension's); without one no payment key of the site made it (every payment address's burn is announced in the registry before it leaves), and it is `own` once Solana holds that burn final and valid with the archive's burner as its fee payer and burn authority. Kept 24 hours per registration once known, and `null` as long when Solana holds that burn failed, or final but not as that burner's own valid burn; the Solana checks share 30 a minute for the whole server; `null` while the registry or Solana cannot tell |
+| `GET /api/cabinet/registration/[wallet]` | The block, burn, burner and amount of a wallet's light node registration from the archive, or with `?type=super` of its super node's (the wallet sends both; the row names the node by its kept id), for Node details (30 s cache, 30 per client per minute): exactly `{"found","record":{"height","burnTx","burner","amount"},"burnBy"}` or `{"found":false}`. `burnBy` says whose burn it is, so the page shows one code: `payment` (a one-time payment address of the site: the wallet's code) or `own` (the wallet's own Solana address: the burner's code; always so for a super node). For a light node: the wallet's row in the activation registry that holds this burn names it (`payment` for a payment address's, `own` for the extension's); without one no payment key of the site made it (every payment address's burn is announced in the registry before it leaves), and it is `own` once Solana holds that burn final and valid with the archive's burner as its fee payer and burn authority. Kept 24 hours per registration once known, and `null` as long when Solana holds that burn failed, or final but not as that burner's own valid burn; the Solana checks share 30 a minute for the whole server; `null` while the registry or Solana cannot tell |
 | `GET /api/cabinet/activation/[wallet]`, `POST /api/cabinet/activation/reserve`, `…/announce`, `…/release`, `…/record` | The activation registry (below) |
-| `POST /api/cabinet/wake` | "I'm back" (`src/server/cabinet/wake.ts`): exactly `{"nodeId": N}`; the owners of the node's light shard in rank order (the genesis that wakes its device, then its two backups), each asked `{"node_id": N}` at its `/api/v1/light-node/wake` only when the one before gave no answer (not reached, not 200, as from an owner behind the network, which answers 503, or no reply the site reads), 8 s for the first and 4 s more for each owner above the one asked, which hands the wake to those first (2 s each for one it cannot reach), all within 40 s; 503 when none answers. The node's reply is read as its route writes it, `{"success", "reason", "node_id"[, "retry_after_seconds"]}`: `reason` one of `sent`, `already_answered`, `no_device`, `not_registered`, `cooldown`, `success` true for `sent` alone, `node_id` the node asked about, and a `cooldown`'s wait in whole seconds up to a day; anything else is no answer. The site answers `{"result": R}`, for a `cooldown` with a known wait `{"result": "cooldown", "retryAfterSeconds": s}`, and the page says when to try again in minutes. A push the network sent holds the node for 10 min and a `cooldown`'s wait for that long: within it the site answers `cooldown` with the wait left without asking the network; an answer that sent nothing holds nothing. 3 per client and 1 per node per 10 min. `no_device` also covers a device the device layer would not push (paused, past its lease or overdue for its key rotation): that rule is the node's (`device_layer_pushable`) and stays as it is while the layer is off on the network and the sandbox; whether to wake those states is the owner's decision for when it is turned on |
 
 Every `/api/cabinet/` route writes nothing of its requests to a log, and nginx gives it a location of its own
 with `access_log off`, the same `Sec-Fetch-Site` refusal as the relay and a rate-limit zone of its own
@@ -545,18 +584,18 @@ with `access_log off`, the same `Sec-Fetch-Site` refusal as the relay and a rate
 ### Activation registry
 
 One wallet gets one activation: one burn and one code, for a light node or a super node, chosen once
-([node activation](../economics/node-activation.md#one-wallet-one-code)). The site keeps one row per QNet wallet in
+([node activation](../economics/node-activation.md#one-wallet-one-code)). The site keeps one row per QNet Blockchain wallet in
 `cabinet_activations` (`005_cabinet_activations.sql`; `src/server/cabinet/activation-registry.ts`, whose every step is
 one statement that compares and sets, and `activation-api.ts`), so every browser, device and client sees the same and
 two of them cannot both burn for one wallet. The routes answer JSON with `Cache-Control: no-store`; they take no
-`Origin`, `https://aiqnet.io` or any browser extension's `chrome-extension://<id>` (the QNet extension's among them), and no `Sec-Fetch-Site`,
+`Origin`, `https://aiqnet.io` or any browser extension's `chrome-extension://<id>` (the QNet Wallet extension's among them), and no `Sec-Fetch-Site`,
 `same-origin` or `none` (anything else 403 `forbidden_origin`); per client 60 reads a minute, 10 reads with `?solana=`
 per 10 min, 20 writes per 10 min, and 10 records per wallet per 10 min once their proof verified; 429
 carries `Retry-After`.
 
 | Route | What it does |
 | --- | --- |
-| `GET /api/cabinet/activation/[wallet][?solana=S]` | The wallet's row: exactly `wallet`, `state` (`none`, `reserved`, `sending`, `recorded`), `nodeType`, `way`, `burner`, `burnTx`, `burnAmount`, `code` (only when recorded), `until` (a reservation's end, an announced burn's last moment to land) and `recordedAt`, and with `?solana=` while the state is `none` the search of that Solana address: its signatures in pages of 1,000, older pages with `before`, up to 4 pages; those with a `QNET_NODE_TYPE` memo read oldest first, at most 30, and only the ones S paid for count toward the 10 of its own (a memo transaction someone else sent it costs a read, never that cap); `{complete, unusable, burns}`, complete only when every page and every marked transaction was read (`unusable`: a 1DEV burn of S's own no code comes from; a transaction that burned no 1DEV is no burn, whatever its memo), kept 5 minutes per address. Each of two lanes, these anonymous reads and the signed requests (a reservation's search and an own-address registration's), which the reads cannot starve, has budgets of its own for the whole server: 120 first pages of signatures a minute, and 30 searches a minute that read further pages or the marked transactions, so an address with no activation memo (a throwaway one) takes nothing scarce. A new search is charged first to the clients the route names (the visitor's IP, IPv6 by its /64, and for a registration also the node), each at most 3 searches a minute in a lane and 1 of them past its first page, so many free QNet wallets from a few addresses cannot drain a lane; a search that joins one in flight costs nothing, and both lanes share the kept results. A search that cannot finish offers no burn; the QNet extension's own search, which continues where it stopped ("Recover my code"), is the way on for such a wallet. A `sending` row is settled first: landed, final and valid, it is recorded, whichever way (its proof came with the announce); failed, or not found 10 minutes after the announce, the row goes |
+| `GET /api/cabinet/activation/[wallet][?solana=S]` | The wallet's row: exactly `wallet`, `state` (`none`, `reserved`, `sending`, `recorded`), `nodeType`, `way`, `burner`, `burnTx`, `burnAmount`, `code` (only when recorded), `until` (a reservation's end, an announced burn's last moment to land) and `recordedAt`, and with `?solana=` while the state is `none` the search of that Solana address: its signatures in pages of 1,000, older pages with `before`, up to 4 pages; those with a `QNET_NODE_TYPE` memo read oldest first, at most 30, and only the ones S paid for count toward the 10 of its own (a memo transaction someone else sent it costs a read, never that cap); `{complete, unusable, burns}`, complete only when every page and every marked transaction was read (`unusable`: a 1DEV burn of S's own no code comes from; a transaction that burned no 1DEV is no burn, whatever its memo), kept 5 minutes per address. Each of two lanes, these anonymous reads and the signed requests (a reservation's search and an own-address registration's), which the reads cannot starve, has budgets of its own for the whole server: 120 first pages of signatures a minute, and 30 searches a minute that read further pages or the marked transactions, so an address with no activation memo (a throwaway one) takes nothing scarce. A new search is charged first to the clients the route names (the visitor's IP, IPv6 by its /64, and for a registration also the node), each at most 3 searches a minute in a lane and 1 of them past its first page, so many free QNet Blockchain wallets from a few addresses cannot drain a lane; a search that joins one in flight costs nothing, and both lanes share the kept results. A search that cannot finish offers no burn; the QNet Wallet extension's own search, which continues where it stopped ("Recover my code"), is the way on for such a wallet. A `sending` row is settled first: landed, final and valid, it is recorded, whichever way (its proof came with the announce); failed, or not found 10 minutes after the announce, the row goes |
 | `POST /api/cabinet/activation/reserve` | Exactly `{wallet, nodeType, way, burner, burnAmount, solana, proof}`, at most 12 KiB (the payment way is light only, the extension's burner is its own Solana address). `proof` is the wallet's signed reservation `{pk, sig, time}`: its ML-DSA-65 key (base64url) must give the wallet, and its signature (FIPS 204 context `QNET_OFFCHAIN_MSG_v1`, over the envelope the wallets build for `https://aiqnet.io`) must verify over `QNet node reservation v1` with these very fields and `time` (400 `invalid_proof`); `time` must be at most 10 minutes old for the extension, 24 hours and 10 minutes for a payment address (QNet Wallet signs it before the address exists), and at most 5 minutes ahead (400 `stale_proof`). Then the wallet's row, then the network (409 `has_node` for a node of either type, 503 `network_unavailable`), then for the payment way a search of the wallet's Solana address no older than 5 minutes: the signed reservation does not name that address, so the page's own recent finished search of it answers, and a new one is charged to the client as above (409 `burn_found` or `burn_unusable`, 503 `scan_incomplete`), then one statement that takes a free row or an expired reservation, keeping the proof: `{reservation, until}` for 10 minutes, or 409 `has_burn`, `burn_pending` or `reserved` with the row |
 | `POST /api/cabinet/activation/announce` | The extension's burn under its reservation, with the proof made with the wallet's own keys (`src/lib/cabinet/burn-record.ts`: the wallet's ML-DSA-65 signature, FIPS 204 context `QNET_OFFCHAIN_MSG_v1`, and the burner's Ed25519 signature over one message naming the wallet, the node type, the burner, the burn and the amount): `sending`, or 409 `reservation`, 400 `invalid_proof` |
 | `POST /api/cabinet/activation/release` | A reservation without a burn given up (a burn is never released); always `{"ok":true}` |
@@ -580,12 +619,13 @@ once it is verified against the network's committee certificate. It asks the pin
 certified macroblock, and the proof (inclusion, absence, or absence in a shared bucket with every entry of the bucket, over every
 field of the account leaf) must fold to that macroblock's state root as the site's own light client verified it
 (`src/server/light/lineage.ts`), never to the root the node served. The light client walks the macroblocks' committee
-certificates up from the wallets' release pin (`src/server/light/pin.ts`, the block kept identical to the mobile
-wallet's `genesisConsensus.js`; the site proves no state at or below the pinned macroblock): each committee is drawn
-from the eligible set and beacon of the macroblock two below, its keys are bound to that macroblock's registry root,
-and a strict quorum of distinct valid ML-DSA-65 signatures is required. It keeps the newest verified macroblocks in
-memory, runs one walk per parity chain at a time for every request, reads at most 180 times a minute from each node,
-and starts again from the pin when the server restarts. The macroblock must also be recent: at most two below the
+certificates up from the pin (`src/server/light/pin.ts`: the mobile wallet's release pin from its `genesisConsensus.js`,
+or a pin proven from it by `scripts/light-pin.mjs --write-pin` below; a test keeps the two on one lineage, the same
+block or one naming the other, or the pin both were proven from, as `provenFrom`; the site proves no state at or below
+the pinned macroblock): each committee is drawn from the eligible set and beacon of the macroblock two below, its keys
+are bound to that macroblock's registry root, and a strict quorum of distinct valid ML-DSA-65 signatures is required.
+It keeps the newest verified macroblocks in memory, runs one walk per parity chain at a time for every request, and
+reads at most 180 times a minute from each node. The macroblock must also be recent: at most two below the
 certified head, the second highest `newest_certified_index` of at least three genesis nodes'
 `GET /api/v1/state/certified` (from nodes that predate that route, the second highest of the macroblocks at least three of
 their heights fall in), read once a minute. A node that predates the certified form answers the legacy proof against its live root; that
@@ -600,6 +640,55 @@ for the walk, which goes on after it. Results are cached per address, 30 s when 
 may ask 120 times a minute; a request for an address whose check is already running waits for that check. The address
 page's Verify Balance, which shows the proven balance with its checkpoint, the block its state is at and the state root,
 is hidden at present.
+
+The checkpoints the light client verifies, the eight highest of each parity chain, go to its store within 5 s
+(`src/server/light/store.ts`: the file `data/light-checkpoints.json` under the site's directory, or
+`LIGHT_STORE_FILE`, written whole and renamed into place, mode 600), bound to the pin they were walked from; after a
+restart the walk resumes from the highest of them instead of from the pin. Stored checkpoints count only when they
+were walked from the current pin or from the pin it names as `provenFrom`, only above the pin, and only with every
+field well formed again; the store is a local file and not a database table, since anyone with write access to the
+database could otherwise plant a checkpoint. The checkpoints are not re-proven when read (their certificates would
+need every macroblock from the pin, and the nodes drop old signatures), so the file is trusted as the site's own code
+is: a link, a file of another user or one writable by group or others is not read (the walk then starts from the pin,
+and the next save replaces it with the site's own file), so `npm run build` and the server run as one user. A store that contradicts a checkpoint verified in memory is
+replaced.
+
+A GALC v2 capsule ([GALC v2 capsule](../protocols/galc-capsule-v2.md), `src/server/light/galc.ts`) roots a walk when
+the walk from the site's own checkpoints (or the pin) to the head would take more than 16 steps: two genesis nodes are
+asked for `GET /api/v1/galc/capsule` (with `If-None-Match` naming the capsule held), the highest one that passes the
+cheap checks (version 2, `NETWORK_ID` of `pin.ts`, K a multiple of `GALC_V2_MINT_INTERVAL` above the pin and at most
+two above the certified head) and carries valid signatures of at least four of the five embedded genesis keys
+(`src/server/light/genesis-keys.ts`) over the preimage the site builds is taken, and it counts once two nodes each
+serve proofs of K and K-1 whose checkpoints hash to the signed values with matching epoch commitments. From the
+newest capsule the walk to the head takes at most six steps a parity. It is a faster root, never a replacement: a capsule naming another checkpoint
+than one the site verified is refused, one held is dropped when a walk verifies another checkpoint at K or K-1 or two
+nodes refuse the first step above its root, the trust floor stays at the pin, and with no capsule (nodes of today
+answer 405; a 404, 405 or unusable answer leaves that node unasked for 10 minutes) every walk is as before. The store
+keeps the capsule with the checkpoints and verifies it again, signatures and roots, when it reads it.
+`src/instrumentation.ts` starts the client's follower: every 30 s it reads the certified head and walks both parity
+chains to it (a walk cut short by the nodes' read budget resumes at the next look; at the head it reads only the head,
+once a minute), so a request finds the newest checkpoint verified already; `LIGHT_FOLLOW=0` turns it off. Nodes strip
+the committee signatures of macroblocks more than 14,880 below their tip, so a walk can only start from a pin or a
+stored checkpoint above that horizon: the store, the follower and the build-time walk keep the site above it, and the
+pin must be refreshed within that time for a host that starts without a store.
+
+`npm run build` runs `scripts/light-pin.mjs --build` first (`prebuild`): the same walk, from the store or the pin up
+to the certified head and the macroblock below it, every step verified the same way, with 120 reads a minute per node
+(the running site keeps its 180 of the 300 a node allows one address), its checkpoints written to the store for the
+server started after the build. It is skipped when `CI` is set or `LIGHT_REFRESH=0`, stops after
+`LIGHT_REFRESH_BUDGET_S` seconds (300 by default; the server's follower carries on from where it stopped), needs
+Node.js 22.6 or later for the light client's TypeScript, never fails the build and writes no tracked file, so the
+host's checkout stays clean for the next pull. Run by hand (`node scripts/light-pin.mjs`, `--budget-s N`, `--store
+FILE`) it exits 1 short of the head; it roots at a capsule as the server does. `--write-pin` instead rewrites the
+`<ws-pin>` block of `pin.ts` with the macroblock `--margin` (4 by default) below the certified head and the one below
+it as anchors, both verified by a walk in that run from the committed pin with no store and no capsule (a pin every
+host starts from rests on the pin before it, never on one machine's file; a client holding stored checkpoints or a
+capsule, or rooted at another pin, is refused), its `MacroBlock::hash` named alike by every genesis node that answers,
+at least three, for a header whose state root is the one the walk verified, `provenFrom` naming the committed pin,
+`NETWORK_ID`, block 0's hash from `GET /api/v1/blocks/headers?from=0&limit=1` as every genesis node that answers names
+it, at least three (another one than the committed `NETWORK_ID` is another chain and refused), and
+`GALC_V2_MINT_INTERVAL` (`--galc-interval N`, the committed one by default); there is no bootstrap from the nodes'
+word.
 
 ### Faucet
 
@@ -630,7 +719,7 @@ with a pass later in the hour still finds its part; a claim with a pass may take
 for by the node cabinet's payment card with the wallet's signed reservation it holds (`POST /api/faucet/pass`, exactly
 `{wallet, burner, proof}`: the reservation must verify for that wallet and payment address and be within the payment
 way's window, 400 `invalid_proof` or `stale_proof` otherwise; 10 requests per client per 10 min; once the reservation
-verified, 3 passes an hour per client IP and 10 per network block, since a QNet wallet costs nothing and these are what
+verified, 3 passes an hour per client IP and 10 per network block, since a QNet Blockchain wallet costs nothing and these are what
 make a pass scarce; 429 with `retryAfterS` past either; 404 off testnet) and handed to the Testnet page with the
 address; it names the wallet and the second it
 ends, an hour later, with an HMAC of both under `FAUCET_PASS_KEY` (`src/server/faucet-pass.ts`, compared in constant
@@ -661,10 +750,14 @@ Values are operator-supplied. Never commit them; never place them in a document.
 | `FAUCET_PRIVATE_KEY` | Faucet signing key, read only at runtime |
 | `CABINET_READ_KEY` | 32 bytes or more in hex (`deploy-aiqnet.sh` makes it once and keeps it): the key of the read passes the cabinet's send route gives for a burn or refund, so they outlive a restart; unset, a key of the process |
 | `FAUCET_PASS_KEY` | 32 bytes or more in hex (`openssl rand -hex 32`, set once in `.env.local`; `deploy-aiqnet.sh` makes it once and keeps it): the key of the faucet passes `POST /api/faucet/pass` gives, so they outlive a restart; unset, a key of the process, and a restart ends the passes it gave (a claim then takes the open share) |
-| `CABINET_PHONE_FLOWS` | `1` lets the node cabinet send QNet Wallet its `link` and `claim` requests; any other value, or none, is off (the deploy scripts write `0`) |
+| `CABINET_PHONE_FLOWS` | `1` lets the node cabinet send QNet Wallet its `link`, `claim`, `reserve` and `unlink` requests; any other value, or none, is off (the deploy scripts write `0`) |
 | `WALLET_APK_URL` | The https address of an `.apk` file: QNet Wallet's Android file, the same Play-signed build as Google Play, which `/wallet` then offers; unset offers none. The file is served from aiqnet.io, or is the asset of one fixed GitHub release, `https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>` (for example the tag `app-1.3.0-20`), whose tag does not match `wallet-<x.y.z>-<n>` and whose asset is not named `QNet-Wallet.apk`: that tag pattern and that asset name belong to the older Android build's move release, which the 1.1.7 site APK's update check takes ([mobile wallet](mobile-wallet.md)). A `.../releases/latest/...` address, which could resolve to that release, and a release file with that tag pattern or asset name are refused (`src/server/wallet-apk.ts`), and the page then offers no file |
 | `SECURITY_WEBHOOK_URL` | Destination for security and alert events |
 | `INDEXER_LOG_LEVEL` | Indexer log level: `err`, `warn` or `info` (the default) |
+| `LIGHT_STORE_FILE` | The balance check's checkpoint store; unset, `data/light-checkpoints.json` under the site's directory (see Balance check) |
+| `LIGHT_FOLLOW` | `0` stops the web tier walking to the certified head in the background; any other value, or none, walks |
+| `LIGHT_REFRESH` | `0` skips the build-time walk of `npm run build` (`scripts/light-pin.mjs --build`); `CI` set skips it too |
+| `LIGHT_REFRESH_BUDGET_S` | Seconds the build-time walk may take, 300 by default |
 | `NODE_ENV` | Standard Next.js environment selector |
 
 The API routes read the node through `src/lib/node-api.ts`: each read goes to the first node in the list that is
@@ -699,7 +792,7 @@ npm run test:indexer      # builds, then runs the indexer's pure-function tests 
 Production build and start of the web tier:
 
 ```bash
-npm run build
+npm run build             # first the balance check's walk to the certified head (prebuild, see Balance check)
 npm start                 # next start -H 127.0.0.1: reachable only from this host, through nginx
 ```
 

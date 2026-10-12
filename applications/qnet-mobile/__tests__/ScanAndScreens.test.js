@@ -80,7 +80,7 @@ describe('the scan sheet (components/QrScanSheet)', () => {
 
     for (const junk of ['https://example.org/pay', '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', 'b'.repeat(64)]) {
       await read(tree, junk);
-      expect(texts(tree)).toContain('Not a QNet address');
+      expect(texts(tree)).toContain('Not a QNet Blockchain address');
       expect(tree.root.findAllByProps({ testID: 'scan-camera' }).length).toBeGreaterThan(0);
     }
     expect(onAddress).not.toHaveBeenCalled();
@@ -293,7 +293,7 @@ describe('Receive and the address card', () => {
     expect(receive).toMatch(/t\('receive_title'\)/);
     expect(receive).toMatch(/t\(selectedNetwork === 'qnet' \? 'receive_your_qnet' : 'receive_your_solana'\)/);
     expect(t('receive_title')).toBe('Receive');
-    expect(t('receive_your_qnet')).toBe('Your QNet address for QNC and QNet tokens.');
+    expect(t('receive_your_qnet')).toBe('Your address for QNC and tokens on QNet Blockchain.');
     expect(t('receive_your_solana')).toBe('Your Solana address for SOL and Solana tokens.');
     expect(receive).not.toMatch(/warning|Warning|notice/);
     for (const [lang, table] of Object.entries(translations)) {

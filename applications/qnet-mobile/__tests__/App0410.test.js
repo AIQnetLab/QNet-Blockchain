@@ -266,7 +266,7 @@ describe('A4: History', () => {
   it('the tab: the same QNet · Solana selector as Assets, no filter chips', () => {
     const ws = read('src/screens/WalletScreen.js');
     const tab = ws.slice(ws.indexOf("      case 'history': {"), ws.indexOf("      case 'node': {"));
-    expect(tab).toMatch(/\[\['qnet', 'QNet'\], \['solana', 'Solana'\]\]\.map/);
+    expect(tab).toMatch(/\[\['qnet', CHAIN_NAME\], \['solana', 'Solana'\]\]\.map/);
     expect(tab).toMatch(/onPress=\{\(\) => setSelectedNetwork\(key\)\}/);
     expect(tab).not.toMatch(/historyChip|assetChips|matchesAsset/);
     // One row per transaction under a header for its day (06.10).

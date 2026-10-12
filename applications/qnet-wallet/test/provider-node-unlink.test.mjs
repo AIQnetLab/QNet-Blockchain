@@ -206,7 +206,7 @@ describe('approve page: the light node\'s device', () => {
   it('a node no device runs, and a network that does not take the unlink yet, offer one Close that tells the site', async () => {
     for (const [reason, line, code] of [
       ['NOT_LINKED', 'This wallet’s light node runs on no device.', 'NOT_LINKED'],
-      ['UNSUPPORTED', 'The QNet network does not take an unlink from the wallet yet.', 'INTERNAL'],
+      ['UNSUPPORTED', 'QNet Blockchain does not take an unlink from the wallet yet.', 'INTERNAL'],
     ]) {
       const w = createWorld();
       w.state.unlinkView = { mode: 'unavailable', reason, platform: null, linkedSince: null };
@@ -237,7 +237,7 @@ describe('approve page: the light node\'s device', () => {
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_MS);
     page.app.button('Unlink').click();
     assert.deepEqual((await replyTo(port, 'r')).result, { status: 'error', error: 'UNLINK_REFUSED' });
-    await until(() => page.app.textContent.includes('The QNet network refused to unlink the device.'));
+    await until(() => page.app.textContent.includes('QNet Blockchain refused to unlink the device.'));
     assert.ok(page.app.button('Close'));
   });
 });

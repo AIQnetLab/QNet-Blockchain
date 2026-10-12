@@ -120,6 +120,8 @@ The super set is sampled at the epoch **settle point** — `h % 14_400 == HB_ANC
 
 Registration is bounded by the same settle point. Epoch `E`'s leaf set is built from `super_registrations_as_of((E + 1) * 14_400 + 90)`: a super whose registration row is stamped above that height contributes to the following epoch instead. The roster that decides an epoch's reward leaves is committed inside `reward_root`, so it must be a function of chain data that is already final when the epoch settles.
 
+**Admission.** From the `super_reward_admission` gate (height 3,657,600, epoch 254) a third condition applies: the node must be in the epoch's consensus-admitted set. While the `emergency_committee_allowlist` gate is active that set is the compiled `EMERGENCY_COMMITTEE_ALLOWLIST`, `genesis_node_001`…`005` and `super_node_c78c3017a4f93464`. One function, `super_reward_admission`, decides the set. The condition is keyed on the epoch's first block: epoch `E` is governed when `E * 14_400` is at or above the gate, so epoch 253, which settles above the gate, keeps the old rule, and the first emission affected is the one at 3,686,400. It is applied once, where the settle point files `super_elig_{E}`; the producer, replicas and a snapshot joiner re-deriving inside epoch `E + 1` all file the same set, and every reward reader and shard rebuild reads those rows. A registered super outside the set keeps its registry row, its heartbeats and every reward it already earned: the claim path checks the proof against the certified root and the watermark, never membership. See [consensus](../architecture/consensus.md#emergency-committee-allowlist).
+
 **Light nodes.** Eligibility is committed on-chain as per-epoch bitmaps. Each of the five genesis nodes publishes a `LightNodeEligibilityBitmap` transaction for its hash-shard, where bit `i` corresponds to the light node whose **permanent** `reg_index` is `i`, set when that node attested during the epoch. The bitmap is per-shard; the bit position is the global registration ordinal, and `index_span` is the highest `reg_index` in the shard plus one. Using the permanent registration index rather than a scan-relative ordinal matters: under a scan-relative ordinal a truncated roster shifts every later node, which yields a different payout set rather than a smaller one.
 
 The shard is a pure function of the node id: `light_shard_of(node_id) = u64::from_le_bytes(blake3(node_id)[..8]) % 5`. It is roster-size-independent, so a node's owning genesis never changes as the registry grows, and three genesis nodes own each shard: genesis `00N` is the primary of shard `N-1` and the next two genesis nodes, mod 5, back it up. The node that takes a device's reply sends the attestation to the shard's other owners directly, and each owner commits its own bitmap row: the primary 150 blocks before the epoch ends, the backups at 100 and 50. The primary stands down only once its own row has landed, a backup once any row for the shard has. The reward path bit-ORs the rows, so a backup's cover adds to the primary's and never replaces it.
@@ -297,7 +299,7 @@ There is exactly one split in the protocol, and it is a two-pool split of each e
 
 | Recipient class | Share | Gate |
 | --- | --- | --- |
-| Super and genesis operators | 25% (`OPERATOR_POOL_BP` = 2500 bp) | `banned_at_height == 0` and heartbeat popcount >= 9 for the epoch |
+| Super and genesis operators | 25% (`OPERATOR_POOL_BP` = 2500 bp) | `banned_at_height == 0` and heartbeat popcount >= 9 for the epoch; from the `super_reward_admission` gate, also in the epoch's admitted set |
 | Light nodes | 75% | in the epoch's roster (registration stamped below `epoch_start + 14_250`) and bit set in a `LightNodeEligibilityBitmap` row committed for its shard in that epoch, which one attestation in the epoch achieves |
 | Block producer | 100% of the block's net transaction fees | on-chain registered wallet resolvable |
 
@@ -305,7 +307,7 @@ The 25/75 figure is a pool ratio, not a per-node weighting. Within each pool eve
 
 ## Activation payments
 
-A Phase 2 node activation debits `amount` from the payer's balance and pays no fee, since `NodeActivation` is system-typed. The debited QNC leaves circulation while `total_supply` is unchanged. A Phase 1 activation is paid by burning 1DEV on the external Solana chain and carries `amount = 0` on the QNet transaction. See [node-activation.md](node-activation.md).
+A Phase 2 node activation debits `amount` from the payer's balance and pays no fee, since `NodeActivation` is system-typed. The debited QNC leaves circulation while `total_supply` is unchanged. A Phase 1 activation is paid by burning 1DEV on the external Solana chain and carries `amount = 0` on the QNet Blockchain transaction. See [node-activation.md](node-activation.md).
 
 ## Related documents
 

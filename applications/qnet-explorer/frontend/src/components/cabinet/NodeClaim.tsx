@@ -1,10 +1,12 @@
 'use client';
 
-// Move to wallet, beside the node balance on the Overview (unified plan SITE-5 and SITE-7; owner, 29.09: it was a page of
-// its own). The wallet signs the move (docs/protocols/light-node-messages.md section 4): the QNet extension of this
-// computer when it holds the chosen wallet (qnet_claimNodeBalance, docs/protocols/qnet-link-v1.md section 14.10),
-// otherwise QNet Wallet through a QNet Link `claim` request, its button on this phone or tablet or its QR code for
-// another device. An answer is the wallet's report; the balance the page shows comes from the QNet network.
+// Move to wallet, beside the node balance on the Overview, for a light and for a super node (unified plan SITE-5 and
+// SITE-7; owner, 29.09: it was a page of its own; owner, 12.10: through this site too, whichever way the wallet is
+// connected here). The wallet signs the move of the node it is asked for (docs/protocols/light-node-messages.md section
+// 4): the QNet extension of this computer when it holds the chosen wallet (qnet_claimNodeBalance with the node,
+// docs/protocols/qnet-link-v1.md section 14.10), whose own window confirms it, otherwise QNet Wallet through a QNet Link
+// `claim` request that names the wallet and the node (section 14.4), its button on this phone or tablet or its QR code
+// for another device. An answer is the wallet's report; the balance the page shows comes from the QNet network.
 
 import { useEffect, useRef, useState } from 'react';
 import { useWallet } from '@/contexts/AppContext';
@@ -13,7 +15,7 @@ import { useLinkSession } from '@/hooks/useLinkSession';
 import { number, t } from '@/lib/texts';
 import { claimReport, failureKey, type ClaimVia } from '@/lib/cabinet/extension-view';
 import { formatQnc } from '@/lib/cabinet/node-view';
-import type { ClaimFailure, LinkAnswer } from '@/lib/qnet-link';
+import { walletHash, type ClaimFailure, type ClaimRequest, type LinkAnswer } from '@/lib/qnet-link';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
 
@@ -32,13 +34,15 @@ function Report({ answer, via }: { answer: LinkAnswer; via: ClaimVia }) {
   return <p className={answer.status === 'ok' ? 'activate-result' : 'activate-note'} role="status">{t(report.key, vars)}</p>;
 }
 
-// The ways to move it; kept mounted when the balance falls below 1 QNC, so a report stays on screen.
-export function Move({ qnet, movable, onAnswer }: { qnet: string; movable: boolean; onAnswer: () => void }) {
-  const { walletHash, choice, phoneFlows } = useCabinet();
+// The ways to move the balance of `nodeId`, the wallet's light or super node; kept mounted when the balance falls below
+// 1 QNC, so a report stays on screen.
+export function Move({ qnet, nodeId, movable, onAnswer }: { qnet: string; nodeId: string; movable: boolean; onAnswer: () => void }) {
+  const { choice, phoneFlows } = useCabinet();
   const { providerStatus, providerChannel, accounts, claimNodeBalance } = useWallet();
   const device = useDeviceKind();
-  const button = useLinkSession({ slot: 'claim' });
-  const qr = useLinkSession({ slot: 'claim-qr' });
+  // One session per node: a wallet with both node types shows two balances.
+  const button = useLinkSession({ slot: `claim.${nodeId}` });
+  const qr = useLinkSession({ slot: `claim-qr.${nodeId}` });
   const [ext, setExt] = useState<ExtClaim>({ phase: 'idle' });
   // The extension moves its own wallet's balance only: offered when it is the wallet this page shows.
   const extension = providerStatus === 'available' && providerChannel === 'extension'
@@ -54,11 +58,12 @@ export function Move({ qnet, movable, onAnswer }: { qnet: string; movable: boole
 
   const withExtension = async () => {
     setExt({ phase: 'waiting' });
-    const result = await claimNodeBalance(qnet);
+    const result = await claimNodeBalance(qnet, nodeId);
     setExt(result.ok ? { phase: 'done', answer: result.answer } : { phase: 'failed', failure: result.failure });
   };
 
-  const request = { walletHash };
+  // The request names the wallet the page shows and the node: QNet Wallet signs for that node of that wallet only.
+  const request: ClaimRequest = { walletHash: walletHash(qnet), nodeId };
   const ask = () => {
     if (!device) return;
     if (device.phone) void button.start('claim', request);

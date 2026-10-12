@@ -1,6 +1,6 @@
 # The 1DEV token (Solana)
 
-1DEV is an SPL token on Solana that QNet uses as the Phase 1 node-activation credit: an operator burns 1DEV on Solana, and a committee of QNet nodes attests that burn so it can be bound to a node identity on the QNet chain. 1DEV is not a QNet asset, it never enters QNet state, and it is unrelated to the native QNC token described in [overview.md](overview.md).
+1DEV is an SPL token on Solana that QNet Blockchain uses as the Phase 1 node-activation credit: an operator burns 1DEV on Solana, and a committee of QNet Blockchain nodes attests that burn so it can be bound to a node identity on QNet Blockchain. 1DEV is not an asset of QNet Blockchain, it never enters its state, and it is unrelated to the native QNC token described in [overview.md](overview.md).
 
 ## External references
 
@@ -77,7 +77,7 @@ Phase 1 ends and Phase 2 begins on whichever comes first:
 
 ## What Phase 2 changes
 
-In Phase 2, activation is paid in native QNC on the QNet chain rather than by burning 1DEV. Phase 2 QNC is deducted from the payer on QNet and `total_supply` is unchanged.
+In Phase 2, activation is paid in native QNC on QNet Blockchain rather than by burning 1DEV. Phase 2 QNC is deducted from the payer on QNet Blockchain and `total_supply` is unchanged.
 
 | Node type | Phase 2 base cost | Chain-level floor |
 | --- | --- | --- |
@@ -90,8 +90,8 @@ An existing operator is not re-charged at the transition: `NodeActivation` apply
 
 ## Burn mechanics
 
-- A burn is permanent. Activation burns are made in two places, both with the SPL Token `Burn` instruction, which removes the tokens from the 1DEV supply; they cannot be recovered or re-minted: the QNet browser extension, with the wallet's own key (its Activate tab, or the node cabinet at aiqnet.io/node asking it through `qnet_activateNode`), and the node cabinet itself, with a one-time payment key it creates in the browser, for a light node only, whose burn names the wallet it is for (see [node-activation.md](node-activation.md#activation-code)). Nodes also accept a transfer to the Solana incinerator as a burn (see [node-activation.md](node-activation.md)).
-- One burn activates exactly one node. The binding is enforced from committed QNet state by a `burn_tx -> node_id` uniqueness index, keyed on `node_id` rather than wallet, precisely because one wallet owns two distinct pseudonyms (Super and Light) and a wallet-keyed bind would let a single burn activate both tiers for one fee.
+- A burn is permanent. Activation burns are made in two places, both with the SPL Token `Burn` instruction, which removes the tokens from the 1DEV supply; they cannot be recovered or re-minted: the QNet Wallet browser extension, with the wallet's own key (its Activate tab, or the node cabinet at aiqnet.io/node asking it through `qnet_activateNode`), and the node cabinet itself, with a one-time payment key it creates in the browser, for a light node only, whose burn names the wallet it is for (see [node-activation.md](node-activation.md#activation-code)). Nodes also accept a transfer to the Solana incinerator as a burn (see [node-activation.md](node-activation.md)).
+- One burn activates exactly one node. The binding is enforced from committed QNet Blockchain state by a `burn_tx -> node_id` uniqueness index, keyed on `node_id` rather than wallet, precisely because one wallet owns two distinct pseudonyms (Super and Light) and a wallet-keyed bind would let a single burn activate both tiers for one fee.
 - The burning Solana wallet must sign an authorization message binding the beneficiary wallet, node id and the node's attestation-root tag, so a burn can only ever activate the node its owner named, running the key its owner named.
 - A quorum of committee members must independently sign an attestation over `(burn_tx, burner, beneficiary, amount, node_type, cost, attest_epoch)`. Attestation is committee-wide, not limited to the genesis nodes.
 
@@ -99,7 +99,7 @@ An existing operator is not re-charged at the transition: `NodeActivation` apply
 
 ## Risk disclaimer
 
-QNet is an experimental blockchain project, and 1DEV is a utility token for node activation only. Nothing here is investment advice, an offer, or a solicitation. Activation is a one-way burn with no refund path. Verify every external address on Solana before sending anything to it.
+QNet Blockchain is an experimental project, and 1DEV is a utility token for node activation only. Nothing here is investment advice, an offer, or a solicitation. Activation is a one-way burn with no refund path. Verify every external address on Solana before sending anything to it.
 
 ## Related documents
 

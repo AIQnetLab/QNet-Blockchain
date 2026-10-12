@@ -4,16 +4,22 @@
 // A lower figure at least two genesis nodes agree on (`agreed`) is not a lagging node: it lowers the balance, so a
 // spend made elsewhere (the in-app browser, the extension, anyone holding the phrase) shows (MOBNET-R3-04).
 // Nothing changed for the same address: `prev` itself, so the screen does not render again for it.
-export function mergeTokenBalances(prev, { owner, sol, oneDev, qnc, verified, optimistic, agreed }) {
+// `qncLce`: the claim watermark of the leaf the QNC figure came from (null: not known), kept with the figure it belongs
+// to, so Assets' in-transit line never shows a moved amount the figure on screen already holds (ClaimTransit); left
+// out (undefined), the figure keeps the watermark it had (the optimistic figure after a send moves no watermark); null
+// clears it (a figure whose leaf is not known).
+export function mergeTokenBalances(prev, { owner, sol, oneDev, qnc, verified, optimistic, agreed, qncLce }) {
   const same = !!prev && prev.owner === owner;
   const base = same ? prev : { owner, qnc: 0, sol: 0, '1dev': 0 };
   const next = { ...base, owner };
   if (sol != null) next.sol = sol;
   if (oneDev != null) next['1dev'] = oneDev;
   if (qnc != null) {
-    next.qnc = (same && !optimistic && !verified && !agreed && qnc < (base.qnc || 0)) ? base.qnc : qnc;
+    const keep = same && !optimistic && !verified && !agreed && qnc < (base.qnc || 0);
+    next.qnc = keep ? base.qnc : qnc;
+    if (!keep && qncLce !== undefined) next.qncLce = Number.isSafeInteger(qncLce) && qncLce >= 0 ? qncLce : null;
   }
-  if (same && next.qnc === prev.qnc && next.sol === prev.sol && next['1dev'] === prev['1dev']) return prev;
+  if (same && next.qnc === prev.qnc && next.sol === prev.sol && next['1dev'] === prev['1dev'] && next.qncLce === prev.qncLce) return prev;
   return next;
 }
 

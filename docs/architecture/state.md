@@ -1,6 +1,6 @@
 # State and storage
 
-This document specifies how QNet represents chain state: the flat account model, the exact account
+This document specifies how QNet Blockchain represents chain state: the flat account model, the exact account
 leaf preimage the consensus state commitment hashes (a cross-implementation contract mirrored by the
 mobile light client), the sparse Merkle tree that produces `state_root`, the per-contract storage
 tree, the RocksDB storage engine and its column families, every index the node maintains, the node
@@ -45,7 +45,8 @@ Pool 3, not burned) — see [../economics/node-activation.md](../economics/node-
 
 The liveness fields work as follows. The 14,400-block epoch is split into 10 subwindows of 1,440
 blocks; a valid on-chain `Heartbeat` transaction sets the bit of its subwindow in `heartbeat_slots`,
-reward eligibility is `popcount(heartbeat_slots) >= 9`, and a heartbeat is admitted only within
+reward eligibility is `popcount(heartbeat_slots) >= 9` (from the `super_reward_admission` gate a super must
+also be in the epoch's admitted set, see [economics](../economics/overview.md#reward-eligibility)), and a heartbeat is admitted only within
 `HB_ANCHOR_MAX_LAG_BLOCKS = 90` blocks of its declared anchor. The recency test runs at apply, against
 the inclusion height: a heartbeat sets its bit when `anchor_height < h` and `h - anchor_height <= 90`,
 and otherwise leaves all four fields as they were. `heartbeat_final_epoch` and `heartbeat_final_slots`
@@ -686,7 +687,8 @@ assertion enforces that `MICROBLOCK_BODY_RETENTION_BLOCKS` exceeds both `SNAPSHO
 (1,500) and `SNAPSHOT_KEEP_COUNT × SNAPSHOT_INCREMENTAL_INTERVAL` (3 × 3,600), so a cold or lagging
 node can never need a pruned body — changing those constants is a compile error, not a silent sync
 break. `prune_epoch_reward_shards` range-deletes only the sharded leaf-set cache
-(`epoch_wshard_` / `epoch_shardmeta_`), leaving `epoch_root_`, `super_elig_` and `light_bm_` intact so
+(`epoch_wshard_` / `epoch_shardmeta_`), leaving `epoch_root_`, `super_elig_` (an epoch's settled super set,
+admitted members only from the `super_reward_admission` gate) and `light_bm_` intact so
 a pruned epoch's claim path still works. Compaction is selective: only families with at least
 `COMPACT_MIN_ROWS` = 1,000 rows deleted are compacted, so a family holding no tombstones is not
 rewritten.
@@ -747,7 +749,7 @@ form; `calculate_hash` is SHA3-256 over those bytes, hex-encoded.
 262,144, signature 16,384, public key 4,096) plus per-variant limits, and runs on the block-validation
 path because `validate()` does not run it there; `NodeRegistration.vrf_pk` must be empty (Light) or
 exactly 1952 bytes. The one Ed25519 verification on the state path is the external burn-owner
-signature over `burn_owner_bind_message`, made with a Solana burner key that is outside QNet identity.
+signature over `burn_owner_bind_message`, made with a Solana burner key that is no QNet Blockchain identity.
 
 Both block hashes bind `state_root`: `MicroBlock::hash` binds height, timestamp, previous hash, merkle
 root, producer, `timeout_round`, carried baseline and `state_root` (not `fees_collected`, not

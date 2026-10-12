@@ -1,9 +1,10 @@
 // How it works (/docs/how-it-works): every step of the ways to a running node, each with the screen it happens on: a light
 // node from a phone (QNet Wallet makes or imports the wallet, the payment address burns, QNet Wallet registers and runs
 // the node, and moves its balance) or from a computer (the QNet extension makes or imports the wallet and burns, the same
-// wallet in QNet Wallet runs the node), and a super node, which only the QNet extension on a computer activates (the
-// burn in the extension, its code and the server steps on the page, the server with the node software, then My node
-// follows it and QNet Wallet's Node tab moves its balance).
+// wallet in QNet Wallet runs the node, and My node moves its balance with the extension's window), and a super node, which
+// only the QNet extension on a computer activates (the burn in the extension, its code and the server steps on the page,
+// the server with the node software, then My node follows it and moves its balance with the extension's window).
+// QNet Wallet's own Node tab moves a balance of either node type too (owner, 12.10).
 // A picture is described here as parts of a screen; src/components/cabinet/GuideArt.tsx draws it. Every label a
 // picture shows is a key of src/lib/texts.ts, and every one is the label of the screen it draws: the app's and the
 // extension's labels there are their own words, and this site's are the ones its pages show (cabinet-guide.test.mjs).
@@ -72,7 +73,7 @@ export interface GuideStep {
 
 export interface GuideOptions {
   network: 'testnet' | 'mainnet';
-  // CABINET_PHONE_FLOWS: this site pays from a phone and sends QNet Wallet link and claim requests.
+  // CABINET_PHONE_FLOWS: this site pays from a phone and sends QNet Wallet its link and claim requests.
   phoneFlows: boolean;
 }
 
@@ -103,8 +104,9 @@ const typeCards = (current: number): Part => ({
     { label: 'ext_type_super', note: 'ext_type_super_where', price: { key: 'ext_price', vars: { price: '…' } } },
   ],
 });
-// The node software's own guide (docs/operators/running-a-node.md).
-export const RUNNING_A_NODE = 'https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/docs/operators/running-a-node.md';
+// The node software's own guide (docs/operators/running-a-node.md), at its section on the settings the server steps use
+// (the code, the burn, its amount and the phrase file); its build-and-run sections predate the Overview's image steps.
+export const RUNNING_A_NODE = 'https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/docs/operators/running-a-node.md#activation-code-and-burn-data';
 // The extension's window: its six tabs.
 const EXT_TABS: Label[] = ['ui_ext_assets', 'ui_ext_send', 'ui_ext_receive', 'ui_ext_history', 'ui_ext_activate', 'ui_ext_settings'];
 
@@ -339,16 +341,16 @@ function extensionWallet(network: GuideOptions['network']): GuideStep[] {
     {
       id: 'setup',
       text: 'guide_pc_setup',
-      // The extension's window with no wallet yet, and the setup tab its button opens.
+      // The extension's window with no wallet yet, and the setup tab its Create a new wallet opens, already at that step.
       scene: setup(
         [
-          { kind: 'title', label: 'ui_ext_setup_welcome' },
-          appButton('ui_ext_create'),
-          appButton('ui_ext_import', false, 'secondary'),
+          { kind: 'title', label: 'ui_ext_setup_title' },
+          { kind: 'lines', count: 3 },
         ],
         [
           { kind: 'small', label: 'ui_ext_welcome_lead' },
-          appButton('ui_ext_welcome_setup', true),
+          appButton('ui_ext_welcome_create', true),
+          appButton('ui_ext_welcome_import', false, 'secondary'),
         ],
       ),
     },
@@ -444,7 +446,9 @@ function extensionWallet(network: GuideOptions['network']): GuideStep[] {
 }
 
 // From a computer: the QNet extension makes or imports the wallet, pays and records the node in one approval; the same
-// wallet imported in QNet Wallet then runs the node on the phone.
+// wallet imported in QNet Wallet runs the node on the phone once My node links that phone (a QR code for the phone's
+// camera, or the phone's own browser); My node moves the node balance with the extension's window, and QNet Wallet's
+// Node tab on that phone can too.
 export function computerGuide({ network, phoneFlows }: GuideOptions): GuideStep[] {
   return [
     ...extensionWallet(network),
@@ -507,12 +511,14 @@ export function computerGuide({ network, phoneFlows }: GuideOptions): GuideStep[
       : {
         id: 'link',
         text: 'guide_pc_link_app',
+        // My node's Device tab as it reads while this site sends QNet Wallet no link request (LinkDevice.tsx): QNet
+        // Wallet shows a light node only on the device it is linked to, so a phone that is not linked yet has no button
+        // of its own to take the node (its Node tab says the wallet has no node), and the step says linking opens soon.
         scene: {
-          frame: 'phone', screen: 'app', parts: [
-            { kind: 'title', label: 'ui_app_node_tab' },
-            { kind: 'small', label: 'no_device' },
-            appButton('ui_app_use', true),
-            { kind: 'lines', count: 2 },
+          frame: 'browser', url: 'aiqnet.io/node', parts: [
+            { kind: 'tabs', items: ['nav_overview', 'nav_device', 'nav_history'], current: 1 },
+            { kind: 'title', label: 'action_link_device' },
+            { kind: 'small', label: 'devices_link_closed' },
           ],
         },
       },
@@ -539,8 +545,9 @@ export function computerGuide({ network, phoneFlows }: GuideOptions): GuideStep[
 // A super node (R3, R5): only the QNet extension on a computer activates it. The extension makes or imports the wallet
 // and burns (the one-time payment address burns for light nodes only, and a phone activates none), the page shows the
 // code and every server step right after the burn and the Overview later in any browser where the wallet is connected,
-// the server runs the QNet node software with the same wallet, the Overview follows it, and QNet Wallet's Node tab
-// moves its balance (the site moves a light node's only).
+// the server runs the QNet node software with the same wallet, the operator checks that it runs and catches up, the
+// node registers itself, the Overview follows it, and My node moves its balance with the extension's window (or QNet
+// Wallet's Node tab on any phone with the wallet, owner 12.10).
 export function superGuide({ network }: GuideOptions): GuideStep[] {
   const SUPER_CODE = { raw: 'QNET-S2C4A1-806358-771140' };
   return [
@@ -600,6 +607,18 @@ export function superGuide({ network }: GuideOptions): GuideStep[] {
       },
     },
     {
+      id: 'verify',
+      text: 'guide_super_check',
+      scene: {
+        frame: 'browser', url: 'aiqnet.io/node', parts: [
+          { kind: 'title', label: 'super_steps_title' },
+          { kind: 'small', label: 'super_step_check' },
+          { kind: 'lines', count: 3 },
+          siteButton('copy', true, 'secondary'),
+        ],
+      },
+    },
+    {
       id: 'watch',
       text: 'guide_super_watch',
       scene: {
@@ -615,7 +634,20 @@ export function superGuide({ network }: GuideOptions): GuideStep[] {
     {
       id: 'move',
       text: 'guide_super_move',
-      scene: APP_NODE_TAB,
+      // QNet Wallet shows a super node on every device that holds the wallet, a light node only on its own device.
+      also: 'guide_or_move_app_super',
+      scene: {
+        frame: 'browser', url: 'aiqnet.io/node', parts: [
+          nodeTabs,
+          { kind: 'small', label: BALANCE },
+          { kind: 'status', label: 'wallet_extension_waiting' },
+        ],
+        popup: [
+          { kind: 'title', label: 'ui_ext_claim_title' },
+          { kind: 'lines', count: 2 },
+          confirmPair('ui_ext_reject', 'ui_ext_move'),
+        ],
+      },
     },
   ];
 }

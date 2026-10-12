@@ -124,22 +124,23 @@ describe('MOB-BR-R3-01: a contract is never paid', () => {
     expect(s.deps.send).toHaveBeenCalledTimes(1);
   });
 
-  it('the wallet\'s rule: two nodes agreeing on no contract, the own address unread, anything else refused', async () => {
+  it('the wallet\'s rule: the certified leaf decides, the own address unread, anything else refused', async () => {
     const wm = new WalletManager();
-    const kind = jest.spyOn(wm, 'agreedContractKind');
-    kind.mockResolvedValue('none');
-    expect(await wm.payableRecipientProblem(TO, QNET)).toBe(null);
-    expect(kind).toHaveBeenCalledWith(TO);
-    for (const k of ['contract', 'token']) {
-      kind.mockResolvedValueOnce(k);
-      expect(await wm.payableRecipientProblem(TO.toUpperCase(), QNET)).toBe('contract');
-    }
-    kind.mockRejectedValueOnce(Object.assign(new Error('x'), { code: 'TOKEN_UNAVAILABLE' }));
+    // The certified account leaf decides (WalletFollow.test.js); the nodes' word never does, not even as a fallback.
+    const certified = jest.spyOn(wm, 'certifiedRecipientKind').mockResolvedValue(null);
+    const kind = jest.spyOn(wm, 'agreedContractKind').mockResolvedValue('none');
     expect(await wm.payableRecipientProblem(TO, QNET)).toBe('unchecked');
-    kind.mockClear();
+    certified.mockRejectedValueOnce(new Error('x'));
+    expect(await wm.payableRecipientProblem(TO.toUpperCase(), QNET)).toBe('unchecked');
+    certified.mockClear();
     expect(await wm.payableRecipientProblem(QNET, QNET)).toBe(null);
-    expect(kind).not.toHaveBeenCalled();
+    expect(certified).not.toHaveBeenCalled();
     expect(await wm.payableRecipientProblem('ab'.repeat(32), QNET)).toBe('contract');
+    certified.mockResolvedValueOnce('none');
+    expect(await wm.payableRecipientProblem(TO, QNET)).toBe(null);
+    certified.mockResolvedValueOnce('contract');
+    expect(await wm.payableRecipientProblem(TO, QNET)).toBe('contract');
+    expect(kind).not.toHaveBeenCalled();
   });
 
   it('the Send form refuses it before the review and reads it again just before signing, with its own texts', () => {

@@ -119,9 +119,6 @@ export function asksOtherOwners(s: NodeStatusView): boolean {
   return miss !== null && miss.reason === 'woken_no_answer' && !hasDeviceAccount(miss);
 }
 
-// Where I'm back is for the node: on this page (the Overview), on the Overview (the Device tab), or not at all.
-export type WakePlace = 'here' | 'overview' | null;
-
 // What the page says: what happened, and what to do.
 export interface MissNotice {
   what: MessageKey;
@@ -134,12 +131,7 @@ const BACKGROUND: Record<DevicePlatform, MessageKey> = {
   unknown: 'miss_todo_background',
 };
 
-const WAKE: Record<'here' | 'overview', MessageKey> = {
-  here: 'miss_todo_open_or_wake',
-  overview: 'miss_todo_open_or_wake_overview',
-};
-
-export function missNotice(miss: LastMiss, platform: DevicePlatform | null, wake: WakePlace): MissNotice {
+export function missNotice(miss: LastMiss, platform: DevicePlatform | null): MissNotice {
   const background = BACKGROUND[platform ?? 'unknown'];
   switch (miss.reason) {
     case 'woken_no_answer':
@@ -157,7 +149,8 @@ export function missNotice(miss: LastMiss, platform: DevicePlatform | null, wake
     case 'not_committed':
       return { what: 'miss_not_committed', todo: 'miss_todo_network' };
     default:
-      return { what: 'miss_inactive', todo: wake === null ? 'miss_todo_open' : WAKE[wake] };
+      // An app that is alive answers once it is opened; the network wakes it again from then on.
+      return { what: 'miss_inactive', todo: 'miss_todo_open' };
   }
 }
 
@@ -169,8 +162,8 @@ function deliveryLine(miss: LastMiss): MessageKey | null {
 }
 
 // The miss's one line: what happened in that epoch, whether the wake reached the device when known, what to do.
-export function missText(miss: LastMiss, platform: DevicePlatform | null, wake: WakePlace): string {
-  const notice = missNotice(miss, platform, wake);
+export function missText(miss: LastMiss, platform: DevicePlatform | null): string {
+  const notice = missNotice(miss, platform);
   const parts = [t(notice.what, { epoch: number(miss.epoch) })];
   const delivery = deliveryLine(miss);
   if (delivery !== null) parts.push(t(delivery));

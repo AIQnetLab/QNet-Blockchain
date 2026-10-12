@@ -1,6 +1,6 @@
-# Contributing to QNet
+# Contributing to QNet Blockchain
 
-This document describes how to build, test and change the code in this repository. QNet is a Rust
+This document describes how to build, test and change the code in this repository. QNet Blockchain is a Rust
 Cargo workspace (the node and its libraries) plus several JavaScript and Python applications. There
 is no formal RFC or design-review process: substantial changes start as a GitHub issue describing
 the problem, and everything else goes straight to a pull request.
@@ -42,7 +42,7 @@ The root `Cargo.toml` declares these members:
 Applications live outside the workspace under `applications/`: `qnet-mobile` (React Native),
 `qnet-wallet` (browser extension), `qnet-explorer` (Next.js), `qnet-cli` (Python). Three more
 components sit outside it as well: `development/qnet-sdk` (the TypeScript package `@aiqnet/sdk` and
-the `qnet` command line), `contracts` (Rust contract templates for the QNet VM, in a Cargo workspace
+the `qnet` command line), `contracts` (Rust contract templates for the QNet Blockchain VM, in a Cargo workspace
 of its own) and `development/qnet-contracts/1dev-burn-contract` (a Solana program that declares its
 own Cargo workspace).
 
@@ -103,6 +103,12 @@ builds the explorer front end. It also has its own `cargo audit` and `npm audit`
 `cargo audit`, GitHub dependency review, and a Docker image build-and-scan. It triggers on pushes to
 `master` and `develop`, on pull requests targeting `master`, and weekly. A pull request targeting
 `testnet` does not trigger it.
+
+`.github/workflows/deploy.yml` builds the node image on every push to `testnet` and publishes it only as
+`ghcr.io/aiqnetlab/qnet-production:<commit>`. `:latest`, which installed super nodes follow, moves only through its
+promote job (`workflow_dispatch` with `promote_sha`), which points it at an already published commit without a
+rebuild. `scripts/deploy-genesis.sh` rolls the genesis fleet to the checked-out commit by default and starts that job
+once all six nodes run the build and passed their gates; never after a rollback.
 
 ## Code style
 

@@ -214,13 +214,18 @@ function shuffled(list) {
   return out;
 }
 
-// One node's quote for `nodeType`: {phase, cost}, cost a whole number; anything else is refused.
-async function quotePrice(nodeType, nodes) {
+// How long one node's price quote is waited for: every node is asked at once and all are awaited, so a silent one would
+// hold the Activate tab and the burn for the whole request timeout.
+const PRICE_TIMEOUT_MS = 4000;
+
+// One node's quote for `nodeType`: {phase, cost}, cost a whole number; null for any other answer; undefined when the node
+// gave no answer (nodeRequest: no connection, a timeout, a 5xx or a 429).
+async function quoteFrom(nodeType, node) {
   let reply;
   try {
-    reply = await qnet.nodeRequest(`/api/v1/activation/price?type=${nodeType}`, nodes ? { nodes } : {});
+    reply = await qnet.nodeRequest(`/api/v1/activation/price?type=${nodeType}`, { nodes: [node], timeoutMs: PRICE_TIMEOUT_MS });
   } catch {
-    throw new WalletError('PRICE_UNAVAILABLE');
+    return undefined;
   }
   let body = null;
   try {
@@ -232,37 +237,41 @@ async function quotePrice(nodeType, nodes) {
     && (body.node_type === undefined || body.node_type === nodeType);
   const phase = valid ? { 1: 1, 2: 2 }[body.phase] : undefined;
   const cost = valid && typeof body.cost === 'string' && /^[1-9][0-9]{0,9}$/.test(body.cost) ? Number(body.cost) : null;
-  if (!phase || cost === null || cost > MAX_PRICE) throw new WalletError('PRICE_UNAVAILABLE');
-  if (phase === 1 && body.currency !== '1DEV') throw new WalletError('PRICE_UNAVAILABLE');
+  if (!phase || cost === null || cost > MAX_PRICE) return null;
+  if (phase === 1 && body.currency !== '1DEV') return null;
   return { phase, cost };
 }
 
+// The price of `nodeType` as every pinned node that answers quotes it: all of them are asked at once, at least two must
+// answer, and every answer must be a quote of the same phase and cost (no proof serves the price, so it is the nodes'
+// word, and the pages say so; one node quoting otherwise, or answering something else, leaves no price).
+async function agreedPrice(nodeType) {
+  const answers = (await Promise.all(QNET.NODES.map((node) => quoteFrom(nodeType, node).catch(() => undefined))))
+    .filter((answer) => answer !== undefined);
+  if (answers.length < 2 || answers.some((q) => q === null || q.phase !== answers[0].phase || q.cost !== answers[0].cost)) {
+    throw new WalletError('PRICE_UNAVAILABLE');
+  }
+  return answers[0];
+}
+
 /**
- * Handler of `activation.price`: GET /api/v1/activation/price?type=light and ?type=super from the
- * pinned nodes. No fallback numbers: a missing, non-integer or error answer fails.
+ * Handler of `activation.price`: GET /api/v1/activation/price?type=light and ?type=super from every pinned node, all of
+ * which that answer must quote alike (agreedPrice): a node-reported price, shown as such. No fallback numbers: a missing,
+ * non-integer, error or disagreeing answer fails.
  * @returns {Promise<PriceQuote>}
  * @throws {WalletError} PRICE_UNAVAILABLE
  */
 export async function getPrice() {
-  const [light, superNode] = await Promise.all([quotePrice('light'), quotePrice('super')]);
+  const [light, superNode] = await Promise.all([agreedPrice('light'), agreedPrice('super')]);
   if (light.phase !== superNode.phase) throw new WalletError('PRICE_UNAVAILABLE');
   return { phase: light.phase, light: { cost: light.cost }, super: { cost: superNode.cost }, fetchedAt: Date.now() };
 }
 
-// The price the burn is built with: two different pinned nodes must quote the same phase-1 cost.
+// The price the burn is built with: the phase-1 cost every pinned node that answers quotes alike (agreedPrice).
 async function burnPrice(nodeType) {
-  const quotes = [];
-  const nodes = shuffled(QNET.NODES);
-  while (quotes.length < 2 && nodes.length > 0) {
-    const wave = nodes.splice(0, 2 - quotes.length);
-    const answers = await Promise.all(wave.map((node) => quotePrice(nodeType, [node]).catch(() => null)));
-    quotes.push(...answers.filter(Boolean));
-  }
-  if (quotes.length < 2 || quotes[0].phase !== quotes[1].phase || quotes[0].cost !== quotes[1].cost) {
-    throw new WalletError('PRICE_UNAVAILABLE');
-  }
-  if (quotes[0].phase !== 1) throw new WalletError('PHASE_UNSUPPORTED');
-  return quotes[0].cost;
+  const quote = await agreedPrice(nodeType);
+  if (quote.phase !== 1) throw new WalletError('PHASE_UNSUPPORTED');
+  return quote.cost;
 }
 
 // ---------------------------------------------------------------- one code per wallet
@@ -933,8 +942,8 @@ async function storeCanonical(canonical, burner) {
 }
 
 // Stores aiqnet.io's record of a burn of the wallet's own address, whose burn Solana showed as recorded (checkRecordBurn),
-// as the activation unless the vault holds one or a pending burn (decision 35: a restore finds its code at once, before
-// its search reached the burn).
+// as the activation unless the vault holds one or a pending burn (decision 35: the phrase imported again finds its code
+// at once, before its search reached the burn).
 async function adoptRecord(wallet, record, createdAt) {
   const activation = activationOf({ nodeType: record.nodeType, burnTx: record.burnTx, burnAmount: record.burnAmount }, record.burner, createdAt);
   const stored = await vault.updateState((s) => (s.activation || s.pendingBurn ? s
@@ -1246,8 +1255,9 @@ async function walletVerdict(wallet) {
   return verdict;
 }
 
-// A verdict that found a burn the vault does not hold (a reset and a restore in this worker, a burn in flight that could
-// not be kept) answers nothing: the next read searches again, and until then the wallet is still being checked.
+// A verdict that found a burn the vault does not hold (a reset and an import of the phrase in this worker, a burn in
+// flight that could not be kept) answers nothing: the next read searches again, and until then the wallet is still
+// being checked.
 function forgetVerdict(wallet) {
   if (searching === null && lastSearch?.owner === wallet.solanaAddress) lastSearch.startedAt = 0;
 }
@@ -1258,9 +1268,10 @@ function forgetVerdict(wallet) {
  * as one `view`. A vault activation is shown at once and recorded on aiqnet.io in the background (syncRecord); a record
  * of another burn aiqnet.io keeps as the wallet's code is shown as the code, with the vault's burn as `keptBurn`. With
  * no vault activation: a burn the search finds is stored; aiqnet.io's record of a burn of the wallet's own address is
- * stored once Solana shows it (a restore's shortcut), a payment burn is shown with the wallet's code, never stored or
- * recorded here; an activation starting elsewhere, a burn no code derives from and a node the network knows are shown
- * as such; a source that could not answer is named (unavailable). Only 'none', every source's "none", offers a burn.
+ * stored once Solana shows it (the shortcut of a phrase imported again), a payment burn is shown with the wallet's
+ * code, never stored or recorded here; an activation starting elsewhere, a burn no code derives from and a node the
+ * network knows are shown as such; a source that could not answer is named (unavailable). Only 'none', every source's
+ * "none", offers a burn.
  * @returns {Promise<ActivationLookup>} never a code: activation.copy gives it
  * @throws {WalletError} LOCKED
  */

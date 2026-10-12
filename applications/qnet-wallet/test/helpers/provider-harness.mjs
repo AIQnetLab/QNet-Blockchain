@@ -42,6 +42,7 @@ export const TOKEN_INFO = Object.freeze({ kind: 'token', standard: 'qrc20', name
 
 // This wallet's light node id (nodes.js answers for it).
 export const NODE_ID = core.lightNodeId(core.KAT.qnetAddress);
+export const SUPER_NODE_ID = core.superNodeId(core.KAT.qnetAddress);
 
 // A well-formed burn signature (the public activation-code vector's) for this wallet's activation records.
 export const BURN_TX = core.KAT.activation.burnTx;
@@ -130,7 +131,8 @@ export function createWorld(options = {}) {
     // activation.siteActivation (qnet_getActivation, decision 35): its answer, or an error it throws
     siteActivation: null,
     siteActivationError: null,
-    // nodes.claimView / claimForSite (qnet_claimNodeBalance) and getRegistration (the activation window after its answer)
+    // nodes.claimView / claimForSite (qnet_claimNodeBalance, decision 47) and getRegistration (the activation window after
+    // its answer)
     claimBalance: '2500000000',
     claimView: null,
     claimViewError: null,
@@ -146,7 +148,7 @@ export function createWorld(options = {}) {
   const log = {
     windows: [], removed: [], views: [], signCalls: [], sendCalls: [], unlockAttempts: [], recipientChecks: [], maxOpen: 0,
     siteViews: [], activations: [], contractReads: [], recipientReads: [], callPreviews: [], callSends: [], statusReads: [], claimViews: 0,
-    claims: 0, siteActivations: 0, unlinkViews: 0, unlinks: 0,
+    claims: 0, claimNodeIds: [], siteActivations: 0, unlinkViews: 0, unlinks: 0,
   };
   const openWindows = new Set();
   const timers = [];
@@ -303,21 +305,29 @@ export function createWorld(options = {}) {
     },
   };
 
-  // What nodes.js would answer: a claim view of this wallet's light node at state.claimBalance unless the test sets
-  // state.claimView, a submitted move of it unless it sets state.claimOutcome, and state.registration.
+  // What nodes.js would answer: a claim view of the node the site named (this wallet's light or super node, else
+  // WALLET_MISMATCH) at state.claimBalance unless the test sets state.claimView, a submitted move of it unless it sets
+  // state.claimOutcome, and state.registration.
+  const nodeTypeOf = (nodeId) => (nodeId === NODE_ID ? 'light' : nodeId === SUPER_NODE_ID ? 'super' : null);
   const nodes = {
-    claimView: async () => {
+    claimView: async (nodeId) => {
       log.claimViews += 1;
+      log.claimNodeIds.push(nodeId);
       if (!state.unlocked) throw new WalletError('LOCKED');
       if (state.claimViewError) throw state.claimViewError;
-      return { mode: 'claim', reason: null, nodeId: NODE_ID, amountNano: state.claimBalance, ...(state.claimView ?? {}) };
+      const nodeType = nodeTypeOf(nodeId);
+      const base = nodeType === null
+        ? { mode: 'unavailable', reason: 'WALLET_MISMATCH', nodeId, nodeType, amountNano: null }
+        : { mode: 'claim', reason: null, nodeId, nodeType, amountNano: state.claimBalance };
+      return { ...base, ...(state.claimView ?? {}) };
     },
-    claimForSite: async () => {
+    claimForSite: async (nodeId) => {
       log.claims += 1;
+      log.claimNodeIds.push(nodeId);
       if (!state.unlocked) throw new WalletError('LOCKED');
       if (state.claimError) throw state.claimError;
       return state.claimOutcome ?? {
-        status: 'ok', qnet: ACCOUNTS.qnet, nodeId: NODE_ID, amountNano: state.claimBalance, txHash: 'ef'.repeat(32), stoppedAtEpoch: null,
+        status: 'ok', qnet: ACCOUNTS.qnet, nodeId, amountNano: state.claimBalance, txHash: 'ef'.repeat(32), stoppedAtEpoch: null,
       };
     },
     getRegistration: async () => ({ registration: state.registration }),

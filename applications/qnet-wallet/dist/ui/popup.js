@@ -16,7 +16,7 @@ import { LANGUAGE_NAMES } from './i18n/index.js';
 import {
   addressCopy, addressText, button, canonicalAmount, checkbox, codeText, countdown, earlierRemoval, errorCode, errorText, field, formatAmount,
   formatDay, formatTime, heading, kvList, looksLikeKnownAddress, messageLine, newPasswordFields, notice, noticeList, onEnter, openTab,
-  parseSolanaRecipient, passwordInput, qnetTxUrl, segmented, solanaTxUrl, textArea, textInput, valueCopy, whileBusy,
+  parseSolanaRecipient, passwordInput, qnetTxUrl, segmented, solanaTxUrl, textInput, valueCopy, whileBusy,
 } from './kit.js';
 import { qrMatrix } from './qr.js';
 
@@ -30,8 +30,8 @@ const HISTORY_PAGE_SIZE = 20;
 const SOLANA_HISTORY_PAGE_SIZE = 10;
 const TOAST_MS = 4000;
 const WIPE_WORD = 'DELETE';
-// The worker's confirmation of a reset (vault.restore), sent once the user ticked the one checkbox; never typed.
-const RESTORE_CONFIRM = 'ERASE';
+// The worker's confirmation of a reset (vault.reset), sent when the user presses Reset wallet; never typed.
+const RESET_CONFIRM = 'ERASE';
 const QR_QUIET_MODULES = 4;
 const QR_TARGET_PX = 200;
 // Burn failures that happen before anything is sent to Solana (a Solana that could not be read stops the
@@ -49,19 +49,22 @@ const BURN_REFUSED = new Set([
 
 const root = document.getElementById('app');
 const state = {
-  screen: 'loading', // loading | error | welcome | lock | restore | wallet
+  screen: 'loading', // loading | error | welcome | lock | reset | wallet
   status: null,
   addresses: null,
   network: 'qnet',
   tab: 'assets',
   unlocking: false,
-  // true while vault.restore runs: its own 'wiped' event must not reload this page
-  restoring: false,
   // true while Activate shows its overview; an 'activation' event may then refresh it
   activateIdle: false,
 };
 let shell = null;
 let viewSeq = 0;
+// A QNet review that finished while its form was no longer shown: {input, preview, token} (token null for QNC), drawn the
+// next time the Send tab opens on QNet Blockchain, never dropped unseen; a lock drops it.
+let heldReview = null;
+// The QNet review asked for last: one that finishes after a newer one started is no longer asked for.
+let reviewSeq = 0;
 const disposers = new Set();
 // The Activate overview on screen with an activation: {shown, record, isCurrent} (refreshActivate)
 let activateOverview = null;
@@ -109,6 +112,7 @@ function showTab(node) {
  */
 function wipeView() {
   runDisposers();
+  heldReview = null;
   if (shell) clearTimeout(shell.toastTimer);
   wipeInputs(root);
   clear(root);
@@ -391,11 +395,11 @@ function handleWalletEvent(event) {
       }
       break;
     case 'unlocked':
-      if (state.screen === 'lock' && !state.unlocking) route();
+      // another view unlocked: the lock screen and the reset screen give way to the wallet (a reset is refused now)
+      if ((state.screen === 'lock' && !state.unlocking) || state.screen === 'reset') route();
       break;
     case 'wiped':
       clearPageStorage();
-      if (state.restoring) break;
       wipeAndReload();
       break;
     case 'activation':
@@ -409,17 +413,23 @@ function handleWalletEvent(event) {
   }
 }
 
-// No vault of this version. While the wallet an earlier version kept is in this browser (M-4), the screen says so and its
+// No vault of this version: Create a new wallet and Import an existing wallet, each opening setup straight at that step
+// (owner, 11.10). While the wallet an earlier version kept is in this browser (M-4), the screen says so and its one
 // button leads to setup, which moves it.
 function renderWelcome() {
   const earlier = state.status?.earlier === true;
+  const open = (flow) => () => {
+    openSetup(flow).catch((error) => log.warn('setup not opened', error?.name));
+  };
+  const buttons = earlier
+    ? [button(t('setupEarlierUnlock'), open(null), { kind: 'primary', action: 'open-setup', block: true })]
+    : [button(t('welcomeCreate'), open('create'), { kind: 'primary', action: 'open-create', block: true }),
+      button(t('welcomeImport'), open('import'), { action: 'open-import', block: true })];
   showScreen('welcome', el('div', { className: 'center-screen stack' },
     brandMark('logo-lg'),
     el('h1', { className: 'title-gradient', text: t('appName') }),
     el('p', { className: 'lead', text: t(earlier ? 'setupEarlierLead' : 'welcomeLead') }),
-    button(t(earlier ? 'setupEarlierUnlock' : 'welcomeSetup'), () => {
-      openSetup().catch((error) => log.warn('setup not opened', error?.name));
-    }, { kind: 'primary', action: 'open-setup', block: true })));
+    ...buttons));
 }
 
 // ---------------------------------------------------------------- lock screen
@@ -433,15 +443,16 @@ function renderLock(status) {
   const password = passwordInput('password', t('lockPasswordPlaceholder'));
   const message = messageLine();
   const unlock = button(t('lockUnlock'), null, { kind: 'primary', action: 'unlock', block: true });
+  const forgot = button(t('lockForgot'), () => renderReset(), { kind: 'ghost', action: 'forgot-password' });
   showScreen('lock', el('div', { className: 'lock-screen' },
-    el('div', { className: 'lock-top' }, el('h1', { className: 'title-gradient', text: t('appShortName') })),
+    el('div', { className: 'lock-top' }, el('h1', { className: 'title-gradient', text: t('appName') })),
     el('div', { className: 'lock-body' },
       brandMark('logo-lg'),
       el('p', { className: 'lead', text: t('lockLead') }),
       password,
       message.node,
       unlock,
-      button(t('lockForgot'), () => renderRestore(), { kind: 'ghost', action: 'forgot-password' }))));
+      forgot)));
 
   let stopWait = () => {};
   const waitUntil = (until) => {
@@ -463,7 +474,8 @@ function renderLock(status) {
     message.show(t('lockUnlocking'), 'info');
     state.unlocking = true;
     try {
-      await whileBusy([unlock], () => call('vault.unlock', { password: value }));
+      // no reset while the password is being checked
+      await whileBusy([unlock, forgot], () => call('vault.unlock', { password: value }));
     } catch (error) {
       state.unlocking = false;
       if (state.screen !== 'lock') return;
@@ -504,162 +516,41 @@ async function lockNow() {
 // ---------------------------------------------------------------- forgot password: reset wallet
 
 /**
- * "Forgot password?" → Reset wallet: a short lead, one warning, the recovery phrase (checked here in its canonical
- * form, again by the worker) and a new password. Continue empties the fields, asks vault.restoreBegin for the one-time
- * token the worker requires, then vault.restore without `confirm`: that call only checks the phrase and names both
- * wallets (renderRestoreConfirm). Nothing is erased before that confirmation. No word is typed to confirm.
+ * "Forgot password?" → Reset wallet (owner, 11.10): the extension cannot recover the password, so a new one takes a
+ * reset, which removes the wallet from this browser; only its recovery phrase brings it back (Import, from the first
+ * screen). One warning, Back and Reset wallet, nothing typed: the press asks vault.resetBegin for the one-time token
+ * the worker requires, then sends vault.reset with it and the fixed confirmation. The worker announces the wipe before
+ * it answers, and the page starts over at the first screen, as after Delete wallet. The worker resets only a locked
+ * wallet: one unlocked meanwhile opens instead.
  * @returns {void}
  */
-function renderRestore() {
-  const phrase = textArea({ name: 'phrase', rows: 4, placeholder: t('setupImportPlaceholder') });
-  // a pasted phrase leaves the clipboard as soon as it is in the field (R3-EXT-UI-02, as the setup import)
-  phrase.addEventListener('paste', () => {
-    setTimeout(() => copyText('').catch(() => {}), 0);
-  });
-  const fresh = newPasswordFields(core);
+function renderReset() {
   const message = messageLine();
   const back = button(t('back'), () => route(), { action: 'back' });
-  const next = button(t('continue'), null, { kind: 'primary', action: 'restore' });
-  const view = el('div', { className: 'screen-pad stack' },
-    heading(t('restoreTitle'), t('restoreLead')),
-    notice('danger', t('restoreWarn')),
-    field(t('setupImportLabel'), phrase, t('setupImportLead')),
-    ...fresh.nodes,
+  const reset = button(t('resetButton'), null, { kind: 'danger', action: 'reset-wallet' });
+  showScreen('reset', el('div', { className: 'screen-pad stack' },
+    heading(t('resetTitle'), t('resetLead')),
+    notice('danger', t('resetWarn')),
     message.node,
-    actionsRow(back, next));
-  showScreen('restore', view);
-  next.addEventListener('click', async () => {
+    actionsRow(back, reset)));
+  reset.addEventListener('click', async () => {
     message.clear();
-    if (!isValidPhrase(phrase.value)) {
-      message.show(t('setupImportInvalid'));
-      return;
-    }
-    const password = fresh.read(message);
-    if (password === null) return;
-    const mnemonic = core.canonicalizeMnemonic(phrase.value);
-    wipeInputs(view);
-    fresh.refresh();
-    message.show(t('restoreChecking'), 'info');
-    let grant;
     try {
-      grant = await whileBusy([next, back], () => call('vault.restoreBegin'));
+      await whileBusy([reset, back], async () => {
+        const grant = await call('vault.resetBegin');
+        await call('vault.reset', { token: grant.token, confirm: RESET_CONFIRM });
+      });
     } catch (error) {
-      if (state.screen === 'restore') message.show(errorText(error));
+      if (state.screen !== 'reset') return;
+      // unlocked meanwhile in another view: the password is known, the wallet opens instead
+      if (errorCode(error) === 'UNLOCKED') route();
+      else message.show(errorText(error));
       return;
     }
-    if (state.screen !== 'restore') return;
-    keepWorkerAlive();
-    await runRestore({ token: grant.token, mnemonic, password }, [next, back]);
+    // the 'wiped' event usually got here first; either way the clipboard is emptied before the reload (R16)
+    clearPageStorage();
+    await wipeAndReload();
   });
-}
-
-function isValidPhrase(text) {
-  try {
-    return core.validateMnemonic(text) === true;
-  } catch {
-    return false;
-  }
-}
-
-// While the restore token exists the worker must stay up: the token lives in worker memory, and an idle MV3 worker
-// stops after about 30 s (R2-ESM-06). A cheap status read every 20 s keeps it.
-function keepWorkerAlive() {
-  const timer = setInterval(() => {
-    call('vault.status').catch(() => {});
-  }, TIMINGS.RESTORE_KEEPALIVE_MS);
-  onDispose(() => clearInterval(timer));
-}
-
-// One vault.restore call; a 'confirm' answer shows both wallets for the one confirmation.
-async function runRestore(request, busyButtons) {
-  state.restoring = true;
-  let result = null;
-  let failure = null;
-  try {
-    result = await whileBusy(busyButtons, () => call('vault.restore', request));
-  } catch (error) {
-    failure = error;
-  } finally {
-    state.restoring = false;
-  }
-  if (state.screen !== 'restore') return;
-  if (failure === null && result?.status === 'confirm') {
-    renderRestoreConfirm(request, result);
-    return;
-  }
-  // Best effort, as after a wipe: a code copied from the old wallet must not outlive it (R16).
-  await copyText('').catch(() => {});
-  if (state.screen !== 'restore') return;
-  if (failure === null) renderRestoreDone(result);
-  else renderRestoreFailed(failure);
-}
-
-// A wallet's two addresses under what happens to it.
-function walletPair(label, pair) {
-  return el('div', { className: 'wallet-pair' },
-    el('div', { className: 'card-label', text: label }),
-    kvList([[t('qnetAddress'), addressText(pair.qnet)], [t('solanaAddress'), addressText(pair.solana)]]));
-}
-
-/**
- * The one confirmation before the vault is replaced: the wallet in this browser named by its addresses (none when its
- * record cannot be read), and for a phrase of another wallet (EXT-VAULT-R2-04) a danger notice with both wallets. One
- * checkbox arms Reset wallet, which repeats the call with `confirm` (and `replaceOther` for another wallet) and the same
- * token. The phrase and password wait in this page until then, and are dropped when the screen goes.
- * @param {{token: string, mnemonic: string, password: string}} request
- * @param {{erased: {qnet: string, solana: string}|null, restored: {qnet: string, solana: string}, otherWallet: boolean}}
- *   answer
- */
-function renderRestoreConfirm(request, answer) {
-  let pending = { token: request.token, mnemonic: request.mnemonic, password: request.password };
-  const other = answer.otherWallet === true;
-  const message = messageLine();
-  const back = button(t('back'), () => route(), { action: 'back' });
-  const go = button(t('restoreConfirmButton'), null, { kind: 'danger', action: 'restore-confirm', disabled: true });
-  const understood = checkbox('understand', t('restoreUnderstand'), (checked) => {
-    go.disabled = !checked;
-  });
-  let intro = notice('info', t('restoreSameWallet'));
-  if (answer.erased === null) intro = notice('warn', t('restoreUnreadable'));
-  else if (other) intro = notice('danger', t('restoreOtherWallet'));
-  showScreen('restore', el('div', { className: 'screen-pad stack' },
-    heading(t('restoreConfirmTitle')),
-    intro,
-    answer.erased === null ? null : walletPair(t(other ? 'restoreErased' : 'restoreCurrent'), answer.erased),
-    answer.erased === null || other ? walletPair(t('restoreRestored'), answer.restored) : null,
-    understood.node,
-    message.node,
-    actionsRow(back, go)));
-  onDispose(() => {
-    pending = null;
-  });
-  keepWorkerAlive();
-  go.addEventListener('click', async () => {
-    if (!understood.input.checked || pending === null) return;
-    const confirmed = { ...pending, confirm: RESTORE_CONFIRM, ...(other ? { replaceOther: true } : {}) };
-    pending = null;
-    message.show(t('restoreWorking'), 'info');
-    await runRestore(confirmed, [go, back]);
-  });
-}
-
-// The token is spent: whatever failed, the flow starts again from the status (the old vault may be gone).
-function renderRestoreFailed(error) {
-  showScreen('restore', el('div', { className: 'screen-pad stack' },
-    heading(t('restoreTitle')),
-    notice('danger', errorText(error)),
-    button(t('restoreStartAgain'), () => route(), { kind: 'primary', action: 'restore-again', block: true })));
-}
-
-function renderRestoreDone(result) {
-  showScreen('restore', el('div', { className: 'screen-pad stack' },
-    heading(t('restoreDoneTitle')),
-    kvList([
-      [t('qnetAddress'), ownAddress(result.qnet, 'qnet')],
-      [t('solanaAddress'), ownAddress(result.solana, 'solana')],
-    ]),
-    notice('info', t('restoreDoneRecover')),
-    button(t('continue'), () => route(), { kind: 'primary', action: 'continue', block: true })));
 }
 
 // ---------------------------------------------------------------- wallet frame
@@ -675,8 +566,9 @@ function renderWallet() {
     (network) => selectNetwork(network),
     t('networkSwitchLabel'));
   networkSwitch.classList.add('network-switch');
+  // the logo alone names the wallet in the header, so the QNet Blockchain | Solana switch fits the 360 px popup
   const header = el('header', { className: 'topbar' },
-    el('div', { className: 'brand' }, brandMark('brand-mark'), el('span', { className: 'brand-name', text: t('appShortName') })),
+    el('div', { className: 'brand', attrs: { role: 'img', 'aria-label': t('appName'), title: t('appName') } }, brandMark('brand-mark')),
     networkSwitch,
     lockButton());
   const tabButtons = new Map();
@@ -893,8 +785,10 @@ function drawAssets(network, balances, fromCache) {
   };
   showOmitted();
   const unverified = (read) => network === 'qnet' && read?.verification === 'none';
+  // not certified yet: how far the walk is while it is long (qnet.walkSteps), else that it is not confirmed
+  const unverifiedText = (read) => (Number.isSafeInteger(read?.walkSteps) ? t('balanceVerifyingSteps', [read.walkSteps]) : t('assetsUnverified'));
   if (fromCache) assetStatus(status, t('assetsUpdating'));
-  else if (unverified(balances)) assetStatus(status, t('assetsUnverified'), 'warn');
+  else if (unverified(balances)) assetStatus(status, unverifiedText(balances), 'warn');
   let first = fromCache;
   const isCurrent = showTab(el('div', { className: 'stack' },
     accountCard(network),
@@ -915,7 +809,7 @@ function drawAssets(network, balances, fromCache) {
       if (!isCurrent()) return;
       shown = read;
       redraw();
-      if (unverified(shown)) assetStatus(status, t('assetsUnverified'), 'warn');
+      if (unverified(shown)) assetStatus(status, unverifiedText(shown), 'warn');
       else assetStatus(status, '');
       first = false;
     }, (error) => {
@@ -947,8 +841,21 @@ function drawAssets(network, balances, fromCache) {
  * @returns {Promise<void>}
  */
 async function renderSend() {
+  if (state.network === 'qnet' && heldReview !== null) {
+    const { input, preview, token } = heldReview;
+    heldReview = null;
+    if (token === null) renderQnetReview(input, preview);
+    else renderTokenReview(input, preview);
+    return;
+  }
   if (state.network === 'qnet') renderQnetForm();
   else renderSolanaForm();
+}
+
+// A review whose form is no longer shown when it finishes is kept for the Send tab, and said so (heldReview).
+function holdReview(input, preview, token) {
+  heldReview = { input, preview, token };
+  toast(t('sendReviewReady'), 'info');
 }
 
 // The worker's recipient check (qnet.recipientCheck / solana.recipientCheck, from the addresses this wallet
@@ -996,6 +903,19 @@ function renderQnetForm(prefill = {}) {
   const message = messageLine();
   const next = button(t('sendReview'), null, { kind: 'primary', action: 'review', block: true });
   let qncSpendable = null;
+  // the reads a review makes start ahead of it: the wallet's own certified balance now, a recipient's checks once a whole
+  // address is typed (qnet.sendWarm); the review finds them done
+  let warmed = null;
+  const warm = (params) => call('qnet.sendWarm', params).catch((error) => log.warn('send read ahead failed', error?.code));
+  // a form drawn again with its recipient (Back from the review) reads that recipient's checks too
+  if (validAddress(core.isValidQnetAddress, to.value.trim())) warmed = to.value.trim();
+  warm(warmed === null ? {} : { to: warmed });
+  to.addEventListener('input', () => {
+    const typed = to.value.trim();
+    if (typed === warmed || !validAddress(core.isValidQnetAddress, typed)) return;
+    warmed = typed;
+    warm({ to: typed });
+  });
   const tokenOf = (value) => tokens.find((token) => token.contract === value) ?? (prefill.token?.contract === value ? prefill.token : null);
   const listed = () => {
     const list = [...tokens];
@@ -1057,25 +977,27 @@ function renderQnetForm(prefill = {}) {
       message.show(t('sendInvalidAmount', [decimals]));
       return;
     }
-    if (token !== null) {
-      let preview;
-      try {
-        preview = await whileBusy([next, picker], () => call('qnet.tokenPreview', { token: token.contract, to: recipient, amount: value }));
-      } catch (error) {
-        if (isCurrent()) message.show(errorText(error));
-        return;
-      }
-      if (isCurrent()) renderTokenReview({ token, to: recipient, amount: value }, preview);
-      return;
-    }
+    // while the review is read the button stays busy and a status line says what runs
+    message.show(t('sendChecking'), 'info');
+    const input = token === null ? { to: recipient, amount: value } : { token, to: recipient, amount: value };
+    // a new review replaces one held from before
+    const mine = ++reviewSeq;
+    heldReview = null;
     let preview;
     try {
-      preview = await whileBusy([next, picker], () => call('qnet.preview', { to: recipient, amount: value }));
+      preview = await whileBusy([next, picker], () => (token === null ? call('qnet.preview', input)
+        : call('qnet.tokenPreview', { token: token.contract, to: recipient, amount: value })));
     } catch (error) {
       if (isCurrent()) message.show(errorText(error));
       return;
     }
-    if (isCurrent()) renderQnetReview({ to: recipient, amount: value }, preview);
+    if (mine !== reviewSeq) return;
+    // its form went: kept for the Send tab, unless the Send tab on QNet Blockchain is what shows now (opened again
+    // meanwhile), where it is drawn at once
+    const onSend = state.screen === 'wallet' && state.tab === 'send' && state.network === 'qnet';
+    if (!isCurrent() && !onSend) holdReview(input, preview, token);
+    else if (token === null) renderQnetReview(input, preview);
+    else renderTokenReview(input, preview);
   };
   next.addEventListener('click', review);
   onEnter(amount, review);
@@ -2058,9 +1980,11 @@ function historyDetail(view, back, isCurrent) {
   const { item } = view;
   const badgeBox = el('span', {}, historyBadge(view.status));
   const lead = el('div');
+  // an unverified token row is one whose own logs proof could not be checked against a certified checkpoint (yet)
+  const leadOf = (status) => (status === 'unverified' && item.kind === 'token' ? 'historyTokenUnverifiedLead' : HISTORY_LEADS[status]);
   const showLead = (status) => {
     clear(lead);
-    if (HISTORY_LEADS[status]) lead.append(notice(status === 'unverified' ? 'info' : 'warn', t(HISTORY_LEADS[status])));
+    if (leadOf(status)) lead.append(notice(status === 'unverified' ? 'info' : 'warn', t(leadOf(status))));
   };
   showLead(view.status);
   let rows;
@@ -2092,7 +2016,8 @@ function historyDetail(view, back, isCurrent) {
     rows.push([t('sentSignature'), valueCopy(item.signature, t('sentSignature'), copiedToast)]);
     explorer = button(t('openSolanaExplorer'), () => openTab(solanaTxUrl(item.signature)), { kind: 'primary', action: 'explorer' });
   }
-  if (view.network === 'qnet' && item.hash && view.status === 'unverified') {
+  // two nodes listing the call is no proof of a token row: only its logs proof is (qnet.history)
+  if (view.network === 'qnet' && item.hash && view.status === 'unverified' && item.kind !== 'token') {
     call('qnet.txLookup', { hash: item.hash }).then((found) => {
       if (!isCurrent() || !badgeBox.isConnected || found?.status !== 'in_block') return;
       badgeBox.replaceChildren(historyBadge('included'));
@@ -2366,7 +2291,8 @@ function priceCards(priceResult, balancesResult, blocked) {
         kind: 'primary', action: `choose-${nodeType}`, block: true, disabled: !valid || blocked || shortfall !== null,
       }));
   });
-  return el('div', { className: 'stack' }, ...cards);
+  // no proof serves the price: it is what the pinned nodes all quote alike, and said so
+  return el('div', { className: 'stack' }, ...cards, el('p', { className: 'muted small', text: t('activatePriceReported') }));
 }
 
 // Where the node is managed once the burn is made (owner, 06.10): one line, the node's status, device and balance live
@@ -2691,6 +2617,7 @@ function renderBurnConfirm(nodeType, cost) {
       [t('activateFrom'), ownAddress(state.addresses.solana, 'solana')],
       [t('reviewFee'), t('activateFeeValue')],
     ]),
+    el('p', { className: 'muted small', text: t('activatePriceReported') }),
     // the burn is irreversible: its one confirmation line is the acknowledgement the button waits for
     ack.node,
     actionsRow(back, burn)));

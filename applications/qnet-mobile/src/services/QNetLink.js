@@ -2,9 +2,9 @@
 // a verified https://link.aiqnet.io/l#v1... link, to share its addresses (`connect`), to confirm that the page may
 // prepare this wallet's light node with a one-time address it makes (`reserve`), to consent to its light node and run
 // it on this device (`link`), to stop running it on the device it runs on (`unlink`: on that device its own key signs the
-// unbind; on any other device that holds the wallet, the wallet key), or to move its node balance (`claim`). The answer goes back end-to-end encrypted through
-// the site's relay. The wallet answers only after the user confirmed on the wallet's own screen
-// (screens/QNetLinkScreen).
+// unbind; on any other device that holds the wallet, the wallet key), or to move the node balance of the node it names,
+// this wallet's light or super node (`claim`). The answer goes back end-to-end encrypted through the site's relay. The
+// wallet answers only after the user confirmed on the wallet's own screen (screens/QNetLinkScreen).
 //
 // The relay is untrusted: its session must match the link exactly (the request included, bound by its hash), an answer
 // is sealed to the site's ephemeral key, and nothing the relay or the link says can change what the wallet signs: the
@@ -20,7 +20,7 @@ import { sha3_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex, hexToBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 import { isSolanaAddress, isSolanaSignature } from '../utils/solanaFormat';
 import { eonFromPublicKeyBytes } from '../crypto/WalletIdentity';
-import { lightNodeId } from '../crypto/NodePreimages';
+import { lightNodeId, ownNodeType } from '../crypto/NodePreimages';
 
 const CAPS = Object.freeze({
   connect: Object.freeze({ plaintext: 1024, ct: 1040 }),
@@ -75,7 +75,7 @@ export const LINK = Object.freeze({
   ERRORS: Object.freeze([...new Set(Object.values(INTENT_ERRORS).flat())]),
   REQUEST_KEYS: Object.freeze({
     link: Object.freeze(['burnTx', 'walletHash', 'check']),
-    claim: Object.freeze(['walletHash']),
+    claim: Object.freeze(['walletHash', 'nodeId']),
     reserve: Object.freeze(['walletHash', 'burner']),
     unlink: Object.freeze(['walletHash']),
   }),
@@ -150,6 +150,8 @@ export function contributoryKey(publicKey) {
 // ---------------------------------------------------------------- requests (section 14.4)
 
 const WALLET_HASH_RE = /^[0-9a-f]{16}$/;
+// The node a `claim` request names: a wallet's light or super node, never a genesis node.
+const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 
 /** First 16 hex of SHA3-256("qnet-link-wallet:" + wallet): how a request names the wallet the page already knows. */
 export function walletHashOf(wallet) {
@@ -176,9 +178,13 @@ export function requestText(intent, request) {
     if (typeof check !== 'boolean') return null;
     if (ownBurn && (burnTx === null || walletHash === null || !isSolanaAddress(burner))) return null;
   }
-  // A reservation always names the wallet, and the one-time address the page made; an unlink the wallet the page shows.
+  // A reservation always names the wallet, and the one-time address the page made; an unlink the wallet the page shows;
+  // a claim the wallet and the node whose balance it moves.
   if (intent === 'reserve' && (walletHash === null || !isSolanaAddress(burner))) return null;
   if (intent === 'unlink' && walletHash === null) return null;
+  if (intent === 'claim' && (walletHash === null || typeof request.nodeId !== 'string' || !CLAIM_NODE_ID_RE.test(request.nodeId))) {
+    return null;
+  }
   return JSON.stringify(Object.fromEntries(keys.map((k) => [k, request[k]])));
 }
 
@@ -318,6 +324,11 @@ function keysFor(intent, status) {
   return [...base, ...((ROWS[intent] && ROWS[intent][status]) || [])];
 }
 
+function answerNodeOk(intent, obj, request) {
+  if (intent !== 'claim') return obj.nodeId === lightNodeId(obj.qnet);
+  return !!request && obj.nodeId === request.nodeId && ownNodeType(obj.nodeId, obj.qnet) !== null;
+}
+
 const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
 const isU64 = (v) => typeof v === 'string' && U64_RE.test(v) && (v.length < 20 || v <= '18446744073709551615');
 const bigOf = (v) => BigInt(v);
@@ -353,7 +364,9 @@ export function plaintextProblem(text, session, { now = Math.floor(Date.now() / 
   if ('error' in obj && !LINK.INTENT_ERRORS[intent].includes(obj.error)) return 'error';
   if ('qnet' in obj && !isEonAddress(obj.qnet)) return 'qnet';
   if ('solana' in obj && !isSolanaAddress(obj.solana)) return 'solana';
-  if ('nodeId' in obj && obj.nodeId !== lightNodeId(obj.qnet)) return 'nodeId';
+  // A `claim` answer names the node the request named, the light or the super node of `qnet`; every other answer the
+  // light node of `qnet`.
+  if ('nodeId' in obj && !answerNodeOk(intent, obj, request)) return 'nodeId';
   if ('qnet' in obj && request && request.walletHash && walletHashOf(obj.qnet) !== request.walletHash) return 'walletHash';
   if (intent === 'link' && obj.status === 'ok') {
     if (typeof obj.bound !== 'boolean') return 'bound';
@@ -578,8 +591,9 @@ async function otherNodeProblem(node, qnet) {
  * wallet's other node (`otherNode`), aiqnet.io's record of its burn (`record`), this device's binding (`binding`), and
  * the actions that sign. Answers { kind: 'connect', addresses } · { kind: 'reserve', qnet, nodeId, burner } ·
  * { kind: 'link', mode: 'consent' | 'device', nodeId, qnet, device, switchFrom } · { kind: 'unlink', mode: 'here', nodeId,
- * qnet, since } · { kind: 'unlink', mode: 'wallet', nodeId, qnet, platform, since } · { kind: 'claim', nodeId, qnet,
- * amountNano } · { kind: 'claim_empty', nodeId, qnet } · { kind: 'unavailable', error, reason? }.
+ * qnet, since } · { kind: 'unlink', mode: 'wallet', nodeId, qnet, platform, since } · { kind: 'claim', nodeId, nodeType,
+ * qnet, amountNano } · { kind: 'claim_empty', nodeId, nodeType, qnet } · { kind: 'unavailable', error, reason? }. A `claim`
+ * moves the balance of the node the request names, this wallet's light or super node (`nodeType`), and no other.
  */
 export async function prepareOffer(link, { wallet, session = null, node = null }) {
   if (link.intent === 'connect') {
@@ -591,6 +605,7 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
   const request = (session && session.request) || {};
   if (request.walletHash && request.walletHash !== walletHashOf(qnet)) return unavailable('WALLET_MISMATCH');
   if (!node) return unavailable('INTERNAL');
+  if (link.intent === 'claim') return claimOffer(node, qnet, request.nodeId);
   const nodeId = lightNodeId(qnet);
   if ((link.intent === 'link' || link.intent === 'reserve') && node.serverNode) return unavailable('NODE_OTHER');
 
@@ -633,16 +648,6 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
   const status = await node.status(nodeId);
   if (!status || status.onChain === null) return unavailable('NETWORK');
 
-  if (link.intent === 'claim') {
-    if (status.onChain !== true) return unavailable('NO_NODE');
-    if (node.claimBusy && node.claimBusy()) return unavailable('CLAIM_BUSY');
-    const amount = await node.balance(nodeId);
-    if (!Number.isSafeInteger(amount) || amount < 0) return unavailable('NETWORK');
-    return amount >= LINK.CLAIM_MIN_NANO
-      ? { kind: 'claim', nodeId, qnet, amountNano: amount }
-      : { kind: 'claim_empty', nodeId, qnet };
-  }
-
   const features = status.features || [];
   const device = await node.device();
   const capable = !!device && device.capable === true;
@@ -668,6 +673,29 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
   return {
     kind: 'link', mode: 'consent', nodeId, qnet, burnTx: request.burnTx, burner, device, features, switchFrom: capable ? switchFrom : null,
   };
+}
+
+// The `claim` offer for the node the request names (`nodeId`): this wallet's light node, whose public status two of its
+// shard owners give alike, or its super node, which two genesis nodes list alike (node.serverListed). Any other id is
+// another wallet's, refused before anything is read. The amount is the node balance (the wallet's, whichever of its
+// node ids is asked).
+async function claimOffer(node, qnet, nodeId) {
+  const nodeType = ownNodeType(nodeId, qnet);
+  if (nodeType === null) return unavailable('WALLET_MISMATCH');
+  let listed;
+  if (nodeType === 'light') {
+    const status = await node.status(nodeId);
+    listed = status ? status.onChain : null;
+  } else {
+    listed = typeof node.serverListed === 'function' ? await node.serverListed(nodeId) : null;
+  }
+  if (listed !== true) return unavailable(listed === false ? 'NO_NODE' : 'NETWORK');
+  if (node.claimBusy && node.claimBusy()) return unavailable('CLAIM_BUSY');
+  const amount = await node.balance(nodeId);
+  if (!Number.isSafeInteger(amount) || amount < 0) return unavailable('NETWORK');
+  return amount >= LINK.CLAIM_MIN_NANO
+    ? { kind: 'claim', nodeId, nodeType, qnet, amountNano: amount }
+    : { kind: 'claim_empty', nodeId, nodeType, qnet };
 }
 
 const u64Text = (n) => (typeof n === 'bigint' ? n.toString() : String(n));

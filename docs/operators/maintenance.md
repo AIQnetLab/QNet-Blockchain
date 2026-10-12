@@ -1,6 +1,6 @@
 # Node maintenance
 
-This document covers day-to-day operation of a running QNet Super node: which endpoints to poll and what their
+This document covers day-to-day operation of a running QNet Blockchain Super node: which endpoints to poll and what their
 fields mean, how to read the node's consensus-position diagnostics, how logging works, how disk usage grows and what
 the node prunes on its own, what must be backed up, how to upgrade, the coordinated-restart procedure, and how to work
 through common failure states. Installation and first start are in [running-a-node.md](running-a-node.md); every
@@ -206,6 +206,8 @@ start unless `QNET_SKIP_RAM_CHECK` is set, and then logs `[CRIT][MEMORY] INSUFFI
 
 ## Public HTTPS endpoint
 
+A Super node that is not a genesis identity opens its own HTTPS listener for wallets, with a certificate it
+obtains itself ([public RPC](running-a-node.md#public-rpc-port-443)); this section is about the genesis nodes.
 The node's RPC is plain HTTP on `:8001`. A phone platform that refuses cleartext to a public host — iOS
 does, and the Android build will once the exception is dropped — can only reach a node through a TLS
 name. `scripts/node-tls.sh` puts that in front of each genesis node: a Caddy container in host network
@@ -241,6 +243,9 @@ never stored, so the on-disk copy is worthless without the code — keep code an
 [node-activation.md](../economics/node-activation.md). If a node's derived public key does not match its chain anchor,
 startup aborts with `[CRIT][NODE] identity_anchor_mismatch` and a hash of both keys for comparison; the remedy is to
 restore the correct mnemonic.
+
+`<data dir>/wallet_tls/` (the public RPC's CA account, certificate, serving key and schedule) needs no backup: a node
+that starts without it creates a new account key and serving key and requests a new certificate on the usual schedule.
 
 For chain data:
 

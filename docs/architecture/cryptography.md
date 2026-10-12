@@ -1,6 +1,6 @@
 # Cryptography
 
-This document describes the cryptographic primitives the QNet node runs: the post-quantum signature
+This document describes the cryptographic primitives the QNet Blockchain node runs: the post-quantum signature
 scheme used end-to-end, key derivation from an operator's mnemonic, how the on-chain address binds to
 a signing key, which hash function is used where, the domain separation strings that keep those uses
 from colliding, the three accumulator constructions behind the chain's commitments, and transport
@@ -189,6 +189,7 @@ in one context can never be replayed as a valid preimage in another. The main in
 | `RDCR:` | coordinated-recovery decree over the genesis hash, sequence and target height, verified against the genesis consensus keys |
 | `QNet_Seed_FP_v1` | wallet seed fingerprint |
 | `qnet_onchain_reg:`, `burn_attest:` | burn-owner binding and burn-attestation quorum messages |
+| `node_serve_cert:`, `node_serve_proof:` | the wallet plane's ServeCert (wallet key) and per-challenge serving proof (serving key), after the chain tag |
 | `QNET_SECRET_INTEGRITY_V1`, `QNET_DB_ENCRYPTION_V1`, `qnet-light-challenge-secret-v1` | key-file integrity tag, database key derivation, light-client RPC challenge MAC |
 
 Transaction signing preimages are type-tagged ASCII strings, and every one of them is prefixed with
@@ -331,6 +332,15 @@ provider. ALPN is `qnet-p2p-v1`.
   consensus registry, or the local verifier is not yet published — the peer is admitted as
   unauthenticated transport, and nothing it asserts is trusted until a message of its own verifies.
 
+The wallet plane of a Super node (HTTPS for wallets, [RPC reference](../developers/rpc-api.md#wallet-plane))
+is a separate `rustls` server on the same provider: TLS 1.3, and TLS 1.2 with ECDHE-ECDSA AEAD suites only;
+key exchange `X25519MLKEM768` first, then X25519 and P-256; no 0-RTT. Its certificate is a short-lived
+public-CA certificate for the node's IPv4 under a fresh P-256 key, requested with an ES256-signed account
+(`rpc/acme.rs`). Who the node is comes from its ServeCert, not from TLS: the wallet key signs (ML-DSA-65)
+`{chain tag}node_serve_cert:{hex(SHA3-256(body))}` over a body the node composes, and a random, node-local
+serving key, replaced every 30 days, signs `{chain tag}node_serve_proof:{challenge}:{hex cert_hash}:{ip}` for each
+client challenge. Neither kind is a transaction preimage.
+
 See [networking](networking.md).
 
 ## Symmetric encryption and secret handling
@@ -353,7 +363,7 @@ See [mobile wallet](../applications/mobile-wallet.md).
 
 ## Where each signature scheme is used
 
-ML-DSA-65 authenticates everything QNet itself produces: consensus messages, blocks, node identity,
+ML-DSA-65 authenticates everything QNet Blockchain itself produces: consensus messages, blocks, node identity,
 and all transactions, including every system transaction type.
 
 The Phase-1 burn credential is external, so it is verified with the host chain's own signature
@@ -362,7 +372,7 @@ scheme. `verify_ed25519_signature` validates the burn wallet owner's signature o
 during node registration, authorising which node a given burn may activate; `attest_root_tag` is
 `hex(SHA3-256(ML-DSA-65 pk))` or the empty string. It requires a 128-hex-character (64-byte)
 signature and a base58 address decoding to exactly 32 bytes, with a length gate applied before base58
-decoding. The related burn-attestation quorum message, signed with ML-DSA-65 by QNet nodes, is
+decoding. The related burn-attestation quorum message, signed with ML-DSA-65 by QNet Blockchain nodes, is
 `burn_attest:{burn_tx}:{burn_wallet}:{wallet}:{amount}:{node_type_u8}:{cost}:{attest_epoch}`, with the
 node type encoded as a stable integer so all signers produce identical bytes. See
 [node activation](../economics/node-activation.md).

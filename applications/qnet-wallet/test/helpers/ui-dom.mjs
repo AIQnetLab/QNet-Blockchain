@@ -408,9 +408,9 @@ const GLOBALS = ['window', 'document', 'navigator', 'location', 'localStorage', 
 
 /**
  * Puts a fresh fake window/document on globalThis.
- * @param {{localStorage?: Record<string, string>}} [options]
+ * @param {{localStorage?: Record<string, string>, search?: string}} [options] search: the page address's query
  */
-export function installDom({ localStorage = {} } = {}) {
+export function installDom({ localStorage = {}, search = '' } = {}) {
   const saved = new Map(GLOBALS.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const document = new FakeDocument();
   const app = document.createElement('main');
@@ -424,7 +424,7 @@ export function installDom({ localStorage = {} } = {}) {
   };
   const location = {
     reloads: 0,
-    search: '',
+    search,
     reload() {
       this.reloads += 1;
     },

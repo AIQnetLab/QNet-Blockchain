@@ -254,7 +254,7 @@ describe('integration: one wallet from setup to delete', () => {
     assert.equal(network.registrations.length, 3);
     assert.equal((await ask('activation.status')).result.registration.state, 'onchain');
     await popup.click('[data-tab="activate"]');
-    await popup.until(() => /Recorded on the QNet network for this wallet/.test(popup.text()), 'the record');
+    await popup.until(() => /Recorded on QNet Blockchain for this wallet/.test(popup.text()), 'the record');
     assert.equal(popup.$('[data-action="record"]'), null);
   });
 
@@ -392,22 +392,14 @@ describe('integration: one wallet from setup to delete', () => {
   });
 });
 
-// Forgot password → Reset wallet, the popup against the real worker: the phrase of another wallet is named before
-// anything goes, Back keeps the old vault, and only the ticked checkbox replaces it.
+// Forgot password → Reset wallet, the popup against the real worker (owner, 11.10): Back keeps the vault; Reset wallet
+// erases it while locked, with no password, as Delete wallet does; the popup then shows its first screen, and the
+// recovery phrase imported again brings the wallet back under a new password.
 describe('integration: Reset wallet from the lock screen', () => {
   const NEW_PASSWORD = 'quantum otter lantern meadow';
   const storedRecord = () => structuredClone(globalThis.indexedDB.dump(VAULT_DB.NAME).stores[VAULT_DB.STORE][VAULT_DB.KEY]);
 
-  async function forgotWithPeerPhrase() {
-    await popup.click('[data-action="forgot-password"]');
-    type(popup.$('textarea[name="phrase"]'), PEER_MNEMONIC);
-    type(popup.$('input[name="new-password"]'), NEW_PASSWORD);
-    type(popup.$('input[name="confirm-password"]'), NEW_PASSWORD);
-    await popup.click('[data-action="restore"]');
-    await popup.until(() => popup.$('input[name="understand"]') !== null, 'the confirmation');
-  }
-
-  it('names both wallets and erases nothing until the checkbox is ticked; then the other wallet takes its place', async () => {
+  it('Back erases nothing; Reset wallet erases the locked wallet, and only its phrase brings it back', async () => {
     const setup = pageSender(browser.chrome.runtime, 'setup');
     assert.equal((await browser.ask(setup, 'vault.import', { mnemonic: KAT_MNEMONIC, password: PASSWORD })).ok, true);
     await ask('vault.lock');
@@ -416,28 +408,29 @@ describe('integration: Reset wallet from the lock screen', () => {
     popup = await openView(browser, 'popup');
     await popup.until(() => popup.$('[data-action="forgot-password"]') !== null, 'the lock screen');
 
-    await forgotWithPeerPhrase();
-    const text = popup.text();
-    assert.match(popup.$('.notice-danger').textContent, /different wallet/);
-    for (const address of [WALLET.qnet, WALLET.solana, PEER.qnet, PEER.solana]) assert.ok(text.includes(address), address);
-    assert.equal(popup.$('[data-action="restore-confirm"]').disabled, true);
-    assert.deepEqual(storedRecord(), before, 'the check erased nothing');
+    await popup.click('[data-action="forgot-password"]');
+    assert.equal(popup.$$('input, textarea').length, 0, 'nothing to type');
     await popup.click('[data-action="back"]');
     assert.ok(popup.$('[data-action="unlock"]'));
     assert.deepEqual(storedRecord(), before, 'Back erased nothing');
-    assert.equal((await ask('vault.unlock', { password: PASSWORD })).result.qnet, WALLET.qnet, 'the old vault still opens');
-    await ask('vault.lock');
 
-    await popup.until(() => popup.$('[data-action="forgot-password"]') !== null, 'the lock screen');
-    await forgotWithPeerPhrase();
-    popup.$('input[name="understand"]').click();
-    await popup.click('[data-action="restore-confirm"]');
-    await popup.until(() => /Wallet restored/.test(popup.text()), 'the result');
-    assert.ok(popup.text().includes(PEER.qnet) && popup.text().includes(PEER.solana));
-    assert.equal(popup.location.reloads, 0, "the popup's own reset does not reload it");
-    assert.equal(storedRecord().aad.qnetAddress, PEER.qnet);
+    await popup.click('[data-action="forgot-password"]');
+    await popup.click('[data-action="reset-wallet"]');
+    await popup.until(() => popup.location.reloads > 0, 'the reload');
+    assert.equal((await ask('vault.status')).result.exists, false);
+    assert.equal((await globalThis.indexedDB.databases()).some((d) => d.name === VAULT_DB.NAME), false);
+    assert.deepEqual(browser.chrome.storage.local.dump(), {});
+
+    // the reloaded popup: the first screen with its two buttons
+    popup.close();
+    popup = await openView(browser, 'popup');
+    await popup.until(() => popup.$('[data-action="open-import"]') !== null, 'the first screen');
+    assert.ok(popup.$('[data-action="open-create"]'));
+
+    const imported = await browser.ask(setup, 'vault.import', { mnemonic: KAT_MNEMONIC, password: NEW_PASSWORD });
+    assert.equal(imported.result.qnet, WALLET.qnet);
     await ask('vault.lock');
     assert.equal((await ask('vault.unlock', { password: PASSWORD })).error.code, 'BAD_PASSWORD');
-    assert.equal((await ask('vault.unlock', { password: NEW_PASSWORD })).result.qnet, PEER.qnet);
+    assert.equal((await ask('vault.unlock', { password: NEW_PASSWORD })).result.qnet, WALLET.qnet);
   });
 });

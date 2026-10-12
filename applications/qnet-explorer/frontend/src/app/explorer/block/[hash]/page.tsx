@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import ExplorerLink from '@/components/ExplorerLink';
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import type { Block, BlockTransaction, HeartbeatEntry } from '@/lib/types';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
@@ -190,9 +190,9 @@ export default function BlockPage() {
             <span className="detail-value">
               {block.height > 0 ? (
                 <>
-                  <ExplorerLink href={`/explorer/block/${block.height - 1}`} className="address-link">
+                  <Link href={`/explorer/block/${block.height - 1}`} className="address-link">
                     {truncate(block.previous_hash)}
-                  </ExplorerLink>
+                  </Link>
                   <CopyBtn text={block.previous_hash} />
                 </>
               ) : (
@@ -314,9 +314,9 @@ export default function BlockPage() {
               <tr key={idx}>
                 <td>
                   {tx.hash ? (
-                    <ExplorerLink href={`/explorer/tx/${tx.hash}`} className="address-link">
+                    <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
                       {truncate(tx.hash, 6, 4)}
-                    </ExplorerLink>
+                    </Link>
                   ) : (
                     <span className="mono">{idx + 1}</span>
                   )}
@@ -326,17 +326,17 @@ export default function BlockPage() {
                 </td>
                 <td>
                   {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
-                    <ExplorerLink href={`/explorer/address/${tx.from}`} className="address-link">
+                    <Link href={`/explorer/address/${tx.from}`} className="address-link">
                       {truncate(tx.from, 6, 4)}
-                    </ExplorerLink>
+                    </Link>
                   ) : (
                     <span className="address-link">{txPartyLabel(tx.from || 'N/A', full)}</span>
                   )}
                   <span className="tx-arrow">→</span>
                   {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
-                    <ExplorerLink href={`/explorer/address/${tx.to}`} className="address-link">
+                    <Link href={`/explorer/address/${tx.to}`} className="address-link">
                       {truncate(tx.to, 6, 4)}
-                    </ExplorerLink>
+                    </Link>
                   ) : (
                     <span className="address-link">{txPartyLabel(tx.to || 'N/A', full)}</span>
                   )}
@@ -372,9 +372,9 @@ export default function BlockPage() {
                     <td>{formatTime(entry.timestamp)}</td>
                     <td>{entry.node_id}</td>
                     <td>
-                      <ExplorerLink href={`/explorer/address/${entry.node_address}`} className="address-link">
+                      <Link href={`/explorer/address/${entry.node_address}`} className="address-link">
                         {truncate(entry.node_address, 6, 4)}
-                      </ExplorerLink>
+                      </Link>
                     </td>
                     <td>
                       <span className={`node-type-badge ${entry.node_type.toLowerCase()}`}>
@@ -402,9 +402,9 @@ export default function BlockPage() {
               {block.micro_blocks.map((mbHash, idx) => (
                 <div key={idx} className="related-block-row">
                   <span className="related-label">#{idx + 1}</span>
-                  <ExplorerLink href={`/explorer/block/${mbHash}`} className="block-link">
+                  <Link href={`/explorer/block/${mbHash}`} className="block-link">
                     {truncate(mbHash, 12, 12)}
-                  </ExplorerLink>
+                  </Link>
                   <CopyBtn text={mbHash} />
                 </div>
               ))}

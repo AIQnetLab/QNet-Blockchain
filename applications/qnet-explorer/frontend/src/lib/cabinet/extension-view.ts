@@ -71,13 +71,14 @@ export function recordsLightNode(answer: ActivationAnswer): answer is Activation
 
 export type ClaimVia = 'app' | 'extension';
 
-// The error of a `claim` answer, told by the wallet that answered.
+// The error of a `claim` answer, told by the wallet that answered: the extension's WALLET_MISMATCH means it holds
+// another wallet than the one whose node the page named.
 export function claimErrorKey(error: LinkError, via: ClaimVia): MessageKey {
   switch (error) {
     case 'NO_WALLET':
       return via === 'extension' ? 'ext_error_NO_WALLET' : 'link_error_NO_WALLET';
     case 'WALLET_MISMATCH':
-      return 'link_error_WALLET_MISMATCH';
+      return via === 'extension' ? 'claim_failure_other_wallet' : 'link_error_WALLET_MISMATCH';
     case 'NO_NODE':
     case 'NETWORK':
     case 'CLAIM_REFUSED':

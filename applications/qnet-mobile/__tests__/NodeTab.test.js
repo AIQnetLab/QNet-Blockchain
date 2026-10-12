@@ -9,7 +9,8 @@ import React from 'react';
 import renderer, { act } from 'react-test-renderer';
 import { Text, TouchableOpacity } from 'react-native';
 import NodeTab, {
-  nodeView, linkedHere, bindingVerdict, refusalText, deviceText, agoText, checkState, CHECK_RUNNING_MS,
+  nodeView, linkedHere, bindingVerdict, refusalText, deviceText, agoText, checkState, CHECK_RUNNING_MS, lightShownHere,
+  waitingAdmission, keptServerStatus, rewardAdmission,
 } from '../src/screens/NodeTab';
 import {
   readNodeStatus, agreedFeatures, readLinkPending, BIND_SETTLE_MS, LINK_PENDING_KEY,
@@ -180,10 +181,10 @@ describe('what each state shows', () => {
     }
   });
 
-  it('checking and unreachable keep the balance and Move of a node the wallet has (owner, 05.10)', () => {
+  it('checking and unreachable keep the balance and Move of the node this device runs (owner, 05.10)', () => {
     for (const [l, key] of [
-      [light({ status: null, balanceNano: 4_714_356_375_000 }), 'node_checking'],
-      [light({ status: status({ onChain: null }), balanceNano: 4_714_356_375_000 }), 'node_unreachable'],
+      [light({ local: LOCAL, status: null, balanceNano: 4_714_356_375_000 }), 'node_checking'],
+      [light({ local: LOCAL, status: status({ onChain: null }), balanceNano: 4_714_356_375_000 }), 'node_unreachable'],
     ]) {
       const tree = render({ light: l });
       expect(shown(tree)).toContain(t(key));
@@ -193,19 +194,32 @@ describe('what each state shows', () => {
     }
   });
 
-  it('another device: Use this device, the reason of a refusal, and the balance with Move', () => {
-    let tree = render({ light: light({ balanceNano: 2 * 1e9 }) });
-    expect(shown(tree)).toContain(t('node_other_device'));
-    expect(shown(tree)).toContain('2 QNC');
-    expect(buttons(tree)).toEqual(['node-use', 'node-move']);
-    tree = render({ light: light({ status: status({ deviceBound: false }) }), refusal: { reason: 'device_unsupported' } });
-    expect(shown(tree)).toContain(t('node_no_device'));
-    expect(shown(tree)).toContain(t('node_cant_run'));
-    expect(buttons(tree)).toEqual(['node-use', 'node-move']);
+  // Owner, 11.10: one wallet, one node. A light node bound to another device, or to none, is not this device's to show:
+  // the tab says what a wallet without a node says, with no balance, no button and no word about binding or activation.
+  it('another device, no device, or no binding here: what a wallet without a node shows, nothing to press', () => {
+    const S = LOCAL.seq;
+    for (const l of [
+      light({ balanceNano: 2 * 1e9 }), // bound elsewhere, no binding here
+      light({ status: status({ deviceBound: false }), balanceNano: 2 * 1e9 }), // bound to no device
+      light({ local: LOCAL, status: status({ bindingSeqAgreed: S + 5 }), balanceNano: 2 * 1e9 }), // taken over
+      light({ local: LOCAL, status: status({ bindingSeqAgreed: S, deviceBound: false }), balanceNano: 2 * 1e9 }), // unlinked
+      light({ status: status({ deviceBoundAgreed: null }), balanceNano: 2 * 1e9 }), // no verdict, no binding here
+      light({ status: status({ onChain: null }), balanceNano: 2 * 1e9 }), // network not reached, no binding here
+    ]) {
+      const tree = render({ light: l, refusal: { reason: 'device_unsupported' } });
+      expect(shown(tree)).toBe(`${t('node_title')}\n${t('node_none')}`);
+      expect(buttons(tree)).toEqual([]);
+      expect(lightShownHere(l, nodeView(l))).toBe(false);
+    }
+    // Not read yet: still being checked; bound here or being linked here: shown.
+    expect(lightShownHere(null, { state: 'checking' })).toBe(true);
+    expect(lightShownHere(light({ local: LOCAL }), nodeView(light({ local: LOCAL })))).toBe(true);
+    const pending = light({ status: status({ onChain: false }), pending: { nodeId: NODE, T: 1, expired: false } });
+    expect(lightShownHere(pending, nodeView(pending))).toBe(true);
   });
 
   it('an unknown balance reads as unknown, never 0 QNC, and cannot be moved', () => {
-    for (const l of [light({ balanceNano: null }), light({ status: status({ onChain: null }), balanceNano: undefined })]) {
+    for (const l of [light({ local: LOCAL, balanceNano: null }), light({ local: LOCAL, status: status({ onChain: null }), balanceNano: undefined })]) {
       const tree = render({ light: l });
       expect(shown(tree)).toContain('—');
       expect(shown(tree)).not.toContain('0 QNC');
@@ -219,13 +233,12 @@ describe('what each state shows', () => {
     expect(deviceText(t, { capable: false, reason: 'device_desktop' })).toBe(t('node_cant_run'));
     expect(deviceText(t, { capable: false, reason: 'device_unsupported' })).toBe(t('node_cant_run'));
     expect(deviceText(t, { capable: false, reason: 'device_secondary_user' })).toBe(t('node_main_profile'));
-    for (const s of [status(), status({ deviceBound: false })]) {
-      const tree = render({ light: light({ status: s, device: { capable: false, reason: 'device_unsupported' } }) });
-      expect(shown(tree)).toContain(t('node_cant_run'));
-      // Nothing to run the node with; moving its balance takes only the wallet key, so that stays.
-      expect(buttons(tree)).toEqual(['node-move']);
-    }
-    // The wallet stays whole: a node on another device still shows, and so does no node.
+    // The node on this device, whose card would offer Use this device (a binding with no device key once two genesis nodes
+    // take them): the device says it cannot run a node instead, and moving the balance, the wallet key's alone, stays.
+    const tree = render({ light: light({ local: LOCAL, status: status({ features: ['device_v1'] }), device: { capable: false, reason: 'device_unsupported' } }) });
+    expect(shown(tree)).toContain(t('node_cant_run'));
+    expect(buttons(tree)).toEqual(['node-move']);
+    // The wallet stays whole: no node says so.
     const none = render({ light: light({ status: status({ onChain: false }), device: { capable: false, reason: 'device_desktop' } }) });
     expect(shown(none)).toContain(t('node_none'));
   });
@@ -236,13 +249,15 @@ describe('what each state shows', () => {
     const tree = render({
       light: light({
         local: LOCAL, balanceNano: 12.5e9, answeredAt: { epoch, at },
-        status: status({ answered: true, counted: { since: 6, counted: 5, last: epoch - 1 } }),
+        status: status({ answered: true, counted: { since: 6, counted: 5, last: epoch - 1 },
+          device: { platform: 'android', model: 'Acme Phone 7', linkedSince: 1790035200, lastAnswerEpoch: epoch - 1, state: 'online' } }),
       }),
     });
     const text = shown(tree);
     expect(text).toContain(t('node_badge_online'));
     expect(text).toContain(t('node_answered_yes', { time: '14:05' }));
-    expect(text).toContain(t('node_counted_last', { n: 5, m: 6 }));
+    // No count of epochs and no device model: the site's node cabinet shows both (owner, 11.10).
+    expect(text).not.toMatch(/Counted epochs|5 of 6|Acme Phone 7|Device/);
     expect(text).toContain('12.5 QNC');
     // No line on how the node works: status rows, the balance and Move to wallet only.
     expect(text).not.toMatch(/app switcher|status requests|until you move it|reaches 1 QNC/);
@@ -312,7 +327,7 @@ describe('what each state shows', () => {
     lastSeenAgoSeconds: 125, heartbeatCount: 4, requiredHeartbeats: 9, pendingRewards: 2e9, reputation: 70, ...over,
   });
 
-  it('a server node shows last seen, its heartbeats this epoch, counted and missed epochs, and the balance', () => {
+  it('a server node shows last seen, its heartbeats this epoch, missed epochs, and the balance', () => {
     const tree = render({
       server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: { counted: 5, missed: 1 } }, light: null,
     });
@@ -321,7 +336,7 @@ describe('what each state shows', () => {
     expect(text).toContain(t('node_badge_online'));
     expect(text).toContain(`${t('node_last_seen')}\n${t('node_last_seen_ago', { time: t('node_ago_m', { m: 2 }) })}`);
     expect(text).toContain(`${t('node_heartbeats')}\n${t('node_heartbeats_of', { n: 4, m: 9 })}`);
-    expect(text).toContain(`${t('node_counted')}\n${t('node_counted_last', { n: 5, m: 6 })}`);
+    expect(text).not.toMatch(/Counted epochs|5 of 6/); // the site's node cabinet counts epochs (owner, 11.10)
     expect(text).toContain(`${t('node_missed')}\n1`);
     expect(text).toContain('2 QNC');
     expect(buttons(tree)).toEqual(['node-move']);
@@ -336,6 +351,87 @@ describe('what each state shows', () => {
     expect(off).not.toContain(t('node_missed'));
   });
 
+  // Owner, 11.10: a coming network rule holds outside super nodes back from consensus while registrations stay open. Such
+  // a node, registered and not admitted (its status's consensus_admitted false), says so in place of Offline, and what
+  // it earned moves all the same. A node that says nothing of admission is not waiting.
+  it('a super node registered and not admitted yet: waiting for admission, never Offline, its balance movable', () => {
+    const waiting = serverStatus({ isOnline: false, lastSeen: 0, lastSeenAgoSeconds: undefined, consensusAdmitted: false });
+    const tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: waiting, epochs: null }, light: null });
+    const text = shown(tree);
+    expect(text).toContain(`${t('node_status_node')}\n${t('node_waiting_admission')}`);
+    expect(text).toContain(t('node_badge_waiting'));
+    expect(text).not.toContain(t('node_badge_offline'));
+    expect(text).not.toContain(t('node_server_offline'));
+    expect(text).toContain('2 QNC');
+    expect(tree.root.find((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function').props.disabled).toBe(false);
+    expect(t('node_waiting_admission')).toBe('Registered — waiting for admission to QNet Blockchain');
+    expect(waitingAdmission(waiting)).toBe(true);
+    for (const s of [serverStatus({ isOnline: false }), serverStatus({ consensusAdmitted: true }), serverStatus({ registered: false, consensusAdmitted: false }),
+      serverStatus({ admission: 'admitted' }), serverStatus({ admission: 'not_required' }), serverStatus({ registered: false, admission: 'waiting' }), null]) {
+      expect(waitingAdmission(s)).toBe(false);
+    }
+    // The node's admission 'waiting' (what live nodes report) is the same state, as the site shows it: online or not.
+    expect(waitingAdmission(serverStatus({ admission: 'waiting' }))).toBe(true);
+    const reported = shown(render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ admission: 'waiting' }), epochs: null }, light: null }));
+    expect(reported).toContain(`${t('node_status_node')}\n${t('node_waiting_admission')}`);
+    expect(reported).toContain(t('node_badge_waiting'));
+    expect(reported).not.toContain(t('node_badge_online'));
+    expect(reported).not.toContain(t('node_active'));
+    // Online, as before, while the node names no admission rule.
+    expect(shown(render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: null }, light: null })))
+      .toContain(t('node_badge_online'));
+  });
+
+  // Plan P1: the node's own admission field, when it reports it admitted, is a row of the card ("Admitted"); waiting is
+  // the node's status (the test above); a node that says nothing of it, or that no rule governs the epoch, shows no row.
+  // Epochs outside the admitted set are not admitted, never missed.
+  it('a super node\'s admission, when the node reports it, and its epochs outside admission counted apart', () => {
+    const card = (over, epochs = null) => shown(render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(over), epochs }, light: null }));
+    expect(card({ admission: 'admitted' })).toContain(`${t('node_admission')}\n${t('node_admission_admitted')}`);
+    for (const over of [{}, { admission: 'waiting' }, { admission: 'not_required' }, { admission: undefined }]) {
+      expect(card(over)).not.toContain(t('node_admission'));
+    }
+    expect(rewardAdmission(serverStatus({ admission: 'waiting', registered: false }))).toBe(null);
+    expect(rewardAdmission(null)).toBe(null);
+    const text = card({ admission: 'waiting' }, { counted: 3, missed: 1, notAdmitted: 4 });
+    expect(text).toContain(`${t('node_missed')}\n1`);
+    expect(text).toContain(`${t('node_not_admitted')}\n4`);
+    expect(card({}, { counted: 3, missed: 0, notAdmitted: 0 })).not.toContain(t('node_not_admitted'));
+  });
+
+  // Owner, 11.10: a move in transit (services/ClaimTransit) shows as "Moving X" with the button off and the rest of the
+  // balance; one that did not go through is said under the button. The balance and its watermark are the wallet's, so a
+  // move made by either node id holds the card that shows the balance, whichever it is.
+  it('a move in transit: Moving X, the button off, the rest of the balance; nothing else says what became of it', () => {
+    const move = (nodeId, amountNano, restNano) => ({ nodeId, amountNano, restNano, prevWatermark: 100, lastEpoch: 103, parts: null, txHash: 'ab'.repeat(32), time: Date.now() });
+    // A move of the light node's id (a QNet Link sheet), with the super node's card showing the wallet's balance.
+    const transit = { owner: 'w', moves: [move(NODE, '12500000000', 500_000_000)], outcomes: [], floor: null };
+    const tree = render({
+      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ pendingRewards: 13e9 }), epochs: null },
+      light: light({ local: LOCAL, balanceNano: 13e9, status: status({ answered: true }) }),
+      transit,
+    });
+    const text = shown(tree);
+    expect(text).toContain(t('node_moving', { amount: '12.5 QNC' }));
+    // The rest of the balance, never the amount moving, and once: the light card under it shows no balance of its own.
+    expect(text).toContain(`${t('node_balance')}\n0.5 QNC`);
+    expect(text).not.toContain('13 QNC');
+    expect(text.split(t('node_balance')).length - 1).toBe(1);
+    const moves = tree.root.findAllByType(TouchableOpacity).filter((n) => n.props.testID === 'node-move');
+    expect(moves.map((n) => n.props.disabled)).toEqual([true]);
+    // The light card alone holds the same move whichever id made it.
+    const alone = render({ light: light({ local: LOCAL, balanceNano: 13e9, status: status({ answered: true }) }),
+      transit: { ...transit, moves: [move(SUPER, '12500000000', 500_000_000)] } });
+    expect(shown(alone)).toContain(t('node_moving', { amount: '12.5 QNC' }));
+    expect(alone.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.disabled).toBe(true);
+    // A settled move leaves no sentence on the card (owner, 12.10: no "did not go through"): the balance, the button on.
+    const settled = { owner: 'w', moves: [], outcomes: [{ nodeId: SUPER, txHash: null, amountNano: '12500000000', result: 'done', at: Date.now() }], floor: 103 };
+    const after = render({ light: light({ local: LOCAL, balanceNano: 13e9, status: status({ answered: true }) }), transit: settled });
+    expect(after.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.disabled).toBe(false);
+    expect(shown(after)).toContain(`${t('node_balance')}\n13 QNC`);
+    expect(after.root.findAll((n) => n.props.testID === 'node-move-failed')).toEqual([]);
+  });
+
   it('how long ago, in the language\'s units: at least a minute, then hours and minutes, then days and hours', () => {
     expect(agoText(t, 0)).toBe(t('node_last_seen_ago', { time: t('node_ago_m', { m: 1 }) }));
     expect(agoText(t, 3599)).toBe(t('node_last_seen_ago', { time: t('node_ago_m', { m: 60 }) }));
@@ -346,20 +442,29 @@ describe('what each state shows', () => {
     expect(agoText(t, 1.5)).toBe(null);
   });
 
-  it('a wallet with a super and a light node on the chain: both cards, the server first, each with its move', () => {
+  // The node balance is the wallet's (the network sums one wallet's reward leaves whichever node id is asked), so with
+  // both cards it shows, and moves, once: on the server card. Before, each card showed the same figure with its own move.
+  it('a wallet with a super and a light node on the chain: both cards, the server first, the balance and its move once', () => {
     const moved = [];
     const tree = render({
-      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: null },
+      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ pendingRewards: 3e9 }), epochs: null },
       light: light({ local: LOCAL, balanceNano: 3e9, status: status({ answered: true }) }),
       onMove: () => moved.push('light'), onMoveServer: () => moved.push('server'),
     });
     const text = shown(tree);
     expect(text.indexOf(SUPER)).toBeGreaterThan(-1);
     expect(text.indexOf(SUPER)).toBeLessThan(text.indexOf(NODE));
-    expect(buttons(tree)).toEqual(['node-move', 'node-move']);
-    const moves = tree.root.findAllByType(TouchableOpacity).filter((n) => n.props.testID === 'node-move');
-    act(() => { moves[0].props.onPress(); moves[1].props.onPress(); });
-    expect(moved).toEqual(['server', 'light']);
+    expect(buttons(tree)).toEqual(['node-move']);
+    expect(text.split('3 QNC').length - 1).toBe(1);
+    act(() => { tree.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.onPress(); });
+    expect(moved).toEqual(['server']);
+    // A server card that shows no balance (not registered): the light card keeps its own.
+    const unregistered = render({
+      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ registered: false }), epochs: null },
+      light: light({ local: LOCAL, balanceNano: 3e9, status: status({ answered: true }) }),
+    });
+    expect(buttons(unregistered)).toEqual(['node-move']);
+    expect(shown(unregistered)).toContain('3 QNC');
     // Under a server node a light node that is not the wallet's shows nothing: no "no node" line under the server card.
     for (const s of [status({ onChain: false }), status({ onChain: null })]) {
       const only = render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: null }, light: light({ status: s }) });
@@ -369,10 +474,35 @@ describe('what each state shows', () => {
     }
   });
 
-  it('a node aiqnet.io recorded that the network does not list yet: its sentence for either type, nothing to press', () => {
+  // A super node shows on every device with its status, last seen, balance and move (owner, 11.10): a read that fails
+  // keeps the last good status (stale, said above it) rather than turn the card into the server text and back; before
+  // its first answer it is being checked; the server text is for a node the network says is not registered.
+  it('a super node\'s card: checking first, the last good status kept while a read fails, the server text only when not registered', () => {
+    const card = (status) => render({ server: { nodeType: 'super', nodeId: SUPER, status, epochs: null }, light: null });
+    expect(shown(card(null))).toContain(t('node_checking'));
+    expect(shown(card(null))).not.toContain(t('node_super_server'));
+    expect(shown(card({ success: false, error: 'network' }))).toContain(t('node_unreachable'));
+    expect(buttons(card({ success: false, error: 'network' }))).toEqual([]);
+    const good = serverStatus();
+    const kept = keptServerStatus(good, { success: false, error: 'network' }, SUPER);
+    expect(kept).toEqual({ ...good, stale: true });
+    const text = shown(card(kept));
+    expect(text).toContain(t('node_unreachable'));
+    expect(text).toContain(t('node_badge_online'));
+    expect(text).toContain('2 QNC');
+    expect(buttons(card(kept))).toEqual(['node-move']);
+    expect(text).not.toContain(t('node_super_server'));
+    // The next good answer replaces it, with no stale mark; another node's status is not kept for this one.
+    expect(keptServerStatus(kept, serverStatus({ pendingRewards: 5e9 }), SUPER)).toEqual(serverStatus({ pendingRewards: 5e9 }));
+    expect(keptServerStatus(good, { success: false }, 'super_node_other')).toEqual({ success: false });
+    expect(keptServerStatus(null, null)).toEqual({ success: false, error: 'network' });
+    expect(shown(card(serverStatus({ registered: false })))).toContain(t('node_super_server'));
+  });
+
+  it('a super node aiqnet.io recorded that the network does not list yet: its sentence, nothing to press; a light one is not this device\'s', () => {
+    // A light node bound to no device yet is not shown (owner, 11.10): what a wallet without a node shows.
     let tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'light' });
-    expect(shown(tree)).toContain(t('node_not_on_network_light'));
-    expect(shown(tree)).not.toContain(t('node_none'));
+    expect(shown(tree)).toBe(`${t('node_title')}\n${t('node_none')}`);
     expect(buttons(tree)).toEqual([]);
     tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'super' });
     expect(shown(tree)).toContain(t('node_title_super'));
@@ -389,8 +519,8 @@ describe('what each state shows', () => {
     tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ registered: false }), epochs: null }, light: null });
     expect(shown(tree)).toContain(t('node_super_server'));
     expect(t('node_not_on_network_super')).toBe(
-      "This wallet's super node has not joined the QNet network yet. It runs on a server with the QNet node software.");
-    expect(t('node_not_on_network_light')).toBe("This wallet's light node is not on the QNet network yet.");
+      "This wallet's super node has not joined QNet Blockchain yet. It runs on a server with QNet Blockchain node software.");
+    expect(hasKey('node_not_on_network_light')).toBe(false);
   });
 
   it('no card shows a code, a price, a link or an address to open', () => {

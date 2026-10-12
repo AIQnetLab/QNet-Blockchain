@@ -1,7 +1,7 @@
 // How the explorer names the chain's transaction types and system accounts in the QNet app's view (its in-app browser,
-// a page it opened with ?from=app, and every page before the wallet is detected; src/lib/activate-view.ts). The store
-// builds carry no reward or activation wording, so there the emission to node balances reads as the node balance it
-// is, and a node activation as a change of the node's status (SD-11). Outside that view the chain's own names stay.
+// and every page before the wallet is detected; src/lib/activate-view.ts). The store builds carry no reward or
+// activation wording, so there the emission to node balances reads as the node balance it is, and a node activation
+// as a change of the node's status (SD-11). Outside that view the chain's own names stay.
 
 // The explorer's type names (src/lib/tx-mapping.ts) and their names in the app's view.
 const IN_APP_TYPES: Record<string, string> = { Reward: 'Node balance', Activation: 'Node status' };

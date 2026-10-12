@@ -23,8 +23,10 @@ const WAY_INTRO: Record<Way, MessageKey> = { phone: 'guide_phone_intro', compute
 const FAQ: [MessageKey, MessageKey][] = [
   ['faq_one_q', 'faq_one_a'],
   ['faq_move_q', 'faq_move_a'],
+  ['faq_stop_q', 'faq_stop_a'],
   ['faq_code_q', 'faq_code_a'],
   ['faq_back_q', 'faq_back_a'],
+  ['faq_server_q', 'faq_server_a'],
   ['faq_words_q', 'faq_words_a'],
 ];
 

@@ -1,5 +1,5 @@
 // What the activation page asks the user to send to a payment address, as standard payment request texts for a QR
-// code: `solana:<address>?amount=<amount>&spl-token=<mint>&label=QNet%20activation` for the 1DEV (the mint of the
+// code: `solana:<address>?amount=<amount>&spl-token=<mint>&label=QNet%20Blockchain%20node%20activation` for the 1DEV (the mint of the
 // release's cluster), and the same without `spl-token` for the SOL. A wallet that scans one fills in the address, the
 // token and the amount; one request carries one token, so the SOL has a code of its own. Amounts are decimal, in whole
 // tokens, as the request form writes them. Pure.
@@ -7,7 +7,7 @@
 import { FUNDING_SOL_LAMPORTS } from './burn-tx.ts';
 import { ONE_DEV_MINT, SOL_DECIMALS } from '../one-dev.ts';
 
-export const REQUEST_LABEL = 'QNet activation';
+export const REQUEST_LABEL = 'QNet Blockchain node activation';
 
 // Base units of a token with `decimals` places as a plain decimal, without grouping or trailing zeros.
 export function decimalAmount(raw: bigint, decimals: number): string {

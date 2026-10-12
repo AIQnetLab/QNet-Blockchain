@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 //  and a fixed 30s would misclassify slow-tracked txs as dropped → duplicate-nonce churn)
 
 #[derive(Parser, Debug)]
-#[command(name = "qnet-loadtest", about = "QNet real-/transaction confirmed-TPS + finality-latency harness")]
+#[command(name = "qnet-loadtest", about = "QNet Blockchain real-/transaction confirmed-TPS + finality-latency harness")]
 struct Args {
     /// Comma-separated node base URLs, e.g. http://127.0.0.1:8001,http://1.2.3.4:8001
     #[arg(long, default_value = "http://127.0.0.1:8001")]
@@ -452,7 +452,7 @@ async fn main() {
         "proof_p3b": { "checked": proof_checked, "verified": proof_ok, "note": proof_note },
     });
 
-    println!("\n================ QNet load test — real /transaction ================");
+    println!("\n================ QNet Blockchain load test — real /transaction ================");
     println!("submitted={} included={} finalized={} errors={} dropped={} success={:.2}%",
         submitted_n, included_n, finalized_n, errors_n, dropped_n, success);
     println!("INCLUDED (soft/microblock) TPS = {:.0}   FINALIZED (hard/macroblock-QC) TPS = {:.0}  (over {:.1}s)",

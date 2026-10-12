@@ -246,7 +246,7 @@ describe('MPLAT-R5-01: a send is reviewed with its whole recipient, which the fr
   it('the review shows the whole recipient and arms only after it stayed untouched; a press begun before does nothing', async () => {
     const onConfirm = jest.fn();
     const onCancel = jest.fn();
-    const review = { to: LOOKALIKE, network: 'QNet', amount: '900 QNC', fee: '0.00015 QNC', total: '900.00015 QNC',
+    const review = { to: LOOKALIKE, network: 'QNet Blockchain', amount: '900 QNC', fee: '0.00015 QNC', total: '900.00015 QNC',
       warnings: { lookAlike: true } };
     let tree;
     await act(async () => { tree = renderer.create(<SendReview review={review} t={t} onCancel={onCancel} onConfirm={onConfirm} />); });

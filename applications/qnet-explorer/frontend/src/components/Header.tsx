@@ -7,8 +7,8 @@ import { usePathname } from 'next/navigation';
 // the browser, after hydration.
 import ConnectWalletButton from './wallet/connect-wallet-button';
 import WalletBoundary from './wallet/WalletBoundary';
-import { useActivationContent, useWallet } from '@/contexts/AppContext';
-import { IN_APP_HOME, IN_APP_NAV, keepFromApp, type NavLink } from '@/lib/activate-view';
+import { useActivationContent } from '@/contexts/AppContext';
+import { IN_APP_HOME, IN_APP_NAV, type NavLink } from '@/lib/activate-view';
 import { ACTIVATION_NETWORK } from '@/lib/one-dev';
 
 // The site's navigation (owner, 29.09): the logo is Home, then Explorer, My node, Wallet, Testnet (its own tab on a
@@ -90,17 +90,14 @@ function DocsMenu({ pathname }: { pathname: string }) {
 
 const HeaderComponent = () => {
   const pathname = usePathname();
-  // In the QNet app's view (its in-app browser, or a page it opened with ?from=app) the header leads only
-  // to the explorer and the policies: no page about the wallet, its activation, the faucet or the DAO is a
-  // tap away. The server's render and the moments before the wallet is detected get the same header, so
-  // nothing else is reachable before the page knows where it is.
+  // In the QNet app's view (its in-app browser) the header leads only to the explorer and the policies: no
+  // page about the wallet, its activation, the faucet or the DAO is a tap away. The server's render and the
+  // moments before the wallet is detected get the same header, so nothing else is reachable before the page
+  // knows where it is.
   const inApp = !useActivationContent();
-  const { fromApp } = useWallet();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
 
-  const navLinks = inApp
-    ? IN_APP_NAV.map((link) => ({ ...link, href: keepFromApp(link.href, fromApp) }))
-    : MAIN_NAV;
+  const navLinks = inApp ? IN_APP_NAV : MAIN_NAV;
 
   useEffect(() => {
     // Close menu on route change
@@ -114,7 +111,7 @@ const HeaderComponent = () => {
   return (
     <header className="qnet-header">
       <div className="header-content">
-        <Link href={inApp ? keepFromApp(IN_APP_HOME, fromApp) : '/'} className="qnet-logo">QNET</Link>
+        <Link href={inApp ? IN_APP_HOME : '/'} className="qnet-logo">QNET</Link>
 
         {/* A link that stays on the page (My node's Connect wallet) closes the menu too. */}
         <nav className={`qnet-nav ${isMenuOpen ? 'active' : ''}`} onClick={(e) => {

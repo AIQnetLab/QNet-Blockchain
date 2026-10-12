@@ -8,6 +8,11 @@ mod queries_api;
 use queries_api::*;
 mod certified_proofs;
 use certified_proofs::*;
+// N2: the wallet plane (HTTPS on host 443), its certificates, and the node's serving identity.
+pub(crate) mod wallet_plane;
+use wallet_plane::{WalletPeer, WalletPlane};
+pub(crate) mod acme;
+pub(crate) mod node_serve;
 #[cfg(test)]
 mod certified_e2e_tests;
 mod rewards_api;
@@ -514,6 +519,37 @@ impl ApiRateLimiter {
             block_duration: 30,
         });
 
+        // The wallet plane's own buckets (N2; their names are the routes' constants, pinned by
+        // tests_wallet_buckets): a macroblock proof is up to ~8 MB, a registry body a full scan, a
+        // serve-proof one ML-DSA-65 signature, a whoami probe a connect-back. On the plane every
+        // per-address key is an IPv4 address or an IPv6 /64 (`client_addr`). The 600/min certified
+        // buckets above serve the plane's proof and state reads.
+        configs.insert("wallet_mb_proof".to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+        configs.insert("wallet_registry".to_string(), RateLimitConfig {
+            max_requests: 6,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        configs.insert("serve_proof".to_string(), RateLimitConfig {
+            max_requests: 6,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        configs.insert("nodes_rpc".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        configs.insert("whoami".to_string(), RateLimitConfig {
+            max_requests: 2,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+
         if tx_rate != 100 {
             println!("[INFO][SECURITY] api_rate_limit_configured tx={}/min general={}/min read={}/min", 
                      tx_rate, general_rate, read_rate);
@@ -735,10 +771,19 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 /// appended — the last one, so a value the client wrote into the header itself is never taken. Every
 /// other peer is what the socket says. Without this every proxied request would look like localhost,
 /// which the limiter whitelists, and the per-address limits would not exist for the public at all.
+///
+/// On the wallet plane the TLS socket's own peer is the client and X-Forwarded-For is ignored
+/// entirely: the plane has no proxy in front of it. It is given as its limit key (an IPv4 address,
+/// an IPv6 /64, or the shared bucket of a masked peer, `wallet_plane::plane_key`), so every
+/// per-address limit on the plane counts a /64 as one source.
 fn client_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
-    warp::addr::remote()
+    warp::ext::optional::<WalletPeer>()
+        .and(warp::addr::remote())
         .and(warp::header::optional::<String>("x-forwarded-for"))
-        .map(|peer: Option<std::net::SocketAddr>, xff: Option<String>| forwarded_client(peer, xff.as_deref()))
+        .map(|plane_peer: Option<WalletPeer>, peer: Option<std::net::SocketAddr>, xff: Option<String>| match plane_peer {
+            Some(p) => Some(std::net::SocketAddr::new(p.key, 0)),
+            None => forwarded_client(peer, xff.as_deref()),
+        })
 }
 
 /// Port 0 marks a forwarded address; every consumer keys on the IP alone. A request the local proxy
@@ -836,9 +881,14 @@ fn gate_client(client: Option<std::net::SocketAddr>, from_page: bool) -> Option<
 }
 
 /// client_addr for the routes that answer only local, whitelisted or genesis callers (served outside the
-/// CORS filter): gate_client of the request.
+/// CORS filter): gate_client of the request. A request that came through the wallet plane is nobody in
+/// particular whatever its peer: the plane's allowlist already refuses these routes, and this keeps them
+/// refused if a path ever slipped through it.
 fn gate_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
-    client_addr().and(from_page()).map(gate_client)
+    client_addr().and(from_page()).and(warp::ext::optional::<WalletPlane>())
+        .map(|client: Option<std::net::SocketAddr>, from_page: bool, plane: Option<WalletPlane>| {
+            gate_client(client, from_page || plane.is_some())
+        })
 }
 
 /// The paths of the gate_addr routes, which `start_rpc_server` serves outside the CORS filter. A preflight for
@@ -889,6 +939,25 @@ fn api_rate_limit_retry(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -
     }
     let (allowed, retry_after) = API_RATE_LIMITER.check_rate_limit(ip_addr, endpoint_type);
     if allowed { Ok(()) } else { Err(retry_after) }
+}
+
+/// The per-address limit of a route that answers on both planes. On the wallet plane the plane's own
+/// bucket applies and the refusal is a typed 429 (every refusal there is typed); elsewhere the route's
+/// bucket, typed when the caller asked for the typed form, else the legacy 200 body.
+fn route_limit(
+    remote: Option<std::net::SocketAddr>,
+    plane: Option<WalletPlane>,
+    plain_bucket: &str,
+    plane_bucket: &str,
+    typed: bool,
+) -> Result<(), warp::reply::Response> {
+    let bucket = if plane.is_some() { plane_bucket } else { plain_bucket };
+    match api_rate_limit_retry(remote, bucket) {
+        Ok(()) => Ok(()),
+        Err(retry) if plane.is_some() => Err(wallet_plane::plane_rate_limited(retry)),
+        Err(retry) if typed => Err(certified_proofs::rate_limited(retry)),
+        Err(retry) => Err(warp::reply::json(&rate_limit_body(retry)).into_response()),
+    }
 }
 
 fn rate_limit_body(retry_after: u64) -> Value {
@@ -1722,7 +1791,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_token_transfers_range);
 
-    // GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer inclusion proof.
+    // GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer inclusion proof. On the wallet
+    // plane it counts in the certified-proof bucket and refuses typed.
     let log_proof = api_v1
         .and(warp::path("logs"))
         .and(warp::path("proof"))
@@ -1730,8 +1800,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(warp::query::<LogProofQuery>())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
-        .and_then(handle_log_proof);
+        .and_then(|q: LogProofQuery, remote: Option<std::net::SocketAddr>, plane: Option<WalletPlane>, bc: Arc<BlockchainNode>| async move {
+            if let Err(r) = route_limit(remote, plane, "read_only", certified_proofs::CERTIFIED_PROOF_BUCKET, false) {
+                return Ok::<_, Rejection>(r);
+            }
+            handle_log_proof(q, plane.is_some(), bc).await
+        });
 
     // Extended transaction history with pagination and filters
     // GET /api/v1/transactions/history?address=XXX&page=1&per_page=20&type=transfer
@@ -1806,14 +1882,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
 
-    // Light-client QC proof: /macroblock/{idx}/proof (cacheable, immutable per index)
+    // Light-client QC proof: /macroblock/{idx}/proof (cacheable, immutable per index). Typed errors on
+    // the wallet plane or with `form=2`.
     let macroblock_proof = api_v1
         .and(warp::path("macroblock"))
         .and(warp::path::param::<u64>())
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_proof);
 
@@ -1825,6 +1904,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
         .and_then(handle_registry_height);
 
@@ -1890,6 +1970,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
 
     // Transaction endpoints with IP-based rate limiting
     // SECURITY: Limit transaction body to 64KB (typical TX is <1KB)
+    // The per-address limit sits here, not in the handler, so the wallet plane can refuse typed.
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
         .and(warp::path::end())
@@ -1897,8 +1978,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
-        .and_then(handle_transaction_submit);
+        .and_then(|req: TransactionRequest, remote: Option<std::net::SocketAddr>, plane: Option<WalletPlane>, bc: Arc<BlockchainNode>| async move {
+            if let Err(r) = route_limit(remote, plane, "transaction", "transaction", false) {
+                return Ok::<_, Rejection>(r);
+            }
+            handle_transaction_submit(req, bc).await.map(|r| r.into_response())
+        });
     
     // v6.0: Client-created NodeRegistration TX submit (producer-aware routing)
     let node_registration_submit = api_v1
@@ -2951,7 +3038,41 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let bundle_routes = bundle_submit
         .or(bundle_status);
         
+    // N2 (node_serve.rs): the serving identity (wallet plane only; 404 here), the committed-endpoint hints
+    // for ids a client chose, and the caller's address with the optional 443 connect-back.
+    let serve_proof = api_v1
+        .and(warp::path("node"))
+        .and(warp::path("serve-proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
+        .and(blockchain_filter.clone())
+        .and_then(node_serve::handle_serve_proof);
+    let nodes_rpc = api_v1
+        .and(warp::path("nodes"))
+        .and(warp::path("rpc"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(node_serve::handle_nodes_rpc);
+    let whoami = api_v1
+        .and(warp::path("whoami"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
+        .and(warp::ext::optional::<WalletPeer>())
+        // The raw socket peer: the only address a probe may connect back to.
+        .and(warp::addr::remote())
+        .and_then(node_serve::handle_whoami);
+    let wallet_plane_routes = serve_proof.or(nodes_rpc).or(whoami).boxed();
+
     let node_routes = node_discovery
+        .or(wallet_plane_routes)
         .or(node_health)
         .or(gas_recommendations)
         .or(auth_challenge)
@@ -3272,6 +3393,21 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // WebSocket and the gated routes before the REST routes; a preflight for a gated path is refused before the
     // CORS filter would answer it.
     let routes = ws_subscribe.or(gated_preflight()).or(gated_routes).or(rest_routes);
+
+    // N2: the wallet plane, on its own runtime, for a super node that serves wallets. It hands requests
+    // to these same routes (handlers are not duplicated) behind its allowlist and a typed recover.
+    match wallet_plane::plane_off_reason(blockchain.get_node_type(), &blockchain.get_node_id()) {
+        None => {
+            let plane_routes: wallet_plane::PlaneRoutes = routes.clone()
+                .recover(wallet_plane::recover_rejection)
+                .map(|r| warp::Reply::into_response(r))
+                .boxed();
+            wallet_plane::start(plane_routes);
+        }
+        Some(reason) => if is_info() {
+            println!("[INFO][WALLETRPC] public_rpc_off reason={}", reason);
+        },
+    }
 
 
     // PORT BIND RETRY: survive TIME_WAIT after fast Docker restart (same pattern as Genesis signal_listener)
@@ -4307,7 +4443,7 @@ async fn tx_submit(
     if dilithium_signature.is_none() {
         return Err(RpcError {
             code: -32602,
-            message: "dilithium_signature required (pure-PQ; Ed25519 not accepted on QNet)".to_string(), data: None,
+            message: "dilithium_signature required (pure-PQ; Ed25519 not accepted on QNet Blockchain)".to_string(), data: None,
         });
     }
     // FIX-5 pk-elision: the pubkey may be OMITTED once it is committed on-chain (the first-use TX carries
@@ -4487,7 +4623,7 @@ async fn mempool_submit(
         // (address = SHA512(dilithium_pk)); Ed25519 is Solana-only and not accepted on a QNet path.
         let dil_sig = tx_data["dilithium_signature"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing dilithium_signature - QNet TX require an ML-DSA-65 signature".to_string(), data: None,
+            message: "Missing dilithium_signature - transactions on QNet Blockchain require an ML-DSA-65 signature".to_string(), data: None,
         })?;
         let dil_pk = tx_data["dilithium_public_key"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,

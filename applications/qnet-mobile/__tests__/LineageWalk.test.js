@@ -120,6 +120,91 @@ it('concurrent checks on one parity chain share one walk: no step is fetched twi
   expect(results).toEqual([true, true, true, true, true]);
 });
 
+it('hooks.maxSteps bounds one call (a follow tick), never above WALK_STEPS_PER_CALL', async () => {
+  serveChain();
+  const node = () => 'https://node1.aiqnet.io';
+  await expect(lc.verifyMacroblockStateRoot(stateRootOf(20), 20 * 90, node, { maxSteps: 1 })).resolves.toBe(false);
+  expect(asked).toEqual([2]);
+  expect(lc.stepsToVerify(20)).toBe(9);
+  await expect(lc.verifyMacroblockStateRoot(stateRootOf(20), 20 * 90, node, { maxSteps: 3 })).resolves.toBe(false);
+  expect(asked).toEqual([2, 4, 6, 8]);
+  await expect(lc.verifyMacroblockStateRoot(stateRootOf(20), 20 * 90, node, { maxSteps: 1000 })).resolves.toBe(true);
+});
+
+// P1: a verified entry keeps what later checks fold to (the window's block hashes, the reward roots), and the anchors a
+// wallet keeps carry the roots, so a restart answers at the kept index with no walk.
+describe('verified entries and the anchors kept from them', () => {
+  const N1 = 'https://node1.aiqnet.io';
+  const windowOf = (j) => [0, 1, 2].map((i) => sha3_256(`w/${j}/${i}`));
+
+  function serveRich() {
+    asked = [];
+    global.fetch = jest.fn(async (url) => {
+      const m = /\/macroblock\/(\d+)\/proof$/.exec(url);
+      if (m) {
+        const j = Number(m[1]);
+        asked.push(j);
+        const p = proofFor(j);
+        Object.assign(p.checkpoint, {
+          window_mb_hashes: windowOf(j), reward_root: sha3_256(`r/${j}`), reward_epoch_root: sha3_256(`re/${j}`),
+          logs_root: sha3_256(`l/${j}`), timestamp: 1790000000 + j,
+        });
+        return { ok: true, json: async () => p };
+      }
+      if (/\/registry\/height\//.test(url)) return { ok: true, json: async () => ({ entries: ENTRIES }) };
+      throw new TypeError('Network request failed');
+    });
+  }
+
+  it('keep the window\'s block hashes and the reward roots', async () => {
+    serveRich();
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(10), 10 * 90, () => N1)).resolves.toBe(true);
+    const cp = lc.verifiedCheckpoint(10);
+    expect(cp).toMatchObject({
+      index: 10, stateRoot: stateRootOf(10), logsRoot: sha3_256('l/10'), windowMbHashes: windowOf(10),
+      rewardRoot: sha3_256('r/10'), rewardEpochRoot: sha3_256('re/10'), registryRoot: REG_ROOT, beacon: BEACON,
+      timestamp: 1790000010,
+    });
+    expect(cp.checkpointHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(lc.verifiedCheckpoint(12)).toBeNull();
+  });
+
+  it('are exported with their roots; one imported with them answers at its own index with no fetch', async () => {
+    serveRich();
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(11), 11 * 90, () => N1)).resolves.toBe(true);
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(10), 10 * 90, () => N1)).resolves.toBe(true);
+    const kept = lc.exportVerifiedAnchors();
+    expect(Object.keys(kept).map(Number).sort((a, b) => a - b)).toEqual([10, 11]);
+    expect(kept[10]).toEqual({
+      eligible_ids: IDS, beacon: BEACON, registry_root: REG_ROOT, state_root: stateRootOf(10), logs_root: sha3_256('l/10'),
+      checkpoint_hash: lc.verifiedCheckpoint(10).checkpointHash,
+    });
+    lc.clearQcCache();
+    expect(lc.importVerifiedAnchors(kept)).toBe(2);
+    asked.length = 0;
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(10), 10 * 90, () => N1)).resolves.toBe(true);
+    await expect(lc.verifyMacroblockLogsRoot(sha3_256('l/11'), 11 * 90, () => N1)).resolves.toBe(true);
+    expect(asked).toEqual([]);
+    expect(lc.stepsToVerify(10)).toBe(0);
+    expect(lc.verifiedCheckpoint(10)).toMatchObject({ stateRoot: stateRootOf(10), windowMbHashes: null, timestamp: null });
+    // One kept by an earlier build (no roots) still roots a walk; its own index is verified again.
+    lc.clearQcCache();
+    const { state_root: _s, logs_root: _l, checkpoint_hash: _c, ...older } = kept[10];
+    expect(lc.importVerifiedAnchors({ 10: older })).toBe(1);
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(10), 10 * 90, () => N1)).resolves.toBe(true);
+    expect(asked).toEqual([2, 4, 6, 8, 10]);
+  });
+
+  it('an anchor with only some of the roots, or a malformed one, is ignored', () => {
+    const a = { eligible_ids: IDS, beacon: BEACON, registry_root: REG_ROOT };
+    const r = { state_root: 'aa'.repeat(32), logs_root: 'bb'.repeat(32), checkpoint_hash: 'cc'.repeat(32) };
+    expect(lc.importVerifiedAnchors({
+      10: { ...a, state_root: r.state_root }, 11: { ...a, ...r, logs_root: 'BB'.repeat(32) }, 12: { ...a, ...r, checkpoint_hash: 7 },
+    })).toBe(0);
+    expect(lc.importVerifiedAnchors({ 13: { ...a, ...r } })).toBe(1);
+  });
+});
+
 it('an oversized answer is that node\'s failure: the next node serves the step', async () => {
   const BAD = 'https://pool.example';
   serveChain({ oversizedFrom: BAD });

@@ -1,6 +1,6 @@
-# Sign-in with a QNet wallet
+# Sign-in with a QNet Blockchain wallet
 
-A site proves that a visitor controls a QNet address by having the visitor's wallet sign a short text
+A site proves that a visitor controls a QNet Blockchain address by having the visitor's wallet sign a short text
 and checking that signature on the site's server. Nothing is sent to the chain and nothing costs QNC.
 The text format and the server check are implemented in `@aiqnet/sdk` (`development/qnet-sdk/src/signin.ts`,
 tested in `development/qnet-sdk/test/signin.test.mjs`); the signature itself is the wallets'

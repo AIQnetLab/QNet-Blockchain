@@ -98,7 +98,7 @@ export function signingEnabled() {
 }
 
 /**
- * Both addresses of an entropy (used at create, import, restore and unlock to compare with the AAD).
+ * Both addresses of an entropy (used at create, import and unlock to compare with the AAD).
  * Zeroizes the seed and both private keys before returning. Refused while the self-test has failed:
  * an address from an unverified derivation must never be shown or stored.
  * @param {Uint8Array} entropy 16 or 32 bytes (not zeroized here)
@@ -403,8 +403,8 @@ export async function signNodeRegistration(fields) {
 }
 
 /**
- * Step 1 of moving this wallet's node balance: ML-DSA-65 over q1337|claim_rewards:{nodeId}:{wallet} (the core builds
- * it; the node id must be the wallet's own). Re-checks the session first.
+ * Step 1 of moving a node balance of this wallet: ML-DSA-65 over q1337|claim_rewards:{nodeId}:{wallet} (the core builds
+ * it; the node id must be the wallet's own light or super node id). Re-checks the session first.
  * @param {{nodeId: string, wallet: string}} fields
  * @returns {Promise<{signature: Uint8Array, publicKey: Uint8Array}>}
  * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_NODE_MESSAGE, KEY_ADDRESS_MISMATCH,

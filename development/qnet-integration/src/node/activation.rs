@@ -403,7 +403,7 @@ impl BlockchainNode {
         if matches!(node_type, NodeType::Super) && !is_genesis_code {
             if let Some((other, other_type)) = Self::wallet_other_node_at_tip(&self.storage, &wallet_address, &self.node_id) {
                 return Err(QNetError::ValidationError(format!(
-                    "This wallet already has a {} node on the QNet network ({}). One wallet runs one node: start this \
+                    "This wallet already has a {} node on QNet Blockchain ({}). One wallet runs one node: start this \
                      server with another wallet's recovery phrase, code and burn.", other_type, other)));
             }
         }

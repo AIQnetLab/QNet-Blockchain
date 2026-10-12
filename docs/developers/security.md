@@ -1,9 +1,9 @@
 # Security for developers
 
-What a site, a game server or a tool must do so that building on QNet does not put users, their
+What a site, a game server or a tool must do so that building on QNet Blockchain does not put users, their
 funds or the server at risk. The rules follow from how the wallets, the SDK and the nodes behave
 ([dApp integration](dapp-integration.md), [Transactions](transactions.md), [Smart contracts](smart-contracts.md)).
-To report a vulnerability in QNet itself, follow [SECURITY.md](../../SECURITY.md).
+To report a vulnerability in QNet Blockchain itself, follow [SECURITY.md](../../SECURITY.md).
 
 ## Keys and recovery phrases
 
@@ -86,6 +86,19 @@ To report a vulnerability in QNet itself, follow [SECURITY.md](../../SECURITY.md
   zero. For anything else, ask several nodes and require agreement, as the wallets do.
 - `/api/v1/validators/proof` is a hash over a list the node builds itself, not a proof; treat it as a
   plain read.
+- **Any super node's public RPC** (`https://<IPv4>`, the [wallet plane](rpc-api.md#wallet-plane)) serves
+  only reads you verify yourself, so it can withhold, stall or serve an older certified view, never a wrong
+  one. Before you use one, decide who it is from data you verified, never from its own say-so: take node ids
+  from the eligible lists of macroblocks you verified (bound by their `epoch_commitment`) and not in the
+  newest verified `banned` set; a node id's address from `/api/v1/nodes/rpc` is a hint. Admit the address
+  only when `GET /api/v1/node/serve-proof` with your own fresh random challenge returns a ServeCert that
+  decodes strictly, names that node id, the address you connected to and a current lifetime of at most
+  7 days, whose wallet is the EON of its `wallet_pk` and whose node id is that wallet's pseudonym, with the
+  wallet's signature over `q1337|node_serve_cert:{hex cert_hash}` and the serving key's signature over
+  `q1337|node_serve_proof:{challenge}:{hex cert_hash}:{ip}` both verifying. Refuse any address that is not
+  public unicast IPv4. The public RPC never serves a read that names an exact address in a way you did not
+  choose: send exact-address reads (nonce, token balances, history) to the genesis names unless you mean to
+  show that address to the node you ask.
 - **Token names and symbols are the deployer's text.** Any token can call itself QNC or copy another
   token's name. Identify a token by its contract address, and show the address.
 

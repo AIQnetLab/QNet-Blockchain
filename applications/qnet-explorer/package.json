@@ -1,7 +1,7 @@
 {
   "name": "qnet-explorer",
   "version": "1.0.0",
-  "description": "Qnet - Quantum Blockchain Explorer",
+  "description": "QNet Blockchain Explorer",
   "private": true,
   "scripts": {
     "dev": "cd frontend && npm run dev",

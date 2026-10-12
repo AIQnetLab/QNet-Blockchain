@@ -1547,21 +1547,36 @@ main.qnet-container {
 .footer-center {
   display: flex;
   justify-content: center;
+}
+
+/* Keeps the icon and badge row in the middle of the footer. */
+.footer-right {
   flex: 1;
 }
 
-.footer-right { 
-  color: #d8d8d8; 
-  flex: 1;
-  text-align: right;
+/* One row of icons and store badges, the same height, wrapping only on narrow screens. */
+.badge-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.75rem;
+}
+
+/* The small line under the footer: copyright, Privacy, Terms. */
+.footer-legal {
+  max-width: 1400px;
+  margin: 0.5rem auto 0;
+  padding: 0.5rem 2rem 0;
+  border-top: 1px solid rgba(0, 255, 255, 0.08);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
-  gap: 0.25rem 1.25rem;
+  justify-content: center;
+  gap: 0.25rem 1rem;
+  font-size: 0.8rem;
+  color: #8fb3bb;
 }
-
-/* Privacy, Terms and Support: on every page, out of the header. */
 .footer-links {
   display: flex;
   gap: 1rem;
@@ -1569,8 +1584,8 @@ main.qnet-container {
 .footer-link {
   display: inline-flex;
   align-items: center;
-  min-height: 44px;
-  color: #bdeff2;
+  min-height: 32px;
+  color: #8fb3bb;
   text-decoration: none;
 }
 .footer-link:hover,
@@ -1625,10 +1640,24 @@ main.qnet-container {
 }
 
 .google-play-badge img {
-  height: 66px !important; 
+  height: 66px !important;
   width: auto;
   margin-top: -11px;
   margin-bottom: -11px;
+}
+
+/* The iOS store badge beside it, at the same visible height and touch target. */
+.app-store-badge {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+}
+
+/* Both store badges side by side, kept together when the row wraps. */
+.store-badges {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .activation-card {
@@ -1681,19 +1710,18 @@ main.qnet-container {
   .qnet-footer.compact-footer .footer-content {
     gap: 0.25rem;
   }
-}
 
-a[href*="play.google.com"] {
-  height: 44px !important;
-  display: flex !important;
-  align-items: center !important;
-}
+  .badge-row {
+    flex-wrap: wrap;
+  }
 
-a[href*="play.google.com"] img {
-  height: 66px !important;
-  width: auto !important;
-  margin-top: -11px !important;
-  margin-bottom: -11px !important;
+  .footer-right {
+    display: none;
+  }
+
+  .footer-legal {
+    padding: 0.5rem 0 0;
+  }
 }
 
 .activation-card .activation-content {
@@ -4848,11 +4876,6 @@ a[href*="play.google.com"] img {
 }
 .cabinet-more:not([open]) {
   gap: 0;
-}
-.cabinet-subtitle {
-  color: #00ffff;
-  font-size: 1.05rem;
-  font-weight: 600;
 }
 .cabinet-epoch.missed td:nth-child(3) {
   color: #ffd29a;

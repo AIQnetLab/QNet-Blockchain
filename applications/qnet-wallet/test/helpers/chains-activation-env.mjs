@@ -135,6 +135,19 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
         env.forgotten.push(...names);
         for (const name of names) env.views[name] = null;
       },
+      // session.keepSendProof / keptSendProof / forgetSendProofs: the certified figures a send may stand on, kept in the
+      // session's storage (a fresh worker of the same session finds them)
+      async keepSendProof(address, figure) {
+        if (env.locked) return;
+        env.sendProofs[address] = clone(figure);
+      },
+      async keptSendProof(address) {
+        if (env.locked) return null;
+        return Object.hasOwn(env.sendProofs, address) ? clone(env.sendProofs[address]) : null;
+      },
+      async forgetSendProofs() {
+        env.sendProofs = {};
+      },
     },
     vault: {
       async readState() {
@@ -166,6 +179,16 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
         env.anchorWrites++;
         env.anchors = clone(anchors);
       },
+      // the genesis capsule (vault.readCapsule / writeCapsule; null deletes it)
+      async readCapsule() {
+        if (env.locked) throw new WalletError('LOCKED');
+        return env.capsule === null ? null : clone(env.capsule);
+      },
+      async writeCapsule(record) {
+        if (env.locked) throw new WalletError('LOCKED');
+        env.capsuleWrites++;
+        env.capsule = record === null ? null : clone(record);
+      },
       // the chain cache (vault.readChainCache / updateChainCache): the head this wallet saw and the kept balances
       async readChainCache() {
         if (env.locked) throw new WalletError('LOCKED');
@@ -193,6 +216,9 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
     forgotten: [],
     anchors: null,
     anchorWrites: 0,
+    capsule: null,
+    capsuleWrites: 0,
+    sendProofs: {},
     keys: {
       async signQnetTransfer(fields) {
         if (env.locked) throw new WalletError('LOCKED');

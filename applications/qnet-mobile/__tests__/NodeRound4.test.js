@@ -435,6 +435,8 @@ describe('SD-R2-01: a refused device carries its reference; the app shows none (
       .toMatchObject({ ok: false, reason: 'device_slot_paused', ref: 'abcdef01' });
   });
 
+  // On the card of the node this device runs, where it offers Use this device (a binding with no device key once two
+  // genesis nodes take them): a node on another device has no card here (owner, 11.10).
   it('the tab says why under "can\'t run", with nothing to write to anyone', () => {
     let tree;
     act(() => {
@@ -442,7 +444,7 @@ describe('SD-R2-01: a refused device carries its reference; the app shows none (
         nodeId: NODE, status: {
           onChain: true, deviceBound: true, deviceBoundAgreed: true, keyOurs: false, features: ['device_v1'], signed: null, deviceTags: [],
         },
-        local: null, pending: null, answeredAt: null, balanceNano: 0, device: DEVICE,
+        local: { nodeId: NODE, seq: 1790000000, pushType: 'fcm', hw: false }, pending: null, answeredAt: null, balanceNano: 0, device: DEVICE,
       }} refusal={{ reason: 'device_slot_paused', ref: REF }} onMove={() => {}} onUse={() => {}} onCopy={() => {}}
         nodeTitle={() => ''} />);
     });

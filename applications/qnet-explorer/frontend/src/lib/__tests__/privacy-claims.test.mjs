@@ -29,15 +29,17 @@ function sources(dir) {
 }
 
 test('what the site stores in the browser: the address view, the node pages\' wallet, their open request and the payment address', () => {
-  assert.match(policy, /The site stores in your browser whether the QNet or the Solana address is shown and, for the node pages, the wallet address you chose there, or the extension's once you approved the site in it \(with its Solana address when the extension or QNet Wallet shared it\) until you change it, after you press Disconnect there a mark that keeps the page from connecting the extension's wallet by itself until you connect a wallet again, a request from those pages to QNet Wallet with its one-time key until the page has read the answer, so that it can still read it after the browser unloaded the tab, and the record of an activation on those pages: its payment address and key and what the activation has reached so far \(QNet Wallet's confirmation that the activation is for the wallet, with its QNet address, public key, signature and time; the burn and the transfer back, each with the pass the server gave for reading its state; the request to QNet Wallet; and the wallet's answer, with its public key and consent\), and the activation the QNet extension reported on those pages for a wallet \(the wallet's QNet and Solana addresses, the node type, the burn, its amount and the activation code, all public on Solana or on the QNet chain\), for at most five wallets, so that the node pages can show it again\./);
+  assert.match(policy, /The site stores in your browser whether the wallet's QNet Blockchain address or its Solana address is shown and, for the node pages, the wallet address you chose there, or the extension's once you approved the site in it \(with its Solana address when the extension or QNet Wallet shared it\) until you change it, after you press Disconnect there a mark that keeps the page from connecting the extension's wallet by itself until you connect a wallet again, a request from those pages to QNet Wallet with its one-time key until the page has read the answer, so that it can still read it after the browser unloaded the tab, and the record of an activation on those pages: its payment address and key and what the activation has reached so far \(QNet Wallet's confirmation that the activation is for the wallet, with its QNet Blockchain address, public key, signature and time; the burn and the transfer back, each with the pass the server gave for reading its state; the request to QNet Wallet; and the wallet's answer, with its public key and consent\), and the activation the QNet Wallet extension reported on those pages for a wallet \(the wallet's QNet Blockchain and Solana addresses, the node type, the burn, its amount and the activation code, all public on Solana or on QNet Blockchain\), for at most five wallets, so that the node pages can show it again\./);
   // SITE-F6: the addresses Connect wallet gives the page are the wallet My node shows, and what My node sends is named.
   assert.doesNotMatch(policy, /they stay in the page and are not sent to the server|is not sent to the server either/);
-  assert.match(policy, /When you press Connect wallet and approve the site in the QNet browser extension, the page receives your public QNet and Solana addresses; My node then shows that wallet, and what it sends the server is described next\./);
+  assert.match(policy, /When you press Connect wallet and approve the site in the QNet Wallet browser extension, the page receives your public QNet Blockchain and Solana addresses; My node then shows that wallet, and what it sends the server is described next\./);
   assert.match(policy, /What the extension answers on the node pages about the wallet's activation is shown there, and an activation it reports is kept in the browser, as below\./);
-  assert.match(policy, /They also send the wallet's QNet address, to ask the network whether the wallet has a node of either type and to read the wallet's activation record, the id of its super node, to read that node's status, and, when the page knows it, the wallet's own Solana address, whose public Solana history the server searches for an activation burn: the server asks a Solana RPC endpoint and keeps the answer in its memory for five minutes\./);
+  assert.match(policy, /They also send the wallet's QNet Blockchain address, to ask the network whether the wallet has a node of either type and to read the wallet's activation record, the id of its super node, to read that node's status, and, when the page knows it, the wallet's own Solana address, whose public Solana history the server searches for an activation burn: the server asks a Solana RPC endpoint and keeps the answer in its memory for five minutes\./);
   assert.doesNotMatch(policy, /stays in the open tab/);
   assert.match(policy, /The browser keeps those keys for this site only and never hands them out\. A request expires after ten minutes; the page deletes what is left of an expired one when it next opens\./);
-  assert.match(policy, /The node pages\{full && ' \(aiqnet\.io\/node\)'\} send the server the light node id of the wallet you choose there, or of the extension's once you approved the site in it, to read that node's public status and history from the network and, when you press I'm back, to ask the network to wake the node's linked device, and what an activation on those pages needs/);
+  assert.match(policy, /The node pages\{full && ' \(aiqnet\.io\/node\)'\} send the server the light node id of the wallet you choose there, or of the extension's once you approved the site in it, to read that node's public status and history from QNet Blockchain, and what an activation on those pages needs/);
+  // Owner, 11.10: no "I'm back" on the site, so the policy names no wake the pages ask for.
+  assert.doesNotMatch(policy, /I'm back|press I/);
   const users = [];
   for (const url of sources(SRC)) {
     const text = readFileSync(url, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
@@ -85,7 +87,7 @@ test('the activation\'s payment address: what it signs, what the browser keeps, 
   assert.doesNotMatch(policy, /you give the burn up|only that key can register a node/);
   assert.match(policy, /What is left goes to the wallet's Solana address when the extension or QNet Wallet on your device shared it, else to the Solana address you enter\. On testnet, when the page does not know the wallet's Solana address, it does not ask for one: it leaves the test tokens, which have no value, on the payment address and deletes the key\. You may instead leave it on the payment address: the page then tells you that nobody can move it once the key is gone, and deletes the key only after you confirm\. On mainnet a payment address with nothing on it keeps its key until you delete it, in case a transfer to it is still on its way\./);
   assert.doesNotMatch(policy, /at the latest 24 hours after the activation started, the page sends what is left back/);
-  assert.match(policy, /Once the node is registered and the key deleted, only a receipt of the activation stays in the browser \(the payment address, the burn, its amount, the node and the wallet's QNet address\), at most ten, for the node details on My node; its activation code names the wallet, not the payment address\./);
+  assert.match(policy, /Once the node is registered and the key deleted, only a receipt of the activation stays in the browser \(the payment address, the burn, its amount, the node and the wallet's QNet Blockchain address\), at most ten, for the node details on My node; its activation code names the wallet, not the payment address\./);
   const flow = read(SRC, 'lib/cabinet/flow.ts');
   assert.match(flow, /burnFinal: \{ linkStarted: 'linkOpen', \.\.\.GIVE_BACK \},/);
   assert.match(flow, /const GIVE_BACK = \{ returnLeftovers: 'closing' \} as const;/);
@@ -93,9 +95,9 @@ test('the activation\'s payment address: what it signs, what the browser keeps, 
   // registration, the wallet's key and consent alone.
   assert.match(policy, /The page sends the aiqnet\.io server the payment address, the wallet's confirmation, its signed transactions with the owner bind, and the registration \(the wallet's public key and its consent\), and My node sends the wallet address you chose to read its registration;/);
   assert.match(read(SRC, 'lib/cabinet/activation.ts'), /const keepsEmptyKey = \(record: PaymentRecord\): boolean => record\.stage === 'closing' && record\.network === 'mainnet';/);
-  assert.match(policy, /every one of them is public on Solana or on the QNet chain\./);
+  assert.match(policy, /every one of them is public on Solana or on QNet Blockchain\./);
   // One faucet (owner, 29.09): the user funds the payment address; the route that funded one, and what it kept, are gone.
-  assert.match(policy, /A registration links the payment address that made the burn to the wallet's QNet address on chain\. The payment address gets its tokens from your own wallet\. Activation record\./);
+  assert.match(policy, /A registration links the payment address that made the burn to the wallet's QNet Blockchain address on chain\. The payment address gets its tokens from your own wallet\. Activation record\./);
   assert.doesNotMatch(policy, /refuse a second claim|testnet faucet funded|sends a payment address test tokens/);
   assert.equal(existsSync(new URL('server/cabinet/faucet.ts', SRC)), false);
   assert.match(policy, /beyond them the aiqnet\.io server holds the few request details described below in memory only, for at most a day\./);
@@ -113,10 +115,10 @@ test('the activation\'s payment address: what it signs, what the browser keeps, 
 // R1, R6: the activation record the server keeps for a wallet, and for how long, as the registry and its table have it.
 test('the activation record: what the server keeps, who reads it, and for how long, as the registry has it', () => {
   assert.match(policy, /Activation record\. One wallet gets one activation, for a light or a super node\./);
-  assert.match(policy, /the aiqnet\.io server keeps, for each wallet whose activation starts or finishes through the node pages or the browser extension: the wallet's QNet address, the node type, how it was paid \(the extension or a one-time payment address\), the Solana address that burned, the burn transaction, its amount and the times it was reserved, sent, burned and recorded, and the proof that the reservation and the burn are that wallet's: the wallet's public key with its signed reservation \(its time included\) and, for a burn of the extension, its signatures over the burn, or, for a payment address's burn, the payment address's owner bind\./);
+  assert.match(policy, /the aiqnet\.io server keeps, for each wallet whose activation starts or finishes through the node pages or the browser extension: the wallet's QNet Blockchain address, the node type, how it was paid \(the extension or a one-time payment address\), the Solana address that burned, the burn transaction, its amount and the times it was reserved, sent, burned and recorded, and the proof that the reservation and the burn are that wallet's: the wallet's public key with its signed reservation \(its time included\) and, for a burn of the extension, its signatures over the burn, or, for a payment address's burn, the payment address's owner bind\./);
   assert.match(policy, /Anyone can read a wallet's record by its address, as the node pages, the extension and QNet Wallet do\./);
   // What is public and what only the record shows: its answer carries no proof (RECORD_VIEW_KEYS).
-  assert.match(policy, /The burn, its amount and the Solana address that burned are public on Solana, and which wallet a burn is for becomes public on the QNet chain when its node registers; the record shows that link from the start and never shows the proof\./);
+  assert.match(policy, /The burn, its amount and the Solana address that burned are public on Solana, and which wallet a burn is for becomes public on QNet Blockchain when its node registers; the record shows that link from the start and never shows the proof\./);
   assert.doesNotMatch(policy, /All of it but the times repeats what is public/);
   assert.doesNotMatch(read(SRC, 'lib/cabinet/burn-record.ts').match(/export const RECORD_VIEW_KEYS = \[[^\]]*\]/)[0], /proof/);
   // A2: a payment address's burn is the wallet's record like an extension burn; nothing ends it after a day.
@@ -200,7 +202,7 @@ test('the relay\'s and the node pages\' requests are not in the access log, as t
 
 test('the policy covers the mobile app\'s in-app browser: what sites get, what stays on the phone', () => {
   assert.match(policy, /In-app browser \(mobile\)\. The mobile app includes a web browser\./);
-  assert.match(policy, /receives your public QNet and Solana addresses only after you connect it on the app's own confirmation screen/);
+  assert.match(policy, /receives your public QNet Blockchain and Solana addresses only after you connect it on the app's own confirmation screen/);
   assert.match(policy, /a message signature, a QNC transfer, a token transfer or a contract call only after you confirm that request there/);
   assert.match(policy, /Clear browsing data deletes them together with the recent pages/);
   // What stays on the device lists the browser's data: the recent pages as not encrypted, the connected
@@ -220,7 +222,7 @@ const onDevice = () => policy.slice(policy.indexOf('What stays on your device'),
 
 test('the device section lists the app\'s unencrypted history, unconfirmed transactions and Solana sends as they are kept', () => {
   const text = onDevice();
-  assert.match(text, /three records of public chain data: the QNet transactions it signed that the network has not confirmed yet/);
+  assert.match(text, /three records of public chain data: the QNet Blockchain transactions it signed that the network has not confirmed yet/);
   // The SOL and 1DEV sends made on this device (services/SolanaSend): each entry's fields, the newest 100 per Solana
   // address, plain AsyncStorage JSON like the other two.
   assert.match(text, /and the SOL and 1DEV sends it made on this device \(each with its signature, token, amount, recipient, network fee and the SOL a new token account took, its status, the time it was sent and the block height until which it can land; the newest 100 for each Solana address\), which History lists and follows until the network settles them\./);
@@ -303,9 +305,10 @@ test('the extension\'s unencrypted data is listed as the extension stores it', (
   const plain = text.slice(text.indexOf("Not encrypted, in the browser extension's storage:"), text.indexOf('Deleting the wallet'));
   for (const item of [
     /the chosen language; the list of websites approved to see your addresses, each approval carrying a check value/,
-    /stored in the clear next to the encrypted wallet, the wallet's public QNet and Solana addresses, a random wallet identifier, when the wallet was created and whether its activation is for a light or a super node, which anyone who can read the browser profile sees without the password/,
+    /stored in the clear next to the encrypted wallet, the wallet's public QNet Blockchain and Solana addresses, a random wallet identifier, when the wallet was created and whether its activation is for a light or a super node, which anyone who can read the browser profile sees without the password/,
     /two records of public chain data, each with a check value made with a key from the encrypted wallet data: how far the searches for the wallet's activation burn have read the Solana history of the wallet \(its address and 1DEV account: the transactions listed and checked\)/,
     /the network checkpoints the extension's light client verified/,
+    /one record of public chain data with no check value, since the extension verifies it again in full each time it reads it: the checkpoint signed by the genesis nodes of QNet Blockchain that its light client walks from/,
     /in the browser's session memory, which is not written to disk and is cleared when the browser closes: the key of the unlocked wallet with its addresses, until it locks; the count of wrong passwords; the result of its start-up self-test; and the recent approval requests of each website/,
   ]) assert.match(plain, item);
   assert.doesNotMatch(plain, /2\.1|earlier version/);
@@ -323,7 +326,9 @@ test('the extension\'s unencrypted data is listed as the extension stores it', (
   // The kept burn searches (the wallet's) and the light client's anchors: MAC only.
   assert.match(vault, /store\.put\(\{ v: 1, scans, mac \}, BURN_SCANS_KEY\)/);
   assert.match(vault, /export async function writeBurnScan\(owner, /);
-  assert.match(vault, /store\.put\(\{ v: 1, anchors: copy, mac \}, LIGHT_ANCHORS_KEY\)/);
+  assert.match(vault, /store\.put\(\{ v: LIGHT_ANCHORS_VERSION, chain, anchors: copy, mac \}, LIGHT_ANCHORS_KEY\)/);
+  // The genesis capsule its light client holds: no MAC, since the core verifies it again in full on every read.
+  assert.match(vault, /store\.put\(\{ v: 1, chain: core\.chainIdentity\(\), record: copy \}, CAPSULE_KEY\)/);
   assert.doesNotMatch(read(REPO, 'applications/qnet-wallet/dist/ui/common.js'), /LEGACY_PASSWORD_EXPOSED_KEY|qnet_legacy_password_exposed/);
   // Session memory: the unlocked session, the backoff, the self-test pass and the approval cooldowns.
   const config = read(REPO, 'applications/qnet-wallet/dist/background/config.js');
@@ -344,9 +349,9 @@ test('the testnet faucet is covered: what it sends, what it keeps and for how lo
   assert.match(policy, /Testnet faucet\. The faucet\{full && ' on aiqnet\.io\/testnet'\} sends test tokens \(1DEV and SOL on Solana devnet\) to the Solana address you enter/);
   assert.match(policy, /that transfer publicly links the faucet wallet to your address on Solana/);
   assert.match(policy, /the server keeps the address and the time of its last claim in memory for 24 hours, and then drops it; it is never written to disk/);
-  assert.match(policy, /Testnet faucet claims \(the Solana address and the time of its last claim, and with a faucet pass the wallet's QNet address and that time\): in server memory, 24 hours\./);
+  assert.match(policy, /Testnet faucet claims \(the Solana address and the time of its last claim, and with a faucet pass the wallet's QNet Blockchain address and that time\): in server memory, 24 hours\./);
   // SITE M-13: the faucet pass, what the page sends for it, what it names, and the wallet's day of claims.
-  assert.match(policy, /the node pages send the server the wallet's confirmation that QNet Wallet gave for the activation \(its QNet address, public key, signature and time\) with the payment address, and get a faucet pass for that wallet, which names the wallet and the time it ends, an hour later; the server keeps no list of the passes\. A claim with a pass allows one claim of each token per wallet a day: the server then also keeps the wallet's QNet address and the time of its last claim in memory for 24 hours, in the same way\./);
+  assert.match(policy, /the node pages send the server the wallet's confirmation that QNet Wallet gave for the activation \(its QNet Blockchain address, public key, signature and time\) with the payment address, and get a faucet pass for that wallet, which names the wallet and the time it ends, an hour later; the server keeps no list of the passes\. A claim with a pass allows one claim of each token per wallet a day: the server then also keeps the wallet's QNet Blockchain address and the time of its last claim in memory for 24 hours, in the same way\./);
   assert.match(policy, /With it the page keeps the faucet pass the server gave for the wallet of the activation, the same way, until the faucet page reads it once and sends it with your claim\./);
   const pass = read(SRC, 'server/faucet-pass.ts');
   assert.match(pass, /export const FAUCET_PASS_TTL_S = 3_600;/);
@@ -468,7 +473,7 @@ test('Support says what a second send does in each wallet, never that it cannot 
 // only on those), and it stays inside the kept proof.
 test('the device check names the app activity Play Integrity reports, what it is used for and how long it is kept', () => {
   const section = policy.slice(policy.indexOf('Device check for a light node'), policy.indexOf('Device permissions'));
-  assert.match(section, /On Android, Google Play Integrity's answer also reports app activity on the device: whether apps are running that could view the screen, show themselves over other apps or control the device, and whether other apps are installed, telling apps from Google Play or the device maker apart from apps installed any other way\. The report names no app, only whether such apps are present\. QNet uses it only to tell a phone or tablet from other devices, and keeps it only as part of the operating system's proof, for as long as that proof \(below\)\./);
+  assert.match(section, /On Android, Google Play Integrity's answer also reports app activity on the device: whether apps are running that could view the screen, show themselves over other apps or control the device, and whether other apps are installed, telling apps from Google Play or the device maker apart from apps installed any other way\. The report names no app, only whether such apps are present\. QNet Blockchain uses it only to tell a phone or tablet from other devices, and keeps it only as part of the operating system's proof, for as long as that proof \(below\)\./);
   assert.match(policy, /Device check: the device record while the node is linked and 90 days after; the operating system's proof \(on Android with Google Play Integrity's report of app activity: apps running that could view the screen or control the device, and whether apps from Google Play, from the device maker or from elsewhere are installed\) 7 days, or 90 days after a refusal or a pause;/);
   // SD-R3-01: Google's verdict also carries KNOWN_INSTALLED and UNKNOWN_INSTALLED (apps installed from Google Play or
   // preloaded, and apps installed any other way, whatever their permissions), and the device service keeps the whole
@@ -486,9 +491,10 @@ test('the device check names the app activity Play Integrity reports, what it is
 // has no camera, photo or file access, while both wallets also sign token transfers and contract calls for sites, and
 // below iOS 18.4 a page's upload sheet can still hand a photo or file to the site (hence the camera text in Info.plist).
 test('what a website can ask the wallets for, and what a page\'s upload sheet can pass, as the apps do it', () => {
-  assert.match(policy, /At a site's request the extension signs a message, sends a QNC transfer, a token transfer or a contract call, or moves a light node's balance into its wallet, each only after you confirm that request in its own window\./);
+  // Owner, 12.10: at aiqnet.io's request the extension moves the balance of the wallet's light or super node too.
+  assert.match(policy, /At a site's request the extension signs a message, sends a QNC transfer, a token transfer or a contract call, or moves the balance of the wallet's light or super node into its wallet, each only after you confirm that request in its own window\./);
   assert.match(policy, /it receives a message signature, a QNC transfer, a token transfer or a contract call only after you confirm that request there with the device's authentication or your app password\./);
-  assert.match(policy, /Camera: only after you tap the scan icon on a Send screen and allow it, to read a QNet address, a Solana address or a Solana payment request from a QR code; what it reads only fills in that Send form\. Frames are decoded on the device, on Android and iOS alike, and never stored or sent\. The app itself uses no photos, location, contacts, microphone or files\. On iOS below 18\.4 a website's upload sheet in the in-app browser can still pass that website a photo or file you pick or take there; the camera opens only if you choose it in that sheet\./);
+  assert.match(policy, /Camera: only after you tap the scan icon on a Send screen and allow it, to read a QNet Blockchain address, a Solana address or a Solana payment request from a QR code; what it reads only fills in that Send form\. Frames are decoded on the device, on Android and iOS alike, and never stored or sent\. The app itself uses no photos, location, contacts, microphone or files\. On iOS below 18\.4 a website's upload sheet in the in-app browser can still pass that website a photo or file you pick or take there; the camera opens only if you choose it in that sheet\./);
   assert.doesNotMatch(policy, /tap Scan on the Send screen/);
   assert.doesNotMatch(policy, /uses no camera/);
   assert.doesNotMatch(policy, /No camera, photos, location, contacts, microphone or file access/);
@@ -533,7 +539,7 @@ test('SITE-R3-03: what an activation keeps in the browser and on the server is w
     v: 1, pub: full.pub, key: null, network: 'testnet', createdAt: 1, updatedAt: 9, stage: 'done', burn: { tx: 't', lastValidBlockHeight: 3, amount: 1500 },
     link: null, answer: null, submit: null, refund: null, receipt: { qnet: 'q', nodeId: 'n' },
   });
-  assert.match(policy, /only a receipt of the activation stays in the browser \(the payment address, the burn, its amount, the node and the wallet's QNet address\)/);
+  assert.match(policy, /only a receipt of the activation stays in the browser \(the payment address, the burn, its amount, the node and the wallet's QNet Blockchain address\)/);
   // The server: no list of sent transactions, and the policy says so.
   const proxy = read(SRC, 'server/cabinet/solana-proxy.ts');
   assert.doesNotMatch(proxy, /FORWARDED_KEPT|forwarded = new Map/);
@@ -553,7 +559,7 @@ test('M-1: what a light node answer reports, what the network keeps and for how 
   assert.doesNotMatch(policy, /no analytics, no advertising SDK and no tracking of any kind/);
   assert.match(policy, /There is no account, no sign-up, no analytics or advertising SDK, and no tracking for advertising or across other apps and websites\./);
   assert.match(policy, /and the node's answers report how the network's wake-up messages reached the device \(light node answers, below\)\. Those records, the node's latest epoch not counted and latest answer that the network keeps from those reports, and the aiqnet\.io server's record of each node activation/);
-  assert.match(policy, /Light node answers\. With each answer the app also reports, for the earlier epochs whose wake-up messages reached the device without an answer, when the network sent the message, when the device received it, and whether QNet Wallet could answer it: for example that it had been closed by a swipe since it was last opened, had not been opened since the phone restarted, held no key for the node, answered after the epoch's check had closed, or answered and the answer did not get through\./);
+  assert.match(policy, /Light node answers\. With each answer the app also reports, for the earlier epochs whose wake-up messages reached the device without an answer, when QNet Blockchain sent the message, when the device received it, and whether QNet Wallet could answer it: for example that it had been closed by a swipe since it was last opened, had not been opened since the phone restarted, held no key for the node, answered after the epoch's check had closed, or answered and the answer did not get through\./);
   assert.match(policy, /The device keeps its record for the last six epochs \(about a day\) and deletes it when the device is unlinked\./);
   assert.match(policy, /while an epoch runs they hold in memory when each wake-up message was sent and taken by the push service, until that epoch's check closes \(about four hours\); then each keeps, for the node, only its latest epoch not counted \(the epoch, the reason, the times of its wake-up message and of a late answer, the delay, the network's refusal code and what the app reported\) and its latest counted answer \(when it arrived, the delay and how long the app took\), each replaced by the next one\./);
   assert.match(policy, /The node's public status, which anyone can read by the node identity, as the Device page of aiqnet\.io does, shows the device's platform and model, the day it was linked, its state, the epoch of its last answer and, for an epoch not counted, the epoch, the reason and whether the wake-up message reached the device; it shows no exact time, delay or what the app reported\. Those are shown only to the node's own keys, in the app on the linked device\./);
@@ -585,7 +591,7 @@ test('M-1: what a light node answer reports, what the network keeps and for how 
 
 test('SITE-C-04: QNet Link names the wallet\'s own Solana address for its burn\'s link, and the answer\'s owner bind goes to the nodes', () => {
   assert.match(policy, /and for the link of a burn made from the wallet's own Solana address also that Solana address, for a confirmation, that hash and the payment address/);
-  assert.match(policy, /and for a burn of the wallet's own Solana address the owner bind that Solana key signed for the node, which the page sends with the registration to the aiqnet\.io server and on to the network's nodes, for an unlink,/);
+  assert.match(policy, /and for a burn of the wallet's own Solana address the owner bind that Solana key signed for the node, which the page sends with the registration to the aiqnet\.io server and on to the nodes of QNet Blockchain, for an unlink,/);
   const link = read(SRC, 'lib/qnet-link.ts');
   assert.match(link, /export const OWN_BURN_REQUEST_KEYS = \['burnTx', 'walletHash', 'check', 'burner'\] as const;/);
   assert.match(link, /const OWN_BURN_CONSENT_KEYS = \['ts', 'pk', 'sig', 'ownerSig'\] as const;/);

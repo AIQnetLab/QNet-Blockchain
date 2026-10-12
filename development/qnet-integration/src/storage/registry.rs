@@ -2,6 +2,30 @@
 
 use super::*;
 
+/// A light-client registry dump (`Storage::registry_dump_as_of`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryDump {
+    /// The encoded body `{"entries":[...],"registry_root":"<hex>"}`.
+    Body(Vec<u8>),
+    /// The body would pass the cap: the rows counted before the scan stopped (at least this many).
+    Oversize(usize),
+    /// A missing column family or an iterator error: no answer at all.
+    Failed,
+}
+
+/// One dump row. Fields in key order, so it serializes to the bytes a JSON object of the same values
+/// gives (the light clients hash nothing here, but the body stays what it always was).
+#[derive(serde::Serialize)]
+struct RegistryRow<'a> {
+    burn: &'a str,
+    node_id: &'a str,
+    node_type: &'a str,
+    reg_height: u64,
+    reg_index: u32,
+    vrf_pk_sha3: &'a str,
+    wallet: &'a str,
+}
+
 impl Storage {
     /// Genesis-local PERSISTENT burn-attestation dedup (one burn_tx → one wallet). Survives process
     /// restart — the prior in-memory map was wiped on restart, letting one burn back >1 node across
@@ -649,37 +673,61 @@ impl Storage {
     /// (node_id, wallet, reg_height, burn, vrf_pk_sha3) with reg_height <= up_to_height, plus the
     /// LtHash root over them — byte-identical to the QC-signed registry_root sealed at that height.
     /// The light client recomputes the root and binds each committee pubkey to it. Read-only, cacheable.
-    pub fn registry_entries_as_of(&self, up_to_height: u64) -> (Vec<serde_json::Value>, String) {
+    ///
+    /// Written straight into the JSON body `{"entries":[...],"registry_root":"<hex>"}` (the bytes a
+    /// serialization of the rows as JSON values gives: keys in order), never holding more than `cap`
+    /// bytes: past it the scan stops and reports the rows it had, so a roster of millions costs one
+    /// bounded pass and no allocation per row. Rows above the height are skipped by the index value's
+    /// height without reading them; the dedup set holds only super ids.
+    pub fn registry_dump_as_of(&self, up_to_height: u64, cap: usize) -> RegistryDump {
         use rocksdb::{IteratorMode, Direction};
-        let registry_cf = match self.persistent.db.cf_handle("node_registry") { Some(cf) => cf, None => return (Vec::new(), String::new()) };
+        let registry_cf = match self.persistent.db.cf_handle("node_registry") { Some(cf) => cf, None => return RegistryDump::Failed };
         let mut lt = crate::registry_lthash::LtHash::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
+        // Ids under srtr_: an id indexed under both prefixes is counted once, as the root counts it.
+        let mut supers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut body: Vec<u8> = b"{\"entries\":[".to_vec();
+        let mut rows = 0usize;
+        for (pass, prefix) in [b"srtr_".as_ref(), b"lrtr_".as_ref()].into_iter().enumerate() {
             for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
                 // A partial dump would carry a root that no light client can match; serve nothing.
-                let (k, _) = match item { Ok(kv) => kv, Err(_) => return (Vec::new(), String::new()) };
+                let (k, v) = match item { Ok(kv) => kv, Err(_) => return RegistryDump::Failed };
                 if !k.starts_with(prefix) { break; }
-                let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s.to_string(), Err(_) => continue };
-                if !seen.insert(node_id.clone()) { continue; }
+                let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
+                if pass == 0 {
+                    supers.insert(node_id.to_string());
+                } else if supers.contains(node_id) {
+                    continue;
+                }
+                // The index carries the row's first-stamped height (the node_ row's): a row above the
+                // bound costs no point read. A value that does not decode is read in full.
+                if Self::decode_roster_index_value(&v).map_or(false, |(h, _, _)| h > up_to_height) { continue; }
                 let nk = format!("node_{}", node_id);
                 let val = match self.persistent.db.get_cf(&registry_cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
                 let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
                 let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue };
                 if h > up_to_height { continue; }
-                let wallet = parsed["wallet"].as_str().unwrap_or("").to_string();
-                let burn = parsed["burn"].as_str().unwrap_or("").to_string();
-                let vrf = parsed["vrf_pk_sha3"].as_str().unwrap_or("").to_string();
-                let vrf_bytes = hex::decode(&vrf).unwrap_or_default();
-                let reg_index = parsed["reg_index"].as_u64().unwrap_or(0) as u32;
-                let ntype = parsed["node_type"].as_str().unwrap_or("").to_string();
-                lt.add(&crate::registry_lthash::row_lanes(&node_id, &wallet, h, reg_index, &ntype, &burn, &vrf_bytes));
-                out.push(serde_json::json!({"node_id": node_id, "wallet": wallet, "reg_height": h,
-                                            "reg_index": reg_index, "node_type": ntype,
-                                            "burn": burn, "vrf_pk_sha3": vrf}));
+                let row = RegistryRow {
+                    burn: parsed["burn"].as_str().unwrap_or(""),
+                    node_id,
+                    node_type: parsed["node_type"].as_str().unwrap_or(""),
+                    reg_height: h,
+                    reg_index: parsed["reg_index"].as_u64().unwrap_or(0) as u32,
+                    vrf_pk_sha3: parsed["vrf_pk_sha3"].as_str().unwrap_or(""),
+                    wallet: parsed["wallet"].as_str().unwrap_or(""),
+                };
+                let vrf_bytes = hex::decode(row.vrf_pk_sha3).unwrap_or_default();
+                lt.add(&crate::registry_lthash::row_lanes(row.node_id, row.wallet, h, row.reg_index, row.node_type, row.burn, &vrf_bytes));
+                if rows > 0 { body.push(b','); }
+                if serde_json::to_writer(&mut body, &row).is_err() { return RegistryDump::Failed; }
+                rows += 1;
+                if body.len() > cap { return RegistryDump::Oversize(rows); }
             }
         }
-        (out, hex::encode(lt.root()))
+        body.extend_from_slice(b"],\"registry_root\":\"");
+        body.extend_from_slice(hex::encode(lt.root()).as_bytes());
+        body.extend_from_slice(b"\"}");
+        if body.len() > cap { return RegistryDump::Oversize(rows); }
+        RegistryDump::Body(body)
     }
 
     /// QC-certified digest of the chain-confirmed registry BURN-IDENTITY (SUPER+genesis AND LIGHT),

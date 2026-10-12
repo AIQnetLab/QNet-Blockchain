@@ -1,13 +1,13 @@
 # dApp integration
 
-A web page never holds a QNet key. It finds the user's QNet wallet through a provider the wallet
+A web page never holds a QNet Blockchain key. It finds the user's QNet Blockchain wallet through a provider the wallet
 injects into the page, asks it for the user's address, and asks it to sign or send; the wallet shows
 every request to the user in its own window or sheet and does the signing itself. This document is
 the page-facing contract of that provider, as the two wallets implement it:
 
 - the browser extension (`applications/qnet-wallet`, contract in `applications/qnet-wallet/CONTRACTS.md`
   section 4, internals in [Browser wallet](../applications/browser-wallet.md#page-provider));
-- the in-app browser of the QNet app (`applications/qnet-mobile/src/browser`, internals in
+- the in-app browser of the QNet Wallet app (`applications/qnet-mobile/src/browser`, internals in
   [Mobile wallet](../applications/mobile-wallet.md#in-app-browser)).
 
 Both announce the same provider with the same methods, parameters, results, errors and events.
@@ -19,7 +19,7 @@ Where they differ, the difference is listed under [Differences between the walle
 | --- | --- | --- |
 | Browser extension, store build | top frame of `https://aiqnet.io/*` and `https://games.aiqnet.io/*`, and no other site | `extension` |
 | Browser extension, development build (`npm run build:dev` in `applications/qnet-wallet`) | the same, plus plain-HTTP `http://localhost/*` and `http://127.0.0.1/*` on any port | `extension` |
-| QNet app, in-app browser | top frame of every HTTPS page it opens, except the pages it never loads: every page of `link.aiqnet.io`, the site's `/node`, `/activate`, `/wallet` and `/l` pages, and the pages the site keeps out of the app's view (its home page, `/docs`, `/dao`, `/testnet` and `/qnet-wallet-extension`); for those it opens `https://aiqnet.io/explorer` instead | `mobile` |
+| QNet Wallet app, in-app browser | top frame of every HTTPS page it opens, except the pages it never loads: every page of `link.aiqnet.io`, the site's `/node`, `/activate`, `/wallet` and `/l` pages, and the pages the site keeps out of the app's view (its home page, `/docs`, `/dao`, `/testnet` and `/qnet-wallet-extension`); for those it opens `https://aiqnet.io/explorer` instead | `mobile` |
 
 A page on any other host, or in a subframe, gets no provider.
 
@@ -71,7 +71,7 @@ timeout: an approval waits for the user, up to the wallet's own 10-minute limit.
 | `qnet_getTransactionStatus` | `{from, nonce}` | `{status, blockHeight, txHash}` | never |
 | `qnet_activateNode` | `{nodeType: 'light' \| 'super'}` | see [QNet Link v1](../protocols/qnet-link-v1.md) section 10 | extension only, and only for `https://aiqnet.io` |
 | `qnet_getActivation` | none | what the extension knows of the wallet's activation (its code, a burn on its way, or whether its search found none), see [QNet Link v1](../protocols/qnet-link-v1.md) section 10 | never; extension only, and only for `https://aiqnet.io` (a connected site, at most 30 reads a minute) |
-| `qnet_claimNodeBalance` | none | the `claim` answer of [QNet Link v1](../protocols/qnet-link-v1.md) section 14.7, without `v` and `intent` | extension only, and only for `https://aiqnet.io`; moves the node balance of the wallet's own light node |
+| `qnet_claimNodeBalance` | `{nodeId}`: the wallet's light or super node id | the `claim` answer of [QNet Link v1](../protocols/qnet-link-v1.md) section 14.7, without `v` and `intent` | extension only, and only for `https://aiqnet.io`; moves the node balance of that node, which must be the wallet's own (else `WALLET_MISMATCH`) |
 | `qnet_unlinkNodeDevice` | none | the `unlink` answer of [QNet Link v1](../protocols/qnet-link-v1.md) section 14.7, without `v` and `intent` | extension only, and only for `https://aiqnet.io`; ends the wallet's own light node on the device that runs it |
 
 "None" means the params are absent, `null`, `[]` or `{}`; anything else is -32602.
@@ -109,8 +109,7 @@ What the wallet does with a request:
   decimals, else -32602; an unreadable token is -32603. The amount becomes base units exactly. The gas
   limit is the call's intrinsic gas. A recipient that holds none of the token yet costs the sender a
   refundable 0.01 QNC storage deposit, which the approval shows. A transfer to the burn address
-  `0000000000000000000eon00000000000000036877022` destroys the tokens, and the approval says so, as it
-  does for a token that uses QNet's own name.
+  `0000000000000000000eon00000000000000036877022` destroys the tokens, and the approval says so, as it does for a token named after QNC or QNet Blockchain.
 - **Contract call.** The extension reads the contract first and refuses an address that holds a
   built-in token or no contract (-32602); the in-app browser does not read it and names the contract
   in its sheet. The gas limit is the site's `gasLimit`, which must leave at least 10,000 fuel above the
@@ -225,7 +224,7 @@ site's own `https://aiqnet.io/api/*` routes set no cross-origin headers. A page:
 // development/qnet-sdk/README.md
 import { findWallet } from '@aiqnet/sdk';
 
-const wallet = await findWallet();                 // null when no QNet wallet is installed
+const wallet = await findWallet();                 // null when no QNet Blockchain wallet is installed
 const { qnet } = await wallet.connect();           // the user approves the site once
 const sent = await wallet.sendTransfer({ to: '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d', amount: '1.5' });
 // (sent.from, sent.nonce) is the transaction's identity; sent.txHash is one node's name for its copy.

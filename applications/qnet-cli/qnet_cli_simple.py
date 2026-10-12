@@ -62,7 +62,7 @@ class SimpleCLI:
     
     def show_help(self, args=None):
         """Show help message."""
-        print("QNet CLI - Command line interface for QNet blockchain")
+        print("QNet Blockchain CLI - Command line interface")
         print("\nUsage: qnet-cli <command> <subcommand> [options]")
         print("\nCommands:")
         print("  node status        - Check node status")
@@ -79,8 +79,8 @@ class SimpleCLI:
     
     def show_version(self, args=None):
         """Show version."""
-        print("QNet CLI v0.1.0")
-        print("QNet Protocol v1.0.0")
+        print("QNet Blockchain CLI v0.1.0")
+        print("QNet Blockchain protocol v1.0.0")
     
     def _api_request(self, endpoint, method="GET", data=None):
         """Make API request to node."""
@@ -279,7 +279,7 @@ class SimpleCLI:
             # "claim_rewards:{node_id}:{wallet}", and one over the payload the node quotes back. This
             # CLI holds no key and has no post-quantum signer, so it cannot produce either.
             print("❌ Claiming requires your wallet's ML-DSA-65 key, which this CLI does not hold.")
-            print("   Claim from the QNet wallet app.")
+            print("   Claim from the QNet Wallet app.")
             print(f"   node_id: {node_id}")
         except Exception as e:
             print(f"Error claiming rewards: {e}")

@@ -280,9 +280,11 @@ export async function startSession(session) {
   };
   if (previous !== null && previous.vaultKey !== vaultKey) previous.vaultKey.fill(0);
   const started = current;
-  // a new session starts with no view cache
+  // a new session starts with no view cache and no send proofs
   views = null;
+  sendProofs = null;
   await attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.VIEW_CACHE)).catch(noop);
+  await attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.SEND_PROOFS)).catch(noop);
   try {
     await writeMirror(started);
   } catch {
@@ -406,9 +408,11 @@ export async function lock(reason) {
   current = null;
   if (s !== null) s.vaultKey.fill(0);
   views = null;
+  sendProofs = null;
   await Promise.allSettled([
     attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.SESSION)),
     attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.VIEW_CACHE)),
+    attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.SEND_PROOFS)),
     attempt(() => chromeApi().alarms.clear(AUTO_LOCK_ALARM)),
   ]);
   fire({ locked: true, reason: why });
@@ -519,6 +523,83 @@ export async function forgetViews(names) {
     for (const name of names) delete left[name];
     return { ...kept, views: left };
   }).catch((error) => log.warn('kept balances not dropped', error?.code ?? error?.name));
+}
+
+// ---------------------------------------------------------------- the send proofs (qnet.js)
+
+// The certified account figure a QNet send may stand on, per address of the session's wallet ({balanceNano, nonce,
+// index}: a proof qnet.js folded to the state root of a macroblock whose committee certificate it verified), in worker
+// memory and chrome.storage.session, so a worker woken from sleep sends without reading again. qnet.js judges a figure by
+// its index against the certified head, never by its age. Every lock and every new session drop them.
+const SEND_PROOFS_MAX = 8;
+const U64_TEXT_RE = /^(0|[1-9][0-9]{0,19})$/;
+const isU64Text = (value) => typeof value === 'string' && U64_TEXT_RE.test(value) && BigInt(value) <= 0xffffffffffffffffn;
+const isSendProof = (address, figure) => core.isValidQnetAddress(address) && hasExactKeys(figure, ['balanceNano', 'nonce', 'index'])
+  && isU64Text(figure.balanceNano) && isU64Text(figure.nonce) && Number.isSafeInteger(figure.index) && figure.index >= 0;
+// {walletId, proofs} of the session, read from storage.session once per worker
+let sendProofs = null;
+
+async function sendProofsOf(s) {
+  if (sendProofs?.walletId === s.walletId) return sendProofs;
+  let stored = null;
+  try {
+    stored = (await chromeApi().storage.session.get(STORAGE_KEYS.SEND_PROOFS))?.[STORAGE_KEYS.SEND_PROOFS];
+  } catch {
+    stored = null;
+  }
+  const given = isPlainObject(stored) && stored.walletId === s.walletId && isPlainObject(stored.proofs) ? stored.proofs : {};
+  const proofs = Object.fromEntries(Object.entries(given).filter(([address, figure]) => isSendProof(address, figure)).slice(-SEND_PROOFS_MAX));
+  sendProofs = { walletId: s.walletId, proofs };
+  return sendProofs;
+}
+
+/**
+ * Keeps the certified figure of `address` a send may stand on (qnet.js); nothing while locked. Never throws for storage:
+ * a figure that could not be written stays in worker memory.
+ * @param {string} address
+ * @param {{balanceNano: string, nonce: string, index: number}} figure
+ * @returns {Promise<void>}
+ */
+export async function keepSendProof(address, figure) {
+  const kept = { balanceNano: figure?.balanceNano, nonce: figure?.nonce, index: figure?.index };
+  if (!isSendProof(address, kept)) return;
+  const s = await activeSession();
+  if (s === null) return;
+  const mine = epoch;
+  const cache = await sendProofsOf(s);
+  if (epoch !== mine) return;
+  delete cache.proofs[address];
+  cache.proofs[address] = kept;
+  for (const other of Object.keys(cache.proofs)) {
+    if (Object.keys(cache.proofs).length <= SEND_PROOFS_MAX) break;
+    if (other !== address) delete cache.proofs[other];
+  }
+  await attempt(() => chromeApi().storage.session.set({ [STORAGE_KEYS.SEND_PROOFS]: { walletId: s.walletId, proofs: cache.proofs } }))
+    .catch(() => log.warn('send proof not written'));
+  if (epoch !== mine) await attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.SEND_PROOFS)).catch(noop);
+}
+
+/**
+ * The figure keepSendProof kept for `address` in this session, or null (none, locked).
+ * @param {string} address
+ * @returns {Promise<{balanceNano: string, nonce: string, index: number}|null>}
+ */
+export async function keptSendProof(address) {
+  const s = await activeSession();
+  if (s === null) return null;
+  const figure = (await sendProofsOf(s)).proofs[address];
+  return figure === undefined ? null : { ...figure };
+}
+
+/**
+ * Forgets every kept send proof of this session: they belong to a chain the wallet no longer follows (qnet.js).
+ * @returns {Promise<void>}
+ */
+export async function forgetSendProofs() {
+  const s = await activeSession();
+  if (s === null) return;
+  sendProofs = { walletId: s.walletId, proofs: {} };
+  await attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.SEND_PROOFS)).catch(noop);
 }
 
 // The balances kept across sessions (keptAcrossSessions), read back from the vault's chain cache.

@@ -60,6 +60,8 @@ function handlers(overrides = {}) {
     'qnet.history': () => ({ items: [], cursor: null, pending: [] }),
     // the wallet's built-in QNet tokens: none unless a test lists some (owner, 06.10)
     'qnet.tokens': () => ({ tokens: [], complete: true }),
+    // the Send tab's reads ahead of a review (plan 2.7)
+    'qnet.sendWarm': () => ({ started: true }),
     // the session's view cache, empty until a test fills it, and the Solana History (decision 39)
     'wallet.cached': () => ({ qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null }),
     'solana.history': () => ({ items: [], cursor: null }),
@@ -103,7 +105,7 @@ async function openWallet(overrides = {}, options = {}) {
 // The Activate tab once the wallet has its code (owner, 06.10; decisions 41 and 43): the light node's record only while the
 // chain does not list it, one line to aiqnet.io/node, and a warning only when another burn is involved; nothing else. The
 // code itself is in Settings.
-const recordCard = () => page.$$('.tab-body .card').find((card) => card.children[0]?.textContent === 'QNet network') ?? null;
+const recordCard = () => page.$$('.tab-body .card').find((card) => card.children[0]?.textContent === 'QNet Blockchain') ?? null;
 
 // The tab's parts, top to bottom, by what each is.
 function activateParts() {
@@ -143,7 +145,7 @@ function shownActions(node = page.$('.tab-body')) {
 }
 const MANAGE = 'Manage the node at aiqnet.io/node';
 // the light node's record card with its line, while the chain does not list the node
-const recordLines = (...line) => ['QNet network', 'Light node', core.lightNodeId(core.KAT.qnetAddress), ...line];
+const recordLines = (...line) => ['QNet Blockchain', 'Light node', core.lightNodeId(core.KAT.qnetAddress), ...line];
 
 // The one line where the node is managed: the tab's only link, to aiqnet.io/node in a new tab.
 function assertManageLine() {
@@ -240,47 +242,49 @@ describe('popup: lock screen', () => {
     assert.match(page.text(), /Try again in (9|10) s/);
   });
 
-  it('without a vault offers setup, which opens ui/setup.html in a tab and closes the popup', async () => {
-    await openWallet({
-      'vault.status': () => ({ exists: false, unlocked: false, lockDeadline: null, addresses: null, signingEnabled: true, backoffUntil: null }),
-    });
-    await page.click('[data-action="open-setup"]');
-    assert.deepEqual(page.tabsCreated, [{ url: page.chrome.runtime.getURL(UI_PAGES.setup) }]);
+  // Owner, 11.10: the first open shows two buttons, and each opens setup straight at its step.
+  it('without a vault offers Create a new wallet and Import an existing wallet, each opening setup at that step and closing the popup', async () => {
+    const noVault = () => ({ exists: false, unlocked: false, lockDeadline: null, addresses: null, signingEnabled: true, backoffUntil: null });
+    await openWallet({ 'vault.status': noVault });
+    assert.match(page.text(), /No wallet in this browser yet\./);
+    const create = page.$('[data-action="open-create"]');
+    const importing = page.$('[data-action="open-import"]');
+    assert.equal(create.textContent, 'Create a new wallet');
+    assert.equal(create.className, 'btn btn-primary btn-block');
+    assert.equal(importing.textContent, 'Import an existing wallet');
+    assert.equal(importing.className, 'btn btn-secondary btn-block');
+    assert.deepEqual(page.$$('button').map((node) => node.getAttribute('data-action')), ['open-create', 'open-import']);
+    await page.click('[data-action="open-create"]');
+    assert.deepEqual(page.tabsCreated, [{ url: page.chrome.runtime.getURL(`${UI_PAGES.setup}?flow=create`) }]);
+    assert.equal(page.window.closed, true);
+    page.close();
+    await openWallet({ 'vault.status': noVault });
+    await page.click('[data-action="open-import"]');
+    assert.deepEqual(page.tabsCreated, [{ url: page.chrome.runtime.getURL(`${UI_PAGES.setup}?flow=import`) }]);
     assert.equal(page.window.closed, true);
   });
 });
 
+// Owner, 11.10: "Forgot password?" asks for no phrase and no new password. One screen says the password cannot be
+// recovered and that a new one takes a reset, which removes the wallet from this browser; Reset wallet erases it (the
+// worker's one-time token and fixed confirmation, no password) and the popup starts over at its first screen.
 describe('popup: forgot password (Reset wallet)', () => {
   const TOKEN = 'ab'.repeat(32);
-  const NEW_PASSWORD = 'quantum otter lantern meadow';
-  const OTHER = Object.freeze({ qnet: RECIPIENT, solana: SOLANA_RECIPIENT });
+  const noVault = () => ({ exists: false, unlocked: false, lockDeadline: null, addresses: null, signingEnabled: true, backoffUntil: null });
 
-  // The worker's protocol: without `confirm` a check that names both wallets; with it the replace.
-  let replaced = false;
-  const worker = (checked, restored = ADDRESSES) => (params) => {
-    if (params.confirm !== 'ERASE') return { status: 'confirm', ...checked };
-    page.emit('wiped'); // the worker erases the old vault before it answers
-    replaced = true;
-    return { status: 'restored', ...restored, lockDeadline: Date.now() + 900000 };
-  };
-  const SAME = Object.freeze({ erased: ADDRESSES, restored: ADDRESSES, otherWallet: false });
-
-  async function openRestore(overrides = {}) {
-    replaced = false;
+  async function openReset(overrides = {}) {
+    let erased = false;
     await openWallet({
-      'vault.status': () => (replaced ? unlockedStatus() : lockedStatus()),
-      'vault.restoreBegin': () => ({ token: TOKEN, expiresAt: Date.now() + TIMINGS.RESTORE_TOKEN_TTL_MS }),
-      'vault.restore': worker(SAME),
+      'vault.status': () => (erased ? noVault() : lockedStatus()),
+      'vault.resetBegin': () => ({ token: TOKEN, expiresAt: Date.now() + TIMINGS.RESET_TOKEN_TTL_MS }),
+      'vault.reset': () => {
+        page.emit('wiped'); // the worker announces the wipe before it answers
+        erased = true;
+        return { wiped: true };
+      },
       ...overrides,
     });
     await page.click('[data-action="forgot-password"]');
-  }
-
-  async function typeAndContinue(phrase = core.KAT.mnemonic) {
-    type(page.$('textarea[name="phrase"]'), phrase);
-    type(page.$('input[name="new-password"]'), NEW_PASSWORD);
-    type(page.$('input[name="confirm-password"]'), NEW_PASSWORD);
-    await page.click('[data-action="restore"]');
   }
 
   it('the lock screen says only "Forgot password?"', async () => {
@@ -288,158 +292,115 @@ describe('popup: forgot password (Reset wallet)', () => {
     assert.equal(page.$('[data-action="forgot-password"]').textContent, 'Forgot password?');
   });
 
-  it('Reset wallet: a lead, one warning, the phrase and a new password checked here, no typed word', async () => {
-    await openRestore();
+  it('one screen: why, one danger warning, Back and Reset wallet; nothing to type and nothing asked of the worker yet', async () => {
+    await openReset();
     const text = page.text();
     assert.match(text, /Reset wallet/);
-    assert.match(text, /cannot recover your password/);
-    assert.match(text, /replaced only after the phrase is checked/);
+    assert.match(text, /The extension cannot recover your password\. To set a new one, reset the wallet and import it again with its recovery phrase\./);
     assert.equal(page.$$('.notice').length, 1, 'one warning');
-    assert.match(page.$('.notice').textContent, /removes the wallet from this browser/);
-    assert.doesNotMatch(text, /ERASE|Type .* to confirm/);
-    assert.equal(page.$('input[name="confirm"]'), null);
-    assert.deepEqual(page.$$('input, textarea').map((node) => node.getAttribute('name')), ['phrase', 'new-password', 'confirm-password']);
-    assertAllInputsHardened(page);
-
-    const phrase = page.$('textarea[name="phrase"]');
-    type(phrase, core.KAT.mnemonic.replace(/about$/, 'abandon'));
-    type(page.$('input[name="new-password"]'), NEW_PASSWORD);
-    type(page.$('input[name="confirm-password"]'), NEW_PASSWORD);
-    await page.click('[data-action="restore"]');
-    assert.match(page.text(), /not a valid recovery phrase/);
-    type(phrase, `  ${core.KAT.mnemonic.toUpperCase().replaceAll(' ', '\n')} `);
-    type(page.$('input[name="confirm-password"]'), 'something else entirely');
-    assert.match(page.text(), /✓ At least 8 characters/);
-    assert.match(page.text(), /Passwords do not match/);
-    await page.click('[data-action="restore"]');
-    assert.match(page.text(), /Passwords do not match/);
-    assert.equal(page.callsOf('vault.restoreBegin').length + page.callsOf('vault.restore').length, 0,
-      'invalid input never reaches the worker');
+    assert.ok(page.$('.notice').classList.contains('notice-danger'));
+    assert.match(page.$('.notice').textContent, /removes the wallet from this browser\. Only its recovery phrase brings it back/);
+    assert.deepEqual(page.$$('input, textarea'), [], 'no phrase, no password, no typed word');
+    assert.doesNotMatch(text, /ERASE|Type .* to confirm|New password/);
+    assert.deepEqual(page.$$('button').map((node) => node.getAttribute('data-action')), ['back', 'reset-wallet']);
+    const reset = page.$('[data-action="reset-wallet"]');
+    assert.equal(reset.textContent, 'Reset wallet');
+    assert.ok(reset.classList.contains('btn-danger'));
+    assert.equal(reset.disabled, false);
+    assert.equal(page.callsOf('vault.resetBegin').length + page.callsOf('vault.reset').length, 0);
   });
 
-  it('checks first (nothing erased, this wallet named), then one checkbox arms Reset wallet, which sends the confirmation with the same token', async () => {
-    await openRestore();
-    const phrase = page.$('textarea[name="phrase"]');
-    type(phrase, `  ${core.KAT.mnemonic.toUpperCase().replaceAll(' ', '\n')} `);
-    type(page.$('input[name="new-password"]'), NEW_PASSWORD);
-    type(page.$('input[name="confirm-password"]'), NEW_PASSWORD);
-    page.$('[data-action="restore"]').click();
-    assert.equal(phrase.value, '', 'the phrase leaves the field as the requests are sent');
-    assert.equal(page.$('input[name="new-password"]').value, '');
-    await page.settle();
-    assert.deepEqual(page.callsOf('vault.restoreBegin').map((c) => c.params), [{}], 'no typed word: nothing to send');
-    assert.deepEqual(page.callsOf('vault.restore').map((c) => c.params), [
-      { token: TOKEN, mnemonic: core.KAT.mnemonic, password: NEW_PASSWORD },
-    ], 'the check carries no confirmation');
+  it('Reset wallet asks for the token, erases with it and the fixed confirmation, then starts over at the first screen', async () => {
+    await openReset();
+    page.clipboard.text = 'something copied earlier';
+    const atReload = [];
+    const reload = page.location.reload.bind(page.location);
+    page.location.reload = () => {
+      atReload.push(page.clipboard.text);
+      reload();
+    };
+    await page.click('[data-action="reset-wallet"]');
+    assert.deepEqual(page.callsOf('vault.resetBegin').map((c) => c.params), [{}]);
+    assert.deepEqual(page.callsOf('vault.reset').map((c) => c.params), [{ token: TOKEN, confirm: 'ERASE' }], 'no password, no phrase');
+    assert.equal(page.callsOf('vault.unlock').length, 0);
+    assert.deepEqual(atReload, [''], 'the clipboard is emptied before the one reload, as after Delete wallet (R16)');
+    assert.equal(page.location.reloads, 1);
+    // the reloaded popup: no wallet in this browser, its two buttons
+    page.close();
+    await openWallet({ 'vault.status': noVault });
+    assert.ok(page.$('[data-action="open-create"]') && page.$('[data-action="open-import"]'));
+  });
 
-    const text = page.text();
-    assert.match(text, /Confirm the reset/);
-    assert.match(text, /This recovery phrase is this wallet’s/);
-    assert.match(text, /Wallet in this browser/);
-    assert.ok(text.includes(ADDRESSES.qnet) && text.includes(ADDRESSES.solana), 'the wallet that is replaced is named');
-    assert.doesNotMatch(text, /different wallet|Takes its place/);
-    assert.deepEqual(page.$$('input, textarea').map((node) => node.getAttribute('name')), ['understand'], 'one checkbox, no typing');
-    const go = page.$('[data-action="restore-confirm"]');
-    assert.equal(go.textContent, 'Reset wallet');
-    assert.equal(go.disabled, true);
-    const understand = page.$('input[name="understand"]');
-    assert.match(page.text(), /I understand the wallet in this browser will be replaced/);
-    understand.click();
-    assert.equal(go.disabled, false);
-    understand.click();
-    assert.equal(go.disabled, true, 'unticked: disarmed again');
-    understand.click();
-    await page.click('[data-action="restore-confirm"]');
-    assert.deepEqual(page.callsOf('vault.restore').map((c) => c.params).slice(1), [
-      { token: TOKEN, mnemonic: core.KAT.mnemonic, password: NEW_PASSWORD, confirm: 'ERASE' },
-    ]);
-    assert.equal(page.location.reloads, 0, "its own 'wiped' event does not reload the page mid-restore");
-    assert.match(page.text(), /Wallet restored/);
-    assert.ok(page.text().includes(ADDRESSES.qnet) && page.text().includes(ADDRESSES.solana));
-    assert.match(page.text(), /use Recover my code/);
-    await page.click('[data-action="continue"]');
+  it('a refused step says why on the same screen and erases nothing; Reset wallet works again', async () => {
+    let resets = 0;
+    await openReset({
+      'vault.reset': () => {
+        resets += 1;
+        if (resets === 1) fail('RESET_EXPIRED');
+        page.emit('wiped');
+        return { wiped: true };
+      },
+    });
+    await page.click('[data-action="reset-wallet"]');
+    assert.match(page.text(), /The reset step expired or was interrupted\. Nothing was erased\. Try again\./);
+    assert.equal(page.location.reloads, 0);
+    assert.equal(page.$('[data-action="reset-wallet"]').disabled, false);
+    await page.click('[data-action="reset-wallet"]');
+    assert.equal(page.callsOf('vault.resetBegin').length, 2, 'every press asks for a new token');
+    assert.equal(page.location.reloads, 1);
+  });
+
+  it('Back returns to the lock screen and asks the worker for nothing', async () => {
+    await openReset();
+    await page.click('[data-action="back"]');
+    assert.ok(page.$('[data-action="unlock"]'));
+    assert.ok(page.$('[data-action="forgot-password"]'));
+    assert.equal(page.callsOf('vault.resetBegin').length + page.callsOf('vault.reset').length, 0);
+  });
+
+  it('"Forgot password?" waits while an unlock runs', async () => {
+    let unlocked = false;
+    let release = null;
+    await openWallet({
+      'vault.status': () => (unlocked ? unlockedStatus() : lockedStatus()),
+      'vault.unlock': () => new Promise((resolve) => {
+        release = () => {
+          unlocked = true;
+          resolve({ ...ADDRESSES, lockDeadline: Date.now() + 900000 });
+        };
+      }),
+    });
+    type(page.$('input[name="password"]'), PASSWORD);
+    await page.click('[data-action="unlock"]');
+    assert.equal(page.$('[data-action="forgot-password"]').disabled, true, 'no reset while the password is checked');
+    release();
+    await page.settle();
+    assert.ok(page.$('[data-tab="assets"]'), 'the wallet opens');
+    assert.equal(page.callsOf('vault.resetBegin').length + page.callsOf('vault.reset').length, 0);
+  });
+
+  it('a wallet unlocked in another view replaces the reset screen with the wallet', async () => {
+    let unlocked = false;
+    await openReset({ 'vault.status': () => (unlocked ? unlockedStatus() : lockedStatus()) });
+    unlocked = true;
+    page.emit('unlocked');
+    await page.settle();
+    assert.equal(page.$('[data-action="reset-wallet"]'), null);
     assert.ok(page.$('[data-tab="assets"]'));
   });
 
-  it('a refused step says why and starts again from the lock screen', async () => {
-    await openRestore({ 'vault.restore': () => fail('RESTORE_EXPIRED') });
-    await typeAndContinue();
-    assert.match(page.text(), /Nothing was erased/);
-    await page.click('[data-action="restore-again"]');
-    assert.ok(page.$('[data-action="unlock"]'));
-    assert.ok(page.$('[data-action="forgot-password"]'));
-  });
-
-  it('a phrase of another wallet: a danger notice, both wallets named, one checkbox, replaceOther with the same token (EXT-VAULT-R2-04)', async () => {
-    await openRestore({ 'vault.restore': worker({ erased: ADDRESSES, restored: OTHER, otherWallet: true }, OTHER) });
-    await typeAndContinue();
-    const text = page.text();
-    assert.match(page.$('.notice-danger').textContent, /This recovery phrase is of a different wallet/);
-    assert.match(text, /Removed from this browser/);
-    assert.match(text, /Takes its place/);
-    for (const address of [ADDRESSES.qnet, ADDRESSES.solana, OTHER.qnet, OTHER.solana]) {
-      assert.ok(text.includes(address), address);
-    }
-    assert.ok(text.indexOf(ADDRESSES.qnet) < text.indexOf('Takes its place') && text.indexOf(OTHER.qnet) > text.indexOf('Takes its place'));
-    assert.deepEqual(page.$$('input, textarea').map((node) => node.getAttribute('name')), ['understand']);
-    assert.equal(page.$('[data-action="restore-confirm"]').disabled, true);
-    // a click that reaches the button while the box is not ticked sends nothing
-    fire(page.$('[data-action="restore-confirm"]'), 'click');
-    await page.settle();
-    assert.equal(page.callsOf('vault.restore').length, 1, 'no confirmation without the checkbox');
-    page.$('input[name="understand"]').click();
-    await page.click('[data-action="restore-confirm"]');
-    assert.deepEqual(page.callsOf('vault.restore').map((c) => c.params), [
-      { token: TOKEN, mnemonic: core.KAT.mnemonic, password: NEW_PASSWORD },
-      { token: TOKEN, mnemonic: core.KAT.mnemonic, password: NEW_PASSWORD, confirm: 'ERASE', replaceOther: true },
-    ]);
-    assert.match(page.text(), /Wallet restored/);
-    assert.ok(page.text().includes(OTHER.qnet));
-  });
-
-  it('a stored wallet that cannot be read is said so, and the phrase\'s wallet is named', async () => {
-    await openRestore({ 'vault.restore': worker({ erased: null, restored: ADDRESSES, otherWallet: false }) });
-    await typeAndContinue();
-    assert.match(page.$('.notice-warn').textContent, /cannot be read/);
-    assert.match(page.text(), /Takes its place/);
-    assert.ok(page.text().includes(ADDRESSES.qnet));
-    page.$('input[name="understand"]').click();
-    await page.click('[data-action="restore-confirm"]');
-    assert.equal(page.callsOf('vault.restore')[1].params.replaceOther, undefined);
-    assert.match(page.text(), /Wallet restored/);
-  });
-
-  it('keeps the worker up while the token exists: the restore token lives in its memory (R2-ESM-06)', async () => {
-    mock.timers.enable({ apis: ['setInterval'] });
-    await openRestore();
-    const start = page.callsOf('vault.status').length;
-    mock.timers.tick(TIMINGS.RESTORE_KEEPALIVE_MS * 3);
-    await page.settle();
-    assert.equal(page.callsOf('vault.status').length, start, 'no token yet: nothing to keep');
-    await typeAndContinue();
-    assert.ok(page.$('input[name="understand"]'));
-    const before = page.callsOf('vault.status').length;
-    mock.timers.tick(TIMINGS.RESTORE_KEEPALIVE_MS * 3);
-    await page.settle();
-    assert.equal(page.callsOf('vault.status').length, before + 3);
-    await page.click('[data-action="back"]');
-    const after = page.callsOf('vault.status').length;
-    mock.timers.tick(TIMINGS.RESTORE_KEEPALIVE_MS * 3);
-    await page.settle();
-    assert.equal(page.callsOf('vault.status').length, after, 'no keepalive once the screen is gone');
-  });
-
-  it('Back leaves the flow without asking the worker for anything; Back from the confirmation erases nothing', async () => {
-    await openRestore();
-    await page.click('[data-action="back"]');
-    assert.ok(page.$('[data-action="unlock"]'));
-    assert.equal(page.callsOf('vault.restoreBegin').length, 0);
-    await page.click('[data-action="forgot-password"]');
-    await typeAndContinue();
-    page.$('input[name="understand"]').click();
-    await page.click('[data-action="back"]');
-    assert.ok(page.$('[data-action="unlock"]'));
-    assert.equal(page.callsOf('vault.restore').filter((c) => c.params.confirm === 'ERASE').length, 0);
+  it('a reset the worker refuses because the wallet was unlocked meanwhile opens the wallet and erases nothing', async () => {
+    let unlocked = false;
+    await openReset({
+      'vault.status': () => (unlocked ? unlockedStatus() : lockedStatus()),
+      'vault.reset': () => {
+        unlocked = true;
+        fail('UNLOCKED');
+      },
+    });
+    await page.click('[data-action="reset-wallet"]');
+    assert.ok(page.$('[data-tab="assets"]'));
+    assert.equal(page.location.reloads, 0);
   });
 });
 
@@ -546,7 +507,7 @@ describe('popup: send', () => {
     type(page.$('input[name="to"]'), `${RECIPIENT.slice(0, -1)}0`);
     type(page.$('input[name="amount"]'), '01.50');
     await page.click('[data-action="review"]');
-    assert.match(page.text(), /not a valid QNet address/);
+    assert.match(page.text(), /not a valid QNet Blockchain address/);
     assert.equal(page.callsOf('qnet.preview').length, 0);
 
     type(page.$('input[name="to"]'), ` ${RECIPIENT} `);
@@ -724,6 +685,129 @@ describe('popup: send', () => {
     await page.click('[data-action="review"]');
     assert.match(page.text(), /looks like one you sent to before/);
     assert.doesNotMatch(page.text(), /has not sent to this address before/);
+  });
+});
+
+// Plan 2.7: the Send tab starts the reads a review makes before the review is asked for, says what runs while it is read,
+// and a review that finishes after the user left the form is kept for the Send tab, never dropped unseen.
+describe('popup: the QNet send reads ahead (plan 2.7)', () => {
+  const previewOf = ({ to }) => ({
+    from: ADDRESSES.qnet, to, amountNano: '1000000000', feeNano: '31500', totalNano: '1000031500', nonce: '4', balanceNano: '12500000000',
+    verified: true, verification: 'proof', outstanding: [], replacesNonce: null,
+    recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+  });
+
+  it('opening the tab starts the wallet\'s own certified read, and a whole typed address its recipient checks, once', async () => {
+    await openWallet({ 'qnet.preview': previewOf });
+    await page.click('[data-tab="send"]');
+    assert.deepEqual(page.callsOf('qnet.sendWarm').map((c) => c.params), [{}]);
+    type(page.$('input[name="to"]'), RECIPIENT.slice(0, 20));
+    type(page.$('input[name="to"]'), `${RECIPIENT.slice(0, -1)}0`);
+    await page.settle();
+    assert.equal(page.callsOf('qnet.sendWarm').length, 1, 'no read for a part of an address or an invalid one');
+    type(page.$('input[name="to"]'), ` ${RECIPIENT} `);
+    type(page.$('input[name="to"]'), RECIPIENT);
+    await page.settle();
+    assert.deepEqual(page.callsOf('qnet.sendWarm').map((c) => c.params), [{}, { to: RECIPIENT }]);
+  });
+
+  it('the form button says Send and the review\'s says Confirm; while the review is read a status line shows and the button stays busy', async () => {
+    let release;
+    await openWallet({
+      'qnet.preview': (params) => new Promise((resolve) => {
+        release = () => resolve(previewOf(params));
+      }),
+    });
+    await page.click('[data-tab="send"]');
+    assert.equal(page.$('[data-action="review"]').textContent, 'Send');
+    type(page.$('input[name="to"]'), RECIPIENT);
+    type(page.$('input[name="amount"]'), '1');
+    await page.click('[data-action="review"]');
+    assert.match(page.text(), /Checking your balance on QNet Blockchain…/);
+    assert.equal(page.$('[data-action="review"]').disabled, true);
+    assert.equal(page.$('[data-action="review"]').getAttribute('aria-busy'), 'true');
+    release();
+    await page.settle();
+    assert.equal(page.$('[data-action="confirm-send"]').textContent, 'Confirm');
+    assert.doesNotMatch(page.text(), /Checking your balance/);
+  });
+
+  it('a review that finishes after the user left the form is kept and drawn when the Send tab opens again', async () => {
+    let release;
+    await openWallet({
+      'qnet.preview': (params) => new Promise((resolve) => {
+        release = () => resolve(previewOf(params));
+      }),
+    });
+    await page.click('[data-tab="send"]');
+    type(page.$('input[name="to"]'), RECIPIENT);
+    type(page.$('input[name="amount"]'), '1');
+    await page.click('[data-action="review"]');
+    await page.click('[data-tab="assets"]');
+    release();
+    await page.settle();
+    assert.equal(page.$('.toast').textContent, 'Your send is ready to review on the Send tab.');
+    assert.equal(page.$('[data-action="confirm-send"]'), null, 'Assets stays on screen');
+    await page.click('[data-tab="send"]');
+    assert.ok(page.$('[data-action="confirm-send"]'), 'the review is drawn');
+    assert.ok(page.text().includes(RECIPIENT));
+    assert.equal(page.callsOf('qnet.preview').length, 1, 'not read again');
+    await page.click('[data-action="back"]');
+    await page.click('[data-tab="assets"]');
+    await page.click('[data-tab="send"]');
+    assert.equal(page.$('[data-action="confirm-send"]'), null, 'drawn once: the form again');
+  });
+
+  // decision 49: the Send tab opened again while the review is read draws it at once, with no toast; a newer review
+  // replaces an older one, which then never comes back
+  it('a review finishing while the Send tab shows again is drawn at once; an older one is never drawn after a newer one', async () => {
+    const releases = [];
+    await openWallet({
+      'qnet.preview': (params) => new Promise((resolve) => {
+        releases.push(() => resolve(previewOf(params)));
+      }),
+    });
+    await page.click('[data-tab="send"]');
+    type(page.$('input[name="to"]'), RECIPIENT);
+    type(page.$('input[name="amount"]'), '1');
+    await page.click('[data-action="review"]');
+    await page.click('[data-tab="send"]');
+    releases[0]();
+    await page.settle();
+    assert.ok(page.$('[data-action="confirm-send"]'), 'the review is drawn on the Send tab');
+    assert.ok(!page.text().includes('Your send is ready to review on the Send tab.'), 'no toast while on the Send tab');
+    // an older review left behind by a newer one: only the newer is drawn, and nothing is held
+    await page.click('[data-action="back"]');
+    type(page.$('input[name="amount"]'), '1');
+    await page.click('[data-action="review"]');
+    await page.click('[data-tab="assets"]');
+    await page.click('[data-tab="send"]');
+    type(page.$('input[name="to"]'), RECIPIENT);
+    type(page.$('input[name="amount"]'), '2');
+    await page.click('[data-action="review"]');
+    releases[2]();
+    await page.settle();
+    assert.ok(page.$('[data-action="confirm-send"]'), 'the newer review is drawn');
+    releases[1]();
+    await page.settle();
+    await page.click('[data-tab="assets"]');
+    await page.click('[data-tab="send"]');
+    assert.equal(page.$('[data-action="confirm-send"]'), null, 'the older review is not held');
+  });
+});
+
+describe('popup: the header and the lock screen name the wallet', () => {
+  it('the header shows the logo without a bare QNet, so the QNet Blockchain | Solana switch fits; the lock screen says QNet Wallet', async () => {
+    await openWallet();
+    const header = page.$('header.topbar');
+    assert.equal(header.querySelector('.brand').textContent, '');
+    assert.equal(header.querySelector('.brand').getAttribute('aria-label'), 'QNet Wallet');
+    assert.ok(header.querySelector('.brand img.brand-mark'));
+    assert.match(header.textContent, /QNet Blockchain/);
+    assert.doesNotMatch(header.textContent.replace('QNet Blockchain', ''), /QNet/);
+    page.close();
+    await openWallet({ 'vault.status': () => lockedStatus() });
+    assert.equal(page.$('.lock-top h1').textContent, 'QNet Wallet');
   });
 });
 
@@ -1056,10 +1140,10 @@ describe('popup: Solana send', () => {
     type(page.$('input[name="to"]'), `solana:${SOLANA_RECIPIENT}?amount=1`);
     type(page.$('input[name="amount"]'), '1');
     await page.click('[data-action="review"]');
-    assert.match(page.text(), /This is not a valid QNet address/);
+    assert.match(page.text(), /This is not a valid QNet Blockchain address/);
     type(page.$('input[name="to"]'), SOLANA_RECIPIENT);
     await page.click('[data-action="review"]');
-    assert.match(page.text(), /This is not a valid QNet address/);
+    assert.match(page.text(), /This is not a valid QNet Blockchain address/);
     assert.equal(page.callsOf('qnet.preview').length, 0);
   });
 });
@@ -1086,7 +1170,7 @@ describe('popup: receive and history', () => {
     await page.click('[data-tab="receive"]');
     const tab = page.$('.tab-body');
     assert.equal(tab.querySelector('h2').textContent, 'Receive');
-    assert.equal(tab.querySelector('.heading .lead').textContent, 'Your QNet address for QNC and QNet tokens.');
+    assert.equal(tab.querySelector('.heading .lead').textContent, 'Your address for QNC and tokens on QNet Blockchain.');
     assert.equal(tab.querySelectorAll('.notice').length, 0, 'no notice or warning box');
     assert.doesNotMatch(tab.textContent, /Receive QNC|Only QNC|testnet|first and last characters/);
     assert.equal(tab.querySelectorAll('.addr-edge').length, 2, 'the start and end of the address are set apart');
@@ -1273,8 +1357,11 @@ describe('popup: activate', () => {
     await page.click('[data-tab="activate"]');
     assert.match(page.text(), /1500 1DEV/);
     assert.match(page.text(), /3000 1DEV/);
+    // no proof serves the price: it is labelled as what the nodes report
+    assert.match(page.text(), /Price as reported by the nodes of QNet Blockchain./);
     await page.click('[data-action="choose-light"]');
     const text = page.text();
+    assert.match(text, /Price as reported by the nodes of QNet Blockchain./);
     // the burn is irreversible: one confirmation line, the acknowledgement, and no warning list (owner, 28.09)
     assert.match(text, /I understand that 1500 1DEV will be destroyed and that this wallet gets exactly one code\./);
     assert.equal(page.$$('.tab-body .notice').length, 0);
@@ -1307,7 +1394,7 @@ describe('popup: activate', () => {
     assert.equal(page.$('[data-action="done"]'), null);
     assert.equal(page.$('.tab-body h2').textContent, 'Activate a node');
     assert.deepEqual(activateParts(), ['heading', 'record', 'manage']);
-    assert.deepEqual(shownLines(), ['Activate a node', ...recordLines('Recording on the QNet network… This usually takes a minute or two.'), MANAGE]);
+    assert.deepEqual(shownLines(), ['Activate a node', ...recordLines('Recording on QNet Blockchain… This usually takes a minute or two.'), MANAGE]);
     assert.deepEqual(shownActions(), []);
     assertOnlyTheLine();
     assertManageLine();
@@ -1427,7 +1514,7 @@ describe('popup: activate', () => {
     assert.doesNotMatch(page.text(), /One code per wallet|burned on aiqnet\.io|finish it on aiqnet\.io/);
     assert.doesNotMatch(page.text(), /Burn 1DEV on Solana to get/, 'no invitation to burn once the wallet has its code');
     // the chain lists the node: nothing to record here, and the card is off the screen
-    assert.doesNotMatch(shownText(), /QNet network|Recorded on the QNet network/);
+    assert.doesNotMatch(shownText(), /QNet Blockchain|Recorded on QNet Blockchain/);
     assert.equal(page.$('[data-action="record"]'), null);
     // its code is in Settings like any other
     await page.click('[data-tab="settings"]');
@@ -1454,16 +1541,16 @@ describe('popup: activate', () => {
     mock.timers.tick(1);
     await page.settle();
     assert.deepEqual(activateParts(), ['heading', 'record', 'manage']);
-    assert.deepEqual(shownLines(), ['Activate a node', ...recordLines('Not recorded on the QNet network yet.',
-      'Records this wallet’s light node on the QNet network. It costs no fee and burns nothing.', 'Record on the network'), MANAGE]);
+    assert.deepEqual(shownLines(), ['Activate a node', ...recordLines('Not recorded on QNet Blockchain yet.',
+      'Records this wallet’s light node on QNet Blockchain. It costs no fee and burns nothing.', 'Record on QNet Blockchain'), MANAGE]);
     assert.deepEqual(shownActions(), ['record']);
-    assert.match(shownText(), /Not recorded on the QNet network yet\./);
+    assert.match(shownText(), /Not recorded on QNet Blockchain yet\./);
     assert.equal(page.callsOf('activation.registration').length, 1, 'an activation without a record is looked up once');
     assert.match(shownText(), /It costs no fee and burns nothing\./);
     assert.equal(page.$('.tab-body input[type="password"]'), null, 'no password (decision 33)');
     await page.click('[data-action="record"]');
     assert.deepEqual(registered, [{}]);
-    assert.match(shownText(), /Recording on the QNet network/);
+    assert.match(shownText(), /Recording on QNet Blockchain/);
     assert.equal(page.$('[data-action="record"]'), null, 'no button while the wallet records it on its own');
     // read again while it is being recorded, until the chain lists it; then the card goes (owner, 06.10: aiqnet.io/node
     // shows the node) and the manage line stays
@@ -1475,7 +1562,7 @@ describe('popup: activate', () => {
     assert.deepEqual(activateParts(), ['heading', 'record:hidden', 'manage']);
     assert.deepEqual(shownLines(), ['Activate a node', MANAGE]);
     assert.deepEqual(shownActions(), []);
-    assert.doesNotMatch(shownText(), /QNet network|Record on the network/);
+    assert.doesNotMatch(shownText(), /QNet Blockchain|Record on QNet Blockchain/);
     assertManageLine();
     mock.timers.tick(TIMINGS.REGISTRATION_POLL_MS * 3);
     await page.settle();
@@ -1485,16 +1572,16 @@ describe('popup: activate', () => {
     // a retry hours away, the one-node rule, another burn's registration), with Record on the network when it can help
     const deferred = { ...view('queued', true), attempts: 7, deferred: true };
     const states = [
-      ['refused', view('refused'), /The QNet network did not accept the record\. Nothing is burned again\. Try again later\./, true],
+      ['refused', view('refused'), /QNet Blockchain did not accept the record\. Nothing is burned again\. Try again later\./, true],
       ['clock', view('clock'), /This computer’s clock is more than 5 minutes off\./, true],
       // EXT-R1-04 (b): a retry hours away is not "a minute or two": Not recorded, with Record on the network
-      ['deferred', deferred, /Not recorded on the QNet network yet\./, true],
+      ['deferred', deferred, /Not recorded on QNet Blockchain yet\./, true],
       // decision 36: the network's one-node rule refused it (this wallet has a node of either type): said so, and no
       // Record on the network, which would only meet the same refusal
       ['wallet_has_node', { ...view('refused'), lastError: 'wallet_has_node' },
-        /The QNet network refused the record: this wallet already has a node\. One wallet, one node\./, false],
+        /QNet Blockchain refused the record: this wallet already has a node\. One wallet, one node\./, false],
       // EXT-R2A-03: listed with another burn's registration: said so, never "Recorded", and no Record on the network
-      ['other_burn', view('other_burn'), /recorded on the QNet network with another 1DEV burn\. The burn made here recorded nothing/, false],
+      ['other_burn', view('other_burn'), /recorded on QNet Blockchain with another 1DEV burn\. The burn made here recorded nothing/, false],
     ];
     for (const [state, shown, text, offered] of states) {
       registration = shown;
@@ -1507,7 +1594,7 @@ describe('popup: activate', () => {
       assert.deepEqual(shownActions(), offered ? ['record'] : [], state);
       assertOnlyTheLine();
       assert.match(shownText(), text, state);
-      assert.doesNotMatch(shownText(), /Recording on the QNet network|Recorded on the QNet network for this wallet/, state);
+      assert.doesNotMatch(shownText(), /Recording on QNet Blockchain|Recorded on QNet Blockchain for this wallet/, state);
       assert.equal(page.$('[data-action="record"]') !== null, offered, state);
       assert.equal(page.$$('.tab-body .notice-success').length, 0, `${state}: no success banner`);
       page.close();
@@ -1517,7 +1604,7 @@ describe('popup: activate', () => {
     await page.click('[data-tab="activate"]');
     assert.equal(recordCard(), null);
     assert.deepEqual(shownLines(), ['Activate a node', MANAGE]);
-    assert.doesNotMatch(page.text(), /QNet network/);
+    assert.doesNotMatch(page.text(), /(?:Recorded|Recording|Not recorded|light node|Record) on QNet Blockchain/);
     assert.equal(page.callsOf('activation.registration').length, 0);
   });
 
@@ -1556,9 +1643,9 @@ describe('popup: activate', () => {
     assert.equal(page.callsOf('activation.registration').length, 1, 'read at once');
     assert.deepEqual(shownLines(), ['Activate a node',
       'Another device with this recovery phrase burned first: that burn is this wallet’s activation. The burn of 1500 1DEV this device sent also went through; it gives no second activation code.',
-      'Open in Solana Explorer', ...recordLines('Recording on the QNet network… This usually takes a minute or two.'), MANAGE]);
+      'Open in Solana Explorer', ...recordLines('Recording on QNet Blockchain… This usually takes a minute or two.'), MANAGE]);
     assert.ok(!page.text().includes(CODE), 'the code the burn answered is not drawn here');
-    assert.match(shownText(), /Recording on the QNet network/);
+    assert.match(shownText(), /Recording on QNet Blockchain/);
     mock.timers.tick(TIMINGS.REGISTRATION_POLL_MS);
     await page.settle();
     assert.equal(page.callsOf('activation.registration').length, 2, 'one read per poll');
@@ -1580,7 +1667,7 @@ describe('popup: activate', () => {
 
     await openWallet({ 'activation.price': () => ({ phase: 2, light: { cost: 5000 }, super: { cost: 10000 }, fetchedAt: 1 }) });
     await page.click('[data-tab="activate"]');
-    assert.match(page.text(), /not available in this network phase/);
+    assert.match(page.text(), /not available in the current phase of QNet Blockchain/);
     assert.equal(page.$('[data-action="choose-super"]'), null);
     page.close();
 
@@ -1616,8 +1703,8 @@ describe('popup: activate', () => {
     // the outcome, then the tab as after any burn (the restored code is in Settings)
     assert.deepEqual(activateParts(), ['heading', 'notice-success', 'record', 'manage']);
     assert.deepEqual(shownLines(), ['Activate a node', 'The code of this wallet’s burn was restored.',
-      ...recordLines('Not recorded on the QNet network yet.',
-        'Records this wallet’s light node on the QNet network. It costs no fee and burns nothing.', 'Record on the network'), MANAGE]);
+      ...recordLines('Not recorded on QNet Blockchain yet.',
+        'Records this wallet’s light node on QNet Blockchain. It costs no fee and burns nothing.', 'Record on QNet Blockchain'), MANAGE]);
     assert.deepEqual(shownActions(), ['record']);
     assert.equal(page.$('.code-box'), null);
     assert.equal(page.$('[data-action="recover"]'), null, 'Recover goes once the wallet has its code');
@@ -1628,7 +1715,7 @@ describe('popup: activate', () => {
   // (a phone-only activation paid on aiqnet.io) points to Recover, and no answer is "nothing burned, try again".
   it('a burn the QNet network cannot clear goes back to the overview with the reason and Recover, never "maybe sent"', async () => {
     for (const [code, text] of [['NODE_EXISTS', /already has a node\. Use Recover my code on the Activate tab/],
-      ['NETWORK', /QNet nodes could not be reached/]]) {
+      ['NETWORK', /QNet Blockchain could not be reached/]]) {
       await openWallet({ 'activation.burn': () => fail(code) });
       await page.click('[data-tab="activate"]');
       // Recover is its title and its button, with no paragraph on how it works (owner, 28.09)
@@ -1656,10 +1743,10 @@ describe('popup: activate', () => {
     await page.click('[data-action="choose-light"]');
     page.$('input[name="acknowledge"]').click();
     await page.click('[data-action="burn"]');
-    assert.match(page.text(), /in a form no QNet app derives a code from/);
+    assert.match(page.text(), /in a form no app for QNet Blockchain derives a code from/);
     assert.ok(page.$('[data-action="choose-light"]'), 'back on the overview with the reason');
     await page.click('[data-action="recover"]');
-    assert.match(page.text(), /in a form no QNet app derives a code from/);
+    assert.match(page.text(), /in a form no app for QNet Blockchain derives a code from/);
     assert.doesNotMatch(page.text(), /No burn/i);
   });
 
@@ -1697,8 +1784,8 @@ describe('popup: activate', () => {
     await page.settle();
     // the settled burn: the tab of a wallet with its code
     assert.deepEqual(activateParts(), ['heading', 'record', 'manage']);
-    assert.deepEqual(shownLines(), ['Activate a node', ...recordLines('Not recorded on the QNet network yet.',
-      'Records this wallet’s light node on the QNet network. It costs no fee and burns nothing.', 'Record on the network'), MANAGE]);
+    assert.deepEqual(shownLines(), ['Activate a node', ...recordLines('Not recorded on QNet Blockchain yet.',
+      'Records this wallet’s light node on QNet Blockchain. It costs no fee and burns nothing.', 'Record on QNet Blockchain'), MANAGE]);
     assert.deepEqual(shownActions(), ['record']);
     assertOnlyTheLine();
     assertManageLine();
@@ -1756,7 +1843,7 @@ describe('popup: activate', () => {
     registration = view('admitted', true);
     page.emit('activation');
     await page.settle();
-    assert.match(page.text(), /Recording on the QNet network/);
+    assert.match(page.text(), /Recording on QNet Blockchain/);
     assert.equal(page.$('[data-action="record"]'), null, 'nothing left to record by hand');
     expectKept('admitted');
     // the chain lists the node: the card goes in place (owner, 06.10)
@@ -1766,7 +1853,7 @@ describe('popup: activate', () => {
     await page.settle();
     assert.equal(recordCard(), card, 'the same card');
     assert.ok(card.classList.contains('hidden'));
-    assert.doesNotMatch(shownText(), /QNet network/);
+    assert.doesNotMatch(shownText(), /QNet Blockchain/);
     assert.deepEqual(activateParts(), ['heading', 'record:hidden', 'manage']);
     assert.deepEqual(shownActions(), [], 'the line and nothing else');
     expectKept('onchain');
@@ -1952,7 +2039,7 @@ describe('popup: settings', () => {
     await page.click('[data-action="revoke"]');
     assert.deepEqual(page.callsOf('sites.revoke').map((entry) => entry.params), [{ origin: 'https://aiqnet.io' }]);
     assert.equal(page.$$('[data-action="revoke"]').length, 1);
-    assert.match(page.text(), /Version3\.1\.0/);
+    assert.match(page.text(), /Version3\.1\.2/);
   });
 
   it('checks a new password locally, then changes it with the current one', async () => {
@@ -2261,7 +2348,7 @@ describe('popup: activate, one code per wallet (decision 35)', () => {
     let current = view('checking', { search: 'searching' });
     await openWallet({ 'activation.lookup': () => current });
     await page.click('[data-tab="activate"]');
-    assert.match(page.text(), /Checking this wallet: the QNet network, Solana and aiqnet\.io…/);
+    assert.match(page.text(), /Checking this wallet: QNet Blockchain, Solana and aiqnet\.io…/);
     for (const action of ['choose-light', 'choose-super', 'recover', 'check-again']) assert.equal(page.$(`[data-action="${action}"]`), null, action);
     assert.doesNotMatch(page.text(), /1500 1DEV|3000 1DEV/);
     assert.doesNotMatch(page.text(), /Burn 1DEV on Solana to get/, 'no invitation to burn while the wallet is checked');
@@ -2273,7 +2360,7 @@ describe('popup: activate, one code per wallet (decision 35)', () => {
     assert.ok(page.$('[data-action="choose-super"]'), 'a Light or a Super code, chosen once');
     // where each node runs: a Light node in QNet Wallet on a phone or tablet, a Super node only on a server (decision 36)
     assert.match(page.text(), /Runs in QNet Wallet on a phone or tablet\./);
-    assert.match(page.text(), /Runs on your own server with the QNet node software\./);
+    assert.match(page.text(), /Runs on your own server with the QNet Blockchain node software\./);
     assert.match(page.text(), /Burn 1DEV on Solana to get this wallet’s node activation code\./);
     // none: no more reads
     mock.timers.tick(TIMINGS.ACTIVATE_RECHECK_MS * 3);
@@ -2305,23 +2392,23 @@ describe('popup: activate, one code per wallet (decision 35)', () => {
     // its warning and Recover, nothing else
     assert.deepEqual(activateParts(), ['heading', 'notice-warn', 'recover']);
     assert.deepEqual(shownLines(), ['Activate a node',
-      'This wallet already has a node on the QNet network. Recover my code below looks for its code.', 'Already burned?', 'Recover my code']);
+      'This wallet already has a node on QNet Blockchain. Recover my code below looks for its code.', 'Already burned?', 'Recover my code']);
     assert.deepEqual(shownActions(), ['recover']);
-    assert.match(page.text(), /This wallet already has a node on the QNet network\. Recover my code below looks for its code\./);
+    assert.match(page.text(), /This wallet already has a node on QNet Blockchain\. Recover my code below looks for its code\./);
     assert.equal(page.$('[data-action="recover"]').textContent, 'Recover my code');
     assert.equal(page.$('[data-action="choose-light"]'), null);
     assert.doesNotMatch(page.text(), /Burn 1DEV on Solana to get/, 'no invitation to burn beside a node');
     page.close();
     await openWallet({ 'activation.lookup': () => view('unusable', { search: 'unusable' }) });
     await page.click('[data-tab="activate"]');
-    assert.match(page.text(), /in a form no QNet app derives a code from/);
+    assert.match(page.text(), /in a form no app for QNet Blockchain derives a code from/);
     assert.equal(page.$('[data-action="choose-light"]'), null);
     assert.equal(page.$('[data-action="recover"]'), null);
   });
 
   it('a source that cannot answer is named, with Retry and no cards', async () => {
     for (const [reason, text] of [['RECORD_UNAVAILABLE', /aiqnet\.io could not be reached, so it could not confirm that this wallet has no burn\./],
-      ['NETWORK', /The QNet nodes could not be reached\./], ['SOLANA_UNAVAILABLE', /Solana could not be read\./],
+      ['NETWORK', /QNet Blockchain could not be reached\./], ['SOLANA_UNAVAILABLE', /Solana could not be read\./],
       ['HISTORY_TOO_LONG', /too long to search in one go/]]) {
       let reads = 0;
       if (page) page.close();
@@ -2744,7 +2831,7 @@ describe('popup: any QNet token can be sent (owner, 06.10)', () => {
       },
     });
     await page.click('[data-tab="send"]');
-    assert.equal(page.$('.tab-body h2').textContent, 'Send on QNet');
+    assert.equal(page.$('.tab-body h2').textContent, 'Send on QNet Blockchain');
     const picker = page.$('select[name="asset"]');
     // a token's option names its short contract too (M-5)
     assert.deepEqual(picker.querySelectorAll('option').map((node) => [node.getAttribute('value'), node.textContent]),
@@ -2784,7 +2871,7 @@ describe('popup: any QNet token can be sent (owner, 06.10)', () => {
     type(page.$('input[name="amount"]'), '2.5');
     await page.click('[data-action="review"]');
     assert.match(page.text(), /The token balance does not cover the amount\./);
-    assert.match(page.text(), /named after QNet’s own coin/);
+    assert.match(page.text(), /named after the native coin of QNet Blockchain/);
     assert.match(page.text(), /destroys every token sent to it/);
     assert.equal(page.$('[data-action="confirm-send"]').disabled, true);
     await page.click('[data-action="back"]');
@@ -2855,9 +2942,28 @@ describe('popup: a history row opens its detail (owner, 06.10)', () => {
     await page.settle();
     const dropped = page.$('.history-detail').textContent;
     assert.ok(dropped.includes('Not found'));
-    assert.ok(dropped.includes('The network no longer holds this transaction and it did not go through.'));
+    assert.ok(dropped.includes('QNet Blockchain no longer holds this transaction and it did not go through.'));
     assert.ok(dropped.includes('Nonce'));
     assert.equal(page.$('.history-detail [data-action="explorer"]'), null, 'no hash, no explorer link');
+  });
+
+  it('an unverified token row is not looked up on the nodes: only its logs proof confirms it, and its detail says so', async () => {
+    await openWallet({
+      'qnet.history': () => ({
+        items: [row({ kind: 'token', direction: 'in', from: RECIPIENT, to: ADDRESSES.qnet, amountNano: '0', feeNano: '0', status: 'unverified',
+          token: { contract: RECIPIENT, symbol: 'GOLD', decimals: 6, reserved: false }, amountBase: '5000000' })],
+        cursor: null,
+        pending: [],
+      }),
+      'qnet.txLookup': () => ({ status: 'in_block', blockHeight: 4321 }),
+    });
+    await page.click('[data-tab="history"]');
+    page.$$('[data-action="open-detail"]')[0].click();
+    await page.settle();
+    assert.equal(page.callsOf('qnet.txLookup').length, 0);
+    const detail = page.$('.history-detail').textContent;
+    assert.ok(detail.includes('Unverified'));
+    assert.ok(detail.includes('The explorer lists this token transfer, but the wallet could not prove it on QNet Blockchain yet.'));
   });
 
   it('a token row shows the token and its amount; Solana rows show their mint, sides and signature', async () => {
@@ -2938,7 +3044,7 @@ describe('popup: tokens named after QNC, and a list that leaves tokens out (M-5,
     await page.click('[data-tab="history"]');
     assert.deepEqual(page.$$('.history-row .amount-symbol').map((node) => node.textContent), ['\u26a0 QNC', 'GOLD']);
     await page.click('[data-action="open-detail"]');
-    assert.match(page.text(), /This token is named after QNet’s own coin, but it is not QNC\./);
+    assert.match(page.text(), /This token is named after the native coin of QNet Blockchain, but it is not QNC\./);
     assert.equal(page.$$('.tab-body .notice-danger').length, 1);
     await page.click('[data-action="back"]');
     page.$$('[data-action="open-detail"]')[1].click();
@@ -3059,7 +3165,7 @@ describe('popup: private key export (owner, 06.10)', () => {
     assert.match(page.text(), /Private key/);
     await page.click('[data-action="export-key"]');
     assert.match(page.text(), /Anyone with this key controls this account and everything in it\./);
-    assert.match(page.text(), /QNet: the 32-byte seed the wallet derives its ML-DSA-65 key pair from, as 64 hex characters\./);
+    assert.match(page.text(), /QNet Blockchain: the 32-byte seed the wallet derives its ML-DSA-65 key pair from, as 64 hex characters\./);
     await page.click('.tab-body [data-value="solana"]');
     assert.match(page.text(), /Solana: the 64-byte secret key in base58\./);
     await page.click('.tab-body [data-value="qnet"]');

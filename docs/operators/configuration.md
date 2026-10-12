@@ -1,6 +1,6 @@
 # Configuration
 
-The QNet node is configured through environment variables supplied to the container at start. This document lists the operator-facing variables with their defaults, states which ports the node uses, and separates out the development and test variables that must never be set on a production node. For installation and startup, see [running a node](running-a-node.md).
+The QNet Blockchain node is configured through environment variables supplied to the container at start. This document lists the operator-facing variables with their defaults, states which ports the node uses, and separates out the development and test variables that must never be set on a production node. For installation and startup, see [running a node](running-a-node.md).
 
 ## Configuration policy
 
@@ -48,7 +48,7 @@ Several settings are resolved from more than one source. The order is fixed in c
 - **Wallet seed.** `<NAME>_FILE` (read from disk, trimmed) before the inline `<NAME>`; `QNET_WALLET_SEED` before `QNET_GENESIS_SEED`.
 - **Data directory.** `QNET_DATA_DIR` when set; otherwise an automatic selection which, under Docker, prefers `/app/data` if it is writable.
 - **Advertised external address.** `QNET_EXTERNAL_IP`, then `DOCKER_HOST_IP`, then STUN discovery against public servers.
-- **Advertised API endpoint (on chain).** Suppressed entirely by `QNET_HIDE_IP`; otherwise `QNET_PUBLIC_IP`, then `EXTERNAL_IP`, then `HOST_IP`.
+- **Advertised API endpoint (on chain).** Suppressed entirely by `QNET_HIDE_IP`; `https://<IP>` while the node serves the [public RPC](running-a-node.md#public-rpc-port-443) with a valid certificate for its address; otherwise `http://<QNET_PUBLIC_IP, then EXTERNAL_IP, then HOST_IP>:8001`. Either form is announced only when today's on-chain endpoint rule accepts it, else nothing is announced and `endpoint_refused_by_validator` is logged.
 - **Pre-flight reachability address.** Detected by HTTP query to public IP services (`api.ipify.org`, `ifconfig.me`, `icanhazip.com`). When detection fails, the external reachability checks are skipped.
 - **Genesis node list.** `QNET_GENESIS_NODES` (each entry security-validated), then a `genesis-nodes.json` file searched at `./`, `config/`, `/etc/qnet/` and `~/.qnet/` (files over 10 KB or listing more than 10 nodes are skipped), then the addresses pinned in the binary.
 - **Genesis RPC base URL.** `QNET_RPC_URL`, then the first entry of `QNET_GENESIS_NODES` on port 8001, then `http://127.0.0.1:8001`.
@@ -63,6 +63,7 @@ Several settings are resolved from more than one source. The order is fixed in c
 | 9876 | TCP | Pre-flight availability probe | Must be free; exposed by the image |
 | 9877 | TCP | Pre-flight availability probe | Must be free; exposed by the image |
 | 8101 | TCP | `QNET_API_PORT` + 100 | Bound inside the container; not published by the image and needs no firewall rule |
+| 8443 | TCP | Wallet plane (Super nodes that serve wallets) | The [public RPC](running-a-node.md#public-rpc-port-443) over HTTPS; host 443 is published to it. Fixed; not opened by a genesis identity, a Light node or under `QNET_HIDE_IP` |
 
 Pre-flight probes a fixed port set — 8001/TCP, 9876/TCP, 9877/TCP and 10876/UDP — regardless of the values of `QNET_API_PORT` and `QNET_P2P_PORT`. Those four ports must be free on the host even when the node is configured to serve elsewhere.
 
@@ -95,8 +96,8 @@ The QUIC listener binds IPv4. Pre-flight treats UDP 10876 as critical: if it is 
 | `QNET_EXTERNAL_IP` | Public address to advertise. Consulted before `DOCKER_HOST_IP` and before STUN discovery. | auto-detected | `<your.public.ip>` |
 | `DOCKER_HOST_IP` | Fallback public address when `QNET_EXTERNAL_IP` is unset. | auto-detected | — |
 | `EXTERNAL_IP` / `HOST_IP` | Address used for QUIC transport initialisation, and the fallbacks behind `QNET_PUBLIC_IP` when building the API endpoint advertised in the node's on-chain registration. | `0.0.0.0` for QUIC; empty for the endpoint | — |
-| `QNET_PUBLIC_IP` | Address used when advertising the node's API endpoint on chain, in registration and in reactivation. | falls back to `EXTERNAL_IP`, then `HOST_IP` | — |
-| `QNET_HIDE_IP` | If set (any value), the node advertises no API endpoint; a reactivation sent under it leaves the committed endpoint as it stands. | unset | `1` |
+| `QNET_PUBLIC_IP` | Address used when advertising the node's API endpoint on chain, in registration and in reactivation, and the public RPC's address. Without it (nor `EXTERNAL_IP` / `HOST_IP`) the public RPC takes the address two genesis nodes agree on, and keeps it while genesis is down or busy; with it, a genesis view that differs is only logged (`public_ip_env_differs`), and while every genesis runs a version without the 443 check the node requests its certificate without that check. | falls back to `EXTERNAL_IP`, then `HOST_IP` | — |
+| `QNET_HIDE_IP` | If set (any value), the node advertises no API endpoint, opens no public RPC and commits no endpoint by itself; a reactivation sent under it without an explicit `api_endpoint` leaves the committed endpoint as it stands. A node that served the public RPC before keeps `https://<IP>` committed until a reactivation with `"api_endpoint": "http://<IP>:8001"`; it logs `hidden_node_endpoint_still_https` at each start until then. | unset | `1` |
 | `QNET_GENESIS_NODES` | Comma-separated genesis node addresses; each is security-validated. Also used to derive a genesis RPC URL when `QNET_RPC_URL` is unset. | pinned genesis list | `<ip1>,<ip2>` |
 | `QNET_RPC_URL` | Explicit RPC base URL for genesis-side queries (device registration, uniqueness checks). | derived from `QNET_GENESIS_NODES`, else `http://127.0.0.1:8001` | `http://<host>:8001` |
 

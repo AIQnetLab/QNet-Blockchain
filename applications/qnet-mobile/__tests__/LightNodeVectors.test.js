@@ -2,7 +2,9 @@
  * The shared light node vectors (docs/protocols/light-node.vectors.json), the app's side: the file is what its
  * generator writes; the identity the app derives from a phrase; every wallet-key, ping-key and device message the app
  * builds (src/crypto/NodePreimages.js) and the signatures over them; and QNet Link revision 2 with the app's own
- * X25519 / HKDF / AES-GCM. P-256 checks run on node:crypto, independent of the app's libraries.
+ * X25519 / HKDF / AES-GCM. P-256 checks run on node:crypto, independent of the app's libraries. The file's `claim` cases
+ * keep the earlier request, which named no node: the app refuses it (the request that names the node, light or super:
+ * docs/protocols/node-claim.vectors.json, __tests__/NodeClaimVectors.test.js).
  */
 const { spawnSync } = require('child_process');
 const nodeCrypto = require('crypto');
@@ -16,6 +18,7 @@ const { hkdf } = require('@noble/hashes/hkdf.js');
 const { gcm } = require('@noble/ciphers/aes.js');
 const { x25519 } = require('@noble/curves/ed25519');
 const P = require('../src/crypto/NodePreimages');
+const Q = require('../src/services/QNetLink');
 const { walletSeedString, eonFromPublicKeyBytes } = require('../src/crypto/WalletIdentity');
 const { WalletManager } = require('../src/components/WalletManager');
 const kat = require('./fixtures/wallet_kat.json');
@@ -282,6 +285,16 @@ describe('QNet Link revision 2 with the app\'s cryptography', () => {
     const pt = gcm(key, bytes(c.iv), utf8(c.aad)).decrypt(bytes(c.ciphertext));
     expect(Buffer.from(pt).toString('utf8')).toBe(c.plaintext);
     const answer = JSON.parse(c.plaintext);
+    const view = { intent: c.intent, request: c.request || null };
+    const window = { now: Number(c.context.now), consent24h: c.context.consent24h };
+    if (c.intent === 'claim') {
+      // The earlier request names no node: the app takes no such request, and an answer naming a node answers none.
+      expect(Q.requestText('claim', c.request)).toBeNull();
+      expect(Q.plaintextProblem(c.plaintext, view, window)).toBe('nodeId' in answer ? 'nodeId' : null);
+      return;
+    }
+    if (c.request) expect(Q.requestText(c.intent, c.request)).toBe(c.requestText);
+    expect(Q.plaintextProblem(c.plaintext, view, window)).toBe(null);
     if (c.intent === 'link' && answer.status === 'ok') {
       const proof = P.registrationProof(c.request.burnTx, answer.nodeId, answer.qnet);
       const preimage = P.consentPreimage(answer.nodeId, answer.qnet, proof, answer.consent.ts);

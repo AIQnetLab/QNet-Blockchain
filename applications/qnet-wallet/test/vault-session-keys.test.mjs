@@ -101,6 +101,11 @@ describe('keys', () => {
 
     const quote = await keys.signNodeClaim({ nodeId, wallet: KAT_EON });
     assert.equal(await verify(core.claimQuotePreimage(nodeId, KAT_EON), quote), true);
+    // the wallet's super node (decision 47): the same quote for its super id, and no other wallet's
+    const superId = core.superNodeId(KAT_EON);
+    const superQuote = await keys.signNodeClaim({ nodeId: superId, wallet: KAT_EON });
+    assert.equal(await verify(core.claimQuotePreimage(superId, KAT_EON), superQuote), true);
+    await rejectsWith(keys.signNodeClaim({ nodeId: core.superNodeId(OTHER_EON), wallet: KAT_EON }), 'INVALID_NODE_MESSAGE');
     const payload = await keys.signClaimPayload({ wallet: KAT_EON, timestamp: 1_790_000_000, claimsData: '{"claims":[]}' });
     assert.equal(await verify(core.claimPayloadPreimage(KAT_EON, 1_790_000_000, '{"claims":[]}'), payload), true);
     const status = await keys.signNodeStatus({ nodeId, wallet: KAT_EON, timestamp: 1_790_000_060 });

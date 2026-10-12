@@ -113,6 +113,7 @@ const activationOf = (nodeType) => ({
 const pendingBurn = { burnTx: BURN_TX, nodeType: 'light', burnAmount: 1500, solanaAddress: A.solana, cluster: 'devnet', createdAt: NOW };
 // the light node's record on the QNet network (nodes.publicRegistration), and a node aiqnet.io paid for this wallet
 const NODE_ID = core.lightNodeId(A.qnet);
+const SUPER_NODE_ID = core.superNodeId(A.qnet);
 const registrationOf = (state, automatic = false) => ({
   nodeId: NODE_ID, state, attempts: automatic ? 1 : 12, lastError: null, txHash: null, updatedAt: NOW, automatic,
 });
@@ -190,9 +191,10 @@ const sites = {
 };
 
 // ---------------------------------------------------------------- scenarios
-// responses: type → result | {$error: CODE, retryAfterMs?} | {$pending: true} | {$seq: [..]} (the last repeats)
+// responses: type → result | {$error: CODE, retryAfterMs?, walkSteps?} | {$pending: true} | {$seq: [..]} (the last repeats)
 // steps: ['check', name] | ['click', sel] | ['trusted', sel] | ['type', sel, text] | ['waitFor', sel] |
 //        ['wait', ms] | ['words'] (setup: type the asked words back) | ['hold', sel] (pointerdown) | ['select', sel, value]
+// query: appended to the page's address (setup's ?flow=)
 
 const popupBase = {
   'vault.status': unlocked,
@@ -208,15 +210,12 @@ const popupBase = {
   'solana.history': solanaHistory,
   'node.unlinkView': noDevice,
   'qnet.tokens': tokens,
+  'qnet.sendWarm': { started: true },
 };
 
 const tab = (name) => ['click', `[data-tab="${name}"]`];
 const net = (name) => ['click', `.network-switch [data-value="${name}"]`];
 const pw = (sel = 'input[name="password"]') => ['type', sel, PASSWORD];
-// Reset wallet: locked, a token, and the phrase with a new password typed up to the confirmation
-const restoreBase = { 'vault.status': locked, 'vault.restoreBegin': { token: 'ab'.repeat(32), expiresAt: NOW + 600000 } };
-const restoreTyped = [['type', 'textarea[name="phrase"]', KAT], pw('input[name="new-password"]'), pw('input[name="confirm-password"]'),
-  ['click', '[data-action="restore"]'], ['waitFor', 'input[name="understand"]']];
 // a Solana send of 1500 1DEV up to its sent screen
 const solanaSendSteps = [net('solana'), tab('send'), ['click', '.segmented [data-value="1dev"]'], ['type', 'input[name="to"]', SOL_RECIPIENT],
   ['type', 'input[name="amount"]', '1500'], ['click', '[data-action="review"]'], ['waitFor', '[data-action="confirm-send"]:not([disabled])'],
@@ -234,45 +233,13 @@ const POPUP = [
     steps: [['check', 'lock'], pw(), ['click', '[data-action="unlock"]'], ['check', 'lock-wrong-password']],
   },
   {
-    // Forgot password → Reset wallet: the phrase and a new password, the check naming this wallet, one checkbox
-    name: 'restore',
+    // Forgot password → Reset wallet (owner, 11.10): why, one warning, Back and Reset wallet; a refused step says so there
+    name: 'reset',
     responses: {
-      ...restoreBase,
-      'vault.restore': { $seq: [
-        { status: 'confirm', erased: A, restored: A, otherWallet: false },
-        { status: 'restored', qnet: A.qnet, solana: A.solana, lockDeadline: NOW + 900000 },
-      ] },
+      'vault.status': locked, 'vault.resetBegin': { token: 'ab'.repeat(32), expiresAt: NOW + 60000 }, 'vault.reset': { $error: 'RESET_EXPIRED' },
     },
-    steps: [['click', '[data-action="forgot-password"]'], ['check', 'restore'],
-      ['type', 'textarea[name="phrase"]', 'not a phrase'], ['click', '[data-action="restore"]'], ['check', 'restore-invalid'],
-      ...restoreTyped, ['check', 'restore-confirm'], ['click', 'input[name="understand"]'],
-      ['click', '[data-action="restore-confirm"]'], ['waitFor', '[data-action="continue"]'], ['check', 'restore-done']],
-  },
-  {
-    // another wallet's phrase: both pairs under a danger notice, the same checkbox
-    name: 'restore-other-wallet',
-    responses: {
-      ...restoreBase,
-      'vault.restore': { $seq: [
-        { status: 'confirm', erased: A, restored: { qnet: HISTORY_PEER, solana: SOL_RECIPIENT }, otherWallet: true },
-        { status: 'restored', qnet: HISTORY_PEER, solana: SOL_RECIPIENT, lockDeadline: NOW + 900000 },
-      ] },
-    },
-    steps: [['click', '[data-action="forgot-password"]'], ...restoreTyped, ['check', 'restore-other-confirm'],
-      ['click', 'input[name="understand"]'], ['click', '[data-action="restore-confirm"]'], ['waitFor', '[data-action="continue"]'],
-      ['check', 'restore-other-done']],
-  },
-  {
-    // a stored record that does not parse: said so, the phrase's wallet named
-    name: 'restore-unreadable',
-    responses: { ...restoreBase, 'vault.restore': { status: 'confirm', erased: null, restored: A, otherWallet: false } },
-    steps: [['click', '[data-action="forgot-password"]'], ...restoreTyped, ['check', 'restore-unreadable']],
-  },
-  {
-    name: 'restore-failed',
-    responses: { ...restoreBase, 'vault.restore': { $error: 'RESTORE_EXPIRED' } },
-    steps: [['click', '[data-action="forgot-password"]'], ['type', 'textarea[name="phrase"]', KAT], pw('input[name="new-password"]'),
-      pw('input[name="confirm-password"]'), ['click', '[data-action="restore"]'], ['waitFor', '[data-action="restore-again"]'], ['check', 'restore-failed']],
+    steps: [['click', '[data-action="forgot-password"]'], ['check', 'reset'], ['click', '[data-action="reset-wallet"]'], ['wait', 50],
+      ['check', 'reset-failed']],
   },
   {
     name: 'assets',
@@ -287,12 +254,30 @@ const POPUP = [
     steps: [['check', 'assets-unverified']],
   },
   { name: 'assets-unconfirmed', responses: { 'qnet.balance': { $error: 'BALANCE_UNCONFIRMED' } }, steps: [['check', 'assets-unconfirmed']] },
+  // decision 49: while a long walk is why, the status line and the error say how far it is
+  {
+    name: 'assets-walking',
+    responses: { 'qnet.balance': { ...qnetBalance, spendableNano: '12500000000', verified: false, verification: 'none', walkSteps: 12345 } },
+    steps: [['check', 'assets-walking']],
+  },
+  {
+    name: 'assets-walking-error',
+    responses: { 'qnet.balance': { $error: 'BALANCE_UNCONFIRMED', walkSteps: 12345 } },
+    steps: [['check', 'assets-walking-error']],
+  },
   {
     // the send rule refuses: a transaction from another device is not confirmed yet
     name: 'send-qnet-foreign',
     responses: { 'qnet.preview': { $error: 'BALANCE_FOREIGN_PENDING' } },
     steps: [tab('send'), ['type', 'input[name="to"]', HISTORY_PEER], ['type', 'input[name="amount"]', '1'], ['click', '[data-action="review"]'],
       ['wait', 200], ['check', 'send-qnet-foreign']],
+  },
+  {
+    // the review is being read: the button busy and the status line under the form
+    name: 'send-qnet-checking',
+    responses: { 'qnet.preview': { $pending: true } },
+    steps: [tab('send'), ['type', 'input[name="to"]', HISTORY_PEER], ['type', 'input[name="amount"]', '1'], ['click', '[data-action="review"]'],
+      ['wait', 100], ['check', 'send-qnet-checking']],
   },
   { name: 'signing-off', responses: { 'vault.status': { ...unlocked, signingEnabled: false } }, steps: [['check', 'signing-disabled']] },
   {
@@ -726,6 +711,9 @@ const SETUP = [
       ['check', 'earlier-remove-confirm'], ['click', '[data-action="confirm-remove-earlier"]'], ['wait', 50], ['check', 'earlier-remove-refused']],
   },
   { name: 'exists', responses: { 'vault.status': locked }, steps: [['check', 'exists']] },
+  // the popup's two buttons open setup straight at their step (owner, 11.10)
+  { name: 'create-direct', query: '?flow=create', responses: { 'vault.status': noVault }, steps: [['check', 'create-direct']] },
+  { name: 'import-direct', query: '?flow=import', responses: { 'vault.status': noVault }, steps: [['check', 'import-direct']] },
   { name: 'error', responses: { 'vault.status': { $error: 'INTERNAL' } }, steps: [['check', 'error']] },
   {
     name: 'create',
@@ -793,7 +781,7 @@ const unlinkDetails = (extra = {}) => ({
   mode: 'confirm', reason: null, nodeId: NODE_ID, wallet: A.qnet, platform: 'unknown', linkedSince: 1_790_035_200, ...extra,
 });
 const claimDetails = (extra = {}) => ({
-  mode: 'claim', reason: null, nodeId: NODE_ID, wallet: A.qnet, amountNano: '123456789012345678', ...extra,
+  mode: 'claim', reason: null, nodeId: NODE_ID, nodeType: 'light', wallet: A.qnet, amountNano: '123456789012345678', ...extra,
 });
 // a send or an activation arms after CONFIRM_ARM_VALUE_MS; a press before that starts the wait over
 const ARMED = TIMINGS.CONFIRM_ARM_VALUE_MS + 400;
@@ -981,7 +969,8 @@ const APPROVE = [
     },
     steps: [...confirmBurn, ['waitFor', '.ap-actions .ap-btn-primary'], ['wait', 100], ['check', 'activate-outcome-record-wallet-has-node']],
   },
-  // Move to wallet (qnet_claimNodeBalance): the balance, the armed confirm, the outcome
+  // Move to wallet (qnet_claimNodeBalance, decision 47): the node the site named, light or super, its balance, the armed
+  // confirm, the outcome
   {
     name: 'claim',
     responses: {
@@ -991,15 +980,28 @@ const APPROVE = [
     steps: [['check', 'claim'], ['wait', ARMED], ['trusted', '.ap-actions .ap-btn-primary'], ['waitFor', '.ap-ok'], ['check', 'claim-outcome-ok-partial']],
   },
   {
+    name: 'claim-super',
+    responses: { 'approval.get': approvalView('claimNodeBalance', claimDetails({ nodeId: SUPER_NODE_ID, nodeType: 'super' })) },
+    steps: [['check', 'claim-super']],
+  },
+  {
     name: 'claim-progress',
     responses: { 'approval.get': approvalView('claimNodeBalance', claimDetails()), 'approval.resolve': { $pending: true } },
     steps: [['wait', ARMED], ['trusted', '.ap-actions .ap-btn-primary'], ['waitFor', '.progress'], ['check', 'claim-progress']],
   },
-  { name: 'claim-reading', responses: { 'approval.get': approvalView('claimNodeBalance', claimDetails({ mode: null, nodeId: null, wallet: null, amountNano: null })) }, steps: [['check', 'claim-reading']] },
+  {
+    name: 'claim-reading',
+    responses: { 'approval.get': approvalView('claimNodeBalance', claimDetails({ mode: null, nodeId: null, nodeType: null, wallet: null, amountNano: null })) },
+    steps: [['check', 'claim-reading']],
+  },
   { name: 'claim-empty', responses: { 'approval.get': approvalView('claimNodeBalance', claimDetails({ mode: 'empty', amountNano: '999999999' })) }, steps: [['check', 'claim-empty']] },
-  ...['NO_NODE', 'NETWORK', 'SIGNING_DISABLED'].map((reason) => ({
+  ...['WALLET_MISMATCH', 'NO_NODE', 'NETWORK', 'SIGNING_DISABLED'].map((reason) => ({
     name: `claim-unavailable-${reason}`,
-    responses: { 'approval.get': approvalView('claimNodeBalance', claimDetails({ mode: 'unavailable', reason, amountNano: null })) },
+    responses: {
+      'approval.get': approvalView('claimNodeBalance', claimDetails({
+        mode: 'unavailable', reason, amountNano: null, ...(reason === 'WALLET_MISMATCH' ? { nodeType: null } : {}),
+      })),
+    },
     steps: [['check', `claim-unavailable-${reason}`]],
   })),
   ...[['empty', null], ['error', 'CLAIM_BUSY'], ['error', 'CLAIM_REFUSED'], ['error', 'NETWORK']].map(([status, error]) => ({
@@ -1070,6 +1072,7 @@ function pageScript(responses, language, localStorageItems) {
     if (entry && typeof entry.$error === 'string') {
       const error = { code: entry.$error, message: entry.$error };
       if (entry.retryAfterMs) error.retryAfterMs = entry.retryAfterMs;
+      if (entry.walkSteps) error.walkSteps = entry.walkSteps;
       return { ok: false, error };
     }
     return { ok: true, result: JSON.parse(JSON.stringify(entry).replaceAll('"$LANG"', JSON.stringify(S.language))) };
@@ -1344,7 +1347,7 @@ async function runScenario(browser, origin, spec, scenario, language, report) {
       responses['activation.lookup'] = lookupFrom(responses['activation.status']);
     }
     await s('Page.addScriptToEvaluateOnNewDocument', { source: pageScript(responses, language, scenario.localStorage ?? {}) });
-    await s('Page.navigate', { url: `${origin}/${spec.html}` });
+    await s('Page.navigate', { url: `${origin}/${spec.html}${scenario.query ?? ''}` });
     const deadline = Date.now() + 10000;
     while (Date.now() < deadline && !(await evaluate('Boolean(window.__q && window.__q.ready())').catch(() => false))) await sleep(30);
     await settle();

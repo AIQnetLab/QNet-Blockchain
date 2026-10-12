@@ -10,12 +10,17 @@ export const requireUnlocked = (...args) => env().session.requireUnlocked(...arg
 export const touch = (...args) => env().session.touch(...args);
 export const cachedViews = (...args) => env().session.cachedViews(...args);
 export const forgetViews = (...args) => env().session.forgetViews(...args);
+export const keepSendProof = (...args) => env().session.keepSendProof(...args);
+export const keptSendProof = (...args) => env().session.keptSendProof(...args);
+export const forgetSendProofs = (...args) => env().session.forgetSendProofs(...args);
 
 export const readState = (...args) => env().vault.readState(...args);
 export const updateState = (...args) => env().vault.updateState(...args);
 export const verifyPassword = (...args) => env().vault.verifyPassword(...args);
 export const readLightAnchors = (...args) => env().vault.readLightAnchors(...args);
 export const writeLightAnchors = (...args) => env().vault.writeLightAnchors(...args);
+export const readCapsule = (...args) => env().vault.readCapsule(...args);
+export const writeCapsule = (...args) => env().vault.writeCapsule(...args);
 export const readChainCache = (...args) => env().vault.readChainCache(...args);
 export const updateChainCache = (...args) => env().vault.updateChainCache(...args);
 export const readBurnScan = (...args) => env().vault.readBurnScan(...args);

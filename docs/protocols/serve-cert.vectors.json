@@ -1,0 +1,20 @@
+{
+  "description": "ServeCert v1 and serve-proof preimages. The wallet key is the wallet ML-DSA-65 key of `phrase`; the serving key is the FIPS 204 ML-DSA-65 key generated from `serve_key_seed_hex`. Signatures are randomized and not fixed: verify them, do not compare them.",
+  "phrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+  "serve_key_seed_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+  "wallet": "d9fa370374e24333242eon847d1d354dcd87fe873823e",
+  "node_id": "super_node_f3e187d8752f4514",
+  "ip": "203.0.113.7",
+  "issued_at": 1800000000,
+  "not_after": 1800604800,
+  "seq": 1800000000,
+  "serve_pk_sha3": "0ec14b563b18aa6a1b18be4cba83e9d37d41763799b4e2348d08771032a52776",
+  "wallet_pk_sha3": "cc8dbbec8ddd7b01f7926748b3738028ab92570e04e694bf0f4ddc346085de6f",
+  "body_len": 4019,
+  "body_head_hex": "011b73757065725f6e6f64655f663365313837643837353266343531342d64396661333730333734653234333333323432656f6e383437643164333534646364383766653837333832336500000000000000000000ffffcb00710700d2496b00000000800c536b0000000000d2496b00000000",
+  "body_sha3": "5c7504582093e01d6f9c481cce7570fd8d5cae27e6813834eacf2c15a979ec68",
+  "cert_hash": "5c7504582093e01d6f9c481cce7570fd8d5cae27e6813834eacf2c15a979ec68",
+  "cert_preimage": "q1337|node_serve_cert:5c7504582093e01d6f9c481cce7570fd8d5cae27e6813834eacf2c15a979ec68",
+  "challenge": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "proof_preimage": "q1337|node_serve_proof:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:5c7504582093e01d6f9c481cce7570fd8d5cae27e6813834eacf2c15a979ec68:203.0.113.7"
+}

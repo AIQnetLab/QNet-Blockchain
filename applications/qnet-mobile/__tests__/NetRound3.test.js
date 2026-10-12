@@ -260,7 +260,8 @@ describe('MOBNET-R3-08: look-alike names and unasked tokens in the history', () 
     // Marked on the row (⚠ before the symbol) and said in words on the detail screen.
     expect(rows).toMatch(/symbol: reserved \? `⚠ \$\{symbol\}` : symbol/);
     expect(rows).toMatch(/if \(d\.reserved\) fields\.push\(<Text key="reserved" style=\{styles\.txDetailWarning\}>\{t\('tok_reserved_warning'\)\}<\/Text>\);/);
-    expect(screen).toMatch(/\? txHistory\.filter\(rowVisible\)/);
+    // The rows (with the state of a node balance move in transit: services/ClaimTransit) filtered the same way.
+    expect(screen).toMatch(/\? withMoveStates\(txHistory, moveState\)\.filter\(rowVisible\)/);
     expect(screen).toMatch(/t\('hist_unasked_hidden', \{ count: unaskedRows \}\)/);
   });
 });

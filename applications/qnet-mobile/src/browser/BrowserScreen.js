@@ -234,10 +234,12 @@ const BrowserScreen = forwardRef(function BrowserScreen({
   const engine = useMemo(() => {
     const grants = createGrantStore(walletManager, () => live.current.credential, { dev });
     // What this wallet's unsettled transactions may still take of each balance read (dappProvider spendableNano), and
-    // why a balance could not be read: 'foreign', 'unconfirmed' or 'unanswered' (the sheet says which).
+    // why a balance could not be read: 'foreign', 'unconfirmed' or 'unanswered' (the sheet says which), with the steps a
+    // long lineage walk still takes when that is why (WalletManager.walkSteps).
     const balanceRead = (balance, tokenBalance) => ({
       spends: balance && balance.ok && Array.isArray(balance.pending) ? balance.pending : [],
       balanceProblem: balance && balance.ok ? null : (balance && balance.error) || 'unanswered',
+      walkSteps: [balance, tokenBalance].map((b) => (b && !b.ok ? b.walkSteps : null)).find((n) => Number.isSafeInteger(n)) ?? null,
       ...(tokenBalance !== null ? {
         tokenSpends: tokenBalance && tokenBalance.ok && Array.isArray(tokenBalance.pending) ? tokenBalance.pending : [],
         tokenProblem: tokenBalance && tokenBalance.ok ? null : (tokenBalance && tokenBalance.error) || 'unanswered',

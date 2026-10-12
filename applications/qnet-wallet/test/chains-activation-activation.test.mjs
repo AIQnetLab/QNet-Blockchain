@@ -286,15 +286,29 @@ describe('chains-activation activation: code helpers', () => {
 describe('chains-activation activation: price', () => {
   beforeEach(() => installEnv());
 
-  it('reads both node types from the node, phase 1 in whole 1DEV', async () => {
+  it('reads both node types from every pinned node, phase 1 in whole 1DEV', async () => {
     const { seen } = world();
     const quote = await activation.getPrice();
     assert.equal(quote.phase, 1);
     assert.deepEqual(quote.light, { cost: 1500 });
     assert.deepEqual(quote.super, { cost: 1500 });
     assert.ok(Number.isSafeInteger(quote.fetchedAt));
-    assert.equal(seen.priceCalls, 2);
+    assert.equal(seen.priceCalls, 2 * QNET.NODES.length, 'every pinned node is asked for each type');
     assertSafeResult(quote);
+  });
+
+  // P1: no proof serves the price, so every pinned node that answers must quote it alike; one that does not answer is left out
+  it('takes the price only when every answering pinned node quotes it alike; a node that does not answer is left out', async () => {
+    const [first, second] = QNET.NODES;
+    world({ price: (type, node) => (node === first ? null : {}) });
+    assert.deepEqual((await activation.getPrice()).light, { cost: 1500 }, 'one node down');
+    world({ price: (type, node) => (node === second ? { cost: 1600 } : {}) });
+    await rejectsWith(activation.getPrice(), 'PRICE_UNAVAILABLE');
+    world({ price: (type, node) => (node === second ? '{"error":"supply read failed"}' : {}) });
+    await rejectsWith(activation.getPrice(), 'PRICE_UNAVAILABLE');
+    world({ price: (type, node) => (node === first ? {} : null) });
+    // one answer is no agreement
+    await rejectsWith(activation.getPrice(), 'PRICE_UNAVAILABLE');
   });
 
   it('reports phase 2 as such (the burn refuses it)', async () => {
@@ -1712,7 +1726,7 @@ describe('chains-activation activation: aiqnet.io\'s record and reservation (dec
     assert.equal(proofValid({ wallet: W, nodeType: 'super', burner: OWNER, burnTx, burnAmount: 1500 }, proof), true);
   });
 
-  it('after a reset and a restore of the same phrase the old burn is found again and no second burn starts', async () => {
+  it('after a reset and an import of the same phrase the old burn is found again and no second burn starts', async () => {
     installEnv();
     let a = await fresh();
     let { seen, cabinet } = world();
@@ -1934,7 +1948,7 @@ describe('chains-activation activation: aiqnet.io\'s record and reservation (dec
     assert.deepEqual([(view = await a.lookup()).view, view.reason], ['unavailable', 'NETWORK']);
   });
 
-  it('a search verdict the vault no longer holds (a reset and a restore in the same worker) is no "none": the tab checks again', async () => {
+  it('a search verdict the vault no longer holds (a reset and an import of the phrase in the same worker) is no "none": the tab checks again', async () => {
     const burnTx = fakeSignature(5500);
     const found = burnJson({ signature: burnTx });
     installEnv();

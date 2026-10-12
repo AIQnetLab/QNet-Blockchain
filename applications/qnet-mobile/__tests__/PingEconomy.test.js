@@ -488,8 +488,8 @@ describe('the Node tab\'s Background row and its one button', () => {
   const button = (tree) => tree.root.findAll((n) => n.props.testID === 'node-background' && typeof n.props.onPress === 'function');
 
   it('maps the state to one row, with the button only while restricted and the user can change it', () => {
-    expect(backgroundView(Bg.androidPriority({ exempt: true }))).toEqual({ key: 'node_background_unrestricted', color: '#34c759', open: false });
-    expect(backgroundView(Bg.androidPriority({ exempt: false }))).toEqual({ key: 'node_background_restricted', color: '#ff9500', open: true });
+    expect(backgroundView(Bg.androidPriority({ exempt: true }))).toEqual({ key: 'node_background_unrestricted', tone: 'ok', open: false });
+    expect(backgroundView(Bg.androidPriority({ exempt: false }))).toEqual({ key: 'node_background_restricted', tone: 'warn', open: true });
     expect(backgroundView(Bg.iosPriority(0))).toMatchObject({ key: 'node_background_restricted', open: false });
     expect(backgroundView(null)).toBeNull();
   });

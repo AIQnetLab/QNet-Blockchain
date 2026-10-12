@@ -12,7 +12,7 @@ setup(
     version="0.1.0",
     author="Orrery Group LLC",
     author_email="team@qnet.network",
-    description="Command line interface for QNet blockchain",
+    description="Command line interface for QNet Blockchain",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/qnet/qnet-cli",

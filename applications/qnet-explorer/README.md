@@ -1,6 +1,6 @@
-# QNet explorer
+# QNet Blockchain Explorer
 
-Block explorer for QNet: a Next.js frontend plus an indexer process that ingests blocks and
+Block explorer for QNet Blockchain: a Next.js frontend plus an indexer process that ingests blocks and
 transactions from the nodes' RPC into PostgreSQL.
 
 Full documentation: [docs/applications/explorer.md](../../docs/applications/explorer.md)

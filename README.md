@@ -1,6 +1,6 @@
-# QNet
+# QNet Blockchain
 
-QNet is a post-quantum layer-1 blockchain. Every consensus vote, block signature, node identity
+QNet Blockchain is a post-quantum layer-1 blockchain. Every consensus vote, block signature, node identity
 and transaction on the chain is authenticated with ML-DSA-65 (CRYSTALS-Dilithium3, FIPS 204). The
 external Solana burn credential presented at node activation is verified with its own native
 Ed25519 signature.
@@ -52,7 +52,7 @@ contracts at your own risk. See [SECURITY.md](SECURITY.md) for how to report a v
 | Consensus key | Publishes a 1952-byte ML-DSA-65 `vrf_pk` in its on-chain registration row | None |
 | Chain data | Stores and serves chain state, and may take on archival duty | Stores no blocks, headers or state |
 | Producer eligibility | From `ACTIVATION_WARMUP_BLOCKS = 180` blocks past its registration height; genesis identities are eligible immediately | Not applicable |
-| Reward eligibility | On-chain heartbeat subwindow popcount >= 9 for the epoch and never banned | Per-epoch eligibility bitmaps published on chain by genesis nodes |
+| Reward eligibility | On-chain heartbeat subwindow popcount >= 9 for the epoch and never banned; from the `super_reward_admission` gate also in the epoch's consensus-admitted set | Per-epoch eligibility bitmaps published on chain by genesis nodes |
 | Where it runs | Servers and desktops, via Docker | A phone or tablet, inside QNet Wallet; one device per Light node, which passes the system's device check |
 | Registration | Created server-side by the node itself | Submitted by the aiqnet.io node cabinet or the browser extension; the wallet signs its consent in QNet Wallet or the extension |
 
@@ -61,7 +61,7 @@ committee at network start, and the committee is sampled from the on-chain roste
 
 ## Node activation
 
-A node is registered on the network after its owner pays the network's entry cost. Two phases
+A node is registered on QNet Blockchain after its owner pays the network's entry cost. Two phases
 exist. In Phase 1 the payment is a burn of the external 1DEV token on Solana; the price is
 identical for both node types and falls as more of the 1DEV supply is burned, following
 `max(1500 - 150 x floor(burn% / 10), 300)` whole 1DEV. In Phase 2 the payment is QNC transferred
@@ -69,7 +69,7 @@ on-chain rather than burned, with base costs of 10,000 QNC for a Light node and 
 Super node before a network-size multiplier. The transition happens when 90% of the 1DEV supply
 has been burned or five years have passed since the genesis block, whichever comes first; Phase 1
 is the active path today. The Phase 1 burn is made in one of two places, with one activation per wallet:
-the QNet browser extension burns with the wallet's own key, from its Activate tab or when the node
+the QNet Wallet browser extension burns with the wallet's own key, from its Activate tab or when the node
 cabinet at aiqnet.io/node asks it (`qnet_activateNode`); and the node cabinet itself, in a phone's or a
 computer's browser, burns with a one-time payment key it creates in the page, whose activation code
 names the wallet the burn is for. That payment key burns for a Light node only, once QNet Wallet has
@@ -117,7 +117,8 @@ docker run -d --name my-qnet-node --restart=always \
   -e QNET_BURN_TX_HASH="<your Solana burn transaction signature>" \
   -e QNET_BURN_AMOUNT="<exact 1DEV amount burned>" \
   -v "$(pwd)/qnet_seed:/run/secrets/qnet_seed:ro" -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -p 9876:9876 -p 9877:9877 -p 0.0.0.0:8001:8001 -p 10876:10876/udp \
+  -p 0.0.0.0:443:8443 \
   -v "$(pwd)/super_node_data:/app/data" \
   qnet-production
 ```
@@ -136,7 +137,11 @@ image binary.
 All values above are operator-supplied and must never be committed to a repository. TCP 9876,
 9877 and 8001 plus UDP 10876 must be reachable; the QUIC port is the HTTP port plus
 `QUIC_PORT_OFFSET = 2875`. `DOCKER_ENV=1` pins the P2P port to 9876, the port the command
-publishes, and makes the node retry that bind and exit rather than move to another port. Light nodes run inside the mobile application; see
+publishes, and makes the node retry that bind and exit rather than move to another port. Port 8001 is published on
+IPv4 only: over IPv6 the container runtime's proxy would hide the client's address. TCP 443 is the public RPC for
+wallets ([running a node](docs/operators/running-a-node.md#public-rpc-port-443)); leave its mapping out to serve no
+wallet reads. `scripts/install-super-node.sh` runs the same node from the published image and moves it to each release once the
+genesis nodes run it. Light nodes run inside the mobile application; see
 [docs/applications/mobile-wallet.md](docs/applications/mobile-wallet.md).
 
 ## Documentation
@@ -156,8 +161,8 @@ publishes, and makes the node retry that bind and exit rather than move to anoth
 | [docs/operators/configuration.md](docs/operators/configuration.md) | Environment variables and ports |
 | [docs/operators/maintenance.md](docs/operators/maintenance.md) | Monitoring, upgrades, restart, recovery |
 | [docs/developers/overview.md](docs/developers/overview.md) | Where developers start: what exists, who talks to what, limits |
-| [docs/developers/dapp-integration.md](docs/developers/dapp-integration.md) | Connecting web pages to the QNet wallets |
-| [docs/developers/sign-in.md](docs/developers/sign-in.md) | Sign-in with a QNet wallet |
+| [docs/developers/dapp-integration.md](docs/developers/dapp-integration.md) | Connecting web pages to QNet Wallet |
+| [docs/developers/sign-in.md](docs/developers/sign-in.md) | Sign-in with a QNet Blockchain wallet |
 | [docs/developers/transactions.md](docs/developers/transactions.md) | Transaction formats, gas, fees and status |
 | [docs/developers/smart-contracts.md](docs/developers/smart-contracts.md) | WASM contracts and token standards |
 | [docs/developers/sdk.md](docs/developers/sdk.md) | The `@aiqnet/sdk` developer kit |
@@ -181,7 +186,7 @@ BSL 1.1 is not an open-source licence, but this deployment of it carries an Addi
 that permits production and commercial use for everything an operator or builder actually needs,
 with no separate agreement, registration or fee:
 
-- running one or more QNet nodes of any type that participate in the network, including earning
+- running one or more nodes of any type that participate in QNet Blockchain, including earning
   network rewards for doing so;
 - operating public endpoints from such a node — RPC, API, WebSocket, explorers, faucets,
   dashboards and similar services — for yourself or for the public, free or paid;
@@ -190,7 +195,7 @@ with no separate agreement, registration or fee:
 - internal business use, evaluation, testing, research, education and security research.
 
 The restrictions are narrow and aimed at cloning rather than usage. You may not use the licensed
-work or a derivative of it to operate a blockchain network other than QNet; you may not offer the
+work or a derivative of it to operate a blockchain network other than QNet Blockchain; you may not offer the
 licensed work itself to third parties as a managed or hosted product where the customer's node is
 the deliverable (running your own nodes and serving their endpoints publicly is expressly
 permitted); you may not redistribute modified versions as a substitute for the original; and you
@@ -203,7 +208,7 @@ Scope: BSL 1.1 covers `core/`, `development/` (except `development/qnet-sdk/`), 
 applications under `applications/` — mobile wallet, browser extension, explorer and CLI — each
 carry their own Apache-2.0 `LICENSE` file. `development/qnet-sdk/` is licensed under Apache-2.0 by
 the Scope section of the root [LICENSE](LICENSE) and has no `LICENSE` file of its own. None of
-these contain protocol code, and they reach the network over its HTTP API only. Third-party dependency licences are listed in
+these contain protocol code, and they reach QNet Blockchain over its HTTP API only. Third-party dependency licences are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing and security

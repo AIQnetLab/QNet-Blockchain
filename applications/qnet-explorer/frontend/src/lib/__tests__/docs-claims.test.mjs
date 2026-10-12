@@ -19,14 +19,14 @@ const APP_BURNS = [
 
 // Owner corrections 26.09: the cabinet's one-time payment key burns a Light activation (src/lib/cabinet/payment-key.ts)
 // and the extension burns with the wallet's own key; QNet Wallet makes no burn and takes no code (revision 2 links carry
-// connect, link and claim only, src/lib/qnet-link.ts).
+// connect, link, claim, reserve and unlink only, src/lib/qnet-link.ts).
 test('the README and the operator guide name the two places that burn, and what the app does', () => {
   const readme = flat(read('README.md'));
   const section = readme.slice(readme.indexOf('## Node activation'), readme.indexOf('## Repository layout'));
-  assert.match(section, /The Phase 1 burn is made in one of two places, with one activation per wallet: the QNet browser extension burns with the wallet's own key, from its Activate tab or when the node cabinet at aiqnet\.io\/node asks it \(`qnet_activateNode`\); and the node cabinet itself, in a phone's or a computer's browser, burns with a one-time payment key it creates in the page, whose activation code names the wallet the burn is for/);
+  assert.match(section, /The Phase 1 burn is made in one of two places, with one activation per wallet: the QNet Wallet browser extension burns with the wallet's own key, from its Activate tab or when the node cabinet at aiqnet\.io\/node asks it \(`qnet_activateNode`\); and the node cabinet itself, in a phone's or a computer's browser, burns with a one-time payment key it creates in the page, whose activation code names the wallet the burn is for/);
   assert.match(section, /QNet Wallet on a phone or tablet signs the wallet's consent to the registration and links the node to its device/);
   const guide = flat(read('docs/operators/running-a-node.md'));
-  assert.match(guide, /\| Light \| QNet Wallet on a phone or tablet only, one device per node \| Registered on aiqnet\.io\/node \(the cabinet's one-time payment key burns and QNet Wallet signs the wallet's consent\) or by the QNet browser extension \| No \| No \|/);
+  assert.match(guide, /\| Light \| QNet Wallet on a phone or tablet only, one device per node \| Registered on aiqnet\.io\/node \(the cabinet's one-time payment key burns and QNet Wallet signs the wallet's consent\) or by the QNet Wallet browser extension \| No \| No \|/);
   assert.match(guide, /The app links the node to its device \("Use this device"\) and moves the node balance\./);
   for (const [name, text] of [['README.md', readme], ['running-a-node.md', guide], ['mobile-wallet.md', flat(read('docs/applications/mobile-wallet.md'))]]) {
     for (const pattern of APP_BURNS) assert.doesNotMatch(text, pattern, `${name}: ${pattern}`);
@@ -46,7 +46,7 @@ test('the protocol: HISTORY_TOO_LONG and the site\'s codes agree; pending covers
   assert.match(text, /\| `HISTORY_TOO_LONG` \| Solana was read, but this wallet's burn history could not be searched back to its start in one attempt/);
   // R5-ESA-03 / XP-R5-01: the burn no code derives from, in the table and in the app's order of checks.
   assert.match(text, /\| `BURN_UNUSABLE` \| the wallet already made a 1DEV burn of its own that yields no Light or Super code: a successful Token-program burn of the cluster's 1DEV mint that the wallet paid for, signed and authorized, with another memo \(such as `QNET_NODE_TYPE:FULL`\) or from a 1DEV token account other than the associated one/);
-  assert.match(text, /a burn of the wallet's own that yields no code \(section 7, `BURN_UNUSABLE`\), finalized or confirmed, among the candidates of that search or burned from any other of the wallet's 1DEV token accounts \(every such burn is a transaction the wallet signed, so it lists in the history of the wallet's own address, a closed account's included\) → `BURN_UNUSABLE`; a search for such burns that has not reached the start of that history fails closed as above; the QNet wallet already has a node → `NODE_EXISTS`/);
+  assert.match(text, /a burn of the wallet's own that yields no code \(section 7, `BURN_UNUSABLE`\), finalized or confirmed, among the candidates of that search or burned from any other of the wallet's 1DEV token accounts \(every such burn is a transaction the wallet signed, so it lists in the history of the wallet's own address, a closed account's included\) → `BURN_UNUSABLE`; a search for such burns that has not reached the start of that history fails closed as above; the QNet Blockchain wallet already has a node → `NODE_EXISTS`/);
   assert.match(text, /A burn of the wallet's own that yields no code, found as in section 8, is answered `BURN_UNUSABLE` without burning\./);
   assert.match(text, /`pending`: a valid burn of this wallet is on its way and not final yet: one this wallet sent \(now, or earlier and still recorded\), or one Solana reports as confirmed but not finalized, which another device of the same wallet sent/);
   assert.match(text, /\| `BURN_IN_PROGRESS` \| another activation request is running in this wallet \(its own one-at-a-time lock\); a burn of this wallet seen on Solana and not final is `pending`, never this code \|/);
@@ -216,7 +216,7 @@ test('the extension doc and the protocol describe its burn search, NO_WALLET and
   const releaseNotes = browserDoc.slice(browserDoc.indexOf('## Store release notes'), browserDoc.indexOf('## Languages'));
   assert.match(moveParagraph, /^- \*\*A wallet of the earlier version\.\*\* The store's 2\.1\.x kept its wallet/);
   assert.match(moveParagraph, /the worker takes only the wallet's recovery phrase, never the keys stored beside it/);
-  assert.match(releaseNotes, /^## Store release notes 3\.1\.0: a wallet created in version 2\.1 moves into this version\./);
+  assert.match(releaseNotes, /^## Store release notes 3\.1\.2: the first screen offers \*\*Create a new wallet\*\*[\s\S]* 3\.1\.0: a wallet created in version 2\.1 moves into this version\./);
   assert.doesNotMatch(browserDoc.replace(moveParagraph, '').replace(releaseNotes, ''), /2\.1\.x|version 2\.1\b/);
   assert.doesNotMatch(extActivation, /earlier\.js|previousAddress|readEarlierWallet/);
   assert.match(extActivation, /if \(scan\.canonical\) return \{ status: 'exists', activation: await storeCanonical\(scan\.canonical, owner\) \};/);
@@ -372,7 +372,7 @@ test('the extension doc states the round-5 behaviour as the code has it', () => 
   // refused transfers, the resend intervals, the per-nonce reserve.
   assert.match(en, /historyConfirmed: 'Confirmed',/);
   assert.match(en, /historyNotFound: 'Not found',/);
-  assert.match(doc, /Confirmed when two pinned nodes list it alike, Failed when another transaction took its nonce, Not found for a dropped transfer, Unverified for an archive row no two pinned nodes list/);
+  assert.match(doc, /Confirmed when two pinned nodes list it alike \(a token row: when its logs proof verifies\), Failed when another transaction took its nonce, Not found for a dropped transfer, Unverified for an archive row no two pinned nodes list/);
   assert.match(doc, /Two nodes listing a row says it is in a block, not that it applied/);
   assert.match(qnet, /const RESUBMIT_INTERVAL_MS = 30000;/);
   assert.match(qnet, /const RESEND_ACCEPTED_MS = 10 \* 60 \* 1000;/);
@@ -454,6 +454,8 @@ test('explorer.md states the cabinet routes\' limits as limits.ts has them', asy
     `Per client ${perMinute(C.price)}, ${perMinute(C.payment)}, ${perMinute(C.blockhash)}, ${perMinute(C.tx)} and ${perMinute(C.send)} per minute; \`send\` also ${perTen(K.send)} per payment address per 10 min`,
     `one submit in flight per node; ${perTen(C.register)} per client per 10 min and ${perTen(K.register)} per node`,
     `(30 s cache, ${perMinute(C.registration)} per client per minute)`,
-    `${perTen(C.wake)} per client and ${perTen(K.wake)} per node per 10 min`,
   ]) assert.ok(doc.includes(claim), claim);
+  // Owner, 11.10: the site has no "I'm back", so no wake route and no wake limit.
+  assert.ok(!('wake' in C) && !('wake' in K));
+  assert.doesNotMatch(doc, /\/api\/cabinet\/wake|I'm back/);
 });

@@ -137,7 +137,10 @@ fn bip39_mnemonic_to_seed(mnemonic: &str) -> [u8; 64] {
     // trim() before NFKD: the genesis constants + linkage gate derive from a trimmed
     // seed, so an operator seed with a trailing newline (`export X=$(cat seed.txt)` /
     // docker env-files) still yields the same identity. No-op for clean ASCII seeds.
-    let normalized: String = mnemonic.trim().nfkd().collect();
+    // The normalized copy is the phrase itself: wiped when it goes. Sized up front (NFKD of a
+    // wordlist phrase at most doubles its bytes), so no smaller copy is left behind by a regrowth.
+    let mut normalized = zeroize::Zeroizing::new(String::with_capacity(mnemonic.len() * 4));
+    normalized.extend(mnemonic.trim().nfkd());
     let password = normalized.as_bytes();
     let salt = b"mnemonic"; // BIP39 spec: salt = "mnemonic" + optional passphrase (empty)
     let iterations = 2048;

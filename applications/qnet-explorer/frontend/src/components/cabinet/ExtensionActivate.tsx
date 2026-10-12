@@ -24,7 +24,7 @@ import {
   recordsLightNode,
 } from '@/lib/cabinet/extension-view';
 import { isLinkedState, nodeState } from '@/lib/cabinet/node-view';
-import { SITE_ORIGIN, lightNodeId, type ActivationAnswer, type ActivationErrorCode, type ExtensionFailure, type NodeType } from '@/lib/qnet-link';
+import { SITE_ORIGIN, lightNodeId, superNodeId, type ActivationAnswer, type ActivationErrorCode, type ExtensionFailure, type NodeType } from '@/lib/qnet-link';
 import { solanaTxUrl } from '@/lib/one-dev';
 import CopyButton from './CopyButton';
 import { useCabinet } from './CabinetProvider';
@@ -166,7 +166,7 @@ function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; reque
       {recordsLightNode(answer) && requested === 'light' ? (
         <LightNext qnet={answer.qnet} since={at} burnFinal={answer.status !== 'pending'} />
       ) : answer.nodeType === 'super' && answer.code ? (
-        <SuperNext code={answer.code} burnTx={burnTx} burnAmount={burnAmount} />
+        <SuperNext code={answer.code} burnTx={burnTx} burnAmount={burnAmount} nodeId={answer.qnet ? superNodeId(answer.qnet) : null} />
       ) : null}
     </div>
   );

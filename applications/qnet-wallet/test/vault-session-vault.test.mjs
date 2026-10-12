@@ -987,6 +987,57 @@ describe('vault: the light client anchors', () => {
     await vault.wipe({ password: NEW_PASSWORD, confirm: 'DELETE' });
     await rejectsWith(vault.readLightAnchors(), 'LOCKED');
   });
+
+  // record v2 (plan 2.5): an anchor carries its three certified roots, all or none, and the record the chain identity it was
+  // verified under; a record of an earlier version or of another chain identity reads as none
+  it('keeps each anchor\'s certified roots, all or none, under the chain identity; an earlier record or another chain reads as none', async () => {
+    const roots = { state_root: '11'.repeat(32), logs_root: '22'.repeat(32), checkpoint_hash: '33'.repeat(32) };
+    const anchor = { eligible_ids: ['node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) };
+    const anchors = { 23401: { ...anchor, ...roots }, 23402: anchor };
+    await create();
+    await vault.writeLightAnchors(anchors);
+    assert.deepEqual(await vault.readLightAnchors(), anchors);
+    const store = () => env.idb.dump(VAULT_DB.NAME).stores[VAULT_DB.STORE];
+    assert.equal(store().lightAnchors.v, 2);
+    assert.equal(store().lightAnchors.chain, core.chainIdentity());
+    for (const bad of [{ 1: { ...anchor, state_root: roots.state_root } }, { 1: { ...anchor, ...roots, logs_root: 'XY'.repeat(32) } },
+      { 1: { ...anchor, ...roots, state_root: '11' } }]) {
+      await assert.rejects(vault.writeLightAnchors(bad), { code: 'INTERNAL' }, JSON.stringify(bad));
+    }
+    const seed = (value) => env.idb.seed(VAULT_DB.NAME, env.idb.dump(VAULT_DB.NAME).version, { [VAULT_DB.STORE]: { ...store(), lightAnchors: value } });
+    const kept = structuredClone(store().lightAnchors);
+    seed({ ...kept, chain: 'ff'.repeat(16) });
+    assert.equal(await vault.readLightAnchors(), null, 'another chain identity');
+    seed({ v: 1, anchors: kept.anchors, mac: kept.mac });
+    assert.equal(await vault.readLightAnchors(), null, 'a record of an earlier version');
+    seed(kept);
+    assert.deepEqual(await vault.readLightAnchors(), anchors);
+  });
+});
+
+describe('vault: the genesis capsule', () => {
+  // the light client verifies a kept capsule again in full (core.importCapsule): the vault keeps it as it is, with the
+  // chain identity, never without a session
+  it('keeps the capsule record under the chain identity, deletes it on null, and reads another chain\'s as none', async () => {
+    const record = { capsule: { version: 2, mb_index: 39140, sigs: [['genesis_node_001', 'dilithium_sig_genesis_node_001_AAAA']] }, roots: { 39140: { index: 39140 } } };
+    await rejectsWith(vault.writeCapsule(record), 'LOCKED');
+    await rejectsWith(vault.readCapsule(), 'LOCKED');
+    await create();
+    assert.equal(await vault.readCapsule(), null, 'none kept yet');
+    await vault.writeCapsule(record);
+    assert.deepEqual(await vault.readCapsule(), record);
+    await assert.rejects(vault.writeCapsule([record]), { code: 'INTERNAL' });
+    await assert.rejects(vault.writeCapsule({ big: 'x'.repeat(1 << 20) }), { code: 'INTERNAL' });
+    const store = () => env.idb.dump(VAULT_DB.NAME).stores[VAULT_DB.STORE];
+    env.idb.seed(VAULT_DB.NAME, env.idb.dump(VAULT_DB.NAME).version, { [VAULT_DB.STORE]: { ...store(), galcCapsule: { ...store().galcCapsule, chain: 'ff'.repeat(16) } } });
+    assert.equal(await vault.readCapsule(), null, 'another chain identity');
+    await vault.writeCapsule(record);
+    await vault.writeCapsule(null);
+    assert.equal(await vault.readCapsule(), null);
+    assert.equal(store().galcCapsule, undefined, 'deleted');
+    await session.lock('user');
+    await rejectsWith(vault.readCapsule(), 'LOCKED');
+  });
 });
 
 // Owner, 06.10: the popup draws the last verified balances at once, also right after an unlock: they are kept in the

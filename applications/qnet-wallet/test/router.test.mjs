@@ -51,14 +51,17 @@ const VALID = Object.freeze({
   // the private key of one account, behind the password as the phrase (owner, 06.10)
   'vault.exportKey': { password: 'pw', network: 'qnet' },
   'vault.wipe': { password: 'pw', confirm: 'DELETE' },
-  'vault.restoreBegin': {},
-  'vault.restore': { token: 'ab'.repeat(32), mnemonic: core.KAT.mnemonic, password: 'correct horse battery' },
+  // Forgot password → Reset wallet: no password, the popup's one-time token and the fixed confirmation (owner, 11.10)
+  'vault.resetBegin': {},
+  'vault.reset': { token: 'ab'.repeat(32), confirm: 'ERASE' },
   'wallet.addresses': {},
   // the popup's view cache and the Solana History (decision 39)
   'wallet.cached': {},
   'qnet.balance': {},
   'qnet.history': { cursor: null, limit: 20 },
   'qnet.preview': { to: QNET, amount: '1.5' },
+  // the Send tab's reads ahead of a review (plan 2.7)
+  'qnet.sendWarm': { to: QNET },
   // the wallet's built-in tokens, the popup's token send and the History detail's lookup (owner, 06.10)
   'qnet.tokens': {},
   'qnet.tokenPreview': { token: QNET_TOKEN, to: QNET, amount: '2.25' },
@@ -173,7 +176,7 @@ describe('router: message table', () => {
     assert.deepEqual(UI_MESSAGES['vault.import'].pages, ['setup']);
     assert.deepEqual(UI_MESSAGES['vault.migrate'].pages, ['setup']);
     assert.deepEqual(UI_MESSAGES['vault.removeEarlier'].pages, ['setup', 'popup']);
-    for (const type of ['vault.reveal', 'vault.wipe', 'vault.changePassword', 'vault.restoreBegin', 'vault.restore',
+    for (const type of ['vault.reveal', 'vault.wipe', 'vault.changePassword', 'vault.resetBegin', 'vault.reset',
       'activation.burn', 'activation.copy', 'activation.register', 'activation.lookup', 'qnet.send', 'solana.send', 'solana.max',
       'solana.status', 'sites.revoke', 'node.unlinkView', 'node.unlink', 'wallet.cached', 'solana.history']) {
       assert.deepEqual(UI_MESSAGES[type].pages, ['popup'], type);
@@ -335,16 +338,17 @@ describe('router: UI message schema', () => {
       ['vault.wipe', { password: 'pw', confirm: 'DELETE', discard: true }, 'discard'],
       ['vault.wipe', { password: 'pw', confirm: 'delete' }, 'confirm'],
       ['vault.wipe', { password: 'pw' }, 'confirm'],
-      // a reset starts with no typed word; the confirmation goes with the replacing vault.restore
-      ['vault.restoreBegin', { confirm: 'ERASE' }, 'confirm'],
-      ['vault.restore', { ...VALID['vault.restore'], token: undefined }, 'token'],
-      ['vault.restore', { ...VALID['vault.restore'], token: 'AB'.repeat(32) }, 'token'],
-      ['vault.restore', { ...VALID['vault.restore'], token: 'ab'.repeat(31) }, 'token'],
-      ['vault.restore', { ...VALID['vault.restore'], confirm: 'erase' }, 'confirm'],
-      ['vault.restore', { ...VALID['vault.restore'], confirm: true }, 'confirm'],
-      ['vault.restore', { ...VALID['vault.restore'], confirm: 'DELETE' }, 'confirm'],
-      ['vault.restore', { ...VALID['vault.restore'], replaceOther: 'yes' }, 'replaceOther'],
-      ['vault.restore', { ...VALID['vault.restore'], mnemonic: '' }, 'mnemonic'],
+      // a reset starts with no typed word and takes no password or phrase; the confirmation goes with vault.reset
+      ['vault.resetBegin', { confirm: 'ERASE' }, 'confirm'],
+      ['vault.reset', { ...VALID['vault.reset'], token: undefined }, 'token'],
+      ['vault.reset', { ...VALID['vault.reset'], token: 'AB'.repeat(32) }, 'token'],
+      ['vault.reset', { ...VALID['vault.reset'], token: 'ab'.repeat(31) }, 'token'],
+      ['vault.reset', { ...VALID['vault.reset'], confirm: undefined }, 'confirm'],
+      ['vault.reset', { ...VALID['vault.reset'], confirm: 'erase' }, 'confirm'],
+      ['vault.reset', { ...VALID['vault.reset'], confirm: true }, 'confirm'],
+      ['vault.reset', { ...VALID['vault.reset'], confirm: 'DELETE' }, 'confirm'],
+      ['vault.reset', { ...VALID['vault.reset'], password: 'pw' }, 'password'],
+      ['vault.reset', { ...VALID['vault.reset'], mnemonic: core.KAT.mnemonic }, 'mnemonic'],
       ['vault.changePassword', { password: 'pw', newPassword: null }, 'newPassword'],
       ['qnet.send', { ...VALID['qnet.send'], to: badQnet }, 'to'],
       ['qnet.send', { ...VALID['qnet.send'], to: QNET.toUpperCase() }, 'to'],
@@ -779,22 +783,29 @@ describe('router: provider port', () => {
       Array.from({ length: 4 }, () => [SITE, 'qnet_getActivation', {}]));
   });
 
-  it('serves qnet_claimNodeBalance to https://aiqnet.io only, with no params: 4100 elsewhere before the params', async () => {
+  // Decision 47: the move names the node, the wallet's light or super node; the provider checks it is this wallet's.
+  it('serves qnet_claimNodeBalance to https://aiqnet.io only, naming a light or super node: 4100 elsewhere before the params', async () => {
     const h = harness();
+    const LIGHT = core.lightNodeId(QNET);
+    const SUPER = core.superNodeId(QNET);
     const other = h.connect(`${APP}/node`);
-    for (const params of [undefined, { nodeId: 'light_mobile_0000000000000000' }]) {
+    for (const params of [undefined, { nodeId: LIGHT }]) {
       assert.equal(errorOf(await ask(other, { id: 'a', method: 'qnet_claimNodeBalance', params })).code, 4100);
     }
     assert.equal(h.providerCalls.length, 0);
     const port = h.connect(`${SITE}/node`);
-    for (const params of [{ amountNano: '1' }, { wallet: QNET }, ['x'], 'x', 1]) {
+    for (const params of [undefined, null, [], {}, { amountNano: '1' }, { wallet: QNET }, { nodeId: LIGHT, wallet: QNET }, ['x'], 'x', 1,
+      { nodeId: 'genesis_node_001' }, { nodeId: LIGHT.toUpperCase() }, { nodeId: `${SUPER}0` }, { nodeId: 'light_node_0000000000000000' },
+      { nodeId: 7 }]) {
       assert.equal(errorOf(await ask(port, { id: 'p', method: 'qnet_claimNodeBalance', params })).code, -32602, JSON.stringify(params));
     }
-    for (const params of [undefined, null, [], {}]) {
-      assert.equal((await ask(port, { id: 'ok', method: 'qnet_claimNodeBalance', params })).ok, true, JSON.stringify(params));
+    for (const nodeId of [LIGHT, SUPER, 'super_node_0000000000000000']) {
+      assert.equal((await ask(port, { id: 'ok', method: 'qnet_claimNodeBalance', params: { nodeId } })).ok, true, nodeId);
     }
-    assert.deepEqual(h.providerCalls.map((call) => [call.ctx.origin, call.method, call.params]),
-      Array.from({ length: 4 }, () => [SITE, 'qnet_claimNodeBalance', {}]));
+    assert.deepEqual(h.providerCalls.map((call) => [call.ctx.origin, call.method, call.params]), [
+      [SITE, 'qnet_claimNodeBalance', { nodeId: LIGHT }], [SITE, 'qnet_claimNodeBalance', { nodeId: SUPER }],
+      [SITE, 'qnet_claimNodeBalance', { nodeId: 'super_node_0000000000000000' }],
+    ]);
   });
 
   it('serves qnet_unlinkNodeDevice to https://aiqnet.io only, with no params: 4100 elsewhere before the params', async () => {

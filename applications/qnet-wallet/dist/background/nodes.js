@@ -1,11 +1,12 @@
-// This wallet's light node on the QNet network (docs/protocols/light-node-messages.md section 4; CONTRACTS.md section
-// 4.10). After a light burn the wallet records the node on chain: one pinned node builds the registration from the
+// This wallet's nodes on the QNet network (docs/protocols/light-node-messages.md section 4; CONTRACTS.md section 4.10).
+// After a light burn the wallet records the light node on chain: one pinned node builds the registration from the
 // wallet's consent (ML-DSA-65) and the burner's owner bind (Ed25519) and collects the committee's burn attestations
-// inside the submit. For aiqnet.io (qnet_claimNodeBalance) it moves the node balance into the wallet; for Recover it
-// reads the burn the node's registration record names (a burn aiqnet.io paid for this wallet); before any burn it asks
-// whether the network already holds the node (lightNodeKnown), which such a burn leaves no other trace of. The wallet
-// key also ends the node on whatever device runs it (unlinkForSite, decision 38). The extension never runs a node: no
-// device, ping key or push token here. A change of the registration's state calls events.notifyViews('activation').
+// inside the submit. For aiqnet.io (qnet_claimNodeBalance, decision 47) it moves the balance of the node the site names,
+// the wallet's light or super node, into the wallet; for Recover it reads the burn the node's registration record names
+// (a burn aiqnet.io paid for this wallet); before any burn it asks whether the network already holds the node
+// (lightNodeKnown), which such a burn leaves no other trace of. The wallet key also ends the light node on whatever device
+// runs it (unlinkForSite, decision 38). The extension never runs a node: no device, ping key or push token here. A change
+// of the registration's state calls events.notifyViews('activation').
 import * as core from '../lib/qnet-core.js';
 import { CLAIM_MIN_NANO, LIMITS, QNET, REGISTRATION_ALARM, TIMINGS } from './config.js';
 import { WalletError } from './errors.js';
@@ -32,8 +33,10 @@ import * as vault from './vault.js';
  *
  * @typedef {object} ClaimView  what the qnet_claimNodeBalance window offers (claimView)
  * @property {'claim'|'empty'|'unavailable'} mode empty: below CLAIM_MIN_NANO
- * @property {'NO_NODE'|'NETWORK'|'SIGNING_DISABLED'|null} reason unavailable only
- * @property {string} nodeId
+ * @property {'WALLET_MISMATCH'|'NO_NODE'|'NETWORK'|'SIGNING_DISABLED'|null} reason unavailable only; WALLET_MISMATCH: the
+ *   node the site names is neither of this wallet's
+ * @property {string} nodeId the node the site names
+ * @property {'light'|'super'|null} nodeType which of this wallet's nodes it is; null for WALLET_MISMATCH
  * @property {string|null} amountNano the balance two pinned nodes agree on
  *
  * @typedef {{status: 'ok', qnet: string, nodeId: string, amountNano: string, txHash: string,
@@ -52,6 +55,8 @@ import * as vault from './vault.js';
 
 const SUBMIT_PATH = '/api/v1/node-registration/submit';
 const STATUS_PATH = '/api/v1/light-node/status';
+// A super node's public status (light_nodes.rs handle_server_node_status): whether the chain registered it.
+const SERVER_STATUS_PATH = '/api/v1/node/status';
 const CLAIM_PATH = '/api/v1/rewards/claim';
 const UNBIND_PATH = '/api/v1/light-node/unbind';
 // The public status's feature that says a genesis node takes the wallet key's unbind (decision 38).
@@ -590,21 +595,62 @@ async function readPending(nodeId, node) {
 }
 
 /**
- * What the qnet_claimNodeBalance window offers now (provider.js, while unlocked): this wallet's light node, whether
- * the chain lists it, and the balance two pinned nodes agree on. Nothing is signed or sent.
+ * Which of `wallet`'s nodes `nodeId` is: 'light' for its light node id, 'super' for its super node id (both computed from
+ * the wallet), null for any other id. A site's move names one of them (QNet Link v1 section 14.4).
+ * @param {unknown} nodeId
+ * @param {string} wallet
+ * @returns {'light'|'super'|null}
+ */
+export function ownNodeType(nodeId, wallet) {
+  if (typeof nodeId !== 'string') return null;
+  if (nodeId === core.lightNodeId(wallet)) return 'light';
+  return nodeId === core.superNodeId(wallet) ? 'super' : null;
+}
+
+// One pinned node's word on whether the chain registered the super node `nodeId` (GET /api/v1/node/status: its
+// `onchain_registered`, else `registered`, for that node), or null for no readable answer.
+async function readServerListed(nodeId, node) {
+  try {
+    const reply = await qnet.nodeRequest(`${SERVER_STATUS_PATH}?node_id=${nodeId}`, { nodes: [node] });
+    const body = reply.status === 200 ? parse(reply.text) : null;
+    if (!isObject(body) || body.success !== true || (body.node_id !== nodeId && body.node_id !== null)) return null;
+    const listed = typeof body.onchain_registered === 'boolean' ? body.onchain_registered : body.registered;
+    return typeof listed === 'boolean' ? listed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Whether the chain lists `nodeId`, this wallet's node of `nodeType`, as two pinned nodes report it alike: a light node
+// by its public status (onChain), a super node by its server status. true, false, or null when no two agree.
+async function nodeOnChain(nodeId, nodeType) {
+  if (nodeType === 'light') return onChain(nodeId);
+  const word = await agreed(async (node) => {
+    const listed = await readServerListed(nodeId, node);
+    return listed === null ? null : String(listed);
+  });
+  return word === null ? null : word === 'true';
+}
+
+/**
+ * What the qnet_claimNodeBalance window offers now (provider.js, while unlocked): the node the site names when it is one
+ * of this wallet's (its light or super node), whether the chain lists it, and the balance two pinned nodes agree on.
+ * Nothing is signed or sent.
+ * @param {string} nodeId
  * @returns {Promise<ClaimView>}
  * @throws {WalletError} LOCKED
  */
-export async function claimView() {
+export async function claimView(nodeId) {
   const wallet = await session.requireUnlocked();
-  const nodeId = core.lightNodeId(wallet.qnetAddress);
-  const unavailable = (reason) => ({ mode: 'unavailable', reason, nodeId, amountNano: null });
+  const nodeType = ownNodeType(nodeId, wallet.qnetAddress);
+  const unavailable = (reason) => ({ mode: 'unavailable', reason, nodeId, nodeType, amountNano: null });
+  if (nodeType === null) return unavailable('WALLET_MISMATCH');
   if (!keys.signingEnabled()) return unavailable('SIGNING_DISABLED');
-  const listed = await onChain(nodeId);
+  const listed = await nodeOnChain(nodeId, nodeType);
   if (listed !== true) return unavailable(listed === false ? 'NO_NODE' : 'NETWORK');
   const amountNano = await agreed(async (node) => (await readPending(nodeId, node))?.amount ?? null);
   if (amountNano === null) return unavailable('NETWORK');
-  return { mode: BigInt(amountNano) < BigInt(CLAIM_MIN_NANO) ? 'empty' : 'claim', reason: null, nodeId, amountNano };
+  return { mode: BigInt(amountNano) < BigInt(CLAIM_MIN_NANO) ? 'empty' : 'claim', reason: null, nodeId, nodeType, amountNano };
 }
 
 // The quote of step 1, checked as the app checks it (WalletManager.claimRewards): claims strictly ascending above the
@@ -727,11 +773,13 @@ async function crossChecked(nodeId, others, checked) {
   if (full && BigInt(checked.amountNano) < BigInt(agreedAmount)) throw new WalletError('CLAIM_REFUSED');
 }
 
-// A part of the balance (`stopped_at_epoch` set) escapes the pending-total check, so an epoch the quoting node left out
-// below its last one would pass, and the claim's watermark would forfeit it (EXT-R3-01). Another pinned node quotes the
-// same request (the claim_rewards signature carries no time); honest nodes list the same epochs and amounts from the
-// same watermark and differ only in where they stop. The quote ending lower is signed, and only if the other lists
-// exactly its entries up to its last epoch: the other covers every epoch below its own, higher stop. Returns that quote.
+// An epoch the quoting node left out below its last one would pass, and the claim's watermark would forfeit it
+// (EXT-R3-01): a part of the balance (`stopped_at_epoch` set) escapes the pending-total check, and a whole batch passes it
+// whenever the other nodes' totals under-report (they stop at the first epoch whose shard they lack). So every batch is
+// held to another pinned node's quote of the same request (the claim_rewards signature carries no time); honest nodes
+// list the same epochs and amounts from the same watermark and differ only in where they stop. The quote ending lower is
+// signed, and only if the other lists exactly its entries up to its last epoch: the other covers every epoch below its
+// own, higher stop. Returns that quote.
 async function corroborated(request, checked, wallet) {
   const answer = await quoteRequest(request, pickNodes(QNET.NODES.length).filter((other) => other !== checked.node));
   const body = answer?.body ?? null;
@@ -748,17 +796,18 @@ async function corroborated(request, checked, wallet) {
 
 /**
  * The action of qnet_claimNodeBalance (provider.js, after its approval), as the app moves the node balance: the quote
- * of the first pinned node that can serve it for this wallet's own light node (ML-DSA-65 over claim_rewards), checked;
- * a part of the balance held to a second node's quote (corroborated); the first epoch of the quote to sign (and, for a
- * full batch, its total) compared with what other pinned nodes report (crossChecked); then the payload signed over the
- * message the wallet builds and sent back to the node that quoted it. The site learns the result; the network credits
- * it once a block includes it.
+ * of the first pinned node that can serve it for the node the site names, this wallet's light or super node (ML-DSA-65
+ * over claim_rewards for that node), checked; the batch held to a second node's quote (corroborated); the
+ * first epoch of the quote to sign (and, for a full batch, its total) compared with what other pinned nodes report
+ * (crossChecked); then the payload signed over the message the wallet builds and sent back to the node that quoted it.
+ * The site learns the result; the network credits it once a block includes it.
+ * @param {string} nodeId
  * @returns {Promise<ClaimOutcome>}
- * @throws {WalletError} LOCKED, SIGNING_DISABLED, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY
+ * @throws {WalletError} LOCKED, WALLET_MISMATCH, SIGNING_DISABLED, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY
  */
-export async function claimForSite() {
+export async function claimForSite(nodeId) {
   const wallet = (await session.requireUnlocked()).qnetAddress;
-  const nodeId = core.lightNodeId(wallet);
+  if (ownNodeType(nodeId, wallet) === null) throw new WalletError('WALLET_MISMATCH');
   const quote = await keys.signNodeClaim({ nodeId, wallet });
   const signature = core.bytesToHex(quote.signature);
   const publicKey = core.bytesToHex(quote.publicKey);
@@ -769,7 +818,7 @@ export async function claimForSite() {
     throw new WalletError(claimRefusal(first));
   }
   let checked = { ...checkedQuote(first, wallet), node };
-  if (checked.stoppedAtEpoch !== null) checked = await corroborated(request, checked, wallet);
+  checked = await corroborated(request, checked, wallet);
   await crossChecked(nodeId, pickNodes(QNET.NODES.length).filter((other) => other !== checked.node), checked);
   const payload = await keys.signClaimPayload({ wallet, timestamp: checked.timestamp, claimsData: checked.claimsData });
   const { body: second } = await claimRequest([checked.node], {

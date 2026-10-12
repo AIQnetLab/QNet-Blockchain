@@ -6,7 +6,7 @@ exact text each one signs, the gas it needs, what it costs, the request a node a
 follow it afterwards.
 
 There is one implementation of these formats: `applications/qnet-mobile/src/crypto/TxBuilders.js`
-(with the signed texts in `WalletIdentity.js`). The QNet app imports it, the browser extension's
+(with the signed texts in `WalletIdentity.js`). The QNet Wallet app imports it, the browser extension's
 bundle and `@aiqnet/sdk` compile it. Its known answers are in
 `applications/qnet-mobile/src/crypto/__vectors__/tx-vectors.json`, checked by the app, the extension
 and the SDK; `applications/qnet-mobile/__tests__/TxSourcePin.test.js` fails when the node's own
@@ -251,7 +251,7 @@ transaction is in the site archive: `GET https://aiqnet.io/api/tx/{hash}`.
 ## System transactions
 
 The node builds the system transactions of a block itself; a wallet never sends one. From the
-`tx_target_bound` gate (height 2,851,200, [consensus](../architecture/consensus.md#consensus-feature-gates)) a
+`tx_target_bound` gate (its height is in the [consensus gate table](../architecture/consensus.md#consensus-feature-gates)) a
 commitment-class system transaction carries, in each envelope field its signature leaves out, the one
 value its builder writes (`check_commitment_envelope` in `core/qnet-state/src/transaction.rs`), so a relay's
 copy has the same hash:

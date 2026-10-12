@@ -5,17 +5,14 @@
 // UTC day it linked, whether it answered this epoch and the epoch of its last answer; for a typed address its platform,
 // state and epochs only). With a device linked, "Unlink the device" (UnlinkDevice.tsx:
 // the wallet signs it, the QNet extension that holds it or QNet Wallet on any device; the device's own form while the
-// network does not take the wallet's) and "Move the node to another device"; an Offline device's row leads to the
-// Overview, where I'm back is (owner, 04.10: one place only). With none, Link a device in numbered steps (NextSteps.tsx
-// LinkPhone). A super node runs on its server: no device to link, its server's status instead (R3, R4). Without a node,
-// the state the wallet's sources agree on and the way on (NextSteps.tsx).
+// network does not take the wallet's) and "Move the node to another device", the same request that runs the node on
+// a phone again. With none, Link a device in numbered steps (NextSteps.tsx LinkPhone). A super node runs on its server:
+// no device to link, its server's status instead (R3, R4), or that it is not on the network yet. Without a node, the
+// state the wallet's sources agree on and the way on (NextSteps.tsx).
 
-import Link from 'next/link';
 import { useNodeStatus, useSuperStatus } from '@/hooks/useNodeStatus';
 import { t } from '@/lib/texts';
 import { STATUS_KEPT_MS, isLinkedState } from '@/lib/cabinet/node-view';
-import { TAB_HREF } from '@/lib/cabinet/tabs';
-import { canWake } from '@/lib/cabinet/wake';
 import { lightSectionState } from '@/lib/cabinet/wallet-activation';
 import CabinetFrame from './CabinetFrame';
 import { useCabinet } from './CabinetProvider';
@@ -43,7 +40,6 @@ function Devices({ nodeId }: { nodeId: string }) {
             <div className="activate-card">
               <h3 className="activate-step">{t('device_title')}</h3>
               <DeviceRows status={status} full viewOnly={viewOnly} />
-              {s === 'offline' && canWake(status) && <p><Link href={TAB_HREF.overview}>{t('device_wake_overview')}</Link></p>}
               <p className="activate-note">{t('devices_lead')}</p>
             </div>
             {viewOnly ? <div className="activate-card"><ConnectFirst /></div> : (
@@ -72,7 +68,7 @@ function SuperServer({ nodeId }: { nodeId: string }) {
           <button type="button" className="qnet-button secondary" onClick={retry}>{t('try_again')}</button>
         </div>
       )}
-      {state.phase === 'ok' && state.value.registered && <SuperRows status={state.value} />}
+      {state.phase === 'ok' && (state.value.registered ? <SuperRows status={state.value} /> : <p>{t(state.value.connected ? 'super_connected' : 'super_not_yet')}</p>)}
     </div>
   );
 }

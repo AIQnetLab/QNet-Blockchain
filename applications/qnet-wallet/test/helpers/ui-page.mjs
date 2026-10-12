@@ -29,10 +29,11 @@ let loadSeq = 0;
 
 /**
  * @param {'popup'|'setup'} page
- * @param {{handlers?: Record<string, (params: object) => unknown>, localStorage?: Record<string, string>}} [options]
+ * @param {{handlers?: Record<string, (params: object) => unknown>, localStorage?: Record<string, string>, search?: string}}
+ *   [options] search: the page address's query (setup's ?flow=)
  */
-export async function openPage(page, { handlers = {}, localStorage = {} } = {}) {
-  const dom = installDom({ localStorage });
+export async function openPage(page, { handlers = {}, localStorage = {}, search = '' } = {}) {
+  const dom = installDom({ localStorage, search });
   const calls = [];
   const violations = [];
   const tabsCreated = [];

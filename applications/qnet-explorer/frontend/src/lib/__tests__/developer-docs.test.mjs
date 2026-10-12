@@ -72,7 +72,8 @@ function mentions(text) {
   for (const block of blocksOf(text)) {
     const row = /^\s*\|\s*([A-Z, ]+?)\s*\|\s*`(\/(?:api|ws)\/[^`]*)`/.exec(block);
     for (const m of block.matchAll(/(?:\b(GET|POST|DELETE|PUT|WS)\s+`?)?(\/(?:api|ws)\/[A-Za-z0-9_{}<>.:…\-/[\]*]*)/g)) {
-      let path = m[2].replace(/[.,:)]+$/, '').replace(/\/+$/, '');
+      // `/path[?query]`: the optional query in brackets is no part of the route.
+      let path = m[2].replace(/\[$/, '').replace(/[.,:)]+$/, '').replace(/\/+$/, '');
       if (path.includes('*') || path === '/api/v1' || path === '/api') continue;
       let methods = m[1] ? [m[1]] : [];
       if (!m[1] && row && row[2].startsWith(m[2])) methods = row[1].split(',').map((s) => s.trim()).filter((s) => /^(GET|POST|DELETE|PUT|WS)$/.test(s));
@@ -169,7 +170,8 @@ test('signed texts, calldata and deploy payloads in the docs are the shared vect
   let seen = 0;
   for (const doc of DOCS) {
     for (const [text] of doc.text.matchAll(/q1337\|[a-z_]+:[^\s`'"]*/g)) {
-      if (text.includes('{')) continue;
+      // A template, or a kind named alone (`q1337|node_serve_cert:` and what follows told in words), is no signed text.
+      if (text.includes('{') || text.endsWith(':')) continue;
       assert.ok(preimages.has(text), `${doc.name}: ${text} is not a vector's signed text`);
       seen++;
     }

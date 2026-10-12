@@ -93,7 +93,8 @@ export function journey(connected: boolean, view: ActivationView | null): { done
         return at(2, null);
       }
       if (view.superNode === 'online') return at(4, null);
-      if (view.superNode === 'offline') return at(3, 3);
+      // Registered: its server ran; Running waits for it to answer, or for the network to admit it.
+      if (view.superNode === 'offline' || view.superNode === 'waiting') return at(3, 3);
       return at(3, null);
     }
   }

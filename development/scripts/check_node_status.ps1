@@ -1,7 +1,7 @@
 # QNet Node Status Checker
 # Checks the status of running QNet nodes
 
-Write-Host "=== QNet Node Status ===" -ForegroundColor Cyan
+Write-Host "=== QNet Blockchain Node Status ===" -ForegroundColor Cyan
 Write-Host "Checking nodes..." -ForegroundColor Yellow
 
 # Function to check node status

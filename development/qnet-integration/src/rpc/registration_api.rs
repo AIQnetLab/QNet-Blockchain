@@ -2496,66 +2496,26 @@ pub(super) async fn handle_node_reactivation_submit(
         })));
     }
 
-    // Endpoint to republish: the caller's explicit value, else this node's own configured endpoint.
-    // Same validator the block-validity check runs, so a bad address is refused here instead of
-    // being signed, gossiped and rejected network-wide.
+    // Endpoint to republish: the caller's explicit value, else this node's own announced endpoint.
     let api_endpoint = req.api_endpoint.clone().unwrap_or_else(|| {
         crate::node::BlockchainNode::self_public_api_endpoint(crate::node::NodeType::Super)
     });
-    if let Err(e) = qnet_state::transaction::validate_public_api_endpoint(&api_endpoint) {
-        println!("[REJECT][RPC] reactivation_bad_endpoint node={} err={}", req.node_id, e);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": e
-        })));
-    }
-
-    // Create NodeReactivation TX (sync, same pattern as NodeRegistration)
-    let mut react_tx = crate::node::BlockchainNode::create_node_reactivation_tx(
-        &req.node_id,
-        req.current_height,
-        &req.last_macroblock_hash,
-        req.last_macroblock_index,
-        &api_endpoint,
-    );
-
-    // Sign with pure ML-DSA-65 (ML-DSA-65) — the node's registered post-quantum identity key
-    let wallet_identity = blockchain.get_wallet_identity();
-    crate::node::BlockchainNode::sign_reactivation_tx(
-        &mut react_tx,
-        &req.node_id,
-        wallet_identity.as_deref(),
-    );
-
-    let tx_hash = react_tx.hash.clone();
-    let tx_bytes = bincode::serialize(&react_tx).unwrap_or_default();
-    let mempool = blockchain.get_mempool();
-
-    let state = blockchain.get_state_manager();
-    if let Err(e) = crate::node::refuse_held_commitment(&state, &react_tx).await {
-        return Ok(warp::reply::json(&json!({ "success": false, "error": e })));
-    }
-    if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), react_tx.gas_price) {
-        println!("[INFO][NODE-REACTIVATION] tx_added node={} h={} mb={} hash={}",
-                 req.node_id, req.current_height, req.last_macroblock_index,
-                 qnet_state::char_prefix(&tx_hash, 16));
-
-        // Broadcast to all peers for fast inclusion
-        if let Some(p2p) = blockchain.get_unified_p2p() {
-            let _ = p2p.broadcast_transaction(tx_bytes);
-        }
-
-        Ok(warp::reply::json(&json!({
+    // The same builder, signature, admission and broadcast as the automatic endpoint commit.
+    match blockchain.submit_self_reactivation(
+        &req.node_id, req.current_height, &req.last_macroblock_hash, req.last_macroblock_index, &api_endpoint,
+    ).await {
+        Ok(tx_hash) => Ok(warp::reply::json(&json!({
             "success": true,
             "tx_hash": tx_hash,
             "node_id": req.node_id,
             "message": "NodeReactivation TX submitted — node will re-enter eligible producers within 2-3 macroblocks"
-        })))
-    } else {
-        Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Failed to add TX to mempool (duplicate or mempool full)"
-        })))
+        }))),
+        Err(e) => {
+            if e.contains("api_endpoint") {
+                println!("[REJECT][RPC] reactivation_bad_endpoint node={} err={}", req.node_id, e);
+            }
+            Ok(warp::reply::json(&json!({ "success": false, "error": e })))
+        }
     }
 }
 

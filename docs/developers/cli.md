@@ -60,7 +60,7 @@ This is the command's own help text (`qnet --help`), which also lists the option
 | `--burn` | `transfer`, `token transfer` | allow sending to the burn address, which destroys what is sent |
 | `--network testnet` | all | the network; the testnet is the default and only one |
 | `--node URL` | all | a node to use instead of the public ones (repeatable; HTTPS, or plain HTTP on this machine) |
-| `--home DIR` | all | the QNet directory (default `$QNET_HOME`, else `~/.qnet`) |
+| `--home DIR` | all | the data directory (default `$QNET_HOME`, else `~/.qnet`) |
 | `--timeout SECONDS` | all | how long each node request may take (default 10, at most 600) |
 | `--json` | all | machine-readable output on standard output; a send that asks first prints its review (and a deploy its module report) on standard error |
 

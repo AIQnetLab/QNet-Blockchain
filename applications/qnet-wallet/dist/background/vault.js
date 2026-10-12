@@ -223,10 +223,9 @@ const CT_RANGE = Object.freeze({ min: 2 + 16 + 2 + TAG_BYTES, max: 2 + 32 + STAT
 const PENDING_BODY_MAX_CHARS = 65536;
 const BURN_AMOUNT_MAX = 1000000000;
 const DELETE_WAIT_MS = 10000;
-const RESTORE_TOKEN_BYTES = 32;
-// Sent with the one vault.restore call that may replace the vault, once the user confirmed the reset (popup: the wallet
-// being replaced named, one checkbox). A call without it only checks the phrase and names both wallets.
-const RESTORE_CONFIRM = 'ERASE';
+const RESET_TOKEN_BYTES = 32;
+// Sent with the vault.reset call once the user pressed Reset wallet; never typed.
+const RESET_CONFIRM = 'ERASE';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
@@ -267,12 +266,22 @@ const NODE_ID_RE = /^light_mobile_[0-9a-f]{16}$/;
 const REGISTRATION_ERROR_RE = /^[a-z0-9_]{1,32}$/;
 // A pending burn written before its block height was kept reads with lastValidBlockHeight null.
 const PENDING_BURN_KEYS_BEFORE = Object.freeze(PENDING_BURN_KEYS.filter((key) => key !== 'lastValidBlockHeight'));
-// The new record of a forgot-password restore, written and read back before the old vault is replaced.
+// Where the forgot-password restore of 3.0.0 and 3.1.0 staged its new record; this version writes nothing there.
 const RESTORE_STAGING_KEY = 'restoreStaging';
-// The light client's verified anchors (qnet.js, EXT-CHAINS-04): chain data next to the record, with a MAC.
+// The light client's verified anchors (qnet.js, EXT-CHAINS-04): chain data next to the record, with a MAC over the
+// anchors and the build's chain identity. Record v2 carries each anchor's certified roots when known; a v1 record (no
+// chain identity, no roots) is read as none once, and the next walk starts from the pin or the capsule.
 const LIGHT_ANCHORS_KEY = 'lightAnchors';
-const LIGHT_ANCHORS_LABEL = 'qnet-light-anchors-v1';
+const LIGHT_ANCHORS_VERSION = 2;
+const LIGHT_ANCHORS_LABEL = 'qnet-light-anchors-v2';
 const LIGHT_ANCHOR_IDS_MAX = 4096;
+const ANCHOR_KEYS = Object.freeze(['eligible_ids', 'beacon', 'registry_root']);
+const ANCHOR_ROOT_KEYS = Object.freeze(['state_root', 'logs_root', 'checkpoint_hash']);
+const HEX32_RE = /^[0-9a-f]{64}$/;
+// The genesis capsule the light client holds (qnet.js, core.exportCapsule): public chain data that core.importCapsule
+// verifies again in full, so it carries no MAC; tagged with the build's chain identity.
+const CAPSULE_KEY = 'galcCapsule';
+const CAPSULE_RECORD_MAX_CHARS = 1 << 20;
 // What the wallet last read of the QNet chain and of its balances (vault.updateChainCache): public data next to the
 // record, with a MAC, so the next popup draws the last verified balances at once and a chain the wallet no longer follows
 // is noticed (qnet.js).
@@ -368,7 +377,7 @@ export function normalizePassword(password) {
 /**
  * NFKC form of a new vault password under the rule of both wallets: at least core.PASSWORD_MIN_LENGTH characters as
  * typed (core.passwordTooShort, the one copy the app uses too), nothing else. The pages check that it was typed
- * twice. Every path that sets a vault password (create, import, restore, change) goes through it.
+ * twice. Every path that sets a vault password (create, import, change) goes through it.
  * @param {string} password
  * @returns {string}
  * @throws {WalletError} WEAK_PASSWORD
@@ -966,8 +975,8 @@ function assertAddresses(entropy, aad) {
 
 // Read back what was just written: the same record, decryptable with the key, holding the same entropy,
 // whose addresses re-derive to the AAD's (EXT-SEC-M2).
-async function confirmWritten(record, vaultKey, entropy, storeKey = VAULT_DB.KEY) {
-  const back = await readRawValue(storeKey);
+async function confirmWritten(record, vaultKey, entropy) {
+  const back = await readRawRecord();
   if (back === null) throw corrupt();
   const parsed = parseRecord(back);
   if (canonicalJson(back) !== canonicalJson(record)) throw corrupt();
@@ -988,60 +997,18 @@ async function clearArea(area, keep = []) {
   if (left.length > 0) throw internal();
 }
 
-// The staged record of a restore that did not finish (R5-ESM-03): it holds the typed phrase's entropy under the
-// restore password, and outside a running restore it is never valid, so it goes whenever one is found. Callers
-// hold the record lock (exclusive).
+// The staged record a forgot-password restore of 3.0.0 or 3.1.0 left when its worker stopped between that write and
+// the replacing transaction (R5-ESM-03): it holds a typed phrase's entropy under that restore's password and is never
+// valid, so it goes whenever one is found. Callers hold the record lock (exclusive).
 const dropRestoreStaging = () => withDb(false, (db) => (hasStore(db)
   ? transact(db, 'readwrite', (store) => store.delete(RESTORE_STAGING_KEY)) : undefined));
-
-// A forgot-password restore replaces the vault by writing before it deletes (EXT-VAULT-R3-04): the new
-// record is staged next to the old one and read back; then one transaction clears the store and puts the new
-// record under the vault key, so either the old vault or the new one is there whatever
-// fails or crashes; the session ends as a wipe ends it; the final record is read back; the old wallet's
-// entries in chrome.storage go last (they open nothing of the new wallet: its grants need its sitesKey). When
-// anything before that transaction commits fails, the staged copy is deleted again (R5-ESM-03); one a stopped
-// worker left goes at the next start or unlock (discardRestoreStaging).
-async function replaceVault({ vaultKey, record }, entropy) {
-  let replaced = false;
-  try {
-    await withDb(false, (db) => {
-      if (!hasStore(db)) throw internal();
-      return transact(db, 'readwrite', (store) => store.put(record, RESTORE_STAGING_KEY));
-    });
-    await confirmWritten(record, vaultKey, entropy, RESTORE_STAGING_KEY);
-    await withDb(false, (db) => {
-      if (!hasStore(db)) throw internal();
-      return transact(db, 'readwrite', (store) => {
-        store.clear();
-        return store.put(record, VAULT_DB.KEY);
-      });
-    });
-    replaced = true;
-  } finally {
-    if (!replaced) await dropRestoreStaging().catch((error) => log.error('restore staging not deleted', error?.code ?? error?.name));
-  }
-  await session.lock('wipe');
-  await confirmWritten(record, vaultKey, entropy);
-  // failed attempts on the replaced vault must not delay the next one (a restore checks no password)
-  await session.recordPasswordSuccess();
-  const storage = globalThis.chrome?.storage;
-  try {
-    if (!storage?.local || !storage?.session) throw internal();
-    await clearArea(storage.local);
-    await clearArea(storage.session, [STORAGE_KEYS.SELF_TEST]);
-  } catch (error) {
-    log.error('storage of the replaced vault not cleared', error?.code ?? error?.name);
-  }
-  // the earlier version's pages' copy goes with its record, which the clear above removed
-  await earlier.deleteEarlierDatabase().catch((error) => log.error('earlier database not deleted', error?.code ?? error?.name));
-}
 
 // Lock (reason 'wipe'), delete the database, clear chrome.storage.local (and the earlier version's database) and
 // session, check nothing is left.
 async function eraseAll() {
   await session.lock('wipe');
   await deleteVaultDatabase();
-  // Failed attempts on the deleted vault must not delay the next one (a restore checks no password);
+  // Failed attempts on the deleted vault must not delay the next one (a reset checks no password);
   // the backoff also lives in session memory, which the storage clear below does not reach.
   await session.recordPasswordSuccess();
   const storage = globalThis.chrome?.storage;
@@ -1049,17 +1016,18 @@ async function eraseAll() {
   await clearArea(storage.local);
   // the earlier version's pages' copy goes with its record, which the clear above removed
   await earlier.deleteEarlierDatabase().catch((error) => log.error('earlier database not deleted', error?.code ?? error?.name));
-  // The crypto self-test pass (keys.startKeys) is not wallet data and may land after the clear.
-  await clearArea(storage.session, [STORAGE_KEYS.SELF_TEST]);
+  // The crypto self-test pass (keys.startKeys) and the light client's hints (qnet.js: the certified head last seen) are
+  // not wallet data and may land after the clear.
+  await clearArea(storage.session, [STORAGE_KEYS.SELF_TEST, STORAGE_KEYS.LIGHT_HINTS]);
   if ((await readRawRecord()) !== null) throw internal();
 }
 
 // ---------------------------------------------------------------- API
 
 /**
- * Worker start: deletes the staged record of a forgot-password restore that a stopped worker (browser closed,
- * extension reloaded or updated) left between its write and the replacing transaction (R5-ESM-03). Unlock does
- * the same. Never touches the vault record itself.
+ * Worker start: deletes the staged record a forgot-password restore of 3.0.0 or 3.1.0 left when its worker stopped
+ * (browser closed, extension reloaded or updated) between its write and the replacing transaction (R5-ESM-03). Unlock
+ * does the same. Never touches the vault record itself.
  * @returns {Promise<void>}
  */
 export async function discardRestoreStaging() {
@@ -1219,7 +1187,7 @@ export async function unlock(params) {
   return exclusive(async () => {
     const parsed = await loadParsedRecord().catch(lockOnDoubt);
     if (parsed === null) throw new WalletError('NO_VAULT');
-    // no restore runs while this holds the record lock: a staged record here is one a stopped worker left (R5-ESM-03)
+    // a staged record an earlier version's stopped restore left goes here too (R5-ESM-03)
     await dropRestoreStaging().catch((error) => log.warn('restore staging not deleted', error?.code ?? error?.name));
     // a screen lock while the KDF runs keeps the session from starting behind it (R3-ESM-03)
     const since = session.lockMark();
@@ -1352,13 +1320,13 @@ export async function wipe(params) {
   });
 }
 
-// ---------------------------------------------------------------- forgot password: restore
+// ---------------------------------------------------------------- forgot password: reset
 
-// {token, expiresAt, holder} of the one restore the popup started; worker memory only.
-let restoreGrant = null;
+// {token, expiresAt, holder} of the one reset the popup started; worker memory only.
+let resetGrant = null;
 
-// The page a restore token belongs to: the popup's own document (its documentId when Chrome reports it).
-function restoreHolder(meta) {
+// The page a reset token belongs to: the popup's own document (its documentId when Chrome reports it).
+function resetHolder(meta) {
   const sender = meta?.sender;
   if (meta?.page !== 'popup' || typeof sender?.url !== 'string') return null;
   const documentId = typeof sender.documentId === 'string' ? sender.documentId : '';
@@ -1366,101 +1334,59 @@ function restoreHolder(meta) {
   return `${sender.url}\n${documentId}\n${tabId}`;
 }
 
-// One use: whatever the outcome, the token is gone after this, except that a restore which only checks the phrase
-// and asks for the user's confirmation (nothing erased) hands it back (keepRestoreToken).
-function takeRestoreToken(token, meta) {
-  const grant = restoreGrant;
-  restoreGrant = null;
+// One use: whatever the outcome, the token is gone after this.
+function takeResetToken(token, meta) {
+  const grant = resetGrant;
+  resetGrant = null;
   const valid = grant !== null && typeof token === 'string' && token.length === grant.token.length
     && core.equalBytes(core.utf8Encode(token), core.utf8Encode(grant.token))
-    && Date.now() < grant.expiresAt && restoreHolder(meta) === grant.holder;
-  if (!valid) throw new WalletError('RESTORE_EXPIRED');
-  return grant;
+    && Date.now() < grant.expiresAt && resetHolder(meta) === grant.holder;
+  if (!valid) throw new WalletError('RESET_EXPIRED');
 }
-
-// A newer token issued meanwhile wins; the kept one still expires at its own time.
-function keepRestoreToken(grant) {
-  if (restoreGrant === null) restoreGrant = grant;
-}
-
-const pairOf = (qnet, solana) => ({ qnet, solana });
 
 /**
- * Handler of `vault.restoreBegin` (popup, Reset wallet: the phrase and a new password were typed): issues the one-time
- * token vault.restore requires, bound to the sending popup document, valid for TIMINGS.RESTORE_TOKEN_TTL_MS. A new
- * token replaces an earlier one. Nothing is erased here.
+ * Handler of `vault.resetBegin` (popup, "Forgot password?" → Reset wallet pressed): issues the one-time token
+ * vault.reset requires, bound to the sending popup document, valid for TIMINGS.RESET_TOKEN_TTL_MS. A new token replaces
+ * an earlier one. Nothing is erased here.
  * @param {{}} _params
  * @param {{page: string, sender: object}} meta the router's sender info
  * @returns {Promise<{token: string, expiresAt: number}>} token: 64 lowercase hex characters
- * @throws {WalletError} NO_VAULT; FORBIDDEN_SENDER when the sender is not the popup
+ * @throws {WalletError} NO_VAULT, UNLOCKED; FORBIDDEN_SENDER when the sender is not the popup
  */
-export async function beginRestore(_params, meta) {
-  const holder = restoreHolder(meta);
+export async function beginReset(_params, meta) {
+  const holder = resetHolder(meta);
   if (holder === null) throw new WalletError('FORBIDDEN_SENDER');
   if (!(await vaultExists())) throw new WalletError('NO_VAULT');
-  const token = core.bytesToHex(randomBytes(RESTORE_TOKEN_BYTES));
-  const expiresAt = Date.now() + TIMINGS.RESTORE_TOKEN_TTL_MS;
-  restoreGrant = { token, expiresAt, holder };
+  if (await session.isUnlocked()) throw new WalletError('UNLOCKED');
+  const token = core.bytesToHex(randomBytes(RESET_TOKEN_BYTES));
+  const expiresAt = Date.now() + TIMINGS.RESET_TOKEN_TTL_MS;
+  resetGrant = { token, expiresAt, holder };
   return { token, expiresAt };
 }
 
 /**
- * Handler of `vault.restore` (popup, "Forgot password?" → Reset wallet): replaces the vault of this browser with the
- * one of a recovery phrase and a new password. Order: consume the token; check the new password and the phrase
- * (canonicalized, validated) and derive its addresses; compare them with the replaced record's AAD (readable without
- * the password). A call without `confirm` (RESTORE_CONFIRM) answers `confirm` naming both wallets and erases nothing:
- * the popup shows them for the one confirmation. A phrase of another wallet (EXT-VAULT-R2-04) also needs `replaceOther`
- * on the confirmed call, else it answers `confirm` again. Every `confirm` answer hands the token back for the confirmed
- * call. Then the key and sealed record, which is written and read back BEFORE the old vault goes (EXT-VAULT-R3-04:
- * staged, then one transaction replaces everything; the old activation record goes with it, and Recover finds the burn
- * again); the final record is read back, decrypted and its addresses compared (EXT-SEC-M2); then the session starts,
- * unless the screen locked meanwhile (R3-ESM-03: lockDeadline null, the vault stays locked). Any failure before the
- * replace leaves the old vault as it was. A record that does not parse cannot be opened or compared (`erased` null) and
- * is replaced once confirmed (R2-ESM-05).
- * @param {{token: string, mnemonic: string, password: string, confirm?: 'ERASE', replaceOther?: boolean}} params
- * @param {{page: string, sender: object}} meta
- * @returns {Promise<{status: 'restored', qnet: string, solana: string, lockDeadline: number|null}
- *   | {status: 'confirm', erased: {qnet: string, solana: string}|null, restored: {qnet: string, solana: string},
- *   otherWallet: boolean}>} confirm: the stored wallet the replace would erase (null: its record does not parse), the
- *   typed phrase's wallet, and whether they differ
- * @throws {WalletError} RESTORE_EXPIRED, WEAK_PASSWORD, NO_VAULT, SIGNING_DISABLED, VAULT_CORRUPT, ADDRESS_MISMATCH,
- *   INTERNAL; CoreError INVALID_MNEMONIC
+ * Handler of `vault.reset` (popup, "Forgot password?" → Reset wallet): the password is forgotten, so the wallet
+ * leaves this browser without one, locked as it is, and only its recovery phrase brings it back (Import). Order: refuse
+ * any page but the popup; take the token vault.resetBegin issued to that popup document (any call spends it); require
+ * `confirm` RESET_CONFIRM; refuse an unlocked wallet (its password is known: Delete wallet takes it), checked in the
+ * same queue as unlock so that an unlock finishing first is seen; then erase as vault.wipe does after its password
+ * check (eraseAll: lock 'wipe', the vault database, chrome.storage.local and session, the earlier version's database,
+ * the password backoff), whatever the record holds: one that does not parse goes too (R2-ESM-05).
+ * @param {{token: string, confirm: 'ERASE'}} params
+ * @param {{page: string, sender: object}} meta the router's sender info
+ * @returns {Promise<{wiped: true}>}
+ * @throws {WalletError} FORBIDDEN_SENDER, RESET_EXPIRED, INVALID_PARAMS, NO_VAULT, UNLOCKED, INTERNAL when something stays
  */
-export async function restoreVault(params, meta) {
-  const grant = takeRestoreToken(params?.token, meta);
-  const normalized = normalizeNewPassword(params?.password);
-  const entropy = core.mnemonicToEntropy(core.parseMnemonic(params?.mnemonic));
-  try {
-    return await exclusive(async () => {
-      const raw = await readRawRecord();
-      if (raw === null) throw new WalletError('NO_VAULT');
-      let replaced = null;
-      try {
-        replaced = parseRecord(raw);
-      } catch {
-        replaced = null;
-      }
-      const typed = keys.deriveAddresses(entropy);
-      const erased = replaced === null ? null : pairOf(replaced.aad.qnetAddress, replaced.aad.solanaAddress);
-      const otherWallet = erased !== null && (erased.qnet !== typed.qnetAddress || erased.solana !== typed.solanaAddress);
-      if (params?.confirm !== RESTORE_CONFIRM || (otherWallet && params?.replaceOther !== true)) {
-        keepRestoreToken(grant);
-        return { status: 'confirm', erased, restored: pairOf(typed.qnetAddress, typed.solanaAddress), otherWallet };
-      }
-      const since = session.lockMark();
-      const sealed = await sealNewVault(entropy, normalized, emptyState());
-      try {
-        await replaceVault(sealed, entropy);
-      } catch (error) {
-        core.zeroize(sealed.vaultKey);
-        throw error;
-      }
-      const restored = await startNewSession(sealed, since);
-      return { status: 'restored', ...restored };
-    });
-  } finally {
-    core.zeroize(entropy);
-  }
+export async function resetVault(params, meta) {
+  if (resetHolder(meta) === null) throw new WalletError('FORBIDDEN_SENDER');
+  takeResetToken(params?.token, meta);
+  if (params?.confirm !== RESET_CONFIRM) throw new WalletError('INVALID_PARAMS', { field: 'confirm' });
+  return exclusive(async () => {
+    if ((await readRawRecord()) === null) throw new WalletError('NO_VAULT');
+    if (await session.isUnlocked()) throw new WalletError('UNLOCKED');
+    await eraseAll();
+    return { wiped: true };
+  });
 }
 
 /**
@@ -1640,19 +1566,23 @@ export async function rotateSitesKey() {
   });
 }
 
-const isAnchors = (anchors) => isPlainObject(anchors) && Object.keys(anchors).length <= 2
-  && Object.values(anchors).every((a) => hasExactKeys(a, ['eligible_ids', 'beacon', 'registry_root'])
-    && Array.isArray(a.eligible_ids) && a.eligible_ids.length <= LIGHT_ANCHOR_IDS_MAX
-    && a.eligible_ids.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 256)
-    && typeof a.beacon === 'string' && typeof a.registry_root === 'string');
+// One kept anchor: its derivation data, and its three certified roots together or none of them.
+const isAnchor = (a) => (hasExactKeys(a, ANCHOR_KEYS) || hasExactKeys(a, [...ANCHOR_KEYS, ...ANCHOR_ROOT_KEYS]))
+  && Array.isArray(a.eligible_ids) && a.eligible_ids.length <= LIGHT_ANCHOR_IDS_MAX
+  && a.eligible_ids.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 256)
+  && typeof a.beacon === 'string' && typeof a.registry_root === 'string'
+  && ANCHOR_ROOT_KEYS.every((key) => a[key] === undefined || (typeof a[key] === 'string' && HEX32_RE.test(a[key])));
 
-// HMAC-SHA256 of the anchors under a key derived from the session's vault key: without the password
-// nobody, not even a program that can write this profile's database, can make a walk start elsewhere.
-async function anchorsMac(parsed, anchors) {
+const isAnchors = (anchors) => isPlainObject(anchors) && Object.keys(anchors).length <= 2 && Object.values(anchors).every(isAnchor);
+
+// HMAC-SHA256 of the anchors and the chain identity they were verified under, under a key derived from the session's
+// vault key: without the password nobody, not even a program that can write this profile's database, can make a walk
+// start elsewhere, and anchors of another build's chain never root this one's walks.
+async function anchorsMac(parsed, chain, anchors) {
   return session.withVaultKey((vaultKey) => {
     const key = core.hmac(core.sha256, vaultKey, utf8.encode(`${LIGHT_ANCHORS_LABEL}:${parsed.aad.walletId}`));
     try {
-      return core.hmac(core.sha256, key, utf8.encode(canonicalJson(anchors)));
+      return core.hmac(core.sha256, key, utf8.encode(canonicalJson({ chain, anchors })));
     } finally {
       core.zeroize(key);
     }
@@ -1660,42 +1590,91 @@ async function anchorsMac(parsed, anchors) {
 }
 
 /**
- * The light client's verified anchors kept by writeLightAnchors (core.exportVerifiedAnchors shape), or
- * null when there are none or their MAC does not verify under this session's vault key (after a password
- * change the next walk starts from the pin again). core.importVerifiedAnchors checks the shape again.
- * @returns {Promise<Record<string, {eligible_ids: string[], beacon: string, registry_root: string}>|null>}
+ * The light client's verified anchors kept by writeLightAnchors (core.exportVerifiedAnchors shape: each anchor's three
+ * roots together or none), or null when there are none, they were kept under another chain identity (core.chainIdentity)
+ * or by an earlier record version, or their MAC does not verify under this session's vault key (after a password change
+ * the next walk starts from the pin again). core.importVerifiedAnchors checks the shape again.
+ * @returns {Promise<Record<string, {eligible_ids: string[], beacon: string, registry_root: string, state_root?: string,
+ *   logs_root?: string, checkpoint_hash?: string}>|null>}
  * @throws {WalletError} LOCKED
  */
 export async function readLightAnchors() {
   return exclusive(async () => {
     const parsed = await sessionRecord();
     const value = await readRawValue(LIGHT_ANCHORS_KEY);
-    if (!hasExactKeys(value, ['v', 'anchors', 'mac']) || value.v !== 1 || !isAnchors(value.anchors)) return null;
+    if (!hasExactKeys(value, ['v', 'chain', 'anchors', 'mac']) || value.v !== LIGHT_ANCHORS_VERSION
+      || value.chain !== core.chainIdentity() || !isAnchors(value.anchors)) return null;
     const stored = decodeBase64(value.mac, { min: 32, max: 32 });
-    if (stored === null || !core.equalBytes(stored, await anchorsMac(parsed, value.anchors))) return null;
+    if (stored === null || !core.equalBytes(stored, await anchorsMac(parsed, value.chain, value.anchors))) return null;
     return structuredClone(value.anchors);
   });
 }
 
 /**
- * Keeps the light client's verified anchors (core.exportVerifiedAnchors) next to the record with their
- * MAC (anchorsMac), so a new worker walks on from them (EXT-CHAINS-04). Needs the session; a wipe deletes
- * them.
- * @param {Record<string, {eligible_ids: string[], beacon: string, registry_root: string}>} anchors
+ * Keeps the light client's verified anchors (core.exportVerifiedAnchors) next to the record with the build's chain
+ * identity and their MAC (anchorsMac), so a new worker walks on from them and answers at their index (EXT-CHAINS-04).
+ * Needs the session; a wipe deletes them.
+ * @param {Record<string, {eligible_ids: string[], beacon: string, registry_root: string, state_root?: string,
+ *   logs_root?: string, checkpoint_hash?: string}>} anchors
  * @returns {Promise<void>}
  * @throws {WalletError} LOCKED; INTERNAL for another shape
  */
 export async function writeLightAnchors(anchors) {
   if (!isAnchors(anchors)) throw internal();
   const copy = structuredClone(anchors);
+  const chain = core.chainIdentity();
   await exclusive(async () => {
     const parsed = await sessionRecord();
-    const mac = core.base64Encode(await anchorsMac(parsed, copy));
+    const mac = core.base64Encode(await anchorsMac(parsed, chain, copy));
     return withDb(false, (db) => {
       if (!hasStore(db)) throw internal();
-      return transact(db, 'readwrite', (store) => store.put({ v: 1, anchors: copy, mac }, LIGHT_ANCHORS_KEY));
+      return transact(db, 'readwrite', (store) => store.put({ v: LIGHT_ANCHORS_VERSION, chain, anchors: copy, mac }, LIGHT_ANCHORS_KEY));
     });
   });
+}
+
+const capsuleFits = (record) => {
+  try {
+    return isPlainObject(record) && canonicalJson(record).length <= CAPSULE_RECORD_MAX_CHARS;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The genesis capsule kept by writeCapsule (core.exportCapsule shape), or null when there is none or it was kept under
+ * another chain identity. No MAC: core.importCapsule verifies the genesis signatures and the kept proof parts again.
+ * Needs the session.
+ * @returns {Promise<object|null>}
+ * @throws {WalletError} LOCKED
+ */
+export async function readCapsule() {
+  await session.requireUnlocked();
+  return exclusive(async () => {
+    const value = await readRawValue(CAPSULE_KEY);
+    if (!hasExactKeys(value, ['v', 'chain', 'record']) || value.v !== 1 || value.chain !== core.chainIdentity()
+      || !capsuleFits(value.record)) return null;
+    return structuredClone(value.record);
+  });
+}
+
+/**
+ * Keeps the genesis capsule the light client holds (core.exportCapsule) next to the record, tagged with the build's
+ * chain identity; null deletes it (the chain went back, or the walk found it of another lineage). Needs the session; a
+ * wipe deletes it.
+ * @param {object|null} record
+ * @returns {Promise<void>}
+ * @throws {WalletError} LOCKED; INTERNAL for another shape
+ */
+export async function writeCapsule(record) {
+  if (record !== null && !capsuleFits(record)) throw internal();
+  const copy = record === null ? null : structuredClone(record);
+  await session.requireUnlocked();
+  await exclusive(() => withDb(false, (db) => {
+    if (!hasStore(db)) throw internal();
+    return transact(db, 'readwrite', (store) => (copy === null ? store.delete(CAPSULE_KEY)
+      : store.put({ v: 1, chain: core.chainIdentity(), record: copy }, CAPSULE_KEY)));
+  }));
 }
 
 // HMAC-SHA256 of the chain cache under a key derived from the vault key, as the anchors'.
@@ -1754,7 +1733,7 @@ export async function readChainCache() {
  * Read-modify-write of the chain cache under the record lock, with its MAC (chainCacheMac): `mutator` gets a copy and
  * returns the next cache (a plain JSON object of at most 64 KiB as canonical JSON); nothing is written when it is
  * unchanged, or when the session's record cannot be read (nothing is locked for it). Needs the session; a wipe and a
- * restore delete it.
+ * reset delete it.
  * @param {(cache: object) => object} mutator
  * @returns {Promise<object>} the stored cache
  * @throws {WalletError} LOCKED; INTERNAL for another shape

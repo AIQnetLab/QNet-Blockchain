@@ -2852,7 +2852,11 @@ impl BlockchainNode {
                 }
             });
             
-            // Wait for server readiness  
+            // N2: the public RPC side of a super node that serves wallets (its address, certificate,
+            // ServeCert and endpoint commit). A no-op elsewhere; it never blocks boot or consensus.
+            super::public_rpc::start(self.clone());
+
+            // Wait for server readiness
             println!("[INFO][NODE] waiting_for_server");
             // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
             let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };

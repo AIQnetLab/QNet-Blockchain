@@ -177,6 +177,16 @@ describe('ui common: worker messages', () => {
     assert.deepEqual(tabsCreated, [{ url: `${BASE}/${UI_PAGES.setup}` }]);
     assert.equal(dom.window.closed, true);
   });
+
+  it('openSetup(flow) opens setup straight at Create or Import; any other value at its first screen', async () => {
+    await common.openSetup('create');
+    await common.openSetup('import');
+    await common.openSetup('migrate');
+    await common.openSetup('create&x=1');
+    assert.deepEqual(tabsCreated.map((tab) => tab.url), [
+      `${BASE}/${UI_PAGES.setup}?flow=create`, `${BASE}/${UI_PAGES.setup}?flow=import`, `${BASE}/${UI_PAGES.setup}`, `${BASE}/${UI_PAGES.setup}`,
+    ]);
+  });
 });
 
 describe('ui common: clipboard and reveal', () => {
@@ -335,6 +345,11 @@ describe('ui kit', () => {
     assert.equal(kit.errorText(new Error('seed abandon abandon')), EN.err_INTERNAL);
     assert.equal(kit.errorText(new common.UiError('SOMETHING_NEW')), EN.err_INTERNAL);
     assert.equal(kit.errorCode(new TypeError('x')), 'INTERNAL');
+    // decision 49: a balance not certified while a long walk runs says how far it is
+    assert.equal(kit.errorText(new common.UiError('BALANCE_UNCONFIRMED', { walkSteps: 7 })),
+      'Checking the balance against QNet Blockchain: 7 steps left.');
+    assert.equal(kit.errorText(new common.UiError('BALANCE_UNCONFIRMED', { walkSteps: 0 })), EN.err_BALANCE_UNCONFIRMED);
+    assert.equal(kit.errorText(new common.UiError('BALANCE_UNCONFIRMED')), EN.err_BALANCE_UNCONFIRMED);
   });
 
   // The rule of both wallets: at least 8 characters, typed twice, nothing else (owner decision of 2026-09-28).

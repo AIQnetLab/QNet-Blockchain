@@ -22,6 +22,9 @@ export const LANGUAGES = Object.freeze([
 export const DEFAULT_LANGUAGE = 'en';
 const RTL = new Set(['ar']);
 
+// The chain's name as the screens write it: the same words in every language, never translated.
+export const CHAIN_NAME = 'QNet Blockchain';
+
 export const isSupported = (lang) => typeof lang === 'string' && Object.prototype.hasOwnProperty.call(translations, lang);
 export const isRTL = (lang) => RTL.has(lang);
 export const languageName = (lang) => (LANGUAGES.find((l) => l.code === lang) || LANGUAGES[0]).name;

@@ -1,27 +1,28 @@
 // The node cabinet's reads through the site (src/server/cabinet/node-proxy.ts, limits.ts): exact shapes, two
 // genesis nodes that must agree for "no node" (both at the network's height, none listing it) and for "registered",
-// the features both list, the node balance, the node's epochs one by one (a second node for the epochs the first could
-// not serve, the explorer archive's registration, dates and moves: epoch-archive.ts), caching and one upstream round
+// the features both list, the node balance, the node's epochs one by one, a page at a time (a second node for the epochs
+// the first could not serve, the explorer archive's registration, dates and moves: epoch-archive.ts), caching and one upstream round
 // per node, the per-client gate; a super node's status, and whether a wallet has a node of either type (wallet-node.ts).
 // Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import jsSha3 from 'js-sha3';
 import { CABINET_LIMITS, CLIENT_BUDGETS, createGate } from '../../server/cabinet/limits.ts';
 import {
-  NONE_CACHE_MS, RESERVE_CACHE_MS, STATUS_CACHE_MS, SUPER_CACHE_MS, createNodeProxy, historyView, lightShardOwners, mergeHistory, mergeStatus, parseHistory, parsePending,
-  parsePublicStatus, settlingPair, stillNeeded,
+  HISTORY_CACHE_MS, NONE_CACHE_MS, RESERVE_CACHE_MS, STATUS_CACHE_MS, SUPER_CACHE_MS, createNodeProxy, historyPath, historyView, lightShardOwners,
+  mergeHistory, mergeStatus, parseHistory, parsePending, parsePublicStatus, settlingPair, stillNeeded,
 } from '../../server/cabinet/node-proxy.ts';
 import { createKnownNodes } from '../../server/cabinet/known-nodes.ts';
 import {
-  CLAIMS_SQL, TIMES_SQL, claimsFrom, createEpochArchive, movedEpochs, registrationHeight, timesFrom,
+  CLAIMS_SQL, REGISTRATION_CACHE_MS, REGISTRATION_RECHECK_MS, REGISTRATION_SQL, TIMES_SQL, claimsFrom, createEpochArchive, movedEpochs, timesFrom,
+  walletRegistrations,
 } from '../../server/cabinet/epoch-archive.ts';
-import { RECORD_SQL } from '../../server/cabinet/registration-record.ts';
+import { superNodeId } from '../qnet-link.ts';
 import { epochOfHeight, epochOfKey } from '../cabinet/epochs.ts';
 import { UPSTREAM_BUDGETS, createUpstreamBudget } from '../../server/cabinet/upstream.ts';
-import { parseHistoryView, parseStatusView } from '../cabinet/node-view.ts';
+import { HISTORY_PAGE_ROWS, joinPages, parseHistoryView, parseStatusView } from '../cabinet/node-view.ts';
 import { GENESIS_NODES } from '../genesis-nodes.ts';
 import { PRICE_NODES } from '../activation-price.ts';
 
@@ -388,11 +389,14 @@ test('epochs: key 160 * (N + 1) settles epoch N, blocks N * 14,400 to (N + 1) * 
   assert.equal(epochOfHeight(14_400), 1);
 });
 
-test('the history: every epoch a node settled, a second node for the ones the first could not serve, the archive for dates and moves', async () => {
+const startOf = (epoch) => epoch * 14_400;
+
+test('the history: a page of the epochs a node settled, a second node for the ones the first could not serve, the archive for dates and moves', async () => {
   const first = {
     node_id: NODE,
     wallet: WALLET,
     last_claimed_epoch: key(150),
+    pagination: { offset: 0, limit: 30, total_epochs: 160, has_more: true },
     history: [
       { epoch: key(156), status: 'claimable', amount_qnc: 1.25, shard_certified: null },
       { epoch: key(155), status: 'not_eligible', amount_qnc: 0, shard_certified: true },
@@ -400,11 +404,12 @@ test('the history: every epoch a node settled, a second node for the ones the fi
       { epoch: key(153), status: 'shard_not_certified', amount_qnc: 0, shard_certified: false },
       { epoch: key(152), status: 'a_status_to_come', amount_qnc: 0 },
       { epoch: key(151), status: 'unavailable', amount_qnc: 0, shard_certified: null },
-      { epoch: key(150), status: 'claimed', amount_qnc: 2, shard_certified: null },
+      { epoch: key(150), status: 'claimed', amount_qnc: 2.000000001, shard_certified: null },
       { epoch: 100, status: 'claimable', amount_qnc: 9 },
+      { epoch: key(142), status: 'unavailable', amount_qnc: 0, shard_certified: null },
     ],
   };
-  // Another node serves epoch 154 (and not 151).
+  // Another node serves epoch 154 (and not 151 or 142).
   const second = { ...first, history: first.history.map((r) => (r.epoch === key(154) ? { ...r, status: 'claimed', amount_qnc: 0.5 } : r)) };
   const table = everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? second : undefined));
   table[host(1)] = (path) => (path.startsWith('/api/v1/rewards/history/') ? first : undefined);
@@ -413,44 +418,52 @@ test('the history: every epoch a node settled, a second node for the ones the fi
     asked.push({ wallet, nodeId, keys });
     return {
       registeredHeight: 140 * 14_400 + 500,
-      claims: new Map([[key(154), { tx: TX('a'), amountNano: '500000000' }], [key(150), { tx: TX('b'), amountNano: '2000000000' }], [key(142), { tx: TX('c'), amountNano: '3500000000' }], [key(120), { tx: TX('d'), amountNano: '1' }]]),
-      times: new Map([[endOf(156), 1_790_000_000_000], [endOf(142), 1_789_000_000_000]]),
+      superHeight: null,
+      claims: new Map([[key(154), { tx: TX('a'), amountNano: '500000000' }], [key(150), { tx: TX('b'), amountNano: '2000000000' }], [key(142), { tx: TX('c'), amountNano: '3500000000' }]]),
+      times: new Map([[startOf(156), 1_789_985_600_000], [endOf(156), 1_790_000_000_000], [endOf(142), 1_789_000_000_000]]),
     };
   };
   const { p, calls, advance } = proxy(table);
   const res = await p.history(get(`${BASE}/history`), NODE, archive);
   assert.equal(res.status, 200);
   const body = await json(res);
-  const row = (epoch, result, amountQnc = null, claimTx = null, endedAt = null) => ({ epoch, result, amountQnc, endedAt, claimTx });
+  const row = (epoch, result, amountQnc = null, claimTx = null, startedAt = null, endedAt = null) => ({ epoch, result, amountQnc, startedAt, endedAt, claimTx });
   assert.deepEqual(body, {
     registeredEpoch: 140,
     archived: true,
     rows: [
-      row(156, 'counted', 1.25, null, 1_790_000_000_000),
-      row(155, 'missed'),
+      row(156, 'counted', 1.25, null, 1_789_985_600_000, 1_790_000_000_000),
+      // An epoch ends as the next one begins.
+      row(155, 'missed', null, null, null, 1_789_985_600_000),
       row(154, 'moved', 0.5, TX('a')),
       row(153, 'unchecked'),
       row(151, 'unknown'),
+      // The moved amount is the move's own, exact.
       row(150, 'moved', 2, TX('b')),
+      // No node can read it any more; the archive holds it as moved.
+      row(142, 'moved', 3.5, TX('c'), null, 1_789_000_000_000),
     ],
-    // Older than the nodes' oldest epoch, from the registration on: the archive's moves.
-    earlier: [row(142, 'moved', 3.5, TX('c'), 1_789_000_000_000)],
+    // The node has more, and the page did not reach the registration's epoch.
+    more: true,
   });
   assert.deepEqual(parseHistoryView(body), body);
   assert.equal(JSON.stringify(body).includes('eon'), false, 'the wallet the node names is not passed on');
-  // Two nodes, a page of 100 epochs each (neither has more); the archive for the wallet the nodes name, which is the node's.
-  assert.deepEqual(calls.map((c) => c.path), [`/api/v1/rewards/history/${NODE}?limit=100`, `/api/v1/rewards/history/${NODE}?limit=100`]);
+  // Two nodes, one page of 30 epochs each; the archive for the wallet the nodes name, which is the node's.
+  assert.deepEqual(calls.map((c) => c.path), [`/api/v1/rewards/history/${NODE}?limit=30`, `/api/v1/rewards/history/${NODE}?limit=30`]);
   assert.deepEqual(asked, [{ wallet: WALLET, nodeId: NODE, keys: first.history.filter((r) => r.status !== 'a_status_to_come').map((r) => r.epoch) }]);
   await p.history(get(`${BASE}/history`), NODE, archive);
   assert.equal(calls.length, 2, 'cached');
-  advance(30_000);
+  advance(HISTORY_CACHE_MS);
   await p.history(get(`${BASE}/history`), NODE, archive);
   assert.equal(calls.length, 4);
   assert.equal((await proxy({}).p.history(get(`${BASE}/history`), NODE)).status, 503);
 });
 
-test('the history without the archive, or for a wallet that is not the node\'s: undated, nothing left out, one node when it serves all', async () => {
-  const answer = { node_id: NODE, wallet: WALLET, history: [{ epoch: key(10), status: 'not_eligible', amount_qnc: 0 }, { epoch: key(9), status: 'claimed', amount_qnc: 1 }] };
+test('the history without the archive: undated, nothing left out; one node when it serves all; an id that names no wallet has no older page', async () => {
+  const answer = {
+    node_id: NODE, wallet: WALLET, pagination: { has_more: true },
+    history: [{ epoch: key(10), status: 'not_eligible', amount_qnc: 0 }, { epoch: key(9), status: 'claimed', amount_qnc: 1 }],
+  };
   const { p, calls } = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? answer : undefined)));
   let archived = 0;
   const failing = async () => {
@@ -461,78 +474,175 @@ test('the history without the archive, or for a wallet that is not the node\'s: 
   assert.deepEqual(body, {
     registeredEpoch: null,
     archived: false,
-    rows: [{ epoch: 10, result: 'missed', amountQnc: null, endedAt: null, claimTx: null }, { epoch: 9, result: 'moved', amountQnc: 1, endedAt: null, claimTx: null }],
-    earlier: [],
+    rows: [{ epoch: 10, result: 'missed', amountQnc: null, startedAt: null, endedAt: null, claimTx: null }, { epoch: 9, result: 'moved', amountQnc: 1, startedAt: null, endedAt: null, claimTx: null }],
+    more: true,
   });
   assert.equal(calls.length, 1);
   assert.equal(archived, 1);
-  // A node that names another wallet: the archive is not asked.
+  // A node that names a wallet the id does not derive from (a genesis node's): the archive is asked for that wallet, and
+  // older pages are offered.
   const body19 = `${'1'.repeat(19)}eon${'2'.repeat(15)}`;
   const otherWallet = `${body19}${jsSha3.sha3_256(body19).slice(0, 8)}`;
-  const other = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...answer, wallet: otherWallet } : undefined)));
-  await other.p.history(get(`${BASE}/history`), NODE, failing);
+  const asked = [];
+  const facts = async (wallet, nodeId) => {
+    asked.push([wallet, nodeId]);
+    return { registeredHeight: 0, superHeight: 0, claims: new Map(), times: new Map() };
+  };
+  const other = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...answer, node_id: 'genesis_node_001', wallet: otherWallet } : undefined)));
+  const genesis = await json(await other.p.history(get('https://aiqnet.io/api/cabinet/node/genesis_node_001/history'), 'genesis_node_001', facts));
+  assert.deepEqual([genesis.registeredEpoch, genesis.archived, genesis.more], [0, true, true]);
+  assert.deepEqual(asked, [[otherWallet, 'genesis_node_001']]);
+  // An id the nodes resolve to no wallet (a made-up one): no archive, no older page.
+  const made = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...answer, wallet: '' } : undefined)));
+  assert.equal((await json(await made.p.history(get(`${BASE}/history`), NODE, failing))).more, false);
   assert.equal(archived, 1);
 });
 
-// S10, 04.10: a node from before the cabinet has more epochs than one page: its older pages are read, up to four, for the
-// wallet the id derives from; a made-up id costs one read per node.
-test('the history of an older node: its older pages with offset, while the node has more, for the node\'s own wallet only', async () => {
-  const page = (offset, more, wallet = WALLET) => ({
-    node_id: NODE, wallet,
-    pagination: { offset, limit: 100, total_epochs: 350, has_more: more },
-    history: Array.from({ length: offset === 300 ? 50 : 100 }, (_, i) => ({ epoch: key(400 - offset - i), status: 'claimable', amount_qnc: 1 })),
-  });
+// Owner, 11.10: every epoch, a page at a time. A page after the first starts at the epoch before its own, so a page read
+// from a node one epoch behind, or kept from before an epoch settled, skips none; the page joins them.
+test('the history\'s pages: ?page=N reads 31 epochs from offset 30 N - 1, each kept as long as the first; anything else is 400 before a node is asked', async () => {
+  assert.equal(HISTORY_PAGE_ROWS, 30);
+  assert.equal(historyPath(NODE, 0), `/api/v1/rewards/history/${NODE}?limit=30`);
+  assert.equal(historyPath(NODE, 1), `/api/v1/rewards/history/${NODE}?limit=31&offset=29`);
+  assert.equal(historyPath(NODE, 1000), `/api/v1/rewards/history/${NODE}?limit=31&offset=29999`);
+  const total = 200;
   const answer = (path) => {
     if (!path.startsWith('/api/v1/rewards/history/')) return undefined;
-    const offset = Number(new URL(path, 'https://x').searchParams.get('offset') ?? 0);
-    return page(offset, offset < 300);
+    const q = new URL(path, 'https://x').searchParams;
+    const offset = Number(q.get('offset') ?? 0);
+    const limit = Number(q.get('limit'));
+    const count = Math.max(0, Math.min(limit, total - offset));
+    return {
+      node_id: NODE, wallet: WALLET,
+      pagination: { offset, limit, total_epochs: total, has_more: offset + count < total },
+      history: Array.from({ length: count }, (_, i) => ({ epoch: key(total - 1 - offset - i), status: 'claimable', amount_qnc: 1 })),
+    };
   };
-  const { p, calls } = proxy(everyNode(answer));
-  const body = await json(await p.history(get(`${BASE}/history`), NODE));
-  assert.equal(body.rows.length, 350);
-  assert.equal(body.rows[0].epoch, 400);
-  assert.equal(body.rows[349].epoch, 51);
-  assert.deepEqual(calls.map((c) => c.path), [0, 100, 200, 300].map((o) => `/api/v1/rewards/history/${NODE}?limit=100${o ? `&offset=${o}` : ''}`));
-  assert.deepEqual(parseHistoryView(body), body);
-  // A node that names no wallet for the id (a made-up one): one page, no more.
-  const made = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...page(0, true), wallet: '' } : undefined)));
-  await made.p.history(get(`${BASE}/history`), NODE);
-  assert.equal(made.calls.filter((c) => c.path.includes('offset=')).length, 0);
+  const { p, calls, advance } = proxy(everyNode(answer));
+  const page = async (n) => json(await p.history(get(`${BASE}/history?page=${n}`), NODE));
+  const zero = await page(0);
+  const one = await page(1);
+  assert.deepEqual([zero.rows.length, zero.rows[0].epoch, zero.rows.at(-1).epoch, zero.more], [30, 199, 170, true]);
+  assert.deepEqual([one.rows.length, one.rows[0].epoch, one.rows.at(-1).epoch, one.more], [31, 170, 140, true]);
+  assert.deepEqual(parseHistoryView(one), one);
+  // The pages as the page joins them: each epoch once, newest first.
+  assert.deepEqual(joinPages([zero, one]).map((r) => r.epoch), Array.from({ length: 60 }, (_, i) => 199 - i));
+  const last = await page(6);
+  assert.deepEqual([last.rows.length, last.rows[0].epoch, last.rows.at(-1).epoch, last.more], [21, 20, 0, false]);
+  assert.deepEqual(calls.map((c) => c.path), [historyPath(NODE, 0), historyPath(NODE, 1), historyPath(NODE, 6)]);
+  // Every page is kept HISTORY_CACHE_MS: an older one changes too once the wallet moves its balance.
+  await page(1);
+  assert.equal(calls.length, 3, 'an older page kept');
+  advance(HISTORY_CACHE_MS);
+  await page(1);
+  await page(0);
+  assert.equal(calls.length, 5, 'both read again');
+  for (const bad of ['x', '-1', '01', '1.5', '1001', '', '1e2', '0x1']) {
+    const res = await p.history(get(`${BASE}/history?page=${bad}`), NODE);
+    assert.equal(res.status, 400, bad);
+    assert.deepEqual(await json(res), { error: 'invalid_request' });
+  }
+  assert.equal(calls.length, 5);
+  assert.equal((await p.history(get(`${BASE}/history?page=1000`), NODE)).status, 200);
 });
 
-test('the epochs from the registration on: its own epoch, not counted, is marked; the archive\'s older moves follow', () => {
-  const node = { wallet: WALLET, rows: [key(12), key(11), key(10), key(9)].map((k, i) => ({ key: k, status: i === 0 ? 'claimable' : 'not_eligible', amountQnc: i === 0 ? 1 : 0 })) };
+test('the epochs from the registration on: its own epoch, not counted, is marked; no older page past it', () => {
+  const node = {
+    wallet: WALLET, more: true,
+    rows: [key(12), key(11), key(10), key(9)].map((k, i) => ({ key: k, status: i === 0 ? 'claimable' : 'not_eligible', amountQnc: i === 0 ? 1 : 0 })),
+  };
   const facts = {
     registeredHeight: 10 * 14_400 + 7_000,
+    superHeight: null,
     claims: new Map([[key(8), { tx: TX('e'), amountNano: '1' }], [key(12), { tx: TX('f'), amountNano: '1000000000' }]]),
     times: new Map(),
   };
   const view = historyView(node, facts);
   assert.deepEqual(view.rows.map((r) => [r.epoch, r.result]), [[12, 'counted'], [11, 'missed'], [10, 'joined']]);
-  assert.equal(view.rows[0].claimTx, null, 'counted, not moved: no move');
-  assert.deepEqual(view.earlier, [], 'the move of epoch 8 is from before the registration');
-  assert.equal(view.registeredEpoch, 10);
   // A counted epoch the node reports and the archive lists as moved is still what the node says.
-  assert.deepEqual(historyView({ wallet: WALLET, rows: [] }, { registeredHeight: null, claims: new Map([[key(3), { tx: TX('g'), amountNano: null }]]), times: new Map() }).earlier,
-    [{ epoch: 3, result: 'moved', amountQnc: null, endedAt: null, claimTx: TX('g') }]);
-  // A second node's answer fills only what the first could not serve, and only for the same wallet.
-  const a = { wallet: WALLET, rows: [{ key: key(2), status: 'unavailable', amountQnc: 0 }, { key: key(1), status: 'claimable', amountQnc: 1 }] };
-  const b = { wallet: WALLET, rows: [{ key: key(2), status: 'claimed', amountQnc: 3 }, { key: key(1), status: 'not_eligible', amountQnc: 0 }] };
-  assert.deepEqual(mergeHistory(a, b).rows, [{ key: key(2), status: 'claimed', amountQnc: 3 }, { key: key(1), status: 'claimable', amountQnc: 1 }]);
+  assert.equal(view.rows[0].claimTx, null, 'counted, not moved: no move');
+  assert.equal(view.registeredEpoch, 10);
+  assert.equal(view.more, false, 'the page reached the registration');
+  // A page that stops at the registration's epoch offers no older one; one that stops after it does.
+  assert.equal(historyView({ ...node, rows: node.rows.slice(0, 3) }, facts).more, false);
+  assert.equal(historyView({ ...node, rows: node.rows.slice(0, 2) }, facts).more, true);
+  assert.equal(historyView({ ...node, rows: node.rows.slice(0, 2), more: false }, facts).more, false);
+  assert.equal(historyView({ ...node, rows: node.rows.slice(0, 2), wallet: null }, facts).more, false, 'an id that names no wallet');
+  // A wallet with a super node too, read by its light node: after the super node's registration epoch, an epoch that paid
+  // the wallet nothing is not counted, though the light node's group was not checked; before and in it, not checked.
+  const both = historyView(
+    { wallet: WALLET, more: false, rows: [key(14), key(13), key(12)].map((k) => ({ key: k, status: 'shard_not_certified', amountQnc: 0 })) },
+    { ...facts, superHeight: 13 * 14_400 + 9 },
+  );
+  assert.deepEqual(both.rows.map((r) => [r.epoch, r.result]), [[14, 'missed'], [13, 'unchecked'], [12, 'unchecked']]);
+  assert.equal(historyView({ ...node, rows: [] }, null).more, false, 'no epoch, no older page');
+  // An epoch no node can read: moved when the archive holds its move (its amount when the payload has one), else unknown.
+  const lost = historyView({ wallet: WALLET, more: false, rows: [{ key: key(3), status: 'unavailable', amountQnc: 0 }, { key: key(2), status: 'unavailable', amountQnc: 0 }] },
+    { registeredHeight: null, superHeight: null, claims: new Map([[key(3), { tx: TX('g'), amountNano: null }]]), times: new Map([[startOf(3), 5], [endOf(3), 6]]) });
+  assert.deepEqual(lost.rows, [
+    { epoch: 3, result: 'moved', amountQnc: null, startedAt: 5, endedAt: 6, claimTx: TX('g') },
+    { epoch: 2, result: 'unknown', amountQnc: null, startedAt: null, endedAt: 5, claimTx: null },
+  ]);
+  // A second node's answer fills only what the first could not serve, and only for the same wallet; the first's paging stays.
+  const a = { wallet: WALLET, more: true, rows: [{ key: key(2), status: 'unavailable', amountQnc: 0 }, { key: key(1), status: 'claimable', amountQnc: 1 }] };
+  const b = { wallet: WALLET, more: false, rows: [{ key: key(2), status: 'claimed', amountQnc: 3 }, { key: key(1), status: 'not_eligible', amountQnc: 0 }] };
+  assert.deepEqual(mergeHistory(a, b), { wallet: WALLET, more: true, rows: [{ key: key(2), status: 'claimed', amountQnc: 3 }, { key: key(1), status: 'claimable', amountQnc: 1 }] });
   assert.equal(mergeHistory(a, { ...b, wallet: null }), a);
+  // The page's rows joined: each epoch once, the first page's row kept, newest first.
+  const r = (epoch, result) => ({ epoch, result, amountQnc: null, startedAt: null, endedAt: null, claimTx: null });
+  const pages = [{ rows: [r(12, 'counted'), r(11, 'missed')] }, { rows: [r(11, 'counted'), r(10, 'missed')] }, { rows: [r(13, 'counted')] }];
+  assert.deepEqual(joinPages(pages), [r(13, 'counted'), r(12, 'counted'), r(11, 'missed'), r(10, 'missed')]);
 });
 
-test('the archive: the registration row of the node, the moves to the wallet with their epochs, the block times', async () => {
-  assert.match(CLAIMS_SQL, /WHERE to_address = \$1 AND tx_type = 'RewardDistribution' AND from_address = 'system_rewards_pool'\s+ORDER BY block DESC, tx_index DESC LIMIT 32/);
+// The node's verdict for a super node outside an epoch's admitted set (rewards_api.rs reward_history_status): its zero is
+// the network's admission, not missed heartbeats.
+test('a super node\'s epoch the nodes report as not admitted reads "not admitted", never "not counted", its registration epoch too', () => {
+  assert.deepEqual(parseHistory({ wallet: WALLET, history: [{ epoch: key(11), status: 'not_admitted', amount_qnc: 0, shard_certified: null }] }).rows,
+    [{ key: key(11), status: 'not_admitted', amountQnc: 0 }]);
+  const node = {
+    wallet: WALLET, more: false,
+    rows: [['claimable', 1], ['not_admitted', 0], ['not_admitted', 0], ['not_eligible', 0]].map(([status, amountQnc], i) => ({ key: key(12 - i), status, amountQnc })),
+  };
+  const facts = { registeredHeight: 10 * 14_400 + 5, superHeight: 10 * 14_400 + 5, claims: new Map(), times: new Map() };
+  const view = historyView(node, facts);
+  assert.deepEqual(view.rows.map((r) => [r.epoch, r.result, r.amountQnc]), [[12, 'counted', 1], [11, 'not_admitted', null], [10, 'not_admitted', null]]);
+  assert.deepEqual(parseHistoryView(view), view);
+  // A node that could not serve the epoch is filled by one that reports it not admitted.
+  const a = { wallet: WALLET, more: false, rows: [{ key: key(11), status: 'unavailable', amountQnc: 0 }] };
+  assert.deepEqual(mergeHistory(a, { ...a, rows: [{ key: key(11), status: 'not_admitted', amountQnc: 0 }] }).rows, [{ key: key(11), status: 'not_admitted', amountQnc: 0 }]);
+  assert.equal(historyView(mergeHistory(a, { ...a, rows: [{ key: key(11), status: 'not_admitted', amountQnc: 0 }] }), null).rows[0].result, 'not_admitted');
+});
+
+test('the archive: the wallet\'s first registration and its super node\'s, kept once found; the moves that can hold the page; its block times', async () => {
+  // Heights are ordered as numbers: a bare `block` in ORDER BY would name the text column the query reads it as. Oldest
+  // first, so the wallet's first registration is always read.
+  assert.match(REGISTRATION_SQL, /left\(data, 200\) AS memo FROM transactions\s+WHERE from_address = \$1 AND tx_type = 'NodeRegistration' ORDER BY transactions\.block ASC, tx_index ASC LIMIT 4/);
+  assert.match(CLAIMS_SQL, /WHERE to_address = \$1 AND tx_type = 'RewardDistribution' AND from_address = 'system_rewards_pool' AND transactions\.block >= \$2\s+ORDER BY transactions\.block ASC, tx_index ASC LIMIT 32/);
   assert.match(TIMES_SQL, /FROM blocks WHERE height = ANY\(\$1::bigint\[\]\)/);
+  // The wallet's own super node (superNodeId), and a light id of another wallet.
+  const SUPER = superNodeId(WALLET);
   const rows = [
-    { block: '9', data: { node_id: 'light_mobile_0000000000000000', node_type: 'Light' } },
-    { block: '8', data: { node_id: NODE, node_type: 'Super' } },
-    { block: '7', data: { node_id: NODE, node_type: 'Light' } },
-    { block: '6', data: { node_id: NODE, node_type: 'Light' } },
+    { block: '6', data: { node_id: 'light_mobile_0000000000000000', node_type: 'Light' } },
+    { block: '7', data: { node_id: NODE, node_type: 'Super' } },
+    { block: '8', data: { node_id: NODE, node_type: 'Light' } },
+    { block: '9', data: { node_id: NODE, node_type: 'Light' } },
   ];
-  assert.equal(registrationHeight(NODE, rows), 7);
-  assert.equal(registrationHeight(NODE, [{ block: 'x', data: { node_id: NODE, node_type: 'Light' } }, { block: 5, data: null }]), null);
+  // The first row of one of the wallet's nodes, of its type; one sent again moves nothing, whatever the rows' order.
+  assert.deepEqual(walletRegistrations(WALLET, NODE, rows), { first: 8, superAt: null });
+  assert.deepEqual(walletRegistrations(WALLET, NODE, [...rows].reverse()), { first: 8, superAt: null });
+  assert.deepEqual(walletRegistrations(WALLET, NODE, [{ block: 'x', data: { node_id: NODE, node_type: 'Light' } }, { block: 5, data: null }]), { first: null, superAt: null });
+  // Light and super: the epochs are the wallet's, so they start at whichever came first, asked by either id.
+  const pair = [{ block: '12', data: { node_id: SUPER, node_type: 'Super' } }, ...rows];
+  assert.deepEqual(walletRegistrations(WALLET, NODE, pair), { first: 8, superAt: 12 });
+  assert.deepEqual(walletRegistrations(WALLET, SUPER, [{ block: '4', data: { node_id: SUPER, node_type: 'Super' } }, ...rows]), { first: 4, superAt: 4 });
+  // A row from before the indexer kept its fields, by its memo; a genesis node's, from the genesis block, by its own.
+  const memo = (id, block) => ({ block, data: null, memo: `client_node_reg:${id}:${WALLET}:ac5e6f4b4bb191594731857880ae6665:` });
+  assert.deepEqual(walletRegistrations(WALLET, NODE, [memo(NODE, '15'), memo(SUPER, '20')]), { first: 15, superAt: 20 });
+  assert.deepEqual(walletRegistrations(WALLET, SUPER, [memo(SUPER, '20')]), { first: 20, superAt: 20 });
+  assert.deepEqual(walletRegistrations(WALLET, NODE, [{ block: '3', data: null, memo: `client_node_reg:${NODE}0:${WALLET}:` }]), { first: null, superAt: null }, 'another id that starts alike');
+  const genesis = { block: '0', data: null, memo: `node_registration:genesis_node_001:${WALLET}` };
+  assert.deepEqual(walletRegistrations(WALLET, 'genesis_node_001', [genesis]), { first: 0, superAt: 0 });
+  assert.deepEqual(walletRegistrations(WALLET, 'genesis_node_002', [genesis]), { first: null, superAt: null }, 'another genesis node');
   // A move's payload, whole or cut short by the archive; amounts stay exact.
   const payload = JSON.stringify({ claims: [{ amount: 18446744073709551615, epoch: key(4), proof: [['ab', true]] }, { epoch: key(5), amount: 2, proof: [] }] }).replace('18446744073709552000', '18446744073709551615');
   assert.deepEqual(movedEpochs(payload), [{ key: key(4), amountNano: '18446744073709551615' }, { key: key(5), amountNano: '2' }]);
@@ -546,24 +656,51 @@ test('the archive: the registration row of the node, the moves to the wallet wit
   ]);
   assert.deepEqual([...claims], [[key(6), { tx: TX('1'), amountNano: '5' }], [key(5), { tx: TX('2'), amountNano: '3' }]]);
   assert.deepEqual([...timesFrom([{ height: '14400', ts: '1790000000000' }, { height: 'x', ts: '1' }, { height: '28800', ts: '0' }])], [[14_400, 1_790_000_000_000]]);
-  // Three reads: the registration and the moves by the wallet, then the times of the epochs' ends.
+  // Three reads: the registration by the wallet, the moves from the end of the page's oldest epoch on, the times of the
+  // page's epochs' first blocks and their successors.
+  let t = 0;
   const queries = [];
   const query = async (text, params) => {
     queries.push({ text, params });
-    if (text === RECORD_SQL) return { rows: [{ block: '1000', data: { node_id: NODE, node_type: 'Light' } }] };
+    if (text === REGISTRATION_SQL) return { rows: [{ block: '1000', data: { node_id: NODE, node_type: 'Light' }, memo: null }] };
     if (text === CLAIMS_SQL) return { rows: [{ hash: TX('3'), block: '2000', data: JSON.stringify({ claims: [{ epoch: key(2), amount: 7 }] }) }] };
     return { rows: [{ height: String(endOf(2)), ts: '1790000000000' }] };
   };
-  const facts = await createEpochArchive(query)(WALLET, NODE, [key(3), key(2), 5]);
-  assert.deepEqual(queries.map((q) => q.params), [[WALLET], [WALLET], [[endOf(3), endOf(2)]]]);
-  assert.deepEqual(facts, { registeredHeight: 1000, claims: new Map([[key(2), { tx: TX('3'), amountNano: '7' }]]), times: new Map([[endOf(2), 1_790_000_000_000]]) });
-  // Nothing to date: no third read.
+  const archive = createEpochArchive(query, () => t);
+  const facts = await archive(WALLET, NODE, [key(3), key(2), 5]);
+  assert.deepEqual(queries.map((q) => q.params), [[WALLET], [WALLET, endOf(2)], [[startOf(3), endOf(3), startOf(2)]]]);
+  assert.deepEqual(facts, {
+    registeredHeight: 1000, superHeight: null, claims: new Map([[key(2), { tx: TX('3'), amountNano: '7' }]]), times: new Map([[endOf(2), 1_790_000_000_000]]),
+  });
+  // Registrations found without the super node's are read again after REGISTRATION_RECHECK_MS (the wallet may still
+  // register one); nothing to date or move: no other read.
+  await archive(WALLET, NODE, []);
+  assert.equal(queries.length, 3);
+  t += REGISTRATION_RECHECK_MS;
+  await archive(WALLET, NODE, []);
+  assert.deepEqual(queries.slice(3).map((q) => q.text), [REGISTRATION_SQL]);
+  // With the super node's, they are kept a day.
+  const reads = [];
+  const both = createEpochArchive(async (text) => {
+    reads.push(text);
+    return { rows: [{ block: '1000', data: { node_id: NODE, node_type: 'Light' } }, { block: '3000', data: { node_id: SUPER, node_type: 'Super' } }] };
+  }, () => t);
+  assert.deepEqual([(await both(WALLET, NODE, [])).superHeight, reads.length], [3000, 1]);
+  t += REGISTRATION_CACHE_MS - 1;
+  await both(WALLET, NODE, []);
+  assert.equal(reads.length, 1);
+  t += 1;
+  await both(WALLET, NODE, []);
+  assert.equal(reads.length, 2);
+  // A super node's registration is read by the wallet as well; one not found is read again.
   const none = [];
-  await createEpochArchive(async (text, params) => {
+  const empty = createEpochArchive(async (text, params) => {
     none.push(params);
     return { rows: [] };
-  })(WALLET, NODE, []);
-  assert.equal(none.length, 2);
+  });
+  assert.equal((await empty(WALLET, SUPER, [])).registeredHeight, null);
+  await empty(WALLET, SUPER, []);
+  assert.deepEqual(none, [[WALLET], [WALLET]]);
 });
 
 test('the parsers take only the fields they know, in their forms', () => {
@@ -586,17 +723,24 @@ test('the parsers take only the fields they know, in their forms', () => {
   assert.equal(parseStatusView({ ...view, extra: 1 }), null);
   assert.equal(parseStatusView({ ...view, balanceNano: 1 }), null);
   assert.equal(parseStatusView({ ...view, balanceNano: '01' }), null);
-  const epochs = { registeredEpoch: 3, archived: true, rows: [{ epoch: 4, result: 'missed', amountQnc: null, endedAt: 1, claimTx: null }], earlier: [] };
+  const epochs = { registeredEpoch: 3, archived: true, rows: [{ epoch: 4, result: 'missed', amountQnc: null, startedAt: 0, endedAt: 1, claimTx: null }], more: false };
   assert.deepEqual(parseHistoryView(epochs), epochs);
+  const full = { ...epochs, rows: Array.from({ length: HISTORY_PAGE_ROWS + 1 }, (_, i) => ({ ...epochs.rows[0], epoch: i })) };
+  assert.deepEqual(parseHistoryView(full), full);
   for (const bad of [
     { ...epochs, extra: 1 },
     { ...epochs, archived: 'yes' },
     { ...epochs, registeredEpoch: -1 },
     { ...epochs, rows: [{ ...epochs.rows[0], result: 'not_counted' }] },
     { ...epochs, rows: [{ ...epochs.rows[0], endedAt: -5 }] },
+    { ...epochs, rows: [{ ...epochs.rows[0], startedAt: 1.5 }] },
+    { ...epochs, rows: [{ epoch: 4, result: 'missed', amountQnc: null, endedAt: 1, claimTx: null }] },
+    { ...epochs, more: 'yes' },
+    { registeredEpoch: 3, archived: true, rows: [] },
+    { ...epochs, earlier: [] },
+    { ...full, rows: [...full.rows, { ...epochs.rows[0], epoch: 99 }] },
     { ...epochs, rows: [{ ...epochs.rows[0], amountQnc: -1 }] },
     { ...epochs, rows: [{ ...epochs.rows[0], claimTx: '<b>' }] },
-    { ...epochs, earlier: [{ epoch: 1 }] },
     { lastClaimedEpoch: 1, rows: [] },
   ]) {
     assert.equal(parseHistoryView(bad), null, JSON.stringify(bad));
@@ -644,8 +788,8 @@ test('the routes are thin: every read goes through the proxy, which logs nothing
 
 // SITE-R2-09: every cabinet read and write goes to the five genesis nodes, and the explorer server may be on their
 // whitelist, which skips their own per-address limits. However many clients ask, each genesis node now gets at most
-// UPSTREAM_BUDGETS reads (and submits, and wakes) a second from the site; a call beyond it is not made and counts as that
-// node not answering. The kinds are kept apart, so reads cannot starve a registration or a wake.
+// UPSTREAM_BUDGETS reads (and submits) a second from the site; a call beyond it is not made and counts as that node not
+// answering. The kinds are kept apart, so reads cannot starve a registration.
 test('each genesis node gets a bounded number of calls a second from the site, whatever the clients do', async () => {
   let t = 1_000_000;
   const now = () => t;
@@ -675,23 +819,25 @@ test('each genesis node gets a bounded number of calls a second from the site, w
   assert.equal(budget('readKnown', 'https://node1.aiqnet.io/y'), true, 'unknown ids leave the known ones their budget');
   assert.equal(budget('readUnknown', 'https://node2.aiqnet.io/y'), true);
   assert.equal(budget('submit', 'https://node1.aiqnet.io/submit'), true);
-  assert.equal(budget('wake', 'https://node1.aiqnet.io/wake'), true);
   // A reservation's check that the wallet has no node has a budget of its own (audit M6).
   assert.equal(budget('reserve', 'https://node1.aiqnet.io/x'), true);
   assert.equal(budget('readKnown', 'not a url'), false);
   assert.deepEqual(UPSTREAM_BUDGETS, {
     readKnown: { max: 16, windowMs: 1_000 }, readUnknown: { max: 4, windowMs: 1_000 }, reserve: { max: 10, windowMs: 1_000 }, submit: { max: 2, windowMs: 1_000 },
-    wake: { max: 2, windowMs: 1_000 },
   });
   assert.equal(UPSTREAM_BUDGETS.readKnown.max + UPSTREAM_BUDGETS.readUnknown.max, 20, 'a genesis node is asked no more than before');
   // The process's routes share one budget.
   const src = (name) => readFileSync(new URL(`../../server/cabinet/${name}`, import.meta.url), 'utf8');
-  assert.match(src('node-proxy.ts'), /createNodeProxy\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\) \}\)/);
+  // The eligible set's reads go on the same budget as the reads of an id seen registered.
+  assert.match(src('node-proxy.ts'), /const budget = sharedUpstreamBudget\(\);\s*const created = createNodeProxy\(\{ gate: cabinetGate\(\), budget, eligible: createEligibleSet\(\{ budget \}\) \}\);/);
+  assert.match(src('eligible-set.ts'), /if \(!budget\('readKnown', url\)\) return null;/);
   assert.match(src('register.ts'), /createRegister\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\), verifyConsent, paymentRecord, \.\.\.own \}\)/);
   assert.match(src('wallet-node.ts'), /createWalletNode\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\) \}\)/);
   assert.match(src('wallet-node.ts'), /const url = `\$\{base\}\/api\/v1\/verify-activation`;\s*if \(!budget\(kind, url\)\) return null;/);
   assert.match(src('activation-api.ts'), /walletNode: \(wallet\) => sharedWalletNode\(\)\.check\(wallet, 'reserve'\)/);
-  assert.match(src('wake.ts'), /createWake\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\) \}\)/);
+  // Owner, 11.10: no I'm back on the site, so no wake route and no wake budget.
+  assert.equal(existsSync(new URL('../../server/cabinet/wake.ts', import.meta.url)), false);
+  assert.equal(existsSync(new URL('../../app/api/cabinet/wake/route.ts', import.meta.url)), false);
   assert.match(src('node-proxy.ts'), /async function read\(url: string, kind: UpstreamKind\): Promise<unknown> \{\s*if \(!budget\(kind, url\)\) return null;/);
 });
 // R4: a super node's status for My node: one node that lists it registered answers "yes" with its details; "no" needs
@@ -712,12 +858,22 @@ test('the super node status: a yes from one node, a no from two, last seen, hear
   const url = `https://aiqnet.io/api/cabinet/super/${ID}`;
   const { p, calls } = proxy(everyNode(at(server())));
   const yes = await json(await p.superStatus(get(url), ID));
-  assert.deepEqual(yes, { registered: true, online: true, lastSeenAt: 1_790_000_000_000, heartbeats: { current: 7, required: 9 }, banned: false, balanceNano: '2500000000' });
+  assert.deepEqual(yes, {
+    registered: true, online: true, lastSeenAt: 1_790_000_000_000, heartbeats: { current: 7, required: 9 }, banned: false, balanceNano: '2500000000',
+    admission: null, admitted: null, onPace: null, networkHeight: null, serverHeight: null, connected: false,
+  });
   assert.deepEqual(parseSuperStatus(yes), yes);
   assert.equal(calls.filter((c) => c.path.startsWith('/api/v1/node/status')).length, 2, 'two asked at once, one yes is enough');
   // Not registered: two nodes say so.
   const none = proxy(everyNode(at(server({ registered: false, onchain_registered: false, is_online: false, last_seen: 0, reputation: null }))));
-  assert.deepEqual(await json(await none.p.superStatus(get(url), ID)), { registered: false, online: false, lastSeenAt: null, heartbeats: null, banned: false, balanceNano: null });
+  const NONE = {
+    registered: false, online: false, lastSeenAt: null, heartbeats: null, banned: false, balanceNano: null, admission: null, admitted: null, onPace: null,
+    networkHeight: null, serverHeight: null, connected: false,
+  };
+  assert.deepEqual(await json(await none.p.superStatus(get(url), ID)), NONE);
+  // A node whose peer view holds the server says so before the registration lands (status onboarding, online).
+  const seen = proxy(everyNode(at(server({ registered: false, onchain_registered: false, is_online: true, status: 'onboarding', reputation: null }))));
+  assert.deepEqual(await json(await seen.p.superStatus(get(url), ID)), { ...NONE, connected: true });
   // One node answering "no" and the rest unreachable settles nothing.
   const lone = proxy({ [host(1)]: at(server({ registered: false, onchain_registered: false })) });
   assert.equal((await lone.p.superStatus(get(url), ID)).status, 503);
@@ -736,9 +892,48 @@ test('the super node status: a yes from one node, a no from two, last seen, hear
   // The nodes' answer as read: an error answer or a missing field is none.
   assert.equal(parseServerStatus({ success: false }), null);
   assert.equal(parseServerStatus({ success: true }), null);
-  assert.deepEqual(parseServerStatus({ success: true, registered: false }), { registered: false, online: false, lastSeen: 0, heartbeats: null, reputation: null });
+  assert.deepEqual(parseServerStatus({ success: true, registered: false }), {
+    registered: false, online: false, lastSeen: 0, heartbeats: null, reputation: null, onPace: null, networkHeight: null, serverHeight: null, admission: null,
+    seen: false,
+  });
+  // The pace this epoch, the network's height and the server's own (a field no node of today sends), as read.
+  assert.deepEqual(parseServerStatus(server({ is_reward_eligible: false, current_block_height: 3_508_200, peer_block_height: 3_508_190 })), {
+    registered: true, online: true, lastSeen: 1_790_000_000, heartbeats: { current: 7, required: 9 }, reputation: 70, onPace: false, networkHeight: 3_508_200,
+    serverHeight: 3_508_190, admission: null, seen: false,
+  });
+  // The node's admission (light_nodes.rs handle_server_node_status `admission`), as read: one of its three words, else none;
+  // never for a node not registered.
+  for (const word of ['admitted', 'waiting', 'not_required']) assert.equal(parseServerStatus(server({ admission: word })).admission, word);
+  for (const bad of [null, 'Waiting', 1, true, { waiting: true }]) assert.equal(parseServerStatus(server({ admission: bad })).admission, null, String(bad));
+  assert.equal(parseServerStatus(server({ registered: false, onchain_registered: false, admission: 'waiting' })).admission, null);
+  assert.equal(parseServerStatus(server({ registered: false, onchain_registered: false, is_reward_eligible: true, peer_block_height: 5 })).onPace, null);
+  // Whether the network's eligible set lists the node: admitted, waiting for the network's admission, or not known.
+  const eligibleOf = (set) => proxy(everyNode(at(server())), { eligible: async () => set });
+  assert.equal((await json(await eligibleOf(new Set([ID, 'genesis_node_001'])).p.superStatus(get(url), ID))).admitted, true);
+  assert.equal((await json(await eligibleOf(new Set(['genesis_node_001'])).p.superStatus(get(url), ID))).admitted, false);
+  assert.equal((await json(await eligibleOf(null).p.superStatus(get(url), ID))).admitted, null);
+  const throwing = proxy(everyNode(at(server())), { eligible: async () => { throw new Error('x'); } });
+  assert.equal((await json(await throwing.p.superStatus(get(url), ID))).admitted, null);
+  // The node's own admission settles it, and the eligible set is then not read at all.
+  let setReads = 0;
+  const named = (word) => proxy(everyNode(at(server({ admission: word }))), { eligible: async () => { setReads += 1; return new Set(['genesis_node_001']); } });
+  const waiting = await json(await named('waiting').p.superStatus(get(url), ID));
+  assert.deepEqual([waiting.admission, waiting.admitted], ['waiting', null]);
+  assert.deepEqual(parseSuperStatus(waiting), waiting);
+  assert.equal((await json(await named('admitted').p.superStatus(get(url), ID))).admission, 'admitted');
+  assert.equal((await json(await named('not_required').p.superStatus(get(url), ID))).admission, 'not_required');
+  assert.equal(setReads, 0);
+  // A view naming an admission a node does not send, or one for a node not registered, is not the route's.
+  assert.equal(parseSuperStatus({ ...waiting, admission: 'later' }), null);
+  assert.equal(parseSuperStatus({ ...NONE, admission: 'waiting' }), null);
+  // A slow eligible set holds the status no longer than ELIGIBLE_WAIT_MS.
+  const { ELIGIBLE_WAIT_MS } = await import('../../server/cabinet/node-proxy.ts');
+  const slow = proxy(everyNode(at(server())), { eligible: () => new Promise(() => {}) });
+  const began = Date.now();
+  assert.equal((await json(await slow.p.superStatus(get(url), ID))).admitted, null);
+  assert.ok(Date.now() - began < ELIGIBLE_WAIT_MS + 2_000);
   // The archive's newest heartbeat of the node, by its block time.
-  assert.match(LAST_HEARTBEAT_SQL, /WHERE t\.from_address = \$1 AND t\.tx_type IN \('HeartbeatCommitment', 'Heartbeat'\) ORDER BY t\.block DESC, t\.tx_index DESC LIMIT 1/);
+  assert.match(LAST_HEARTBEAT_SQL, /WHERE t\.from_address = \$1 AND t\.tx_type IN \('HeartbeatCommitment', 'Heartbeat'\)\s+AND EXISTS \(SELECT 1 FROM sync_state s WHERE s\.id = 1 AND s\.last_sync_at > CURRENT_TIMESTAMP - interval '120 seconds'\)\s+ORDER BY t\.block DESC, t\.tx_index DESC LIMIT 1/);
   assert.equal(lastHeartbeatFrom([{ ts: '1789000000000' }]), 1_789_000_000_000);
   assert.equal(lastHeartbeatFrom([]), null);
   const asked = [];

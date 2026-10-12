@@ -567,7 +567,7 @@ impl Refusal {
 
     pub fn message(&self) -> &'static str {
         match self {
-            Refusal::NotRegistered => "The node is not registered on the QNet network",
+            Refusal::NotRegistered => "The node is not registered on QNet Blockchain",
             Refusal::IdentityMismatch => "The node, the wallet and the wallet key do not belong together",
             Refusal::StaleSeq => "A newer binding exists for this node",
             Refusal::FutureSeq => "The binding sequence is ahead of the network clock",

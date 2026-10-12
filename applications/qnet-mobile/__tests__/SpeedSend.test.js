@@ -108,6 +108,8 @@ describe('a hedged read', () => {
     let n = 0;
     const hosts = [];
     global.fetch = jest.fn(async (url) => {
+      // the certified head, read beside the proof (_balanceProofFrom): none here
+      if (/\/api\/v1\/(state\/certified|debug\/consensus-position)$/.test(url)) return reply(404, {});
       hosts.push(genesisOf(url));
       n += 1;
       return n < 3 ? reply(502, {}) : reply(200, `{"balance":5000000000,"nonce":3,"merkle_proof":[{"sibling":"${'00'.repeat(32)}","is_right":true}],"state_root":"ab","block_height":9000}`);

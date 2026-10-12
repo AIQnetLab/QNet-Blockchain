@@ -36,12 +36,14 @@ const nullable = (spec) => ({ ...spec, nullable: true });
 const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
 const DECIMAL_RE = /^(0|[1-9][0-9]*)(\.[0-9]+)?$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const RESTORE_TOKEN_RE = /^[0-9a-f]{64}$/;
+const RESET_TOKEN_RE = /^[0-9a-f]{64}$/;
 const CURSOR_RE = /^[\x21-\x7e]+$/;
 const TYPE_RE = /^[a-z]+\.[a-zA-Z]+$/;
 const TX_HASH_RE = /^[0-9A-Za-z]{16,128}$/;
 const METHOD_RE = /^[A-Za-z_]{1,64}$/;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+// The node a site's move of the node balance names: a light or a super node id (QNet Link v1 section 14.4).
+const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 const PATTERN_RE = /^(https?):\/\/(\*|(?:\*\.)?[a-z0-9.-]+)(?::([0-9]{1,5}))?\/.*$/;
 const DEFAULT_PORTS = Object.freeze({ 'https:': '443', 'http:': '80' });
 // A token amount before the token's decimals are known: a canonical decimal of at most 18 fraction digits.
@@ -105,10 +107,11 @@ const F = Object.freeze({
   assetAmount: string({ max: 40, pattern: DECIMAL_RE }),
   u64: string({ max: 20, check: isU64String }),
   nodeType: oneOf(...core.ACTIVATION_NODE_TYPES),
+  claimNodeId: string({ min: 27, max: 29, pattern: CLAIM_NODE_ID_RE }),
   price: integer(1, 1_000_000_000),
   origin: string({ max: 255, check: isCanonicalOrigin }),
   approvalId: string({ min: 36, max: 36, pattern: UUID_RE }),
-  restoreToken: string({ min: 64, max: 64, pattern: RESTORE_TOKEN_RE }),
+  resetToken: string({ min: 64, max: 64, pattern: RESET_TOKEN_RE }),
   cursor: string({ max: 512, pattern: CURSOR_RE }),
   asset: oneOf('sol', '1dev'),
   solanaSignature: string({ min: 64, max: 88, check: core.isValidSolanaSignature }),
@@ -208,15 +211,10 @@ export const UI_MESSAGES = Object.freeze({
   'vault.exportKey': uiEntry(POPUP, { password: F.password, network: oneOf('qnet', 'solana') }, keys.exportPrivateKey,
     { unlocked: true, activity: true }),
   'vault.wipe': uiEntry(POPUP, { password: F.password, confirm: oneOf('DELETE') }, vault.wipe),
-  // Forgot password → Reset wallet: a one-time token once the phrase and a new password are typed, a check that names
-  // both wallets, then the replace.
-  'vault.restoreBegin': uiEntry(POPUP, {}, vault.beginRestore),
-  // confirm: the user confirmed the reset (without it the call only checks and names both wallets); replaceOther: the
-  // phrase is another wallet's, as the check answered
-  'vault.restore': uiEntry(POPUP, {
-    token: F.restoreToken, mnemonic: F.mnemonic, password: F.password, confirm: optional(oneOf('ERASE')),
-    replaceOther: optional(boolean()),
-  }, vault.restoreVault),
+  // Forgot password → Reset wallet: no password (it is forgotten), so a one-time token issued to the popup document
+  // when Reset wallet is pressed and the fixed confirmation; the wallet then goes as vault.wipe removes it
+  'vault.resetBegin': uiEntry(POPUP, {}, vault.beginReset),
+  'vault.reset': uiEntry(POPUP, { token: F.resetToken, confirm: oneOf('ERASE') }, vault.resetVault),
   'wallet.addresses': uiEntry(['popup', 'approve'], {}, session.getAddresses, { unlocked: true }),
   // the balances and first history pages this session read, for the popup to draw at once (decision 39)
   'wallet.cached': uiEntry(POPUP, {}, session.cachedViews, { unlocked: true }),
@@ -237,6 +235,8 @@ export const UI_MESSAGES = Object.freeze({
   'qnet.txLookup': uiEntry(POPUP, { hash: string({ min: 16, max: 128, pattern: TX_HASH_RE }) }, qnet.txLookup, { unlocked: true }),
   'qnet.preview': uiEntry(POPUP, { to: F.qnetAddress, amount: F.qncAmount, replaceNonce: optional(F.u64) }, qnet.preview,
     { unlocked: true }),
+  // the Send tab's reads ahead of a review: the wallet's own certified balance when it opens, a typed recipient's checks
+  'qnet.sendWarm': uiEntry(POPUP, { to: optional(F.qnetAddress) }, qnet.sendWarm, { unlocked: true }),
   'qnet.send': uiEntry(POPUP, {
     to: F.qnetAddress, amount: F.qncAmount, expectedFeeNano: F.u64, expectedNonce: optional(F.u64), replaceNonce: optional(F.u64),
   }, qnet.send, { unlocked: true, activity: true }),
@@ -283,8 +283,8 @@ export const UI_MESSAGES = Object.freeze({
   }, session.setSettings, { unlocked: true, activity: true, check: (p) => Object.keys(p).length > 0 }),
   'approval.get': uiEntry(['approve'], { id: F.approvalId }, provider.getApproval),
   // No password: the unlocked session and the armed press in the approval's own window confirm (provider.js binds the
-  // call to that window and that approval). revision: the ApprovalView.revision the page showed; a send, burn or claim
-  // confirm needs the latest one
+  // call to that window and that approval). revision: the ApprovalView.revision the page showed; a send, burn, claim or
+  // unlink confirm needs the latest one
   'approval.resolve': uiEntry(['approve'], {
     id: F.approvalId, approved: boolean(), revision: optional(integer(0, Number.MAX_SAFE_INTEGER)),
   }, provider.resolveApproval, { activity: true }),
@@ -311,8 +311,9 @@ export const PROVIDER_METHODS = Object.freeze({
   qnet_activateNode: providerEntry({ nodeType: F.nodeType }, null, isActivationOrigin),
   // the extension's knowledge of the wallet's activation, read-only, never a window, the activation origin only
   qnet_getActivation: providerEntry(null, null, isActivationOrigin),
-  // Move to wallet from the cabinet: the wallet's own light node only, no params, the activation origin only
-  qnet_claimNodeBalance: providerEntry(null, null, isActivationOrigin),
+  // Move to wallet from the cabinet (decision 47): the node the page names, this wallet's light or super node (provider.js
+  // refuses any other), the activation origin only
+  qnet_claimNodeBalance: providerEntry({ nodeId: F.claimNodeId }, null, isActivationOrigin),
   // Unlink from the cabinet: the wallet key ends the wallet's own light node on its device, no params, the activation
   // origin only (decision 38)
   qnet_unlinkNodeDevice: providerEntry(null, null, isActivationOrigin),

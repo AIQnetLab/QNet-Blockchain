@@ -17,11 +17,11 @@ export default function QNetWalletExtensionPage() {
               QNet Wallet Extension
             </h1>
             <p className="text-xl text-gray-300 max-w-2xl mx-auto">
-              The QNet wallet for the browser: hold and send QNC, SOL and 1DEV, with keys that never leave your browser.
+              The browser wallet for QNet Blockchain: hold and send QNC, SOL and 1DEV, with keys that never leave your browser.
               Its Activate tab, or aiqnet.io/node, burns 1DEV on Solana and issues the activation code of the wallet&apos;s
-              one node: a light node, which it also records on the QNet network, or a super node, which only the extension
-              activates and which runs on your own server. It recovers the code of an earlier burn, and Record on the
-              network records an earlier burn&apos;s light node.
+              one node: a light node, which it also records on QNet Blockchain, or a super node, which only the extension
+              activates and which runs on your own server. It recovers the code of an earlier burn, and its &quot;Record on QNet
+              Blockchain&quot; button records an earlier burn&apos;s light node.
             </p>
           </div>
 
@@ -39,7 +39,7 @@ export default function QNetWalletExtensionPage() {
               <div className="text-4xl mb-4">⚡</div>
               <h3 className="text-xl font-semibold mb-3">Verified Balances</h3>
               <p className="text-gray-300">
-                A balance counts as verified only when the node&apos;s account proof folds to a state root that the network&apos;s validator committee signed, which the extension checks itself.
+                A balance counts as verified only when the node&apos;s account proof folds to a state root that the validator committee of QNet Blockchain signed, which the extension checks itself.
               </p>
             </div>
 

@@ -16,7 +16,7 @@ set -euo pipefail
 
 SITE_FILE=/etc/nginx/sites-available/aiqnet.io
 
-echo "=== QNet web-server hardening ==="
+echo "=== QNet Blockchain web-server hardening ==="
 
 # 1. The site file must be the deploy script's: refuse to go on over one without the relay's rules.
 echo "1. Checking the site file written by deployment/deploy-aiqnet.sh..."

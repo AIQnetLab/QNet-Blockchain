@@ -197,9 +197,10 @@ describe('MB-R2-02: the Send form checks what the wallet may still spend, read n
   it('a balance no certified proof gave refuses the send, saying why; the figure on screen never stands in for it', () => {
     const fresh = between(ws, 'const freshQncNano = async () => {', '};');
     expect(fresh).not.toMatch(/tokenBalances/);
-    expect(fresh).toMatch(/r && r\.ok && r\.verified && \/\^\\d\+\$\/\.test\(String\(r\.balanceNano\)\) \? r : \{ error: \(r && r\.error\) \|\| 'unanswered' $/m);
+    // While a long lineage walk is why nothing was certified, the refusal carries how far it is (walkSteps).
+    expect(fresh).toMatch(/r && r\.ok && r\.verified && \/\^\\d\+\$\/\.test\(String\(r\.balanceNano\)\) \? r\s*: \{ error: \(r && r\.error\) \|\| 'unanswered', walkSteps: r \? r\.walkSteps : undefined $/m);
     const send = between(ws, 'const handleSendTransaction = async () => {', 'setSendingTransaction(true);');
-    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error\) \}\);\s*return;/);
+    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error, qncCheck\.walkSteps\) \}\);\s*return;/);
     // A token send is checked against the token balance read again, and its QNC fee against what may still be spent.
     expect(send).toMatch(/walletManager\.checkedTokenBalance\(sendingToken\.contract, myQnetAddress, sendingToken\.decimals\)/);
     expect(send).not.toMatch(/amount > sendingToken\.balance/);
@@ -207,7 +208,7 @@ describe('MB-R2-02: the Send form checks what the wallet may still spend, read n
     // one a replacement signs over excepted.
     expect(send).toMatch(/const replaceNonce = pendingChoice && pendingChoice\.mode === 'replace' \? pendingChoice\.nonce : null;\s*spendable = afterPending\(qncNano, qncCheck\.pending, replaceNonce\);/);
     expect(ws).toMatch(/if \(spendable === null \|\| BigInt\(need\.needNano\) > spendable\) \{/);
-    expect(t('send_balance_unreadable')).toBe('The network did not answer, so nothing was sent. Try again.');
+    expect(t('send_balance_unreadable')).toBe('QNet Blockchain did not answer, so nothing was sent. Try again.');
     expect(t('balance_unconfirmed')).toBe('The balance is not confirmed yet. Try again in a minute.');
   });
 

@@ -20,7 +20,7 @@ export default function WalletPage() {
         <div className="explorer-header">
           <h2 className="section-title">QNet Wallet</h2>
           <p className="section-subtitle" style={{ marginBottom: '3rem' }}>
-            A non-custodial wallet for the QNet network, with an optional light node
+            A non-custodial wallet for QNet Blockchain, with an optional light node
           </p>
         </div>
 
@@ -52,8 +52,9 @@ export default function WalletPage() {
             <p>
               An earlier Android build of QNet Wallet installed from a file is a separate, older app; its last update
               asks you to move. Install this one, restore the wallet in it with the recovery phrase — the funds are on
-              the chain, not in the app — and remove the old app once the new one shows the wallet. The wallet&apos;s
-              light node then runs in the new app after Use this device on its Node tab.
+              the chain, not in the app — and remove the old app once the new one shows the wallet. To run the
+              wallet&apos;s light node in the new app, link the new device on My node (Device tab) and confirm in QNet
+              Wallet.
             </p>
           </div>
 
@@ -62,8 +63,8 @@ export default function WalletPage() {
             <p>
               Create or import a wallet, send and receive QNC, SOL and 1DEV, follow your history. Keys are generated in the
               browser and stored encrypted; they never leave it. The Activate tab burns 1DEV on Solana for a light or a
-              super node, one activation per wallet, issues the activation code and, for a light node, records it on the
-              QNet network in the same approval; a light node then runs on a phone or tablet, a super node on a server. A
+              super node, one activation per wallet, issues the activation code and, for a light node, records it on
+              QNet Blockchain in the same approval; a light node then runs on a phone or tablet, a super node on a server. A
               site such as aiqnet.io can read the wallet&apos;s addresses only after you approve it in the extension.
             </p>
             <a href={EXTENSION_URL} target="_blank" rel="noopener noreferrer" style={BUTTON}>
@@ -76,7 +77,7 @@ export default function WalletPage() {
           <div className="tool-card-large">
             <h4>Post-quantum keys</h4>
             <p>
-              Every QNet transaction is signed on the device with ML-DSA-65 (NIST FIPS 204); SOL and 1DEV transfers are
+              Every QNet Blockchain transaction is signed on the device with ML-DSA-65 (NIST FIPS 204); SOL and 1DEV transfers are
               signed with the wallet&apos;s Solana key, also on the device. Between nodes, the network&apos;s transport
               negotiates ML-KEM-768 hybrid key exchange over QUIC and TLS 1.3.
             </p>
@@ -94,8 +95,8 @@ export default function WalletPage() {
             <h4>Light node</h4>
             <p>
               A light node runs on one phone or tablet at a time; computers and emulators cannot run one. Linking it to a
-              device includes a device check by the device&apos;s operating system. A few times per four-hour epoch the
-              network asks the device for a status answer; the device signs it and answers while QNet Wallet runs on it,
+              device includes a device check by the device&apos;s operating system. A few times per four-hour epoch
+              QNet Blockchain asks the device for a status answer; the device signs it and answers while QNet Wallet runs on it,
               open, in the background or behind the lock screen.
               No hashing and no proof-of-work: each answer is one signature, so the device does no sustained work. For
               each epoch the chain records which nodes answered, and the protocol adds a share of that epoch&apos;s
@@ -109,8 +110,8 @@ export default function WalletPage() {
             <p>
               Nodes are activated at <a href="/node">aiqnet.io/node</a>. In Phase 1 a light node&apos;s 1DEV burn is made
               by the page from a one-time payment address in the browser, after QNet Wallet confirms the wallet, or by
-              the QNet extension from its own address; a super node&apos;s burn only by the extension, and the super node
-              runs on the user&apos;s own server with the QNet node software. The tokens are destroyed, and the burn
+              the QNet Wallet extension from its own address; a super node&apos;s burn only by the extension, and the super node
+              runs on the user&apos;s own server with the QNet Blockchain node software. The tokens are destroyed, and the burn
               transaction is the proof. QNet Wallet then confirms the light node of its own wallet on its own screen and
               runs it on that device. One node per wallet, light or super. The app burns nothing, sells nothing and shows
               no price. Phase 2 moves activation to QNC. The <a href="/docs">documentation</a> has the details.
@@ -120,8 +121,8 @@ export default function WalletPage() {
           <div className="tool-card-large">
             <h4>History that outlives pruning</h4>
             <p>
-              Nodes keep about a day of transactions; the explorer keeps all of them. The wallet reads its QNet history
-              from the explorer archive and the freshest blocks from the nodes, and every confirmed QNet transaction opens
+              Nodes keep about a day of transactions; the explorer keeps all of them. The wallet reads its QNet Blockchain history
+              from the explorer archive and the freshest blocks from the nodes, and each confirmed transaction in it opens
               in the explorer. The app also lists the SOL and 1DEV sends made on that device, and says so above its
               History.
             </p>

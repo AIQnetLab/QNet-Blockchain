@@ -22,7 +22,7 @@ import {
   activateWithExtension, claimWithExtension, getExtensionActivation, unlinkWithExtension, type ExtensionActivation, type ExtensionActivationRead, type ExtensionClaim,
   type ExtensionUnlink, type NodeType,
 } from '@/lib/qnet-link';
-import { keepFromApp, openedFromApp, showsActivationContent } from '@/lib/activate-view';
+import { showsActivationContent } from '@/lib/activate-view';
 
 // How long the page waits for the wallet's announcement before offering the install link. A later
 // announcement still binds.
@@ -34,8 +34,6 @@ interface WalletContextValue {
   providerStatus: ProviderStatus;
   // Null until a provider is bound; 'mobile' is the QNet app's in-app browser.
   providerChannel: WalletChannel | null;
-  // The visit began on a page the QNet app opened with its marker (?from=app); kept for the visit.
-  fromApp: boolean;
   accounts: WalletAccounts | null;
   // `accounts` is the bound provider's answer (the latest read, connect or disconnect), no longer the page's initial
   // null: it says whether the wallet approved this site.
@@ -49,8 +47,9 @@ interface WalletContextValue {
   clearError: () => void;
   // qnet_activateNode: the wallet asks the user, burns and answers; the result is already checked.
   activateNode: (nodeType: NodeType) => Promise<ExtensionActivation>;
-  // qnet_claimNodeBalance: the extension moves its own wallet's node balance; checked for `wallet`.
-  claimNodeBalance: (wallet: string) => Promise<ExtensionClaim>;
+  // qnet_claimNodeBalance: the extension moves the balance of `nodeId`, its own wallet's light or super node; checked
+  // for `wallet` and that node.
+  claimNodeBalance: (wallet: string, nodeId: string) => Promise<ExtensionClaim>;
   // qnet_getActivation: what the extension holds of its wallet's activation, read without a window; checked.
   readActivation: () => Promise<ExtensionActivationRead>;
   // qnet_unlinkNodeDevice: the extension unlinks its own wallet's light node from its device; checked for `wallet`.
@@ -71,7 +70,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [provider, setProvider] = useState<QNetProvider | null>(null);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus>('detecting');
   const [providerChannel, setProviderChannel] = useState<WalletChannel | null>(null);
-  const [fromApp, setFromApp] = useState(false);
   const [accounts, setAccounts] = useState<WalletAccounts | null>(null);
   const [accountsKnown, setAccountsKnown] = useState(false);
   const [view, setViewState] = useState<AddressView>('qnet');
@@ -82,8 +80,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const seq = useRef(0);
 
   useEffect(() => {
-    // Read once and kept in memory only; once set it holds for the visit.
-    if (openedFromApp(window.location.search)) setFromApp(true);
     setViewState(loadView(localStore()));
     let bound = false;
     const bind = (p: QNetProvider, channel: WalletChannel) => {
@@ -186,8 +182,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   const claimNodeBalance = useCallback(
-    async (wallet: string): Promise<ExtensionClaim> =>
-      provider ? claimWithExtension(provider, wallet, Math.floor(Date.now() / 1000)) : { ok: false, failure: 'unsupported' },
+    async (wallet: string, nodeId: string): Promise<ExtensionClaim> =>
+      provider ? claimWithExtension(provider, wallet, nodeId, Math.floor(Date.now() / 1000)) : { ok: false, failure: 'unsupported' },
     [provider],
   );
 
@@ -204,11 +200,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<WalletContextValue>(
     () => ({
-      providerStatus, providerChannel, fromApp, accounts, accountsKnown, view, connecting, error, connect, disconnect, setView, clearError, activateNode,
+      providerStatus, providerChannel, accounts, accountsKnown, view, connecting, error, connect, disconnect, setView, clearError, activateNode,
       claimNodeBalance, readActivation, unlinkNodeDevice,
     }),
-    [providerStatus, providerChannel, fromApp, accounts, accountsKnown, view, connecting, error, connect, disconnect, setView, clearError, activateNode, claimNodeBalance, readActivation,
-      unlinkNodeDevice],
+    [providerStatus, providerChannel, accounts, accountsKnown, view, connecting, error, connect, disconnect, setView, clearError, activateNode,
+      claimNodeBalance, readActivation, unlinkNodeDevice],
   );
 
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
@@ -223,17 +219,9 @@ export function useWallet(): WalletContextValue {
 }
 
 // Whether the page may show text about activation, its cost, other platforms or sideloaded builds: not in
-// the QNet app's in-app browser, not on a visit the app opened, and not before the wallet is detected
-// (src/lib/activate-view.ts). The header and every page decide with this one rule.
+// the QNet app's in-app browser and not before the wallet is detected (src/lib/activate-view.ts). The
+// header and every page decide with this one rule.
 export function useActivationContent(): boolean {
-  const { providerStatus, providerChannel, fromApp } = useWallet();
-  return showsActivationContent(providerStatus, providerChannel, fromApp);
-}
-
-// A same-site path with the app's marker (?from=app) kept on it when the visit began with it, so a reload or
-// a new tab of the next page stays in the app's view (keepFromApp). Every link and navigation between
-// explorer pages goes through it (src/components/ExplorerLink.tsx, R5-XPD-06).
-export function useKeepFromApp(): (href: string) => string {
-  const { fromApp } = useWallet();
-  return useCallback((href: string) => keepFromApp(href, fromApp), [fromApp]);
+  const { providerStatus, providerChannel } = useWallet();
+  return showsActivationContent(providerStatus, providerChannel);
 }

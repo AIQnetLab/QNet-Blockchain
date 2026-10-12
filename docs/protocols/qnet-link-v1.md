@@ -2,7 +2,7 @@
 
 Status: normative, version 1, in two revisions that share the link host, the relay and the cryptography.
 
-**Revision 1** (sections 1 to 13) defines what revision 2 builds on and what the QNet browser extension
+**Revision 1** (sections 1 to 13) defines what revision 2 builds on and what the QNet Wallet browser extension
 answers:
 
 - the link `https://link.aiqnet.io/l#…`, opened on a phone or scanned as a QR code, the relay on aiqnet.io that
@@ -16,7 +16,7 @@ answers:
 session (section 14.5), and QNet Wallet parses revision 2 links only and refuses an `activate` link before it
 fetches anything (section 14.3). The app makes no burn and takes no activation code.
 
-**Revision 2** (section 14) defines how the web cabinet at aiqnet.io/node asks the QNet app to share its
+**Revision 2** (section 14) defines how the web cabinet at aiqnet.io/node asks the QNet Wallet app to share its
 addresses, to sign this wallet's reservation of a light node paid from a one-time payment address, to give its
 consent and link this wallet's light node to the device, or to move the node balance into the wallet; and the
 extension's methods for the cabinet on a desktop. The two revisions' links carry
@@ -25,8 +25,8 @@ anything (section 14.3). The messages the app signs are defined in
 [Light node messages](light-node-messages.md).
 
 Parties: the **site** (a page of aiqnet.io in a browser tab), the **relay** (API routes of the same
-site), the **app** (QNet Wallet on a phone or tablet, `io.aiqnet.wallet`), the **extension** (the QNet browser
-wallet).
+site), the **app** (QNet Wallet on a phone or tablet, `io.aiqnet.wallet`), the **extension** (QNet Wallet in the
+browser).
 Test vectors: [`qnet-link-v1.vectors.json`](qnet-link-v1.vectors.json), produced by
 [`tools/qnet-link-vectors.mjs`](tools/qnet-link-vectors.mjs) (section 13). MUST, MUST NOT, SHOULD and
 MAY are used as in RFC 2119.
@@ -37,7 +37,7 @@ The site never sends a transaction to sign. A request carries only an **intent**
 
 | Intent | Carried by | Meaning |
 | --- | --- | --- |
-| `connect` | the relay, from a link or QR code | share this wallet's QNet and Solana addresses |
+| `connect` | the relay, from a link or QR code | share this wallet's QNet Blockchain and Solana addresses |
 | `activate` | the extension's `qnet_activateNode` only (section 10) | activate a node of type `light` or `super`: the extension builds, signs and sends the 1DEV burn itself, then returns the activation code |
 
 ```
@@ -84,17 +84,17 @@ the wallet's own screen. Section 12 lists what it and others can do.
   Keys are 32 bytes (43 characters), the IV 12 bytes (16 characters).
 - **Solana address**: base58 decoding to exactly 32 bytes. **Burn signature** (`burnTx`): base58 decoding
   to exactly 64 bytes.
-- **QNet address** (EON): `^([0-9a-f]{19})eon([0-9a-f]{15})([0-9a-f]{8})$` where the last group equals the
+- **QNet Blockchain address** (EON): `^([0-9a-f]{19})eon([0-9a-f]{15})([0-9a-f]{8})$` where the last group equals the
   first 8 hex characters of SHA3-256 over the first 37 characters.
 - **Activation code**: `^QNET-[LS][0-9A-F]{5}-[0-9A-F]{6}-[0-9A-F]{6}$`, a deterministic function of
   `(nodeType, address, burnTx, burnAmount)`: `core.generateActivationCode` in the extension bundle,
   `activationCode` on the site, the node's `generate_quantum_activation_code`. `address` is the wallet the code
   names: the burner's own Solana address, or, for a light burn made by aiqnet.io's one-time payment key, the
-  wallet's QNet address (`core.walletActivationCode`); such a burn is found through the node's registration record
+  wallet's QNet Blockchain address (`core.walletActivationCode`); such a burn is found through the node's registration record
   (burn → wallet), never through the payment key's address. KAT: `light`,
   `FVaaBjaHMKv2yneekLf7UtF7TAi4NpYHyDMrCfDtwBsR`,
   `nqh74heddHDKQbzTqJAmu6o8VZEyBbdsfJcDJTtfPCYgTmGagX2xsrdZhkKFKBGFHyEq6tyNFrgZWrbTatq8Ywx`, `1500` →
-  `QNET-LFEFD9-706058-537636`; the same burn named by the KAT wallet's QNet address → `QNET-LFEFD9-520F5F-5307ED`.
+  `QNET-LFEFD9-706058-537636`; the same burn named by the KAT wallet's QNet Blockchain address → `QNET-LFEFD9-520F5F-5307ED`.
 - JSON is the UTF-8 text of one object; wherever a key set is given, a missing or extra key is an error.
 - **Burn order**: a wallet's burns are ordered oldest first by slot; two burns in one slot by their place
   in `getSignaturesForAddress` of the wallet's 1DEV associated token account, which lists newest first, so
@@ -109,8 +109,8 @@ the wallet's own screen. Section 12 lists what it and others can do.
 https://link.aiqnet.io/l#v1.<id>.<sitePub>.connect
 ```
 
-- `sitePub`: the site's ephemeral X25519 public key, b64url. Revision 2 adds the intents `link`, `claim` and
-  `reserve`, each with a request hash (section 14.3). The form `<sitePub>.activate.<nodeType>` that this revision
+- `sitePub`: the site's ephemeral X25519 public key, b64url. Revision 2 adds the intents `link`, `claim`, `reserve`
+  and `unlink`, each with a request hash (section 14.3). The form `<sitePub>.activate.<nodeType>` that this revision
   once defined is not a link any more: no relay session carries it and no app opens it.
 - Parsers MUST match the whole string, without trimming, case folding or percent-decoding, against the pattern of
   section 14.3 (for `connect` alone, `^https://link\.aiqnet\.io/l#v1\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})\.connect$`)
@@ -208,7 +208,7 @@ Common rules:
   evicts the key whose window started first and never refuses a new one, so a crowd of addresses cannot
   lock out the next visitor.
 - Store: `id → {sitePub, intent, request, reqHash, createdAt, owner, response: {appPub, iv, ct} | null, readAt}`
-  (`request` and `reqHash` for a `link`, `claim` or `reserve` session, section 14.5), where
+  (`request` and `reqHash` for a `link`, `claim`, `reserve` or `unlink` session, section 14.5), where
   `owner` is the limiter key of the creating IP and `readAt` the time that IP first read the answer (both memory
   only, never sent). The store is kept on `globalThis`, so every route bundle of the process shares one instance.
 - **A session ends** at the first of: its TTL (600 s after creation); 120 s after its creating IP first read the
@@ -225,7 +225,7 @@ Common rules:
 
 ### 5.1 `POST /api/link/sessions` (site)
 
-Body, exactly these keys (section 14.5 adds the `request` of a `link`, `claim` or `reserve` session):
+Body, exactly these keys (section 14.5 adds the `request` of a `link`, `claim`, `reserve` or `unlink` session):
 
 ```json
 {"id": "<id>", "sitePub": "<b64url 32 bytes>", "intent": "connect"}
@@ -341,7 +341,7 @@ the site checks as below:
 | `TX_FAILED` | the burn was sent and failed on chain (`meta.err`); no tokens were burned |
 | `SOLANA_UNAVAILABLE` | Solana could not be read before sending |
 | `HISTORY_TOO_LONG` | Solana was read, but this wallet's burn history could not be searched back to its start in one attempt (the wallet's time or size budget ran out); a wallet that keeps what it checked continues the search on the next request, so starting again makes progress |
-| `NODE_EXISTS` | the QNet wallet already has a node, but no burn of this wallet was found to derive its code |
+| `NODE_EXISTS` | the QNet Blockchain wallet already has a node, but no burn of this wallet was found to derive its code |
 | `BURN_UNUSABLE` | the wallet already made a 1DEV burn of its own that yields no Light or Super code: a successful Token-program burn of the cluster's 1DEV mint that the wallet paid for, signed and authorized, with another memo (such as `QNET_NODE_TYPE:FULL`) or from a 1DEV token account other than the associated one. The node reads neither the memo nor the source account and counts such a burn for an activation, so it is the wallet's one activation and the wallet makes no new burn |
 | `BURN_IN_PROGRESS` | another activation request is running in this wallet (its own one-at-a-time lock); a burn of this wallet seen on Solana and not final is `pending`, never this code |
 | `NO_WALLET` | the wallet that answers (the app or the extension) holds no wallet yet |
@@ -414,7 +414,7 @@ same code as its Activate tab:
   of that search or burned from any other of the wallet's 1DEV token accounts (every such burn is a transaction
   the wallet signed, so it lists in the history of the wallet's own address, a closed account's included) →
   `BURN_UNUSABLE`; a search for such burns that has not reached the start of that history fails closed as above;
-  the QNet wallet already has a node → `NODE_EXISTS`;
+  the QNet Blockchain wallet already has a node → `NODE_EXISTS`;
 - else re-fetch the price (phase 1, integer, equal to the confirmed price), check balances, build a legacy
   transaction with SPL Burn (instruction 8, raw = price × 10^6, from the wallet's ATA of the cluster mint,
   authority = wallet) and Memo `QNET_NODE_TYPE:LIGHT|SUPER`, fee payer = wallet, `simulateTransaction` with
@@ -431,9 +431,8 @@ phone with its own one-time payment key (section 14).
 The site's node cabinet (aiqnet.io/node) asks the extension to activate, and opens relay sessions for the app
 (section 14.9).
 
-1. The cabinet never renders in the app's in-app browser (an announced provider with `channel` `mobile`, or a
-   page the app opened in the system browser with its marker `?from=app`). With an announced provider of the
-   extension it offers `qnet_activateNode` (section 10).
+1. The cabinet never renders in the app's in-app browser (an announced provider with `channel` `mobile`). With
+   an announced provider of the extension it offers `qnet_activateNode` (section 10).
 2. A relay session, whatever its intent: create it (sections 5.1, 6); on 409 retry once with a new key pair and
    id. Poll `GET …/response` every 2 s; poll at once when the page becomes visible again; stop on 200, on 404, or
    600 s after creation (then expired: the page offers Ask again, a new request with the same content). A session the page gives up before that (the user cancelled,
@@ -471,7 +470,7 @@ Added to the extension's provider allow-list (applications/qnet-wallet CONTRACTS
   armed button → the activation path of `activation.js` (the same code as the Activate tab, one single-flight
   lock with it) → result.
 - The window shows "Activate a Light node?" (or Super) with the price, where the node runs (a Light node in QNet
-  Wallet on a phone or tablet, a Super node on the user's own server with the QNet node software), the exact amount
+  Wallet on a phone or tablet, a Super node on the user's own server with the QNet Blockchain node software), the exact amount
   burned, the token and cluster, the mint, the SPL Token program, the Solana address that burns and its balances, and
   one confirmation line: the acknowledgement that the amount is destroyed and that the wallet gets exactly one code.
   When the wallet already has an activation it shows that instead ("Share your activation code?"), and a burn not
@@ -537,7 +536,7 @@ site shows a code the wallet received in any browser and never offers a burn the
 | Params | none (absent, `null`, `[]` or `{}`); anything else → -32602 |
 | Origins | as section 10; any other origin → 4100 before the params |
 | Grant | read, never created: an origin without a grant of the unlocked wallet gets `not_connected`; no `accountsChanged` |
-| Window | never: no approval queue, budget or cooldown; nothing is signed for the page, burned or sent for it. A burn the search finds is stored as Recover stores it (a Light activation's record on the QNet network then starts), and a read may post the vault's own burn to the site's record with the wallet's proof, as an unlock does |
+| Window | never: no approval queue, budget or cooldown; nothing is signed for the page, burned or sent for it. A burn the search finds is stored as Recover stores it (a Light activation's record on QNet Blockchain then starts), and a read may post the vault's own burn to the site's record with the wallet's proof, as an unlock does |
 | Limit | 30 calls a minute per origin; more → 4001 |
 | Result | exactly one of `{status: "no_wallet"}`, `{status: "locked"}`, `{status: "not_connected"}`, `{status: "searching", qnet, solana}`, `{status: "unknown", qnet, solana, reason}` (`SOLANA_UNAVAILABLE` or `HISTORY_TOO_LONG`), `{status: "unusable", qnet, solana}`, `{status: "none", qnet, solana}`, `{status: "pending", qnet, solana, nodeType, burnTx, burnAmount}`, `{status: "exists", qnet, solana, nodeType, burnTx, burnAmount, code, paidOnSite}` |
 | Errors | 4001 over the limit; 4100 origin not allowed; 4200 a wallet without the method; -32602 invalid params; -32603 an answer that fails its check |
@@ -559,8 +558,8 @@ The `qnet:announceProvider` detail `info` gains `channel`:
 
 | `channel` | Announced by | `qnet_activateNode` |
 | --- | --- | --- |
-| `extension` | the QNet browser extension | yes, on the allowed origins |
-| `mobile` | the QNet app's in-app browser | no (4200) |
+| `extension` | the QNet Wallet browser extension | yes, on the allowed origins |
+| `mobile` | the QNet Wallet app's in-app browser | no (4200) |
 
 `info = {uuid, name: "QNet Wallet", icon, rdns: "io.aiqnet.wallet", channel}`, frozen like the rest. A
 site treats a missing or unknown `channel` as `extension` (older builds answer 4200, shown as "update
@@ -621,7 +620,7 @@ are the extension's origin allow-list and approval, and the absence of the metho
 | --- | --- |
 | `constants` | the values of section 2, the link pattern, statuses and error codes |
 | `activationCodeKat`, `wallet` | the activation-code KAT and the KAT wallet (`abandon` ×11 `about`) used in answers |
-| `walletActivationCodeKat` | the KAT burn as a light burn of aiqnet.io's payment key for the KAT wallet: the code names the wallet's QNet address (section 3) |
+| `walletActivationCodeKat` | the KAT burn as a light burn of aiqnet.io's payment key for the KAT wallet: the code names the wallet's QNet Blockchain address (section 3) |
 | `cases` | ten full exchanges of section 6 under the revision 1 AAD (activate ok/ok/exists/pending/rejected/error, connect ok/ok-with-activation/rejected, activate exists with `supersededBurnTx`): session id, HKDF salt, site and app private and public keys, link, session request, shared secret, key, AAD, plaintext, IV, ciphertext, response request. Their `activate` plaintexts are the section 7 answers the site checks as the extension's results; no relay takes their sessions and a revision 2 parser refuses their links (section 14.3) |
 | `cryptoMustFail` | decrypt inputs that MUST fail: flipped tag, ciphertext or IV bit, swapped intent, other id, other site key, another session's app key, low-order app keys |
 | `lowOrderPublicKeys` | X25519 public keys an implementation MUST refuse |
@@ -654,7 +653,8 @@ for import by product code.
 
 Revision 2 serves the web cabinet at aiqnet.io/node. Payment, the activation code and the burn happen in the
 browser (the cabinet's one-time payment key) or in the extension; the app signs its wallet's reservation of a light
-node and its consent, runs the node on its device, ends it there and moves the node balance. A burn made earlier from
+node and its consent, runs the node on its device and ends it there, and moves the balance of the wallet's light or super
+node on the site's request, as its own Node tab does (owner, 12.10). A burn made earlier from
 the wallet's own Solana address (by the extension, or by an older app) is registered the same way: with the consent, the
 app also signs that burn's owner bind with the wallet's own Solana key, the same recovery phrase's. The app confirms no
 amount, price or code. Sections 3, 5, 6 and 12 apply except where this section says otherwise.
@@ -663,16 +663,16 @@ amount, price or code. Sections 3, 5, 6 and 12 apply except where this section s
 
 | Intent | Meaning |
 | --- | --- |
-| `connect` | share this wallet's QNet and Solana addresses |
+| `connect` | share this wallet's QNet Blockchain and Solana addresses |
 | `link` | give this wallet's consent to register its light node with a burn made on aiqnet.io or from the wallet's own Solana address, and link the node to this device; or, when the node is already on the chain, link it to this device |
-| `claim` | move this wallet's node balance into the wallet |
+| `claim` | move the balance of the node the request names, this wallet's light node or its super node, into the wallet |
 | `reserve` | sign this wallet's reservation of a light node paid from the page's one-time payment address, before the page shows that address |
 | `unlink` | stop running this wallet's light node on the device that runs it: on that device its ping key signs the node's unbind, on any other device that holds the wallet the wallet key signs it ([Light node messages](light-node-messages.md) sections 4 and 5.7) |
 
 A **request** travels with the session: the few fields of section 14.4, bound to the link by its hash. The app
 builds every message it signs from its own keys, the request's fields and the network's answers
-([Light node messages](light-node-messages.md) section 4). "I'm back" is no request: the cabinet asks the node's wake
-route, which sends the linked device a silent push.
+([Light node messages](light-node-messages.md) section 4). The cabinet sends no wake: an Offline device's phone
+answers once QNet Wallet is open on it, or runs the node again through a `link` request.
 
 The node takes an unbind signed by the bound device's ping key at the binding's sequence, and, once two genesis nodes list
 the feature `unbind_wallet`, one signed by the wallet key at that sequence ([Light node messages](light-node-messages.md)
@@ -732,7 +732,7 @@ https://link.aiqnet.io/l#v1.<id>.<sitePub>.<intent>[.<reqHash>]
 | Intent | Request, exactly these keys |
 | --- | --- |
 | `link` | `{"burnTx": <base58 of a 64-byte signature> \| null, "walletHash": <16 lowercase hex> \| null, "check": true \| false}`, or for a burn made from the wallet's own Solana address `{"burnTx": <base58 of a 64-byte signature>, "walletHash": <16 lowercase hex>, "check": true \| false, "burner": <base58 Solana address of 32 bytes>}` |
-| `claim` | `{"walletHash": <16 lowercase hex> \| null}` |
+| `claim` | `{"walletHash": <16 lowercase hex>, "nodeId": <the wallet's light node id or super node id>}` |
 | `reserve` | `{"walletHash": <16 lowercase hex>, "burner": <base58 Solana address of 32 bytes>}` |
 | `unlink` | `{"walletHash": <16 lowercase hex>}` |
 
@@ -743,7 +743,15 @@ https://link.aiqnet.io/l#v1.<id>.<sitePub>.<intent>[.<reqHash>]
 - `walletHash`: first 16 hex of SHA3-256(`qnet-link-wallet:` ‖ EON address) of the wallet the page already knows
   (chosen earlier or from the extension); `null` when it knows none, and the app answers for the wallet open in it. A
   `reserve` request always names the wallet (never `null`): the page reserves for the wallet it holds. An `unlink`
-  request always names it too: the page unlinks the node of the wallet it shows.
+  request always names it too: the page unlinks the node of the wallet it shows. So does a `claim` request: the page
+  moves the balance of a node of the wallet it shows.
+- `nodeId` (`claim`): the node whose balance moves, of the wallet `walletHash` names: its light node id `N`
+  (`light_mobile_` and 16 lowercase hex) or its super node id `S` (`super_node_` and 16 lowercase hex, the first 16 hex
+  of BLAKE3(`SUPER_NODE_PRIVACY_` ‖ `W`), the id the node gives a super node of `W`; [Light node
+  messages](light-node-messages.md) section 3). A genesis node's id is no `nodeId`. The rewards the claim moves are the
+  wallet's; `nodeId` only names the registration that vouches for the wallet, and the network checks that the chain
+  registered that node to `W`. The earlier `claim` request `{"walletHash": <16 lowercase hex> | null}`, which named no node and meant the
+  light node, is no request any more: the relay refuses its session (section 14.5).
 - `burner` (`link`): only for a burn made from the wallet's own Solana address, which it names; such a request always
   names the burn and the wallet. The app answers it only from the wallet whose own Solana address it is, and its consent
   then carries that address's owner bind (section 14.7). An app built before this key refuses such a request as one that
@@ -762,9 +770,10 @@ https://link.aiqnet.io/l#v1.<id>.<sitePub>.<intent>[.<reqHash>]
 Section 5 applies with these changes:
 
 - `POST /api/link/sessions` body, exactly these keys: `{"id", "sitePub", "intent"}` for `connect`, and
-  `{"id", "sitePub", "intent", "request"}` for `link`, `claim`, `reserve` and `unlink`, the request as section 14.4 requires
-  (keys and value forms). The relay computes `reqHash` from the request bytes and stores the request and `reqHash`
-  with the session. Any other intent (`activate` among them) or body → 400.
+  `{"id", "sitePub", "intent", "request"}` for `link`, `claim`, `reserve` and `unlink`, the request as section 14.4
+  requires (keys and value forms). The relay computes `reqHash` from the request bytes and stores the request and
+  `reqHash` with the session. Any other intent (`activate` among them) or body, the earlier `claim` request without
+  `nodeId` among them, → 400.
 - `GET /api/link/sessions/:id` → 200 `{"id", "sitePub", "intent", "request", "reqHash", "answered", "expiresIn"}`,
   without `request` and `reqHash` for `connect`.
 - `POST /api/link/sessions/:id/response`: the caps of section 14.2 for the session's intent.
@@ -813,7 +822,7 @@ One JSON object with `v` = `1`, `intent` equal to the session's, `status`, and e
   the consent's `T`.
 - `link` `linked`: the node was on the chain and this device is linked now; `seq` is the binding's sequence (decimal
   string). A `burnTx` in the request was not used.
-- `claim` `ok`: the claim was submitted. `txHash` is 64 lowercase hex. `stoppedAtEpoch` is `null` for a claim of
+- `claim` `ok`: the claim of the request's node was submitted; `nodeId` is the request's. `txHash` is 64 lowercase hex. `stoppedAtEpoch` is `null` for a claim of
   the whole balance; for a part (the node's quote stopped before the whole balance, and more epochs remain to claim
   later), it is the first epoch the claim did not take, as a decimal string. `amountNano` (decimal string) is at
   least 1 QNC when `stoppedAtEpoch` is `null`, and above zero when it is set.
@@ -849,10 +858,10 @@ One JSON object with `v` = `1`, `intent` equal to the session's, `status`, and e
 | `error` | Intents | Meaning |
 | --- | --- | --- |
 | `NO_WALLET` | all | the app holds no wallet yet |
-| `WALLET_MISMATCH` | `link`, `claim`, `reserve`, `unlink` | no wallet of the app matches `walletHash`, or a `link` request's `burner` is not that wallet's own Solana address |
-| `NO_NODE` | `link`, `claim` | this wallet has no light node on the chain (and the request carries no burn) |
+| `WALLET_MISMATCH` | `link`, `claim`, `reserve`, `unlink` | no wallet of the app matches `walletHash`, a `link` request's `burner` is not that wallet's own Solana address, or a `claim` request's `nodeId` is neither that wallet's light node id nor its super node id |
+| `NO_NODE` | `link`, `claim` | this wallet has no light node on the chain (and the request carries no burn); for `claim`, the chain lists no node by the request's `nodeId` |
 | `NODE_OTHER` | `link`, `reserve` | this wallet has a server node, or aiqnet.io's record names a super node's burn for it |
-| `NETWORK` | `link`, `claim`, `reserve`, `unlink` | the QNet network, or aiqnet.io's record, could not be read |
+| `NETWORK` | `link`, `claim`, `reserve`, `unlink` | QNet Blockchain, or aiqnet.io's record, could not be read |
 | `BIND_REFUSED` | `link` | the shard owner refused the device binding |
 | `CLAIM_REFUSED` | `claim` | the network refused the claim |
 | `CLAIM_BUSY` | `claim` | a claim of this node is already running |
@@ -863,7 +872,8 @@ One JSON object with `v` = `1`, `intent` equal to the session's, `status`, and e
 **Site validation**, in this order, all MUST pass or the answer is refused as unreadable: size (the intent's cap);
 JSON object; `v`; `intent`; `status` allowed for the intent, and `link` `ok` only for a request with a `burnTx`;
 exact key set (and `consent` exactly `ts`, `pk`, `sig`, with `ownerSig` too when the request has `burner`); `error` in the intent's list; `qnet` a valid EON address;
-for `connect` `solana` a 32-byte address; `nodeId` equal to the light node id of `qnet`; `qnet` matching the
+for `connect` `solana` a 32-byte address; `nodeId` equal to the light node id of `qnet` (for `claim`: equal to the
+request's `nodeId`, and that the light or the super node id of `qnet`); `qnet` matching the
 request's `walletHash` when it carried one; for `link` `ok`: `bound` a boolean, `ts` a decimal u64 inside the
 consent window, `pk` 1952 bytes whose EON address is `qnet`, `sig` 3309 bytes that verify under `pk` (ML-DSA-65,
 empty context) over `q1337|client_node_reg:{nodeId}:{qnet}:{proof}:{ts}` with
@@ -894,11 +904,15 @@ Example (vector `link-linked`):
    for the TTL).
 3. Pick the wallet: the one whose `walletHash` equals the request's (after unlock), `WALLET_MISMATCH` when none does;
    the open wallet when the request has none. A `link` request with `burner` for a node not on the chain:
-   `WALLET_MISMATCH` unless `burner` is that wallet's own Solana address.
+   `WALLET_MISMATCH` unless `burner` is that wallet's own Solana address. A `claim` request: `WALLET_MISMATCH` unless
+   `nodeId` is that wallet's light node id `N` or its super node id `S`, which the app computes from the wallet.
 4. Compute `N` and, for a `burnTx`, `proof` itself. Read the node's status from two genesis nodes: on the chain → the
    device sheet, answered `linked`; not on the chain and no `burnTx` → `NO_NODE`; a server node → `NODE_OTHER`. For
    `reserve`: a server node on the chain, or aiqnet.io's record naming a super node's burn for the wallet →
-   `NODE_OTHER`; either source not answering → `NETWORK` (the same checks as for a consent). For `unlink`: this device's
+   `NODE_OTHER`; either source not answering → `NETWORK` (the same checks as for a consent). For `claim`: whether the
+   chain lists the request's node, as two genesis nodes report it alike (a light node's public status, a super node's
+   `GET /api/v1/node/status`, its `onchain_registered`): not on the chain → `NO_NODE`; no answer alike → `NETWORK`. For
+   `unlink`: this device's
    binding of `N`, which the status signed with its ping key names (or gives no verdict on) → the unlink sheet for this
    device; otherwise the public status from two genesis nodes: no answer alike → `NETWORK`; not on the chain, no
    `unbind_wallet` feature, or no device bound → `NOT_LINKED`; else the unlink sheet for the wallet key, naming the device
@@ -906,7 +920,7 @@ Example (vector `link-linked`):
 5. Show the sheet; origin line fixed to `aiqnet.io`. `link`: title "Link this wallet's node to this device", the node
    id and the wallet, and the device-check block:
 
-   > **Device check.** To run the node, this device proves to the QNet network that it is a genuine device running the
+   > **Device check.** To run the node, this device proves to QNet Blockchain that it is a genuine device running the
    > genuine QNet Wallet. The app creates a key in the device's secure hardware and sends only its public part, with
    > the system's own check of the device, which can say whether apps that can capture the screen, show themselves over
    > other apps or control the device are installed or running. The system provider keeps a small marker for this
@@ -918,7 +932,8 @@ Example (vector `link-linked`):
    (light-node-messages section 1) the block reads "This device can't run a node. Confirm to add the node to this
    wallet. It can run on another device later." and Confirm gives only the consent. When this install runs another
    wallet's node, the sheet adds "The node of {wallet label} stops on this device." `claim`: title "Move node balance
-   to this wallet" and the amount the app reads from its own quorum; the site sends no amount. `reserve`: title "Set
+   to this wallet", the node's type (light or super) and id, and the amount the app reads from its own quorum for that
+   node; the site sends no amount. `reserve`: title "Set
    up a light node for this wallet", with the text that the website prepares a light node for this wallet only, that
    no funds leave the wallet and that QNet Wallet asks once more when the node is added; it names no price, burn,
    payment or code. `unlink`: title "Unlink this wallet's node from this device", the text that the
@@ -938,13 +953,14 @@ Example (vector `link-linked`):
      challenge's issuer and to the node's backup owner; a pending-link record `{nodeId, wallet, T, createdAt, bound,
      bindBlob}` that lives until the chain lists the node or `T` + 24 h + 10 min, and re-sends the same binding when a
      later status read shows the node on the chain but unbound; answer `ok`. The answer carries nothing about the
-     device. The app shows "The node will run on this device once the QNet network records it." For a request with
+     device. The app shows "The node will run on this device once QNet Blockchain records it." For a request with
      `burner`, the wallet's Solana key (its stored key, which must give that address) also signs the owner bind v1 of the
      same registration with the same `T`, checked against the key before it goes, as `consent.ownerSig`; the binding
      and the device block are the same, and the owner bind goes only into the answer.
    - `link`, node on the chain: the enrolment with `seq = max(now, binding_seq + 1)` on `/light-node/bind`; answer
      `linked`.
-   - `claim`: the claim of light-node-messages section 4 (quote, then payload); `ok` or `empty`.
+   - `claim`: the claim of light-node-messages section 4 (quote, then payload) for the request's `nodeId`: the quote
+     signs `q1337|claim_rewards:{nodeId}:{W}` and `/rewards/claim` carries `node_id` = `nodeId`; `ok` or `empty`.
    - `unlink` on the device that runs the node: the ping key signs the unbind for the binding's sequence (`POST
      /api/v1/light-node/unbind`, with the device key's release when the node holds that key, light-node-messages section
      5.7), within 8 seconds; then the push token, the wakes, the ping key and the device schedule go, whatever the
@@ -969,10 +985,9 @@ Example (vector `link-linked`):
 
 ### 14.9 Site behaviour
 
-1. The cabinet never renders in the app's in-app browser (an announced provider with `channel` `mobile`, or the
-   `?from=app` marker): there it renders nothing and replaces the route with `/explorer` (keeping the marker), with
-   no text about where or how to activate, since a pointer to activation inside a store app is itself an activation
-   link.
+1. The cabinet never renders in the app's in-app browser (an announced provider with `channel` `mobile`): there it
+   renders nothing and replaces the route with `/explorer`, with no text about where or how to activate, since a
+   pointer to activation inside a store app is itself an activation link.
 2. On a phone or tablet the page opens the link with its button (Android: the `intent:` URL of section 14.3), with
    "Use another device: show the QR"; on a desktop it shows the QR, or uses the extension's methods (section 14.10).
 3. Create, poll and decrypt as section 9 step 2; validate as section 14.7.
@@ -1011,6 +1026,12 @@ Example (vector `link-linked`):
    QR code on a computer. It needs no check number: the answer changes nothing by itself, and only keys of that wallet sign
    what the network takes. A lost device is unlinked the same way, from any device that holds the wallet. Beside it,
    "Move the node to another device" is the `link` request without a burn.
+7. **Move to wallet.** Beside the balance of a light or a super node of the wallet it shows, from 1 QNC, the page
+   offers Move to wallet, whichever way the wallet is connected (owner, 12.10): the extension's `qnet_claimNodeBalance`
+   naming the node when the extension holds the wallet the page shows, and a `claim` request naming that wallet and the
+   node (beside the extension's, or alone), its button on a phone or tablet and its QR code on a computer. It needs no
+   check number: the request names the wallet and the node, and only that wallet's key signs what the network takes. A
+   genesis node's balance is only shown.
 
 ### 14.10 Extension methods
 
@@ -1018,11 +1039,13 @@ Example (vector `link-linked`):
 | --- | --- | --- |
 | `qnet_activateNode` | as section 10 | as section 10; after a light burn the extension also records the node on the chain, so the page reads the chain for "Registered" |
 | `qnet_getActivation` | none | as section 10.1: what the extension knows of the wallet's activation, never a window |
-| `qnet_claimNodeBalance` | none | the `claim` answer of section 14.7 without `v` and `intent`: `ok`, `empty` or `error`; a closed window is the provider error 4001 |
+| `qnet_claimNodeBalance` | `{nodeId}`: the wallet's light node id or super node id (section 14.4) | the `claim` answer of section 14.7 without `v` and `intent`: `ok`, `empty` or `error` (`WALLET_MISMATCH` for a node that is not the wallet's); a closed window is the provider error 4001 |
 | `qnet_unlinkNodeDevice` | none | the `unlink` answer of section 14.7 without `v` and `intent`: `ok` with `unbound: true` (the wallet key's unbind, section 14.8), or `error` with `NO_WALLET`, `NOT_LINKED`, `NETWORK`, `UNLINK_REFUSED` or `INTERNAL`; a closed window is the provider error 4001; an extension without the method answers 4200 |
 
-All four methods answer only the origins of section 10 (4100 for any other). `qnet_claimNodeBalance` and
-`qnet_unlinkNodeDevice` act on the wallet's own light node only.
+All four methods answer only the origins of section 10 (4100 for any other). `qnet_claimNodeBalance` acts on the
+wallet's own light or super node only, which its own window confirms; `qnet_unlinkNodeDevice` on its own light node only.
+An extension from before the named node takes no params for `qnet_claimNodeBalance` and refuses `{nodeId}` with -32602,
+which the site reads as an extension to update. The extension's popup offers no move of a node balance of its own.
 
 ### 14.11 Security notes
 
@@ -1034,6 +1057,10 @@ Section 12 applies, with these additions:
   unbind from, and a page's `signMessage` cannot obtain one: both wallets refuse messages that start with the chain tag.
 - **Request binding.** `reqHash` sits in the link, the relay recomputes it, the app checks it against the session,
   and the AAD binds every answer to it: a relay cannot swap the request of a session.
+- **Named node.** A `claim` request and `qnet_claimNodeBalance` name the node; both wallets sign its claim quote only for
+  the wallet's own light or super node, computed from the wallet, and the node takes the claim only for a node the chain
+  registered to the signing wallet, while the rewards it pays are that wallet's: a forged request or answer moves
+  nothing to anyone else, and the page replaces a report with the balance the nodes give.
 - **Signed reservation.** Only the wallet's own key holds a wallet at aiqnet.io: a stranger can neither reserve a
   wallet nor make a burn in its name, and a payment address shows only after its wallet signed for it. The signature
   is bound to aiqnet.io's origin and to the payment address; a page's `signMessage` cannot obtain it, since both
@@ -1062,12 +1089,19 @@ section 10) holds:
 
 | Key | Content |
 | --- | --- |
-| `cases` | twenty-three full exchanges (`connect` ok, rejected, error; `link` ok with `check: true`, ok for a known wallet, linked, rejected, error; `claim` ok, ok for part of the balance, ok for a part below 1 QNC, empty, rejected, error; `reserve` ok, with the wallet's signed reservation for the vectors' burner, rejected, error; `unlink` ok with the unbind taken, ok with it not confirmed, rejected, error, ok by the wallet key, refused by the network): the context the site validates in (`request`, `now`, `consent24h`), session id, site and app keys, request, request bytes, `reqHash`, link, session request and session view, shared secret, key, AAD, check number (and whether the app shows it), plaintext, IV, ciphertext, response request |
+| `cases` | twenty-three full exchanges (`connect` ok, rejected, error; `link` ok with `check: true`, ok for a known wallet, linked, rejected, error; the earlier `claim` request, which named no node: ok, ok for part of the balance, ok for a part below 1 QNC, empty, rejected, error, whose sessions the relay refuses (section 14.5); `reserve` ok, with the wallet's signed reservation for the vectors' burner, rejected, error; `unlink` ok with the unbind taken, ok with it not confirmed, rejected, error, ok by the wallet key, refused by the network): the context the site validates in (`request`, `now`, `consent24h`), session id, site and app keys, request, request bytes, `reqHash`, link, session request and session view, shared secret, key, AAD, check number (and whether the app shows it), plaintext, IV, ciphertext, response request |
 | `cryptoMustFail` | decrypt inputs that MUST fail: flipped tag or IV bit, another request's `reqHash`, the revision 1 AAD, another intent, a `connect` AAD with a `reqHash` |
 | `invalidLinks` | strings a revision 2 parser MUST refuse, `activate` among them, and `reserve` and `unlink` links without their `reqHash` |
 | `invalidSessionRequests`, `invalidResponseRequests` | relay bodies that MUST get 400 (or 413 for size), the latter per intent |
 | `invalidPlaintexts` | answers the site MUST refuse, with the session, the context and the failing check |
 | `androidIntent` | the `intent:` URL of the site's button for a `link` request |
+
+[`node-claim.vectors.json`](node-claim.vectors.json) holds the `claim` request that names the node: for each wallet of
+`light-node.vectors.json` its light and super node ids and the claim quote of each, signed by the wallet key; ten full
+exchanges (the light and the super node's `ok`, a part of the balance, a part below 1 QNC, `empty`, `rejected`,
+`NO_NODE`, `CLAIM_BUSY`, and `WALLET_MISMATCH` for a request naming another wallet), in the form of the `link` cases above;
+the session bodies a relay refuses (the earlier request among them); and the answers a site refuses, each with the case
+it is read in and the failing check.
 
 [`light-node-own-burn.vectors.json`](light-node-own-burn.vectors.json) holds the `link` request with `burner` (its
 bytes and `reqHash`), the answer with `consent.ownerSig` and the body the site submits, for each wallet of

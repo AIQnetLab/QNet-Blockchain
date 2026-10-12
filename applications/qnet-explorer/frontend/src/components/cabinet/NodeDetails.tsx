@@ -167,7 +167,7 @@ export default function NodeDetails({ nodeType = 'light', nodeId, statusText, kn
         {facts?.code && <p className="activate-note">{t(light ? 'details_note' : 'details_note_super')}</p>}
         {facts?.open && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
       </div>
-      {!light && facts?.code && <div className="activate-card"><SuperNext code={facts.code} burnTx={facts.burnTx} burnAmount={facts.amount} /></div>}
+      {!light && facts?.code && <div className="activate-card"><SuperNext code={facts.code} burnTx={facts.burnTx} burnAmount={facts.amount} nodeId={nodeId} /></div>}
     </>
   );
 }

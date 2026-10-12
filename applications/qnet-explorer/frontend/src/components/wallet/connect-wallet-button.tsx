@@ -19,7 +19,7 @@ import { CONNECT_ID, isNodePath } from '@/lib/cabinet/tabs';
 import { shortAddress, type AddressView } from '@/lib/qnet-provider';
 
 const VIEWS: { key: AddressView; label: string }[] = [
-  { key: 'qnet', label: 'QNet' },
+  { key: 'qnet', label: 'QNet Blockchain' },
   { key: 'solana', label: 'Solana' },
 ];
 
@@ -155,9 +155,7 @@ export default function ConnectWalletButton() {
     );
   }
 
-  // The app's view from here on. A page the app opened (?from=app) in a browser without a wallet shows no control.
-  if (providerStatus === 'missing') return null;
-
+  // The app's in-app browser from here on: its own provider connects.
   if (!accounts || !address) {
     return (
       <div className="wallet-widget">
@@ -202,7 +200,7 @@ export default function ConnectWalletButton() {
       </button>
       {menuOpen && (
         <div className="wallet-menu" id={menuId}>
-          <div className="wallet-menu-label">{view === 'qnet' ? 'QNet address' : 'Solana address'}</div>
+          <div className="wallet-menu-label">{view === 'qnet' ? 'QNet Blockchain address' : 'Solana address'}</div>
           <div className="wallet-menu-address">{address}</div>
           <div className="wallet-menu-actions">
             <button type="button" className="qnet-button secondary" onClick={() => void copy()}>

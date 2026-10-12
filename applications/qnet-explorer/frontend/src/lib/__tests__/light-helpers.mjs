@@ -164,7 +164,7 @@ export function proofFor(j, stateRoot, { edit = null, signWith = null, anchor = 
     };
     const message = new TextEncoder().encode(`QNET_BFT2_VOTE:${core.checkpointHash(cp)}`);
     const signers = committee.slice(0, core.quorumSize(committee.length));
-    base = { index: j, checkpoint: cp, eligible_raw: ELIGIBLE, banned: [],
+    base = { index: j, checkpoint: cp, eligible_raw: ELIGIBLE, banned: [], committee,
       committee_pubkeys: Object.fromEntries(IDS.map((id) => [id, pkHex(KEYS[id])])),
       qc: { signers, sigs: signers.map((id) => wireSig(id, ml_dsa65.sign(message, KEYS[id].secretKey))) } };
     signedCache.set(key, base);
@@ -183,8 +183,9 @@ export function proofFor(j, stateRoot, { edit = null, signWith = null, anchor = 
 const reply = (status, body, retryAfterS = null) => ({ status, text: body === undefined ? '' : JSON.stringify(body), retryAfterS });
 
 /**
- * Scripted nodes: `handlers[base](path)` answers {status, body, retryAfterS} or a reply, else the honest chain does
- * (macroblock proofs up to `top`, the registry, /state/certified and /height). Every request is logged in `asked`.
+ * Scripted nodes: `handlers[base](path, honest, headers)` answers {status, body, retryAfterS} or a reply, else the honest
+ * chain does (macroblock proofs up to `top` with the committee the node serves, the registry, /state/certified and
+ * /height; 405 for the capsule, as nodes of today). Every request is logged in `asked` with the headers it sent.
  */
 export function network({ nodes, top, stateRootOf, handlers = {}, legacyHeads = false }) {
   const asked = [];
@@ -200,14 +201,16 @@ export function network({ nodes, top, stateRootOf, handlers = {}, legacyHeads = 
         : reply(200, { proof_format: 2, views: [], newest_certified_index: top, finalized_height: top * 90 + 30, applied_height: top * 90 + 80, capture: 'ok' });
     }
     if (path === '/api/v1/height') return reply(200, { height: top * 90 + 60 });
+    // No node of today serves a capsule: the route is not there.
+    if (path === '/api/v1/galc/capsule') return reply(405, undefined);
     return reply(404, { error: 'not found' });
   };
-  const fetchText = async (url) => {
+  const fetchText = async (url, maxBytes, timeoutMs, headers = {}) => {
     const base = nodes.find((n) => url.startsWith(`${n}/`));
     if (!base) throw new TypeError(`not a node: ${url}`);
     const path = url.slice(base.length);
-    asked.push([base, path]);
-    const custom = handlers[base] ? await handlers[base](path, honest) : undefined;
+    asked.push([base, path, headers]);
+    const custom = handlers[base] ? await handlers[base](path, honest, headers) : undefined;
     if (custom === 'throw') throw new TypeError('fetch failed');
     if (custom) return 'status' in custom && 'text' in custom ? custom : reply(custom.status ?? 200, custom.body, custom.retryAfterS ?? null);
     return honest(path);
@@ -216,3 +219,45 @@ export function network({ nodes, top, stateRootOf, handlers = {}, legacyHeads = 
 }
 
 export const NODES = ['https://n1.test', 'https://n2.test', 'https://n3.test', 'https://n4.test', 'https://n5.test'];
+
+// ---------------------------------------------------------------------------------------------- GALC v2 capsules
+
+// The shared vectors (docs/protocols/galc-capsule-v2.vectors.json): five TEST genesis keys and an outsider, which stand in
+// for the embedded genesis keys wherever a capsule is checked here, and the vectors' network id.
+export const GALC_V = JSON.parse(read('docs/protocols/galc-capsule-v2.vectors.json'));
+export const TEST_GENESIS_IDS = GALC_V.keys.filter((k) => k.id.startsWith('genesis_node_')).map((k) => k.id);
+export const TEST_GENESIS_KEYS = Object.fromEntries(GALC_V.keys.filter((k) => TEST_GENESIS_IDS.includes(k.id)).map((k) => [k.id, k.publicKey]));
+const TEST_SECRETS = Object.fromEntries(GALC_V.keys.map((k) => [k.id, ml_dsa65.keygen(Uint8Array.from(Buffer.from(k.seed, 'hex'))).secretKey]));
+const TEST_PUBLIC = Object.fromEntries(GALC_V.keys.map((k) => [k.id, k.publicKey]));
+/** The light client's options that make it judge capsules by the vectors' keys, network id and cadence. */
+export const CAPSULE_OPTIONS = { genesisKeys: TEST_GENESIS_KEYS, networkId: GALC_V.networkId, capsuleInterval: GALC_V.constants.mintInterval };
+
+/** The text the genesis keys sign, built here from the spec (section 3). */
+export const capsuleText = (f) => ['QNET_GENESIS_CHECKPOINT_v2', f.version, f.network_id, f.mb_index, f.mb_hash, f.committee_digest_anchor,
+  f.committee_digest_pred, f.minted_at_height, f.cp_hash_anchor, f.cp_hash_pred].join(':');
+
+const genesisSigned = new Map();
+/** A consensus signature string by `keyId` over `text`, named for `nameInString`, the key trailer kept. */
+export function genesisSig(keyId, text, nameInString = keyId) {
+  const key = `${keyId}|${text}`;
+  if (!genesisSigned.has(key)) genesisSigned.set(key, Buffer.from(ml_dsa65.sign(Buffer.from(text, 'utf8'), TEST_SECRETS[keyId])));
+  const sig = genesisSigned.get(key);
+  const msg = Buffer.from(text, 'utf8');
+  const len = Buffer.alloc(4); len.writeUInt32LE(sig.length + msg.length);
+  const pkLen = Buffer.alloc(4); pkLen.writeUInt32LE(1952);
+  return `dilithium_sig_${nameInString}_${Buffer.concat([len, sig, msg, pkLen, Buffer.from(TEST_PUBLIC[keyId], 'hex')]).toString('base64')}`;
+}
+
+/**
+ * A capsule of the synthetic chain at `k` (the checkpoint hashes of the proofs the honest nodes serve for k and k-1 with
+ * `stateRootOf`, unless `cpOf` says otherwise), `over` its fields, signed by `signers` over its own preimage.
+ */
+export function capsuleAt(k, stateRootOf, { cpOf = (j) => core.checkpointHash(proofFor(j, stateRootOf(j)).checkpoint), over = {}, signers = TEST_GENESIS_IDS.slice(0, 4) } = {}) {
+  const label = (s) => sha3_256(`capsule-test/${s}`);
+  const f = {
+    version: 2, network_id: GALC_V.networkId, mb_index: k, mb_hash: label(`mb/${k}`), committee_digest_anchor: label(`dA/${k}`),
+    committee_digest_pred: label(`dP/${k}`), minted_at_height: k * 90, cp_hash_anchor: cpOf(k), cp_hash_pred: cpOf(k - 1), ...over,
+  };
+  const text = capsuleText(f);
+  return { ...f, sigs: signers.map((id) => [id, genesisSig(id, text)]) };
+}

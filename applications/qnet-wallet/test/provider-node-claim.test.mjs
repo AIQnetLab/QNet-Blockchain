@@ -1,8 +1,9 @@
-// qnet_claimNodeBalance (QNet Link v1 section 14.10) through the real router and provider state machine: served to
-// https://aiqnet.io only, no grant read or created, the approval's view (nodes.claimView: this wallet's own light node
-// and the balance two nodes agree on), an armed confirm without the password running nodes.claimForSite, the claim
-// answer of section 14.7 (ok, empty, error) re-checked before it leaves, and the window's own screens on the fake DOM.
-// The light activation window's registration line and its longer stay are checked here too.
+// qnet_claimNodeBalance (QNet Link v1 section 14.10, decision 47) through the real router and provider state machine:
+// served to https://aiqnet.io only, naming the node to move, no grant read or created, the approval's view
+// (nodes.claimView of that node: this wallet's light or super node and the balance two nodes agree on, WALLET_MISMATCH
+// for any other), an armed confirm without the password running nodes.claimForSite, the claim answer of section 14.7
+// (ok, empty, error) re-checked before it leaves, and the window's own screens on the fake DOM. The shared vectors of
+// docs/protocols/node-claim.vectors.json are answered exactly. The extension's popup offers no move (owner, 12.10).
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -11,13 +12,16 @@ import { ProviderError, WalletError } from '../dist/background/errors.js';
 import { CLAIM_ERROR_CODES } from '../dist/background/provider.js';
 import { until } from './helpers/chrome-mock.mjs';
 import { createPage } from './helpers/provider-dom.mjs';
+import * as core from '../dist/lib/qnet-core.js';
 import {
-  ACCOUNTS, APP, NODE_ID, PASSWORD, SITE, createWorld, eventsOf, replyTo, settleAll,
+  ACCOUNTS, APP, NODE_ID, PASSWORD, SITE, SUPER_NODE_ID, createWorld, eventsOf, replyTo, settleAll,
 } from './helpers/provider-harness.mjs';
 
 const ERROR_LINGER_MS = 30000;
 const COOLDOWN_TEXT = 'Too many rejected requests from this site, try again later';
-const claim = (port, id, params) => port.send({ id, method: 'qnet_claimNodeBalance', ...(params === undefined ? {} : { params }) });
+// The site names the node to move: this wallet's light node unless a test names another.
+const claim = (port, id, params = { nodeId: NODE_ID }) => port.send({ id, method: 'qnet_claimNodeBalance', ...(params === undefined ? {} : { params }) });
+const OTHER_WALLET = core.qnetAddressFromPublicKey(new Uint8Array(1952).fill(9));
 const answered = (port, id) => port.posted.some((message) => message.id === id);
 const TX_HASH = 'ef'.repeat(32);
 
@@ -51,7 +55,9 @@ describe('provider: qnet_claimNodeBalance', () => {
     const view = (await shown.get()).result;
     assert.equal(view.kind, 'claimNodeBalance');
     assert.equal(view.origin, SITE);
-    assert.deepEqual(view.details, { mode: 'claim', reason: null, nodeId: NODE_ID, wallet: ACCOUNTS.qnet, amountNano: '2500000000' });
+    assert.deepEqual(view.details, {
+      mode: 'claim', reason: null, nodeId: NODE_ID, nodeType: 'light', wallet: ACCOUNTS.qnet, amountNano: '2500000000',
+    });
     // no approval takes a password
     assert.equal((await shown.resolve(true, { password: PASSWORD })).error.code, 'INVALID_PARAMS');
     assert.equal(w.log.claims, 0);
@@ -60,6 +66,7 @@ describe('provider: qnet_claimNodeBalance', () => {
     });
     assert.deepEqual(w.log.views.filter((event) => event === 'balance'), ['balance'], 'the pages read the balances again');
     assert.equal(w.log.claims, 1);
+    assert.ok(w.log.claimNodeIds.every((id) => id === NODE_ID), 'the node the site named, read and moved');
     assert.deepEqual((await replyTo(port, 'c')).result, {
       status: 'ok', qnet: ACCOUNTS.qnet, nodeId: NODE_ID, amountNano: '2500000000', txHash: TX_HASH, stoppedAtEpoch: null,
     });
@@ -76,8 +83,13 @@ describe('provider: qnet_claimNodeBalance', () => {
     const other = w.connect(`${APP}/node`);
     claim(other, 'x');
     assert.equal((await replyTo(other, 'x')).error.code, 4100);
-    await assert.rejects(w.provider.handleRequest(Object.freeze({ origin: APP, tabId: 1, portId: 77 }), 'qnet_claimNodeBalance', {}),
-      (error) => error instanceof ProviderError && error.code === 4100);
+    await assert.rejects(w.provider.handleRequest(Object.freeze({ origin: APP, tabId: 1, portId: 77 }), 'qnet_claimNodeBalance',
+      { nodeId: NODE_ID }), (error) => error instanceof ProviderError && error.code === 4100);
+    // the provider holds the node's form itself too
+    for (const params of [{}, { nodeId: 'genesis_node_001' }, { nodeId: 7 }]) {
+      await assert.rejects(w.provider.handleRequest(Object.freeze({ origin: SITE, tabId: 1, portId: 78 }), 'qnet_claimNodeBalance', params),
+        (error) => error instanceof WalletError && error.code === 'INVALID_PARAMS', JSON.stringify(params));
+    }
     w.state.vaultExists = false;
     const port = w.connect(`${SITE}/`);
     claim(port, 'n');
@@ -156,7 +168,8 @@ describe('provider: qnet_claimNodeBalance', () => {
       assert.deepEqual((await shown.resolve(true)).result, { resolved: true, status: 'error', error: code });
       assert.deepEqual((await replyTo(port, 'f')).result, { status: 'error', error: code });
     }
-    assert.deepEqual([...CLAIM_ERROR_CODES].sort(), ['CLAIM_BUSY', 'CLAIM_REFUSED', 'INTERNAL', 'NETWORK', 'NO_NODE', 'NO_WALLET']);
+    assert.deepEqual([...CLAIM_ERROR_CODES].sort(),
+      ['CLAIM_BUSY', 'CLAIM_REFUSED', 'INTERNAL', 'NETWORK', 'NO_NODE', 'NO_WALLET', 'WALLET_MISMATCH']);
     // an answer about another node, a full move below 1 QNC, a part of nothing, a stop epoch that is no u64 string or no
     // hash never reaches the site
     for (const outcome of [
@@ -199,26 +212,73 @@ describe('provider: qnet_claimNodeBalance', () => {
   });
 
   it('answers exactly the claim answers of the shared vectors, without v and intent (QNet Link v1 section 14.10)', async () => {
-    const vectors = JSON.parse(await readFile(new URL('../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
-    // every claim answer but the app's `rejected` (the extension answers a reject with 4001): the four of section 14.7,
-    // and any further one the vectors add (a part below 1 QNC: EXT-R2-01)
-    const cases = vectors.link.cases.filter((c) => c.intent === 'claim' && JSON.parse(c.plaintext).status !== 'rejected');
-    for (const name of ['claim-ok', 'claim-ok-partial', 'claim-empty', 'claim-error']) {
+    const vectors = JSON.parse(await readFile(new URL('../../../docs/protocols/node-claim.vectors.json', import.meta.url), 'utf8'));
+    // every claim answer but the app's `rejected` (the extension answers a reject with 4001), for the node each request
+    // names: the light and the super node of the KAT wallet, and another wallet's node (WALLET_MISMATCH)
+    const cases = vectors.cases.filter((c) => JSON.parse(c.plaintext).status !== 'rejected');
+    for (const name of ['claim-light-ok', 'claim-super-ok', 'claim-super-ok-partial', 'claim-light-empty', 'claim-super-empty',
+      'claim-super-error-no-node', 'claim-light-error-busy', 'claim-error-mismatch']) {
       assert.ok(cases.some((c) => c.name === name), name);
     }
     for (const c of cases) {
       const { v, intent, ...answer } = JSON.parse(c.plaintext);
       assert.deepEqual([v, intent], [1, 'claim']);
       const w = createWorld();
-      if (answer.status === 'error') w.state.claimError = new WalletError(answer.error);
-      else w.state.claimOutcome = answer;
+      if (answer.status === 'error' && answer.error !== 'WALLET_MISMATCH') w.state.claimError = new WalletError(answer.error);
+      else if (answer.status !== 'error') w.state.claimOutcome = answer;
       const port = w.connect(`${SITE}/`);
-      claim(port, 'q');
+      claim(port, 'q', { nodeId: c.request.nodeId });
       const shown = await w.shown();
       await shown.get();
       await shown.resolve(true);
       assert.deepEqual((await replyTo(port, 'q')).result, answer, c.name);
     }
+  });
+
+  it('the wallet\'s super node: its view and its move name the super id', async () => {
+    const w = createWorld();
+    const port = w.connect(`${SITE}/node`);
+    claim(port, 's', { nodeId: SUPER_NODE_ID });
+    const shown = await w.shown();
+    assert.deepEqual((await shown.get()).result.details, {
+      mode: 'claim', reason: null, nodeId: SUPER_NODE_ID, nodeType: 'super', wallet: ACCOUNTS.qnet, amountNano: '2500000000',
+    });
+    assert.equal((await shown.resolve(true)).result.status, 'ok');
+    assert.deepEqual((await replyTo(port, 's')).result, {
+      status: 'ok', qnet: ACCOUNTS.qnet, nodeId: SUPER_NODE_ID, amountNano: '2500000000', txHash: TX_HASH, stoppedAtEpoch: null,
+    });
+    assert.ok(w.log.claimNodeIds.length >= 2 && w.log.claimNodeIds.every((id) => id === SUPER_NODE_ID));
+    // an outcome that names the light node for a move of the super node never reaches the site
+    const other = createWorld();
+    other.state.claimOutcome = { status: 'ok', qnet: ACCOUNTS.qnet, nodeId: NODE_ID, amountNano: '2500000000', txHash: TX_HASH, stoppedAtEpoch: null };
+    const p = other.connect(`${SITE}/`);
+    claim(p, 'x', { nodeId: SUPER_NODE_ID });
+    const s = await other.shown();
+    await s.get();
+    await s.resolve(true);
+    assert.deepEqual((await replyTo(p, 'x')).result, { status: 'error', error: 'INTERNAL' });
+  });
+
+  it('another wallet\'s node: the window says so, nothing moves, and the site learns WALLET_MISMATCH', async () => {
+    for (const nodeId of [core.superNodeId(OTHER_WALLET), core.lightNodeId(OTHER_WALLET)]) {
+      const w = createWorld();
+      const port = w.connect(`${SITE}/`);
+      claim(port, 'm', { nodeId });
+      const shown = await w.shown();
+      assert.deepEqual((await shown.get()).result.details, {
+        mode: 'unavailable', reason: 'WALLET_MISMATCH', nodeId, nodeType: null, wallet: ACCOUNTS.qnet, amountNano: null,
+      });
+      assert.deepEqual((await shown.resolve(true)).result, { resolved: true, status: 'error', error: 'WALLET_MISMATCH' });
+      assert.deepEqual((await replyTo(port, 'm')).result, { status: 'error', error: 'WALLET_MISMATCH' });
+      assert.equal(w.log.claims, 0);
+    }
+    // a view that says this wallet's own node is someone else's, or the reverse, is never shown
+    const w = createWorld();
+    w.state.claimView = { mode: 'unavailable', reason: 'WALLET_MISMATCH', nodeType: null, amountNano: null };
+    const port = w.connect(`${SITE}/`);
+    claim(port, 'v');
+    const shown = await w.shown();
+    assert.equal((await shown.get()).result.details.mode, null);
   });
 
   it('a view nodes.js cannot give, or one about another node, is never shown', async () => {
@@ -268,6 +328,36 @@ describe('approve page: the node balance', () => {
     await until(() => page.window.closed);
   });
 
+  it('a super node: its row and the window\'s words name it', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const w = createWorld();
+    const port = w.connect(`${SITE}/`);
+    claim(port, 's', { nodeId: SUPER_NODE_ID });
+    const page = await openPage(w, await w.shown());
+    await until(() => page.app.button('Move to wallet') !== null);
+    const text = page.app.textContent;
+    assert.ok(text.includes(SUPER_NODE_ID) && text.includes('Super node'), text);
+    assert.ok(text.includes('this wallet’s super node'), text);
+    assert.ok(!text.includes(NODE_ID) && !text.includes('Light node'), text);
+    page.app.button('Reject').click();
+    assert.equal((await replyTo(port, 's')).error.code, 4001);
+    await until(() => page.window.closed);
+  });
+
+  it('another wallet\'s node offers one Close and names the reason', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const w = createWorld();
+    const port = w.connect(`${SITE}/`);
+    claim(port, 'm', { nodeId: core.superNodeId(OTHER_WALLET) });
+    const page = await openPage(w, await w.shown());
+    await until(() => page.app.button('Close') !== null);
+    assert.ok(page.app.textContent.includes('not this wallet’s'), page.app.textContent);
+    assert.equal(page.app.button('Move to wallet'), null);
+    page.app.button('Close').click();
+    assert.deepEqual((await replyTo(port, 'm')).result, { status: 'error', error: 'WALLET_MISMATCH' });
+    await until(() => page.window.closed);
+  });
+
   it('a balance below 1 QNC offers one Close that tells the site', async () => {
     const w = createWorld();
     w.state.claimView = { mode: 'empty', amountNano: '100' };
@@ -283,45 +373,3 @@ describe('approve page: the node balance', () => {
   });
 });
 
-describe('qnet_activateNode: the light node\'s record on the QNet network', () => {
-  it('after a light answer the window shows the record and stays up to REGISTRATION_WINDOW_MS; the site result is unchanged', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
-    const w = createWorld();
-    w.state.registration = { nodeId: NODE_ID, state: 'queued', attempts: 0, lastError: null, txHash: null, updatedAt: 1, automatic: true };
-    const port = w.connect(`${SITE}/activate`);
-    port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const shown = await w.shown();
-    await shown.get();
-    const resolved = (await shown.resolve(true)).result;
-    assert.deepEqual(resolved.registration, { nodeId: NODE_ID, state: 'queued', automatic: true, deferred: false });
-    const result = (await replyTo(port, 'a')).result;
-    assert.deepEqual(Object.keys(result).sort(), ['burnAmount', 'burnTx', 'code', 'nodeType', 'qnet', 'solana', 'status']);
-    await settleAll();
-    w.fireTimers(ERROR_LINGER_MS);
-    await settleAll();
-    assert.equal(w.openWindows.has(shown.windowId), true, 'not the short linger while it is recorded');
-    w.fireTimers(TIMINGS.REGISTRATION_WINDOW_MS);
-    await until(() => !w.openWindows.has(shown.windowId));
-  });
-
-  it('the page follows the record after the answer, with no line on it before the confirm', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
-    const w = createWorld();
-    w.state.registration = { nodeId: NODE_ID, state: 'queued', attempts: 0, lastError: null, txHash: null, updatedAt: 1, automatic: true };
-    const port = w.connect(`${SITE}/activate`);
-    port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
-    await until(() => page.app.button('Burn 1500 1DEV') !== null);
-    assert.ok(!page.app.textContent.includes('Then the wallet records its light node on the QNet network'));
-    const [ack] = page.app.querySelectorAll('input');
-    t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
-    ack.checked = true;
-    ack.fire('change');
-    page.app.button('Burn 1500 1DEV').click();
-    await replyTo(port, 'a');
-    await until(() => page.app.textContent.includes('Recording on the QNet network'));
-    w.state.registration = { ...w.state.registration, state: 'onchain', automatic: false };
-    t.mock.timers.tick(TIMINGS.REGISTRATION_POLL_MS);
-    await until(() => page.app.textContent.includes('Recorded on the QNet network for this wallet.'));
-  });
-});

@@ -73,8 +73,8 @@ import * as vault from './vault.js';
  *   one read; mode and the rest null while locked; recorded: the QNet network lists the light activation's node with
  *   its registration of this burn, otherBurn: with a registration of another burn (nodes.js whoseBurn), the only parts
  *   of its registration the window draws);
- *   claimNodeBalance: {mode: 'claim'|'empty'|'unavailable'|null, reason, nodeId, wallet, amountNano} (nodes.claimView,
- *   read again on every approval.get while not busy; null while locked);
+ *   claimNodeBalance: {mode: 'claim'|'empty'|'unavailable'|null, reason, nodeId, nodeType, wallet, amountNano}
+ *   (nodes.claimView of the node the site named, read again on every approval.get while not busy; null while locked);
  *   unlinkNodeDevice: {mode: 'confirm'|'unavailable'|null, reason, nodeId, wallet, platform, linkedSince}
  *   (nodes.unlinkView, read again on every approval.get while not busy; null while locked)
  *
@@ -95,10 +95,10 @@ import * as vault from './vault.js';
  *   (CONTRACTS.md decision 35)
  *
  * @typedef {object} SiteClaimResult  qnet_claimNodeBalance result (QNet Link v1 section 14.10: the claim answer of
- *   section 14.7 without v and intent)
+ *   section 14.7 without v and intent; decision 47)
  * @property {'ok'|'empty'|'error'} status
  * @property {string} [qnet] ok, empty
- * @property {string} [nodeId] ok, empty
+ * @property {string} [nodeId] ok, empty: the node the site named, this wallet's light or super node
  * @property {string} [amountNano] ok: decimal nano, at least CLAIM_MIN_NANO, or above zero for a part of the balance
  *   (stoppedAtEpoch set)
  * @property {string} [txHash] ok: 64 lowercase hex
@@ -157,12 +157,14 @@ const READ_STATUSES = new Set(['searching', 'none', 'unusable', 'unknown', 'pend
 const READ_REASONS = new Set(['SOLANA_UNAVAILABLE', 'HISTORY_TOO_LONG']);
 const READ_WINDOW_MS = 60000;
 // The error codes a qnet_claimNodeBalance result may carry (QNet Link v1 section 14.7, claim); anything else is INTERNAL.
-const CLAIM_ERRORS = new Set(['NO_WALLET', 'NO_NODE', 'NETWORK', 'CLAIM_REFUSED', 'CLAIM_BUSY', 'INTERNAL']);
+const CLAIM_ERRORS = new Set(['NO_WALLET', 'WALLET_MISMATCH', 'NO_NODE', 'NETWORK', 'CLAIM_REFUSED', 'CLAIM_BUSY', 'INTERNAL']);
 /** The error codes a qnet_claimNodeBalance result may carry, for the shared-vectors test. */
 export const CLAIM_ERROR_CODES = Object.freeze([...CLAIM_ERRORS]);
 const claimError = (code) => ({ status: 'error', error: CLAIM_ERRORS.has(code) ? code : 'INTERNAL' });
 const CLAIM_VIEW_MODES = new Set(['claim', 'empty', 'unavailable']);
-const CLAIM_VIEW_REASONS = new Set(['NO_NODE', 'NETWORK', 'SIGNING_DISABLED']);
+const CLAIM_VIEW_REASONS = new Set(['WALLET_MISMATCH', 'NO_NODE', 'NETWORK', 'SIGNING_DISABLED']);
+// The node a site's move names (router.js CLAIM_NODE_ID_RE): a light or a super node id.
+const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 // The error codes a qnet_unlinkNodeDevice result may carry (decision 38); anything else is INTERNAL (UNSUPPORTED and
 // SIGNING_DISABLED among them).
 const UNLINK_ERRORS = new Set(['NO_WALLET', 'NOT_LINKED', 'NETWORK', 'UNLINK_REFUSED', 'INTERNAL']);
@@ -1183,22 +1185,31 @@ export function createProviderService(options = {}) {
     };
   }
 
-  // nodes.claimView's answer, shape-checked against this wallet's own light node.
-  function checkedClaimView(view, current) {
+  // Which of the current wallet's nodes `nodeId` is: 'light', 'super', or null for none of them.
+  const claimNodeType = (nodeId, current) => {
+    if (nodeId === core.lightNodeId(current.qnetAddress)) return 'light';
+    return nodeId === core.superNodeId(current.qnetAddress) ? 'super' : null;
+  };
+
+  // nodes.claimView's answer for the node the site named, shape-checked against this wallet: that node, its type among
+  // this wallet's nodes, or WALLET_MISMATCH when it is neither of them.
+  function checkedClaimView(view, current, nodeId) {
+    const nodeType = claimNodeType(nodeId, current);
     const ok = isPlainObject(view) && CLAIM_VIEW_MODES.has(view.mode)
       && (view.mode === 'unavailable' ? CLAIM_VIEW_REASONS.has(view.reason) : view.reason === null)
-      && view.nodeId === core.lightNodeId(current.qnetAddress)
+      && view.nodeId === nodeId && view.nodeType === nodeType
+      && (nodeType !== null || view.reason === 'WALLET_MISMATCH') && (view.reason !== 'WALLET_MISMATCH' || nodeType === null)
       && (view.mode === 'unavailable' ? view.amountNano === null : isU64String(view.amountNano))
       && (view.mode !== 'claim' || BigInt(view.amountNano) >= BigInt(CLAIM_MIN_NANO));
     if (!ok) throw new WalletError('INTERNAL');
     return Object.freeze({
-      mode: view.mode, reason: view.reason, nodeId: view.nodeId, wallet: current.qnetAddress, amountNano: view.amountNano,
+      mode: view.mode, reason: view.reason, nodeId, nodeType, wallet: current.qnetAddress, amountNano: view.amountNano,
     });
   }
 
   // The claim window's view: read again on every approval.get while not busy; a failed read keeps the last one.
   async function claimDetails(approval, current) {
-    const none = { mode: null, reason: null, nodeId: null, wallet: null, amountNano: null };
+    const none = { mode: null, reason: null, nodeId: null, nodeType: null, wallet: null, amountNano: null };
     if (current === null) {
       approval.view = null;
       return none;
@@ -1207,7 +1218,7 @@ export function createProviderService(options = {}) {
       approval.readGen += 1;
       const generation = approval.readGen;
       try {
-        const view = checkedClaimView(await d.nodes.claimView(), current);
+        const view = checkedClaimView(await d.nodes.claimView(approval.payload.nodeId), current, approval.payload.nodeId);
         if (stillCurrent(approval, generation)) approval.view = view;
       } catch (error) {
         log.warn('claim view failed', error?.code ?? error?.name);
@@ -1477,11 +1488,11 @@ export function createProviderService(options = {}) {
     };
   }
 
-  // The dApp result of a claim outcome (nodes.claimForSite), checked once more: this wallet's own node, a move with a
-  // transaction hash of at least CLAIM_MIN_NANO (a full batch) or above zero (a part of the balance, with the epoch its
-  // quote stopped at: EXT-R1-03), or an empty balance.
-  function claimResult(outcome, current) {
-    const nodeId = core.lightNodeId(current.qnetAddress);
+  // The dApp result of a claim outcome (nodes.claimForSite), checked once more: the node the site named, one of this
+  // wallet's own, a move with a transaction hash of at least CLAIM_MIN_NANO (a full batch) or above zero (a part of the
+  // balance, with the epoch its quote stopped at: EXT-R1-03), or an empty balance.
+  function claimResult(outcome, current, nodeId) {
+    if (claimNodeType(nodeId, current) === null) throw new WalletError('WALLET_MISMATCH');
     if (outcome?.status === 'empty' && outcome.qnet === current.qnetAddress && outcome.nodeId === nodeId) {
       return { status: 'empty', qnet: current.qnetAddress, nodeId };
     }
@@ -1522,7 +1533,7 @@ export function createProviderService(options = {}) {
     let result;
     try {
       current = await d.session.requireUnlocked();
-      result = claimResult(await d.nodes.claimForSite(), current);
+      result = claimResult(await d.nodes.claimForSite(approval.payload.nodeId), current, approval.payload.nodeId);
     } catch (error) {
       approval.busy = false;
       const code = knownCode(error?.code) ?? 'INTERNAL';
@@ -1798,11 +1809,14 @@ export function createProviderService(options = {}) {
     return enqueue(ctx, 'activateNode', { nodeType });
   }
 
-  // Move to wallet from the cabinet: the activation origin only (the router refused every other), no grant, no params.
-  async function requestClaim(ctx) {
+  // Move to wallet from the cabinet (decision 47): the activation origin only (the router refused every other), no grant;
+  // the node the page names, which the window checks against the wallet once it is unlocked.
+  async function requestClaim(ctx, params) {
     if (!isActivationOrigin(ctx.origin)) throw new ProviderError(CODES.UNAUTHORIZED);
+    const nodeId = params?.nodeId;
+    if (typeof nodeId !== 'string' || !CLAIM_NODE_ID_RE.test(nodeId)) throw new WalletError('INVALID_PARAMS', { field: 'nodeId' });
     if (!(await d.vault.vaultExists())) return claimError('NO_WALLET');
-    return enqueue(ctx, 'claimNodeBalance', {});
+    return enqueue(ctx, 'claimNodeBalance', { nodeId });
   }
 
   // Unlink the light node's device from the cabinet (decision 38): the activation origin only, no grant, no params.
@@ -1837,7 +1851,7 @@ export function createProviderService(options = {}) {
       case 'qnet_getActivation':
         return requestReadActivation(ctx);
       case 'qnet_claimNodeBalance':
-        return requestClaim(ctx);
+        return requestClaim(ctx, params);
       case 'qnet_unlinkNodeDevice':
         return requestUnlink(ctx);
       default:
@@ -2099,10 +2113,12 @@ export function eventSink() {
  *   qnet_getActivation {}: router.isActivationOrigin only (else 4100), never a window (decision 35); at most
  *     LIMITS.ACTIVATION_READS_PER_MINUTE a minute per origin (more: 4001); {status: 'no_wallet'}, {status: 'locked'},
  *     {status: 'not_connected'} (no grant of this wallet), else activation.siteActivation checked (SiteActivationRead).
- *   qnet_claimNodeBalance {}: router.isActivationOrigin only (else 4100), no grant; no vault → {status: 'error', error:
- *     'NO_WALLET'} at once; otherwise a 'claimNodeBalance' approval showing nodes.claimView (the balance of the wallet's
- *     own light node two pinned nodes agree on, or why nothing can move); its armed confirm (no password) runs
- *     nodes.claimForSite → SiteClaimResult (ok, empty, or error with a CLAIM_ERRORS code; 4001 on reject).
+ *   qnet_claimNodeBalance {nodeId}: router.isActivationOrigin only (else 4100), no grant; nodeId a light or super node
+ *     id (decision 47); no vault → {status: 'error', error: 'NO_WALLET'} at once; otherwise a 'claimNodeBalance' approval
+ *     showing nodes.claimView (the balance of that node two pinned nodes agree on when it is this wallet's light or super
+ *     node, or why nothing can move: WALLET_MISMATCH for a node that is not this wallet's); its armed confirm (no
+ *     password) runs nodes.claimForSite → SiteClaimResult (ok, empty, or error with a CLAIM_ERRORS code; 4001 on
+ *     reject).
  *   qnet_unlinkNodeDevice {}: router.isActivationOrigin only (else 4100), no grant; no vault → {status: 'error', error:
  *     'NO_WALLET'} at once; otherwise an 'unlinkNodeDevice' approval showing nodes.unlinkView (the device the public
  *     status names for the wallet's own light node, or why nothing can be unlinked); its armed confirm (no password)

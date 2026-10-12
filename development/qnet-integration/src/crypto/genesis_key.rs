@@ -50,7 +50,10 @@ pub fn derive_mldsa65_from_xi(xi: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
 
     let (pk, sk) = ml_dsa_65::KG::keygen_from_seed(xi);
     let pk_bytes = pk.into_bytes().to_vec();
-    let sk_bytes = sk.into_bytes().to_vec();
+    // The encoded key array is a copy of the secret: wiped once the caller's Vec holds it.
+    let mut sk_array = sk.into_bytes();
+    let sk_bytes = sk_array.to_vec();
+    zeroize::Zeroize::zeroize(&mut sk_array);
     (pk_bytes, sk_bytes)
 }
 
@@ -66,8 +69,13 @@ const WALLET_SEED_PREFIX: &str = "QNET_WALLET_MLDSA65_v1:";
 /// Canonical wallet seed string: `PREFIX + hex(BIP-39 64-byte seed)`. Node and the
 /// client wallets SHAKE-256 this exact string to obtain the 32-byte KeyGen seed.
 pub fn wallet_seed_string(mnemonic: &str) -> String {
-    let seed64 = crate::crypto::solana_derivation::bip39_seed64(mnemonic);
-    format!("{}{}", WALLET_SEED_PREFIX, hex::encode(seed64))
+    let mut seed64 = crate::crypto::solana_derivation::bip39_seed64(mnemonic);
+    let mut seed_hex = hex::encode(seed64);
+    let out = format!("{}{}", WALLET_SEED_PREFIX, seed_hex);
+    // Both are the wallet's seed: wiped here, the returned string by the caller.
+    zeroize::Zeroize::zeroize(&mut seed64);
+    zeroize::Zeroize::zeroize(&mut seed_hex);
+    out
 }
 
 /// SHAKE-256(seed_string) -> 32-byte ML-DSA-65 KeyGen seed. Byte-for-byte identical
@@ -86,8 +94,13 @@ pub fn wallet_xi_from_seed_string(seed_string: &str) -> [u8; 32] {
 /// Deterministic USER-WALLET ML-DSA-65 keypair from a BIP-39 mnemonic. Standard
 /// FIPS-204 encoding (pk 1952, sk 4032), byte-identical to the mobile/ext wallet key.
 pub fn derive_wallet_mldsa65_from_mnemonic(mnemonic: &str) -> (Vec<u8>, Vec<u8>) {
-    let xi = wallet_xi_from_seed_string(&wallet_seed_string(mnemonic));
-    derive_mldsa65_from_xi(&xi)
+    // The seed string and xi are the wallet's secret: wiped once the key pair is derived.
+    let seed_string = zeroize::Zeroizing::new(wallet_seed_string(mnemonic));
+    let mut xi = wallet_xi_from_seed_string(&seed_string);
+    drop(seed_string);
+    let keys = derive_mldsa65_from_xi(&xi);
+    zeroize::Zeroize::zeroize(&mut xi);
+    keys
 }
 
 /// Fail-closed startup self-test: determinism + sizes + fips204→pqcrypto

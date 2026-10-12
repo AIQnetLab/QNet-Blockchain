@@ -356,7 +356,7 @@ pub(super) async fn handle_light_node_register(
     if let Err(e) = validate_eon_address_with_error(&register_request.wallet_address) {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Invalid QNet EON wallet address",
+            "error": "Invalid QNet Blockchain wallet address",
             "details": e,
             "hint": "Wallet address must be in EON format: {19 hex}eon{15 hex}{8 checksum} = 45 chars"
         })));
@@ -1955,6 +1955,9 @@ pub(crate) fn epoch_started_at(storage: &crate::storage::Storage, epoch: u64, ti
     storage.block_timestamp_at(first).ok().flatten().or_else(|| Some(now.saturating_sub(tip - first)))
 }
 
+/// The status message of a registered super outside the running epoch's admitted set.
+const SUPER_ADMISSION_WAITING: &str = "Registered, waiting for network admission: no super share while outside.";
+
 /// Handle Server node (Super, including Genesis) status check
 /// Returns online status, heartbeat count, and activity info
 pub(super) async fn handle_server_node_status(
@@ -2038,10 +2041,11 @@ pub(super) async fn handle_server_node_status(
                 // v35: heartbeat count from the on-chain tally (Account.heartbeat_slots popcount).
                 let cur_height = blockchain.get_height().await;
                 let hb_epoch = cur_height / 14400;
-                let heartbeat_count = blockchain.get_account(found_id).await.ok().flatten()
-                    .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
+                let account = blockchain.get_account(found_id).await.ok().flatten();
+                let heartbeat_count = account.as_ref()
+                    .map(|a| crate::node::BlockchainNode::account_heartbeat_count(a, hb_epoch))
                     .unwrap_or(0);
-                
+
                 // Determine required heartbeats based on node type (case-insensitive)
                 // v3.18: Only Super nodes (Full removed)
                 let required_heartbeats = match node_type.to_lowercase().as_str() {
@@ -2068,10 +2072,15 @@ pub(super) async fn handle_server_node_status(
                 // derive from srtr_/reg_height, so this is the ONE truth the payout actually uses.
                 let onchain = blockchain.get_storage().is_node_registration_onchain(found_id);
 
-                // is_reward_eligible mirrors the EMISSION predicate (srtr_ ∩ heartbeat_count>=9) —
-                // NOT the producer-selection predicate (no warmup/rep-floor: those gate selection,
-                // not payout). on_pace is a mid-epoch APPROXIMATION of the boundary-finalized popcount.
-                let is_reward_eligible = onchain && (heartbeat_count >= required_heartbeats || on_pace);
+                // is_reward_eligible mirrors the EMISSION predicate (srtr_ ∩ unbanned ∩ heartbeat_count>=9
+                // ∩ admitted) — NOT the producer-selection predicate (no warmup/rep-floor: those gate
+                // selection, not payout). on_pace is a mid-epoch APPROXIMATION of the boundary-finalized popcount.
+                let is_super = !found_id.starts_with("light_");
+                let admission = is_super.then(|| crate::node::BlockchainNode::super_admission_label(
+                    &blockchain.get_storage(), found_id, hb_epoch));
+                let banned = is_super && account.as_ref().map_or(false, |a| a.banned_at_height != 0);
+                let is_reward_eligible = onchain && (heartbeat_count >= required_heartbeats || on_pace)
+                    && admission != Some("waiting") && !banned;
 
                 // v2.96: CRITICAL FIX - Get reputation from LAST MACROBLOCK SNAPSHOT (not local state)
                 // This ensures ALL nodes return SAME value (blockchain consensus)
@@ -2101,7 +2110,7 @@ pub(super) async fn handle_server_node_status(
                     }
                 };
                 
-                return Ok(warp::reply::json(&json!({
+                let mut reply = json!({
                     "success": true,
                     "registered": onchain,
                     "onchain_registered": onchain,
@@ -2114,6 +2123,7 @@ pub(super) async fn handle_server_node_status(
                     "heartbeat_count": heartbeat_count,
                     "required_heartbeats": required_heartbeats,
                     "is_reward_eligible": is_reward_eligible,
+                    "admission": admission,
                     "reputation": reputation,
                     "current_block_height": block_height,
                     "current_window_start": current_window,
@@ -2121,7 +2131,11 @@ pub(super) async fn handle_server_node_status(
                     "needs_attention": !onchain || !is_online || (heartbeat_count as u32) + 1 < expected,
                     // Rewards info (QNC tokens in smallest units) — wallet-scoped, status-independent.
                     "pending_rewards": pending_rewards
-                })));
+                });
+                if onchain && admission == Some("waiting") {
+                    reply["message"] = json!(SUPER_ADMISSION_WAITING);
+                }
+                return Ok(warp::reply::json(&reply));
             }
 
             // Not in active Super/Genesis list — check light_node_registry (point-read: no full-map clone)
@@ -2194,11 +2208,18 @@ pub(super) async fn handle_server_node_status(
                     let cur_height = blockchain.get_height().await;
                     let chain_alive = blockchain.get_storage().heartbeat_recent_onchain(off_id, cur_height);
                     let hb_epoch = cur_height / 14400;
-                    let heartbeat_count = blockchain.get_account(off_id).await.ok().flatten()
-                        .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
+                    let account = blockchain.get_account(off_id).await.ok().flatten();
+                    let heartbeat_count = account.as_ref()
+                        .map(|a| crate::node::BlockchainNode::account_heartbeat_count(a, hb_epoch))
                         .unwrap_or(0);
                     let expected = ((cur_height % 14400) / 1440) as u32;
                     let on_pace = chain_alive && (heartbeat_count as u32) + 1 >= expected;
+                    let is_super = !off_id.starts_with("light_");
+                    let admission = is_super.then(|| crate::node::BlockchainNode::super_admission_label(
+                        &blockchain.get_storage(), off_id, hb_epoch));
+                    let waiting = admission == Some("waiting");
+                    // The settle writer drops a banned super whatever its heartbeats.
+                    let banned = is_super && account.as_ref().map_or(false, |a| a.banned_at_height != 0);
                     let reputation = if onchain {
                         serde_json::json!(get_reputation_from_snapshot(&blockchain, off_id).await)
                     } else {
@@ -2214,13 +2235,15 @@ pub(super) async fn handle_server_node_status(
                         "last_seen": 0,
                         "heartbeat_count": heartbeat_count,
                         "required_heartbeats": 9,
-                        "is_reward_eligible": onchain && (heartbeat_count >= 9 || on_pace),
+                        "is_reward_eligible": onchain && (heartbeat_count >= 9 || on_pace) && !waiting && !banned,
+                        "admission": admission,
                         "reputation": reputation,
                         "current_block_height": cur_height,
                         "needs_attention": !onchain || !chain_alive || (heartbeat_count as u32) + 1 < expected,
                         // Wallet-scoped, status-independent: earned rewards stay visible/claimable.
                         "pending_rewards": pending_rewards,
                         "message": if !onchain { "Node registration not on-chain yet (onboarding)." }
+                                   else if waiting { SUPER_ADMISSION_WAITING }
                                    else if chain_alive { "Node online (on-chain heartbeat)." }
                                    else { "Node registered but offline this window." }
                     })));

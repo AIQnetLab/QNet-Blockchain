@@ -1,5 +1,6 @@
 GOOGLE PLAY STORE LISTING — QNet Wallet
-Publisher (legal): Orrery Group LLC · developer name shown on Play: QNet · package: io.aiqnet.wallet
+Publisher (legal): Orrery Group LLC · developer name shown on Play: QNet Blockchain (the Play Console
+account's developer name) · package: io.aiqnet.wallet
 
 The texts themselves live where the upload tooling reads them, one copy only:
   fastlane/metadata/android/en-US/title.txt              (30 chars max)
@@ -35,9 +36,8 @@ Privacy policy URL:   https://aiqnet.io/privacy?from=app
 Developer website:    https://aiqnet.io/explorer?from=app
 Developer email:      support@aiqnet.io   (Google publishes it)
 
-Every aiqnet.io URL given to Play carries the site's app marker (?from=app): the site then shows its app view,
-whose header leads only to the explorer and the policies, so nothing the listing links steers outside Play
-(R3-XPD-03). The full description's links follow the same rule.
+Every aiqnet.io URL given to Play carries ?from=app, which only names where the visit came from: the site shows the
+same pages with or without it. The full description's links carry the same query.
 
 ====================
 DEVICE CATALOG
@@ -57,6 +57,6 @@ Store-listing translations (English only at launch; the app itself is in ten mor
 Phone screenshots of the six scenes in store-listing/app-store-listing.txt, and 7" and 10" tablet screenshots (four or
 more each), all from the current build (store-listing/README.md, "Before submission").
 Play Console still shows the four phone screenshots saved on 23.09 from 1.1.6 (17). Their tab bar has Activate, a tab
-1.3.0 (20) does not have. Replace them with phone screenshots of the current build before the 20 release goes to review.
+1.3.0 does not have. Replace them with phone screenshots of the current build before the 21 release goes to review.
 Replace, don't just delete: the phone slot needs at least two. An upload from an empty phoneScreenshots folder does not
-remove them. Each new folder carries build.txt = 20 (__tests__/StoreListing.test.js).
+remove them. Each new folder carries build.txt = 21 (__tests__/StoreListing.test.js).

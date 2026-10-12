@@ -22,7 +22,7 @@ const inflight = new Map<string, Promise<Record<string, unknown>>>();
 
 const MESSAGES: Record<'not_confirmed_yet' | 'network_unavailable', string> = {
   not_confirmed_yet: 'The balance is not confirmed yet: the newest checkpoint is still being verified. Try again in a minute.',
-  network_unavailable: 'The network did not answer. Try again later.',
+  network_unavailable: 'QNet Blockchain did not answer. Try again later.',
 };
 
 // Nano QNC as an exact decimal QNC string.

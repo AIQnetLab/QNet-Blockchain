@@ -1,7 +1,7 @@
 {
-  "name": "QNet Explorer",
-  "short_name": "QNet",
-  "description": "Post-Quantum Blockchain Explorer",
+  "name": "QNet Blockchain Explorer",
+  "short_name": "QNet Blockchain",
+  "description": "Blocks, transactions and addresses on QNet Blockchain",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0a0e27",

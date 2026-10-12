@@ -4,7 +4,8 @@
  * - the shared verifier (src/crypto/SmtFold.js): every leaf field, the three proof kinds, strict reading;
  * - the light client: the root of a named macroblock (walking up to it only), the certified head, a node that says it
  *   holds no such macroblock, the walk's memory bound by bytes;
- * - the wallet: the certified form asked for, the older body of a node from before it, rate limits, never an unverified 0.
+ * - the wallet: the certified form asked for, the older body of a node from before it, rate limits, a folded 0 (a proven
+ *   absence too) shown as any other figure, the claim watermark with a certified figure, a network that stopped.
  * The proofs here come from a small reference tree built in this file the way the node builds its tree.
  */
 const { sha3_256 } = require('js-sha3');
@@ -303,13 +304,13 @@ const ENTRIES = IDS.map((id, i) => ({
 const REG_ROOT = lc.recomputeRegistryRoot(ENTRIES);
 const BEACON = 'bb'.repeat(32);
 const stateRootOf = (j) => (j % 256).toString(16).padStart(2, '0').repeat(32);
-function proofFor(j, { root = stateRootOf(j), pad = 0 } = {}) {
+function proofFor(j, { root = stateRootOf(j), pad = 0, ts = 0 } = {}) {
   const committee = j < 3 ? IDS.slice() : lc.sampleCommittee([...IDS].sort(), j, BEACON);
   const cp = {
     index: j, parent_qc: null, window_head_height: j * 90, window_mb_hashes: [], state_root: root, beacon: BEACON,
     epoch_commitment: lc.epochCommitment(Buffer.from(ELIGIBLE, 'hex'), committee, []),
     reward_root: ZERO, registry_root: REG_ROOT, logs_root: ZERO, dilithium_pk_root: ZERO, reward_epoch_root: ZERO,
-    total_supply: '0', timestamp: 0, proposer: IDS[0], recovery_anchor: null,
+    total_supply: '0', timestamp: ts, proposer: IDS[0], recovery_anchor: null,
   };
   const signers = committee.slice(0, lc.quorumSize(committee.length));
   return {
@@ -326,7 +327,7 @@ const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 let asked;
 let inFlight;
 let maxInFlight;
-function serveChain({ top = Infinity, answer = null, delay = 0, pad = 0, roots = {} } = {}) {
+function serveChain({ top = Infinity, answer = null, delay = 0, pad = 0, roots = {}, stamps = {} } = {}) {
   asked = [];
   inFlight = 0;
   maxInFlight = 0;
@@ -341,7 +342,7 @@ function serveChain({ top = Infinity, answer = null, delay = 0, pad = 0, roots =
       const own = answer ? answer(base, j) : undefined;
       if (own !== undefined) return own;
       if (j > top) return { ok: true, json: async () => ({ error: 'macroblock_not_found', index: j }) };
-      const body = proofFor(j, { root: roots[j], pad });
+      const body = proofFor(j, { root: roots[j], pad, ts: stamps[j] || 0 });
       const text = JSON.stringify(body);
       return { ok: true, headers: { get: () => null }, text: async () => text, json: async () => body };
     }
@@ -388,6 +389,14 @@ describe('the root of a named macroblock', () => {
     expect(lc.NOT_FOUND_MORE_NODES).toBe(2);
     expect(failures).toEqual([]);
     expect(lc.highestVerifiedIndex()).toBe(8);
+  });
+
+  it('keeps the time its checkpoint names, for display only (Assets names it when the network stopped)', async () => {
+    serveChain({ stamps: { 4: 1791400000 } });
+    await expect(lc.certifiedStateRootAt(4, () => [N1])).resolves.toMatchObject({ ok: true });
+    expect(lc.verifiedCheckpointTime(4)).toBe(1791400000 * 1000);
+    expect(lc.verifiedCheckpointTime(2)).toBe(null); // a checkpoint that names no time
+    expect(lc.verifiedCheckpointTime(99)).toBe(null); // not verified here
   });
 
   it('a root the committee certified for another index never stands for this one', async () => {
@@ -505,6 +514,8 @@ describe('the wallet reads certified proofs', () => {
     return { ok: status >= 200 && status < 300, status, text: async () => text, json: async () => JSON.parse(text), headers: { get: (h) => headers[h.toLowerCase()] ?? null } };
   };
   const genesisOf = (url) => GENESIS_NODES.find((g) => url.startsWith(`${g}/`));
+  // The certified head a balance read starts beside its proof (_balanceProofFrom); the tests below count proof reads only.
+  const headRead = (url) => /\/api\/v1\/(state\/certified|debug\/consensus-position)$/.test(url);
   const ME = PLAIN;
   const fresh = () => {
     const wm = new WalletManager();
@@ -524,7 +535,11 @@ describe('the wallet reads certified proofs', () => {
 
   it('asks for the certified form and folds to the root verified for the named macroblock', async () => {
     const urls = [];
-    global.fetch = jest.fn(async (url) => { urls.push(url); return reply(200, accountAnswer(state, ME, plainFields, 7)); });
+    global.fetch = jest.fn(async (url) => {
+      if (headRead(url)) return reply(404, {});
+      urls.push(url);
+      return reply(200, accountAnswer(state, ME, plainFields, 7));
+    });
     const wm = fresh();
     const r = await wm.getQNCBalanceWithProof(ME);
     expect(r).toMatchObject({ ok: true, verified: true, balanceNano: '5000000000', nonce: '3', index: 7, stateRoot: state.root });
@@ -538,6 +553,7 @@ describe('the wallet reads certified proofs', () => {
     const hosts = [];
     const otherState = tree([[addrKey(ME), leafOf(ME, { ...plainFields, balance: '9000000000' })]]);
     global.fetch = jest.fn(async (url) => {
+      if (headRead(url)) return reply(404, {});
       hosts.push(genesisOf(url));
       return reply(200, accountAnswer(otherState, ME, { ...plainFields, balance: '9000000000' }, 7));
     });
@@ -548,17 +564,147 @@ describe('the wallet reads certified proofs', () => {
     expect(hosts.every(Boolean)).toBe(true);
   });
 
-  it('an absence counts only with its proof; a 0 nothing verified is never given as a balance', async () => {
+  // Owner, 11.10: a wallet with nothing in it shows 0, never a dash. A proven absence (exists:false, its proof folded to
+  // the root the node served) counts exactly as a figure that is not 0 under the same rules: early, then not verified
+  // while the walk has not certified the root. Before, an uncertified 0 was no figure at all (ok:false).
+  it('an absence counts only with its proof, and a folded 0 is a figure like any other', async () => {
     global.fetch = jest.fn(async () => reply(200, accountAnswer(state, 'eon_golden_absent', null, 7)));
     const wm = fresh();
     await expect(wm.getQNCBalanceWithProof('eon_golden_absent')).resolves.toMatchObject({ ok: true, verified: true, balanceNano: '0', exists: false });
-    // The same absence, not certified: no figure at all.
+    // The same absence, not certified: shown as not verified, early and at the end.
     wm._certifiedRootFresh = jest.fn(async () => ({ ok: false, reason: 'unconfirmed' }));
     WalletManager.sendProofs.clear();
-    await expect(wm.getQNCBalanceWithProof('eon_golden_absent')).resolves.toMatchObject({ ok: false, balance: null, reason: 'unconfirmed' });
-    // A node's word without a proof: no figure either.
+    const early = [];
+    await expect(wm.getQNCBalanceWithProof('eon_golden_absent', true, { onFigure: (f) => early.push(f) })).resolves
+      .toMatchObject({ ok: true, verified: false, balance: 0, balanceNano: '0', exists: false, reason: 'unconfirmed' });
+    expect(early).toEqual([expect.objectContaining({ balance: 0, balanceNano: '0', folded: true, figureClaimedEpoch: 0 })]);
+    expect(early[0].lastClaimedEpoch).toBeUndefined(); // no certified watermark before the walk certified the root
+    // Nothing of it is kept for a send: a send checks its own certified figure.
+    expect(WalletManager.sendProofs.get('qnc|eon_golden_absent')).toBeUndefined();
+    // A node's word without a proof: no figure.
     global.fetch = jest.fn(async () => reply(200, { balance: 0, nonce: 0 }));
     await expect(wm.getQNCBalanceWithProof('eon_golden_absent')).resolves.toMatchObject({ ok: false, balance: null });
+  });
+
+  it('an absence in a shared bucket and an account whose balance is 0 fold to a 0 the same way', async () => {
+    const zero = 'eon_golden_zero';
+    const zeroFields = fieldsOf({ nonce: '2' });
+    const withZero = tree([[addrKey(PLAIN), leafOf(PLAIN, plainFields)], [addrKey(zero), leafOf(zero, zeroFields)]]);
+    // Another key in the absent address's bucket: its absence is proven by the bucket's entries.
+    const absent = 'eon_golden_absent';
+    const bucketed = tree([[addrKey(PLAIN), leafOf(PLAIN, plainFields)], [coBucket(addrKey(absent)), leafOf(PLAIN, plainFields)]]);
+    expect(bucketed.prove(addrKey(absent)).kind).toBe('absence_in_bucket');
+    for (const [t, address, f, kind] of [[withZero, zero, zeroFields, 'inclusion'], [bucketed, absent, null, 'absence_in_bucket']]) {
+      global.fetch = jest.fn(async () => reply(200, accountAnswer(t, address, f, 7)));
+      const wm = new WalletManager();
+      wm._certifiedRootFresh = jest.fn(async () => ({ ok: false, reason: 'unconfirmed' }));
+      const early = [];
+      const r = await wm.getQNCBalanceWithProof(address, true, { onFigure: (x) => early.push(x) });
+      expect([kind, r.ok, r.verified, r.balanceNano, early.length]).toEqual([kind, true, false, '0', 1]);
+    }
+  });
+
+  it('a figure whose proof did not fold under the root its node served is never shown, 0 or not', async () => {
+    for (const f of [plainFields, fieldsOf()]) {
+      const answer = accountAnswer(f === plainFields ? state : tree([[addrKey(ME), leafOf(ME, f)]]), ME, f, 7);
+      global.fetch = jest.fn(async () => reply(200, { ...answer, state_root: 'ab'.repeat(32) }));
+      const wm = new WalletManager();
+      wm._certifiedRootFresh = jest.fn(async () => ({ ok: false, reason: 'unconfirmed' }));
+      const early = [];
+      await expect(wm.getQNCBalanceWithProof(ME, true, { onFigure: (x) => early.push(x) })).resolves
+        .toMatchObject({ ok: false, balance: null, reason: 'unconfirmed' });
+      expect(early).toEqual([]);
+    }
+  });
+
+  // Owner, 11.10: a move in transit ends only by a certified watermark. The figure's own watermark (bound to it by the
+  // fold) rides with every figure, so the screen's in-transit line follows the figure on screen; the certified one
+  // (`lastClaimedEpoch`) only with a verified figure, never early and never with a figure whose root was not certified.
+  it('the account\'s claim watermark: the figure\'s own with every figure, the certified one only with a verified figure', async () => {
+    global.fetch = jest.fn(async () => reply(200, accountAnswer(state, ME, plainFields, 7)));
+    const early = [];
+    await expect(fresh().getQNCBalanceWithProof(ME, true, { onFigure: (f) => early.push(f) })).resolves
+      .toMatchObject({ ok: true, verified: true, lastClaimedEpoch: 10, figureClaimedEpoch: 10 });
+    expect(early[0].figureClaimedEpoch).toBe(10);
+    expect(early[0].lastClaimedEpoch).toBeUndefined();
+    // The same answer whose root the walk did not certify: the figure's watermark, no certified one.
+    const unconfirmed = fresh();
+    unconfirmed._certifiedRootFresh = jest.fn(async () => ({ ok: false, reason: 'unconfirmed' }));
+    const notCertified = await unconfirmed.getQNCBalanceWithProof(ME);
+    expect([notCertified.verified, notCertified.figureClaimedEpoch, notCertified.lastClaimedEpoch]).toEqual([false, 10, undefined]);
+    const legacy = { address: ME, balance: 5000000000, nonce: 3, heartbeat_epoch: 12, heartbeat_slots: 0x01ff, heartbeat_final_epoch: 0,
+      heartbeat_final_slots: 0, last_claimed_epoch: 10, banned_at_height: 0, is_node: false,
+      merkle_proof: state.prove(addrKey(ME)).steps, state_root: state.root, block_height: 700, proof_valid: true };
+    global.fetch = jest.fn(async () => reply(200, legacy));
+    const wm = new WalletManager();
+    wm._certifiedFresh = jest.fn(async () => false);
+    const live = [];
+    const r = await wm.getQNCBalanceWithProof(ME, true, { onFigure: (f) => live.push(f) });
+    expect(r).toMatchObject({ ok: true, verified: false, figureClaimedEpoch: 10 });
+    expect(r.lastClaimedEpoch).toBeUndefined();
+    expect([live[0].figureClaimedEpoch, live[0].lastClaimedEpoch]).toEqual([10, undefined]);
+  });
+
+  it('a token proven absent is a 0 shown as not verified until the root is certified', async () => {
+    const holderless = tree([[addrKey(PLAIN), leafOf(PLAIN, plainFields)]]);
+    const level1 = holderless.prove(addrKey(CONTRACT));
+    const body = {
+      proof_format: 2, contract_address: CONTRACT, holder: PLAIN, macroblock_index: 7, state_height: 630, state_root: holderless.root,
+      contract_status: 'absent', account_proof_kind: level1.kind, account_proof: level1.steps, account_balance: '0',
+      account_nonce: '0', contract_code_hash: null, storage_root: null, heartbeat_epoch: '0', heartbeat_slots: 0,
+      heartbeat_final_epoch: '0', heartbeat_final_slots: 0, last_claimed_epoch: '0', banned_at_height: '0', is_node: false,
+      ...(level1.entries ? { account_bucket_entries: level1.entries } : {}),
+    };
+    global.fetch = jest.fn(async () => reply(200, body));
+    const wm = new WalletManager();
+    wm._certifiedRootFresh = jest.fn(async () => ({ ok: false, reason: 'unconfirmed' }));
+    const r = await wm.getTokenBalanceWithProof(CONTRACT, PLAIN, 1, true, { index: 7 });
+    // Before (11.10) this was ok:false: a token the wallet holds none of had no figure.
+    expect(r).toMatchObject({ ok: true, verified: false, balanceBase: '0', balance: '0', reason: 'unconfirmed' });
+  });
+
+  it('the network stopped certifying: the same head for five minutes, with the time its checkpoint names once verified', async () => {
+    let head = 40;
+    global.fetch = jest.fn(async (url) => {
+      if (url.endsWith('/api/v1/state/certified')) return reply(200, { proof_format: 2, views: [], newest_certified_index: head, finalized_height: 0, applied_height: 1, capture: 'ok' });
+      return reply(404, {});
+    });
+    const wm = new WalletManager();
+    const t0 = Date.now();
+    await expect(wm.networkPause(t0)).resolves.toBe(null);
+    expect(WalletManager.HEAD_STALL_MS).toBe(5 * 60_000);
+    // Still 40 more than five minutes on: stopped, and no time is named while no checkpoint of it was verified here (the
+    // time this device first saw the head is not when the network certified it).
+    await expect(wm.networkPause(t0 + WalletManager.HEAD_STALL_MS + 60_000)).resolves.toEqual({ index: 40, since: null });
+    // A newer head: moving again.
+    head = 41;
+    wm._headHint = null;
+    wlc.clearQcCache();
+    const t1 = Date.now();
+    await expect(wm.networkPause(t1 + 1000)).resolves.toBe(null);
+    expect(wm._headSeen.idx).toBe(41);
+    // No head to be read: unknown, never "running".
+    global.fetch = jest.fn(async () => { throw new TypeError('Network request failed'); });
+    wm._headHint = null;
+    wlc.clearQcCache();
+    await expect(wm.networkPause(t1 + WalletManager.HEAD_STALL_MS * 2)).resolves.toBeUndefined();
+  });
+
+  // Owner, 11.10: the honest time of the last certified state, never when this device first saw the head.
+  it("a stopped network's head one step above what this device holds: one step walked for the time its checkpoint names", async () => {
+    serveChain({ stamps: { 4: 1791400000, 6: 1791400090 } });
+    await wlc.certifiedStateRootAt(4, () => [N1]);
+    expect([wlc.stepsToVerify(4), wlc.stepsToVerify(6), wlc.stepsToVerify(8)]).toEqual([0, 1, 2]);
+    const wm = new WalletManager();
+    wm._networkHeadIndex = jest.fn(async () => 6);
+    wm._lineageNodes = () => [N1];
+    const t0 = Date.now();
+    wm._headSeen = { idx: 6, at: t0 };
+    await expect(wm.networkPause(t0 + WalletManager.HEAD_STALL_MS)).resolves.toEqual({ index: 6, since: 1791400090 * 1000 });
+    // Two steps above what it holds: not walked for this line, and no time named.
+    wm._headSeen = { idx: 10, at: t0 };
+    await expect(wm.networkPause(t0 + WalletManager.HEAD_STALL_MS + 120_000)).resolves.toEqual({ index: 10, since: null });
+    expect(asked.some(([, j]) => j > 6)).toBe(false);
   });
 
   it('a node from before certified proofs: its proof still counts when its root is certified, and it is asked last', async () => {
@@ -566,7 +712,11 @@ describe('the wallet reads certified proofs', () => {
       heartbeat_final_slots: 0, last_claimed_epoch: 10, banned_at_height: 0, is_node: false,
       merkle_proof: state.prove(addrKey(ME)).steps, state_root: state.root, block_height: 700, proof_valid: true };
     const first = [];
-    global.fetch = jest.fn(async (url) => { first.push(genesisOf(url)); return reply(200, legacy); });
+    global.fetch = jest.fn(async (url) => {
+      if (headRead(url)) return reply(404, {});
+      first.push(genesisOf(url));
+      return reply(200, legacy);
+    });
     const wm = new WalletManager();
     wm._certifiedFresh = jest.fn(async (root, height) => root === state.root && height === 700);
     const r = await wm.getQNCBalanceWithProof(ME);
@@ -581,6 +731,7 @@ describe('the wallet reads certified proofs', () => {
     let n = 0;
     const hosts = [];
     global.fetch = jest.fn(async (url) => {
+      if (headRead(url)) return reply(404, {});
       hosts.push(genesisOf(url));
       n += 1;
       if (n === 1) return reply(429, { proof_format: 2, error: 'rate_limited', retry_after_seconds: 30 }, { 'retry-after': '30' });
