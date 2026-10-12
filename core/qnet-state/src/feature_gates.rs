@@ -199,9 +199,10 @@ pub const EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT: u64 = 3_505_410;
 /// membership. Asked at the epoch's first block by the settle writer of super_elig_{N}, so producer, replicas and
 /// snapshot joiners file one set; the claim path never asks it, so earned rewards stay claimable. Below it every
 /// qualifying super earns and stored rows replay unchanged. A consensus rule (the set feeds reward_root): every node
-/// must run the binary before this epoch settles. Provisional: epoch 254, the height of the three gates above, until
-/// scripts/gate-height.sh sets it at push time; once any node has crossed it, the height never changes.
-pub const SUPER_REWARD_ADMISSION_GATE_HEIGHT: u64 = 3_657_600;
+/// must run the binary before this epoch settles. Epoch 258: the release that ships it rolls after the three gates
+/// above (epoch 254) are crossed, and this boundary is the first one far enough above that roll. Once any node has
+/// crossed it, the height never changes.
+pub const SUPER_REWARD_ADMISSION_GATE_HEIGHT: u64 = 3_715_200;
 
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
@@ -425,6 +426,8 @@ mod tests {
     fn super_reward_admission_is_epoch_aligned_above_the_allowlist() {
         let h = super::SUPER_REWARD_ADMISSION_GATE_HEIGHT;
         assert_eq!(h % 14_400, 0, "an epoch boundary");
+        assert_eq!(h / 14_400, 258, "epoch 258");
+        assert!(h > super::TX_TARGET_BOUND_GATE_HEIGHT, "above the gates the release rolls after");
         assert!(h > super::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT, "the allowlist governs every gated epoch");
         assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
         assert!(h < i64::MAX as u64, "shell arithmetic in the roll script holds it");
@@ -465,11 +468,12 @@ mod tests {
 
     /// SIGBIND-R1-03: the roll script accepted any moved gate whose new height was ahead of the tip, so a gate
     /// the fleet had crossed could be moved up and every block between replayed under the other rule. A gate
-    /// whose old height is within the margin of the tip is refused as frozen, before the ahead-of-tip check.
+    /// whose old height is within the margin of the tip (FINISH_MARGIN in a mixed fleet) is refused as frozen,
+    /// before the ahead-of-tip check.
     #[test]
     fn the_roll_script_freezes_a_crossed_gate() {
         let script = include_str!("../../../scripts/deploy-genesis.sh");
-        let frozen = script.find(r#"[ "$ov" -le $((tip + GATE_MARGIN)) ]"#).expect("the frozen-gate test");
+        let frozen = script.find(r#"[ "$ov" -le $((tip + crossed)) ]"#).expect("the frozen-gate test");
         let refusal = script.find("gate already crossed").expect("its refusal");
         let ahead = script.find(r#"if [ "$nv" -gt $((tip + GATE_MARGIN)) ]; then"#).expect("the ahead-of-tip check");
         assert!(frozen < refusal && refusal < ahead, "the frozen check runs first");

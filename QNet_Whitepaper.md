@@ -635,7 +635,7 @@ Eligibility is proven on-chain, not self-attested. A **super or genesis** node n
 heartbeat sub-window popcount of at least 9 for the epoch, read from committed account state: the 14,400-block epoch
 is divided into ten sub-windows of 1440 blocks, a heartbeat transaction sets its sub-window's bit, and it is
 admissible only within `HB_ANCHOR_MAX_LAG = 90` blocks of its anchor — which is also why the eligible set is sampled
-90 blocks past the epoch boundary rather than at it. From the `super_reward_admission` gate (epoch 254) it must also be
+90 blocks past the epoch boundary rather than at it. From the `super_reward_admission` gate (epoch 258) it must also be
 in the epoch's consensus-admitted set, decided at the epoch's first block; while the emergency committee allowlist is in
 force that set is the allowlist. Rewards already earned stay claimable whatever the admission. A **light** node is eligible if its bit is set in the per-epoch
 bitmaps published by the genesis nodes, indexed by its permanent registration index: each of the five hash shards is

@@ -250,6 +250,11 @@ mod producer_cache {
     // DashMap provides concurrent read/write without blocking tokio runtime
     pub static CACHED_PRODUCER_SELECTION: Lazy<DashMap<u64, (String, Vec<(String, f64)>)>> = 
         Lazy::new(|| DashMap::new());
+
+    /// The local seal (`last_sealed_mb_index`) each cached selection was computed at. A frozen roster derives from
+    /// that seal, so a selection computed before the seal moved is recomputed rather than reused for the rest of
+    /// its round, and is no authority at ingest meanwhile.
+    pub static CACHED_SELECTION_SEAL: Lazy<DashMap<u64, u64>> = Lazy::new(|| DashMap::new());
 }
 
 // PRODUCTION v4.0: Global VRF instance for static access in select_producer
@@ -878,6 +883,9 @@ pub(crate) fn test_seed_producer_selection(leadership_round: u64, round0: &str, 
 pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
     let lr = if height <= ROTATION_INTERVAL_BLOCKS { 0 }
              else { (height - 1) / ROTATION_INTERVAL_BLOCKS };
+    if let (Some(at), Some(s)) = (producer_cache::CACHED_SELECTION_SEAL.get(&lr), try_get_storage()) {
+        if *at != s.last_sealed_mb_index() { return None; }
+    }
     let entry = producer_cache::CACHED_PRODUCER_SELECTION.get(&lr)?;
     let (round0_producer, candidates) = entry.value();
     if candidates.is_empty() { return None; }
@@ -2511,6 +2519,44 @@ pub(crate) fn production_throttle_reason(next_block_height: u64, last_finalized:
         * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
     let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_DERIVED_BLOCKS;
     if seal_over { Some("roster_derivation_horizon") } else { None }
+}
+
+/// Node policy, never a change to who the schedule names: why this node's election for `next_block_height` must not
+/// stand as the slot's authority here (the Category-B expectation ingest enforces against other producers), or None.
+///   - "past_derivation_horizon": the height lies past this node's own frozen-roster horizon (production parks
+///     there too). A node there can only have elected from a seal the network has moved past: on 12.10, nodes still
+///     at seal 38948 elected from its eight members while the rest elected from the six of 38949 and later, and
+///     hard-rejected the new heights.
+///   - "seal_behind_finality": the window's roster is frozen here (macroblock w-2 is not sealed locally and no newer
+///     certified macroblock is held) while this node's certified finality runs more than the unsealed tail past its
+///     seal. Its frozen anchor is its own newest seal, and peers that sealed further elect from newer macroblocks.
+///     It stops producing too only on proof that they did (`peer_sealed_past`): a seal held or refused on every node
+///     at once looks the same from here, and there A1 production off the common frozen anchor must go on, since
+///     only later commits release a held seal. In a genuine finality stall finality does not run ahead at all.
+pub(crate) fn election_abstain_reason(next_block_height: u64, last_sealed: u64, seal_base: u64,
+                                      finalized: u64, frozen: bool) -> Option<&'static str> {
+    if production_throttle_reason(next_block_height, 0, seal_base).is_some() {
+        return Some("past_derivation_horizon");
+    }
+    let mb = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let tail = (MAX_UNSEALED_WINDOWS + 1).saturating_mul(mb);
+    if frozen && finalized > last_sealed.saturating_mul(mb).saturating_add(tail) {
+        return Some("seal_behind_finality");
+    }
+    None
+}
+
+/// Highest macroblock index whose certificate this node verified on receipt from a peer: proof that the network
+/// sealed that far, whatever this node managed to store. Node policy only (`seal_behind_finality`).
+static PEER_CERTIFIED_MB: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_peer_certified_macroblock(index: u64) {
+    PEER_CERTIFIED_MB.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a peer's certified macroblock above `seal` verified here.
+pub(crate) fn peer_sealed_past(seal: u64) -> bool {
+    PEER_CERTIFIED_MB.load(std::sync::atomic::Ordering::Relaxed) > seal
 }
 
 /// Local right-to-produce precondition — the companion to production_throttle_reason.
@@ -5252,6 +5298,8 @@ impl BlockchainNode {
             // Reward shards, so a gap cannot outlive the process that opened it. Root-verified: an
             // epoch is only healed when the rebuilt leaf-set hashes to the committed reward_root.
             Self::backfill_reward_shards(&storage);
+            // The recipient index an epoch needs before the shard cache may drop it.
+            Self::index_reward_recipients(&storage);
             // Macroblocks are never pruned on a Super (archival role), so their committee signatures
             // are the one store with no horizon. Strip them past the cold-join walk budget; the
             // checkpoint half every stored reader uses stays.

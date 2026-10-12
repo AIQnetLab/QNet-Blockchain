@@ -175,8 +175,11 @@ pub(super) async fn handle_claim_rewards(
         let mut total_amount: u64 = 0;
         // Reported so a wallet knows WHY the batch ended and can retry elsewhere.
         let mut stopped_at: Option<(u64, &'static str)> = None;
-        // One O(roster) rebuild per request: this endpoint must not amplify into repeated full walks.
-        let mut rebuilt = false;
+        // Rebuilds are bounded by the leaves they produce, so this endpoint cannot amplify into repeated full
+        // walks: one rebuild always fits, and more while the epochs rebuilt are small (the early ones are).
+        const REBUILD_LEAF_BUDGET: usize = 65_536;
+        let mut rebuilt_leaves: usize = 0;
+        let mut rebuilt_any = false;
         const MAX_BATCH: usize = 512; // bound the TX size; the wallet re-calls for any remainder
         // The quote goes back out over the wire signed, so it must be bounded in BYTES: proof depth
         // grows with the recipient count, so an epoch count alone cannot keep the body under the route
@@ -200,9 +203,10 @@ pub(super) async fn handle_claim_rewards(
                 None => { stopped_at = Some((epoch, "root_not_here")); break; }
             };
             // Resolve from the shard cache (one shard + meta, never the whole leaf set); the shard
-            // roots are re-verified against the certified root before proving. Absent = cache miss,
-            // rebuildable from durable indices — bounded to one rebuild per request.
-            let claim = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true) {
+            // roots are re-verified against the certified root before proving. An epoch the cache no
+            // longer holds is passed from the recipient index when the wallet has no leaf in it; Absent =
+            // a leaf may be there, rebuildable from durable indices within the rebuild budget.
+            let claim = match crate::node::BlockchainNode::reward_claim_at(&storage, epoch, &committed_root, &wallet_address, true) {
                 crate::node::ShardClaim::Absent => {
                     const REBUILD_RETRY_SECS: u64 = 3600;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -211,10 +215,14 @@ pub(super) async fn handle_claim_rewards(
                         stopped_at = Some((epoch, "local_corruption"));
                         break;
                     }
-                    if rebuilt { stopped_at = Some((epoch, "rebuild_budget")); break; }
-                    rebuilt = true;
+                    if rebuilt_any && rebuilt_leaves >= REBUILD_LEAF_BUDGET {
+                        stopped_at = Some((epoch, "rebuild_budget"));
+                        break;
+                    }
+                    rebuilt_any = true;
                     let w = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, ctotal)
                         .map(|x| x.0).unwrap_or_default();
+                    rebuilt_leaves = rebuilt_leaves.saturating_add(w.len().max(1));
                     if crate::node::BlockchainNode::epoch_reward_merkle_root(&w, epoch) != committed_root {
                         // Inputs present but they do not reproduce the certified root: local data is
                         // corrupt, not merely missing. Alarm and stop; a resync is the repair.
@@ -224,6 +232,11 @@ pub(super) async fn handle_claim_rewards(
                         break;
                     }
                     crate::node::BlockchainNode::save_epoch_reward_sharded(&storage, epoch, &w);
+                    // The set matched the certified root, so it also gives the epoch its recipient index:
+                    // no later walk rebuilds it to learn that a wallet has no leaf there.
+                    if let Some(raw) = hex::decode(&committed_root).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+                        crate::node::BlockchainNode::index_epoch_recipients(&storage, epoch, &raw, &w);
+                    }
                     crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true)
                 }
                 other => other,
@@ -360,7 +373,7 @@ pub(super) async fn wallet_first_unclaimed_epoch(blockchain: &BlockchainNode, wa
             Some(_) => continue, // epoch distributed nothing
             None => return None, // cannot resolve here; reporting a later epoch would be a lie
         };
-        match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &root, wallet, false) {
+        match crate::node::BlockchainNode::reward_claim_at(&storage, epoch, &root, wallet, false) {
             crate::node::ShardClaim::Proof(_, _) => return Some(epoch),
             crate::node::ShardClaim::NotRecipient => continue,
             _ => return None,
@@ -396,7 +409,7 @@ pub(super) async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &s
         // O(N) leaf-set rebuild (the Absent self-heal is the sig-gated claim path's job) — otherwise a
         // cheap public request could amplify into a full-roster recompute. On Absent/Divergent skip the
         // epoch; the figure self-corrects once the shards are present (via apply/finalization or a claim).
-        let amt = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, wallet, false) {
+        let amt = match crate::node::BlockchainNode::reward_claim_at(&storage, epoch, &committed_root, wallet, false) {
             crate::node::ShardClaim::Proof(a, _) => a,
             crate::node::ShardClaim::NotRecipient => continue, // no leaf here — the claim path keeps batching
             _ => break,                                       // unservable: the claim path stops here
@@ -649,7 +662,7 @@ pub(super) async fn handle_get_reward_history(
         // Amount + servability in one resolution, verified against the 2f+1-committed root.
         let (amount, servable) = match storage.load_epoch_root(epoch) {
             Ok(Some(r)) if r != [0u8; 32] && !wallet.is_empty() => {
-                match crate::node::BlockchainNode::reward_proof_from_shard(
+                match crate::node::BlockchainNode::reward_claim_at(
                     &storage, epoch, &hex::encode(r), &wallet, false) {
                     crate::node::ShardClaim::Proof(a, _) => (a, true),
                     crate::node::ShardClaim::NotRecipient => (0, true),

@@ -1170,6 +1170,19 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         Ok(self.db.get_cf(&cf, b"galc_held")?)
     }
+    // The GALC v2 wallet capsule, under its own key: v1's value is read as v1's bincode at boot, at
+    // rollback and over P2P. Re-verified against the embedded genesis keys on reload.
+    pub fn put_galc_v2_held(&self, bytes: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"galc_v2_held", bytes)?;
+        Ok(())
+    }
+    pub fn get_galc_v2_held(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"galc_v2_held")?)
+    }
     // Adopted cold-join snapshot anchor (anchor_mb u64 LE ++ anchor hash [u8;32]) — persisted so a
     // warm-restarted joiner reloads its trusted floor (the SNAPSHOT_ANCHOR_MB static resets on restart).
     pub fn put_snapshot_anchor(&self, bytes: &[u8]) -> IntegrationResult<()> {

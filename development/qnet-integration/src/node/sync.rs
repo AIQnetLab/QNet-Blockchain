@@ -2,6 +2,22 @@
 
 use super::*;
 
+/// The longest runtime stall the watchdog takes for boundary work's known pause (a snapshot pin or frame write, an
+/// epoch's body expiry) rather than a real stall.
+const BOUNDARY_STALL_MAX_MS: u64 = 3_000;
+
+/// Whether a stall that began at `beat` and has lasted `stall_ms` so far is boundary work's pause: shorter than
+/// BOUNDARY_STALL_MAX_MS, beginning within 30 s of the last boundary work stamp `boundary`, and the first such stall
+/// in 30 s (`last_deferral` is when the previous one began). The watchdog holds it back and logs it at WARN when it
+/// ends; one that lasts longer, a second one, or any stall away from boundary work is a [CRIT] as before.
+fn runtime_stall_is_boundary_pause(stall_ms: u64, beat: u64, boundary: u64, last_deferral: u64) -> bool {
+    const GRACE_MS: u64 = 30_000;
+    stall_ms < BOUNDARY_STALL_MAX_MS
+        && boundary > 0
+        && beat.abs_diff(boundary) <= GRACE_MS
+        && beat.saturating_sub(last_deferral) >= GRACE_MS
+}
+
 /// Anchors this process already dropped as poisoned (see verify_v2_macroblock): one attempt each.
 static POISONED_ANCHORS_DROPPED: once_cell::sync::Lazy<dashmap::DashMap<u64, ()>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
@@ -856,6 +872,7 @@ impl BlockchainNode {
             if is_info() {
                 println!("[INFO][MB] v2_qc_ok mb={}", index);
             }
+            note_peer_certified_macroblock(index);
             // The certified reward root is persisted by save_macroblock, atomically with this
             // macroblock. No adoption step: there is nothing to reconcile.
             // Catch-up safety-net (§4.5): hand the now-VERIFIED (checkpoint, QC) to the BFT2 driver so
@@ -1137,6 +1154,9 @@ impl BlockchainNode {
                 const STALL_MS: u64 = 2_000;
                 let mut episode_beat: u64 = 0;
                 let mut episode_max: u64 = 0;
+                // A stall held back as boundary work's known pause: its facts, kept for the [CRIT] if it lasts.
+                let mut held: Option<String> = None;
+                let mut last_deferral: u64 = 0;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
                     let beat = RUNTIME_BEAT_MS.load(Ordering::Relaxed);
@@ -1147,6 +1167,10 @@ impl BlockchainNode {
                     let stall_ms = now_ms.saturating_sub(beat);
                     if stall_ms < STALL_MS {
                         if episode_beat != 0 {
+                            if let Some(facts) = held.take() {
+                                println!("[WARN][WATCHDOG] runtime_stall_boundary stalled_ms={} boundary_ms={} {}",
+                                         episode_max, crate::storage::LAST_BOUNDARY_WORK_MS.load(Ordering::Relaxed), facts);
+                            }
                             println!("[INFO][WATCHDOG] runtime_recovered stalled_ms={}", episode_max);
                             episode_beat = 0;
                             episode_max = 0;
@@ -1154,7 +1178,15 @@ impl BlockchainNode {
                         continue;
                     }
                     episode_max = episode_max.max(stall_ms);
-                    if episode_beat == beat { continue; } // one report per episode
+                    if episode_beat == beat {
+                        // A held stall that outlasts boundary work's pause is a real one after all.
+                        if stall_ms >= BOUNDARY_STALL_MAX_MS {
+                            if let Some(facts) = held.take() {
+                                println!("[CRIT][WATCHDOG] runtime_stalled stall_ms={} {} after_boundary=true", stall_ms, facts);
+                            }
+                        }
+                        continue; // one report per episode
+                    }
                     episode_beat = beat;
                     // Non-blocking probe: names the suspect instead of just recording the symptom.
                     let committee_lock = match crate::unified_p2p::CURRENT_COMMITTEE.try_read() {
@@ -1169,8 +1201,15 @@ impl BlockchainNode {
                         }
                         None => "workers=? alive_tasks=? global_queue=?".to_string(),
                     };
-                    println!("[CRIT][WATCHDOG] runtime_stalled stall_ms={} committee_lock={} beat_ms={} {} {}",
-                             stall_ms, committee_lock, beat, tokio_facts, storage.rocksdb_stall_facts());
+                    let facts = format!("committee_lock={} beat_ms={} {} {}",
+                                        committee_lock, beat, tokio_facts, storage.rocksdb_stall_facts());
+                    let boundary = crate::storage::LAST_BOUNDARY_WORK_MS.load(Ordering::Relaxed);
+                    if runtime_stall_is_boundary_pause(stall_ms, beat, boundary, last_deferral) {
+                        last_deferral = beat;
+                        held = Some(facts);
+                        continue;
+                    }
+                    println!("[CRIT][WATCHDOG] runtime_stalled stall_ms={} {}", stall_ms, facts);
                 }
             });
         if spawned.is_ok() {
@@ -1216,4 +1255,23 @@ impl BlockchainNode {
         Ok(())
     }
     
+}
+
+#[cfg(test)]
+mod runtime_stall_tests {
+    use super::*;
+
+    // A single stall under 3 s at boundary work is its known pause; a longer one, a second within 30 s, or a stall
+    // away from boundary work stays a [CRIT].
+    #[test]
+    fn only_a_single_short_stall_at_boundary_work_is_held_back() {
+        let b = 1_000_000u64;
+        assert!(runtime_stall_is_boundary_pause(2_100, b + 4_000, b, 0), "short, just after the boundary");
+        assert!(runtime_stall_is_boundary_pause(2_100, b - 1_000, b, 0), "the work stamped while it stalled");
+        assert!(!runtime_stall_is_boundary_pause(3_000, b + 4_000, b, 0), "3 s or more is a real stall");
+        assert!(!runtime_stall_is_boundary_pause(2_100, b + 31_000, b, 0), "away from boundary work");
+        assert!(!runtime_stall_is_boundary_pause(2_100, b + 4_000, 0, 0), "no boundary work seen yet");
+        assert!(!runtime_stall_is_boundary_pause(2_100, b + 9_000, b, b + 4_000), "a second stall in the grace");
+        assert!(runtime_stall_is_boundary_pause(2_100, b + 40_000, b + 39_000, b + 4_000), "the next boundary's first");
+    }
 }

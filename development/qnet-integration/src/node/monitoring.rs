@@ -160,6 +160,9 @@ impl BlockchainNode {
                 // Extract tx_type as string for explorer
                 let tx_type_str = format!("{:?}", tx.tx_type);
                 let (shown_to, shown_amount) = crate::rpc::tx_display_to_amount(&tx);
+                // A claim that credited nothing is in its block but is no confirmed credit.
+                let (status, shown_amount) = crate::rpc::claim_outcome_display(&self.storage, &tx)
+                    .unwrap_or(("confirmed", shown_amount));
 
                 Ok(Some(TransactionInfo {
                     hash: tx.hash,
@@ -171,7 +174,7 @@ impl BlockchainNode {
                     gas_limit: tx.gas_limit,
                     timestamp: tx.timestamp,
                     block_height,
-                    status: "confirmed".to_string(),
+                    status: status.to_string(),
                     tx_type: Some(tx_type_str),
                     // Fast Finality Indicators
                     confirmation_level: Some(confirmation_level),

@@ -73,6 +73,8 @@ pub(crate) enum WalletRoute {
     TokenProof,
     LogsProof,
     MacroblockProof,
+    /// The GALC v2 capsule: light (about 21 KB), its own buckets.
+    GalcCapsule,
     Registry,
     ServeProof,
     NodesRpc,
@@ -107,6 +109,7 @@ fn route_of(path: &str, query: Option<&str>) -> Option<WalletRoute> {
         ["api", "v1", "token", c, h, "balance", "proof"] if key(c) && key(h) && query_has_mb(query) => WalletRoute::TokenProof,
         ["api", "v1", "logs", "proof"] => WalletRoute::LogsProof,
         ["api", "v1", "macroblock", j, "proof"] if decimal_segment(j) => WalletRoute::MacroblockProof,
+        ["api", "v1", "galc", "capsule"] => WalletRoute::GalcCapsule,
         ["api", "v1", "registry", "height", h] if decimal_segment(h) => WalletRoute::Registry,
         ["api", "v1", "node", "serve-proof"] => WalletRoute::ServeProof,
         ["api", "v1", "nodes", "rpc"] => WalletRoute::NodesRpc,

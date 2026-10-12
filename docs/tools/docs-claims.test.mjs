@@ -253,12 +253,13 @@ test('SD-R2-13: the protocol names the app-access-risk verdict a licensed store 
 // DEV-R2-01: every rate-limit bucket the node defines has its row, with the node's numbers.
 test('DEV-R2-01: the rate-limit table is the node\'s ApiRateLimiter', () => {
   const rpc = read('development/qnet-integration/src/rpc/mod.rs');
-  // A bucket named by a constant (`certified_proofs::CERTIFIED_PROOF_BUCKET`) is read as that constant's value.
-  const proofs = read('development/qnet-integration/src/rpc/certified_proofs.rs');
-  const bucketName = (literal, constant) => literal ?? proofs.match(new RegExp(`const ${constant}: &str = "([a-z_]+)";`))?.[1];
+  // A bucket named by a constant (`certified_proofs::CERTIFIED_PROOF_BUCKET`, `galc_api::GALC_CAPSULE_BUCKET`) is read
+  // as that constant's value in its module.
+  const bucketName = (literal, module, constant) => literal
+    ?? read(`development/qnet-integration/src/rpc/${module}.rs`).match(new RegExp(`const ${constant}: &str = "([a-z_]+)";`))?.[1];
   const configs = new Map([...rpc.matchAll(
-    /configs\.insert\((?:"([a-z_]+)"|certified_proofs::([A-Z_]+))\.to_string\(\), RateLimitConfig \{\s*max_requests: (\w+),\s*window_seconds: (\d+),\s*block_duration: (\d+),?\s*\}\);/g,
-  )].map((m) => [bucketName(m[1], m[2]), { max: m[3], window: m[4], block: m[5] }]));
+    /configs\.insert\((?:"([a-z_]+)"|(certified_proofs|galc_api)::([A-Z_]+))\.to_string\(\), RateLimitConfig \{\s*max_requests: (\w+),\s*window_seconds: (\d+),\s*block_duration: (\d+),?\s*\}\);/g,
+  )].map((m) => [bucketName(m[1], m[2], m[3]), { max: m[4], window: m[5], block: m[6] }]));
   // Every bucket the node inserts is read, so a bucket in a shape this pattern misses fails here.
   const inserts = (rpc.match(/configs\.insert\(/g) ?? []).length;
   assert.ok(configs.size > 0 && configs.size === inserts, `${configs.size} of ${inserts} buckets read from mod.rs`);

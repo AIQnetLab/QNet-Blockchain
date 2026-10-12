@@ -8,6 +8,7 @@ mod queries_api;
 use queries_api::*;
 mod certified_proofs;
 use certified_proofs::*;
+mod galc_api;
 // N2: the wallet plane (HTTPS on host 443), its certificates, and the node's serving identity.
 pub(crate) mod wallet_plane;
 use wallet_plane::{WalletPeer, WalletPlane};
@@ -76,6 +77,15 @@ pub(crate) fn tx_display_to_amount(tx: &qnet_state::Transaction) -> (Option<Stri
         _ if tx.moves_no_envelope_value() => (None, 0),
         _ => (tx.to.clone(), tx.amount),
     }
+}
+
+/// A merkle claim's shown status and amount, from what its apply recorded: "no_effect" and 0 when it credited
+/// nothing (a repeat of an applied claim), else "confirmed" and what it credited. None for any other TX, or for a
+/// claim with no recorded outcome (applied before outcomes were kept, or past their retention).
+pub(crate) fn claim_outcome_display(storage: &crate::storage::Storage, tx: &qnet_state::Transaction) -> Option<(&'static str, u64)> {
+    if !tx.is_merkle_reward_claim() { return None; }
+    let (_height, credited, epochs) = storage.load_claim_outcome(&tx.hash)?;
+    Some(if epochs == 0 { ("no_effect", 0) } else { ("confirmed", credited) })
 }
 
 /// What `address` receives from a batch: the sum of its transfers to it, or None if it is no recipient.
@@ -271,43 +281,31 @@ impl WsRateLimiter {
         }
     }
     
-    /// Check if new connection is allowed from this IP
-    fn check_connection(&self, ip: Option<IpAddr>) -> bool {
-        let total = self.total_connections.load(std::sync::atomic::Ordering::Relaxed);
-        
-        // Check total limit
+    /// Take a connection slot for `ip` when both limits allow, in one step: the check and the count cannot
+    /// interleave with another connection's, so concurrent upgrades never pass a limit together. The slot is
+    /// released when the returned guard drops.
+    fn try_acquire(&'static self, ip: Option<IpAddr>) -> Option<WsSlot> {
+        use std::sync::atomic::Ordering;
+        let total = self.total_connections.fetch_add(1, Ordering::SeqCst);
         if total >= self.max_total {
-            println!("[WS] 🚫 Total connection limit reached ({}/{})", total, self.max_total);
-            return false;
+            self.total_connections.fetch_sub(1, Ordering::SeqCst);
+            if is_warn() { println!("[WARN][WS] connection_refused reason=total_limit total={} max={}", total, self.max_total); }
+            return None;
         }
-        
-        // Check per-IP limit
         if let Some(ip_addr) = ip {
-            let current = self.connections_per_ip.get(&ip_addr)
-                .map(|v| *v)
-                .unwrap_or(0);
-            
-            if current >= self.max_per_ip {
-                println!("[WS] 🚫 Per-IP limit reached for {} ({}/{})", ip_addr, current, self.max_per_ip);
-                return false;
+            let mut count = self.connections_per_ip.entry(ip_addr).or_insert(0);
+            if *count >= self.max_per_ip {
+                let current = *count;
+                drop(count);
+                self.total_connections.fetch_sub(1, Ordering::SeqCst);
+                if is_warn() { println!("[WARN][WS] connection_refused reason=per_ip_limit ip={} count={} max={}", ip_addr, current, self.max_per_ip); }
+                return None;
             }
+            *count += 1;
         }
-        
-        true
+        Some(WsSlot { limiter: self, ip })
     }
-    
-    /// Register new connection
-    fn add_connection(&self, ip: Option<IpAddr>) {
-        self.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
-        if let Some(ip_addr) = ip {
-            self.connections_per_ip
-                .entry(ip_addr)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-        }
-    }
-    
+
     /// Unregister connection on close
     fn remove_connection(&self, ip: Option<IpAddr>) {
         self.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -336,6 +334,23 @@ impl WsRateLimiter {
 
 /// Global WebSocket rate limiter
 static WS_RATE_LIMITER: Lazy<WsRateLimiter> = Lazy::new(|| WsRateLimiter::new());
+
+/// One WebSocket connection slot, released when dropped: when the connection ends, when its handler unwinds, and
+/// when the upgrade never completes (warp drops the upgrade callback that owns it). Before this guard the slot was
+/// counted before the upgrade and released only at the end of a handler that might never run or never end, so
+/// dead slots accumulated until every connection from a shared address was refused.
+pub(super) struct WsSlot {
+    limiter: &'static WsRateLimiter,
+    ip: Option<IpAddr>,
+}
+
+impl WsSlot {
+    pub(super) fn ip(&self) -> Option<IpAddr> { self.ip }
+}
+
+impl Drop for WsSlot {
+    fn drop(&mut self) { self.limiter.remove_connection(self.ip); }
+}
 
 /// Rate limit configuration per endpoint type
 #[derive(Clone)]
@@ -548,6 +563,18 @@ impl ApiRateLimiter {
             max_requests: 2,
             window_seconds: 60,
             block_duration: 60,
+        });
+        // The GALC v2 capsule (~21 KB, cached): a wallet asks a node about once in 10 minutes, the site
+        // follows it with If-None-Match. One bucket off the plane, one on it.
+        configs.insert(galc_api::GALC_CAPSULE_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+        configs.insert(galc_api::WALLET_GALC_CAPSULE_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 30,
         });
 
         if tx_rate != 100 {
@@ -1896,6 +1923,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_proof);
 
+    // GALC v2 wallet capsule (galc_api.rs): typed 404/503, ETag, cached 60 s.
+    let galc_capsule = api_v1
+        .and(warp::path("galc"))
+        .and(warp::path("capsule"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("if-none-match"))
+        .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
+        .and(blockchain_filter.clone())
+        .and_then(galc_api::handle_galc_capsule);
+
     // Light-client registry dump as of a height: /registry/height/{h}
     let registry_height = api_v1
         .and(warp::path("registry"))
@@ -3005,6 +3044,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(block_by_hash)
         .or(macroblock_by_index)
         .or(macroblock_proof)
+        .or(galc_capsule)
         .or(registry_height)
         .or(debug_consensus_position)
         .or(snapshot_latest)
@@ -3325,19 +3365,16 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // Extract IP for rate limiting
             let ip = remote_addr.map(|addr| addr.ip());
             
-            // SECURITY: Check rate limit before upgrading connection
-            if !WS_RATE_LIMITER.check_connection(ip) {
-                // Return 429 Too Many Requests
-                return warp::reply::with_status(
+            // The slot is taken before the upgrade, so a refusal is a 429, and it rides in the upgrade
+            // callback: released when the connection ends, or with the callback if the upgrade never completes.
+            let slot = match WS_RATE_LIMITER.try_acquire(ip) {
+                Some(s) => s,
+                None => return warp::reply::with_status(
                     "WebSocket connection limit exceeded",
                     warp::http::StatusCode::TOO_MANY_REQUESTS
-                ).into_response();
-            }
-            
-            // Register connection and upgrade
-            WS_RATE_LIMITER.add_connection(ip);
-            
-            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, query, blockchain, ip))
+                ).into_response(),
+            };
+            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, query, blockchain, slot))
                 .into_response()
         });
     

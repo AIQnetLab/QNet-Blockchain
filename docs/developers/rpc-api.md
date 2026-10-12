@@ -139,6 +139,8 @@ address in that header, the one the TLS proxy on the same host appended (`client
 | `serve_proof` | 6 | 60 s | 60 s | `GET /api/v1/node/serve-proof` (wallet plane only); refused with HTTP 429 |
 | `nodes_rpc` | 30 | 60 s | 60 s | `GET /api/v1/nodes/rpc`, on both planes; refused with HTTP 429 |
 | `whoami` | 2 | 60 s | 60 s | `GET /api/v1/whoami`, on both planes; refused with HTTP 429 |
+| `galc_capsule` | 120 | 60 s | 30 s | `GET /api/v1/galc/capsule` on port 8001; refused with HTTP 429 |
+| `wallet_galc_capsule` | 120 | 60 s | 30 s | `GET /api/v1/galc/capsule` on the wallet plane; refused with HTTP 429 |
 
 `tx_rate` is `QNET_API_RATE_LIMIT`, parsed as requests per minute and clamped to `1..=10_000`,
 default `100`. The certified and wallet-plane buckets do not scale with it. On the wallet plane every
@@ -197,8 +199,9 @@ is seen as one client, so enforce rate limiting at that proxy.
   certified form of the two balance-proof routes (400, 404, 410, 429, 503) and `/api/v1/state/certified`
   (429) answer with real statuses too ([Certified state proofs](#certified-state-proofs)), as do
   `/api/v1/registry/height/{height}` (404, 413 `registry_oversize`, 503), the typed form of
-  `/api/v1/macroblock/{index}/proof` (404, 410, 429, 503), `/api/v1/node/serve-proof`, `/api/v1/nodes/rpc` and
-  `/api/v1/whoami` (400, 429, 503), and every refusal of the [wallet plane](#wallet-plane).
+  `/api/v1/macroblock/{index}/proof` (404, 410, 429, 503), `/api/v1/galc/capsule` (404, 429, 503),
+  `/api/v1/node/serve-proof`, `/api/v1/nodes/rpc` and `/api/v1/whoami` (400, 429, 503), and every refusal of the
+  [wallet plane](#wallet-plane).
 - **The HTTP layer's own refusals are plain text**, not JSON: HTTP 400 for a JSON body or query that
   does not deserialize (a missing required field, an integer sent as a string, a number above the
   64-bit range), 413 above a route's body cap, 415 for a body that is not JSON, 405 for a known path
@@ -409,6 +412,7 @@ commits to.
 | --- | --- | --- |
 | GET | `/api/v1/macroblock/{index}/proof` | Optional `?form=2` asks for the typed errors below. Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned, recovery_anchor_checkpoint}`. `committee_pubkeys` covers the derived committee union the QC's actual signers. Past the QC-signature retention the signatures and any signer key the node can no longer resolve come from its history archive, when it keeps one and the archived checkpoint hashes the same. A success carries `Cache-Control: public, max-age=31536000, immutable` (the body for an index never changes) and is served from a 64 MiB cache, built once per index (at most two builds at once node-wide, whichever port asked: port 8001 queues for one, the wallet plane waits at most 3 s, then `busy`; a build runs to the end and is cached even when its request went away); a body missing a QC signer's key, or the anchor checkpoint its recovery pin names, is served with `Cache-Control: no-store` and never cached, since the next build may complete it. |
 | GET | `/api/v1/registry/height/{height}` | `{registry_root, entries}` — the chain-confirmed roster as of that height plus its LtHash root. Only a checkpoint head (a multiple of 30) at or below the applied tip is answered, the heights a checkpoint's QC-signed `registry_root` covers: any other height is HTTP 404 `registry_height_not_head`, one above the tip 404 `registry_height_not_applied` (with `Retry-After`), with no read. A height is built once (one build at a time node-wide; a request waits at most 3 s for it, else 503 `busy`), written straight into its body and kept in a 32 MiB cache; the answer carries `Cache-Control: public, max-age=86400, immutable`. A body above 16 MiB (the client's cap) is not built: the build stops at the cap and answers HTTP 413 `{error: "registry_oversize", rows}`, `rows` being the rows counted before it stopped (at least that many); every later head answers the same without a build, since the roster only grows. A build that fails answers HTTP 503 `{error: "registry_unavailable"}` and is not cached. Refusals carry `Cache-Control: no-store`, and on the wallet plane the typed form |
+| GET | `/api/v1/galc/capsule` | The GALC v2 capsule ([galc-capsule-v2](../protocols/galc-capsule-v2.md)): `{version, network_id, mb_index, mb_hash, committee_digest_anchor, committee_digest_pred, minted_at_height, cp_hash_anchor, cp_hash_pred, sigs[[id, sig]]}`, at least four genesis signatures in the compact form, about 21 KB. Served only while macroblocks K and K-1 decode on the node to the checkpoints it names and K is at most its finalized macroblock (re-read at most once a minute); otherwise HTTP 503 `capsule_unbound` with `Retry-After: 60`. HTTP 404 `no_capsule` when the node holds none; only genesis nodes hold one. A success carries `Cache-Control: public, max-age=60` and the ETag `"2-<K>-<first 8 hex of cp_hash_anchor>"`; a matching `If-None-Match` answers 304. Errors are typed |
 | GET | `/api/v1/validators/proof` | `{validators[], epoch, merkle_root, last_update_height, current_height, total_validators, active_validators}`; the root is SHA3-256 over the tag `QNET_VALIDATOR_SET:` + epoch + each sorted validator's fields, computed by the answering node over its own list and not tied to any checkpoint, so it is a plain read, not a proof |
 | GET | `/api/v1/account/{address}/balance/proof?mb=latest\|{j}` | The certified form: the account at macroblock j, proven against that checkpoint's `state_root` ([Certified state proofs](#certified-state-proofs)) |
 | GET | `/api/v1/token/{contract}/{holder}/balance/proof?mb=latest\|{j}` | The certified form of the two-level QRC-20 balance proof |
@@ -612,6 +616,7 @@ publishes it on IPv4 only. The code is `rpc/wallet_plane.rs` (listener),
 | GET | `/api/v1/token/{contract}/{holder}/balance/proof` | only with `mb` |
 | GET | `/api/v1/logs/proof` | counted in `certified_proof`; typed errors |
 | GET | `/api/v1/macroblock/{index}/proof` | `index` decimal; typed errors |
+| GET | `/api/v1/galc/capsule` | light route, own bucket; a super holds no capsule, so it answers 404 `no_capsule` |
 | GET | `/api/v1/registry/height/{height}` | checkpoint heads at or below the tip; body cache; 413 above 16 MiB |
 | GET | `/api/v1/node/serve-proof` | served on the wallet plane only |
 | GET | `/api/v1/nodes/rpc` | also on port 8001 |
@@ -802,7 +807,7 @@ Balances are nano-QNC as JSON numbers, which pass 2^53: read them from the raw t
 | --- | --- | --- |
 | POST | `/api/v1/transaction` | Submit a signed transfer |
 | POST | `/api/v1/batch/transfer` | Up to 1000 transfers from one sender as one signed transaction: `{transfers[{from, to_address, amount, memo}], batch_id, nonce, gas_price, gas_limit, dilithium_signature, dilithium_public_key}` → `{success, batch_id, transaction_hash, signed_id, transfer_count, total_amount, from_address, message, processed_by}`. Every `from` is the same address, each `amount` is above 0, each `memo` at most 128 bytes, and `gas_limit` at least 10 000 (`gas_limits::TRANSFER`) per transfer; the signature covers the batch message under [Batch transfers](#batch-transfers), and `dilithium_public_key` may be elided as for a transfer |
-| GET | `/api/v1/transaction/{hash}` | `{tx_hash, transaction{...}, status}`; `status` is `found`, `not_found` or `error`, and a found transaction's own `status` is `pending` (in this node's pool) or `confirmed` (in a stored block). There is no failed state: see [Transactions](transactions.md#status-and-outcome) |
+| GET | `/api/v1/transaction/{hash}` | `{tx_hash, transaction{...}, status}`; `status` is `found`, `not_found` or `error`, and a found transaction's own `status` is `pending` (in this node's pool), `confirmed` (in a stored block) or, for a reward claim that credited nothing, `no_effect` with `amount` 0. There is no failed state: see [Transactions](transactions.md#status-and-outcome) |
 | GET | `/api/v1/transaction/by-nonce/{from}/{nonce}` | The value transaction (transfer, batch, deploy or call) `from` signed at `nonce`: `{success: true, status, from, nonce, hash, signed_id}` with `status` `pending` (in this node's pool) or `confirmed` (in the sender's history this node keeps, about 28 hours, at most its last 500 index rows; two of one sender in one block are both found), or `{success: false, status: "not_found", from, nonce}`; older ones are in the explorer. `hash` is the hash of the copy this node holds. `read_only` bucket |
 | GET | `/api/v1/transactions/recent?page=&per_page=` | `{success, transactions[{hash, from, to, amount, nonce, timestamp, type, gas_price, gas_limit, is_quantum_signed}], pagination{page, per_page, total_count, total_pages, has_next, has_prev}, current_height}`: the newest transactions, newest first (the higher block first, and within a block its last transaction first), from the last 3600 blocks up to and including `current_height` (about an hour), 1000 transactions at most. `total_count` counts that feed, not the chain's history, and a page past it is empty; older transactions are in the address history and the explorer. `type` is the transaction type with its fields as the node prints them. `read_only` bucket |
 | GET | `/api/v1/transactions/history?address=&page=&per_page=&tx_type=&direction=` | Filtered, paginated address history |
@@ -1045,19 +1050,24 @@ The call above returns a **quote**: `claims_data`, `sign_message`, `claim_timest
 `{success, tx_hash, amount_qnc, message}`.
 
 A quote walks the epoch grid strictly above `last_claimed_epoch`, ascending, and stops rather than skips at
-the first epoch it cannot serve. When it stops it carries `stopped_at_epoch` and `stopped_reason`:
+the first epoch it cannot serve. An epoch whose shard cache was pruned is passed from the node's recipient index
+when the wallet holds no leaf in it, and rebuilt when it does. When it stops it carries `stopped_at_epoch` and
+`stopped_reason`:
 
 | `stopped_reason` | Meaning | Client action |
 | --- | --- | --- |
 | `batch_full` | 512-epoch batch limit reached | re-call for the remainder |
 | `quote_byte_budget` | 128 KiB quote budget reached | re-call for the remainder |
 | `root_not_here` | this node holds no certified root for the epoch | retry against another node |
-| `rebuild_budget` | the one leaf-set rebuild allowed per request was spent | re-call |
+| `rebuild_budget` | the leaf-set rebuilds allowed per request were spent (65,536 rebuilt leaves, at least one rebuild) | re-call |
 | `local_corruption` | this node's inputs do not reproduce the certified root; the epoch is parked for 3600 s while the node resyncs | claim against another node |
 | `epoch_unservable` | the epoch yields no servable proof here | claim against another node |
 
 Proof generation is bounded at 16 concurrent generations node-wide, and a per-node in-progress lock
-refuses a second concurrent claim for the same `node_id`. See
+refuses a second concurrent claim for the same `node_id`. The submit is refused with `claim_stale` when the
+batch names an epoch at or below the wallet's watermark (it was quoted before an earlier claim landed: request a
+new quote), and with `claim_pending` while another claim of the same wallet waits in this node's pool (retry
+after it lands). See
 [economics](../economics/overview.md).
 
 ## REST: smart contracts and tokens

@@ -392,10 +392,13 @@ impl CheckpointConsensus {
         let mut out = Vec::new();
         if let Some(timeouts) = snapshot {
             self.high_tc_index = self.high_tc_index.max(tm.index);
-            out.push(Action::FormedTc(TimeoutCertificate {
-                index: tm.index, timeouts, high_qc: self.high_qc.clone(),
-            }));
+            // A view this node already left (it adopted that view's TC, or one above it, or jumped past it) moves
+            // nothing here: forming its TC again would only relay a duplicate O(committee) certificate. The
+            // members still at that view hold the same timeouts and form it themselves.
             if tm.index >= self.current_index {
+                out.push(Action::FormedTc(TimeoutCertificate {
+                    index: tm.index, timeouts, high_qc: self.high_qc.clone(),
+                }));
                 self.current_index = tm.index + 1;
                 out.push(Action::EnterView(self.current_index));
             }
@@ -646,10 +649,32 @@ mod tests {
         let out = stuck.on_timeout_msg(&helper);
         assert!(out.iter().any(|a| matches!(a, Action::FormedTc(t) if t.index == 5)), "the sixth timeout forms TC(5)");
         assert_eq!(stuck.current_index, 6);
-        // The sender's own copy completes the certificate there too; nothing more is owed for 5.
-        assert!(ahead.on_timeout_msg(&helper).iter().any(|a| matches!(a, Action::FormedTc(_))));
-        assert_eq!(ahead.current_index, 6, "a certificate below the view moves nothing");
+        // The sender's own copy completes the quorum there too, below its view: it forms and relays no second
+        // certificate for 5, and nothing more is owed for 5.
+        assert!(!ahead.on_timeout_msg(&helper).iter().any(|a| matches!(a, Action::FormedTc(_))));
+        assert_eq!(ahead.current_index, 6, "a quorum below the view moves nothing");
         assert_eq!(timeouts_of(&ahead.on_local_timeout()), vec![6]);
+    }
+
+    // A view this node left by adopting its certificate from a peer: its own tally reaching the quorum later forms
+    // no duplicate. At its own view the quorum forms exactly one certificate, and later timeouts add none.
+    #[test]
+    fn a_tc_forms_once_and_never_for_a_view_left() {
+        let c = committee(4); // quorum 3
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        let tm = |i: u64, v: &str| TimeoutMsg { index: i, voter: v.to_string(), high_qc_index: 0, signature: Vec::new() };
+        assert!(eng.on_timeout_cert(&TimeoutCertificate {
+            index: 1, timeouts: vec![tm(1, "n1"), tm(1, "n2"), tm(1, "n3")], high_qc: None,
+        }).iter().any(|a| *a == Action::EnterView(2)));
+        for v in ["n1", "n2", "n3"] {
+            assert!(!eng.on_timeout_msg(&tm(1, v)).iter().any(|a| matches!(a, Action::FormedTc(_))), "no TC for view 1 again");
+        }
+        assert_eq!(eng.current_index, 2);
+        let formed: usize = ["n1", "n2", "n3", "n0"].iter()
+            .map(|v| eng.on_timeout_msg(&tm(2, v)).iter().filter(|a| matches!(a, Action::FormedTc(t) if t.index == 2)).count())
+            .sum();
+        assert_eq!(formed, 1, "one certificate at the quorum-crossing timeout");
+        assert_eq!(eng.current_index, 3);
     }
 
     // No helper for a view this member already signed, nor for one a held certificate covers.

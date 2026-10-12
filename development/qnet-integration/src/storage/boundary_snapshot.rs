@@ -12,6 +12,17 @@ pub fn is_snapshot_boundary(height: u64) -> bool {
             || height % crate::node::SNAPSHOT_INCREMENTAL_INTERVAL == 0)
 }
 
+/// Wall time (ms) of the last boundary work: a snapshot pin or frame write, or an epoch's body expiry. The runtime
+/// stall watchdog reads it to tell the short pause these cause from a real stall.
+pub static LAST_BOUNDARY_WORK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp boundary work as running now.
+pub fn mark_boundary_work() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0);
+    LAST_BOUNDARY_WORK_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A frozen boundary view on its way to the frame writer.
 struct BoundaryCapture {
     storage: Arc<Storage>,
@@ -67,7 +78,10 @@ fn submit(cap: BoundaryCapture) {
 
 fn write_capture(cap: BoundaryCapture) {
     let BoundaryCapture { storage, height, views, expected_leaves, fence, rt } = cap;
-    if let Err(e) = storage.write_boundary_frame(height, views, expected_leaves, Some(fence)) {
+    mark_boundary_work();
+    let written = storage.write_boundary_frame(height, views, expected_leaves, Some(fence));
+    mark_boundary_work();
+    if let Err(e) = written {
         println!("[WARN][STORAGE] snapshot_create_failed h={} err={:?}", height, e);
         return;
     }
@@ -90,6 +104,7 @@ impl Storage {
     /// Queue the boundary snapshot at `height` behind the block's rows. The caller holds the state lock that
     /// applied the block, so the pin sees exactly the state at `height`; nothing heavy runs here.
     pub fn request_boundary_pin(self: &Arc<Self>, sg: &crate::StateManager, height: u64) {
+        mark_boundary_work();
         let hash = match self.load_microblock_hash(height) {
             Ok(Some(h)) => h,
             _ => {
@@ -121,12 +136,14 @@ impl Storage {
             return;
         }
         let storage = Arc::clone(self);
+        mark_boundary_work();
         tokio::task::spawn_blocking(move || {
             match storage.prune_old_microblock_bodies(height, crate::node::MICROBLOCK_BODY_RETENTION_BLOCKS) {
                 Ok(0) => {}
                 Ok(n) => println!("[INFO][STORAGE] microblock_bodies_pruned count={} h={}", n, height),
                 Err(e) => println!("[WARN][STORAGE] body_prune_failed h={} err={:?}", height, e),
             }
+            mark_boundary_work();
         });
     }
 

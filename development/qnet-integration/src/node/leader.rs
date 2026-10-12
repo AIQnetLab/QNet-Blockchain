@@ -174,6 +174,12 @@ impl BlockchainNode {
             if timeout_round > 0 {
                 can_use_cache = false;
             }
+            // A selection made at another local seal may come from another roster (a frozen one derives from the
+            // seal): recompute instead of keeping it for the rest of the round.
+            let seal_now = storage.map(|s| s.last_sealed_mb_index()).unwrap_or(0);
+            if producer_cache::CACHED_SELECTION_SEAL.get(&leadership_round).map_or(false, |at| *at != seal_now) {
+                can_use_cache = false;
+            }
             // v2.96: Lock-free cache lookup with DashMap
             if can_use_cache {
                 if let Some(entry) = CACHED_PRODUCER_SELECTION.get(&leadership_round) {
@@ -516,6 +522,8 @@ impl BlockchainNode {
             if timeout_round == 0 {
                 CACHED_PRODUCER_SELECTION.insert(leadership_round, (selected_producer.clone(), candidates.clone()));
                 CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
+                producer_cache::CACHED_SELECTION_SEAL.insert(leadership_round, seal_now);
+                producer_cache::CACHED_SELECTION_SEAL.retain(|round, _| *round + 3 >= leadership_round);
             }
             
             let is_rotation_boundary = current_height > 0 && (current_height - 1) % rotation_interval == 0;
@@ -1349,4 +1357,58 @@ impl BlockchainNode {
         selected
     }
     
+}
+
+#[cfg(test)]
+mod election_abstain_tests {
+    use super::*;
+
+    const W: u64 = 90;
+
+    // 12.10: nodes still at seal 38948 elected the new heights 3,508,201+ from the eight of 38948 and hard-rejected
+    // the six's blocks. Past a node's own derivation horizon its election is no authority; inside it, a frozen
+    // window abstains only while certified finality runs past the unsealed tail, never in a genuine stall.
+    #[test]
+    fn an_election_from_a_seal_the_network_left_is_no_authority() {
+        let seal = 38_948u64;
+        let horizon_top = (seal + BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * W;
+        assert_eq!(horizon_top, 3_508_200);
+        assert_eq!(election_abstain_reason(horizon_top + 1, seal, seal * W, seal * W, true),
+                   Some("past_derivation_horizon"), "the first new height after the recovery");
+        assert_eq!(election_abstain_reason(horizon_top + 1, seal, seal * W, seal * W, false),
+                   Some("past_derivation_horizon"), "whatever the mode");
+        assert_eq!(election_abstain_reason(horizon_top, seal, seal * W, seal * W, true), None,
+                   "inside the horizon with finality stalled at the seal: A1 production goes on");
+
+        let tail = (MAX_UNSEALED_WINDOWS + 1) * W;
+        let h = (seal + 5) * W + 1;
+        assert_eq!(election_abstain_reason(h, seal, seal * W, seal * W + tail, true), None, "finality within the tail");
+        assert_eq!(election_abstain_reason(h, seal, seal * W, seal * W + tail + 1, true),
+                   Some("seal_behind_finality"), "certified finality past the tail: this node's seal lags");
+        assert_eq!(election_abstain_reason(h, seal, seal * W, seal * W + tail + 1, false), None,
+                   "a sealed window elects from macroblock w-2, the same on every node");
+        assert_eq!(election_abstain_reason(h, seal, seal * W, 0, true), None, "no finality known");
+    }
+
+    // A seal behind finality stops production only once a peer's certified macroblock above the seal verified
+    // here; a seal lagging on every node (none holds anything above it) keeps A1 production.
+    #[test]
+    fn production_stops_only_on_proof_that_peers_sealed_past() {
+        let seal = u64::MAX / 2;
+        assert!(!peer_sealed_past(seal), "no peer macroblock above the seal");
+        note_peer_certified_macroblock(seal);
+        assert!(!peer_sealed_past(seal), "one at the seal proves nothing");
+        note_peer_certified_macroblock(seal + 1);
+        assert!(peer_sealed_past(seal));
+        note_peer_certified_macroblock(seal - 10);
+        assert!(peer_sealed_past(seal), "monotonic");
+        let src = include_str!("production.rs").replace("\r\n", "\n");
+        let arm = &src[src.find("if abstain == Some(\"seal_behind_finality\")").expect("arm")..];
+        let arm = &arm[..arm.find("crate::sync_manager::nudge_sync_check();").expect("end")];
+        assert!(arm.contains("if peers_sealed { is_my_turn_to_produce = false; }"));
+        let sync = include_str!("sync.rs").replace("\r\n", "\n");
+        let verified = sync.find("Self::verify_v2_macroblock(&macroblock, index, p2p").expect("verify");
+        assert!(sync[verified..].find("note_peer_certified_macroblock(index);").expect("noted") < 600,
+                "noted right after the received macroblock's certificate verified");
+    }
 }

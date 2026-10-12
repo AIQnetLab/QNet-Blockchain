@@ -26,13 +26,17 @@
 #   QNET_ARCHIVE_SINCE=2026-10-07T10:00:00Z ./deploy-genesis.sh  # archive the old log from then (default 48h)
 #   QNET_UNSET_ENV=KEY[,KEY] ./deploy-genesis.sh         # drop env entries
 #   QNET_ADD_BIND=/abs/host:/abs/ctr:ro[,...] ./deploy-genesis.sh  # add a read-only bind of a root-owned 600/400 file
+#   QNET_RESTORE_PREVIOUS=1 ./deploy-genesis.sh 005     # bring back the container a roll kept (also for a node that is down)
+#   QNET_RESTORE_FORCE=1 QNET_RESTORE_PREVIOUS=1 ./deploy-genesis.sh 005   # the same past its gate check, checked by hand
 #
 # The old container is kept, stopped, until the new one passes its per-node checks; any stop before
 # that prints the commands that bring it back.
 #
 # A gate added or moved in the build must sit GATE_MARGIN blocks above the tip when the roll starts (the
 # check below). Its height is set at push time: ./gate-height.sh prints the first epoch boundary at least
-# 604,800 blocks above the fleet tip. Host checks before a roll: docs/operators/genesis-host-checks.md.
+# 604,800 blocks above the fleet tip. A fleet already mixed between this build and another (a roll that
+# stopped, or its rollback) may still converge on either until FINISH_MARGIN blocks before the gate.
+# Host checks before a roll: docs/operators/genesis-host-checks.md.
 set -uo pipefail
 
 # A commit tag rolls, or rolls back, one exact build. By default it is the checked-out commit: a push publishes
@@ -209,6 +213,182 @@ fleet_gate() {
   done
 }
 
+# The build a node's container runs, from its own config when /healthz does not answer: the stamp is the image's
+# env, and the recreate never carries an old one over. Empty when the container or the stamp is missing.
+container_build() {
+  rsh "$1" "$2" "docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $3 2>/dev/null" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^QNET_BUILD_ID=//p' | head -1
+}
+
+GATE_MARGIN="${GATE_MARGIN:-28800}"
+# A mixed fleet converging on a build (finishing a roll that stopped, or rolling it back): enough blocks for the
+# remaining nodes at up to 15 minutes each, at one block a second.
+FINISH_MARGIN="${FINISH_MARGIN:-5400}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+case "$GATE_MARGIN" in ''|*[!0-9]*) echo "[ERR] GATE_MARGIN must be a block count"; exit 1;; esac
+case "$FINISH_MARGIN" in ''|*[!0-9]*) echo "[ERR] FINISH_MARGIN must be a block count"; exit 1;; esac
+
+image_build() {
+  rsh "$1" "$2" "docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $IMAGE" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^QNET_BUILD_ID=//p'
+}
+
+# `gate height` for every ACTIVATIONS entry of the node source at commit $1, each height resolved through
+# the constants it names (the gas-metering one lives in transaction.rs). `?` = a height it cannot read.
+gate_table() {
+  local f
+  # A commit id only: an empty one would make `git show :path` read the index instead.
+  [[ "$1" =~ ^[0-9a-f]{7,40}$ ]] || return 1
+  for f in transaction.rs feature_gates.rs; do
+    git -C "$REPO" cat-file -e "$1:core/qnet-state/src/$f" 2>/dev/null || return 1
+  done
+  { git -C "$REPO" show "$1:core/qnet-state/src/transaction.rs"; echo '@@FEATURE_GATES@@'
+    git -C "$REPO" show "$1:core/qnet-state/src/feature_gates.rs"; } | awk '
+    function res(e, n) {
+      gsub(/^[ \t]+|[ \t]+$/, "", e)
+      if (e ~ /^[0-9][0-9_]*(u64)?$/) { sub(/u64$/, "", e); gsub(/_/, "", e); return e }
+      if (n < 8 && (e in d)) return res(d[e], n + 1)
+      return "?"
+    }
+    { sub(/\r$/, "") }
+    /^@@FEATURE_GATES@@$/ { fg = 1; next }
+    /^ *(pub )?const [A-Z0-9_]+: u64 = [^;]+;/ {
+      l = $0; sub(/^ *(pub )?const /, "", l); n = l; sub(/:.*/, "", n)
+      e = l; sub(/^[^=]*= */, "", e); sub(/;.*/, "", e); d[n] = e; next
+    }
+    /^ *(pub )?const fn [a-z0-9_]+\(\) -> u64 \{ *crate::transaction::[A-Z0-9_]+ *\}/ {
+      l = $0; sub(/^ *(pub )?const fn /, "", l); n = l; sub(/\(.*/, "", n)
+      e = l; sub(/.*crate::transaction::/, "", e); sub(/[^A-Z0-9_].*/, "", e); d[n "()"] = e; next
+    }
+    fg && /^const ACTIVATIONS/ { act = 1; next }
+    act && /^\];/ { act = 0; next }
+    act && /^ *\(id::[A-Z0-9_]+,/ {
+      l = $0; sub(/^ *\(id::/, "", l); g = l; sub(/,.*/, "", g)
+      e = l; sub(/^[^,]*, */, "", e); sub(/\)[ \t]*,?[ \t]*(\/\/.*)?$/, "", e); ids[++k] = g; ex[g] = e
+    }
+    END { for (i = 1; i <= k; i++) print ids[i], res(ex[ids[i]], 0) }'
+}
+
+# The lowest height at which builds $1 and $2 run different rules (a gate one has and the other lacks, or one gate at
+# two heights; 0 when a height cannot be read), nothing when they agree. Fails when either commit is not here.
+first_gate_split() {
+  local ta tb g v low=""
+  local -A GA=() GB=()
+  ta=$(gate_table "$1") || return 1
+  tb=$(gate_table "$2") || return 1
+  while read -r g v; do [ -n "$g" ] && GA[$g]=$v; done <<< "$ta"
+  while read -r g v; do [ -n "$g" ] && GB[$g]=$v; done <<< "$tb"
+  for g in "${!GA[@]}" "${!GB[@]}"; do
+    [ "${GA[$g]:-}" = "${GB[$g]:-}" ] && continue
+    # A gate dropped once crossed (height 0) is the same rule as no gate.
+    [ "${GA[$g]:-0}" = 0 ] && [ "${GB[$g]:-0}" = 0 ] && continue
+    for v in ${GA[$g]:-} ${GB[$g]:-}; do
+      [ "$v" = "?" ] && v=0
+      if [ -z "$low" ] || [ "$v" -lt "$low" ]; then low=$v; fi
+    done
+  done
+  echo "$low"
+}
+
+# The fleet: tip=<highest height answered> and LIVE[build]="<node ids>", each node's build from /healthz, or from its
+# container's stamp when it does not answer (it runs that build again once it is back). Stops the script on a node
+# with no stamp, or when no node answers.
+declare -A LIVE=()
+tip=0
+fleet_survey() {
+  local n a nh nb
+  tip=0; LIVE=()
+  for n in $(printf '%s\n' "${!NODE_IP[@]}" | sort); do
+    a=$(rsh "${NODE_IP[$n]}" "$(port_of "$n")" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r')
+    nh=$(echo "$a" | sed -n 's/.*h=\([0-9]*\).*/\1/p'); nb=$(echo "$a" | sed -n 's/.*build=\([^ ]*\).*/\1/p')
+    if [ -z "$nh" ]; then
+      nb=$(container_build "${NODE_IP[$n]}" "$(port_of "$n")" "$(container_of "$n")")
+      if [ -z "$nb" ]; then echo "  [WARN] $n did not answer /healthz and its container names no build: not compared"; continue; fi
+      echo "  [WARN] $n did not answer /healthz: comparing the build of its container, ${nb:0:7}"
+      LIVE[$nb]="${LIVE[$nb]:+${LIVE[$nb]} }$n"
+      continue
+    fi
+    if [ -z "$nb" ]; then
+      echo "[ERR] $n reports no build stamp, so the gates it runs are unknown — check by hand, then SKIP_GATE_CHECK=1"; exit 1
+    fi
+    [ "$nh" -gt "$tip" ] && tip=$nh
+    LIVE[$nb]="${LIVE[$nb]:+${LIVE[$nb]} }$n"
+  done
+  if [ ${#LIVE[@]} -eq 0 ] || [ "$tip" -eq 0 ]; then echo "[ERR] no node answered /healthz — the tip is unknown, nothing touched"; exit 1; fi
+}
+
+# rb: bring back the container a roll kept as <name>-pre-<time>, in place of the current one, whether that runs, is
+# stopped or crashed. For a node a roll left down, when fail_node's commands are not at hand. With several kept, the
+# OLDEST: a roll renames the container it replaces, so a second failed attempt keeps the first failed build as the
+# newest, and the oldest is the build from before any attempt (the roll's identity check reads it the same way).
+# Nothing is pulled. The kept build must agree with every other node's on each gate up to FINISH_MARGIN blocks above
+# the tip: brought back past a gate the others enforce, it settles that height under the other rule and drops out of
+# consensus (QNET_RESTORE_FORCE=1 after checking by hand).
+rb() {
+  local id="$1" ip port cont a="" kept kb b split KEPT
+  ip="${NODE_IP[$id]:-}"; [ -n "$ip" ] || { echo "[ERR] unknown node id: $id"; return 1; }
+  port="$(port_of "$id")"; cont="$(container_of "$id")"
+  echo "=== $id ($ip:$port $cont): restore the kept container ==="
+  kept=$(rsh "$ip" "$port" "docker ps -a --format '{{.Names}}'" 2>/dev/null | tr -d '\r' \
+    | grep -E "^${cont}-pre-[0-9]{8}T[0-9]{6}Z\$" | sort)
+  if [ -z "$kept" ]; then echo "  no kept container ${cont}-pre-*: nothing to restore"; return 1; fi
+  KEPT=$(echo "$kept" | head -1)
+  if [ "$(echo "$kept" | wc -l)" -gt 1 ]; then
+    echo "  [WARN] kept: $(echo $kept); restoring the oldest, $KEPT (the build before the first attempt)"
+  fi
+  kb=$(container_build "$ip" "$port" "$KEPT")
+  if [ -n "${QNET_RESTORE_FORCE:-}" ]; then
+    echo "  gate check of the restore SKIPPED (QNET_RESTORE_FORCE set): build ${kb:-<unstamped>}"
+  else
+    if [ -z "$kb" ]; then
+      echo "  [ERR] $KEPT names no build, so its gates are unknown — check by hand, then QNET_RESTORE_FORCE=1"; return 1
+    fi
+    fleet_survey
+    for b in "${!LIVE[@]}"; do
+      [ "$b" = "$kb" ] && continue
+      case " ${LIVE[$b]} " in " $id ") continue;; esac
+      if ! split=$(first_gate_split "$kb" "$b"); then
+        echo "  [ERR] build $kb or $b is not a commit in the local repository — git fetch and rerun"; return 1
+      fi
+      [ -z "$split" ] && continue
+      if [ "$split" -le $((tip + FINISH_MARGIN)) ]; then
+        echo "  [ERR] the kept build ${kb:0:7} and ${b:0:7} (nodes ${LIVE[$b]}) part at a gate at $split, not $FINISH_MARGIN"
+        echo "        blocks above the tip $tip: restored, $id would settle it under the other rule — nothing touched"
+        return 1
+      fi
+      echo "  [WARN] the kept build ${kb:0:7} and ${b:0:7} (nodes ${LIVE[$b]}) part at $split: the fleet must agree before then"
+    done
+  fi
+  if ! rsh_script "$ip" "$port" "$cont" "$KEPT" <<'RB'
+N="$1"; KEPT="$2"
+docker inspect "$KEPT" >/dev/null 2>&1 || { echo "  $KEPT is gone: nothing restored"; exit 3; }
+REST=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$N" 2>/dev/null)
+case "$REST" in ''|no) REST=always;; esac
+if docker inspect "$N" >/dev/null 2>&1; then
+  docker stop "$N" >/dev/null 2>&1 || true
+  docker update --restart=no "$N" >/dev/null 2>&1 || true
+  docker rename "$N" "${N}-failed-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+docker rename "$KEPT" "$N"
+docker update --restart="$REST" "$N" >/dev/null
+docker start "$N" >/dev/null
+echo "  restored $KEPT as $N (restart=$REST); the replaced container is kept, stopped, as ${N}-failed-*"
+RB
+  then echo "  [ERR] restore failed on $id"; return 1; fi
+  for _ in $(seq 1 $((HEALTH_TIMEOUT/5))); do
+    sleep 5
+    a=$(rsh "$ip" "$port" "curl -s -m 5 http://localhost:8001/healthz" 2>/dev/null || true)
+    case "$a" in ok*) echo "  rpc: $a"; return 0;; esac
+  done
+  echo "  [ERR] $id did not answer within ${HEALTH_TIMEOUT}s after the restore"; return 1
+}
+
+if [ -n "${QNET_RESTORE_PREVIOUS:-}" ]; then
+  rc=0
+  for id in "${TARGETS[@]}"; do rb "$id" || rc=1; done
+  exit $rc
+fi
+
 # Measure the healthy signer count once, from the first reachable node, unless it was given.
 #
 # Anchored to the SEAL line, and to " signers=" with the leading space. `signers=` is not unique:
@@ -274,50 +454,6 @@ fi
 # way. The heights come from the source of the commits the build stamps name, so both commits must be in
 # the local repository. SKIP_GATE_CHECK=1 is for an image without a stamp, or a recovery roll whose
 # heights were checked by hand; never a fallback.
-GATE_MARGIN="${GATE_MARGIN:-28800}"
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-case "$GATE_MARGIN" in ''|*[!0-9]*) echo "[ERR] GATE_MARGIN must be a block count"; exit 1;; esac
-
-image_build() {
-  rsh "$1" "$2" "docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $IMAGE" 2>/dev/null \
-    | tr -d '\r' | sed -n 's/^QNET_BUILD_ID=//p'
-}
-
-# `gate height` for every ACTIVATIONS entry of the node source at commit $1, each height resolved through
-# the constants it names (the gas-metering one lives in transaction.rs). `?` = a height it cannot read.
-gate_table() {
-  local f
-  # A commit id only: an empty one would make `git show :path` read the index instead.
-  [[ "$1" =~ ^[0-9a-f]{7,40}$ ]] || return 1
-  for f in transaction.rs feature_gates.rs; do
-    git -C "$REPO" cat-file -e "$1:core/qnet-state/src/$f" 2>/dev/null || return 1
-  done
-  { git -C "$REPO" show "$1:core/qnet-state/src/transaction.rs"; echo '@@FEATURE_GATES@@'
-    git -C "$REPO" show "$1:core/qnet-state/src/feature_gates.rs"; } | awk '
-    function res(e, n) {
-      gsub(/^[ \t]+|[ \t]+$/, "", e)
-      if (e ~ /^[0-9][0-9_]*(u64)?$/) { sub(/u64$/, "", e); gsub(/_/, "", e); return e }
-      if (n < 8 && (e in d)) return res(d[e], n + 1)
-      return "?"
-    }
-    { sub(/\r$/, "") }
-    /^@@FEATURE_GATES@@$/ { fg = 1; next }
-    /^ *(pub )?const [A-Z0-9_]+: u64 = [^;]+;/ {
-      l = $0; sub(/^ *(pub )?const /, "", l); n = l; sub(/:.*/, "", n)
-      e = l; sub(/^[^=]*= */, "", e); sub(/;.*/, "", e); d[n] = e; next
-    }
-    /^ *(pub )?const fn [a-z0-9_]+\(\) -> u64 \{ *crate::transaction::[A-Z0-9_]+ *\}/ {
-      l = $0; sub(/^ *(pub )?const fn /, "", l); n = l; sub(/\(.*/, "", n)
-      e = l; sub(/.*crate::transaction::/, "", e); sub(/[^A-Z0-9_].*/, "", e); d[n "()"] = e; next
-    }
-    fg && /^const ACTIVATIONS/ { act = 1; next }
-    act && /^\];/ { act = 0; next }
-    act && /^ *\(id::[A-Z0-9_]+,/ {
-      l = $0; sub(/^ *\(id::/, "", l); g = l; sub(/,.*/, "", g)
-      e = l; sub(/^[^,]*, */, "", e); sub(/\)[ \t]*,?[ \t]*(\/\/.*)?$/, "", e); ids[++k] = g; ex[g] = e
-    }
-    END { for (i = 1; i <= k; i++) print ids[i], res(ex[ids[i]], 0) }'
-}
 
 # The image is pulled on the first target to read its stamp; a pull touches no running container.
 first="${TARGETS[0]}"; fip="${NODE_IP[$first]:-}"
@@ -336,18 +472,11 @@ if [ -n "${SKIP_GATE_CHECK:-}" ]; then
   echo "=== gate check SKIPPED (SKIP_GATE_CHECK set): every added or moved activation height must be"
   echo "    checked by hand to sit above the tip by more than the whole roll ==="
 else
-  tip=0; declare -A LIVE=()
-  for n in $(printf '%s\n' "${!NODE_IP[@]}" | sort); do
-    a=$(rsh "${NODE_IP[$n]}" "$(port_of "$n")" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r')
-    nh=$(echo "$a" | sed -n 's/.*h=\([0-9]*\).*/\1/p'); nb=$(echo "$a" | sed -n 's/.*build=\([^ ]*\).*/\1/p')
-    if [ -z "$nh" ]; then echo "  [WARN] $n did not answer /healthz: the build it runs is not compared"; continue; fi
-    if [ -z "$nb" ]; then
-      echo "[ERR] $n reports no build stamp, so the gates it runs are unknown — check by hand, then SKIP_GATE_CHECK=1"; exit 1
-    fi
-    [ "$nh" -gt "$tip" ] && tip=$nh
-    LIVE[$nb]="${LIVE[$nb]:+${LIVE[$nb]} }$n"
-  done
-  if [ ${#LIVE[@]} -eq 0 ]; then echo "[ERR] no node answered /healthz — the tip is unknown, nothing touched"; exit 1; fi
+  fleet_survey
+  # Some node already runs this build: the fleet is mixed (a roll that stopped, or its rollback), and converging on
+  # either build before the gate beats leaving it mixed, so a gate needs only FINISH_MARGIN blocks there.
+  mixed=""; [ -n "$NEW_BUILD" ] && [ -n "${LIVE[$NEW_BUILD]:-}" ] && mixed=1
+  [ -n "$mixed" ] && echo "=== fleet mixed: nodes ${LIVE[$NEW_BUILD]} already run ${NEW_BUILD:0:7}; finishing or rolling back needs $FINISH_MARGIN blocks before a gate ==="
   if ! new_tab=$(gate_table "$NEW_BUILD"); then
     echo "[ERR] the image's build=${NEW_BUILD:-<unstamped>} is not a commit in the local repository — git fetch and"
     echo "      rerun; an unstamped image needs its gates checked by hand, then SKIP_GATE_CHECK=1"; exit 1
@@ -356,6 +485,10 @@ else
   while read -r g v; do [ -n "$g" ] && NEWG[$g]=$v; done <<< "$new_tab"
   refused=""
   for b in "${!LIVE[@]}"; do
+    [ "$b" = "$NEW_BUILD" ] && continue
+    # Rolling back: the build to roll is an ancestor of the one these nodes run, so a gate only theirs has is a
+    # rule the older build never had, not one folded into it.
+    back_to=""; git -C "$REPO" merge-base --is-ancestor "$NEW_BUILD" "$b" 2>/dev/null && back_to=1
     if ! old_tab=$(gate_table "$b"); then
       echo "[ERR] build=$b (nodes ${LIVE[$b]}) is not a commit in the local repository — git fetch and rerun;"
       echo "      an unstamped node needs its gates checked by hand, then SKIP_GATE_CHECK=1"; exit 1
@@ -368,25 +501,43 @@ else
       [ "$ov" = "$nv" ] && continue
       # A gate a node may already have crossed never moves: blocks between its old and new height would
       # replay under the other rule, and a node syncing them would accept what the fleet refused.
-      if [ -n "$ov" ] && [ "$ov" != "?" ] && [ "$ov" -le $((tip + GATE_MARGIN)) ]; then
-        echo "  [ERR] gate $g: $ov -> $nv, but $ov is not $GATE_MARGIN blocks above the tip $tip: gate already crossed,"
+      crossed=$GATE_MARGIN; [ -n "$mixed" ] && crossed=$FINISH_MARGIN
+      if [ -n "$ov" ] && [ "$ov" != "?" ] && [ "$ov" -le $((tip + crossed)) ]; then
+        echo "  [ERR] gate $g: $ov -> $nv, but $ov is not $crossed blocks above the tip $tip: gate already crossed,"
         echo "        its height is frozen (nodes ${LIVE[$b]} run ${b:0:7})"
         refused=1; continue
       fi
       if [ "$nv" -gt $((tip + GATE_MARGIN)) ]; then
         echo "  gate $g: ${ov:-new} -> $nv, $((nv - tip)) blocks above the tip (nodes ${LIVE[$b]} run ${b:0:7})"
+      elif [ -n "$mixed" ] && [ "$nv" -gt $((tip + FINISH_MARGIN)) ]; then
+        echo "  [WARN] gate $g: ${ov:-new} -> $nv, $((nv - tip)) blocks above the tip: nodes ${LIVE[$b]} (${b:0:7}) must run"
+        echo "         ${NEW_BUILD:0:7} before it, so this roll must finish now"
       else
-        echo "  [ERR] gate $g: ${ov:-new} -> $nv, not $GATE_MARGIN blocks above the tip $tip (nodes ${LIVE[$b]} run ${b:0:7})"
+        echo "  [ERR] gate $g: ${ov:-new} -> $nv, not $( [ -n "$mixed" ] && echo "$FINISH_MARGIN" || echo "$GATE_MARGIN" ) blocks above the tip $tip (nodes ${LIVE[$b]} run ${b:0:7})"
         refused=1
       fi
     done
     for g in "${!OLDG[@]}"; do
       if [ -n "${NEWG[$g]:-}" ] || [ "${OLDG[$g]}" = "0" ]; then continue; fi
-      echo "  [ERR] gate $g (${OLDG[$g]} in ${b:0:7}) is gone from the new build, so its rule is active from genesis"
-      refused=1
+      ov=${OLDG[$g]}
+      if [ -z "$back_to" ] || [ "$ov" = "?" ]; then
+        echo "  [ERR] gate $g (${ov} in ${b:0:7}) is gone from the new build, so its rule is active from genesis"
+        refused=1
+      elif [ "$ov" -gt $((tip + GATE_MARGIN)) ] || { [ -n "$mixed" ] && [ "$ov" -gt $((tip + FINISH_MARGIN)) ]; }; then
+        echo "  gate $g: $ov in ${b:0:7} (nodes ${LIVE[$b]}), absent from its ancestor ${NEW_BUILD:0:7}: rolled back"
+        echo "         $((ov - tip)) blocks before it, so the rule never activates"
+      else
+        echo "  [ERR] gate $g: $ov in ${b:0:7} (nodes ${LIVE[$b]}) is not $FINISH_MARGIN blocks above the tip $tip: rolled back"
+        echo "        now, those nodes could settle it under both rules"
+        refused=1
+      fi
     done
   done
   if [ -n "$refused" ]; then
+    if [ -n "$mixed" ]; then
+      echo "[ERR] roll refused, nothing touched: the fleet is mixed this close to a gate. Converging by hand (SKIP_GATE_CHECK=1)"
+      echo "      is safe only while no node has applied a block whose result the gate changes (docs/operators/maintenance.md)"; exit 1
+    fi
     echo "[ERR] roll refused, nothing touched: move each gate above to a later epoch boundary (./gate-height.sh"
     echo "      prints one), rebuild, rerun"; exit 1
   fi
@@ -438,6 +589,11 @@ for id in "${TARGETS[@]}"; do
   before=$(rsh "$ip" "$port" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r')
   echo "  before: ${before:-<no answer>}"
   ROLLED_FROM[$id]=$(echo "$before" | sed -n 's/^ok .*build=\([^ ]*\).*/\1/p')
+  # A node that is down reports nothing: its container names the build it ran, so a rollback onto it is still seen.
+  if [ -z "${ROLLED_FROM[$id]}" ]; then
+    ROLLED_FROM[$id]=$(container_build "$ip" "$port" "$cont")
+    [ -n "${ROLLED_FROM[$id]}" ] && echo "  before: build ${ROLLED_FROM[$id]:0:7}, from its container (no /healthz answer)"
+  fi
 
   # Pull first: a registry that cannot be reached must not cost us a running node.
   if ! rsh "$ip" "$port" "docker pull -q $IMAGE >/dev/null && docker tag $IMAGE $LOCAL_TAG"; then
@@ -781,13 +937,27 @@ done
 
 # :latest follows the genesis fleet: it moves to a build only once all six run it and passed their gates, so an
 # auto-updating node never runs code the fleet has not taken first (deploy.yml, promote job). Never after a rollback.
+# Checked, not assumed: a node that follows :latest and stays on the old build stops matching the certified roots at the
+# first gate this build adds, so the run fails until :latest carries the build (read back by a pull on genesis host 001).
+LATEST_TIMEOUT="${LATEST_TIMEOUT:-1200}"
 promote_latest() {
-  if command -v gh >/dev/null 2>&1 \
-     && gh workflow run deploy.yml -R AIQnetLab/QNet-Blockchain --ref testnet -f promote_sha="$NEW_BUILD" >/dev/null 2>&1; then
-    echo "=== :latest promotion started for ${NEW_BUILD:0:7} (deploy.yml promote job) ==="
-  else
-    echo "=== :latest NOT moved: run  gh workflow run deploy.yml --ref testnet -f promote_sha=$NEW_BUILD ==="
+  local got="" lip lport
+  if ! command -v gh >/dev/null 2>&1 \
+     || ! gh workflow run deploy.yml -R AIQnetLab/QNet-Blockchain --ref testnet -f promote_sha="$NEW_BUILD" >/dev/null 2>&1; then
+    echo "[ERR] :latest NOT moved: run  gh workflow run deploy.yml --ref testnet -f promote_sha=$NEW_BUILD"
+    echo "      until it moves, nodes that follow :latest stay on their build and stop matching the certified roots at its first gate"
+    return 1
   fi
+  echo "=== :latest promotion started for ${NEW_BUILD:0:7} (deploy.yml promote job); waiting for :latest to carry it ==="
+  lip="${NODE_IP[001]}"; lport="$(port_of 001)"
+  for _ in $(seq 1 $((LATEST_TIMEOUT/30))); do
+    sleep 30
+    got=$(rsh "$lip" "$lport" "docker pull -q ghcr.io/aiqnetlab/qnet-production:latest >/dev/null 2>&1 && docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ghcr.io/aiqnetlab/qnet-production:latest" 2>/dev/null \
+      | tr -d '\r' | sed -n 's/^QNET_BUILD_ID=//p')
+    if [ "$got" = "$NEW_BUILD" ]; then echo "=== :latest carries build ${NEW_BUILD:0:7} ==="; return 0; fi
+  done
+  echo "[ERR] :latest still carries build=${got:-<unknown>} after ${LATEST_TIMEOUT}s: check the promote job"
+  return 1
 }
 
 # The fleet gate of a halted chain runs here once all six report the build just rolled; until then the
@@ -806,10 +976,10 @@ if [ -n "${QNET_RECOVERY_HALTED:-}" ]; then
   else
     # The parked height defaults to the highest height a node of this roll answered with at M1.
     fleet_gate "${RECOVERY_RESTART_H:-$ROLL_MAX_H}" $(printf '%s\n' "${!NODE_IP[@]}" | sort) || exit 1
-    promote_latest
+    promote_latest || exit 1
   fi
 elif [ -n "$NEW_BUILD" ] && [ -z "$back" ] && [ -z "$behind" ]; then
-  promote_latest
+  promote_latest || exit 1
 else
   echo "=== :latest left as it is:${back:+ moved back$back;}${behind:+ not on ${NEW_BUILD:0:7}:$behind} ==="
 fi

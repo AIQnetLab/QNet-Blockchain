@@ -345,11 +345,13 @@ pub(super) async fn handle_account_transactions(
                     Some(got) if tx.from != address => (Some(address.clone()), got),
                     _ => crate::rpc::tx_display_to_amount(tx),
                 };
+                let (status, amount) = crate::rpc::claim_outcome_display(&storage, tx).unwrap_or(("confirmed", amount));
                 json!({
                     "hash": tx.hash,
                     "from": tx.from,
                     "to": to,
                     "amount": amount,
+                    "status": status,
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
@@ -760,11 +762,13 @@ pub(super) async fn handle_transaction_history(
                     Some(got) if direction == "received" => (Some(query.address.clone()), got),
                     _ => crate::rpc::tx_display_to_amount(tx),
                 };
+                let (status, amount) = crate::rpc::claim_outcome_display(&storage, tx).unwrap_or(("confirmed", amount));
                 json!({
                     "hash": tx.hash,
                     "from": tx.from,
                     "to": to,
                     "amount": amount,
+                    "status": status,
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,

@@ -165,6 +165,8 @@ fn wallet_plane_allows_only_the_listed_routes() {
         (Method::GET, "/api/v1/token/eon_c/eon_h/balance/proof", Some("mb=3"), TokenProof),
         (Method::GET, "/api/v1/logs/proof", Some("tx_hash=ab&log_index=0"), LogsProof),
         (Method::GET, "/api/v1/macroblock/12/proof", None, MacroblockProof),
+        (Method::GET, "/api/v1/galc/capsule", None, GalcCapsule),
+        (Method::OPTIONS, "/api/v1/galc/capsule", None, GalcCapsule),
         (Method::GET, "/api/v1/registry/height/1080", None, Registry),
         (Method::GET, "/api/v1/node/serve-proof", Some("challenge=00"), ServeProof),
         (Method::GET, "/api/v1/nodes/rpc", Some("ids=super_node_0011223344556677"), NodesRpc),
@@ -195,6 +197,10 @@ fn wallet_plane_allows_only_the_listed_routes() {
         ("/api/v1/macroblock/-1/proof", None),
         ("/api/v1/macroblock/123456789012345678901/proof", None),
         ("/api/v1/registry/height/x", None),
+        ("/api/v1/galc", None),
+        ("/api/v1/galc/capsule/", None),
+        ("/api/v1/galc/capsule/x", None),
+        ("/api/v1/galc/capsules", None),
         ("/api/v1/block/latest", None),
         ("/api/v1/blocks/headers", None),
         ("/api/v1/archive", None),
@@ -230,7 +236,8 @@ fn wallet_plane_allows_only_the_listed_routes() {
     for path in ["/rpc", "/", "/api/v1/node-registration/submit", "/api/v1/node-reactivation/submit", "/api/v1/register-device",
                  "/api/v1/light-node/register", "/api/v1/light-node/ping-response", "/api/v1/light-node/bind", "/api/v1/p2p/message",
                  "/api/v1/shutdown", "/api/v1/internal/fcm-token-sync", "/api/v1/rewards/claim", "/api/v1/batch/transfer",
-                 "/api/v1/contract/deploy", "/api/v1/bundle/submit", "/api/v1/macroblock/12/proof", "/api/v1/state/certified"] {
+                 "/api/v1/contract/deploy", "/api/v1/bundle/submit", "/api/v1/macroblock/12/proof", "/api/v1/state/certified",
+                 "/api/v1/galc/capsule"] {
         assert_eq!(p(path), None, "POST {}", path);
     }
     // Methods: a read is GET only, the submit POST only.
@@ -252,7 +259,7 @@ fn wallet_plane_allows_only_the_listed_routes() {
         rest.split('"').next()
     }).collect();
     assert!(first_segments.len() > 30, "segments read from mod.rs: {:?}", first_segments);
-    let listed = ["state", "account", "token", "logs", "macroblock", "registry", "node", "nodes", "whoami", "transaction"];
+    let listed = ["state", "account", "token", "logs", "macroblock", "galc", "registry", "node", "nodes", "whoami", "transaction"];
     for seg in &first_segments {
         if listed.contains(seg) {
             continue;
@@ -585,6 +592,8 @@ async fn egress_reserves_before_a_burst_waits_on_one_build() {
     assert_eq!(fresh.heavy.estimate(WalletRoute::MacroblockProof, "/api/v1/macroblock/1/proof"), 8 * 1024 * 1024);
     assert_eq!(fresh.heavy.estimate(WalletRoute::Registry, "/api/v1/registry/height/1"), 16 * 1024 * 1024);
     assert_eq!(fresh.heavy.estimate(WalletRoute::Healthz, "/healthz"), 0);
+    assert_eq!(fresh.heavy.estimate(WalletRoute::GalcCapsule, "/api/v1/galc/capsule"), 0);
+    assert!(!WalletRoute::GalcCapsule.heavy(), "the capsule is a light route");
 }
 
 #[tokio::test]

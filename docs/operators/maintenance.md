@@ -281,7 +281,17 @@ the hours before a roll can still be read afterwards. It touches the next node o
 previous one answers `/healthz`, is fewer than 10 blocks below the network height with at least one validated peer,
 has taken part in a checkpoint as a validator and seen a full-quorum seal at or above that window above its restart
 height, and has run 30 blocks past its restart with a failover-free metrics window. `QNET_RECOVERY_HALTED=1` skips the
-last two gates for a roll that repairs a halted chain.
+last two gates for a roll that repairs a halted chain. A node that does not answer `/healthz` is still accounted for:
+the build its container names (the image's `QNET_BUILD_ID`) is compared in the gate check and counts when the roll
+decides whether it moved a node back to an older build. `QNET_RESTORE_PREVIOUS=1 scripts/deploy-genesis.sh <id>`
+brings back a container a roll kept for that node, whether the current one runs, stopped or crashed; the replaced
+container is kept, stopped, as `<container>-failed-<timestamp>`. With several kept it takes the oldest, the build from
+before the first attempt. It first compares that build's gates with the build every other node runs, and refuses
+when the two part at a gate less than `FINISH_MARGIN` (5,400 blocks) above the tip: brought back past a gate the rest
+of the fleet enforces, the node would settle that height under the other rule and leave consensus.
+`QNET_RESTORE_FORCE=1` skips that check after it was made by hand. Once a roll has passed its gates, `:latest` (which
+nodes with the auto-updater follow) is moved to the build through the `deploy.yml` promote job and read back; the run
+fails until `:latest` carries it, because a node left on the old build stops matching the certified roots at the build's first gate.
 
 **Gated rule change (rolling).** A consensus rule that ships behind a feature gate rolls like an ordinary upgrade.
 The release carries the rule dormant with an activation height compiled into the binary, every node flips it at that
@@ -291,7 +301,13 @@ treat the activation height as the deadline for the rolling pass above. The curr
 when the deployment must be finished. A crossed gate never moves: only a gate the fleet has not reached may be moved
 to a later epoch boundary, before the first roll of its build, and `scripts/deploy-genesis.sh` refuses to move one
 whose old height is not `GATE_MARGIN` (28,800 blocks) above the fleet tip ("gate already crossed, its height is
-frozen").
+frozen"). A roll starts only while every gate its build adds is `GATE_MARGIN` above the tip. Once part of the fleet
+runs the build (a roll that stopped half way), finishing it, or rolling it back to the ancestor build, needs only
+`FINISH_MARGIN` (5,400 blocks) before each gate the two builds disagree on: converging either way beats a fleet that
+stays mixed, which forks where the gate's rule first changes a result. Closer than that the script refuses. Converging
+by hand with `SKIP_GATE_CHECK=1` is still safe until the first block whose result the gate changes; for
+`super_reward_admission` that is height 3,729,690, where epoch 258's super reward set is filed (epoch 257 settles at
+3,715,290 under the old rule on both builds).
 
 **Protocol-breaking upgrade.** A change that alters what any node considers valid and is not carried by a gate cannot
 be rolled. Use the halt-height mechanism: set the *same* `QNET_HALT_HEIGHT` on every node. The 30-second monitor loop compares the

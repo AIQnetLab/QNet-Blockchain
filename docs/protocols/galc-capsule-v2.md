@@ -94,29 +94,34 @@ This is a node release, not a block rule: no consensus field changes, and v1 sta
    (40, tied to the snapshot cadence) does not change.
 4. **Mint.** A genesis node signs K only when the `checkpoint_qc` of K and of K-1 decode, `cp.hash() ==
    qc.checkpoint_hash` for each, `window_head_height == K × 90` and neither checkpoint carries a `recovery_anchor`. It
-   broadcasts `GenesisCheckpointSig { version: 2, … }` with the v1 fields; a receiver recomputes cpA and cpP from its
-   own K and K-1. Nodes without v2 drop version 2.
-5. **Receive.** A cheap filter first: the sender is a genesis node, `K % 10 == 0`, K is at most one above the node's own
+   sends `GenesisCheckpointSig { version: 2, … }` with the v1 fields to the genesis nodes it is connected to; a receiver
+   recomputes cpA and cpP from its own K and K-1. Nodes without v2 drop version 2.
+5. **Receive.** Only a genesis node takes partials, and only directly from the genesis node that signed them (its
+   address is the signer's genesis address). A cheap filter first: `K % 10 == 0`, K is at most one above the node's own
    finalized macroblock and above its v2 index. Then cpA and cpP are recomputed, the signature verified and the partial
-   aggregated. Partials for a K not stored yet wait in a bounded buffer (newest K, at most 5) and are retried on the
-   15-second tick.
-6. **Persistence.** The assembled capsule is stored under `galc_v2_held` on every assembly path, P2P included, and is
-   reloaded and verified again at boot.
+   aggregated; a signer counts once, at its highest K. Partials for a K not stored yet wait in a bounded buffer (newest
+   K, at most 5) and are retried on the 15-second tick.
+6. **Persistence.** The assembled capsule is stored under `galc_v2_held` on every assembly path, P2P included. At boot
+   it is verified again and held only while the node's own K and K-1 still hash to cpA and cpP (a recovery decree may
+   have re-certified them), so a re-certified K can assemble again.
 7. **Rollback.** A rollback below K deletes `galc_v2_held` and clears the v1 and v2 holders in memory.
-8. **Transport.** P2P serving stays v1; v2 travels over HTTP only.
+8. **Transport.** v2 partials travel only between genesis nodes, so only genesis nodes hold a capsule. P2P serving and
+   sync stay v1; the capsule travels over HTTP only.
 
 ## 6. HTTP route: `GET /api/v1/galc/capsule`
 
 | Answer | When |
 | --- | --- |
-| 200, the JSON of section 2 | the node holds a v2 capsule whose K decodes, on the node, to a checkpoint hashing to cpA, with K at most its finalized macroblock |
+| 200, the JSON of section 2 | the node holds a v2 capsule whose K and K-1 decode, on the node, to checkpoints hashing to cpA and cpP, with K at most its finalized macroblock |
+| 304 | `If-None-Match` names the capsule's ETag (and the 200 conditions hold) |
 | 404 `{"error": "no_capsule"}` | no capsule yet |
-| 503 `{"error": "capsule_unbound"}` | the self-check above fails (after a rollback, for example) |
+| 503 `{"error": "capsule_unbound"}` | the self-check above fails (after a rollback, for example); `Retry-After: 60` |
 | 405 | a node from before this release |
 
 The serialized body is cached by (K, cpA) with `Cache-Control: public, max-age=60` and the ETag `"2-<K>-<first 8 hex of
-cpA>"`. The route has its own rate-limit bucket and is a light route of the wallet plane. With four compact signatures
-the body is about 31 KB.
+cpA>"`; the node reads K and K-1 again for the self-check at most once a minute. The signatures are served in the
+compact form. The route has its own rate-limit buckets (120 a minute per address, one off the wallet plane and one on
+it) and is a light route of the wallet plane. With four compact signatures the body is about 21 KB.
 
 ## 7. Client rules
 

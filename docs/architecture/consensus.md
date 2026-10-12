@@ -55,20 +55,19 @@ branch on `is_active`, and deploy the binary everywhere before that height.
 | `wallet_one_node` | one wallet, one node of either type: a non-genesis `NodeRegistration` is refused when its wallet already has another node registered on chain below the block (its genesis, super or light id), and a block may not carry two registrations of one wallet under different node ids; a light registration's owner bind may take its form without a time ([light node messages](../protocols/light-node-messages.md#4-wallet-key-and-ping-key-messages)) | 3,657,600 |
 | `failover_tenure_bound` | a failover round belongs to the 30-block tenure it was certified for ([timeout votes](#timeout-votes)); fork choice compares two blocks only where their branches part and never rolls back toward a branch that contradicts this node's finality ([fork choice](#fork-choice)); a producer may sign a (height, round) it never signed at that round or above ([producer self-checks](#producer-self-checks)) | 3,657,600 |
 | `emergency_committee_allowlist` | the eligible-producer snapshot admits only the compiled `EMERGENCY_COMMITTEE_ALLOWLIST` (`genesis_node_001`…`005` and `super_node_c78c3017a4f93464`), applied only where the stored set is built (see [the allowlist](#emergency-committee-allowlist)) | 3,505,410 |
-| `super_reward_admission` | a Super node earns an epoch's operator share only inside that epoch's consensus-admitted set, today the `EMERGENCY_COMMITTEE_ALLOWLIST`; keyed on the epoch's first block, applied only where the settle point files the epoch's super reward set (see [the allowlist](#emergency-committee-allowlist)) | 3,657,600 |
+| `super_reward_admission` | a Super node earns an epoch's operator share only inside that epoch's consensus-admitted set, today the `EMERGENCY_COMMITTEE_ALLOWLIST`; keyed on the epoch's first block, applied only where the settle point files the epoch's super reward set (see [the allowlist](#emergency-committee-allowlist)) | 3,715,200 |
 
 The five gates at height 0 run from the genesis block. The two light gates share the epoch boundary 691,200
 (48 × 14,400): the bitmap-owner rule reads the block height while the commit-window rule reads the epoch start, and only
-a boundary moves both together. `wallet_one_node` holds the same provisional height as `tx_target_bound` until
-`scripts/gate-height.sh` sets it for the push that ships it; below it a wallet registered with both types keeps both, so
-blocks already on disk replay unchanged. The rule is judged where registrations are judged (block verification, the
-producer's re-check and the admission doors), never in apply or replay. `failover_tenure_bound` holds the same
-provisional height the same way. It is read at the first slot of a tenure (`failover_tenure_bound(h)` asks the gate at
-`tenure_first_slot(h)`), so no tenure runs on two rules: with the gate `G` on a window boundary, slot `G` is the last slot
+a boundary moves both together. `tx_target_bound`, `wallet_one_node` and `failover_tenure_bound` share the epoch
+boundary 3,657,600 (254 × 14,400). Below `wallet_one_node` a wallet registered with both types keeps both, so blocks
+already on disk replay unchanged; that rule is judged where registrations are judged (block verification, the
+producer's re-check and the admission doors), never in apply or replay. `failover_tenure_bound` is read at the first
+slot of a tenure (`failover_tenure_bound(h)` asks the gate at `tenure_first_slot(h)`), so no tenure runs on two rules: with the gate `G` on a window boundary, slot `G` is the last slot
 of a tenure that keeps the old rules, the first gated tenure is `[G+1, G+30]`, and window `G/90` is the last window that
-holds an old-rule slot. `super_reward_admission` holds the same provisional height the same way, on an epoch boundary:
-it is asked at an epoch's first block, so epoch 253, which settles above the gate, keeps the old rule and epoch 254 is the
-first it governs. Because the heights live in the binary,
+holds an old-rule slot. `super_reward_admission` sits on the epoch boundary 3,715,200 (258 × 14,400), above the
+release that ships it: it is asked at an epoch's first block, so epoch 257, which settles above the gate, keeps the old
+rule and epoch 258 is the first it governs. Because the heights live in the binary,
 agreement needs no on-chain governance vote. See
 [maintenance](../operators/maintenance.md#upgrading-a-node) for how a gated change is rolled out.
 
@@ -261,6 +260,19 @@ FrozenCommittee(w) = sample_committee(FrozenRoster, w, FrozenBeacon(w), 1000, 10
 ```
 
 Because none of these fold post-seal bytes, a contested tail above the seal cannot poison them.
+
+`L` and `B` are this node's own: a node behind on seals that holds no newer certified macroblock reads its lag as a
+stall and freezes on its own newest seal, while peers that sealed further elect from newer macroblocks. Where the
+eligible set changed between those anchors the two name different producers for one slot (12.10, nodes at seal
+38948 against the six of 38949 onward). A node therefore abstains, as node policy, from the election it makes
+(`election_abstain_reason`): for a height past its own derivation horizon it caches no producer expectation, so
+ingest takes the soft path for that slot, and the same holds for a frozen window while its certified finality runs
+more than `MAX_UNSEALED_WINDOWS + 1` windows past its seal. It also stops producing there, until its seal catches up,
+once a peer's certified macroblock above its seal has verified on this node: that is proof the network sealed further.
+Without that proof the lag may be every node's at once (a seal held or refused on all of them while checkpoints
+commit), and production off the common frozen anchor goes on, since only later commits release a held seal. A
+selection the round cache made at another seal is recomputed and is no ingest authority meanwhile. In a genuine
+finality stall finality does not run ahead of the seal, so production off the frozen anchor continues as above.
 
 ## Microblock contents
 

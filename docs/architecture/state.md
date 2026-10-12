@@ -490,6 +490,8 @@ cursor, the consensus round, timeout certificates and the sync resume point amon
 | Registered API endpoint | `node_registry` family, `api_{node_id}` | the endpoint a chain-confirmed super registered with, read once from the `NodeRegistration` in its registration block and indexed, empty when it registered without one; a boot task backfills missing rows, and the public-node list is served from it. A side index, not a `registry_root` input. |
 | Committed burn binding | `metadata` family, `cbw_{burn_tx}` | the node id a 1DEV burn is bound to on-chain. First-wins and immutable, read at block validation so a second registration cannot reuse the same burn under another identity. See [../economics/node-activation.md](../economics/node-activation.md). |
 | Reward shards | `epoch_wshard_` / `epoch_shardmeta_` keys | sharded leaf-set cache for epoch reward roots; separately prunable. |
+| Reward recipient index | `pending_rewards` family, `rcpx_meta_{epoch}` / `rcpx_bkt_{epoch}_{bucket}` | each epoch's recipients as (16-byte wallet fingerprint, amount), with the certified root it was built from; kept after the epoch's shards are pruned. Node-local, never in a frame or a root. |
+| Claim outcomes | `pending_rewards` family, `claim_out_{tx_hash}`, with `claim_oh_{height:020}_{tx_hash}` in height order | what an applied merkle claim credited (height, amount, epochs), pruned with the transaction index at its height (which waits for the archive); node-local display data. |
 
 Wallet-to-node lookup is resolved by deriving the node id from the wallet and point-reading
 `node_{id}`, so no mutable per-node slot can diverge across apply and gossip ordering.
@@ -689,7 +691,12 @@ node can never need a pruned body — changing those constants is a compile erro
 break. `prune_epoch_reward_shards` range-deletes only the sharded leaf-set cache
 (`epoch_wshard_` / `epoch_shardmeta_`), leaving `epoch_root_`, `super_elig_` (an epoch's settled super set,
 admitted members only from the `super_reward_admission` gate) and `light_bm_` intact so
-a pruned epoch's claim path still works. Compaction is selective: only families with at least
+a pruned epoch's claim path still works. The cache keeps the newest 256 epochs, and an older epoch leaves it only
+once its recipient index exists (a hold of at most 64 epochs, skipped for an epoch whose shards do not recombine to
+its certified root): the periodic cleanup and boot index up to four cached epochs a pass, and a claim's rebuild of a
+pruned epoch indexes it too. A claim walk then passes a pruned epoch the wallet holds no leaf in from the index,
+the balance routes count an indexed epoch's amount, and only an epoch the wallet was paid in needs a rebuild for
+its proof. Epochs below the retention floor are not repair targets: no peer serves their leaf set. Compaction is selective: only families with at least
 `COMPACT_MIN_ROWS` = 1,000 rows deleted are compacted, so a family holding no tombstones is not
 rewritten.
 

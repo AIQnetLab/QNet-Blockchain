@@ -1957,6 +1957,7 @@ impl BlockchainNode {
         // Heal any reward epoch holding a certified root but an Absent local shard (freeze-race / snapshot
         // join) so pending/claim serve the certified amount identically to a from-genesis node.
         let _ = crate::node::BlockchainNode::backfill_reward_shards(&blockchain.storage);
+        crate::node::BlockchainNode::index_reward_recipients(&blockchain.storage);
         // Anything the local rebuild could not reproduce — its inputs are gone — is pulled from a peer
         // and accepted only against this node's own certified root.
         crate::node::BlockchainNode::repair_unservable_reward_epochs(&blockchain.storage).await;

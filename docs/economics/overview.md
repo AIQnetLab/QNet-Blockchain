@@ -120,7 +120,7 @@ The super set is sampled at the epoch **settle point** — `h % 14_400 == HB_ANC
 
 Registration is bounded by the same settle point. Epoch `E`'s leaf set is built from `super_registrations_as_of((E + 1) * 14_400 + 90)`: a super whose registration row is stamped above that height contributes to the following epoch instead. The roster that decides an epoch's reward leaves is committed inside `reward_root`, so it must be a function of chain data that is already final when the epoch settles.
 
-**Admission.** From the `super_reward_admission` gate (height 3,657,600, epoch 254) a third condition applies: the node must be in the epoch's consensus-admitted set. While the `emergency_committee_allowlist` gate is active that set is the compiled `EMERGENCY_COMMITTEE_ALLOWLIST`, `genesis_node_001`…`005` and `super_node_c78c3017a4f93464`. One function, `super_reward_admission`, decides the set. The condition is keyed on the epoch's first block: epoch `E` is governed when `E * 14_400` is at or above the gate, so epoch 253, which settles above the gate, keeps the old rule, and the first emission affected is the one at 3,686,400. It is applied once, where the settle point files `super_elig_{E}`; the producer, replicas and a snapshot joiner re-deriving inside epoch `E + 1` all file the same set, and every reward reader and shard rebuild reads those rows. A registered super outside the set keeps its registry row, its heartbeats and every reward it already earned: the claim path checks the proof against the certified root and the watermark, never membership. See [consensus](../architecture/consensus.md#emergency-committee-allowlist).
+**Admission.** From the `super_reward_admission` gate (height 3,715,200, epoch 258) a third condition applies: the node must be in the epoch's consensus-admitted set. While the `emergency_committee_allowlist` gate is active that set is the compiled `EMERGENCY_COMMITTEE_ALLOWLIST`, `genesis_node_001`…`005` and `super_node_c78c3017a4f93464`. One function, `super_reward_admission`, decides the set. The condition is keyed on the epoch's first block: epoch `E` is governed when `E * 14_400` is at or above the gate, so epoch 257, which settles above the gate, keeps the old rule, and the first emission affected is the one at 3,744,000. It is applied once, where the settle point files `super_elig_{E}`; the producer, replicas and a snapshot joiner re-deriving inside epoch `E + 1` all file the same set, and every reward reader and shard rebuild reads those rows. A registered super outside the set keeps its registry row, its heartbeats and every reward it already earned: the claim path checks the proof against the certified root and the watermark, never membership. See [consensus](../architecture/consensus.md#emergency-committee-allowlist).
 
 **Light nodes.** Eligibility is committed on-chain as per-epoch bitmaps. Each of the five genesis nodes publishes a `LightNodeEligibilityBitmap` transaction for its hash-shard, where bit `i` corresponds to the light node whose **permanent** `reg_index` is `i`, set when that node attested during the epoch. The bitmap is per-shard; the bit position is the global registration ordinal, and `index_span` is the highest `reg_index` in the shard plus one. Using the permanent registration index rather than a scan-relative ordinal matters: under a scan-relative ordinal a truncated roster shifts every later node, which yields a different payout set rather than a smaller one.
 
@@ -197,7 +197,7 @@ Rewards are strictly **pull**. Emission credits only `system_rewards_pool`; a wa
 
 A wallet POSTs to `/api/v1/rewards/claim` with `node_id`, `wallet_address`, and a mandatory ML-DSA-65 signature over `q{QNET_CHAIN_ID}|claim_rewards:{node_id}:{wallet_address}`; the chain tag `q{QNET_CHAIN_ID}|` (`QNET_CHAIN_ID = 1337`) prefixes both messages a claim signs, so an authorization made on one chain does not verify on another. The request is rejected outright if that signature is missing, and `wallet_address` must pass full EON-address validation before any state is read. The claimant wallet must equal the on-chain registered wallet for the `node_id`; an unregistered node cannot claim. A per-node in-progress lock rejects concurrent claims for the same node.
 
-Without `claims_data`/`claims_signature`, the node quotes a batch. It walks the epoch grid (multiples of 160) strictly above the wallet's `last_claimed_epoch` in ascending order, up to the newest root it holds, resolves each epoch's root from its stored row or, when the row is missing, from the certifying macroblock it holds, generates each merkle proof from the locally stored shard, and stops at the first epoch it cannot serve, reporting `stopped_at_epoch` and `stopped_reason`. Bounds on the quote:
+Without `claims_data`/`claims_signature`, the node quotes a batch. It walks the epoch grid (multiples of 160) strictly above the wallet's `last_claimed_epoch` in ascending order, up to the newest root it holds, resolves each epoch's root from its stored row or, when the row is missing, from the certifying macroblock it holds, generates each merkle proof from the locally stored shard, and stops at the first epoch it cannot serve, reporting `stopped_at_epoch` and `stopped_reason`. An epoch whose shards were pruned (the cache keeps 256 epochs) is passed from the node's recipient index when the wallet holds no leaf in it, so a wallet that never claimed walks the pruned epochs without a rebuild each; an epoch it was paid in is rebuilt from the durable eligibility rows and checked against the certified root. Bounds on the quote:
 
 | Name | Value |
 | --- | --- |
@@ -206,7 +206,7 @@ Without `claims_data`/`claims_signature`, the node quotes a batch. It walks the 
 | `MAX_CLAIMS_DATA` (submit) | 256 * 1024 bytes |
 | `MAX_CLAIM_ENTRIES` (mempool admission) | 512 entries |
 | `CLAIM_PROOFGEN_SEM` | 16 concurrent proof generations node-wide |
-| `rebuild_budget` | one leaf-set rebuild per request |
+| `rebuild_budget` | 65,536 rebuilt leaves per request, at least one rebuild |
 | `REBUILD_RETRY_SECS` | 3600 s before a diverged epoch is retried |
 | `claim_rewards` rate limit | 10 requests per 3600 s window, 1800 s block duration |
 
@@ -217,7 +217,7 @@ Without `claims_data`/`claims_signature`, the node quotes a batch. It walks the 
 | `batch_full` | `MAX_BATCH` reached — re-call for the remainder |
 | `quote_byte_budget` | `CLAIM_QUOTE_BYTE_BUDGET` reached — re-call for the remainder |
 | `root_not_here` | this node does not hold the epoch's certified root — retry against another node |
-| `rebuild_budget` | the one permitted leaf-set rebuild was already spent this request — re-call |
+| `rebuild_budget` | the leaf-set rebuilds permitted this request were spent — re-call |
 | `local_corruption` | this node's inputs are present but do not reproduce the certified root; the epoch is memoised for `REBUILD_RETRY_SECS` and this node resyncs — claim elsewhere |
 | `epoch_unservable` | the epoch resolves to no servable proof here — claim elsewhere |
 
@@ -243,7 +243,7 @@ A merkle reward claim is fee-less but does **not** ride the consensus priority l
 
 ### Mempool admission
 
-Admission bounds entries at `MAX_CLAIM_ENTRIES`, requires at least one entry above the wallet's watermark (so a credited payload cannot be re-flooded as a free no-op), checks `claim_authorized`, and verifies every entry's proof against the epoch's certified root. Admission is fail-closed on resolution: a claim naming an epoch this node cannot resolve to a certified root is refused here, so a node only relays and packs claims it has itself verified. A wallet whose claim is refused for that reason submits it to a node that holds the epoch. Apply re-runs the same authorization and proof checks and is the final authority.
+Admission bounds entries at `MAX_CLAIM_ENTRIES`, requires every entry above the wallet's watermark (so a credited payload cannot be re-flooded as a free no-op, and a batch quoted before an earlier claim landed is re-quoted instead of landing as a partial or empty credit), keeps one pending claim per wallet in the pool, checks `claim_authorized`, and verifies every entry's proof against the epoch's certified root. Admission is fail-closed on resolution: a claim naming an epoch this node cannot resolve to a certified root is refused here, so a node only relays and packs claims it has itself verified. A wallet whose claim is refused for that reason submits it to a node that holds the epoch. Apply re-runs the same authorization and proof checks and is the final authority.
 
 The producer runs one further check before it builds a block. `claims_resolvable` scans every `RewardDistribution` from `system_rewards_pool` in the candidate list and reports the first epoch that resolves to `LocalFault`, so the producer declines the block rather than discovering the fault inside its inline apply, which has no snapshot to roll back.
 

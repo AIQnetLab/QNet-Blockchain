@@ -4687,6 +4687,8 @@ pub enum NetworkMessage {
 
     /// GALC: one genesis node's partial signature over a checkpoint (mb_index, mb_hash,
     /// committee_digest). Aggregated to >=2f+1 → a self-authenticating capsule. Control-lane.
+    /// `version` 2 is the wallet capsule's partial (galc::GenesisCheckpointV2), sent only to genesis
+    /// peers; the receiver adds the checkpoint hashes of its own K and K-1.
     GenesisCheckpointSig {
         version: u16,
         network_id: [u8; 32],
@@ -4699,7 +4701,8 @@ pub enum NetworkMessage {
         sig: String,
     },
 
-    /// GALC: a complete >=2f+1-signed capsule (bincode of galc::GenesisCheckpoint). Relayed by any super.
+    /// GALC: a complete >=2f+1-signed capsule (bincode of galc::GenesisCheckpoint). Broadcast by the genesis
+    /// node whose mint completes it; any node serves the one it holds on request and on sync.
     GenesisCheckpoint {
         data: Vec<u8>,
     },
