@@ -24,9 +24,10 @@ import {
   highestVerifiedIndex, exportVerifiedAnchors, importVerifiedAnchors, chainIdentity, isRateLimitBody,
   certifiedStateRootAt, certifiedHeadHint, markNodeOld, nodeMarkedOld, trustFloorIndex, verifiedCheckpointTime,
   stepsToVerify, refreshCapsule, followStep, exportCapsule, importCapsule, clearCapsule, heldCapsuleIndex,
-  OWN_ROOT_WALK_STEPS,
+  OWN_ROOT_WALK_STEPS, verifyCapsuleSignatures,
 } from '../crypto/QcLightClient';
 import { NETWORK_ID } from '../config/genesisConsensus';
+import { boundedGetJson } from '../utils/boundedFetch';
 import {
   agreedEndpoints, mergeEndpoints, readPoolUrls, loadDiscovered, saveDiscovered, DISCOVERY_INTERVAL_MS,
   MIN_GENESIS_AGREEMENT,
@@ -2943,8 +2944,33 @@ export class WalletManager {
     const r = await refreshCapsule(() => shuffledGenesisNodes(), {
       headHint: head, proofNodes: () => this._lineageNodes(),
     });
+    this._lastCapsule = { ok: !!(r && r.ok), reason: (r && (r.reason || (r.ok ? 'ok' : null))) || 'none', index: r && r.index, at: Date.now() };
     if (r && r.ok) await this._saveCapsule();
     return r;
+  }
+
+  /**
+   * The light client's state in one line for a support screenshot (long press on the title): the capsule held, the
+   * last capsule answer and the last walk to a certified root, with the steps a walk to the head still takes.
+   */
+  async lightClientDiagnostics() {
+    const c = this._lastCapsule || {};
+    const w = this._lastWalk || {};
+    const age = (at) => (at ? Math.round((Date.now() - at) / 1000) + 's ago' : 'never');
+    const lines = ['capsule held: ' + (heldCapsuleIndex() || 'none'),
+      'capsule ask: ' + (c.reason || 'never') + (c.index ? ' K=' + c.index : '') + ' (' + age(c.at) + ')',
+      'walk: ' + (w.ok === undefined ? 'never' : w.ok ? 'ok' : (w.why || 'failed')) + (w.index ? ' to ' + w.index : '') + ' (' + age(w.at) + ')',
+      'verified up to: ' + highestVerifiedIndex(), 'steps left: ' + (this.walkSteps() ?? 'none')];
+    // The same read and the same signature check the walk uses, done now: which of the two fails on this device.
+    try {
+      const cap = await boundedGetJson(GENESIS_NODES[0] + '/api/v1/galc/capsule', { timeoutMs: 15000, maxBytes: 64 * 1024 });
+      lines.push('capsule read: ok K=' + (cap && cap.mb_index));
+      const sig = await verifyCapsuleSignatures(cap);
+      lines.push('capsule signatures on this device: ' + sig.valid.length + ' valid');
+    } catch (e) {
+      lines.push('capsule read: ' + String((e && (e.code || e.message)) || e).slice(0, 120));
+    }
+    return lines.join(String.fromCharCode(10));
   }
 
   // A walk to `index` of more than OWN_ROOT_WALK_STEPS steps first asks for a capsule (at most CAPSULE_WAIT_MS): one
@@ -6150,6 +6176,7 @@ export class WalletManager {
     if (index < head - lag || index > head + lag) return { ok: false, reason: 'unconfirmed' };
     await this._capsuleFirst(index, network);
     const r = await certifiedStateRootAt(index, () => this._lineageNodes(), this._lineageHooks());
+    this._lastWalk = { ok: !!r.ok, why: r.ok ? null : r.reason, index, at: Date.now() };
     this._saveVerifiedAnchors().catch(() => {});
     return r.ok ? { ok: true, stateRoot: r.stateRoot } : { ok: false, reason: 'unconfirmed', why: r.reason };
   }

@@ -718,8 +718,8 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
         ['fail', null, 'balance_unavailable', true, null],
         ['ok', null, 'balance_network_paused', false, { index: 38948, since: mockNOW }],
         ['ok', null, 'balance_network_paused_untimed', false, { index: 38948, since: null }],
-        // A long lineage walk keeps QNC from being certified: how far it is (plan Part 3, item 6).
-        ['fail', null, 'balance_verifying_steps', false, null, 480],
+        // A long lineage walk keeps QNC from being certified: it runs silently, nothing under the figures.
+        ['fail', null, null, false, null, 480],
       ].filter(([, , key]) => key || table === 'longest')) {
         offset = 0;
         Object.assign(mockState, { qncRead: read, snapshot, pause, walk });

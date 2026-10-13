@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useContext } from 'react';
 import {
   View,
   Text,
@@ -24,7 +24,7 @@ import {
   Keyboard,
   ActivityIndicator,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, SafeAreaInsetsContext } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Clipboard from '@react-native-clipboard/clipboard'; // addresses and transaction hashes only
 import WalletManager, { VaultCorruptError } from '../components/WalletManager';
@@ -164,6 +164,9 @@ const NOTHING_SENT_CODES = ['PENDING_SETTLED', 'PENDING_CHANGED', 'PENDING_CHOIC
 // The longest a pull-to-refresh spinner turns (pullRefresh); the read it started may finish later.
 const REFRESH_SPIN_MS = 15_000;
 const SCREEN_EDGES = ['top', 'left', 'right'];
+// The open wallet's screen: its header takes the top inset itself, so its colour fills the status bar's area too.
+const MAIN_EDGES = ['left', 'right'];
+const NO_INSETS = { top: 0, right: 0, bottom: 0, left: 0 };
 // The accounts a private key is exported for, as the extension offers them: the key, its name, the form it is written in.
 const KEY_ACCOUNTS = [
   ['qnet', 'private_key_qnet', 'private_key_qnet_format'],
@@ -313,6 +316,9 @@ const nodeTitle = (t, type) => (['light', 'super', 'full'].includes(type)
 const serverNodeTypeOf = (type) => (type && type !== 'light' ? type : null);
 
 const WalletScreen = () => {
+  // The device's insets: the main screen's header reaches up behind the status bar (and a Dynamic Island) and keeps its
+  // title below them. Read from the provider in App.tsx; without one (a test render) they are zero.
+  const insets = useContext(SafeAreaInsetsContext) || NO_INSETS;
   const [walletManager] = useState(() => new WalletManager()); // lazy: construct once, not every render
   const [hasWallet, setHasWallet] = useState(false);
   // One rule on every device (WalletManager.DEVICE_AUTH_FLAG): the stored wallet opens with the screen lock or with
@@ -1591,7 +1597,6 @@ const WalletScreen = () => {
   // a balance not confirmed yet (try again in a minute; while a long lineage walk is why, how far it is: wallet-galc
   // plan, Part 3 item 6), or no answer from the network.
   const sendCheckError = (error, walkSteps) => {
-    if (error === 'unconfirmed' && Number.isSafeInteger(walkSteps) && walkSteps > 0) return t('balance_verifying_steps', { steps: walkSteps });
     return t(error === 'foreign' ? 'balance_foreign_pending' : error === 'unconfirmed' ? 'balance_unconfirmed' : 'send_balance_unreadable');
   };
 
@@ -4100,14 +4105,13 @@ const WalletScreen = () => {
   // time of its last certified state once this device verified it (with no time before); else, once QNC reads failed
   // for a sustained time, when the figures shown were read (or that none could be). Reads that start or end with
   // nothing new change nothing on it. While a long lineage walk keeps QNC from being certified, the line says how far
-  // it is (wallet-galc plan, Part 3 item 6).
+  // it runs silently: the figures stay as they are until a certified read replaces them.
   const balanceLine = () => {
     if (!wallet || balanceStatus.owner !== wallet.qnetAddress) return null;
     if (balanceStatus.paused) {
       return Number.isFinite(balanceStatus.paused.since)
         ? t('balance_network_paused', { time: dateTime(balanceStatus.paused.since) }) : t('balance_network_paused_untimed');
     }
-    if (balanceStatus.walk) return t('balance_verifying_steps', { steps: balanceStatus.walk });
     if (balanceStatus.state !== 'stale') return null;
     return balanceStatus.known.qnc && balanceStatus.at
       ? t('balance_stale', { time: dateTime(balanceStatus.at) }) : t('balance_unavailable');
@@ -7322,12 +7326,13 @@ const WalletScreen = () => {
   return (
     <SafeAreaView
       style={[styles.container, dirStyle]}
-      edges={SCREEN_EDGES}
+      edges={MAIN_EDGES}
       onTouchStart={handleUserActivity}
     >
       {renderBrowserPane('main')}
-      <View style={styles.header} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
-        <Text style={styles.title}>{t('qnet_wallet')}</Text>
+      <View style={[styles.header, { paddingTop: 15 + insets.top }]} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
+        {/* A long press shows the light client's state for a support screenshot; nothing else on screen. */}
+        <Text style={styles.title} onLongPress={() => { walletManager.lightClientDiagnostics().then((text) => showAlert('', text)).catch(() => {}); }}>{t('qnet_wallet')}</Text>
         {/* Overflow menu: token manager / hide balances (Settings is a tab of the bottom bar) */}
         <TouchableOpacity
           style={styles.headerMenuBtn}
