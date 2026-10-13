@@ -3,7 +3,8 @@
 // the node, and moves its balance) or from a computer (the QNet extension makes or imports the wallet and burns, the same
 // wallet in QNet Wallet runs the node, and My node moves its balance with the extension's window), and a super node, which
 // only the QNet extension on a computer activates (the burn in the extension, its code and the server steps on the page,
-// the server with the node software, then My node follows it and moves its balance with the extension's window).
+// the server with the node software, then My node follows it, QNet Wallet with the same wallet shows it on every phone
+// and tablet, and My node moves its balance with the extension's window).
 // QNet Wallet's own Node tab moves a balance of either node type too (owner, 12.10).
 // A picture is described here as parts of a screen; src/components/cabinet/GuideArt.tsx draws it. Every label a
 // picture shows is a key of src/lib/texts.ts, and every one is the label of the screen it draws: the app's and the
@@ -78,11 +79,12 @@ export interface GuideOptions {
 }
 
 // Example values a picture shows, shortened as the site shortens addresses: a public test wallet's addresses, a code
-// shaped like the real ones, a light node ID as QNet Wallet shows it, a small node balance.
+// shaped like the real ones, a light and a super node ID as QNet Wallet shows them, a small node balance.
 const QNET = { raw: 'd9fa37…73823e' };
 const SOLANA = { raw: 'HAgk14…3DKpqk' };
 const CODE = { raw: 'QNET-LFEFD9-706058-537636' };
 const NODE_ID = { raw: 'light_mobile_3f9a0c1d2e4b5a69' };
+const SUPER_ID = { raw: 'super_node_8c1e5b07d2a4f396' };
 const BALANCE: Label = { key: 'balance', vars: { amount: '2.5' } };
 const APP_BALANCE = { raw: '2.5 QNC' };
 const SOME: Record<string, string> = { amount: '…' };
@@ -117,6 +119,22 @@ const APP_NODE_TAB: Scene = {
     { kind: 'lines', count: 3 },
     { kind: 'row', label: 'ui_app_node_balance', value: APP_BALANCE },
     appButton('action_move', true),
+  ],
+};
+
+// QNet Wallet's Node tab with a super node of the wallet (NodeTab.js ServerNodeCard), the same on every phone and
+// tablet that holds the wallet: its id, then its rows in the card's order (type, status, last seen, missed epochs), the
+// node balance and its move.
+const APP_SUPER_CARD: Scene = {
+  frame: 'phone', screen: 'app', parts: [
+    { kind: 'title', label: 'ui_app_node_tab' },
+    { kind: 'small', label: SUPER_ID },
+    { kind: 'row', label: 'ui_app_node_type', value: 'ui_app_super_node' },
+    { kind: 'row', label: 'ui_app_status_node', value: 'ui_app_active' },
+    { kind: 'row', label: 'ui_app_last_seen', value: { key: 'ui_app_ago', vars: { time: '1 min' } } },
+    { kind: 'row', label: 'ui_app_missed', value: { raw: '0' } },
+    { kind: 'row', label: 'ui_app_node_balance', value: APP_BALANCE },
+    appButton('action_move'),
   ],
 };
 
@@ -546,8 +564,10 @@ export function computerGuide({ network, phoneFlows }: GuideOptions): GuideStep[
 // and burns (the one-time payment address burns for light nodes only, and a phone activates none), the page shows the
 // code and every server step right after the burn and the Overview later in any browser where the wallet is connected,
 // the server runs the QNet node software with the same wallet, the operator checks that it runs and catches up, the
-// node registers itself, the Overview follows it, and My node moves its balance with the extension's window (or QNet
-// Wallet's Node tab on any phone with the wallet, owner 12.10).
+// node registers itself, the Overview follows it, QNet Wallet with the same wallet shows it on every phone and tablet
+// with no device to link (the wallet derives the super node's id from its own address, WalletManager
+// generateSuperNodePseudonym), and My node moves its balance with the extension's window (or QNet Wallet's Node tab on
+// any phone with the wallet, owner 12.10).
 export function superGuide({ network }: GuideOptions): GuideStep[] {
   const SUPER_CODE = { raw: 'QNET-S2C4A1-806358-771140' };
   return [
@@ -632,6 +652,11 @@ export function superGuide({ network }: GuideOptions): GuideStep[] {
       },
     },
     {
+      id: 'app',
+      text: 'guide_super_app',
+      scene: APP_SUPER_CARD,
+    },
+    {
       id: 'move',
       text: 'guide_super_move',
       // QNet Wallet shows a super node on every device that holds the wallet, a light node only on its own device.
@@ -652,11 +677,11 @@ export function superGuide({ network }: GuideOptions): GuideStep[] {
   ];
 }
 
-// The compact version beside the connect screen: three big steps from a phone, four from a computer and for a super
-// node.
+// The compact version beside the connect screen: three big steps from a phone, four from a computer, five for a super
+// node (the last: QNet Wallet with the same wallet shows it and moves its balance).
 export const SHORT_PHONE: MessageKey[] = ['guide_short_phone_1', 'guide_short_phone_2', 'guide_short_phone_3'];
 export const SHORT_COMPUTER: MessageKey[] = ['guide_short_pc_1', 'guide_short_pc_2', 'guide_short_pc_3', 'guide_short_pc_4'];
-export const SHORT_SUPER: MessageKey[] = ['guide_short_super_1', 'guide_short_super_2', 'guide_short_super_3', 'guide_short_super_4'];
+export const SHORT_SUPER: MessageKey[] = ['guide_short_super_1', 'guide_short_super_2', 'guide_short_super_3', 'guide_short_super_4', 'guide_short_super_5'];
 
 // Every label a group of parts shows, for the tests.
 export function partLabels(parts: Part[]): Label[] {

@@ -16,7 +16,7 @@ Wallet for QNet Blockchain
 ====================
 PROMOTIONAL TEXT (170 chars max, editable without a new build)
 ====================
-Non-custodial wallet for QNet Blockchain with post-quantum signatures. Keys are created on your device and never leave it.
+Non-custodial post-quantum wallet for QNet Blockchain. Keys are created on your device and never leave it.
 
 ====================
 DESCRIPTION (4000 chars max)

@@ -335,14 +335,20 @@ delegate into `frontend/`.
       on its QR code (or on the phone itself, in its own browser; while the site sends no link requests, the step shows
       the Device tab saying linking opens soon), and the move of the node balance with My node's Move to wallet and the
       extension's window (or on QNet Wallet's Node tab).
-    - Super node (15 steps), activated only in the QNet Wallet extension on a computer: the same first eight steps, the burn,
+    - Super node (16 steps), activated only in the QNet Wallet extension on a computer: the same first eight steps, the burn,
       the code and every server step on the page right after it and on the Overview later in any browser, the server
       with the node software (linked to Running a node), the check that it runs and catches up, what the Overview
-      shows, and the move of the node balance with My node's Move to wallet and the extension's window (or on QNet
-      Wallet's Node tab with the same wallet imported).
+      shows, QNet Wallet with the same wallet (the one whose 12 words are on the server, imported with "Import Existing
+      Wallet"), whose Node tab shows the registered super node by itself on every phone and tablet with that wallet,
+      with no device to link (the wallet derives the super node's id from its own address): its status ("Active",
+      "Server offline" or "Registered — waiting for admission to QNet Blockchain"), when it was last seen, its missed
+      epochs, its node balance and Move to wallet, drawn as the app's super node card; and the move of the node balance
+      with My node's Move to wallet and the extension's window, or in QNet Wallet: Node tab, Move to wallet on the super
+      node's card.
     No step asks to keep the app running or names a phone setting (Support keeps those), and no answer sends the
     reader to write to anyone or to a button only the phone flows show. The connect screen's short version shows the
-    three ways in three steps (phone) or four (computer, super node), each starting with create or import.
+    three ways in three steps (phone), four (computer) or five (super node, the last: the same wallet restored in QNet
+    Wallet, whose Node tab shows the node and moves its balance), each starting with create or import.
   - With `CABINET_PHONE_FLOWS` off (the deploy default) the cabinet sends QNet Wallet no `link`, `claim`, `reserve`
     or `unlink` request and the relay opens only `connect` sessions: the read pages and the
     extension's paths stay (the extension's move of a node balance and its unlink among them), and the payment address is not offered. Without the

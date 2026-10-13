@@ -1,1 +1,1 @@
-Non-custodial post-quantum QNet Blockchain wallet, with an optional light node
+Non-custodial post-quantum wallet for QNet Blockchain

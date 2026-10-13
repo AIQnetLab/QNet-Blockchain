@@ -54,6 +54,13 @@ const UI_APP = {
   ui_app_confirm: APP.link_confirm,
   ui_app_node_tab: APP.tab_node,
   ui_app_node_balance: APP.node_balance,
+  ui_app_node_type: APP.node_type,
+  ui_app_super_node: APP.node_title_super,
+  ui_app_status_node: APP.node_status_node,
+  ui_app_active: APP.node_active,
+  ui_app_last_seen: APP.node_last_seen,
+  ui_app_ago: APP.node_last_seen_ago,
+  ui_app_missed: APP.node_missed,
   copy: APP.seed_copy,
   action_move: APP.node_move,
 };
@@ -289,8 +296,9 @@ test('a picture shows only the site\'s texts, and at most one thing to press', (
       for (const label of sceneLabels(step.scene)) {
         if (typeof label === 'string') assert.ok(Object.prototype.hasOwnProperty.call(TEXTS, label), `${step.id}: ${label}`);
         else if ('key' in label) assert.ok(Object.prototype.hasOwnProperty.call(TEXTS, label.key), `${step.id}: ${label.key}`);
-        // Example values only: an address, a code, a light node ID, a node balance, a token's or a host's name.
-        else assert.match(label.raw, /^(?:[0-9A-Za-z]{6}…[0-9A-Za-z]{6}|QNET-[0-9A-Z]{6}-\d{6}-\d{6}|light_mobile_[0-9a-f]{16}|\d+(?:\.\d+)? QNC|1DEV|SOL|aiqnet\.io)$/, label.raw);
+        // Example values only: an address, a code, a light or a super node ID, a node balance, a count of epochs, a
+        // token's or a host's name.
+        else assert.match(label.raw, /^(?:[0-9A-Za-z]{6}…[0-9A-Za-z]{6}|QNET-[0-9A-Z]{6}-\d{6}-\d{6}|light_mobile_[0-9a-f]{16}|super_node_[0-9a-f]{16}|\d+(?:\.\d+)? QNC|\d+|1DEV|SOL|aiqnet\.io)$/, label.raw);
       }
       const scene = step.scene;
       const parts = [...scene.parts, ...(scene.popup ?? []), ...(scene.phone ?? [])];
@@ -385,12 +393,14 @@ test('the steps follow the release\'s network and the site\'s phone flows', () =
   assert.match(page, /const options = \{ network: ACTIVATION_NETWORK, phoneFlows \};/);
   assert.match(page, /function Guide\(\{ phoneFlows \}: \{ phoneFlows: boolean \}\) \{/);
   assert.match(readFileSync(new URL('../../app/docs/how-it-works/page.tsx', import.meta.url), 'utf8'), /return <NodeGuide phoneFlows=\{phoneFlowsEnabled\(\)\} \/>;/);
-  // The short version: three steps from a phone, four from a computer and for a super node; the first steps say
-  // create or import, and the computer's last one works with the phone flows on or off.
+  // The short version: three steps from a phone, four from a computer, five for a super node, whose last is QNet Wallet
+  // with the same wallet; the first steps say create or import, and the computer's last one works with the phone flows
+  // on or off.
   assert.deepEqual(SHORT_PHONE, ['guide_short_phone_1', 'guide_short_phone_2', 'guide_short_phone_3']);
   assert.ok(!('guide_short_phone_4' in TEXTS));
   assert.equal(SHORT_COMPUTER.length, 4);
-  assert.equal(SHORT_SUPER.length, 4);
+  assert.deepEqual(SHORT_SUPER, ['guide_short_super_1', 'guide_short_super_2', 'guide_short_super_3', 'guide_short_super_4', 'guide_short_super_5']);
+  assert.equal(TEXTS.guide_short_super_5, 'Restore the same wallet in QNet Wallet on your phone: its Node tab shows the node too and moves its node balance, with no device to link.');
   assert.equal(TEXTS.guide_short_phone_3, 'Activate: confirm in QNet Wallet, pay once, confirm again.');
   for (const key of ['guide_short_pc_1', 'guide_short_super_1']) {
     assert.equal(TEXTS[key], 'Create or import a wallet in the QNet Wallet extension and put 1DEV and a little SOL on it.', key);
@@ -406,13 +416,14 @@ test('the steps follow the release\'s network and the site\'s phone flows', () =
 
 // R5 (owner, 29.09): the guide covers both node types. A light node: the burn, its code, QNet Wallet links the device,
 // then My node follows it. A super node: the burn in the QNet extension, its code and the server steps on the page and
-// later on the Overview in any browser, the server with the node software, then My node follows it, and QNet Wallet's
-// Node tab moves its balance. No burn window asks for a password (SITE-F2, XC-01: a locked extension asks once to
-// unlock), and the extension's window shows its six tabs.
+// later on the Overview in any browser, the server with the node software, then My node follows it, QNet Wallet with
+// the same wallet shows it on every phone and tablet, and QNet Wallet's Node tab moves its balance. No burn window asks
+// for a password (SITE-F2, XC-01: a locked extension asks once to unlock), and the extension's window shows its six
+// tabs.
 test('the guide covers a light and a super node, and no burn window asks for a password', () => {
   const ids = (steps) => steps.map((s) => s.id);
   const sup = superGuide({ network: 'testnet', phoneFlows: true });
-  assert.deepEqual(ids(sup), ['install', 'setup', 'words', 'check', 'password', 'solana', 'tokens', 'connect', 'activate', 'burn', 'code', 'server', 'verify', 'watch', 'move']);
+  assert.deepEqual(ids(sup), ['install', 'setup', 'words', 'check', 'password', 'solana', 'tokens', 'connect', 'activate', 'burn', 'code', 'server', 'verify', 'watch', 'app', 'move']);
   const step = (id) => sup.find((x) => x.id === id);
   // Both type cards, Super selected (Light on the computer's light guide).
   assert.equal(step('activate').scene.parts.find((p) => p.kind === 'choice').current, 1);
@@ -435,7 +446,33 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   // QNet Wallet's Node tab on any phone with the wallet (owner, 12.10; a light node shows there only on its own device).
   assert.deepEqual(sceneLabels(step('move').scene).filter((l) => typeof l === 'string'), ['nav_overview', 'nav_device', 'nav_history', 'wallet_extension_waiting', 'ui_ext_claim_title', 'ui_ext_reject', 'ui_ext_move']);
   assert.equal(step('move').also, 'guide_or_move_app_super');
-  assert.match(TEXTS.guide_or_move_app_super, /on any phone: "Node" tab, "Move to wallet"\.$/);
+  assert.match(TEXTS.guide_or_move_app_super, /on any phone or tablet: "Node" tab, "Move to wallet" on the super node's card\.$/);
+  // Once the node is registered, QNet Wallet with the same wallet shows it by itself on every phone and tablet, with no
+  // device to link: the wallet derives the super node's id from its own address and looks it up on QNet Blockchain
+  // (WalletManager generateSuperNodePseudonym, WalletScreen loadAllUserNodes), and the Node tab's super node card
+  // (NodeTab.js ServerNodeCard) shows its type, status (Active, Server offline, or registered and waiting for
+  // admission), last seen, missed epochs, node balance and Move to wallet, with no Use this device.
+  const app = step('app');
+  assert.equal(sup[sup.indexOf(app) - 1].id, 'watch');
+  assert.equal(app.text, 'guide_super_app');
+  assert.equal(app.scene.frame, 'phone');
+  assert.equal(app.scene.screen, 'app');
+  assert.deepEqual(sceneLabels(app.scene).filter((l) => typeof l === 'string'), ['ui_app_node_tab', 'ui_app_node_type', 'ui_app_super_node', 'ui_app_status_node', 'ui_app_active', 'ui_app_last_seen', 'ui_app_missed', 'ui_app_node_balance', 'action_move']);
+  assert.match(TEXTS.guide_super_app, /^Once the node is registered, QNet Wallet shows it by itself, with no device to link: open QNet Wallet on a phone or tablet with this same wallet, the one whose 12 words are on the server \(to add it there, tap "Import Existing Wallet" and type those words\)\./);
+  assert.match(TEXTS.guide_super_app, /Its "Node" tab shows the node's status, when it was last seen, its missed epochs \(an epoch is about 4 hours\), whether QNet Blockchain has admitted it \("Registered — waiting for admission to QNet Blockchain" until it does\) and its node balance with "Move to wallet"\. Every phone and tablet with this wallet shows the same card\.$/);
+  const manager = repo('applications/qnet-mobile/src/components/WalletManager.js');
+  assert.match(manager, /const hashBytes = blake3\(Buffer\.from\(`SUPER_NODE_PRIVACY_\$\{walletAddress\}`, 'utf8'\)\);\s*return `super_node_\$\{Buffer\.from\(hashBytes\.slice\(0, 8\)\)\.toString\('hex'\)\}`;/);
+  const screen = repo('applications/qnet-mobile/src/screens/WalletScreen.js');
+  assert.match(screen, /super: walletManager\.generateSuperNodePseudonym\(walletAddress\),/);
+  assert.match(screen, /const serverNode = serverNodes\.find\(n => n\.node_id === ids\.super\)/);
+  const tab = repo('applications/qnet-mobile/src/screens/NodeTab.js');
+  const card = tab.slice(tab.indexOf('function ServerNodeCard('), tab.indexOf('const LIGHT_NODE_STATES'));
+  const order = ["t('node_type')", "t('node_status_node')", "t('node_last_seen')", "t('node_missed')", '<BalanceBlock'].map((s) => card.indexOf(s));
+  assert.ok(order.every((at) => at > 0), String(order));
+  assert.deepEqual([...order].sort((a, b) => a - b), order);
+  assert.match(card, /const statusText = waiting \? t\('node_waiting_admission'\) : t\(status\.isOnline \? 'node_active' : 'node_server_offline'\);/);
+  assert.doesNotMatch(card, /node_use/);
+  assert.equal(APP.node_waiting_admission, 'Registered — waiting for admission to QNet Blockchain');
   assert.match(TEXTS.guide_or_move_app, /on the phone that runs the node: "Node" tab, "Move to wallet"\.$/);
   // From 1 QNC, as the app's button takes it (NodeTab.js BalanceBlock), and as the light guides say.
   assert.equal(TEXTS.guide_super_move, TEXTS.guide_pc_move);
