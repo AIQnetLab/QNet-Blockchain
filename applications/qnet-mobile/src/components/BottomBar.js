@@ -85,7 +85,7 @@ export default function BottomBar({ active, onSelect, t, hidden = false, onLayou
   if (hidden) return null;
   const lit = active === 'receive' ? 'assets' : active;
   return (
-    // The bottom inset (gesture bar, home indicator) is added natively; no provider needed.
+    // The bottom inset (gesture bar, home indicator) comes from the SafeAreaProvider at the app's root (App.tsx).
     <SafeAreaView edges={['bottom']} style={s.bar} onLayout={onLayout} accessibilityRole="tablist">
       <View style={s.row}>
         {BOTTOM_TABS.map((tab) => {

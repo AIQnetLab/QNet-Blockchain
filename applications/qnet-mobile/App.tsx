@@ -7,6 +7,7 @@
 
 import React, { useEffect } from 'react';
 import { StatusBar } from 'react-native';
+import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-context';
 import messaging from '@react-native-firebase/messaging';
 import WalletScreen from './src/screens/WalletScreen';
 import ErrorBoundary from './src/components/ErrorBoundary';
@@ -56,10 +57,14 @@ function App(): React.JSX.Element {
   }, []);
 
   return (
-    <ErrorBoundary>
-      <StatusBar barStyle="light-content" backgroundColor="#11131f" translucent={false} />
-      <WalletScreen />
-    </ErrorBoundary>
+    // Every SafeAreaView reads the device's insets (status bar, Dynamic Island, home indicator, rounded corners) from
+    // this provider; on the legacy architecture one without it gets none.
+    <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+      <ErrorBoundary>
+        <StatusBar barStyle="light-content" backgroundColor="#11131f" translucent={false} />
+        <WalletScreen />
+      </ErrorBoundary>
+    </SafeAreaProvider>
   );
 }
 

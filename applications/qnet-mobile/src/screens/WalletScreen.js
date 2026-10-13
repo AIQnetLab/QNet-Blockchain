@@ -161,6 +161,8 @@ const NOTHING_SENT_CODES = ['PENDING_SETTLED', 'PENDING_CHANGED', 'PENDING_CHOIC
 
 // A full screen keeps clear of the status bar, the notch and the side insets from the safe area on every device (a
 // tablet's status bar, Slide Over and Split View differ from a phone's); the bottom bar keeps clear of the bottom itself.
+// The longest a pull-to-refresh spinner turns (pullRefresh); the read it started may finish later.
+const REFRESH_SPIN_MS = 15_000;
 const SCREEN_EDGES = ['top', 'left', 'right'];
 // The accounts a private key is exported for, as the extension offers them: the key, its name, the form it is written in.
 const KEY_ACCOUNTS = [
@@ -326,7 +328,20 @@ const WalletScreen = () => {
   const typedPassword = typeof password === 'string' ? password : '';
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
+  // A pull to refresh, per tab (Assets, History, Node): a tab opened while another one's read runs starts idle, since an
+  // iOS refresh control mounted already spinning can stay stuck. The spinner ends with the read or after REFRESH_SPIN_MS;
+  // a read still running then lands by itself.
+  const [refreshing, setRefreshingState] = useState({ assets: false, history: false, node: false });
+  const pullRefresh = async (tab, read) => {
+    setRefreshingState((prev) => ({ ...prev, [tab]: true }));
+    try {
+      await Promise.race([Promise.resolve().then(read), new Promise((resolve) => setTimeout(resolve, REFRESH_SPIN_MS))]);
+    } catch (error) {
+      logger.error('Error refreshing:', error);
+    } finally {
+      setRefreshingState((prev) => ({ ...prev, [tab]: false }));
+    }
+  };
   const [showCreateOptions, setShowCreateOptions] = useState(false);
   const [seedPhrase, setSeedPhrase] = useState('');
   const seedPastedRef = useRef(false); // the phrase arrived as one paste (see clearPastedPhrase)
@@ -3702,6 +3717,12 @@ const WalletScreen = () => {
     setSeedConfirmWords({});
 
     setActiveTab('assets');
+    // A wallet generated just now holds nothing: its figures start at 0 (kept like a verified read), never a dash,
+    // until the first read replaces them.
+    await walletManager.saveBalanceSnapshot({
+      owner: savedWallet.qnetAddress, qnc: 0, qncNano: '0', blockHeight: null, sol: 0, oneDev: 0, tokens: [], at: Date.now(),
+    }).catch(() => false);
+    showKeptBalances(savedWallet.qnetAddress);
     loadBalance(savedWallet.publicKey, savedWallet);
   };
 
@@ -6605,17 +6626,8 @@ const WalletScreen = () => {
             scrollEnabled={true}
             refreshControl={
               <RefreshControl
-                refreshing={refreshing}
-                onRefresh={async () => {
-                  setRefreshing(true);
-                  try {
-                    await loadBalance(wallet.publicKey);
-                  } catch (error) {
-                    // console.error('Error refreshing:', error);
-                  } finally {
-                    setRefreshing(false);
-                  }
-                }}
+                refreshing={refreshing.assets}
+                onRefresh={() => pullRefresh('assets', () => loadBalance(wallet.publicKey))}
                 colors={['#00d4ff']}
                 tintColor="#00d4ff"
                 titleColor="#00d4ff"
@@ -7050,12 +7062,8 @@ const WalletScreen = () => {
             removeClippedSubviews={true}
             refreshControl={
               <RefreshControl
-                refreshing={refreshing}
-                onRefresh={async () => {
-                  setRefreshing(true);
-                  await loadTxHistory(true);
-                  setRefreshing(false);
-                }}
+                refreshing={refreshing.history}
+                onRefresh={() => pullRefresh('history', () => loadTxHistory(true))}
                 colors={['#00d4ff']}
                 tintColor="#00d4ff"
               />
@@ -7093,22 +7101,15 @@ const WalletScreen = () => {
             scrollEventThrottle={500}
             refreshControl={
               <RefreshControl
-                refreshing={refreshing}
-                onRefresh={async () => {
-                  setRefreshing(true);
-                  try {
-                    await loadAllUserNodes();
-                    await Promise.all([
-                      refreshHeight(),
-                      serverNodeTypeOf(activatedNodeType) ? loadServerNodeStatus({ rewards: true }) : null,
-                      loadLightNodeStatus({ rewards: true }), loadSiteRecord({ force: true }),
-                    ]);
-                  } catch (error) {
-                    logger.error('Error refreshing node data:', error);
-                  } finally {
-                    setRefreshing(false);
-                  }
-                }}
+                refreshing={refreshing.node}
+                onRefresh={() => pullRefresh('node', async () => {
+                  await loadAllUserNodes();
+                  await Promise.all([
+                    refreshHeight(),
+                    serverNodeTypeOf(activatedNodeType) ? loadServerNodeStatus({ rewards: true }) : null,
+                    loadLightNodeStatus({ rewards: true }), loadSiteRecord({ force: true }),
+                  ]);
+                })}
                 colors={['#00d4ff']}
                 tintColor="#00d4ff"
                 titleColor="#00d4ff"

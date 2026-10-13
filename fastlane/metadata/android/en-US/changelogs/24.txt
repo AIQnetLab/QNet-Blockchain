@@ -1,0 +1,7 @@
+• Copy and paste of the recovery phrase work on every device
+• Amounts with thousands separators are read as written
+• The wallet follows certified blocks in the background, so balances and sends are checked sooner
+• Moving a node balance to the wallet shows as Moving until it arrives
+• Super node: its network admission, and moving its balance to the wallet
+• New app icon and launch screen
+• Unlock with the device's screen lock where it has one, otherwise with a password
