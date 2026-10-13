@@ -456,6 +456,7 @@ QNet Wallet est publié par Orrery Group LLC. Les Conditions d'utilisation compl
   device_unlock_offer_yes: "Utiliser le verrouillage d'écran",
   device_unlock_on: "Le portefeuille s'ouvre désormais avec le verrouillage d'écran de cet appareil. Son mot de passe n'est plus utilisé.",
   device_unlock_unavailable: "Cet appareil ne peut pas protéger le portefeuille par son verrouillage d'écran pour le moment.",
+  device_lock_retry_offer: "Le verrouillage d'écran a de nouveau échoué, et rien n'a été enregistré. Utiliser plutôt un mot de passe du portefeuille ? Il sera demandé à chaque ouverture du portefeuille.",
   enable_biometric: "Déverrouillage biométrique",
   biometric_enabled_msg: "Déverrouillage biométrique activé",
   biometric_disabled_msg: "Déverrouillage biométrique désactivé",

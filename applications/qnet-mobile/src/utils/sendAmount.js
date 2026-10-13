@@ -40,3 +40,45 @@ export function amountShare({ contract = null, decimals = 0, balanceText = null,
   const spendable = held > fee ? held - fee : 0n;
   return fixed((spendable * pct / 100n) / 10n ** BigInt(QNC_DECIMALS - QNC_SHOWN), QNC_SHOWN);
 }
+
+// What separates thousands without being a separator the field keeps: spaces of every width (a no-break space
+// included) and apostrophes.
+const GROUPING_MARKS = /[\s'\u2019\u02BC]/g;
+const THOUSANDS = { ',': /^\d{1,3}(,\d{3})+$/, '.': /^\d{1,3}(\.\d{3})+$/ };
+const groupsOfThree = (text, mark) => THOUSANDS[mark].test(text);
+const count = (text, ch) => text.split(ch).length - 1;
+
+/**
+ * The amount field's text as both Send forms keep it: digits and at most one decimal point, no more than `decimals`
+ * places, a leading point given its zero; or null when the text is refused and the field keeps what it had. Spaces and
+ * apostrophes go, and so does anything but digits, ',' and '.'. A single ',' is the decimal separator. When ',' and
+ * '.' both appear, the last one is the decimal separator and the other may only group thousands (one to three digits,
+ * then groups of exactly three); several of one separator alone may only group thousands too. Anything else is refused
+ * rather than read as another figure: 1,000.50 is 1000.50 and never 1.00050.
+ */
+export function amountInput(text, decimals) {
+  let s = String(text == null ? '' : text).replace(GROUPING_MARKS, '').replace(/[^0-9.,]/g, '');
+  const commas = count(s, ',');
+  const dots = count(s, '.');
+  if (commas > 0 && dots > 0) {
+    const at = Math.max(s.lastIndexOf(','), s.lastIndexOf('.'));
+    const point = s[at];
+    const mark = point === '.' ? ',' : '.';
+    // The decimal separator once, with a figure after it (a separator typed at the end of an amount is no grouping).
+    if (count(s, point) > 1 || at === s.length - 1) return null;
+    const whole = s.slice(0, at);
+    if (!groupsOfThree(whole, mark)) return null;
+    s = `${whole.split(mark).join('')}.${s.slice(at + 1)}`;
+  } else if (commas > 1 || dots > 1) {
+    const mark = commas > 1 ? ',' : '.';
+    if (!groupsOfThree(s, mark)) return null;
+    s = s.split(mark).join('');
+  } else if (commas === 1) {
+    s = s.replace(',', '.');
+  }
+  if (s.startsWith('.')) s = `0${s}`;
+  const dot = s.indexOf('.');
+  const places = Math.max(0, Math.floor(Number(decimals) || 0));
+  if (dot >= 0) s = `${s.slice(0, dot + 1)}${s.slice(dot + 1, dot + 1 + places)}`;
+  return s.slice(0, 32);
+}

@@ -152,7 +152,8 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   writes it for this device only (no Universal Clipboard) with that expiry on the pasteboard item, so it goes while
   the app is suspended too. Android marks the clip sensitive (the clipboard preview hides it) and clears it from a
   native timer that also runs in the background, where the app may write the clipboard but not read it, so a clipboard
-  it cannot read then is cleared all the same.
+  it cannot read then is cleared all the same. The button reads "Copied" for as long as the copy may be on the
+  clipboard, then Copy again.
 - Settings → **Export Private Key** asks first which account's key (the QNet Blockchain key or the Solana key, as the browser extension asks), with the form that key is written in under the choice, then one warning and the check of the
   recovery phrase: a fresh password check (under the screen lock a fresh device authentication) under the same lockout,
   never on a rooted, jailbroken or instrumented device, the apps that can read the screen named first
@@ -164,12 +165,17 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   phrase's clipboard rule (an explicit tap, cleared after 60 seconds, at once on Delete wallet), then Done: no second
   warning, no press-and-hold, no address beside it, no clipboard text. The screen is a secret screen (no capture,
   overlays kept out) and goes on Done, on lock and the moment the app leaves the front. Nothing of either key is
-  stored, logged or sent. The app imports no wallet by a private key: a wallet is restored from its recovery phrase.
+  stored, logged or sent. For both exports, Show reads "Verifying…" while the check runs and a second tap starts
+  nothing; under the screen lock a refusal is the prompt's, never "Incorrect password": a failed prompt says the wallet
+  could not be unlocked, a cancel and iOS's refusal of a read while the app is not in front say nothing, and a secret
+  gone with a removed screen lock offers the way back an open wallet has (below). The app imports no wallet by a private key: a wallet is restored from its recovery phrase.
 - Android biometric unlock keeps a second wrap of the data key under a Keystore key that needs a strong
   biometric for every use and is invalidated when a fingerprint or face is enrolled; the password is
   never stored. The same system prompt, bound to that key, is the fresh check of a send, a site's request,
   a QNet Link request and a security setting; for those it needs a deliberate press after a face match
-  (confirmation required), and a send's prompt shows the whole recipient. Unlock needs no press.
+  (confirmation required), and a send's prompt shows the whole recipient. Unlock needs no press. Turning it on in
+  Settings: a refused prompt says nothing, a device with no biometric key says biometric unlock is not available, and
+  any other failure says the setting could not be saved.
 - A password an older build kept under the Android keychain service `com.qnet.wallet.biometric` (behind a
   fingerprint key that a new enrolment did not invalidate) is deleted at launch with its key, never read.
   When the vault has no biometric wrap of its own, biometric unlock is off from then on and a notice asks
@@ -178,7 +184,10 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   a face or the device passcode) when the device has a screen lock the app can bind a secret to, otherwise an app
   password. With the screen lock the vault secret is 256 random bits generated at create/import and kept by
   `src/services/DeviceAuthStore.js`: on iOS in the keychain item `com.qnetmobile.vault-secret`, in the app's own
-  keychain access group, with `BIOMETRY_ANY_OR_DEVICE_PASSCODE` and `WHEN_UNLOCKED_THIS_DEVICE_ONLY`; on Android 11
+  keychain access group, with `USER_PRESENCE` (Face ID, Touch ID or the passcode; no biometry need be enrolled, which a
+  biometry flag would require) and `WHEN_PASSCODE_SET_THIS_DEVICE_ONLY`, the class iOS deletes when the passcode is
+  turned off (an item an earlier build wrote as `WHEN_UNLOCKED_THIS_DEVICE_ONLY` stays and cannot open, so while the
+  device has no passcode `state()` and a failed read answer `gone` for it too); on Android 11
   and later as a blob in app storage sealed by a Keystore key whose use needs a strong biometric or the device
   credential every time. The Android blob is hybrid: a random AES-256-GCM key seals the secret and only that key goes
   through RSA-OAEP, so a secret of any length fits; its header names the RSA key, so a key made after the screen lock
@@ -190,7 +199,11 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   this time (a timeout, the sensor unavailable, a busy Keystore, any Android failure before the prompt, which the native
   module answers as `PRE_PROMPT`, any iOS error with the item still there) changes nothing, and the next attempt uses
   the screen lock again (`WalletManager._readBackVerdict`). So does a write or a check the device refused for now (a
-  busy Keystore): only a device with no usable screen lock sends a new wallet to a password. The lock screen opens its
+  busy Keystore): only a device with no usable screen lock sends a new wallet to a password. The message after such a
+  failure at create or import also offers **Use password**, and from the second failure in a row on the same screen
+  asks whether to use a wallet password instead: the choice sets the same seven-day mark
+  (`WalletManager.useWalletPassword`), import goes on to its password step, and create starts again with a password.
+  Each such failure writes its stage and the platform's error code (never a secret) to the log of development builds. The lock screen opens its
   prompt by itself only while the app is in front: iOS starts the app in the background for a silent push or a
   background fetch, and refuses a Keychain read there (`errSecInteractionNotAllowed`); the prompt is then owed and
   opens once when the app comes to the front, with no error on screen. On
@@ -231,6 +244,8 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   is: no screen lock now, or a screen lock set again that brings nothing back. On Android a fresh check without the
   screen-lock key answers "not set": no plain system prompt stands in for it. A biometric or screen-lock unlock that
   opens nothing always says why (the attempt could not be recorded, or it failed); only a cancelled prompt is silent.
+  So does the screen lock's fresh check of a send, an approval or a security setting: a prompt that failed says the
+  screen lock cannot be used right now.
 - A **separate**, randomly seeded ML-DSA-65 keypair is generated when this wallet's node is linked to the device,
   for signing its answers. Its secret key is stored in the keychain under service `qnet_ping_sk_{node_id}`
   with `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`, so a background push handler can answer without the wallet
@@ -252,14 +267,18 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   most 4 seconds to forget the token. One plain screen says "Deleting the wallet…" throughout, and "The wallet was
   deleted from this device." ends it; a device check that failed (not one the user cancelled) says the wallet could
   not be deleted (`WalletScreen.eraseWallet`, `PushService.stopLightNode` with `forgetDevice`). Erase from the lock
-  screen or the recovery screen does the same.
+  screen or the recovery screen does the same, and its failed device check says the wallet could not be erased; on
+  Android a screen-lock key the Keystore reports corrupted counts as a removed screen lock there ("not set"), so such a
+  wallet can still be erased.
 - Deleting the wallet, erasing it, and another wallet taking its place also wipe what the in-app browser left on the
   device, at once and the same on Android and iOS: every cookie, every site's storage and the web caches
   (`DeviceSecurity.clearBrowserData`, the native `clearWebData`: on Android the cookie store, the site storage, the web
   view HTTP cache and saved form data; on iOS every kind of data in the default web data store, each browser tab's own
   data being in memory only). It is best effort and never waited for, so a web view never holds up the erase
   (`WalletManager.eraseAllData`, `wipeWalletScope`). The screen's own choices of the previous wallet go with it too: the
-  tokens it chose to show start empty for the next wallet, in memory as on disk (`resetWalletScopedState`).
+  tokens it chose to show start empty for the next wallet, in memory as on disk (`resetWalletScopedState`), and so do
+  hidden amounts and the hardware-seal warning (`eraseWallet`). Of the app's storage only the display language and the
+  seven-day mark of a screen lock that could not keep a new wallet's secret stay (`WalletManager.ERASE_ALLOW_LIST`).
 
 ## Light client
 
@@ -708,7 +727,9 @@ the camera; back from the settings with the camera allowed, the same sheet start
 device and none is stored or sent: on iOS by the system, on Android by an open-source QR decoder bundled in the app
 (`THIRD_PARTY_NOTICES.md`). The app's patch of the camera library (`patches/react-native-camera-kit+18.0.1.patch`) puts
 that decoder in place of the library's own and removes the library's face detection, so the scan makes no network
-connection on either platform. A QR code fills the field only when its text is a QNet Blockchain address the field itself
+connection on either platform; on iOS it also exports the library's two camera-permission methods, which the app's
+legacy bridge reaches only then. A module without them leaves the asking to the camera view (`QrScanSheet`
+`cameraAllowed`). A QR code fills the field only when its text is a QNet Blockchain address the field itself
 accepts: 45 characters with "eon" in the middle and its SHA3 checksum (`src/utils/scanAddress.js`,
 `WalletManager.recipientAddress`).
 The app's own Receive QR carries the bare address. Anything else (a Solana address, a web address, 64 hex, other text
@@ -753,6 +774,14 @@ Signed transactions are kept until the chain settles their nonce (`src/services/
 be read is never taken for an empty one: nothing is signed on it (`PENDING_UNREADABLE`), and a value that does not
 parse holds sends back until nothing it may have held can still land (the node's 30-minute mempool lifetime and a
 margin).
+
+The recipient field keeps what is pasted or typed without surrounding spaces, so the review, the own-address and
+known-recipient warnings, the kept transaction and History all use the address that is signed. The amount field of
+both Send forms (`src/utils/sendAmount.js` `amountInput`) keeps digits and one decimal point: spaces, no-break spaces
+and apostrophes go; a single comma is the decimal point; when a comma and a point both appear the last one is the
+decimal point and the other may only group thousands (groups of exactly three digits), and several of one separator
+alone may only group thousands too. Any other mix is refused and the field keeps what it had, so "1,000.50" is 1000.50
+and never 1.00050.
 
 The QNet Blockchain Send form's 25 %, 50 %, 75 % and MAX buttons fill that share of what may be sent, floored, with as many
 decimals as the asset takes: a token at most six and never more than its own decimals (a token of 2 decimals gets 2, one
@@ -1133,8 +1162,9 @@ answers over the internet:
 - Deleting or erasing the wallet stops its node for good, before its data goes (Key storage above); while that node
   is bound here, the confirmation says first that it stops running on this device.
 - A reinstall keeps nothing of the old node: Android removes the app's data and Keystore keys with the app, and on
-  iPhone and iPad the first launch of a new install wipes every Keychain item an earlier install left
-  (`WalletManager.prepareInstall`), ping keys and the device key record included; the old push token is dead with the
+  iPhone and iPad the first launch of a new install wipes the app's own Keychain items an earlier install left
+  (`WalletManager.prepareInstall`), ping keys and the device key record included (other SDKs' items in the app's
+  Keychain groups are not the wallet's and stay: `WalletManager._ownKeychainService`); the old push token is dead with the
   old install. The node runs here again only after the link sheet from aiqnet.io (a reinstalled app holds no binding,
   so its Node tab shows no node and offers nothing), with a new ping key.
 - The rule is the same on every phone and tablet, one function asked by every path that answers
@@ -1807,7 +1837,7 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.0 (22) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.0 (23) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds enable R8 minification and resource shrinking.
   iOS: bundle id `com.qnetmobile`, iPhone and iPad (`TARGETED_DEVICE_FAMILY = "1,2"`), not offered on Mac or
   Vision Pro; deployment target 15.6 for the app target.

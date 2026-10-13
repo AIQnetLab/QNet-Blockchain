@@ -457,6 +457,7 @@ QNet Wallet is published by Orrery Group LLC. The full Terms of Use and the Priv
   device_unlock_offer_yes: 'Use the screen lock',
   device_unlock_on: "The wallet now opens with this device's screen lock. Its password is no longer used.",
   device_unlock_unavailable: 'This device cannot keep the wallet behind its screen lock right now.',
+  device_lock_retry_offer: 'The screen lock failed again, and nothing was saved. Use a wallet password instead? It is asked each time the wallet opens.',
   enable_biometric: 'Biometric Unlock',
   biometric_enabled_msg: 'Biometric unlock enabled',
   biometric_disabled_msg: 'Biometric unlock disabled',

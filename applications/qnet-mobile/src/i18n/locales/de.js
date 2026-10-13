@@ -456,6 +456,7 @@ QNet Wallet wird von der Orrery Group LLC herausgegeben. Die vollständigen Nutz
   device_unlock_offer_yes: 'Displaysperre verwenden',
   device_unlock_on: 'Die Wallet öffnet sich jetzt mit der Displaysperre dieses Geräts. Ihr Passwort wird nicht mehr verwendet.',
   device_unlock_unavailable: 'Dieses Gerät kann die Wallet gerade nicht hinter seiner Displaysperre schützen.',
+  device_lock_retry_offer: 'Die Displaysperre ist erneut fehlgeschlagen, es wurde nichts gespeichert. Stattdessen ein Wallet-Passwort verwenden? Es wird bei jedem Öffnen der Wallet abgefragt.',
   enable_biometric: 'Biometrisches Entsperren',
   biometric_enabled_msg: 'Biometrisches Entsperren eingeschaltet',
   biometric_disabled_msg: 'Biometrisches Entsperren ausgeschaltet',

@@ -990,10 +990,16 @@ async function confirmWritten(record, vaultKey, entropy) {
   }
 }
 
-// `keep`: keys that may be written again meanwhile and hold nothing of the wallet.
-async function clearArea(area, keep = []) {
-  await area.clear();
-  const left = Object.keys((await area.get(null)) ?? {}).filter((key) => !keep.includes(key));
+// Clears `area` but for the keys in `spare`, which stay as they are. `keep`: keys that may be written again meanwhile
+// and hold nothing of the wallet. Anything else still there fails the erase.
+async function clearArea(area, keep = [], spare = []) {
+  if (spare.length === 0) {
+    await area.clear();
+  } else {
+    const doomed = Object.keys((await area.get(null)) ?? {}).filter((key) => !spare.includes(key));
+    if (doomed.length > 0) await area.remove(doomed);
+  }
+  const left = Object.keys((await area.get(null)) ?? {}).filter((key) => !keep.includes(key) && !spare.includes(key));
   if (left.length > 0) throw internal();
 }
 
@@ -1004,7 +1010,8 @@ const dropRestoreStaging = () => withDb(false, (db) => (hasStore(db)
   ? transact(db, 'readwrite', (store) => store.delete(RESTORE_STAGING_KEY)) : undefined));
 
 // Lock (reason 'wipe'), delete the database, clear chrome.storage.local (and the earlier version's database) and
-// session, check nothing is left.
+// session, check nothing is left. The chosen interface language stays: it is no wallet data, and the welcome screen and
+// the next wallet's setup keep speaking it.
 async function eraseAll() {
   await session.lock('wipe');
   await deleteVaultDatabase();
@@ -1013,7 +1020,8 @@ async function eraseAll() {
   await session.recordPasswordSuccess();
   const storage = globalThis.chrome?.storage;
   if (!storage?.local || !storage?.session) throw internal();
-  await clearArea(storage.local);
+  const language = (await session.storedLanguage()) !== null ? [STORAGE_KEYS.SETTINGS] : [];
+  await clearArea(storage.local, [], language);
   // the earlier version's pages' copy goes with its record, which the clear above removed
   await earlier.deleteEarlierDatabase().catch((error) => log.error('earlier database not deleted', error?.code ?? error?.name));
   // The crypto self-test pass (keys.startKeys) and the light client's hints (qnet.js: the certified head last seen) are

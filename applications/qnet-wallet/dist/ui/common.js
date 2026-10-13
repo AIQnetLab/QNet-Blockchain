@@ -268,10 +268,10 @@ let pendingSeq = null;
 
 // Empties the clipboard unless this page copied something else since `seq` (then that copy is the one on it).
 function clearIfStill(seq) {
-  if (seq !== clipboardSeq) return;
+  if (seq !== clipboardSeq) return Promise.resolve();
   clipboardSeq += 1;
   pendingSeq = null;
-  navigator.clipboard.writeText('').catch(() => {});
+  return navigator.clipboard.writeText('').catch(() => {});
 }
 
 /**
@@ -306,11 +306,11 @@ export async function copyText(text, options = {}) {
 
 /**
  * Empties the clipboard now when it still holds a copy this page made with clearAfterMs (best effort; the page
- * needs the focus).
- * @returns {void}
+ * needs the focus). Anything else on the clipboard is left alone. Resolves once the write is done.
+ * @returns {Promise<void>}
  */
 export function clearCopiedNow() {
-  if (pendingSeq !== null) clearIfStill(pendingSeq);
+  return pendingSeq !== null ? clearIfStill(pendingSeq) : Promise.resolve();
 }
 
 const REVEAL_KEYS = new Set([' ', 'Enter']);

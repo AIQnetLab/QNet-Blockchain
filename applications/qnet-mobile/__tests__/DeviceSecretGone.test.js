@@ -419,6 +419,48 @@ describe.each(['ios', 'android'])('%s: a move from a password never keeps the pa
   });
 });
 
+// iOS deletes only an item of the passcode-set class when the passcode is turned off. An item an older build wrote in
+// the when-unlocked class stays, and cannot pass its check: while the device has no passcode it reads as gone too.
+describe('ios: the screen-lock item goes with the passcode (MA-1)', () => {
+  beforeEach(() => { Platform.OS = 'ios'; });
+
+  it('is written behind user presence, in the class iOS deletes with the passcode', async () => {
+    Keychain.setGenericPassword.mockClear();
+    const wm = manager();
+    await wm.storeWalletWithDeviceAuth(walletB(), 'Protect');
+    const write = Keychain.setGenericPassword.mock.calls.find((c) => c[2].service === WalletManager.DEVICE_AUTH_SERVICE);
+    expect(write[2]).toMatchObject({
+      accessControl: Keychain.ACCESS_CONTROL.USER_PRESENCE,
+      accessible: Keychain.ACCESSIBLE.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
+    });
+    const src = fs.readFileSync(path.join(__dirname, '../src/services/DeviceAuthStore.js'), 'utf8');
+    expect(src).not.toMatch(/BIOMETRY_ANY_OR_DEVICE_PASSCODE,|WHEN_UNLOCKED_THIS_DEVICE_ONLY,/);
+  });
+
+  it('an older item that outlives the passcode reads as gone, and nothing is counted', async () => {
+    const wm = manager();
+    await wm.storeWalletWithDeviceAuth(walletB(), 'Protect');
+    wm.closeSession();
+    // The passcode is turned off; the item stays and every read of it fails.
+    device.available = false;
+    device.error = 'failed';
+    expect(items.has(WalletManager.DEVICE_AUTH_SERVICE)).toBe(true);
+    expect(await wm.deviceAuthSecretState()).toBe('gone');
+    expect(await wm.unlockWithBiometrics()).toEqual({ ok: false, gone: true });
+    expect((await wm.getPasswordLockStatus()).attempts).toBe(0);
+  });
+
+  it('a passcode check the device does not answer reports nothing lost', async () => {
+    const wm = manager();
+    await wm.storeWalletWithDeviceAuth(walletB(), 'Protect');
+    wm.closeSession();
+    device.error = 'failed';
+    Keychain.isPasscodeAuthAvailable.mockImplementation(async () => { throw new Error('no answer'); });
+    expect(await wm.deviceAuthSecretState()).toBe('present');
+    expect((await wm.unlockWithBiometrics()).gone).toBeUndefined();
+  });
+});
+
 describe('no way to the raw secret outside the manager (MA-7)', () => {
   it('the manager has no public secret getter', () => {
     expect(new WalletManager().deviceAuthSecret).toBeUndefined();
@@ -444,10 +486,11 @@ describe('the native side and the screen (MA-1, MA-2, MA-3)', () => {
   it('Android tells a removed screen lock without a prompt, and never stands a plain prompt in for the key', () => {
     const auth = between(kt, 'fun authenticate(', '// The system prompt for the screen-lock key');
     expect(auth).not.toMatch(/authenticateDevice\(activity, null/);
-    // No key: 'not_set' only when an answered listing leaves it out (KeyGoneException -> KEY_MISSING); a Keystore
-    // that did not answer is 'failed' (MA-R2-01).
+    // No key: 'not_set' only when an answered listing leaves it out (KeyGoneException -> KEY_MISSING), or for a key
+    // invalidated or corrupted: the codes that make a blob gone. A Keystore that did not answer is 'failed' (MA-R2-01).
     expect(auth).toMatch(/val pub = existingDevAuthPublicKey\(\)\s*val key = privateKey\(DEV_AUTH_ALIAS\)/);
-    expect(auth).toMatch(/if \(code == "KEY_INVALIDATED" \|\| code == "KEY_MISSING"\) "not_set" else "failed"/);
+    expect(auth).toMatch(/answer\(false, if \(errorCode\(t\) in DEV_AUTH_GONE_CODES\) "not_set" else "failed"\)/);
+    expect(kt).toMatch(/DEV_AUTH_GONE_CODES = setOf\("KEY_MISSING", "KEY_INVALIDATED", "KEY_CORRUPTED", "SEALED_DAMAGED"\)/);
     const usable = between(kt, 'fun devAuthUsable(', '/**');
     expect(usable).toMatch(/"KEY_MISSING", "KEY_INVALIDATED"/);
     // Opening never makes a key: a new one would not open the old secret anyway.
@@ -463,6 +506,13 @@ describe('the native side and the screen (MA-1, MA-2, MA-3)', () => {
     expect(ws).toMatch(/walletManager\.reprotectWithDeviceAuth\(token, t\('auth_device_unlock'\)\)/);
     // The return from the background within the grace time finds a secret that went meanwhile.
     expect(ws).toMatch(/walletManager\.deviceAuthSecretState\(\)\s*\.then\(\(s\) => \{ if \(s === 'gone'\) deviceSecretGone\(\); \}\)/);
+  });
+
+  it('a prompt that failed at Erase or at a fresh check says so; only a cancel is silent', () => {
+    const erase = between(ws, 'const confirmErase = async', '// Terms of Service Modal');
+    expect(erase).toMatch(/if \(!auth\.ok && auth\.code !== 'not_set'\) \{\s*\/\/[^\n]*\n\s*if \(auth\.code !== 'cancelled'\) showAlert\(t\('error'\), t\('err_erase_wallet'\)\);\s*return;\s*\}/);
+    const fresh = between(ws, 'const confirmFresh = async', 'const deviceSecretGone');
+    expect(fresh).toMatch(/if \(auth\.code === 'not_set'\) deviceSecretGone\(\);\s*\/\/[^\n]*\n\s*else if \(auth\.code !== 'cancelled'\) showAlert\(t\('error'\), t\('device_unlock_unavailable'\)\);/);
   });
 
   it('the texts say the truth: after the screen lock goes, only the recovery phrase opens the wallet', () => {

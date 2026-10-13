@@ -204,18 +204,23 @@ lifetime, and the next worker start runs it again.
   says that anyone who can read the clipboard can take the wallet and that the clipboard is cleared in 60 seconds if the
   page stays open, and Settings clears it the same way without a text. The copy is the canonical words on one line. After 60 seconds the page empties the clipboard if nothing was
   copied from it since (a page without the focus then does it as soon as it has the focus again); setup also
-  empties it when the wallet is set up, since the user may close the tab right after, and deleting the wallet empties the
-  clipboard whatever it holds. A page cannot read the clipboard, and a closed page cannot clear it: the popup
-  closes as soon as the user clicks elsewhere.
-- **Delete** needs the word `DELETE` typed and the password. It deletes the vault database, clears
-  `chrome.storage.local` and `chrome.storage.session`, empties the clipboard, disconnects every site, and the
-  open pages reload.
+  empties it when the wallet is set up, since the user may close the tab right after, and deleting or resetting the
+  wallet empties it at once when it still holds a copy the popup made and has yet to clear (an activation code, the
+  phrase or a private key); anything else on the clipboard stays, such as a phrase about to be imported after a reset.
+  A page cannot read the clipboard, and a closed page cannot clear it: the popup closes as soon as the user clicks
+  elsewhere.
+- **Delete** needs the word `DELETE` typed and the password; Enter in the password field deletes as the button does,
+  and a wrong password empties only the password field, so the typed `DELETE` stays. It deletes the vault database,
+  clears `chrome.storage.local` (all but the chosen interface language, which holds no wallet data) and
+  `chrome.storage.session`, takes the popup's own pending copy off the clipboard, disconnects every site, and the open
+  pages reload.
 - **Forgot password.** The lock screen offers "Forgot password?", which opens one screen, Reset wallet: the extension
   cannot recover the password, and setting a new one takes a reset; one danger warning says that the reset removes the
   wallet from this browser and that only its recovery phrase brings it back. It asks for no recovery phrase, no
   password and no typed word: Back returns to the lock screen, and **Reset wallet** erases the locked wallet, as
-  Delete erases it (the vault database, `chrome.storage.local` and `chrome.storage.session`, the earlier version's
-  copies, the password backoff; every site is disconnected), whatever the stored record holds. The press first asks
+  Delete erases it (the vault database, `chrome.storage.local` but the interface language and
+  `chrome.storage.session`, the earlier version's copies, the password backoff; every site is disconnected), whatever
+  the stored record holds. The press first asks
   the service worker for a one-time token, bound to that popup and valid for one minute, then sends the reset with it
   and a fixed confirmation; only the popup may send either request, and no site, content script or other extension
   page can. The service worker resets only a locked wallet: one unlocked meanwhile (by an unlock that finished first,

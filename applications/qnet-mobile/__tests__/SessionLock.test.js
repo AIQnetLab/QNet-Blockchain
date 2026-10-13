@@ -34,6 +34,9 @@ jest.mock('../src/components/WalletManager', () => {
     async purgeLegacyBiometric() { return false; }
     async legacyBiometricNotice() { return false; }
     async vaultState() { return mockState.vault; }
+    // A wallet under the screen lock (mockState.lock): its prompt opens it at once.
+    async deviceAuthState() { return mockState.lock ? 'yes' : 'no'; }
+    async unlockWithBiometrics() { return mockState.lock ? { ok: true, token: 'session-token' } : null; }
     async isBiometricEnabled() { return !!mockState.bio; }
     async confirmWithBiometrics(reason, note) { mockState.bioCalls.push([reason, note]); return mockState.bioAnswer; }
     async isBiometricSupported() { return false; }
@@ -64,6 +67,8 @@ jest.mock('../src/components/WalletManager', () => {
   FakeWalletManager.MIN_PASSWORD_LENGTH = 8;
   FakeWalletManager.publicWallet = (w) => ({ ...w });
   FakeWalletManager.canonicalAddress = (a) => a;
+  FakeWalletManager.deviceAuthCredential = (reason) => Object.freeze({ reason });
+  FakeWalletManager.isSessionToken = (x) => x === 'session-token';
   // The real rule (MOBNET-R4-01): value goes only to a checksummed EON address; 64 hex is a contract or a hash.
   FakeWalletManager.recipientAddress = (a) => {
     if (!/^[0-9a-f]{19}eon[0-9a-f]{23}$/.test(String(a))) throw Object.assign(new Error('not an account'), { code: 'HEX_RECIPIENT' });
@@ -138,7 +143,7 @@ beforeEach(async () => {
   await AsyncStorage.clear();
   Object.assign(mockState, {
     vault: 'none', instances: [], closed: 0, generated: 0, pending: [], recent: [], preview: null, sends: [],
-    bio: false, bioCalls: [], bioAnswer: { ok: false, fallback: true },
+    bio: false, bioCalls: [], bioAnswer: { ok: false, fallback: true }, lock: false,
   });
   mockClock.mono = 1_000_000;
   mockReaders.list = [];
@@ -507,6 +512,17 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
     expect(mockState.sends[0][5]).toEqual({ choice: { mode: 'replace', nonce: 5, bodyHash: 'h5' } });
   });
 
+  it('a recipient pasted with spaces or a line break around it is the bare address in every check', async () => {
+    mockState.pending = [{ nonce: 5 }];
+    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false, recent: [] };
+    const tree = await sendForm(`  ${TO}\n`);
+    expect(input(tree, 'send_placeholder_eon').props.value).toBe(TO);
+    await tap(tree, 'send_button');
+    // The same payment two minutes ago is found: the comparison sees the address, not the pasted text.
+    expect(texts(tree)).toContain(t('send_repeat_body', { minutes: 2 }));
+    expect(mockState.sends).toEqual([]);
+  });
+
   it('every send asks for the password again; without it nothing is signed (MPLAT-R2-01)', async () => {
     const tree = await sendForm();
     await tap(tree, 'send_button');
@@ -827,5 +843,112 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     expect(lines(tree)).toContain(t('common_copied'));
     await pressExact(tree, t('common_done'));
     for (const word of PHRASE.split(' ')) expect(lines(tree)).not.toContain(word);
+  });
+
+  it('"Copied" turns back to Copy when the copy may no longer be on the clipboard', async () => {
+    const { SECRET_CLIPBOARD_SECONDS } = require('../src/services/DeviceSecurity');
+    const tree = await mount();
+    await press(tree, 'create_new_wallet');
+    await type(tree, 'enter_password', '12345678');
+    await type(tree, 'confirm_password', '12345678');
+    await press(tree, 'terms_of_service');
+    await press(tree, 'accept');
+    await press(tree, 'create_wallet');
+    const timers = jest.spyOn(global, 'setTimeout');
+    await pressExact(tree, t('seed_copy'));
+    expect(lines(tree)).toContain(t('common_copied'));
+    // The last timer of that length is the button's (the copy's own clear is set first).
+    const at = timers.mock.calls.map((c) => c[1]).lastIndexOf(SECRET_CLIPBOARD_SECONDS * 1000);
+    expect(at).toBeGreaterThan(-1);
+    clearTimeout(timers.mock.results[at].value);
+    await act(async () => { timers.mock.calls[at][0](); });
+    expect(lines(tree)).not.toContain(t('common_copied'));
+    expect(lines(tree)).toContain(t('seed_copy'));
+  });
+});
+
+describe('Export on Settings: one check at a time, and the screen lock\'s answers are its own', () => {
+  const PHRASE = 'abandon ability able about above absent absorb abstract absurd abuse access accident';
+  const pressShow = async (tree) => {
+    await act(async () => { pressable(tree, t('show')).props.onPress(); });
+    await flush();
+  };
+  const toExport = async (tree) => {
+    await act(async () => { tree.root.find((n) => n.props.testID === 'tab-settings' && typeof n.props.onPress === 'function').props.onPress(); });
+    await flush();
+    await press(tree, 'export_recovery_phrase');
+  };
+
+  it('a second tap on Show while the check runs does nothing, and the button says it is verifying', async () => {
+    mockState.vault = 'ok';
+    const tree = await mount();
+    await type(tree, 'enter_password', 'Otter-Canyon-58');
+    await press(tree, 'unlock_wallet');
+    await flush(6);
+    let finish;
+    let calls = 0;
+    for (const wm of mockState.instances) {
+      wm.revealMnemonic = () => { calls += 1; return new Promise((r) => { finish = r; }); };
+    }
+    await toExport(tree);
+    await type(tree, 'password', 'Otter-Canyon-58');
+    await pressShow(tree);
+    expect(calls).toBe(1);
+    expect(texts(tree)).toContain(t('verifying'));
+    await act(async () => { pressable(tree, t('verifying')).props.onPress(); });
+    await flush();
+    expect(calls).toBe(1);
+    await act(async () => { finish({ ok: true, mnemonic: PHRASE }); });
+    await flush();
+    expect(texts(tree)).not.toContain(t('verifying'));
+    expect(texts(tree).split('\n')).toContain('abandon');
+  });
+
+  it('under the screen lock a failed prompt is not a wrong password, iOS\'s "not now" is silent, and a gone secret offers the way back', async () => {
+    mockState.vault = 'ok';
+    mockState.lock = true;
+    const tree = await mount();
+    await flush(6);
+    expect(input(tree, 'enter_password')).toBeUndefined(); // opened by the screen lock
+    let answer = null;
+    for (const wm of mockState.instances) wm.revealMnemonic = async () => answer;
+    await toExport(tree);
+    expect(input(tree, 'password')).toBeUndefined();
+    answer = { ok: false, failed: true };
+    await pressShow(tree);
+    expect(texts(tree)).toContain(t('unlock_failed'));
+    expect(texts(tree)).not.toContain(t('incorrect_password'));
+    await press(tree, 'common_ok');
+    answer = { ok: false, failed: true, notNow: true };
+    await pressShow(tree);
+    expect(texts(tree)).not.toContain(t('unlock_failed'));
+    expect(texts(tree)).not.toContain(t('incorrect_password'));
+    answer = { ok: false, gone: true };
+    await pressShow(tree);
+    expect(texts(tree)).toContain(t('auth_secret_gone_open_body'));
+    expect(texts(tree)).not.toContain(t('incorrect_password'));
+  });
+
+  it('a fresh check under the screen lock whose prompt failed says so; a cancelled one is silent', async () => {
+    const DS = require('../src/services/DeviceSecurity');
+    const auth = jest.spyOn(DS, 'deviceAuthenticate');
+    mockState.vault = 'ok';
+    mockState.lock = true;
+    const tree = await mount();
+    await flush(6);
+    await act(async () => { tree.root.find((n) => n.props.testID === 'tab-settings' && typeof n.props.onPress === 'function').props.onPress(); });
+    await flush(4);
+    auth.mockResolvedValueOnce({ ok: false, code: 'cancelled' });
+    await press(tree, 'autolock_1');
+    await tap(tree, 'autolock_30');
+    await flush(4);
+    expect(texts(tree)).not.toContain(t('device_unlock_unavailable'));
+    expect(await AsyncStorage.getItem('qnet_autolock_time')).toBeNull();
+    auth.mockResolvedValueOnce({ ok: false, code: 'failed' });
+    await press(tree, 'autolock_1');
+    await tap(tree, 'autolock_30');
+    await flush(4);
+    expect(texts(tree)).toContain(t('device_unlock_unavailable'));
+    expect(await AsyncStorage.getItem('qnet_autolock_time')).toBeNull();
   });
 });

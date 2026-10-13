@@ -60,15 +60,17 @@ function cameraModule() {
 }
 
 // Whether the camera may be used: `ask` shows the system prompt when the user has not answered yet (Android and iOS
-// alike return at once after a refusal). iOS without the module leaves it to the camera view, which asks itself.
+// alike return at once after a refusal). iOS without the module, or with a module that does not expose the method (a
+// build whose bridge cannot reach it), leaves it to the camera view, which asks itself.
 async function cameraAllowed(ask) {
   if (Platform.OS === 'android') {
     if (!ask) return PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA);
     return (await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA)) === PermissionsAndroid.RESULTS.GRANTED;
   }
   const mod = cameraModule();
-  if (!mod) return true;
-  return (await (ask ? mod.requestDeviceCameraAuthorization() : mod.checkDeviceCameraAuthorizationStatus())) === true;
+  const method = ask ? 'requestDeviceCameraAuthorization' : 'checkDeviceCameraAuthorizationStatus';
+  if (!mod || typeof mod[method] !== 'function') return true;
+  return (await mod[method]()) === true;
 }
 
 // The QNet Send screen's reading: a QNet address, else the note that it is not one.

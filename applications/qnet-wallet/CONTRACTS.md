@@ -1,4 +1,4 @@
-# QNet Wallet extension 3.1.2: contracts
+# QNet Wallet extension 3.1.3: contracts
 
 This file is the single agreement between the modules of the rebuilt extension. The rebuild spec and the
 three audit reports (ext-secrets, ext-surface, ext-crypto) are normative; this file turns them into
@@ -359,7 +359,7 @@ only from this extension's worker (`sender.url === getURL('background/sw.js')`, 
 |---|---|---|---|
 | `locked` | any lock | null | clear every input `.value`, drop secrets, show the lock screen |
 | `unlocked` | unlock | null | refresh (the popup's lock and reset screens give way to the wallet) |
-| `wiped` | wipe, reset | null | clear localStorage/sessionStorage of the page, drop the view, empty the clipboard (best effort), reload once. sw.js sends it when the wipe starts, before `vault.wipe` or `vault.reset` answers: the popup that asked for the delete or the reset reloads here, so the clipboard is emptied here, never after the answer (R16, R4-ESM-01) |
+| `wiped` | wipe, reset | null | clear localStorage/sessionStorage of the page, drop the view, take a copy the page made and has yet to clear off the clipboard (`common.clearCopiedNow`, best effort; anything else on the clipboard stays: Reset leads to Import, whose phrase may be on it), reload once. sw.js sends it when the wipe starts, before `vault.wipe` or `vault.reset` answers: the popup that asked for the delete or the reset reloads here, so the clipboard is cleared here, never after the answer (R16, R4-ESM-01) |
 | `activation` | activation record, pending burn or the state of the light node's registration changed | null | refresh the Activate tab |
 | `approval` | approval queue changed | null | approve page refreshes |
 | `balance` | a send, token transfer, contract call, activation or claim a site asked for ran after its confirm (sent, burned, moved, or failed on the way) | null | the popup reads the balances, the token list or the history on screen again at once (section 9, Pages) |
@@ -1022,7 +1022,10 @@ phrase (decision 41) and its balance is moved with this extension's approval win
 - Wipe: password check; then `session.lock('wipe')`, close connections, await `deleteDatabase` (success,
   blocked, error), reset the password backoff (memory and storage; only once the database is deleted),
   clear `chrome.storage.local` and `session`, verify the vault is gone (only the self-test pass, which is
-  not wallet data, may be written again meanwhile).
+  not wallet data, may be written again meanwhile). The interface language (`qnet_settings_v3` holding exactly an
+  allowed `{language}`: `session.storedLanguage()`) stays in `chrome.storage.local`; any other value there goes. The
+  popup's Delete screen sends `vault.wipe` on its button or Enter in the password field; a refusal empties only the
+  password field (the typed `DELETE` stays).
 - Reset ("Forgot password?" on the popup lock screen → Reset wallet; decision 45): the popup says the extension cannot
   recover the password and that a new one takes a reset, gives one danger warning (the reset removes the wallet from this
   browser; only its recovery phrase brings it back) and offers Back and Reset wallet; nothing is typed, no phrase and no
@@ -1031,8 +1034,8 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   (one minute), in worker memory only (a newer token replaces it), then at once `vault.reset` with the token and
   `confirm: 'ERASE'`. `vault.reset` refuses any page but the popup, takes the token (any call spends it; wrong,
   expired, foreign or missing → `RESET_EXPIRED`), requires the confirmation, and erases as Wipe does after its password
-  check (`session.lock('wipe')`, the database deleted, the backoff reset, `chrome.storage.local` and `session` cleared,
-  the earlier version's database deleted, nothing left), whatever the record holds (one that does not parse goes too:
+  check (`session.lock('wipe')`, the database deleted, the backoff reset, `chrome.storage.local` but the interface
+  language and `session` cleared, the earlier version's database deleted, nothing left), whatever the record holds (one that does not parse goes too:
   R2-ESM-05), and only while the wallet is locked: an unlocked one (its password is known; Delete wallet takes it) is
   refused with `UNLOCKED` by both types, `vault.reset` checking in the same queue as unlock, so an unlock that finishes
   first is seen and the wallet just unlocked stays (the popup then opens it; its "Forgot password?" waits while its own
@@ -1123,8 +1126,8 @@ token only when Reset wallet is pressed and spends it at once, so no keepalive h
 - Clearing: after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (60 s) the page writes an empty clipboard if nothing was copied
   from it since (the page cannot read the clipboard: that needs the clipboardRead permission); a page without the focus
   then clears it as soon as it has the focus again. Setup clears it when the wallet is set up (`common.clearCopiedNow`),
-  since the user may close the tab before that timer would run; a wallet deletion empties the clipboard whatever it holds (R16,
-  section 3). A closed page cannot clear: the popup closes when the user clicks elsewhere, which the warning's "if the
+  since the user may close the tab before that timer would run; a wallet deletion or reset clears such a copy still
+  waiting at once (`common.clearCopiedNow`, R16, section 3) and leaves anything else on the clipboard. A closed page cannot clear: the popup closes when the user clicks elsewhere, which the warning's "if the
   page stays open" covers.
 - One line on the setup screen: anyone with the words controls the wallet (`setupWordsWarn`); the reveal has one line
   before its password (`revealWarn`), and the setup screen's copy line is `phraseCopyWarn` (owner, 28.09: one short line
@@ -1215,7 +1218,8 @@ Only vault.js calls it.
 autoLockMinutes}) → {lockDeadline}`, `requireUnlocked() → {walletId, qnetAddress, solanaAddress,
 lockDeadline}`, `isUnlocked()`, `withVaultKey(fn)` (vault.js only), `replaceVaultKey(key)`, `touch()`,
 `lock(reason)`, `onLockChange(listener) → unsubscribe` (implemented), handlers `lockNow()`,
-`getAddresses()`, `getSettings()`, `setSettings(patch)`, `cachedViews()` (`wallet.cached`), the view cache's
+`getAddresses()`, `getSettings()`, `setSettings(patch)`, `storedLanguage() → language|null` (the valid stored
+interface language, which a wipe keeps), `cachedViews()` (`wallet.cached`), the view cache's
 `rememberView(name, value)` (the router, decision 39; nothing while locked; a verified QNet balance, the token list and
 the Solana balances also into the vault's chain cache, decision 40) and `forgetViews(names)` (qnet.js, a chain the wallet
 no longer follows), the send proofs' `keepSendProof(address, figure)`, `keptSendProof(address) → figure|null` and
@@ -1431,7 +1435,7 @@ area D: `loadLocale(language)` (the table of `ui/i18n`, `<html lang dir>`), `cur
 `t(key, subs)` (bidi-isolates substitutions in right-to-left languages), `copyText(text, {clearAfterMs, untilFocused})`
 (with `clearAfterMs` the page empties the clipboard after that delay if nothing was copied from it since and it has
 the focus; with `untilFocused` too, a page without the focus then does it when it gets the focus back),
-`clearCopiedNow()` (empties such a copy at once), `holdToReveal(control, target, secret, {autoHideMs, onExpire,
+`clearCopiedNow() → Promise` (empties such a copy at once, nothing else), `holdToReveal(control, target, secret, {autoHideMs, onExpire,
 placeholder})` (no page uses it since decision 43), `openSetup(flow)` (`'create'` or `'import'`: setup opens at that
 step, `?flow=`; decision 45), `clearPageStorage()` (decision 43: every page at start).
 `ui/kit.js` adds `earlierRemoval({onRemoved})`: what an earlier version left, with Remove behind one confirmation

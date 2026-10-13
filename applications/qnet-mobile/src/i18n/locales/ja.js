@@ -456,6 +456,7 @@ QNet Wallet は Orrery Group LLC が公開しています。利用規約の全�
   device_unlock_offer_yes: '画面ロックを使う',
   device_unlock_on: 'ウォレットはこのデバイスの画面ロックで開くようになりました。パスワードはもう使われません。',
   device_unlock_unavailable: 'このデバイスは現在、画面ロックでウォレットを保護できません。',
+  device_lock_retry_offer: '画面ロックがまた失敗したため、何も保存されていません。代わりにウォレットのパスワードを使いますか？ウォレットを開くたびに入力を求められます。',
   enable_biometric: '生体認証によるロック解除',
   biometric_enabled_msg: '生体認証によるロック解除をオンにしました',
   biometric_disabled_msg: '生体認証によるロック解除をオフにしました',

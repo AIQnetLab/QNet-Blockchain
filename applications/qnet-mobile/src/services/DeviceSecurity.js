@@ -117,6 +117,25 @@ export async function clearPasteboardIfChanged(since) {
   }
 }
 
+/**
+ * Empties the clipboard right after a paste into the phrase field, without reading it: iOS removes the pasteboard's
+ * items, Android clears the clip natively (no paste notice, no 'Copied' overlay). Without the native module: an empty
+ * string on the plain clipboard.
+ */
+export async function clearClipboard() {
+  if (Platform.OS === 'ios' && N && N.clearPasteboardIfChanged) {
+    await clearPasteboardIfChanged(-1);
+    return;
+  }
+  if (Platform.OS === 'android' && N && N.clearClipboard) {
+    try {
+      await N.clearClipboard();
+      return;
+    } catch (_) { /* the plain clipboard below */ }
+  }
+  try { Clipboard.setString(''); } catch (_) { /* nothing to clear */ }
+}
+
 // ── The recovery phrase on the clipboard ───────────────────────────────────────────────────────────
 /** How long a recovery phrase copied by its Copy button may stay on the clipboard. */
 export const SECRET_CLIPBOARD_SECONDS = 60;

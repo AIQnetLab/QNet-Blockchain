@@ -134,6 +134,23 @@ describe('the scan sheet (components/QrScanSheet)', () => {
     act(() => tree.unmount());
   });
 
+  it('iOS on the legacy bridge: a module without the permission methods leaves the asking to the camera view', async () => {
+    // The module object the legacy bridge hands over carries only its exported methods.
+    const mod = { capture: jest.fn() };
+    jest.spyOn(TurboModuleRegistry, 'get').mockImplementation((name) => (name === 'RNCameraKitModule' ? mod : null));
+    let tree;
+    await act(async () => { tree = renderer.create(<QrScanSheet t={t} onAddress={() => {}} onClose={() => {}} />); });
+    expect(texts(tree)).not.toContain(t('scan_camera_off'));
+    expect(tree.root.findAllByProps({ testID: 'scan-camera' }).length).toBeGreaterThan(0);
+    act(() => tree.unmount());
+    // The app's patch exports both methods, so the legacy bridge reaches them (the same bodies as the library's).
+    const patch = fs.readFileSync(path.join(__dirname, '../patches/react-native-camera-kit+18.0.1.patch'), 'utf8');
+    expect(patch).toMatch(/\+RCT_EXPORT_METHOD\(checkDeviceCameraAuthorizationStatus:\(RCTPromiseResolveBlock\)resolve reject:\(RCTPromiseRejectBlock\)reject\) \{\n \s*\[CKCameraManager checkDeviceCameraAuthorizationStatus:resolve reject:reject\];/);
+    expect(patch).toMatch(/\+RCT_EXPORT_METHOD\(requestDeviceCameraAuthorization:\(RCTPromiseResolveBlock\)resolve reject:\(RCTPromiseRejectBlock\)reject\) \{\n \s*\[CKCameraManager requestDeviceCameraAuthorization:resolve reject:reject\];/);
+    // The library's own Android changes stay in the same patch.
+    expect(patch).toMatch(/android\/src\/main\/java\/com\/rncamerakit\/QRCodeAnalyzer\.kt/);
+  });
+
   it('Close closes it', async () => {
     const onClose = jest.fn();
     let tree;

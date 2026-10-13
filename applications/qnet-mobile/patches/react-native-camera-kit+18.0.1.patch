@@ -754,3 +754,22 @@ index 9474b9f..1f629d8 100644
          )
      }
  
+diff --git a/node_modules/react-native-camera-kit/ios/ReactNativeCameraKit/RNCameraKitModule.mm b/node_modules/react-native-camera-kit/ios/ReactNativeCameraKit/RNCameraKitModule.mm
+index df5e1a0..14d2d6f 100644
+--- a/node_modules/react-native-camera-kit/ios/ReactNativeCameraKit/RNCameraKitModule.mm
++++ b/node_modules/react-native-camera-kit/ios/ReactNativeCameraKit/RNCameraKitModule.mm
+@@ -50,11 +50,12 @@ RCT_EXPORT_METHOD(capture:(NSDictionary *)options tag:(nonnull NSNumber *)tag re
+     } reject:reject methodName:@"capture"];
+ }
+  
+- - (void)checkDeviceCameraAuthorizationStatus:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
++// Exported, so the legacy bridge reaches them too (the TurboModule spec alone serves only the new architecture).
++RCT_EXPORT_METHOD(checkDeviceCameraAuthorizationStatus:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject) {
+         [CKCameraManager checkDeviceCameraAuthorizationStatus:resolve reject:reject];
+ }
+ 
+- - (void)requestDeviceCameraAuthorization:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
++RCT_EXPORT_METHOD(requestDeviceCameraAuthorization:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject) {
+         [CKCameraManager requestDeviceCameraAuthorization:resolve reject:reject];
+ }
+ 

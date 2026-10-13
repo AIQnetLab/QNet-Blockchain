@@ -666,6 +666,20 @@ async function readLanguage() {
 }
 
 /**
+ * The interface language chrome.storage.local holds when the key holds nothing but an allowed one, else null: no wallet
+ * data, so deleting or resetting the wallet keeps it (vault.eraseAll).
+ * @returns {Promise<string|null>}
+ */
+export async function storedLanguage() {
+  try {
+    const stored = (await chromeApi().storage.local.get(STORAGE_KEYS.SETTINGS))?.[STORAGE_KEYS.SETTINGS];
+    return hasExactKeys(stored, ['language']) && SUPPORTED_LANGUAGES.includes(stored.language) ? stored.language : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Handler of `settings.get` (any page, locked or not). autoLockMinutes comes from the running session
  * (null while locked); the language from chrome.storage.local, where nothing valid means the browser's
  * language if the UI has it, else DEFAULT_LANGUAGE.

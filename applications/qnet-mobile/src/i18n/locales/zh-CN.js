@@ -456,6 +456,7 @@ QNet Wallet 由 Orrery Group LLC 发布。完整的使用条款和隐私政策�
   device_unlock_offer_yes: '使用屏幕锁',
   device_unlock_on: '钱包现在使用此设备的屏幕锁打开。不再使用其密码。',
   device_unlock_unavailable: '此设备目前无法用其屏幕锁保护钱包。',
+  device_lock_retry_offer: '屏幕锁再次失败，未保存任何内容。改用钱包密码吗？每次打开钱包时都会要求输入。',
   enable_biometric: '生物识别解锁',
   biometric_enabled_msg: '生物识别解锁已开启',
   biometric_disabled_msg: '生物识别解锁已关闭',

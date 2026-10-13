@@ -298,6 +298,20 @@ describe('what the screen holds and what Delete leaves', () => {
     await expect(wm.loadWallet(session)).rejects.toBeDefined();
   });
 
+  it('Delete wallet keeps the mark of a screen lock that could not keep a secret, so the next wallet gets a password', async () => {
+    const wm = manager();
+    await wm.storeWallet({ address: B.sol, publicKey: B.sol, qnetAddress: B.qnet, mnemonic: MNEMONIC }, 'Lantern-Quartz-Oriole-4');
+    await AsyncStorage.multiSet([['qnet_language', 'ru'], [WalletManager.DEVICE_AUTH_BROKEN_KEY, String(Date.now())]]);
+    await wm.eraseAllData();
+    expect((await AsyncStorage.getAllKeys()).sort()).toEqual([WalletManager.DEVICE_AUTH_BROKEN_KEY, 'qnet_language'].sort());
+    expect(await wm.deviceAuthAvailable()).toBe(false);
+    // The screen keeps nothing of the deleted wallet for the next one.
+    const ws = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    const erase = ws.slice(ws.indexOf('const eraseWallet = async'), ws.indexOf('const nodeRunsHere = async'));
+    expect(erase).toMatch(/setHwSeal\(null\);/);
+    expect(erase).toMatch(/setBalancesHidden\(false\);/);
+  });
+
   it('a reinstall wipes the Keychain items the previous install left; an update keeps them', async () => {
     const fresh = manager();
     await fresh.prepareInstall();

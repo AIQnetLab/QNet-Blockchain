@@ -45,8 +45,10 @@ jest.mock('react-native-keychain', () => ({
   ACCESSIBLE: {
     WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'whenUnlockedThisDeviceOnly',
     AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY: 'afterFirstUnlockThisDeviceOnly',
+    WHEN_PASSCODE_SET_THIS_DEVICE_ONLY: 'AccessibleWhenPasscodeSetThisDeviceOnly',
   },
   ACCESS_CONTROL: {
+    USER_PRESENCE: 'UserPresence',
     BIOMETRY_ANY_OR_DEVICE_PASSCODE: 'BiometryAnyOrDevicePasscode',
     BIOMETRY_CURRENT_SET: 'BiometryCurrentSet',
   },

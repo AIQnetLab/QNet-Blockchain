@@ -456,6 +456,7 @@ QNet Wallet è pubblicato da Orrery Group LLC. I Termini d'uso completi e l'Info
   device_unlock_offer_yes: 'Usa il blocco schermo',
   device_unlock_on: 'Ora il portafoglio si apre con il blocco schermo di questo dispositivo. La sua password non viene più usata.',
   device_unlock_unavailable: 'Al momento questo dispositivo non può proteggere il portafoglio con il suo blocco schermo.',
+  device_lock_retry_offer: 'Il blocco schermo non ha funzionato di nuovo e non è stato salvato nulla. Usare invece una password del portafoglio? Verrà chiesta a ogni apertura del portafoglio.',
   enable_biometric: "Sblocco biometrico",
   biometric_enabled_msg: "Sblocco biometrico attivato",
   biometric_disabled_msg: "Sblocco biometrico disattivato",

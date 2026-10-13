@@ -9,8 +9,8 @@ import {
   TIMINGS, WALLET_VERSION, languageForTag,
 } from '../background/config.js';
 import {
-  DECIMALS, UiError, call, clear, clearPageStorage, copyText, currentLanguage, el, formatUnits, loadLocale, log, onWalletEvent,
-  openSetup, refuseAutoFocus, refuseFramed, shortAddress, t, wipeInputs,
+  DECIMALS, UiError, call, clear, clearCopiedNow, clearPageStorage, copyText, currentLanguage, el, formatUnits, loadLocale, log,
+  onWalletEvent, openSetup, refuseAutoFocus, refuseFramed, shortAddress, t, wipeInputs,
 } from './common.js';
 import { LANGUAGE_NAMES } from './i18n/index.js';
 import {
@@ -370,15 +370,17 @@ function phraseText(mnemonic) {
   return mnemonic.split(' ').map((word, index) => `${index + 1}. ${word}`).join('\n');
 }
 
-// The wallet of this browser is gone (a delete here or in another view): the view is dropped, the clipboard is
-// emptied (best effort) so an activation code copied earlier does not outlive the wallet (R16), then the page starts
-// over. The worker announces the wipe before it answers the delete, so this is the only place the popup that asked
-// for it is sure to run before it reloads (R4-ESM-01). Once per page, whichever of the two gets here first.
+// The wallet of this browser is gone (a delete here or in another view): the view is dropped, a copy this page made
+// and still has to clear (an activation code, the recovery phrase or a private key from Settings) leaves the clipboard
+// (best effort) so it does not outlive the wallet (R16), then the page starts over. Anything else on the clipboard
+// stays: Reset leads straight to Import, whose recovery phrase may be on it. The worker announces the wipe before it
+// answers the delete, so this is the only place the popup that asked for it is sure to run before it reloads
+// (R4-ESM-01). Once per page, whichever of the two gets here first.
 let wiping = null;
 function wipeAndReload() {
   wiping ??= (async () => {
     wipeView();
-    await copyText('').catch(() => {});
+    await clearCopiedNow();
     location.reload();
   })();
   return wiping;
@@ -547,7 +549,7 @@ function renderReset() {
       else message.show(errorText(error));
       return;
     }
-    // the 'wiped' event usually got here first; either way the clipboard is emptied before the reload (R16)
+    // the 'wiped' event usually got here first; either way this page's pending copy leaves before the reload (R16)
     clearPageStorage();
     await wipeAndReload();
   });
@@ -3086,10 +3088,11 @@ function renderDelete() {
     message.node,
     actionsRow(back, wipe));
   const isCurrent = showTab(view);
-  wipe.addEventListener('click', async () => {
+  // A wrong password empties only its own field: the typed DELETE stays for the next try.
+  const submit = async () => {
     if (confirmation.value !== WIPE_WORD || password.value === '') return;
     const value = password.value;
-    wipeInputs(view);
+    password.value = '';
     try {
       await whileBusy([wipe, back], () => call('vault.wipe', { password: value, confirm: WIPE_WORD }));
     } catch (error) {
@@ -3097,10 +3100,12 @@ function renderDelete() {
       if (isCurrent()) message.show(errorText(error));
       return;
     }
-    // the 'wiped' event usually got here first; either way the clipboard is emptied before the reload (R16)
+    // the 'wiped' event usually got here first; either way this page's pending copy leaves before the reload (R16)
     clearPageStorage();
     await wipeAndReload();
-  });
+  };
+  wipe.addEventListener('click', submit);
+  onEnter(password, submit);
 }
 
 boot();

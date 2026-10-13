@@ -456,6 +456,7 @@ QNet Wallet은 Orrery Group LLC가 게시합니다. 전체 이용 약관과 개�
   device_unlock_offer_yes: '화면 잠금 사용',
   device_unlock_on: '이제 지갑이 이 기기의 화면 잠금으로 열립니다. 비밀번호는 더 이상 사용되지 않습니다.',
   device_unlock_unavailable: '지금은 이 기기의 화면 잠금으로 지갑을 보호할 수 없습니다.',
+  device_lock_retry_offer: '화면 잠금이 다시 실패해 아무것도 저장되지 않았습니다. 대신 지갑 비밀번호를 사용할까요? 지갑을 열 때마다 비밀번호를 요청합니다.',
   enable_biometric: '생체 인식 잠금 해제',
   biometric_enabled_msg: '생체 인식 잠금 해제를 켰습니다',
   biometric_disabled_msg: '생체 인식 잠금 해제를 껐습니다',

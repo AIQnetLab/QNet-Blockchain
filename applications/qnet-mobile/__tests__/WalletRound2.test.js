@@ -236,7 +236,11 @@ describe('MA2-02: an invalidated screen-lock key is made again, never sealed to'
   it('the new wallet screens keep the screen lock after a failure for now, and say so', () => {
     const src = SCREEN();
     expect((src.match(/DEVICE_LOCK_RETRY/g) || []).length).toBeGreaterThanOrEqual(2);
-    expect(src).toMatch(/e\.code === 'DEVICE_LOCK_RETRY'[\s\S]{0,200}device_unlock_unavailable/);
+    // Both screens say so through one message, which also offers a password instead (App1310.test.js).
+    expect(src).toMatch(/e\.code === 'DEVICE_LOCK_RETRY'\) \{\s*offerPasswordAfterRetry\(\);/);
+    expect(src).toMatch(/error\.code === 'DEVICE_LOCK_RETRY'\) \{\s*offerPasswordAfterRetry\(/);
+    const offer = src.slice(src.indexOf('const offerPasswordAfterRetry = '), src.indexOf('const offerPasswordAfterRetry = ') + 1200);
+    expect(offer).toMatch(/showAlert\(t\('error'\), t\('device_unlock_unavailable'\)/);
   });
 });
 

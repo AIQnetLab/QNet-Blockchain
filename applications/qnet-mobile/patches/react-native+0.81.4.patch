@@ -1,85 +1,16 @@
-diff --git a/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm b/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm
-index 377f41e..f33e993 100644
---- a/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm
-+++ b/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm
-@@ -24,6 +24,15 @@
- // This variable is unused.
- @synthesize dataDetectorTypes;
- 
-+// QNet (MPLAT-R3-01): the recovery-phrase field (testID "qnet-seed-input", which React Native sets as this view's
-+// accessibilityIdentifier) keeps Paste and selection only. Nothing that exports its text is offered (Copy, Cut,
-+// Share, Look Up, Translate and the rest of the edit menu), and a paste takes the phrase off the pasteboard as soon
-+// as it has landed.
-+static BOOL RCTQNetIsSeedField(UIView *view)
-+{
-+  return [view.accessibilityIdentifier isEqualToString:@"qnet-seed-input"];
-+}
-+
- - (instancetype)initWithFrame:(CGRect)frame
- {
-   if (self = [super initWithFrame:frame]) {
-@@ -180,6 +189,11 @@
-     return NO;
-   }
- 
-+  if (RCTQNetIsSeedField(self) && action != @selector(paste:) && action != @selector(select:) &&
-+      action != @selector(selectAll:) && action != @selector(delete:)) {
-+    return NO;
-+  }
-+
-   return [super canPerformAction:action withSender:sender];
- }
- 
-@@ -194,6 +208,11 @@
- #endif
- 
-   [super buildMenuWithBuilder:builder];
-+
-+  if (RCTQNetIsSeedField(self)) {
-+    [builder removeMenuForIdentifier:UIMenuShare];
-+    [builder removeMenuForIdentifier:UIMenuLookup];
-+  }
- }
- 
- #pragma mark - Dictation
-@@ -264,6 +283,25 @@
- {
-   _textWasPasted = YES;
-   [super paste:sender];
-+  if (RCTQNetIsSeedField(self)) {
-+    [[UIPasteboard generalPasteboard] setItems:@[] options:@{}];
-+  }
-+}
-+
-+- (void)copy:(id)sender
-+{
-+  if (RCTQNetIsSeedField(self)) {
-+    return;
-+  }
-+  [super copy:sender];
-+}
-+
-+- (void)cut:(id)sender
-+{
-+  if (RCTQNetIsSeedField(self)) {
-+    return;
-+  }
-+  [super cut:sender];
- }
- 
- #pragma mark - Layout
 diff --git a/node_modules/react-native/Libraries/Text/TextInput/Multiline/RCTUITextView.mm b/node_modules/react-native/Libraries/Text/TextInput/Multiline/RCTUITextView.mm
-index 6e9c384..63aa02d 100644
+index 6e9c384..a860f2b 100644
 --- a/node_modules/react-native/Libraries/Text/TextInput/Multiline/RCTUITextView.mm
 +++ b/node_modules/react-native/Libraries/Text/TextInput/Multiline/RCTUITextView.mm
-@@ -34,6 +34,15 @@ static UIColor *defaultPlaceholderColor(void)
+@@ -34,6 +34,16 @@ static UIColor *defaultPlaceholderColor(void)
    return [UIColor placeholderTextColor];
  }
  
 +// QNet (MPLAT-R3-01): the recovery-phrase field (testID "qnet-seed-input", which React Native sets as this view's
 +// accessibilityIdentifier) keeps Paste and selection only. Nothing that exports its text is offered (Copy, Cut,
-+// Share, Look Up, Translate and the rest of the edit menu), and a paste takes the phrase off the pasteboard as soon
-+// as it has landed.
++// Share, Look Up, Translate and the rest of the edit menu). The pasteboard is not cleared here: since iOS 16 a paste
++// reads it asynchronously, so clearing it at once lost the text; the screen clears it once the phrase has landed
++// (WalletScreen onSeedPhraseChange).
 +static BOOL RCTQNetIsSeedField(UIView *view)
 +{
 +  return [view.accessibilityIdentifier isEqualToString:@"qnet-seed-input"];
@@ -88,15 +19,10 @@ index 6e9c384..63aa02d 100644
  - (instancetype)initWithFrame:(CGRect)frame
  {
    if (self = [super initWithFrame:frame]) {
-@@ -210,6 +219,25 @@ static UIColor *defaultPlaceholderColor(void)
- {
-   _textWasPasted = YES;
+@@ -212,6 +222,22 @@ static UIColor *defaultPlaceholderColor(void)
    [super paste:sender];
-+  if (RCTQNetIsSeedField(self)) {
-+    [[UIPasteboard generalPasteboard] setItems:@[] options:@{}];
-+  }
-+}
-+
+ }
+ 
 +- (void)copy:(id)sender
 +{
 +  if (RCTQNetIsSeedField(self)) {
@@ -111,10 +37,12 @@ index 6e9c384..63aa02d 100644
 +    return;
 +  }
 +  [super cut:sender];
- }
- 
++}
++
  // Turn off scroll animation to fix flaky scrolling.
-@@ -301,6 +329,11 @@ static UIColor *defaultPlaceholderColor(void)
+ // This is only necessary for iOS < 14.
+ #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED < 140000
+@@ -301,6 +327,11 @@ static UIColor *defaultPlaceholderColor(void)
      return NO;
    }
  
@@ -126,7 +54,7 @@ index 6e9c384..63aa02d 100644
    return [super canPerformAction:action withSender:sender];
  }
  
-@@ -315,6 +348,11 @@ static UIColor *defaultPlaceholderColor(void)
+@@ -315,6 +346,11 @@ static UIColor *defaultPlaceholderColor(void)
  #endif
  
    [super buildMenuWithBuilder:builder];
@@ -138,3 +66,71 @@ index 6e9c384..63aa02d 100644
  }
  
  #pragma mark - Dictation
+diff --git a/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm b/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm
+index 377f41e..a91266a 100644
+--- a/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm
++++ b/node_modules/react-native/Libraries/Text/TextInput/Singleline/RCTUITextField.mm
+@@ -24,6 +24,16 @@
+ // This variable is unused.
+ @synthesize dataDetectorTypes;
+ 
++// QNet (MPLAT-R3-01): the recovery-phrase field (testID "qnet-seed-input", which React Native sets as this view's
++// accessibilityIdentifier) keeps Paste and selection only. Nothing that exports its text is offered (Copy, Cut,
++// Share, Look Up, Translate and the rest of the edit menu). The pasteboard is not cleared here: since iOS 16 a paste
++// reads it asynchronously, so clearing it at once lost the text; the screen clears it once the phrase has landed
++// (WalletScreen onSeedPhraseChange).
++static BOOL RCTQNetIsSeedField(UIView *view)
++{
++  return [view.accessibilityIdentifier isEqualToString:@"qnet-seed-input"];
++}
++
+ - (instancetype)initWithFrame:(CGRect)frame
+ {
+   if (self = [super initWithFrame:frame]) {
+@@ -180,6 +190,11 @@
+     return NO;
+   }
+ 
++  if (RCTQNetIsSeedField(self) && action != @selector(paste:) && action != @selector(select:) &&
++      action != @selector(selectAll:) && action != @selector(delete:)) {
++    return NO;
++  }
++
+   return [super canPerformAction:action withSender:sender];
+ }
+ 
+@@ -194,6 +209,11 @@
+ #endif
+ 
+   [super buildMenuWithBuilder:builder];
++
++  if (RCTQNetIsSeedField(self)) {
++    [builder removeMenuForIdentifier:UIMenuShare];
++    [builder removeMenuForIdentifier:UIMenuLookup];
++  }
+ }
+ 
+ #pragma mark - Dictation
+@@ -266,6 +286,22 @@
+   [super paste:sender];
+ }
+ 
++- (void)copy:(id)sender
++{
++  if (RCTQNetIsSeedField(self)) {
++    return;
++  }
++  [super copy:sender];
++}
++
++- (void)cut:(id)sender
++{
++  if (RCTQNetIsSeedField(self)) {
++    return;
++  }
++  [super cut:sender];
++}
++
+ #pragma mark - Layout
+ 
+ - (CGSize)contentSize

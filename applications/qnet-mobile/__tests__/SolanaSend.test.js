@@ -577,7 +577,9 @@ describe('the Send screen itself, against the network in memory', () => {
   });
 
   it('the amount field takes digits and one point, no more decimals than the token has', () => {
-    expect(cleanAmountInput('1.2.3', 9)).toBe('1.23');
+    // A second point is no decimal place: the field keeps what it had (utils/sendAmount amountInput).
+    expect(cleanAmountInput('1.2.3', 9, '1.2')).toBe('1.2');
+    expect(cleanAmountInput('1,000.50', 9, '')).toBe('1000.50');
     expect(cleanAmountInput('abc12,3456789', 6)).toBe('12.345678');
     expect(cleanAmountInput('', 6)).toBe('');
     expect(cleanAmountInput('.5', 9)).toBe('0.5'); // a leading point gets its zero, as the QNet form reads it

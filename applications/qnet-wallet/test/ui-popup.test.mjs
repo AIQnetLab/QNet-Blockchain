@@ -323,7 +323,9 @@ describe('popup: forgot password (Reset wallet)', () => {
     assert.deepEqual(page.callsOf('vault.resetBegin').map((c) => c.params), [{}]);
     assert.deepEqual(page.callsOf('vault.reset').map((c) => c.params), [{ token: TOKEN, confirm: 'ERASE' }], 'no password, no phrase');
     assert.equal(page.callsOf('vault.unlock').length, 0);
-    assert.deepEqual(atReload, [''], 'the clipboard is emptied before the one reload, as after Delete wallet (R16)');
+    // nothing the popup copied is waiting: what is on the clipboard (maybe the phrase to import next) stays
+    assert.deepEqual(atReload, ['something copied earlier']);
+    assert.deepEqual(page.clipboard.writes, []);
     assert.equal(page.location.reloads, 1);
     // the reloaded popup: no wallet in this browser, its two buttons
     page.close();
@@ -439,7 +441,7 @@ describe('popup: lock, wipe and events', () => {
     assert.equal(page.location.reloads, 0);
   });
 
-  it("a 'wiped' event clears the page storage, empties the clipboard and reloads once", async () => {
+  it("a 'wiped' event clears the page storage, leaves a clipboard this page did not fill alone and reloads once", async () => {
     await openWallet({}, { localStorage: { anything: '1' } });
     page.sessionStorage.setItem('s', '1');
     page.emit('wiped');
@@ -447,7 +449,21 @@ describe('popup: lock, wipe and events', () => {
     assert.equal(page.sessionStorage.length, 0);
     page.emit('wiped');
     await page.settle();
-    assert.deepEqual(page.clipboard.writes, [''], 'a wipe from another view empties the clipboard too (R16)');
+    assert.deepEqual(page.clipboard.writes, [], 'nothing this page copied was waiting to be cleared');
+    assert.equal(page.location.reloads, 1);
+  });
+
+  it("a 'wiped' event takes a copy this page made and has yet to clear off the clipboard (R16)", async () => {
+    await openWallet({
+      'activation.status': () => ({ activation: activationRecord('light'), pending: null, busy: false }),
+      'activation.copy': () => ({ code: CODE }),
+    });
+    await page.click('[data-tab="settings"]');
+    await page.click('[data-action="copy-code"]');
+    assert.equal(page.clipboard.text, CODE);
+    page.emit('wiped');
+    await page.settle();
+    assert.equal(page.clipboard.text, '');
     assert.equal(page.location.reloads, 1);
   });
 
@@ -1990,8 +2006,34 @@ describe('popup: settings', () => {
     assert.equal(wipe.disabled, false);
     await page.click('[data-action="confirm-delete"]');
     assert.deepEqual(wiped, { password: PASSWORD, confirm: 'DELETE' });
-    assert.deepEqual(page.clipboard.writes, [''], 'clipboard emptied (R16)');
+    assert.deepEqual(page.clipboard.writes, [], 'nothing this page copied was waiting: the clipboard is left alone');
     assert.equal(page.localStorage.length, 0);
+    assert.equal(page.location.reloads, 1);
+  });
+
+  it('a wrong password empties only the password field, the typed DELETE stays, and Enter deletes', async () => {
+    const asked = [];
+    await openWallet({
+      'vault.wipe': (params) => {
+        asked.push(params);
+        if (params.password !== PASSWORD) throw Object.assign(new Error('bad'), { code: 'BAD_PASSWORD' });
+        return { wiped: true };
+      },
+    });
+    await page.click('[data-tab="settings"]');
+    await page.click('[data-action="delete-wallet"]');
+    type(page.$('input[name="confirm"]'), 'DELETE');
+    type(page.$('input[name="password"]'), 'wrong password');
+    await page.click('[data-action="confirm-delete"]');
+    await page.settle();
+    assert.equal(page.$('input[name="confirm"]').value, 'DELETE');
+    assert.equal(page.$('input[name="password"]').value, '');
+    assert.equal(page.$('[data-action="confirm-delete"]').disabled, true);
+    assert.equal(page.location.reloads, 0);
+    type(page.$('input[name="password"]'), PASSWORD);
+    fire(page.$('input[name="password"]'), 'keydown', { key: 'Enter' });
+    await page.settle();
+    assert.deepEqual(asked, [{ password: 'wrong password', confirm: 'DELETE' }, { password: PASSWORD, confirm: 'DELETE' }]);
     assert.equal(page.location.reloads, 1);
   });
 
@@ -2039,7 +2081,7 @@ describe('popup: settings', () => {
     await page.click('[data-action="revoke"]');
     assert.deepEqual(page.callsOf('sites.revoke').map((entry) => entry.params), [{ origin: 'https://aiqnet.io' }]);
     assert.equal(page.$$('[data-action="revoke"]').length, 1);
-    assert.match(page.text(), /Version3\.1\.2/);
+    assert.match(page.text(), /Version3\.1\.3/);
   });
 
   it('checks a new password locally, then changes it with the current one', async () => {

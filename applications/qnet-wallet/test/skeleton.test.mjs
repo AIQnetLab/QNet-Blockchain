@@ -47,9 +47,9 @@ const ORIGINS = [...config.QNET.NODES, config.QNET.EXPLORER_API, ...config.SOLAN
 const DAPP_MATCHES = ['https://aiqnet.io/*', 'https://games.aiqnet.io/*'];
 
 describe('skeleton: store manifest', () => {
-  it('is MV3 3.1.2 on Chrome 111+ with the module worker and the popup', () => {
+  it('is MV3 3.1.3 on Chrome 111+ with the module worker and the popup', () => {
     assert.equal(MANIFEST.manifest_version, 3);
-    assert.equal(MANIFEST.version, '3.1.2');
+    assert.equal(MANIFEST.version, '3.1.3');
     assert.equal(MANIFEST.version, PACKAGE.version);
     assert.equal(MANIFEST.version, config.WALLET_VERSION);
     assert.equal(MANIFEST.minimum_chrome_version, '111');
@@ -292,7 +292,8 @@ const EXPORTS = {
     'uiPageOf', 'validateParams'],
   'background/session.js': ['backoffDelayMs', 'cachedViews', 'checkBackoff', 'getAddresses', 'getBackoffUntil', 'getSettings', 'initSession',
     'isAutoLockChoice', 'isUnlocked', 'lock', 'lockNow', 'onAlarm', 'onIdleState', 'onLockChange', 'recordPasswordFailure',
-    'recordPasswordSuccess', 'rememberView', 'replaceVaultKey', 'requireUnlocked', 'setSettings', 'startSession', 'touch', 'withVaultKey'],
+    'recordPasswordSuccess', 'rememberView', 'replaceVaultKey', 'requireUnlocked', 'setSettings', 'startSession', 'storedLanguage', 'touch',
+    'withVaultKey'],
   'background/solana.js': ['blockHeight', 'buildBurnTransaction', 'burnInstruction', 'compileLegacyMessage',
     'createAtaIdempotentInstruction', 'findWalletBurns', 'getBalances', 'getHistory', 'historyItem', 'memoInstruction', 'quote', 'rpc', 'send',
     'sendAndConfirm', 'serializeTransaction', 'signatureStatus', 'simulate', 'systemTransferInstruction',
@@ -370,7 +371,7 @@ describe('skeleton: dev overlay', () => {
       await rm(path.join(target, 'ui/i18n/ar.js'));
       await writeFile(path.join(target, 'ui/extra.js'), '');
       const manifestPath = path.join(target, 'manifest.json');
-      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.2"', '"version": "3.0.9"'));
+      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.3"', '"version": "3.0.9"'));
       const configPath = path.join(target, 'background/config.js');
       await writeFile(configPath, (await readFile(configPath, 'utf8')).replace('DEV_BUILD = true', 'DEV_BUILD = false'));
       assert.deepEqual((await checkDevBuild(DIST, target)).sort(), [

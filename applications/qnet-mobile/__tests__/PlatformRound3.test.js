@@ -34,7 +34,9 @@ describe('MPLAT-R3-01: the phrase field exports nothing, and a paste leaves the 
     expect(rn).toMatch(/return \[view\.accessibilityIdentifier isEqualToString:@"qnet-seed-input"\];/);
     expect(rn).toMatch(/if \(RCTQNetIsSeedField\(self\) && action != @selector\(paste:\) && action != @selector\(select:\) &&/);
     expect(rn).toMatch(/- \(void\)copy:\(id\)sender\n\+\{\n\+  if \(RCTQNetIsSeedField\(self\)\) \{\n\+    return;/);
-    expect(rn).toMatch(/\[\[UIPasteboard generalPasteboard\] setItems:@\[\] options:@\{\}\];/);
+    // No clearing inside paste: since iOS 16 the paste reads the pasteboard asynchronously, and clearing it at once
+    // lost the text; the screen clears it once the phrase has landed (onSeedPhraseChange).
+    expect(rn).not.toMatch(/setItems:@\[\] options:@\{\}/);
     expect(rn).toMatch(/\[builder removeMenuForIdentifier:UIMenuShare\];/);
     // Android: the app's own module finds the field by that nativeID.
     const kotlin = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
@@ -51,9 +53,71 @@ describe('MPLAT-R3-01: the phrase field exports nothing, and a paste leaves the 
   it('the import screen uses them: the guard, the change count, the paste signal and the exit rule', () => {
     expect(screen).toMatch(/onLayout=\{onSeedFieldShown\}/);
     expect(screen).toMatch(/const onSeedFieldShown = \(\) => \{\s*guardSeedField\(true\);/);
-    expect(screen).toMatch(/if \(looksPasted\(prev, text\)\) \{\s*seedPastedRef\.current = true;\s*clearPastedPhrase\(text\);/);
-    expect(screen).toMatch(/if \(Platform\.OS === 'ios'\) \{\s*await clearPasteboardIfChanged\(seedBoardAtRef\.current\);/);
+    expect(screen).toMatch(/if \(looksPasted\(prev, text\)\) \{\s*seedPastedRef\.current = true;\s*clearPastedPhrase\(\);/);
+    expect(screen).toMatch(/if \(Platform\.OS === 'ios' && !leaving && seedBoardAtRef\.current !== null\) \{\s*await clearPasteboardIfChanged\(seedBoardAtRef\.current\);/);
     expect(screen).not.toMatch(/words\(text\) - words\(seedPhrase\) >= 11/);
+  });
+
+  it('a detected paste empties the clipboard natively, and nothing reads the clip to compare', () => {
+    const clear = screen.slice(screen.indexOf('const clearPastedPhrase = async'), screen.indexOf('const onSeedFieldShown'));
+    expect(clear).toMatch(/if \(pasted\) \{\s*await clearClipboard\(\);\s*return;/);
+    // Android 12+ announces every clipboard read; an empty string written through the plain module brings Android 13's
+    // 'Copied' overlay and leaves an empty item on iOS.
+    expect(clear).not.toMatch(/Clipboard\.(getString|setString)/);
+    expect(screen).not.toMatch(/Clipboard\.getString/);
+    const kotlin = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
+    expect(kotlin).toMatch(/@ReactMethod\s*fun clearClipboard\(promise: Promise\) \{\s*main\.post \{\s*clearClipboardNow\(\)\s*promise\.resolve\(null\)/);
+    expect(kotlin).toMatch(/if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.P\) cm\.clearPrimaryClip\(\)\s*else cm\.setPrimaryClip\(ClipData\.newPlainText\("", ""\)\)/);
+  });
+
+  it('leaving the app empties the field but does not clear what another app copied meanwhile (iOS)', () => {
+    expect(screen).toMatch(/if \(next === 'background'\) \{[\s\S]{0,400}forgetImportPhrase\(\{ leaving: true \}\);/);
+    expect(screen).toMatch(/const forgetImportPhrase = \(\{ leaving = false \} = \{\}\) => \{\s*setSeedPhrase\(''\);\s*clearPastedPhrase\(\{ leaving \}\);/);
+    // Back, the end of the import and the lock still run the change-count clear.
+    const lock = screen.slice(screen.indexOf('const lockSession = '), screen.indexOf('const lockSession = ') + 1500);
+    expect(lock).toMatch(/forgetImportPhrase\(\);/);
+    expect(screen).toMatch(/await clearPastedPhrase\(\);\s*resetWalletScopedState/);
+    expect(screen).toMatch(/if \(!done\) clearPastedPhrase\(\);/);
+  });
+});
+
+describe('clearClipboard: the clipboard after a paste into the phrase field', () => {
+  const { NativeModules, Platform } = require('react-native');
+  const OS = Platform.OS;
+  afterEach(() => { Platform.OS = OS; delete NativeModules.QNetSecurity; });
+  const load = (native) => {
+    NativeModules.QNetSecurity = native;
+    let DS;
+    jest.isolateModules(() => { DS = require('../src/services/DeviceSecurity'); });
+    return DS;
+  };
+  const Clipboard = require('@react-native-clipboard/clipboard').default;
+
+  it('iOS removes the pasteboard items natively (an unknown change count clears any text)', async () => {
+    Platform.OS = 'ios';
+    const native = { clearPasteboardIfChanged: jest.fn(async () => true), clearClipboard: jest.fn() };
+    Clipboard.setString.mockClear();
+    await load(native).clearClipboard();
+    expect(native.clearPasteboardIfChanged).toHaveBeenCalledWith(-1);
+    expect(native.clearClipboard).not.toHaveBeenCalled();
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+  });
+
+  it('Android clears the clip natively and never writes an empty string', async () => {
+    Platform.OS = 'android';
+    const native = { clearPasteboardIfChanged: jest.fn(), clearClipboard: jest.fn(async () => null) };
+    Clipboard.setString.mockClear();
+    await load(native).clearClipboard();
+    expect(native.clearClipboard).toHaveBeenCalledTimes(1);
+    expect(native.clearPasteboardIfChanged).not.toHaveBeenCalled();
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+  });
+
+  it('without the native module the plain clipboard is emptied', async () => {
+    Platform.OS = 'android';
+    Clipboard.setString.mockClear();
+    await load(undefined).clearClipboard();
+    expect(Clipboard.setString).toHaveBeenCalledWith('');
   });
 });
 
@@ -70,8 +134,11 @@ describe('MPLAT-R3-02: the integrity check runs when a phrase is shown or typed'
     // Export of the phrase and of the private keys run one reveal (revealSecret), which checks first.
     expect(screen).toMatch(/const exportSeedPhrase = \(readersAcknowledged = false\) => revealSecret\('phrase', readersAcknowledged\);/);
     expect(screen).toMatch(/const exportPrivateKey = \(readersAcknowledged = false\) => revealSecret\('key', readersAcknowledged\);/);
-    const exportFn = screen.slice(screen.indexOf('const revealSecret = async'), screen.indexOf('const handleChangePassword'));
-    expect(exportFn).toMatch(/^const revealSecret = async \(kind, readersAcknowledged = false\) => \{\s*\/\/[^\n]*\n\s*const integrity = await deviceIntegrity\(\);[\s\S]{0,120}if \(integrity\.compromised\) \{/);
+    // revealSecret only keeps a second tap out while the check runs; the reveal itself checks first.
+    const once = screen.slice(screen.indexOf('const revealSecret = async'), screen.indexOf('const refuseReveal'));
+    expect(once).toMatch(/if \(revealBusyRef\.current\) return;\s*revealBusyRef\.current = true;\s*setRevealBusy\(true\);\s*try \{\s*await revealSecretNow\(kind, readersAcknowledged\);/);
+    const exportFn = screen.slice(screen.indexOf('const revealSecretNow = async'), screen.indexOf('const handleChangePassword'));
+    expect(exportFn).toMatch(/^const revealSecretNow = async \(kind, readersAcknowledged\) => \{\s*\/\/[^\n]*\n\s*const integrity = await deviceIntegrity\(\);[\s\S]{0,120}if \(integrity\.compromised\) \{/);
     const en = require('../src/i18n/translations').default.en;
     expect(en.set_rooted_warning).not.toMatch(/the recovery phrase is not shown here/);
   });

@@ -441,6 +441,16 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    // A paste into the field that the screen saw land: the clip goes without being read, so Android shows neither a
+    // paste notice nor the 'Copied' overlay that writing an empty clip brings.
+    @ReactMethod
+    fun clearClipboard(promise: Promise) {
+        main.post {
+            clearClipboardNow()
+            promise.resolve(null)
+        }
+    }
+
     private fun words(s: String): List<String> = s.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
 
     // A clip whose text runs inside the field's (a word, part of one, or several) came from the field: cleared.
@@ -1181,9 +1191,10 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
      * A fresh check of whoever holds the device, as iOS's LAContext check: { ok, code }. Only a wallet under the screen lock
      * asks it (a password wallet confirms with its password): the prompt is bound to the screen-lock key and a random probe
      * must come back through its private half. Without that key (an answered listing leaves it out), or with one the
-     * removed screen lock invalidated, the secret it sealed is gone and the answer is 'not_set': no plain prompt stands in
-     * for it. 'not_set' also without a secure lock screen. A Keystore that did not answer is 'failed', never 'not_set'
-     * (MA-R2-01): Delete and Erase take 'not_set' without a prompt.
+     * removed screen lock invalidated or the Keystore holds corrupted (the codes devAuthUsable calls gone), the secret it
+     * sealed is gone and the answer is 'not_set': no plain prompt stands in for it. 'not_set' also without a secure lock
+     * screen. A Keystore that did not answer is 'failed', never 'not_set' (MA-R2-01): Delete and Erase take 'not_set'
+     * without a prompt.
      */
     @ReactMethod
     fun authenticate(reason: String, promise: Promise) = authenticateWith(reason, "", "", promise)
@@ -1215,8 +1226,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
                 answer(same, if (same) "ok" else "failed")
             }
         } catch (t: Throwable) {
-            val code = errorCode(t)
-            answer(false, if (code == "KEY_INVALIDATED" || code == "KEY_MISSING") "not_set" else "failed")
+            answer(false, if (errorCode(t) in DEV_AUTH_GONE_CODES) "not_set" else "failed")
         }
     }
 

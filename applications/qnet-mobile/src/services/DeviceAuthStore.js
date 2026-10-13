@@ -1,13 +1,14 @@
 /**
  * Where a wallet that opens with the device's screen lock keeps its vault secret, one API on both platforms:
- * - iOS: a Keychain item behind Face ID / Touch ID or the device passcode (removed by iOS with the passcode).
+ * - iOS: a Keychain item behind Face ID / Touch ID or the device passcode, of the class iOS deletes with the passcode.
  * - Android (11 and later): a blob in app storage, sealed for an RSA key pair in the Keystore whose private half needs
  *   a strong biometric or the device credential for every use (a CryptoObject-bound system prompt); sealing uses the
  *   public half and asks nothing. The key dies with the screen lock.
  * Writing never prompts; reading prompts once. `available()` says whether this device can hold such a secret now: a
  * device without a screen lock, or an older one, uses a wallet password instead. Removing the screen lock deletes the
  * secret for good on both platforms, even when a screen lock is set again later: `state()` tells so without a prompt,
- * and a read says `gone`.
+ * and a read says `gone`. An iOS item written before it had that class stays in the Keychain without a passcode and
+ * cannot open; while the device has no passcode both answer `gone` for it too.
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NativeModules, Platform } from 'react-native';
@@ -28,10 +29,18 @@ const IOS_CANCEL_CODES = new Set(['-128', '-2', '-4', '-9']);
 // push or a background fetch) or of a locked device. Nothing failed: the same read works once the app is in front.
 const IOS_NOT_NOW_CODE = '-25308';
 
+// User presence: Face ID / Touch ID or the device passcode, and biometry need not be enrolled. A biometry flag
+// (BIOMETRY_ANY_OR_DEVICE_PASSCODE) makes iOS refuse the item outright on a device with only a passcode. Only an item
+// accessible when a passcode is set is deleted by iOS when the passcode is turned off.
 const iosItem = () => ({
-  accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_ANY_OR_DEVICE_PASSCODE,
-  accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  accessControl: Keychain.ACCESS_CONTROL.USER_PRESENCE,
+  accessible: Keychain.ACCESSIBLE.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
 });
+
+// iOS: the device has no passcode now, so no item behind it can open again. An unanswered check proves nothing.
+async function iosPasscodeGone() {
+  try { return (await Keychain.isPasscodeAuthAvailable()) === false; } catch (_) { return false; }
+}
 
 /**
  * Whether the device can hold a vault secret behind its screen lock right now: 'yes', 'no' (no screen lock, an older
@@ -92,6 +101,7 @@ export async function read(services, title) {
         if (IOS_CANCEL_CODES.has(code) || /cancel/i.test(String((e && e.message) || ''))) return { ok: false, reason: 'cancelled' };
         // A read refused because the app is not in front says nothing about the item (MA-R2-02).
         if (code === IOS_NOT_NOW_CODE) return { ok: false, reason: 'failed', code, notNow: true };
+        if (await iosPasscodeGone()) return { ok: false, reason: 'gone' };
         // An item that vanished under the read is gone; one still there failed for now.
         let still = true;
         try { still = !!(await Keychain.hasGenericPassword({ service })); } catch (_) { still = true; }
@@ -125,7 +135,7 @@ export async function state(services) {
   for (const service of services) {
     try {
       if (Platform.OS === 'ios') {
-        if (await Keychain.hasGenericPassword({ service })) return 'present';
+        if (await Keychain.hasGenericPassword({ service })) return (await iosPasscodeGone()) ? 'gone' : 'present';
         continue;
       }
       const blob = await AsyncStorage.getItem(blobKey(service));

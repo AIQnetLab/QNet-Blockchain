@@ -79,7 +79,7 @@ import {
   availability as deviceAuthStoreAvailability, write as writeDeviceAuth, read as readDeviceAuth, remove as removeDeviceAuth,
   state as deviceAuthStoreState,
 } from '../services/DeviceAuthStore';
-import { forgetKeys as forgetNodeDeviceKeys } from '../services/NodeDeviceKey';
+import { forgetKeys as forgetNodeDeviceKeys, NODE_DEVICE_KEY_SERVICE } from '../services/NodeDeviceKey';
 import { createPasswordLimiter } from '../utils/passwordLimiter';
 import logger from '../utils/logger';
 import { tr } from '../i18n';
@@ -2635,8 +2635,6 @@ export class WalletManager {
   static VAULT_BACKUP_KEY = 'qnet_wallet.bak';
   static MIN_PASSWORD_LENGTH = PASSWORD_MIN_LENGTH;
   static INSTALL_MARKER = 'qnet_install_marker';
-  // What Delete wallet leaves on the device: the display language.
-  static ERASE_ALLOW_LIST = ['qnet_language'];
 
   /**
    * One rule on every device: a wallet opens with the device's screen lock (Face ID, Touch ID, a fingerprint or the
@@ -2652,6 +2650,9 @@ export class WalletManager {
   // lapses, and any read-back through the screen lock that works clears it.
   static DEVICE_AUTH_BROKEN_KEY = 'qnet_device_auth_broken';
   static DEVICE_AUTH_BROKEN_MS = 7 * 24 * 3600_000;
+  // What Delete wallet leaves on the device: the display language, and the mark of a screen lock that could not keep a
+  // new wallet's secret (it lapses by itself), so the next wallet does not meet the same failure again.
+  static ERASE_ALLOW_LIST = ['qnet_language', WalletManager.DEVICE_AUTH_BROKEN_KEY];
   // A wallet under the screen lock whose secret is gone moving to a password (reprotectWithPassword): the password wrap
   // of the vault it started from. A vault stored with another one is the moved one (_settlePasswordMove).
   static PASSWORD_MOVE_KEY = 'qnet_device_auth_to_password';
@@ -3584,16 +3585,18 @@ export class WalletManager {
    * refused for any reason but a missing screen lock are 'retry' (MA-R2-04).
    */
   async _protectNewSecret(secret, prompt) {
-    if (!(await this.canStoreNewWallet())) return 'retry'; // checked just before; storage that cannot be read now
+    // Checked just before; storage that cannot be read now.
+    if (!(await this.canStoreNewWallet())) return WalletManager._retryFor('storage', 'STORAGE');
     const avail = await this._deviceAuthAvailability();
     if (avail === 'no') return 'unavailable';
-    if (avail !== 'yes') return 'retry';
+    if (avail !== 'yes') return WalletManager._retryFor('check', avail);
     try {
       await writeDeviceAuth(WalletManager.DEVICE_AUTH_SERVICE, secret);
     } catch (e) {
       // Refused: the screen lock went meanwhile (the device says so when asked again), or the device failed for now.
       if (e && e.code === 'NOT_SET') return 'unavailable';
-      return (await this._deviceAuthAvailability()) === 'no' ? 'unavailable' : 'retry';
+      if ((await this._deviceAuthAvailability()) === 'no') return 'unavailable';
+      return WalletManager._retryFor('write', e && e.code);
     }
     const back = await readDeviceAuth([WalletManager.DEVICE_AUTH_SERVICE], prompt || tr('auth_device_unlock'));
     const verdict = WalletManager._readBackVerdict(back, (s) => s === secret);
@@ -3603,7 +3606,8 @@ export class WalletManager {
         await this._markDeviceAuthBroken();
         return 'failed';
       }
-      return verdict; // 'cancelled' or 'retry': nothing kept, and the next attempt may use the screen lock again
+      if (verdict === 'retry') return WalletManager._retryFor('read', back && back.code);
+      return verdict; // 'cancelled': nothing kept, and the next attempt may use the screen lock again
     }
     await this._deviceAuthWorks();
     await removeDeviceAuth(WalletManager.DEVICE_AUTH_NEXT_SERVICE).catch(() => {});
@@ -3636,9 +3640,25 @@ export class WalletManager {
     return 'broken';
   }
 
+  // A screen-lock step for a new wallet that failed for now: its stage and the platform's error code (never a secret)
+  // go to the log, so a device whose screen lock keeps failing shows why.
+  static _retryFor(stage, code) {
+    console.warn('[WARN][DEVAUTH] retry stage=' + stage + ' code=' + String(code || 'none'));
+    return 'retry';
+  }
+
   // For DEVICE_AUTH_BROKEN_MS this device counts as one without a usable screen lock: a new wallet gets a password (MA-6).
   async _markDeviceAuthBroken() {
     await AsyncStorage.setItem(WalletManager.DEVICE_AUTH_BROKEN_KEY, String(Date.now())).catch(() => {});
+  }
+
+  /**
+   * The user chose a wallet password over a screen lock that keeps failing for a new wallet (DEVICE_LOCK_RETRY): the
+   * same mark as a screen lock that cannot give a secret back, so the next attempt asks for a password. It lapses after
+   * DEVICE_AUTH_BROKEN_MS, and any read-back through the screen lock that works clears it.
+   */
+  async useWalletPassword() {
+    await this._markDeviceAuthBroken();
   }
 
   // A read-back through the screen lock worked: the path works on this device, whatever an earlier failure marked.
@@ -3653,13 +3673,15 @@ export class WalletManager {
 
   /**
    * A password wallet's biometric unlock (Android): the vault's data key is wrapped by a Keystore key that needs a
-   * strong biometric for every use and dies when one is enrolled. The password itself is never stored.
+   * strong biometric for every use and dies when one is enrolled. The password itself is never stored. { ok: true }, or
+   * { ok: false } with `cancelled` (the prompt was refused), `unavailable` (no biometric key on this device, or a wallet
+   * under the screen lock) or neither (it failed).
    */
   async enableBiometricUnlock(password) {
     try {
-      if (await this.usesDeviceAuth()) return false;
+      if (await this.usesDeviceAuth()) return { ok: false, unavailable: true };
       const bio = biometricSealer({ title: tr('bio_prompt_enable'), subtitle: tr('qnet_wallet'), cancel: tr('bio_use_password') });
-      if (!bio || !(await biometricKeyAvailable())) return false;
+      if (!bio || !(await biometricKeyAvailable())) return { ok: false, unavailable: true };
       let opened = await this._openVault(password);
       if (!opened.dek) opened = await this._openVault(password); // migrated just now: open the new vault
       try {
@@ -3668,8 +3690,10 @@ export class WalletManager {
         opened.dek.fill(0);
       }
       await Keychain.resetGenericPassword({ service: WalletManager.KEYCHAIN_SERVICE }).catch(() => {});
-      return true;
-    } catch { return false; }
+      return { ok: true };
+    } catch (e) {
+      return e && e.code === 'BIO_CANCELLED' ? { ok: false, cancelled: true } : { ok: false };
+    }
   }
 
   // A password wallet's biometric unlock off. A wallet under the screen lock is left as it is: its stored secret is
@@ -4188,12 +4212,23 @@ export class WalletManager {
     await deleteDeviceKeys();
   }
 
+  // Whether a Keychain service is one this app writes: its own names all start with qnet_ (the lockout, the ping keys, the
+  // node's device key) or com.qnetmobile. (the vault secret), and the older builds' biometric item has its fixed name.
+  // On iOS the listing names every generic-password item of the app's Keychain groups, other SDKs' too (an installation
+  // id, a push token): those are not the wallet's to delete.
+  static _ownKeychainService(service) {
+    const name = String(service || '');
+    if (name.startsWith('qnet_') || name.startsWith('com.qnetmobile.')) return true;
+    return [WalletManager.KEYCHAIN_SERVICE, WalletManager.DEVICE_AUTH_SERVICE, WalletManager.DEVICE_AUTH_NEXT_SERVICE,
+      LIMITER_SERVICE, NODE_DEVICE_KEY_SERVICE].includes(name);
+  }
+
   async _wipeKeychain() {
     let services = [];
     // Listing never prompts: an item behind Face ID is skipped here and named explicitly below.
     try { services = (await Keychain.getAllGenericPasswordServices({ skipUIAuth: true })) || []; } catch (_) { services = []; }
-    const all = new Set([...services, WalletManager.KEYCHAIN_SERVICE, WalletManager.DEVICE_AUTH_SERVICE,
-      WalletManager.DEVICE_AUTH_NEXT_SERVICE, LIMITER_SERVICE]);
+    const all = new Set([...services.filter((s) => WalletManager._ownKeychainService(s)), WalletManager.KEYCHAIN_SERVICE,
+      WalletManager.DEVICE_AUTH_SERVICE, WalletManager.DEVICE_AUTH_NEXT_SERVICE, LIMITER_SERVICE, NODE_DEVICE_KEY_SERVICE]);
     for (const service of all) {
       try { await Keychain.resetGenericPassword({ service }); } catch (_) { /* keep going */ }
     }

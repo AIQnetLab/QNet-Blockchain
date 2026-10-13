@@ -19,6 +19,7 @@ import {
   BASE_FEE_LAMPORTS, SOLANA_TOKENS, loadSolanaSends, maxSendable, quoteSolanaSend, recordSolanaSend, solanaSendStatus,
   solanaToken, submitSolanaSend, updateSolanaSend,
 } from '../services/SolanaSend';
+import { amountInput } from '../utils/sendAmount';
 
 const solText = (lamports) => `${fromBaseUnits(BigInt(lamports), SOL_DECIMALS)} SOL`;
 
@@ -141,12 +142,11 @@ export function useSolanaSends(owner, onSettled) {
 }
 
 // Digits and one decimal point, no more decimal places than the token has; a leading point gets its zero (".5" is 0.5).
-export function cleanAmountInput(text, decimals) {
-  let s = String(text || '').replace(/,/g, '.').replace(/[^0-9.]/g, '');
-  if (s.startsWith('.')) s = `0${s}`;
-  const dot = s.indexOf('.');
-  if (dot >= 0) s = `${s.slice(0, dot + 1)}${s.slice(dot + 1).replace(/\./g, '').slice(0, decimals)}`;
-  return s.slice(0, 32);
+// Separators are read by the rule both Send forms share (utils/sendAmount amountInput); a text it refuses gives back
+// `kept`, what the field had.
+export function cleanAmountInput(text, decimals, kept = '') {
+  const s = amountInput(text, decimals);
+  return s === null ? kept : s;
 }
 
 /** The form. `balances`: the figures on the Assets list by symbol (null while unknown). */
@@ -275,7 +275,7 @@ export default function SolanaSendForm({
             placeholderTextColor="#888"
             keyboardType="decimal-pad"
             value={amount}
-            onChangeText={(text) => onAmount(cleanAmountInput(text, token.decimals))}
+            onChangeText={(text) => onAmount(cleanAmountInput(text, token.decimals, amount))}
             maxLength={32}
             testID="solana-send-amount"
           />

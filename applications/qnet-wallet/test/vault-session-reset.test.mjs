@@ -73,10 +73,11 @@ async function assertOldVaultIntact(before) {
   await session.lock('user');
 }
 
-// Everything Delete wallet erases is gone.
+// Everything Delete wallet erases is gone; the interface language the user chose stays (no wallet data).
 async function assertErased() {
   assert.deepEqual(await env.idb.databases(), [], 'the vault database is deleted');
-  assert.deepEqual(env.chrome.storage.local.dump(), {}, "grants, settings and the earlier version's keys are gone");
+  assert.deepEqual(env.chrome.storage.local.dump(), { [STORAGE_KEYS.SETTINGS]: { language: 'en' } },
+    "grants and the earlier version's keys are gone; the chosen language stays");
   assert.deepEqual(Object.keys(env.chrome.storage.session.dump()).filter((key) => key !== STORAGE_KEYS.SELF_TEST), []);
   assert.equal(await session.isUnlocked(), false);
   assert.equal((await send(popup(), 'vault.status', {})).result.exists, false);
@@ -99,6 +100,20 @@ describe('forgot password: reset the wallet', () => {
     assert.equal(await session.getBackoffUntil(), null, 'the erased vault took its failed attempts with it');
     assert.equal(errorCode(await resetWith(token)), 'RESET_EXPIRED', 'the token is spent');
     assert.equal(errorCode(await send(popup(), 'vault.resetBegin', {})), 'NO_VAULT');
+  });
+
+  it('keeps the chosen language only as an exact allowed value: anything else under that key goes too', async () => {
+    for (const stored of [{ language: 'xx' }, { language: 'de', extra: 1 }, 'de']) {
+      await oldWallet();
+      await env.chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: stored });
+      assert.equal((await resetWith(await begin())).ok, true);
+      assert.deepEqual(env.chrome.storage.local.dump(), {}, JSON.stringify(stored));
+    }
+    await oldWallet();
+    await env.chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: { language: 'de' } });
+    assert.equal((await resetWith(await begin())).ok, true);
+    assert.deepEqual(env.chrome.storage.local.dump(), { [STORAGE_KEYS.SETTINGS]: { language: 'de' } });
+    assert.equal((await send(popup(), 'settings.get', {})).result.language, 'de', 'the welcome screen keeps speaking it');
   });
 
   it('refuses an unlocked wallet: its password is known, Delete wallet takes it', async () => {

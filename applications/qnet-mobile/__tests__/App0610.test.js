@@ -204,7 +204,7 @@ describe('Export private key', () => {
       }
     }
     expect(read('src/services/DeviceSecurity.js')).toMatch(/export const SECRET_CLIPBOARD_SECONDS = 60;/);
-    expect(ws).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) setKeyCopied\(which\);/);
+    expect(ws).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) showCopied\(keyCopiedTimerRef, setKeyCopied, which, null\);/);
     // A secret screen while shown; gone on lock, on leaving the app and on back.
     expect(ws).toMatch(/const secretScreen = !!seedReveal \|\| !!keyReveal/);
     const lock = ws.slice(ws.indexOf('const lockSession = () => {'), ws.indexOf('const nextQueuedLink'));

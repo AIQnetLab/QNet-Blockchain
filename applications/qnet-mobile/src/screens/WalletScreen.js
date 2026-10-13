@@ -33,7 +33,7 @@ import { usesReservedName, contractShortId, tokenVisible, tokenLabel } from '../
 import { DeviceKeyError } from '../crypto/Vault';
 import {
   useSecureScreen, useProtectedInteraction, deviceIntegrity, deviceAuthenticate, screenReaderApps, setNativeTexts, bootClock,
-  guardSeedField, pasteboardChangeCount, clearPasteboardIfChanged, copySecret, SECRET_CLIPBOARD_SECONDS,
+  guardSeedField, pasteboardChangeCount, clearPasteboardIfChanged, clearClipboard, copySecret, SECRET_CLIPBOARD_SECONDS,
 } from '../services/DeviceSecurity';
 import { PASSWORD_INPUT_PROPS, SEED_INPUT_PROPS, CONFIRM_INPUT_PROPS, looksPasted } from '../utils/sensitiveInput';
 import QRCode from 'react-native-qrcode-svg';
@@ -85,7 +85,7 @@ import {
   rowsDueToDrop, withListing, checkedCachedRows,
 } from '../utils/txHistory';
 import { TRANSFER_FEE_NANO, TRANSFER_FEE_QNC } from '../config/fees';
-import { amountShare } from '../utils/sendAmount';
+import { amountShare, amountInput } from '../utils/sendAmount';
 import { refusalReason, sendErrorText } from '../utils/txRefusal';
 import { GENESIS_WALLETS, genesisWalletMatches } from '../config/genesisWallets';
 import { parseLink, takeInitialUrl } from '../services/QNetLink';
@@ -466,6 +466,8 @@ const WalletScreen = () => {
   const [exportWhat, setExportWhat] = useState('phrase'); // what that dialog reveals: 'phrase' or 'key'
   const [exportAccount, setExportAccount] = useState('qnet'); // whose private key: 'qnet' or 'solana'
   const [exportPassword, setExportPassword] = useState('');
+  const [revealBusy, setRevealBusy] = useState(false); // the check behind Show is running
+  const revealBusyRef = useRef(false);
   // The revealed private keys ({ qnet, solana }, each { address, key }), in their own overlay like the phrase: a key is
   // on screen only while its box is held, and all of it goes on Done, on lock and on leaving the app.
   const [keyReveal, setKeyReveal] = useState(null);
@@ -722,6 +724,30 @@ const WalletScreen = () => {
   // Asked again after a new wallet's screen lock could not keep its secret: the next attempt uses a password.
   const refreshDeviceAuthAvail = () => {
     walletManager.deviceAuthAvailable().then((v) => setDeviceAuthAvail(!!v), () => setDeviceAuthAvail(false));
+  };
+
+  // A new wallet's screen lock failed for now (DEVICE_LOCK_RETRY): the same button asks again with the screen lock, or
+  // the wallet uses a password instead. That choice marks the device as one without a usable screen lock (for new
+  // wallets, until the mark lapses) and the password step appears; `onPassword` runs after it. From the second failure
+  // in a row on the same screen, the password is offered as the question itself.
+  const deviceLockRetriesRef = useRef(0);
+  useEffect(() => { deviceLockRetriesRef.current = 0; }, [showCreateOptions]);
+  const offerPasswordAfterRetry = (onPassword) => {
+    deviceLockRetriesRef.current += 1;
+    const usePassword = {
+      text: t('bio_use_password'),
+      onPress: async () => {
+        deviceLockRetriesRef.current = 0;
+        await walletManager.useWalletPassword();
+        refreshDeviceAuthAvail();
+        if (onPassword) onPassword();
+      },
+    };
+    if (deviceLockRetriesRef.current >= 2) {
+      showAlert(t('device_lock_title'), t('device_lock_retry_offer'), [{ text: t('cancel'), style: 'cancel' }, usePassword]);
+    } else {
+      showAlert(t('error'), t('device_unlock_unavailable'), [{ text: t('common_ok'), style: 'cancel' }, usePassword]);
+    }
   };
 
   useEffect(() => {
@@ -1763,31 +1789,17 @@ const WalletScreen = () => {
   ]);
 
 
-  // v2.101: Validate amount input - international standard (dot separator, max 6 decimals)
+  // The QNet recipient, pasted or typed, is kept without surrounding spaces, so the review, the own-address and
+  // known-recipient checks, the pending record and History all see the address that is signed.
+  const onRecipientChange = (text) => setSendAddress(String(text).trim());
+
+  // The amount as typed or pasted (utils/sendAmount amountInput, the Solana form's rule too): a dot as the decimal point,
+  // at most six places (the chain takes nine), thousands separators only where they group by three; a text that rule
+  // refuses leaves the field as it was. A leading zero goes unless a point follows it.
   const validateAmountInput = (text) => {
-    // Replace comma with dot (for locales that use comma)
-    let normalized = text.replace(',', '.');
-    
-    // Remove any non-numeric characters except dot
-    normalized = normalized.replace(/[^\d.]/g, '');
-    
-    // Ensure only one decimal point
-    const parts = normalized.split('.');
-    if (parts.length > 2) {
-      normalized = parts[0] + '.' + parts.slice(1).join('');
-    }
-    
-    // Limit decimal places (6 for display, blockchain uses 9 internally)
-    if (parts.length === 2 && parts[1].length > 6) {
-      normalized = parts[0] + '.' + parts[1].substring(0, 6);
-    }
-    
-    // Prevent leading zeros (except for "0." pattern)
-    if (normalized.length > 1 && normalized[0] === '0' && normalized[1] !== '.') {
-      normalized = normalized.substring(1);
-    }
-    
-    setSendAmount(normalized);
+    const normalized = amountInput(text, 6);
+    if (normalized === null) return;
+    setSendAmount(normalized.length > 1 && normalized[0] === '0' && normalized[1] !== '.' ? normalized.substring(1) : normalized);
   };
   
   // Set amount as percentage of balance (utils/sendAmount, L-9): floored, with no more decimals than the token takes
@@ -2718,6 +2730,8 @@ const WalletScreen = () => {
       if (auth.ok && foreign()) return false;
       if (auth.ok) return true;
       if (auth.code === 'not_set') deviceSecretGone();
+      // A prompt that failed (not one the user cancelled) says so: a confirmation never ends in nothing.
+      else if (auth.code !== 'cancelled') showAlert(t('error'), t('device_unlock_unavailable'));
       return false;
     }
     // A password wallet (MPLAT-R4-01): the apps that can read the screen and act in other apps are named every time, on
@@ -2950,7 +2964,7 @@ const WalletScreen = () => {
         bootClock().then((c) => { mark.mono = c.mono; }).catch(() => {});
         setSeedReveal(null);
         closeKeyReveal();
-        forgetImportPhrase();
+        forgetImportPhrase({ leaving: true });
       } else if (next === 'inactive') {
         setSeedReveal(null);
         closeKeyReveal();
@@ -3471,15 +3485,18 @@ const WalletScreen = () => {
           setLoading(false);
           // A refused prompt keeps the screen as it is: Import asks again.
           if (e.code === 'DEVICE_LOCK_CANCELLED') return;
-          // A prompt that failed this time: the screen stays, and Import asks again with the screen lock (MA2-02).
+          // A prompt that failed this time: the screen stays, and Import asks again with the screen lock (MA2-02), or
+          // the password step appears.
           if (e.code === 'DEVICE_LOCK_RETRY') {
-            showAlert(t('error'), t('device_unlock_unavailable'));
+            offerPasswordAfterRetry();
             return;
           }
+          deviceLockRetriesRef.current = 0;
           refreshDeviceAuthAvail();
           showAlert(t('device_lock_title'), t('device_lock_body'));
           return;
         }
+        deviceLockRetriesRef.current = 0;
         setBiometricEnabled(true);
       } else {
         session = await walletManager.storeWallet(imported, password);
@@ -3488,7 +3505,7 @@ const WalletScreen = () => {
       await teardownLightNodeIfForeign([
         imported.qnetAddress, imported.publicKey, walletManager.generateQNetAddressFromSolana(imported.publicKey),
       ]);
-      await clearPastedPhrase(seedToImport);
+      await clearPastedPhrase();
 
       resetWalletScopedState(imported.qnetAddress);
       setSeedPhrase('');
@@ -3519,32 +3536,30 @@ const WalletScreen = () => {
     try {
       done = (await importWalletSteps()) === true;
     } finally {
-      if (!done) clearPastedPhrase(seedPhraseRef.current);
+      if (!done) clearPastedPhrase();
     }
   };
 
   // A recovery phrase must not stay on the clipboard once the import is over, whichever way it ends (MPLAT-R2-03,
-  // MPLAT-R3-01). The field itself offers no Copy, Cut or Share, and a menu Paste into it clears the clipboard
-  // natively as soon as the words land. Here: text that arrived in one change of two or more words (seedPastedRef:
-  // a paste or a keyboard's clipboard chip) means the clipboard holds it, cleared on both platforms before the mark
-  // is forgotten (in the background Android no longer lets the app read the clip to compare). Otherwise iOS clears
-  // anything copied since the phrase field appeared (the pasteboard's change count, so it is never read and no paste
-  // prompt appears), and Android compares the clip with the phrase while it still can.
-  const clearPastedPhrase = async (phrase) => {
+  // MPLAT-R3-01). The field itself offers no Copy, Cut or Share. Here: text that arrived in one change of two or more
+  // words (seedPastedRef: a paste or a keyboard's clipboard chip) means the clipboard holds it, emptied natively on
+  // both platforms without reading it (clearClipboard). Otherwise iOS clears anything copied since the phrase field
+  // appeared (the pasteboard's change count, so it is never read and no paste prompt appears) when the import ends:
+  // Back, the import done or failed, the lock. Not when the app only goes to the background (`leaving`): a copy made in
+  // another app meanwhile is not the phrase. Android never reads the clip to compare (that shows a paste notice).
+  const clearPastedPhrase = async ({ leaving = false } = {}) => {
     const pasted = seedPastedRef.current;
     seedPastedRef.current = false;
     try {
       if (pasted) {
-        Clipboard.setString('');
+        await clearClipboard();
         return;
       }
-      if (Platform.OS === 'ios') {
+      // Only while the import's phrase field was on screen: before it nothing reached that field, and a phrase
+      // copied with its own Copy at creation stays for the app it is being pasted into (it expires by itself).
+      if (Platform.OS === 'ios' && !leaving && seedBoardAtRef.current !== null) {
         await clearPasteboardIfChanged(seedBoardAtRef.current);
-        return;
       }
-      if (!phrase) return;
-      const norm = (s) => String(s || '').trim().split(/\s+/).join(' ');
-      if (norm(await Clipboard.getString()) === norm(phrase)) Clipboard.setString('');
     } catch (_) { /* nothing to clear */ }
   };
 
@@ -3563,7 +3578,7 @@ const WalletScreen = () => {
     seedPhraseRef.current = text;
     if (looksPasted(prev, text)) {
       seedPastedRef.current = true;
-      clearPastedPhrase(text);
+      clearPastedPhrase();
     }
     setSeedPhrase(text);
   };
@@ -3577,12 +3592,11 @@ const WalletScreen = () => {
     return undefined;
   }, [seedFieldShown]);
 
-  // The phrase typed or pasted for import leaves the screen: the app goes to the background, the wallet locks,
-  // Back is pressed. The field empties and a pasted phrase takes the clipboard with it.
-  const forgetImportPhrase = () => {
-    const phrase = seedPhraseRef.current;
+  // The phrase typed or pasted for import leaves the screen: the app goes to the background (`leaving`), the wallet
+  // locks, Back is pressed. The field empties and a pasted phrase takes the clipboard with it.
+  const forgetImportPhrase = ({ leaving = false } = {}) => {
     setSeedPhrase('');
-    clearPastedPhrase(phrase);
+    clearPastedPhrase({ leaving });
   };
 
   // The private key arrays of a wallet object that has been sealed in the vault are no longer needed here.
@@ -3654,9 +3668,10 @@ const WalletScreen = () => {
       setLoading(false);
       // A refused prompt keeps the screen as it is: the same button asks again.
       if (underLock && error && error.code === 'DEVICE_LOCK_CANCELLED') return;
-      // A prompt that failed this time: the same button asks again with the screen lock (MA2-02).
+      // A prompt that failed this time: the same button asks again with the screen lock (MA2-02), or, with a password
+      // chosen instead, the wallet is made again from the start with one (the generated wallet has none).
       if (underLock && error && error.code === 'DEVICE_LOCK_RETRY') {
-        showAlert(t('error'), t('device_unlock_unavailable'));
+        offerPasswordAfterRetry(() => showAlert(t('device_lock_title'), t('device_lock_body')));
         return;
       }
       if (underLock && error && error.code === 'DEVICE_LOCK') {
@@ -3666,6 +3681,7 @@ const WalletScreen = () => {
       return;
     }
     wipeKeyArrays(tempWallet);
+    deviceLockRetriesRef.current = 0;
     setWalletDeviceAuth(underLock);
     if (underLock) setBiometricEnabled(true);
 
@@ -4805,7 +4821,35 @@ const WalletScreen = () => {
   const exportPrivateKey = (readersAcknowledged = false) => revealSecret('key', readersAcknowledged);
   const closeExport = () => { setShowExportSeed(false); setExportPassword(''); };
 
+  // One reveal at a time: Show does nothing while the check behind it runs, and says it is verifying.
   const revealSecret = async (kind, readersAcknowledged = false) => {
+    if (revealBusyRef.current) return;
+    revealBusyRef.current = true;
+    setRevealBusy(true);
+    try {
+      await revealSecretNow(kind, readersAcknowledged);
+    } finally {
+      revealBusyRef.current = false;
+      setRevealBusy(false);
+    }
+  };
+
+  // A reveal refused under the screen lock is the prompt's answer, never a wrong password: the secret went with a
+  // removed screen lock (the open session is the one way back), the prompt failed, or iOS refused it only because the
+  // app was not in front (nothing to say). A password wallet gets the password's answer.
+  const refuseReveal = (r, failed) => {
+    if (!deviceAuth || !r || r.locked) { refusePassword(r); return; }
+    if (r.cancelled || r.notNow) return;
+    if (r.gone) {
+      closeExport();
+      deviceSecretGone();
+      return;
+    }
+    if (r.unrecorded) showAlert(t('error'), t('unlock_unrecorded'));
+    else showAlert(t('error'), t(r.failed ? 'unlock_failed' : failed));
+  };
+
+  const revealSecretNow = async (kind, readersAcknowledged) => {
     // Checked now, not taken from launch: a hooking framework attached since then is seen (MPLAT-R3-02).
     const integrity = await deviceIntegrity();
     setDeviceCompromised(!!integrity.compromised);
@@ -4838,7 +4882,7 @@ const WalletScreen = () => {
         ? await walletManager.revealPrivateKeys(cred.password, account)
         : await walletManager.revealMnemonic(cred.password);
       setExportPassword('');
-      if (!r || !r.ok) { refusePassword(r); return; }
+      if (!r || !r.ok) { refuseReveal(r, failed); return; }
       if (kind === 'key' ? !r[account] : !r.mnemonic) {
         showAlert(t('error'), t(failed));
         return;
@@ -4849,6 +4893,7 @@ const WalletScreen = () => {
       if (AppState.currentState === 'background' || !walletManager.sessionOpen(password)) { setShowExportSeed(false); return; }
       setShowExportSeed(false);
       if (kind === 'key') {
+        stopCopiedTimer(keyCopiedTimerRef);
         setKeyCopied(null);
         setKeyReveal({ [account]: r[account] });
       } else {
@@ -4926,14 +4971,17 @@ const WalletScreen = () => {
       refusePassword(r);
       return;
     }
-    const ok = await walletManager.enableBiometricUnlock(biometricPassword);
+    const on = await walletManager.enableBiometricUnlock(biometricPassword);
     setBiometricPassword('');
     setShowBiometricPasswordPrompt(false);
-    if (ok) {
+    if (on && on.ok) {
       setBiometricEnabled(true);
       showAlert('', t('biometric_enabled_msg'));
-    } else {
+    } else if (on && on.unavailable) {
       showAlert(t('error'), t('biometric_unavailable'));
+    } else if (!(on && on.cancelled)) {
+      // The prompt failed or the vault could not be written: the setting did not change. A refused prompt says nothing.
+      showAlert(t('error'), t('err_save_setting'));
     }
   };
 
@@ -4986,8 +5034,10 @@ const WalletScreen = () => {
   };
 
   /**
-   * Erases the wallet from this device: the light node stops, every app key except language and network
-   * goes, every Keychain item and Keystore key goes. Only after a fresh authentication (see callers).
+   * Erases the wallet from this device: the light node stops, every app key except the language and a screen lock's
+   * unusable mark goes (WalletManager.ERASE_ALLOW_LIST), every Keychain item and Keystore key goes, and the screen keeps
+   * nothing of it for the next wallet (hidden amounts, the hardware-seal warning). Only after a fresh authentication
+   * (see callers).
    */
   const eraseWallet = async () => {
     setErasing(true);
@@ -5003,6 +5053,8 @@ const WalletScreen = () => {
       setBiometricEnabled(false);
       setWalletDeviceAuth(false);
       setVaultProblem(null);
+      setHwSeal(null);
+      setBalancesHidden(false);
       setHasWallet(false);
       loadSettings();
       await Promise.resolve(sent).catch(() => false);
@@ -5094,7 +5146,11 @@ const WalletScreen = () => {
     }
     if (deviceAuth) {
       const auth = await deviceAuthenticate(t('auth_erase_wallet'));
-      if (!auth.ok && auth.code !== 'not_set') return;
+      if (!auth.ok && auth.code !== 'not_set') {
+        // A prompt that failed (not one the user cancelled) says so: a confirmation never ends in nothing.
+        if (auth.code !== 'cancelled') showAlert(t('error'), t('err_erase_wallet'));
+        return;
+      }
     }
     setShowEraseConfirm(false);
     setEraseText('');
@@ -5352,13 +5408,27 @@ const WalletScreen = () => {
   // Screens whose taps move value or approve a request: the send form (with its pending-choice and fresh-check
   // dialogs on top), a browser site's sheet, aiqnet.io's QNet Link request (MPLAT-R2-01).
   useProtectedInteraction(showSendScreen || !!dappSheet || !!linkRequest);
+  // "Copied" lasts as long as the copy may stay on the clipboard (SECRET_CLIPBOARD_SECONDS), then the button reads Copy
+  // again; each copy starts that time again. The timer ends with the phrase or key on screen, and with the screen.
+  const seedCopiedTimerRef = useRef(null);
+  const keyCopiedTimerRef = useRef(null);
+  const stopCopiedTimer = (ref) => {
+    if (ref.current) clearTimeout(ref.current);
+    ref.current = null;
+  };
+  const showCopied = (ref, set, value, idle) => {
+    stopCopiedTimer(ref);
+    set(value);
+    ref.current = setTimeout(() => { ref.current = null; set(idle); }, SECRET_CLIPBOARD_SECONDS * 1000);
+  };
+  useEffect(() => () => { stopCopiedTimer(seedCopiedTimerRef); stopCopiedTimer(keyCopiedTimerRef); }, []);
   // "Copied" belongs to the phrase on screen: a phrase shown again, or another screen, starts with Copy.
-  useEffect(() => { setSeedCopied(false); }, [seedReveal, showCreateOptions]);
+  useEffect(() => { stopCopiedTimer(seedCopiedTimerRef); setSeedCopied(false); }, [seedReveal, showCreateOptions]);
 
   // The recovery phrase's Copy, on an explicit tap only: the clipboard is cleared after SECRET_CLIPBOARD_SECONDS if it
   // still holds the phrase, and at once when the wallet is deleted (DeviceSecurity copySecret, WalletManager eraseAllData).
   const copyRecoveryPhrase = async (words) => {
-    if (await copySecret(words.join(' '))) setSeedCopied(true);
+    if (await copySecret(words.join(' '))) showCopied(seedCopiedTimerRef, setSeedCopied, true, false);
   };
 
   // The revealed recovery phrase (owner, 06.10): shown at once after the check, with Copy and Done, as the extension
@@ -5399,13 +5469,13 @@ const WalletScreen = () => {
     );
   };
 
-  const closeKeyReveal = () => { setKeyReveal(null); setKeyCopied(null); };
+  const closeKeyReveal = () => { stopCopiedTimer(keyCopiedTimerRef); setKeyReveal(null); setKeyCopied(null); };
 
   // A private key's Copy, on an explicit tap only, under the phrase's rule: off the clipboard after
   // SECRET_CLIPBOARD_SECONDS if it is still there, and at once when the wallet is deleted.
   const copyPrivateKey = async (which) => {
     const entry = keyReveal && keyReveal[which];
-    if (entry && entry.key && await copySecret(entry.key)) setKeyCopied(which);
+    if (entry && entry.key && await copySecret(entry.key)) showCopied(keyCopiedTimerRef, setKeyCopied, which, null);
   };
 
   // The revealed private key (owner, 06.10): shown at once after the check, the key of the account chosen before the
@@ -6413,7 +6483,7 @@ const WalletScreen = () => {
                     placeholder={t(sendingToken.network === 'qnet' ? 'send_placeholder_eon' : 'send_placeholder_address')}
                     placeholderTextColor="#888"
                     value={sendAddress}
-                    onChangeText={setSendAddress}
+                    onChangeText={onRecipientChange}
                     autoCapitalize="none"
                     autoCorrect={false}
                   />
@@ -7656,9 +7726,9 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[styles.modalButton, styles.modalButtonPrimary]}
                 onPress={() => (exportWhat === 'key' ? exportPrivateKey() : exportSeedPhrase())}
-                disabled={loading}
+                disabled={loading || revealBusy}
               >
-                <Text style={styles.modalButtonText}>{loading ? t('verifying') : t('show')}</Text>
+                <Text style={styles.modalButtonText}>{loading || revealBusy ? t('verifying') : t('show')}</Text>
               </TouchableOpacity>
             </View>
           </View>

@@ -809,7 +809,8 @@ describe('vault: password change, reveal, wipe', () => {
 
     assert.deepEqual(await vault.wipe({ password: PASSWORD, confirm: 'DELETE' }), { wiped: true });
     assert.deepEqual(await env.idb.databases(), []);
-    assert.deepEqual(env.chrome.storage.local.dump(), {});
+    // the grants go; the chosen interface language is no wallet data and stays
+    assert.deepEqual(env.chrome.storage.local.dump(), { [STORAGE_KEYS.SETTINGS]: { language: 'en' } });
     assert.deepEqual(env.chrome.storage.session.dump(), {});
     assert.equal(await session.isUnlocked(), false);
     assert.equal(env.changes.at(-1).reason, 'wipe');

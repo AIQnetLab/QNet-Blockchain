@@ -124,12 +124,11 @@ describe('JavaScript', () => {
     expect(screen.match(/onPress=\{\(\) => copyRecoveryPhrase\(/g)).toHaveLength(2);
     // The same path, and only that, takes a private key from Settings → Export private key to the clipboard.
     expect(screen.match(/copySecret\(/g)).toHaveLength(2);
-    expect(screen).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) setKeyCopied\(which\);/);
+    expect(screen).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) showCopied\(keyCopiedTimerRef, setKeyCopied, which, null\);/);
     // The plain clipboard is left for addresses and transaction hashes (copyToClipboard's `text`, the explorer's
-    // fallback `hash`), and clearing a pasted phrase (iOS clears after a paste without reading the clipboard; Android
-    // clears after comparing).
+    // fallback `hash`); a pasted phrase is cleared natively without reading the clipboard (DeviceSecurity clearClipboard).
     const plain = [...screen.matchAll(/Clipboard\.setString\(([^)]*)\)/g)].map((m) => m[1]);
-    expect(plain.sort()).toEqual(["''", "''", 'hash', 'text'].sort());
+    expect(plain.sort()).toEqual(['hash', 'text'].sort());
   });
 
   it('every masked field and the phrase field keep keyboards out; "never" auto-lock is a choice that asks first', () => {
