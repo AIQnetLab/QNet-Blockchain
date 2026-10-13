@@ -8,6 +8,10 @@ require Pod::Executable.execute_command('node', ['-p',
 platform :ios, min_ios_version_supported
 prepare_react_native_project!
 
+# The legacy architecture, as Info.plist (RCTNewArchEnabled) and the Android build (newArchEnabled=false) declare.
+# React Native's pod scripts turn the new one on unless this is exactly '0', and then rewrite Info.plist to match.
+ENV['RCT_NEW_ARCH_ENABLED'] = '0'
+
 linkage = ENV['USE_FRAMEWORKS']
 if linkage != nil
   Pod::UI.puts "Configuring Pod with #{linkage}ally linked Frameworks".green

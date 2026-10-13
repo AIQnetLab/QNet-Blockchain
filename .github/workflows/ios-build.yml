@@ -134,6 +134,62 @@ jobs:
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO \
             build 2>&1 | tee xcodebuild.log | tail -n 200
 
+      # A build proves nothing about starting: build 21 reached TestFlight and stopped at its first line, because
+      # FirebaseApp.configure() found no GoogleService-Info.plist in the bundle. The Release app is installed on a
+      # booted iPhone simulator and must still run 40 s after launch; otherwise its console and crash report go to
+      # the summary and the job fails, and the testflight job, which waits for this one, uploads nothing.
+      - name: Launch on a simulator
+        run: |
+          APP=$(find build/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' | head -n 1)
+          BID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          # The newest iOS runtime and the newest iPhone it lists as supported (an iPhone Pro type otherwise).
+          xcrun simctl list runtimes -j > runtimes.json
+          xcrun simctl list devicetypes -j > devicetypes.json
+          read -r RUNTIME DTYPE < <(python3 -c "
+          import json
+          r = [x for x in json.load(open('runtimes.json'))['runtimes'] if x['isAvailable'] and 'iOS' in x['identifier']][-1]
+          d = [t for t in r.get('supportedDeviceTypes', []) if t['name'].startswith('iPhone')]
+          d = d or [t for t in json.load(open('devicetypes.json'))['devicetypes'] if t['name'].startswith('iPhone') and 'Pro' in t['name']]
+          print(r['identifier'], d[-1]['identifier'])
+          ")
+          UDID=$(xcrun simctl create launch-check "$DTYPE" "$RUNTIME")
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b > /dev/null
+          touch launch-start
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch --console-pty "$UDID" "$BID" > launch-console.txt 2>&1 &
+          sleep 40
+          if xcrun simctl spawn "$UDID" launchctl list | awk -v b="UIKitApplication:$BID" 'index($3, b) == 1 && $1 != "-" { found = 1 } END { exit !found }'; then
+            echo "QNet Wallet ($BID) still runs 40 s after launch on $DTYPE, $RUNTIME." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo '## The app did not survive its launch on the simulator'
+            echo '### console'
+            echo '```'; tail -n 80 launch-console.txt; echo '```'
+            for f in $(find ~/Library/Logs/DiagnosticReports -type f -newer launch-start 2>/dev/null); do
+              echo "### crash report $(basename "$f")"
+              echo '```'
+              python3 - "$f" <<'PY' || head -c 4000 "$f"
+          import json, sys
+          raw = open(sys.argv[1], errors='replace').read()
+          head, _, rest = raw.partition('\n')
+          body = json.loads(rest) if rest.strip().startswith('{') else json.loads(raw)
+          print('exception:', json.dumps(body.get('exception')))
+          print('termination:', json.dumps(body.get('termination')))
+          print('asi:', json.dumps(body.get('asi'))[:2000])
+          images = body.get('usedImages', [])
+          for frame in (body.get('lastExceptionBacktrace') or [])[:30]:
+              index = frame.get('imageIndex')
+              name = images[index].get('name', '?') if index is not None and index < len(images) else '?'
+              print(' ', name, frame.get('symbol', '?'))
+          PY
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::QNet Wallet does not run 40 s after launch on the simulator"
+          exit 1
+
       # The job summary is readable without signing in to GitHub, the raw log is not: on failure the
       # compiler errors and the tail of the log go there, so a failed run explains itself to anyone.
       - name: Summarise the failure
@@ -167,7 +223,8 @@ jobs:
   # CURRENT_PROJECT_VERSION, so every upload needs a new one.
   # The secrets reach only the steps that use them, nothing prints them, and the key file is deleted at the end.
   testflight:
-    needs: checks
+    # Only a build that started on the simulator is uploaded (the simulator job's launch check).
+    needs: [checks, simulator]
     # The Run workflow button exists only for workflows on the default branch, so a push whose commit message
     # carries [testflight] starts this job too.
     if: >-
@@ -349,6 +406,11 @@ jobs:
           [ -n "$ipa" ] || { echo "::error::the export wrote no .ipa"; exit 1; }
           shipped=$(unzip -p "$ipa" 'Payload/*.app/Info.plist' | plutil -extract CFBundleVersion raw -o - -)
           [ "$shipped" = "$BUILD_NUMBER" ] || { echo "::error::the .ipa carries build $shipped, not $BUILD_NUMBER"; exit 1; }
+          # FirebaseApp.configure() is the app's first line and stops it without this file; the architecture is the
+          # legacy one, as on Android (Podfile RCT_NEW_ARCH_ENABLED).
+          unzip -l "$ipa" | grep -qE 'Payload/[^/]+\.app/GoogleService-Info\.plist$' || { echo "::error::the .ipa has no GoogleService-Info.plist"; exit 1; }
+          arch=$(unzip -p "$ipa" 'Payload/*.app/Info.plist' | plutil -extract RCTNewArchEnabled raw -o - - 2>/dev/null || echo missing)
+          [ "$arch" = "false" ] || { echo "::error::RCTNewArchEnabled is $arch in the .ipa, not false"; exit 1; }
           echo "IPA=$ipa" >> "$GITHUB_ENV"
 
       - name: Upload to TestFlight

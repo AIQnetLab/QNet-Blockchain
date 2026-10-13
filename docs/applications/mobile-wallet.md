@@ -1903,19 +1903,24 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 - iOS: `ITSAppUsesNonExemptEncryption` is `NO`: the app's standard algorithms (its own native module and bundled
   crypto libraries, as `store-listing/README.md` lists them) need no export compliance documentation while the App
   Store in France is left out,
-  `RCTNewArchEnabled` matches Android (`false`), the one background task is `com.transistorsoft.fetch`, and
+  `RCTNewArchEnabled` matches Android (`false`; `ios/Podfile` sets `RCT_NEW_ARCH_ENABLED=0`, without which React Native's pod
+  scripts build the new architecture and rewrite that key), `GoogleService-Info.plist` is a resource of the app target
+  (`FirebaseApp.configure()`, the first line of `AppDelegate.swift`, stops the app without it), the one background task is `com.transistorsoft.fetch`, and
   `PrivacyInfo.xcprivacy` declares four data types, each for app functionality, linked and not for tracking: a
   device ID (the push token and the device check, only while a node is linked), a user ID (the QNet Blockchain and Solana
   addresses), other financial info (the transactions the user signs) and other data types (the device's platform and
   model name sent with the binding, only while a node is linked), as `store-listing/README.md` answers them.
   `.github/workflows/ios-build.yml` runs the dependency audit, the unit tests, the bundle scan and the light-client
-  pin check, then compiles the simulator build on macOS, on every change.
+  pin check, then compiles the Release build for the simulator on macOS, on every change, installs it on a booted
+  iPhone simulator and requires it to still run 40 s after launch (its console and crash report go to the job summary
+  otherwise).
 - iOS pods: each macOS job of that workflow runs `pod install` after `npm ci` and the patches, compares the resolved
   `ios/Podfile.lock` with the committed one (a difference is a warning, with the diff in the job summary) and keeps
   the resolved lock as a run artifact (`ios-podfile-lock`, and `testflight-podfile-lock` for a TestFlight build). The
   committed lock is replaced by that artifact, never edited by hand.
 - TestFlight: a manual run of the workflow (`workflow_dispatch`, with its `testflight` input, on by default) runs the
-  `testflight` job once the checks pass. It archives the `QNetMobile` scheme in Release for bundle id
+  `testflight` job once the checks and that launch pass; the exported `.ipa` must carry `GoogleService-Info.plist` and
+  `RCTNewArchEnabled` `false`. It archives the `QNetMobile` scheme in Release for bundle id
   `com.qnetmobile`, signed automatically for team `33H36C42XS` (`xcodebuild -allowProvisioningUpdates` with the App
   Store Connect API key of the repository secrets `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8`, the `.p8` text),
   exports it with the method `app-store-connect` and uploads it with `xcrun altool --upload-app` under the same key.
