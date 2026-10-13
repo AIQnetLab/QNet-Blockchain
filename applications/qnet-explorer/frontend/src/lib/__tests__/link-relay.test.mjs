@@ -1,18 +1,19 @@
 // The QNet Link relay (src/server/link-relay.ts): revision 2 validation, the request and its hash, per-intent
 // caps, first-write-wins, TTL, the store caps, origins and the per-IP limits, driven through its handlers with
-// web-standard Requests. Run: npm run test:wallet
+// web-standard Requests; a `claim` session names the wallet and its light or super node (node-claim.vectors.json), and the
+// earlier one, which named no node, is refused. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { LIMITS, MAX_LINK_PER_IP, MAX_LINK_SESSIONS, MAX_LIVE_PER_IP, MAX_SESSIONS, READ_GRACE_S, createLinkRelay, linkRelay } from '../../server/link-relay.ts';
 import { rateLimit } from '../../../lib/rate-limit.ts';
-import { LINK, VECTORS } from './link-helpers.mjs';
+import { CLAIM as CLAIM_VECTORS, LINK, VECTORS } from './link-helpers.mjs';
 
 const BASE = 'https://aiqnet.io/api/link/sessions';
 const LINKED = LINK.cases.find((c) => c.name === 'link-ok-check');
 const CONNECT = LINK.cases.find((c) => c.name === 'connect-ok');
-const CLAIM = LINK.cases.find((c) => c.name === 'claim-ok');
+const CLAIM = CLAIM_VECTORS.cases.find((c) => c.name === 'claim-super-ok');
 const RESERVE = LINK.cases.find((c) => c.name === 'reserve-ok');
 const BY_INTENT = { link: LINKED, connect: CONNECT, claim: CLAIM };
 let scopes = 0;
@@ -177,6 +178,27 @@ test('invalid answers get 400 or 413, unknown sessions 404, malformed ids 400', 
     assert.equal((await r.getAnswer(get(BASE), id)).status, 400, id);
     assert.equal((await r.postAnswer(post(BASE, LINKED.responseRequest, from()), id)).status, 400, id);
   }
+});
+
+// Owner, 12.10: the `claim` request names the node; the earlier one named none, and its session is refused as an invalid
+// body, whatever an address sends; an app's answer to such a session finds none.
+test('a claim session names the wallet and its node; the earlier one and every broken one are refused', async () => {
+  const { r } = relay();
+  for (const c of CLAIM_VECTORS.cases.slice(0, 3)) await created(r, c);
+  const earlier = LINK.cases.filter((c) => c.intent === 'claim');
+  assert.equal(earlier.length, 6);
+  for (const c of earlier) {
+    const res = await r.createSession(post(BASE, c.sessionRequest, { 'x-test-ip': '192.0.2.200' }));
+    assert.equal(res.status, 400, c.name);
+    assert.deepEqual(await json(res), { error: 'invalid_request' }, c.name);
+    const answer = await r.postAnswer(post(`${BASE}/${c.sessionId}/response`, c.responseRequest, { 'x-test-ip': '192.0.2.201' }), c.sessionId);
+    assert.equal(answer.status, 404, c.name);
+  }
+  for (const n of CLAIM_VECTORS.invalidSessionRequests) {
+    const res = await r.createSession(post(BASE, n.body, { 'x-test-ip': '192.0.2.202' }));
+    assert.equal(res.status, 400, n.why);
+  }
+  assert.equal(r.size(), 3);
 });
 
 test('a session and its answer are gone after 600 s, and the id can be used again', async () => {

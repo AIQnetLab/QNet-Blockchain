@@ -144,7 +144,7 @@ test('the archive\'s rows: the newest light node row of this wallet with its bur
   assert.deepEqual(recordFrom(KAT.address, [row({}, 'x')]), { found: false });
   assert.deepEqual(recordFrom(KAT.address, [{ block: 5, data: null }]), { found: false });
   assert.deepEqual(recordFrom(KAT.address, []), { found: false });
-  // A super node's registration, sent from its own id, of its type.
+  // A super node's registration, sent from the wallet like a light node's, of its type, naming the node by its id.
   const superRow = { block: '1612800', data: { node_id: superNodeId(KAT.address), node_type: 'Super', burn_tx: BURN.burnTx, burn_wallet: BURN.burner, burn_amount: 1500 } };
   assert.deepEqual(recordFrom(KAT.address, [superRow], 'super'), { found: true, record: RECORD });
   assert.deepEqual(recordFrom(KAT.address, [superRow]), { found: false }, 'not a light node');
@@ -159,8 +159,8 @@ test('the archive\'s rows: the newest light node row of this wallet with its bur
   ]) {
     assert.equal(parseArchivedRecord(bad), null, JSON.stringify(bad));
   }
-  // One indexed query: this sender's registrations, newest first, a few rows.
-  assert.match(RECORD_SQL, /WHERE from_address = \$1 AND tx_type = 'NodeRegistration' ORDER BY block DESC, tx_index DESC LIMIT 4/);
+  // One indexed query: this sender's registrations, newest first by the number (not the text column), a few rows.
+  assert.match(RECORD_SQL, /WHERE from_address = \$1 AND tx_type = 'NodeRegistration' ORDER BY transactions\.block DESC, tx_index DESC LIMIT 4/);
 });
 
 test('/registration/:wallet: an EON address only, one archive read per wallet for half a minute, the client metered', async () => {
@@ -187,9 +187,11 @@ test('/registration/:wallet: an EON address only, one archive read per wallet fo
   await reader.read(get(KAT.address), KAT.address);
   assert.equal(asked.length, 2);
   assert.deepEqual(await json(await reader.read(get(OTHER.address), OTHER.address)), { found: false });
-  // ?type=super reads the rows sent from the wallet's super node id.
+  // ?type=super reads the rows sent from the wallet too (a super node's registration is the wallet's transaction,
+  // development/qnet-integration/src/node/registration.rs), never from the node's id.
   await reader.read(get(KAT.address), KAT.address, 'super');
-  assert.equal(asked.at(-1), superNodeId(KAT.address));
+  assert.equal(asked.at(-1), KAT.address);
+  assert.ok(!asked.includes(superNodeId(KAT.address)));
   assert.equal((await reader.read(get(KAT.address), KAT.address, 'full')).status, 400);
   assert.equal((await reader.read(get('x'), 'x')).status, 400);
   const failing = createRecordReader({ lookup: async () => { throw new Error('db'); }, clientKey: () => ({ ok: true, ip: '203.0.113.31' }), scope: 'record-test-2', devOrigins: false });
@@ -304,7 +306,7 @@ test('whose burn is kept once known, one Solana budget a minute for the server; 
     lookup: async (from) => [
       { block: '1612800', data: { node_id: KAT.nodeId, node_type: 'Light', burn_tx: BURN.burnTx, burn_wallet: BURN.burner, burn_amount: 1500 } },
       { block: '1612800', data: { node_id: superNodeId(KAT.address), node_type: 'Super', burn_tx: BURN.burnTx, burn_wallet: BURN.burner, burn_amount: 1500 } },
-    ].filter((r) => (from === KAT.address ? r.data.node_type === 'Light' : r.data.node_type === 'Super')),
+    ].filter(() => from === KAT.address),
     burnBy: async (wallet, record) => {
       asked.push([wallet, record.burnTx]);
       return 'payment';

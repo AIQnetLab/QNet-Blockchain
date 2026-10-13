@@ -9,7 +9,7 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
   {
     title: 'Architecture',
     items: [
-      { name: 'Overview', path: 'architecture/overview.md', what: 'What the network is made of and how the pieces fit.' },
+      { name: 'Overview', path: 'architecture/overview.md', what: 'What QNet Blockchain is made of and how the pieces fit.' },
       { name: 'Consensus', path: 'architecture/consensus.md', what: 'Microblocks, checkpoints, committees and quorum certificates.' },
       { name: 'Cryptography', path: 'architecture/cryptography.md', what: 'ML-DSA-65 signatures, hashes and the address format.' },
       { name: 'Networking', path: 'architecture/networking.md', what: 'Transport, gossip and the post-quantum handshake between nodes.' },
@@ -20,7 +20,7 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
     title: 'Developers',
     items: [
       { name: 'Overview', path: 'developers/overview.md', what: 'Where to start: what the testnet offers and the limits to design around.' },
-      { name: 'dApp integration', path: 'developers/dapp-integration.md', what: 'Connecting a web page or game to the QNet wallets.' },
+      { name: 'dApp integration', path: 'developers/dapp-integration.md', what: 'Connecting a web page or game to QNet Wallet, the app and the extension.' },
       { name: 'Sign-in', path: 'developers/sign-in.md', what: 'Signing users in with their wallet, checked on your server.' },
       { name: 'Transactions', path: 'developers/transactions.md', what: 'Transfers, token transfers, contract calls and deploys: signing, gas and status.' },
       { name: 'Smart contracts', path: 'developers/smart-contracts.md', what: 'Writing, deploying and calling contracts, gas and events.' },
@@ -29,7 +29,7 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
       { name: 'RPC API', path: 'developers/rpc-api.md', what: 'Every endpoint a wallet, an explorer or a script can call.' },
       { name: 'Security', path: 'developers/security.md', what: 'What to do so users and servers stay safe.' },
       { name: '1DEV burn contract', path: 'developers/1dev-burn-contract.md', what: 'The Solana side of Phase 1 activation.' },
-      { name: 'QNet Link', path: 'protocols/qnet-link-v1.md', what: 'How aiqnet.io asks QNet Wallet to share its addresses, link its light node to a device or move its node balance.' },
+      { name: 'QNet Link', path: 'protocols/qnet-link-v1.md', what: 'How aiqnet.io asks QNet Wallet to share its addresses, link its light node to a device, unlink it or move a node balance.' },
       { name: 'Light node messages', path: 'protocols/light-node-messages.md', what: 'What the wallet, the node and the device sign for a light node, and the device check.' },
     ],
   },
@@ -44,7 +44,7 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
   {
     title: 'Operators',
     items: [
-      { name: 'Running a node', path: 'operators/running-a-node.md', what: 'From a server to a node on the network.' },
+      { name: 'Running a node', path: 'operators/running-a-node.md', what: 'From a server to a node on QNet Blockchain.' },
       { name: 'Configuration', path: 'operators/configuration.md', what: 'Every setting a node reads.' },
       { name: 'Maintenance', path: 'operators/maintenance.md', what: 'Monitoring, logs, upgrades, backups and recovery.' },
     ],

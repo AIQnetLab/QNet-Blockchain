@@ -30,8 +30,6 @@ export const CABINET_LIMITS = {
   // address, each node also held to its own KEYED_LIMITS budget once its signatures verify (SITE-8).
   register: { max: 30, windowMs: 600_000 },
   registration: { max: 30, windowMs: 60_000 },
-  // "I'm back": a silent push to someone's device, so few per client.
-  wake: { max: 3, windowMs: 600_000 },
   // A wallet's activation record (activation-api.ts): read on load and while a burn is on its way; the search of its
   // Solana address, which costs the server Solana reads, far fewer; a reservation, an announce, a release, a record.
   activation: { max: 60, windowMs: 60_000 },
@@ -45,12 +43,10 @@ export type CabinetRoute = keyof typeof CABINET_LIMITS;
 // The routes the QNet extension calls too: their origin rule is request-guard.ts activationOriginAllowed.
 const ACTIVATION_ROUTES: ReadonlySet<string> = new Set(['activation', 'activationScan', 'activationWrite']);
 
-// Limits on a key of the request's own (a payment address, a node), across every client. A wake proves nothing about
-// who asks (a node id is public), so its one per window counts only the pushes the network sent (wake.ts, SITE-R2-07).
+// Limits on a key of the request's own (a payment address, a node), across every client.
 export const KEYED_LIMITS = {
   send: { max: 5, windowMs: 600_000 },
   register: { max: 6, windowMs: 600_000 },
-  wake: { max: 1, windowMs: 600_000 },
   // A record of a wallet's burn, counted only once its proof verified.
   activationRecord: { max: 10, windowMs: 600_000 },
 } as const;

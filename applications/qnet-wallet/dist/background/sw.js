@@ -30,11 +30,15 @@ const background = (tag, fn) => {
 session.onLockChange((change) => {
   notifyViews(change.reason === 'wipe' ? 'wiped' : change.locked ? 'locked' : 'unlocked');
   background('provider lock notify', () => provider.notifyLockChanged(change));
+  if (change.locked) background('follow stop', () => qnet.stopFollow());
   if (!change.locked) {
     // After an unlock: resend signed transfers still pending, go on with a burn search a budget cut short
     // (R4-ESA-03), with the light node's registration, and bring aiqnet.io's record of the wallet's burn in line with
     // the vault (decision 35).
     background('resubmit pending', () => qnet.resubmitPending());
+    // the follow: a verified checkpoint kept at the certified head while the session is unlocked (qnet.followTick on the
+    // FOLLOW_ALARM), so a send's certified balance is at hand; the popup's own balance read covers the first minute
+    background('follow', () => qnet.startFollow());
     background('burn search', () => activation.resumeBurnSearches());
     background('node registration', () => nodes.resumeRegistration());
     background('burn record', () => activation.syncRecord());
@@ -47,6 +51,7 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   session.onAlarm(alarm).catch(guard('alarm'));
   nodes.onAlarm(alarm).catch(guard('registration alarm'));
+  qnet.onAlarm(alarm).catch(guard('follow alarm'));
 });
 chrome.idle.onStateChanged.addListener((state) => {
   session.onIdleState(state).catch(guard('idle'));
@@ -59,7 +64,7 @@ async function startup() {
   await session.initSession();
   // After initSession: storage.session is already limited to trusted contexts when the pass is read.
   await keys.startKeys();
-  // a forgot-password restore this worker's predecessor stopped in the middle of leaves no staged copy (R5-ESM-03)
+  // a forgot-password restore of 3.0.0 or 3.1.0 its worker stopped in the middle of leaves no staged copy (R5-ESM-03)
   await vault.discardRestoreStaging().catch(guard('restore staging'));
 }
 

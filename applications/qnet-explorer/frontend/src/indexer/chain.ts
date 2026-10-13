@@ -509,7 +509,8 @@ export class Chain {
     const g = await this.pool.query<{ genesis_hash: string | null }>('SELECT genesis_hash FROM sync_state WHERE id = 1');
     if (isHex64(g.rows[0]?.genesis_hash)) return { height: 1, hash: g.rows[0].genesis_hash as string };
     const r = (await this.pool.query<{ height: string; hash: string }>(
-      `SELECT height::text, hash FROM blocks WHERE hash ~ '^[0-9a-f]{64}$' ORDER BY height LIMIT 1`)).rows[0];
+      // Qualified: a bare `height` would order the text output column.
+      `SELECT height::text, hash FROM blocks WHERE hash ~ '^[0-9a-f]{64}$' ORDER BY blocks.height LIMIT 1`)).rows[0];
     return r ? { height: Number(r.height), hash: r.hash } : null;
   }
 
@@ -730,6 +731,7 @@ export class Chain {
       await this.refreshArchiveReach();
       const inRetention = Math.max(0, this.nodeHeight - RETENTION_BLOCKS + 100);
       // A pruned row is worth asking for again inside the retention window, or where the archives reach.
+      // Newest first by the number (`c.height`): the bare name would order the text output column.
       const prunedFrom = Math.min(inRetention, this.archiveReach);
       const cand = await this.pool.query<{ height: string; reason: string }>(
         `SELECT height::text, reason FROM (
@@ -740,7 +742,7 @@ export class Chain {
               AND (SELECT count(*) FROM transactions t WHERE t.block = b.height) < b.tx_count - b.tx_skipped
            UNION ALL
            SELECT height, 'pruned' FROM blocks WHERE NOT body_indexed AND height >= $5
-         ) c ORDER BY height DESC LIMIT $2`,
+         ) c ORDER BY c.height DESC LIMIT $2`,
         [inRetention, HEAL_CANDIDATES, Math.max(this.shortScanFrom, inRetention), SHORT_SCAN_WINDOW, prunedFrom]);
       // The short-body scan counts transaction rows per block, so it walks the retention window in
       // slices instead of costing a full correlated count every pass.

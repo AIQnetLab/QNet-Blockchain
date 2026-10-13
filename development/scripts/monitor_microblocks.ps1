@@ -1,7 +1,7 @@
 # QNet Microblock Monitor
 # Monitors microblock creation in real-time
 
-Write-Host "=== QNet Microblock Monitor ===" -ForegroundColor Cyan
+Write-Host "=== QNet Blockchain Microblock Monitor ===" -ForegroundColor Cyan
 Write-Host "Monitoring microblock creation..." -ForegroundColor Yellow
 
 # Function to get block info

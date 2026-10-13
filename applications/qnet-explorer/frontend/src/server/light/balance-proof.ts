@@ -9,6 +9,7 @@ import { readCappedBytes } from '../../lib/capped-body.ts';
 import { GENESIS_NODES } from '../../lib/genesis-nodes.ts';
 import { MACROBLOCK_INTERVAL } from './checkpoint.ts';
 import { createLightClient, type FetchText, type LightClient } from './lineage.ts';
+import { defaultStorePath, fileCheckpointStore } from './store.ts';
 import {
   accountKey, accountLeafHash, verifyAbsence, verifyAbsenceInBucket, verifyInclusion, type AccountFields,
 } from './smt.ts';
@@ -223,22 +224,33 @@ export function createBalanceProver(opts: ProverOptions) {
   return { provenBalance };
 }
 
-/** A bounded GET for the light client and the prover: Node's fetch, the body read up to the cap. */
-export const fetchText: FetchText = async (url, maxBytes, timeoutMs) => {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { Accept: 'application/json' }, cache: 'no-store' });
+/** A bounded GET for the light client and the prover: Node's fetch, the body read up to the cap, `headers` sent along. */
+export const fetchText: FetchText = async (url, maxBytes, timeoutMs, headers) => {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { ...headers, Accept: 'application/json' }, cache: 'no-store' });
   const bytes = await readCappedBytes(res, maxBytes);
   const ra = res.headers.get('retry-after');
   return { status: res.status, text: bytes === null ? null : new TextDecoder().decode(bytes), retryAfterS: ra !== null && /^\d{1,6}$/.test(ra) ? Number(ra) : null };
 };
 
 const SHARED = Symbol.for('qnet.site.balanceProver');
+const SHARED_LIGHT = Symbol.for('qnet.site.lightClient');
 
-/** The server's one prover and light client, reading the pinned genesis nodes. */
+/** The server's one light client, reading the pinned genesis nodes, its verified checkpoints kept in the store file. */
+export function sharedLightClient(): LightClient {
+  const g = globalThis as typeof globalThis & { [SHARED_LIGHT]?: LightClient };
+  if (!g[SHARED_LIGHT]) {
+    const nodes = () => GENESIS_NODES;
+    g[SHARED_LIGHT] = createLightClient({ nodes, fetchText, store: fileCheckpointStore(defaultStorePath()) });
+  }
+  return g[SHARED_LIGHT];
+}
+
+/** The server's one prover, on the shared light client. */
 export function sharedBalanceProver(): ReturnType<typeof createBalanceProver> {
   const g = globalThis as typeof globalThis & { [SHARED]?: ReturnType<typeof createBalanceProver> };
   if (!g[SHARED]) {
     const nodes = () => GENESIS_NODES;
-    g[SHARED] = createBalanceProver({ light: createLightClient({ nodes, fetchText }), nodes, fetchText });
+    g[SHARED] = createBalanceProver({ light: sharedLightClient(), nodes, fetchText });
   }
   return g[SHARED];
 }

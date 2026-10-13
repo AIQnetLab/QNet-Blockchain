@@ -1957,6 +1957,7 @@ impl BlockchainNode {
         // Heal any reward epoch holding a certified root but an Absent local shard (freeze-race / snapshot
         // join) so pending/claim serve the certified amount identically to a from-genesis node.
         let _ = crate::node::BlockchainNode::backfill_reward_shards(&blockchain.storage);
+        crate::node::BlockchainNode::index_reward_recipients(&blockchain.storage);
         // Anything the local rebuild could not reproduce — its inputs are gone — is pulled from a peer
         // and accepted only against this node's own certified root.
         crate::node::BlockchainNode::repair_unservable_reward_epochs(&blockchain.storage).await;
@@ -2852,7 +2853,11 @@ impl BlockchainNode {
                 }
             });
             
-            // Wait for server readiness  
+            // N2: the public RPC side of a super node that serves wallets (its address, certificate,
+            // ServeCert and endpoint commit). A no-op elsewhere; it never blocks boot or consensus.
+            super::public_rpc::start(self.clone());
+
+            // Wait for server readiness
             println!("[INFO][NODE] waiting_for_server");
             // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
             let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };

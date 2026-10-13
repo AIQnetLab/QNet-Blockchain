@@ -12,18 +12,18 @@
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useActivationContent, useWallet } from '@/contexts/AppContext';
-import { IN_APP_HOME, isInAppBrowser, keepFromApp } from '@/lib/activate-view';
+import { IN_APP_HOME, isInAppBrowser } from '@/lib/activate-view';
 
 // `React.ReactNode`: the layouts pass on what Next.js gives them, unchanged.
 export default function InAppGuard({ children }: { children: React.ReactNode }) {
-  const { providerChannel, fromApp } = useWallet();
+  const { providerChannel } = useWallet();
   const show = useActivationContent();
   const router = useRouter();
-  const inApp = fromApp || isInAppBrowser(providerChannel);
+  const inApp = isInAppBrowser(providerChannel);
 
   useEffect(() => {
-    if (inApp) router.replace(keepFromApp(IN_APP_HOME, fromApp));
-  }, [inApp, fromApp, router]);
+    if (inApp) router.replace(IN_APP_HOME);
+  }, [inApp, router]);
 
   if (inApp) return null;
   return (

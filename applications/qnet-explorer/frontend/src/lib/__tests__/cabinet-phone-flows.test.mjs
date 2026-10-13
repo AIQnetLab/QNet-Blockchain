@@ -1,13 +1,13 @@
 // CABINET_PHONE_FLOWS (unified plan SITE-8, rollout R5 and R8; src/server/phone-flows.ts): off unless it is exactly
-// "1". Off, the relay opens only `connect` sessions and the cabinet offers no `link`, `claim` or `reserve` request to
-// QNet Wallet: its read pages, I'm back and the extension's paths stay. Run: npm run test:wallet
+// "1". Off, the relay opens only `connect` sessions and the cabinet offers no `link`, `claim`, `reserve` or `unlink`
+// request to QNet Wallet: its read pages and the extension's paths stay. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { PHONE_FLOWS_ENV, phoneFlowsEnabled } from '../../server/phone-flows.ts';
 import { createLinkRelay } from '../../server/link-relay.ts';
-import { LINK } from './link-helpers.mjs';
+import { CLAIM, LINK } from './link-helpers.mjs';
 
 const read = (p) => readFileSync(new URL(`../../${p}`, import.meta.url), 'utf8');
 let scopes = 0;
@@ -21,7 +21,7 @@ test('on only with the value 1', () => {
   assert.equal(phoneFlowsEnabled({}), false);
 });
 
-test('off, the relay refuses link, claim and reserve sessions and still opens connect', async () => {
+test('off, the relay refuses link, claim, reserve and unlink sessions and still opens connect', async () => {
   const relay = createLinkRelay({
     intents: ['connect'],
     clientKey: () => ({ ok: true, ip: '203.0.113.7' }),
@@ -33,9 +33,11 @@ test('off, the relay refuses link, claim and reserve sessions and still opens co
     headers: { 'content-type': 'application/json', host: 'aiqnet.io' },
     body: JSON.stringify(body),
   });
-  for (const name of ['link-ok-check', 'claim-ok', 'reserve-ok']) {
-    const res = await relay.createSession(post(LINK.cases.find((c) => c.name === name).sessionRequest));
-    assert.equal(res.status, 404, name);
+  const sessions = [...['link-ok-check', 'reserve-ok', 'unlink-ok'].map((name) => LINK.cases.find((c) => c.name === name)),
+    CLAIM.cases.find((c) => c.name === 'claim-super-ok')];
+  for (const c of sessions) {
+    const res = await relay.createSession(post(c.sessionRequest));
+    assert.equal(res.status, 404, c.name);
     assert.deepEqual(JSON.parse(await res.text()), { error: 'not_available' });
   }
   assert.equal(relay.size(), 0);
@@ -43,7 +45,7 @@ test('off, the relay refuses link, claim and reserve sessions and still opens co
   assert.equal(connect.status, 201);
 });
 
-test('one flag for the relay and the pages: the process relay, the layout, and each page that sends link or claim', () => {
+test('one flag for the relay and the pages: the process relay, the layout, and each page that sends a request', () => {
   assert.match(read('server/link-relay.ts'), /createLinkRelay\(\{ intents: phoneFlowsEnabled\(\) \? INTENTS : \['connect'\] \}\)/);
   assert.match(read('app/node/layout.tsx'), /<CabinetProvider phoneFlows=\{phoneFlowsEnabled\(\)\}>/);
   // The pages ask the provider, never the environment.

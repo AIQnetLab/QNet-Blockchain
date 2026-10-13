@@ -1,19 +1,27 @@
 /**
- * The Node tab (plan-mobile 3.2, unified plan 3.1): this wallet's node as the network records it, whichever device or
- * channel registered it, and the two things a device can do about it here: run it (Use this device) and move its
- * balance into the wallet. It stops running on a device only on a request the user confirms on that device's QNet Link
- * sheet (`unlink`, which the device's own key signs), when another device takes it over, or with the wallet's deletion:
- * the tab has no button for it (owner, 30.09). A super node runs on its server: its card only shows it
- * (status, last seen, heartbeats, counted and missed epochs, the balance) and moves its balance. A wallet with a super
- * and a light node on the chain (an older wallet) shows both cards, the server's first. A node aiqnet.io recorded for
- * the wallet that the network does not list yet is said as such. The same states, texts and buttons on every phone and
- * tablet; no link or pointer to any other place. `nodeView` derives the state from the status alone, so it is tested
- * without the screen.
+ * The Node tab (plan-mobile 3.2, unified plan 3.1): this wallet's node as the network records it, and what this device
+ * can do about it here: keep it running (Use this device, where the card offers it) and move its balance into the
+ * wallet. One wallet, one node (owner, 11.10): a light node shows only on the device it is bound to; bound to another
+ * device, or to none, it is not shown at all and the tab says what it says for a wallet without a node (binding is done
+ * on aiqnet.io; the tab names neither it nor activation). It stops running on a device only on a request the user
+ * confirms on that device's QNet Link sheet (`unlink`, which the device's own key signs), when another device takes it
+ * over, or with the wallet's deletion: the tab has no button for it (owner, 30.09). A super node runs on its server and
+ * shows on every device that holds the wallet: its card only shows it (status, last seen, heartbeats, missed epochs, the
+ * balance) and moves its balance; a super node the network registered but does not admit to consensus yet says it
+ * waits for admission, never Offline. A wallet with a super and a light node on the chain (an older wallet) shows both
+ * cards, the server's first, and the node balance (the wallet's, whichever node id is asked) with its move once, on the
+ * server card. A super node aiqnet.io recorded for the wallet that the network does not list yet is said as such. A move
+ * of the wallet's node balance in transit (services/ClaimTransit) shows as "Moving X" with the rest of the balance, and
+ * holds every move button.
+ * The same states, texts and buttons on every phone and tablet; no link or pointer to any other place. `nodeView`
+ * derives the state from the status alone, so it is tested without the screen.
  */
 import React from 'react';
 import { Text, TouchableOpacity, View } from 'react-native';
 import { hasKey } from '../i18n';
+import { InfoField, InfoRow } from '../components/InfoRow';
 import { BIND_SETTLE_MS, freshMiss, shownMiss } from '../services/LightNode';
+import { heldMove } from '../services/ClaimTransit';
 import styles from './WalletScreen.styles';
 
 const EPOCH_BLOCKS = 14400;
@@ -194,13 +202,16 @@ export function nodeView({ status, local = null, pending = null, height = 0, che
 }
 
 /**
- * The model of the device the network links to the node, as its public status names it (LightNode: `device.model`, the
- * unsigned hint that device's binding sent), or null: none named, or no device linked. Shown as the model only: no text
- * of the app names a platform.
+ * Whether the light card shows this wallet's light node on this device (owner, 11.10: one wallet, one node, shown only
+ * where it runs): a node being linked here, or one this device holds a binding of that the network does not name as
+ * another device's or none's. `light` null (nothing read yet) is still being checked. Otherwise the card says what a
+ * wallet without a node says: a node on another device, unbound, or with no binding here is not this device's to show.
  */
-export function linkedModel(status) {
-  const d = status && status.device;
-  return d && d.state !== 'unlinked' && typeof d.model === 'string' && d.model ? d.model : null;
+export function lightShownHere(light, view) {
+  if (!light) return true;
+  if (view.state === 'elsewhere' || view.state === 'no_device') return false;
+  if (view.state === 'linking' || view.state === 'not_recorded' || view.state === 'here') return true;
+  return !!light.local || !!light.pending;
 }
 
 /**
@@ -286,16 +297,13 @@ function answeredText(t, answered, answeredAt, height) {
   return localHere ? t('node_answered_yes', { time: clock(answeredAt.at) }) : t('node_answered_yes_untimed');
 }
 
-// The epoch clock, or null while no height is known (the row is left out rather than shown loading).
+// The epoch clock, or null while no height is known (the row is left out rather than shown loading): about how long is
+// left, at least a minute. At a block a second, the blocks left would only say the same in seconds.
 function epochEndsText(t, height) {
   if (!(height > 0)) return null;
-  const blocks = EPOCH_BLOCKS - (height % EPOCH_BLOCKS);
-  const minutes = Math.floor(blocks / 60);
+  const minutes = Math.max(1, Math.floor((EPOCH_BLOCKS - (height % EPOCH_BLOCKS)) / 60));
   const hours = Math.floor(minutes / 60);
-  const shown = blocks.toLocaleString('en-US');
-  return hours > 0
-    ? t('node_blocks_hm', { blocks: shown, h: hours, m: minutes % 60 })
-    : t('node_blocks_m', { blocks: shown, m: minutes });
+  return t('node_about', { time: hours > 0 ? t('node_ago_hm', { h: hours, m: minutes % 60 }) : t('node_ago_m', { m: minutes }) });
 }
 
 // How long ago a node was last seen, in the language's own units: minutes (at least one), hours and minutes, or days
@@ -311,15 +319,15 @@ export function agoText(t, seconds) {
 
 /**
  * The status row of how much the system lets the app run in the background (services/BackgroundPriority), the same on
- * every phone and tablet: { key, color, open } (`open`: the one button to the system settings, shown only while it is
- * restricted and the user can change it), or null while unknown.
+ * every phone and tablet: { key, tone, open } (`tone`: the row's colour, components/InfoRow TONES; `open`: the one button
+ * to the system settings, shown only while it is restricted and the user can change it), or null while unknown.
  */
 export function backgroundView(background) {
   if (!background || (background.priority !== 'unrestricted' && background.priority !== 'restricted')) return null;
   const free = background.priority === 'unrestricted';
   return {
     key: free ? 'node_background_unrestricted' : 'node_background_restricted',
-    color: free ? '#34c759' : '#ff9500',
+    tone: free ? 'ok' : 'warn',
     open: !free && background.changeable === true,
   };
 }
@@ -332,17 +340,12 @@ function balanceText(nano, hidden) {
   return qnc === 0 ? '0 QNC' : `${qnc.toFixed(6).replace(/\.?0+$/, '')} QNC`;
 }
 
-const Row = ({ label, value, color, ltr, wrap }) => (
-  <View style={[styles.rewardItem, wrap ? styles.rewardItemWrap : null]}>
-    <Text style={styles.rewardLabel}>{label}</Text>
-    <Text style={[styles.rewardValue, color ? { color } : null, ltr ? styles.ltr : null]} numberOfLines={ltr ? 1 : undefined}
-      adjustsFontSizeToFit={!!ltr} minimumFontScale={0.3}>{value}</Text>
-  </View>
-);
-
-const Badge = ({ t, online }) => (
-  <View style={[styles.statusBadge, online ? styles.statusBadgeActivated : styles.statusBadgeInactive]}>
-    <Text style={[styles.statusBadgeText, !online && { color: '#ff3b30' }]}>{t(online ? 'node_badge_online' : 'node_badge_offline')}</Text>
+// `waiting`: a super node registered and not admitted to consensus yet, which is neither online nor offline.
+const Badge = ({ t, online, waiting = false }) => (
+  <View style={[styles.statusBadge, online && !waiting ? styles.statusBadgeActivated : styles.statusBadgeInactive]}>
+    <Text style={[styles.statusBadgeText, waiting ? { color: '#ff9500' } : !online && { color: '#ff3b30' }]}>
+      {t(waiting ? 'node_badge_waiting' : (online ? 'node_badge_online' : 'node_badge_offline'))}
+    </Text>
   </View>
 );
 
@@ -358,12 +361,12 @@ const Button = ({ label, onPress, disabled, secondary, testID }) => (
   </TouchableOpacity>
 );
 
-// The node id, tap to copy.
-const NodeId = ({ t, nodeId, copied, onCopy }) => (
-  <TouchableOpacity style={{ flex: 1, marginEnd: 12 }} onPress={() => onCopy(nodeId)} accessibilityRole="button" testID="node-id">
-    <Text style={styles.nodeMonitoringLabel}>{copied ? t('common_copied') : t('node_name')}</Text>
-    <Text style={[styles.nodeMonitoringValue, styles.ltr]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{nodeId}</Text>
-  </TouchableOpacity>
+// The node id at the head of its card, whole on one line; a tap copies a light node's (`onCopy`).
+const NodeId = ({ t, nodeId, copied = false, onCopy = null }) => (
+  <View style={styles.nodeIdBox}>
+    <InfoField t={t} label={t('node_name')} value={nodeId} mono fit divider={false} onCopy={onCopy ? () => onCopy(nodeId) : null}
+      copied={copied} copyTestID="node-id" />
+  </View>
 );
 
 // The lines under a device check that did not end in counting (checkState 'ended' or 'refused'): why, when the network
@@ -384,34 +387,43 @@ function CheckLines({ t, notice, onPlayDialog }) {
 }
 
 // Balance rows and the move button, the same for a light node and a server node. The button takes a balance of 1 QNC
-// or more (the node refuses a smaller move), with no note about it (owner, 04.10).
-function BalanceBlock({ t, balanceNano, hidden, moving, onMove }) {
-  const known = Number.isFinite(balanceNano) && balanceNano >= 0;
-  const movable = known && balanceNano >= ONE_QNC_NANO;
+// or more (the node refuses a smaller move), with no note about it (owner, 04.10). `alone`: the card holds nothing else.
+// The wallet's move in transit (`move`, ClaimTransit.heldMove): the balance is its rest and the button, off, says
+// "Moving X" until a certified read shows the wallet holds X, or a part of it (owner, 11.10 and 12.10).
+function BalanceBlock({ t, balanceNano, hidden, moving, onMove, alone = false, move = null }) {
+  const shownNano = move ? (move.restNano !== null ? move.restNano : Math.max(0, balanceNano - Number(move.amountNano))) : balanceNano;
+  const known = Number.isFinite(shownNano) && shownNano >= 0;
+  const movable = known && shownNano >= ONE_QNC_NANO;
+  const label = move ? t('node_moving', { amount: balanceText(Number(move.amountNano), hidden) })
+    : (moving ? t('claiming') : t('node_move'));
   return (
     <>
-      <Row label={t('node_balance')} value={balanceText(balanceNano, hidden)} ltr />
-      <Button label={moving ? t('claiming') : t('node_move')} onPress={onMove} disabled={!movable || moving} testID="node-move" />
+      <InfoRow label={t('node_balance')} value={balanceText(shownNano, hidden)} tone="accent" ltr fit divider={!alone} />
+      <Button label={label} onPress={onMove} disabled={!movable || moving || !!move} testID="node-move" />
     </>
   );
 }
 
-// `recordedOnly`: aiqnet.io recorded a light node for this wallet that the network does not list yet.
+// The light node on this device, or what a wallet without a node shows (lightShownHere: a node bound to another device,
+// or to none, is not this device's to show, nor one aiqnet.io recorded that the network does not list yet).
+// `showBalance` false: the server card above shows the wallet's node balance and its move (the same figure), so this
+// card does not show it twice.
 function LightNodeCard({
   t, light, height, balancesHidden, busy, refusal, copied, onMove, onUse, onCopy, onPlayDialog, onOpenBackground, now,
-  recordedOnly = false,
+  transit = null, showBalance = true,
 }) {
   const view = light ? nodeView({ ...light, height, now }) : { state: 'checking' };
   const nodeId = light ? light.nodeId : '';
-  if (view.state === 'none') {
-    const key = recordedOnly ? 'node_not_on_network_light' : 'node_none';
-    return <View style={styles.emptyState}><Text style={styles.emptyText}>{t(key)}</Text></View>;
+  if (view.state === 'none' || !lightShownHere(light, view)) {
+    return <View style={styles.emptyState}><Text style={styles.emptyText}>{t('node_none')}</Text></View>;
   }
-  // The balance is the wallet's whatever device runs the node, and moving it takes only the wallet key: it stays on screen
-  // in every state of a node the wallet has, so it never vanishes while the binding or the network is unclear (owner, 05.10).
-  const balance = nodeId ? (
+  const move = heldMove(transit);
+  // The balance stays on screen in every state of the node this device runs, so it never vanishes while the binding or
+  // the network is unclear (owner, 05.10).
+  const balance = nodeId && showBalance ? (
     <View style={styles.rewardsCard}>
-      <BalanceBlock t={t} balanceNano={light.balanceNano} hidden={balancesHidden} moving={busy.move} onMove={onMove} />
+      <BalanceBlock t={t} balanceNano={light.balanceNano} hidden={balancesHidden} moving={busy.move} onMove={onMove} alone
+        move={move} />
     </View>
   ) : null;
   if (view.state === 'linking' || view.state === 'not_recorded') {
@@ -424,30 +436,6 @@ function LightNodeCard({
       <View>
         <View style={styles.nodeMonitoringCard}>
           <Text style={styles.nodeExplainer}>{t(view.state === 'checking' ? 'node_checking' : 'node_unreachable')}</Text>
-        </View>
-        {balance}
-      </View>
-    );
-  }
-  // The device the network links, by its model: the other device, or this one.
-  const model = light && light.status ? linkedModel(light.status) : null;
-  if (view.state === 'elsewhere' || view.state === 'no_device') {
-    const cant = deviceText(t, light.device);
-    const why = cant || refusalText(t, refusal, now);
-    // Google Play's licence dialog, where the build carries its text (Android): the network found the app unlicensed.
-    const licence = !cant && refusal && refusal.reason === 'device_unlicensed' && onPlayDialog && hasKey('node_play_licence');
-    return (
-      <View>
-        <View style={styles.nodeMonitoringCard}>
-          <View style={styles.nodeMonitoringHeader}>
-            <NodeId t={t} nodeId={nodeId} copied={copied === nodeId} onCopy={onCopy} />
-          </View>
-          <Text style={[styles.nodeExplainer, { marginTop: 12 }]}>{t(view.state === 'no_device' ? 'node_no_device' : 'node_other_device')}</Text>
-          {view.state === 'elsewhere' && model ? <Row label={t('node_device')} value={model} ltr /> : null}
-          {!cant && <Button label={t('node_use')} onPress={onUse} disabled={busy.use} testID="node-use" />}
-          {why ? <Text style={styles.rewardHint}>{why}</Text> : null}
-          {licence ? <Text style={styles.rewardHint}>{t('node_play_licence')}</Text> : null}
-          {licence ? <Button label={t('node_play_open')} onPress={() => onPlayDialog('licence')} secondary testID="node-play" /> : null}
         </View>
         {balance}
       </View>
@@ -473,33 +461,85 @@ function LightNodeCard({
       </View>
       <View style={styles.rewardsCard}>
         <Text style={styles.rewardsTitle}>{t('node_status')}</Text>
-        <Row label={t('node_status_node')} value={t(view.online ? 'node_status_online' : 'node_status_offline')}
-          color={view.online ? '#34c759' : '#ff9500'} />
-        {model ? <Row label={t('node_device')} value={model} ltr /> : null}
-        <Row label={t('node_answered')} value={answeredText(t, light.status.answered, light.answeredAt, height)} />
-        {/* A genesis counts over the epochs it indexed, the last 64 at most (node batch S3): never "since registration". */}
-        {light.status.counted && (
-          <Row label={t('node_counted')}
-            value={t('node_counted_last', { n: light.status.counted.counted, m: light.status.counted.since })} />
-        )}
-        {height > 0 && <Row label={t('node_epoch_ends')} value={epochEndsText(t, height)} />}
-        {background ? <Row label={t('node_background')} value={t(background.key)} color={background.color} wrap /> : null}
+        {/* No device model and no count of epochs here: the site's node cabinet shows both (owner, 11.10). */}
+        <InfoRow label={t('node_status_node')} value={t(view.online ? 'node_status_online' : 'node_status_offline')}
+          tone={view.online ? 'ok' : 'warn'} divider={false} />
+        <InfoRow label={t('node_answered')} value={answeredText(t, light.status.answered, light.answeredAt, height)} />
+        {height > 0 && <InfoRow label={t('node_epoch_ends')} value={epochEndsText(t, height)} />}
+        {background ? <InfoRow label={t('node_background')} value={t(background.key)} tone={background.tone} /> : null}
         {background && background.open && onOpenBackground ? (
           <Button label={t('node_background_open')} onPress={onOpenBackground} secondary testID="node-background" />
         ) : null}
         {miss ? <Text style={styles.rewardHint} testID="node-miss">{miss}</Text> : null}
-        <BalanceBlock t={t} balanceNano={light.balanceNano} hidden={balancesHidden} moving={busy.move} onMove={onMove} />
+        {showBalance ? (
+          <BalanceBlock t={t} balanceNano={light.balanceNano} hidden={balancesHidden} moving={busy.move} onMove={onMove}
+            move={move} />
+        ) : null}
       </View>
     </View>
   );
 }
 
-// A super or genesis node: it runs on its server, this device only shows it and moves its balance (S6). `server` is
-// { nodeType, nodeId, status, epochs } (epochs: PushService.getNodeEpochs, null while unknown), or null for a super node
-// aiqnet.io recorded for the wallet that the network does not list yet (`recordedOnly`).
-function ServerNodeCard({ t, server, height, balancesHidden, busy, onMove, nodeTitle, recordedOnly = false }) {
+/**
+ * Whether the network registered a super node and does not admit it yet (owner, 11.10: registrations stay open while a
+ * rule holds outside super nodes back): the node's own word in its status, its admission 'waiting' (the site's WAITING
+ * state, node-view superState) or `consensus_admitted` false (PushService.checkServerNodeStatus). A node that says
+ * nothing of it (every node before that rule) is not waiting.
+ */
+export function waitingAdmission(status) {
+  return serverRegistered(status) && (status.admission === 'waiting' || status.consensusAdmitted === false);
+}
+
+/**
+ * A super node's admission to the epoch's rewarded set as its status reports it (PushService `admission`), for the
+ * card's row: 'admitted' or 'waiting' (registered, no super share while outside: waiting for network admission). null
+ * when the node says nothing of it (an older node), says no admission rule governs the epoch ('not_required'), or for a
+ * node the network does not list.
+ */
+export function rewardAdmission(status) {
+  if (!serverRegistered(status)) return null;
+  return status.admission === 'admitted' || status.admission === 'waiting' ? status.admission : null;
+}
+
+/** Whether a server node's status is one the network registered (its card then shows the node and its balance). */
+export function serverRegistered(status) {
+  return !!status && status.success === true && status.registered !== false;
+}
+
+/**
+ * A server node's status after a read (`status`, for node `nodeId` when known): a good answer replaces what was shown;
+ * a failed one keeps the last good status of the same node, marked `stale` (the card says the network could not be
+ * reached above it, and keeps the balance and its move), so the card never turns into another one and back; with none,
+ * the failure.
+ */
+export function keptServerStatus(prev, status, nodeId = null) {
+  if (status && status.success === true) return status;
+  if (prev && prev.success === true && (!nodeId || prev.nodeId === nodeId)) return prev.stale ? prev : { ...prev, stale: true };
+  return status || { success: false, error: 'network' };
+}
+
+// A super or genesis node: it runs on its server, this device only shows it and moves its balance (S6), on every device
+// that holds the wallet. `server` is { nodeType, nodeId, status, epochs } (epochs: PushService.getNodeEpochs, null
+// while unknown), or null for a super node aiqnet.io recorded for the wallet that the network does not list yet
+// (`recordedOnly`). Its id heads the card, as a light node's does, and its type is the first status row. One the
+// network registered and does not admit yet (waitingAdmission) says so in place of Active or Offline, as the site does;
+// what it earned moves all the same. An admitted one, when the node reports it (rewardAdmission), says so in a row of
+// its own, and epochs outside the admitted set are counted apart from missed ones (PushService.getNodeEpochs
+// notAdmitted). Before its first answer it is
+// being checked; a read that failed with no good status before it says the network could not be reached; the server
+// text alone is for a node the network says is not registered.
+function ServerNodeCard({ t, server, height, balancesHidden, busy, onMove, nodeTitle, recordedOnly = false, transit = null }) {
   const { nodeType, nodeId, status, epochs } = server || { nodeType: 'super', nodeId: '', status: null, epochs: null };
-  if (!(status && status.success === true && status.registered !== false)) {
+  if (!serverRegistered(status)) {
+    const waitText = recordedOnly ? null : (!status ? 'node_checking' : (status.success !== true ? 'node_unreachable' : null));
+    if (waitText) {
+      return (
+        <View style={styles.nodeMonitoringCard}>
+          <Text style={styles.nodeMonitoringTitle}>{nodeTitle(nodeType)}</Text>
+          <Text style={styles.nodeExplainer}>{t(waitText)}</Text>
+        </View>
+      );
+    }
     return (
       <View style={styles.nodeMonitoringCard}>
         <Text style={styles.nodeMonitoringTitle}>{nodeTitle(nodeType)}</Text>
@@ -517,84 +557,90 @@ function ServerNodeCard({ t, server, height, balancesHidden, busy, onMove, nodeT
   // Last seen only from a node that saw it (an answer from a node that has it offline names no time).
   const seen = status.lastSeen > 0 ? agoText(t, status.lastSeenAgoSeconds) : null;
   const beats = Number.isSafeInteger(status.heartbeatCount) && Number.isSafeInteger(status.requiredHeartbeats);
+  // Reputation is binary: only the permanent ban for proven equivocation is worth a row, its reason under it.
+  const banned = status.reputation != null && status.reputation < 70;
+  const waiting = waitingAdmission(status);
+  const statusText = waiting ? t('node_waiting_admission') : t(status.isOnline ? 'node_active' : 'node_server_offline');
+  const admission = rewardAdmission(status);
   return (
     <View>
       <View style={styles.nodeMonitoringCard}>
         <View style={styles.nodeMonitoringHeader}>
-          <View style={{ flex: 1, marginEnd: 12 }}>
-            {nodeId ? (
-              <>
-                <Text style={styles.nodeMonitoringLabel}>{t('node_name')}</Text>
-                <Text style={styles.nodeMonitoringValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{nodeId}</Text>
-                <View style={{ marginTop: 12 }}>
-                  <Text style={styles.nodeMonitoringLabel}>{t('node_type')}</Text>
-                  <Text style={styles.nodeMonitoringValue}>{nodeTitle(nodeType)}</Text>
-                </View>
-              </>
-            ) : <Text style={styles.nodeMonitoringTitle}>{nodeTitle(nodeType)}</Text>}
-          </View>
-          <Badge t={t} online={!!status.isOnline} />
+          {nodeId ? <NodeId t={t} nodeId={nodeId} />
+            : <Text style={styles.nodeMonitoringTitle}>{nodeTitle(nodeType)}</Text>}
+          <Badge t={t} online={!!status.isOnline} waiting={waiting} />
         </View>
+        {/* The last good status, kept while a read fails (keptServerStatus): said, never swapped for another card. */}
+        {status.stale ? <Text style={styles.rewardHint} testID="node-server-stale">{t('node_unreachable')}</Text> : null}
       </View>
       <View style={styles.rewardsCard}>
         <Text style={styles.rewardsTitle}>{t('node_status')}</Text>
-        <Row label={t('node_status_node')} value={t(status.isOnline ? 'node_active' : 'node_server_offline')}
-          color={status.isOnline ? '#34c759' : '#ff3b30'} />
-        {seen ? <Row label={t('node_last_seen')} value={seen} /> : null}
+        {nodeId ? <InfoRow label={t('node_type')} value={nodeTitle(nodeType)} divider={false} /> : null}
+        {/* The waiting sentence is too long to share a line with its label in most languages: it goes under it, whole. */}
+        {waiting ? <InfoField label={t('node_status_node')} value={statusText} tone="warn" divider={!!nodeId} /> : (
+          <InfoRow label={t('node_status_node')} value={statusText} tone={status.isOnline ? 'ok' : 'bad'} divider={!!nodeId} />
+        )}
+        {seen ? <InfoRow label={t('node_last_seen')} value={seen} /> : null}
+        {/* The super node's admission when it reports it admitted; waiting is the node's status above. */}
+        {admission === 'admitted' ? <InfoRow label={t('node_admission')} value={t('node_admission_admitted')} tone="ok" /> : null}
         {beats ? (
-          <Row label={t('node_heartbeats')} value={t('node_heartbeats_of', { n: status.heartbeatCount, m: status.requiredHeartbeats })} />
+          <InfoRow label={t('node_heartbeats')} value={t('node_heartbeats_of', { n: status.heartbeatCount, m: status.requiredHeartbeats })} />
         ) : null}
-        {/* Over the last 64 epochs the network settled, from the node's registration on (PushService.getNodeEpochs). */}
-        {epochs ? (
-          <Row label={t('node_counted')} value={t('node_counted_last', { n: epochs.counted, m: epochs.counted + epochs.missed })} />
-        ) : null}
-        {epochs ? <Row label={t('node_missed')} value={String(epochs.missed)} color={epochs.missed > 0 ? '#ff9500' : null} /> : null}
+        {/* Over the last 64 epochs the network settled, from the node's registration on (PushService.getNodeEpochs); the
+            count of epochs is the site's (owner, 11.10). */}
+        {epochs ? <InfoRow label={t('node_missed')} value={String(epochs.missed)} tone={epochs.missed > 0 ? 'warn' : 'default'} /> : null}
+        {/* Epochs outside the admitted set are the network's admission, never missed ones: counted apart, when any. */}
+        {epochs && epochs.notAdmitted > 0 ? <InfoRow label={t('node_not_admitted')} value={String(epochs.notAdmitted)} /> : null}
         {(height || status.currentBlockHeight) > 0 && (
-          <Row label={t('node_epoch_ends')} value={epochEndsText(t, height || status.currentBlockHeight)} />
+          <InfoRow label={t('node_epoch_ends')} value={epochEndsText(t, height || status.currentBlockHeight)} />
         )}
-        {/* Reputation is binary: only the permanent ban for proven equivocation is worth a row. */}
-        {status.reputation != null && status.reputation < 70 && (
-          <Row label={t('node_reputation')} value={`⚠ ${t('node_banned')}`} color="#ff3b30" />
-        )}
-        <BalanceBlock t={t} balanceNano={status.pendingRewards} hidden={balancesHidden} moving={busy.move} onMove={onMove} />
+        {banned ? <InfoRow label={t('node_reputation')} value={t('node_banned')} tone="bad" /> : null}
+        {banned ? <Text style={styles.rewardHint}>{t('node_banned_hint')}</Text> : null}
+        <BalanceBlock t={t} balanceNano={status.pendingRewards} hidden={balancesHidden} moving={busy.move} onMove={onMove}
+          move={heldMove(transit)} />
       </View>
     </View>
   );
 }
 
-// The light card's states that show a node of this wallet (on the chain, or being linked here): the ones a wallet with
-// a server node shows under the server card.
-const LIGHT_NODE_STATES = new Set(['linking', 'not_recorded', 'here', 'elsewhere', 'no_device']);
+// The light card's states that show a node of this wallet on this device (being linked here, or bound here): the ones a
+// wallet with a server node shows under the server card.
+const LIGHT_NODE_STATES = new Set(['linking', 'not_recorded', 'here']);
 
 /**
  * The tab's content under its title. `server` ({ nodeType, nodeId, status, epochs }) when this wallet has a super or
  * genesis node; `light` ({ nodeId, status, local, pending, check, answeredAt, background, balanceNano, device }), `device`
  * being NodeDeviceKey.checkDevice's answer or null while unknown, `background` BackgroundPriority.readBackground's (the
- * Background row, and `onOpenBackground` its button to the system settings). With a server node the light card shows only when it
- * holds a node of this wallet (both on the chain: the server card first). `recorded` ('light' | 'super' | null): the node
- * type aiqnet.io recorded for this wallet that the network does not list yet (NodeRecordRead.pendingNodeType).
- * `onMove` moves the light node's balance, `onMoveServer` the server node's.
+ * Background row, and `onOpenBackground` its button to the system settings). The light card shows the light node only on
+ * the device it is bound to (lightShownHere); with a server node it shows only then (both on the chain: the server card
+ * first). `recorded` ('light' | 'super' | null): the node type aiqnet.io recorded for this wallet that the network does
+ * not list yet (NodeRecordRead.pendingNodeType); only a super node's is said. `transit`: the moves of a node balance in
+ * transit (services/ClaimTransit). `onMove` moves the light node's balance, `onMoveServer` the server node's.
  */
 export default function NodeTab({
   t, server = null, light, recorded = null, height = 0, balancesHidden = false, busy = {}, refusal = null, copied = '',
   onMove, onMoveServer = null, onUse, onCopy, onPlayDialog = null, onOpenBackground = null, nodeTitle, now = Date.now(),
+  transit = null,
 }) {
   const b = { move: !!busy.move, use: !!busy.use };
+  const serverCard = !!server || recorded === 'super';
+  // The node balance is the wallet's: with a registered server node it is shown, and moved, on the server card only.
+  const serverBalance = !!server && recorded !== 'super' && serverRegistered(server.status);
   const lightCard = (
     <LightNodeCard t={t} light={light} height={height} balancesHidden={balancesHidden} busy={b} refusal={refusal}
       copied={copied} onMove={onMove} onUse={onUse} onCopy={onCopy} onPlayDialog={onPlayDialog}
-      onOpenBackground={onOpenBackground} now={now} recordedOnly={recorded === 'light'} />
+      onOpenBackground={onOpenBackground} now={now} transit={transit} showBalance={!(serverCard && serverBalance)} />
   );
-  const serverCard = !!server || recorded === 'super';
-  const lightState = light ? nodeView({ ...light, height, now }).state : 'checking';
+  const lightView = light ? nodeView({ ...light, height, now }) : { state: 'checking' };
+  const lightHere = LIGHT_NODE_STATES.has(lightView.state) && lightShownHere(light, lightView);
   return (
     <View>
       <Text style={styles.tabTitle}>{t('node_title')}</Text>
       {serverCard ? (
         <ServerNodeCard t={t} server={server} height={height} balancesHidden={balancesHidden} busy={b}
-          onMove={onMoveServer || onMove} nodeTitle={nodeTitle} recordedOnly={recorded === 'super'} />
+          onMove={onMoveServer || onMove} nodeTitle={nodeTitle} recordedOnly={recorded === 'super'} transit={transit} />
       ) : lightCard}
-      {serverCard && LIGHT_NODE_STATES.has(lightState) ? <View style={{ marginTop: 16 }}>{lightCard}</View> : null}
+      {serverCard && lightHere ? <View style={{ marginTop: 16 }}>{lightCard}</View> : null}
     </View>
   );
 }

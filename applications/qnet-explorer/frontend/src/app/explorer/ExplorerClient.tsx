@@ -1,11 +1,11 @@
 'use client';
 
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import ExplorerLink from '@/components/ExplorerLink';
+import Link from 'next/link';
 import { batchCache, getListCache, setListCache, noteChainHeight } from '@/lib/explorer-cache';
 import { useChainHead } from '@/hooks/useChainHead';
 import TokenIcon from '@/components/TokenIcon';
-import { useActivationContent, useKeepFromApp } from '@/contexts/AppContext';
+import { useActivationContent } from '@/contexts/AppContext';
 import { txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
 
 // Transaction list. First paint comes from SSR (the server's head snapshot); afterwards the head stream
@@ -65,16 +65,16 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
   return (
     <tr className="activity-row">
       <td className="col-hash">
-        <ExplorerLink href={`/explorer/tx/${item.hash}`} className="addr">
+        <Link href={`/explorer/tx/${item.hash}`} className="addr">
           {item.hash.slice(0, 8)}...{item.hash.slice(-6)}
-        </ExplorerLink>
+        </Link>
       </td>
       <td className="col-type">
         <span className={`type-badge ${getBadgeClass(item.type)}`}>{txTypeLabel(item.type, full)}</span>
       </td>
       <td className="col-addresses">
         {item.from && item.from.length > 10 && item.from.includes('eon') ? (
-          <ExplorerLink href={`/explorer/address/${item.from}`} className="addr">{item.from.slice(0, 6)}...{item.from.slice(-4)}</ExplorerLink>
+          <Link href={`/explorer/address/${item.from}`} className="addr">{item.from.slice(0, 6)}...{item.from.slice(-4)}</Link>
         ) : (
           <span className="addr">{txPartyLabel(item.from || 'N/A', full)}</span>
         )}
@@ -82,7 +82,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
         {item.to === 'batch_transfers' ? (
           <span className="addr">batch recipients</span>
         ) : item.to && item.to.length > 10 && item.to.includes('eon') ? (
-          <ExplorerLink href={`/explorer/address/${item.to}`} className="addr">{item.to.slice(0, 6)}...{item.to.slice(-4)}</ExplorerLink>
+          <Link href={`/explorer/address/${item.to}`} className="addr">{item.to.slice(0, 6)}...{item.to.slice(-4)}</Link>
         ) : (
           <span className="addr">{txPartyLabel(item.to || 'N/A', full)}</span>
         )}
@@ -98,10 +98,10 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
               <span>{item.amount}</span>
             </span>
           );
-          return href ? <ExplorerLink href={href} className="token-amount-link">{chip}</ExplorerLink> : chip;
+          return href ? <Link href={href} className="token-amount-link">{chip}</Link> : chip;
         })()}
       </td>
-      <td className="col-block"><ExplorerLink href={`/explorer/block/${item.block}`}>{item.block}</ExplorerLink></td>
+      <td className="col-block"><Link href={`/explorer/block/${item.block}`}>{item.block}</Link></td>
       <td className="col-time" suppressHydrationWarning>{displayTime}</td>
     </tr>
   );
@@ -231,10 +231,9 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
   }, [pagination.maxPage, shownPage]);
 
   const toggleSort = () => { setSortOrder(prev => (prev === 'desc' ? 'asc' : 'desc')); setPos({ page: 1, cursor: null, dir: 'next' }); };
-  const keep = useKeepFromApp();
   const full = useActivationContent();
-  // A full navigation: the next page starts fresh, with the app's marker kept on it (R5-XPD-06).
-  const goToResult = (href: string) => { window.location.href = keep(href); };
+  // A full navigation: the next page starts fresh.
+  const goToResult = (href: string) => { window.location.href = href; };
 
   useEffect(() => {
     const q = searchQuery.trim();
@@ -273,7 +272,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
   return (
     <div className="explorer-page">
       <div className="explorer-header">
-        <h1>Quantum Blockchain Explorer</h1>
+        <h1>QNet Blockchain Explorer</h1>
         <p suppressHydrationWarning>
           All transactions from Genesis to Now • Block Height: {heightLabel || '...'}
         </p>
@@ -344,7 +343,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
           {rows.length === 0 && hasFetched ? (
             <div className="empty-state">
               <p>No transactions found</p>
-              <span>{typeFilters.length > 0 ? `No ${typeFilters.map((type) => txTypeLabel(type, full)).join('/')} transactions yet` : 'Waiting for network activity...'}</span>
+              <span>{typeFilters.length > 0 ? `No ${typeFilters.map((type) => txTypeLabel(type, full)).join('/')} transactions yet` : 'Waiting for activity on QNet Blockchain...'}</span>
             </div>
           ) : rows.length === 0 ? (
             <div className="table-placeholder" />

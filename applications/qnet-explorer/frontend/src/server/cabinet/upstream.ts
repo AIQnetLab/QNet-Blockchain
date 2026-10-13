@@ -3,7 +3,7 @@
 // more than it should take from one server, and the explorer server may be on the nodes' whitelist, which skips their
 // own per-address limits. So each kind of call has a budget per node: a call beyond it is not made and counts as that
 // node not answering (the route tries another node, or answers that the network could not be reached). The kinds are
-// kept apart, so a flood of reads cannot starve a registration, a wake or a reservation's check that the wallet has no
+// kept apart, so a flood of reads cannot starve a registration or a reservation's check that the wallet has no
 // node: that check runs only for a reservation the wallet signed (activation-api.ts), never for an anonymous read. A
 // page's reads are split by the id they are for (SITE M-12): an id the network was seen to list as registered
 // (known-nodes.ts) reads on `readKnown`, any other on the small `readUnknown`, so made-up ids, which cost nothing, cannot
@@ -22,8 +22,6 @@ export const UPSTREAM_BUDGETS = {
   reserve: { max: 10, windowMs: 1_000 },
   // A registration submit (register.ts).
   submit: { max: 2, windowMs: 1_000 },
-  // "I'm back" (wake.ts).
-  wake: { max: 2, windowMs: 1_000 },
 } as const;
 export type UpstreamKind = keyof typeof UPSTREAM_BUDGETS;
 
@@ -34,7 +32,7 @@ export type UpstreamBudget = (kind: UpstreamKind, url: string) => boolean;
 export const unbudgeted: UpstreamBudget = () => true;
 
 export function createUpstreamBudget({ now = Date.now }: { now?: () => number } = {}): UpstreamBudget {
-  // A handful of nodes times five kinds: the store never fills.
+  // A handful of nodes times four kinds: the store never fills.
   const limiter = createRateLimiter({ maxEntries: 1_000, now });
   return (kind, url) => {
     let origin: string;

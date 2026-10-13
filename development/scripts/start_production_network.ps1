@@ -7,7 +7,7 @@ param(
     # REMOVED: SkipValidation - all transactions MUST be validated in production
 )
 
-Write-Host "=== Starting QNet Production Network with $NodeCount nodes ===" -ForegroundColor Green
+Write-Host "=== Starting QNet Blockchain production network with $NodeCount nodes ===" -ForegroundColor Green
 Write-Host "Production TPS Configuration Active" -ForegroundColor Yellow
 
 # Kill any existing nodes

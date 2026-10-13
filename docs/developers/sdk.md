@@ -7,7 +7,7 @@ TypeScript and ships as ES modules with type declarations, for Node 20 or later 
 
 ## Install
 
-The package is not published to the npm registry, and no name there belongs to QNet until it is: do not run
+The package is not published to the npm registry, and no name there belongs to QNet Blockchain until it is: do not run
 `npm install @aiqnet/sdk`, or any other name, against the registry, since whoever holds that name would run code
 beside your keys. Build the package file from this repository and install that file:
 
@@ -53,7 +53,7 @@ tests check the result against the app's known answers
 // development/qnet-sdk/README.md
 import { findWallet } from '@aiqnet/sdk';
 
-const wallet = await findWallet();                 // null when no QNet wallet is installed
+const wallet = await findWallet();                 // null when no QNet Blockchain wallet is installed
 const { qnet } = await wallet.connect();           // the user approves the site once
 const sent = await wallet.sendTransfer({ to: '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d', amount: '1.5' });
 // (sent.from, sent.nonce) is the transaction's identity; sent.txHash is one node's name for its copy.

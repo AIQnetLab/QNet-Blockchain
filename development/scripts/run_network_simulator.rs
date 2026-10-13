@@ -5,7 +5,7 @@ use qnet_integration::regional_p2p::Region;
 use std::time::Duration;
 
 fn main() {
-    println!("=== QNet Network Simulator ===\n");
+    println!("=== QNet Blockchain network simulator ===\n");
     
     // Create simulator
     let mut sim = NetworkSimulator::new();

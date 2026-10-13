@@ -31,7 +31,7 @@ test('Terms: activation outside the app, the app confirms only its own node, and
   const src = read(SRC, 'app/terms/page.tsx');
   assert.doesNotMatch(terms, /claim the rewards|Node rewards|enter or recover the code|opens it\. In Phase 1/);
   // The places that activate are named only outside the app's view.
-  assert.match(src, /\{full && ' on aiqnet\.io\/node or in the QNet browser extension'\}\{!full && ' outside the mobile app'\}/);
+  assert.match(src, /\{full && ' on aiqnet\.io\/node or in the QNet Wallet browser extension'\}\{!full && ' outside the mobile app'\}/);
   assert.match(terms, /The mobile app burns nothing, sells nothing and uses no activation codes: for a node it signs only a request that you confirm on its own screen, to register its own wallet's light node and run it on that device, or to move the node balance into the wallet; its SOL and 1DEV sends are ordinary transfers that you review and confirm, to an address you choose\./);
   assert.match(terms, /One light node per wallet\./);
   // Device rules (red team 2, section 4.5); owner, 04.10: no appeal or review, the node runs on another device.
@@ -45,7 +45,7 @@ test('Terms: activation outside the app, the app confirms only its own node, and
     /The node can run on another phone or tablet at any time \(see Support \)\./,
     /Whether a device can run a node may change when Apple, Google or the network change their checks\./,
   ]) assert.match(terms, sentence);
-  assert.match(src, /<a href=\{`\$\{keepFromApp\('\/support', fromApp\)\}#device-check`\}>Support<\/a>/);
+  assert.match(src, /<a href="\/support#device-check">Support<\/a>/);
   // What the protocol says: one device one node, no device needed to move the balance, a pause keeps it claimable.
   assert.match(protocol, /One device runs one node, and one wallet has one node\./);
   assert.match(protocol, /There is no operating-system version minimum\. A device that cannot prove its hardware/);
@@ -149,9 +149,11 @@ test('Privacy: the app\'s side as the code has it: token at link time, devnet So
   // The store notes say the same of what leaves the device.
   const store = read(REPO, 'applications/qnet-mobile/store-listing/README.md').replace(/\s+/g, ' ');
   assert.match(store, /a Solana transfer the user confirms goes there to be sent and followed; so do the addresses it pays and the token accounts it reads/);
-  // The requests from aiqnet.io are revision 2's five intents with their request fields.
-  assert.match(policy, /A page of aiqnet\.io can ask the QNet app on your phone or tablet for the wallet's addresses, to confirm that a light node paid from a one-time payment address is for the wallet, to link the wallet's light node to that device \(with the wallet's consent to register it\), to unlink the wallet's node from that device, or to move the node balance into the wallet/);
-  assert.match(policy, /the burn transaction it concerns \(or none\) and a short hash of the wallet address the page already knows \(or none\), and for the link of a burn made from the wallet's own Solana address also that Solana address, for a confirmation, that hash and the payment address, for an unlink, that hash;/);
+  // The requests from aiqnet.io are revision 2's five intents with their request fields; a move names the wallet's light
+  // or super node (owner, 12.10).
+  assert.match(policy, /A page of aiqnet\.io can ask the QNet Wallet app on your phone or tablet for the wallet's addresses, to confirm that a light node paid from a one-time payment address is for the wallet, to link the wallet's light node to that device \(with the wallet's consent to register it\), to unlink the wallet's node from that device, or to move the balance of the wallet's light or super node into the wallet: the page shows/);
+  assert.match(policy, /the burn transaction it concerns \(or none\) and a short hash of the wallet address the page already knows \(or none\), and for the link of a burn made from the wallet's own Solana address also that Solana address, for a confirmation, that hash and the payment address, for an unlink, that hash, for a move, that hash and the node's public identity;/);
+  assert.match(policy, /for an unlink, the node identity and whether the network took the change, for a move, the amount and the transaction;/);
   assert.match(policy, /for a confirmation, the wallet's signed reservation \(its public key, signature and time\)/);
   assert.match(policy, /for an unlink, the node identity and whether the network took the change/);
   // The device check ends with the unlink the app on that device confirms and signs; nothing names the removed button.
@@ -159,7 +161,7 @@ test('Privacy: the app\'s side as the code has it: token at link time, devnet So
   assert.doesNotMatch(policy, /Stop on this device/);
   const link = read(SRC, 'lib/qnet-link.ts');
   assert.match(link, /export const INTENTS = \['connect', 'link', 'claim', 'reserve', 'unlink'\] as const;/);
-  assert.match(link, /const REQUEST_KEYS = \{\s*link: \['burnTx', 'walletHash', 'check'\], claim: \['walletHash'\], reserve: \['walletHash', 'burner'\], unlink: \['walletHash'\],\s*\} as const;/);
+  assert.match(link, /const REQUEST_KEYS = \{\s*link: \['burnTx', 'walletHash', 'check'\], claim: \['walletHash', 'nodeId'\], reserve: \['walletHash', 'burner'\], unlink: \['walletHash'\],\s*\} as const;/);
 });
 
 test('the device-check request: the reference only, the note cleaned, never a recovery phrase, nothing sent from the page', () => {
@@ -226,7 +228,7 @@ test('Support: the self-service section for a node that does not run on a device
   const src = read(SRC, 'app/support/page.tsx');
   assert.match(src, /<div className="privacy-section" id="device-check">/);
   assert.doesNotMatch(src, /SupportRequest|support_device_ref/);
-  assert.match(src, /<a href=\{`\$\{here\('\/terms'\)\}#device-rules`\}>\{t\('support_device_rules_link'\)\}<\/a>/);
+  assert.match(src, /<a href="\/terms#device-rules">\{t\('support_device_rules_link'\)\}<\/a>/);
   assert.equal(TEXTS.support_device_rules_link, 'Device rules');
   // Outside the {full && …} blocks nothing names a platform or points to the node pages, in the page or in the
   // text of the keys it shows there.
@@ -250,11 +252,9 @@ test('Support: the move from the older Android app, restored with the recovery p
   const src = read(SRC, 'app/support/page.tsx');
   assert.match(src, /\{full && \(\s*<div className="privacy-section" id="new-app">/);
   assert.match(TEXTS.support_move, /^An earlier Android build of QNet Wallet installed from a file is a separate, older app, and its last update asks you to move\. Install QNet Wallet from Google Play or from the \{walletPage\}: it is the same app\. Restore the wallet in it with the recovery phrase/);
-  assert.match(TEXTS.support_move, /To run the wallet's light node in the new app, open its Node tab and choose Use this device\.$/);
-  // The app's own words for its tab and its button.
-  const app = read(REPO, 'applications/qnet-mobile/src/i18n/locales/en.js');
-  assert.match(app, /^\s*node_use: 'Use this device',$/m);
-  assert.match(app, /^\s*tab_node: 'Node',$/m);
+  // The new app holds no binding of the node, so its Node tab shows none: the new device is linked from My node.
+  assert.match(TEXTS.support_move, /To run the wallet's light node in the new app, link the new device on My node \(Device tab\) and confirm in QNet Wallet\.$/);
+  assert.match(read(REPO, 'applications/qnet-mobile/src/screens/NodeTab.js'), /if \(view\.state === 'elsewhere' \|\| view\.state === 'no_device'\) return false;/);
 });
 
 test('the link page names the three reasons a browser shows it, and leads back to the node pages', () => {

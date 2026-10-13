@@ -27,6 +27,9 @@ pub struct CheckpointConsensus {
     proposals: HashMap<(u64, Hash), Checkpoint>,
     votes: HashMap<(u64, Hash), HashMap<NodeId, Vote>>,
     timeouts: HashMap<u64, HashMap<NodeId, TimeoutMsg>>,
+    /// Highest view a TC formed here or was adopted for: it moves its receivers past every view at or
+    /// below it, so no helper timeout is owed there.
+    high_tc_index: u64,
     /// Newest timeout index seen per member — the view-sync input for the f+1 jump across
     /// DISTINCT indices (views scattered by restarts never meet on one index otherwise).
     peer_views: HashMap<NodeId, u64>,
@@ -71,7 +74,7 @@ impl CheckpointConsensus {
             node_id, committee, current_index: 1, last_voted_index: 0,
             high_qc: None, locked_index: 0, committed_index: 0,
             proposals: HashMap::new(), votes: HashMap::new(),
-            timeouts: HashMap::new(), peer_views: HashMap::new(), peer_high_qc: HashMap::new(),
+            timeouts: HashMap::new(), high_tc_index: 0, peer_views: HashMap::new(), peer_high_qc: HashMap::new(),
             qcs: HashMap::new(),
             relaxed: None, head_votes: HashMap::new(), index_votes: HashMap::new(),
         }
@@ -316,13 +319,33 @@ impl CheckpointConsensus {
         out
     }
 
-    /// Local view timer fired ⇒ broadcast our timeout (carries high_qc index).
+    /// Local view timer fired ⇒ broadcast our timeout (carries high_qc index), preceded by a helper timeout
+    /// when one is owed: first, so a peer's last record of our view is the current one.
     pub fn on_local_timeout(&mut self) -> Vec<Action> {
-        vec![Action::BroadcastTimeout(TimeoutMsg {
-            index: self.current_index, voter: self.node_id.clone(),
-            high_qc_index: self.high_qc.as_ref().map(|q| q.index).unwrap_or(0),
-            signature: Vec::new(),
-        })]
+        let high_qc_index = self.high_qc.as_ref().map(|q| q.index).unwrap_or(0);
+        let mut out = Vec::with_capacity(2);
+        if let Some(t) = self.helper_timeout_view() {
+            out.push(Action::BroadcastTimeout(TimeoutMsg {
+                index: t, voter: self.node_id.clone(), high_qc_index, signature: Vec::new(),
+            }));
+        }
+        out.push(Action::BroadcastTimeout(TimeoutMsg {
+            index: self.current_index, voter: self.node_id.clone(), high_qc_index, signature: Vec::new(),
+        }));
+        out
+    }
+
+    /// Helper timeout: the highest past view at least f+1 other members timed out at, unsigned by us and
+    /// covered by no TC we hold. A replica rebooted past its vote never signs that view, and with exactly a
+    /// quorum live the members left there could then neither form its TC nor jump. No proof reads timeouts.
+    pub fn helper_timeout_view(&self) -> Option<u64> {
+        let f = self.f();
+        self.timeouts.iter()
+            .filter(|(t, by)| **t < self.current_index && **t > self.high_tc_index
+                && !by.contains_key(&self.node_id)
+                && by.keys().filter(|v| self.committee.binary_search(v).is_ok()).count() >= f + 1)
+            .map(|(t, _)| *t)
+            .max()
     }
 
     /// Timeout from a peer (authenticated). Quorum ⇒ TC ⇒ advance; f+1 ahead ⇒ jump.
@@ -368,10 +391,14 @@ impl CheckpointConsensus {
         };
         let mut out = Vec::new();
         if let Some(timeouts) = snapshot {
-            out.push(Action::FormedTc(TimeoutCertificate {
-                index: tm.index, timeouts, high_qc: self.high_qc.clone(),
-            }));
+            self.high_tc_index = self.high_tc_index.max(tm.index);
+            // A view this node already left (it adopted that view's TC, or one above it, or jumped past it) moves
+            // nothing here: forming its TC again would only relay a duplicate O(committee) certificate. The
+            // members still at that view hold the same timeouts and form it themselves.
             if tm.index >= self.current_index {
+                out.push(Action::FormedTc(TimeoutCertificate {
+                    index: tm.index, timeouts, high_qc: self.high_qc.clone(),
+                }));
                 self.current_index = tm.index + 1;
                 out.push(Action::EnterView(self.current_index));
             }
@@ -399,6 +426,7 @@ impl CheckpointConsensus {
     /// TC from a peer: adopt its high_qc, advance past its view.
     pub fn on_timeout_cert(&mut self, tc: &TimeoutCertificate) -> Vec<Action> {
         let mut out = Vec::new();
+        self.high_tc_index = self.high_tc_index.max(tc.index);
         if let Some(hq) = &tc.high_qc { out.extend(self.adopt_qc(hq)); }
         if tc.index >= self.current_index {
             self.current_index = tc.index + 1;
@@ -587,6 +615,91 @@ mod tests {
         let acts = eng.on_timeout_msg(&TimeoutMsg { index: 5, voter: "n2".into(), high_qc_index: 0, signature: Vec::new() });
         assert!(acts.iter().any(|a| *a == Action::EnterView(5)));
         assert_eq!(eng.current_index, 5);
+    }
+
+    fn timeouts_of(acts: &[Action]) -> Vec<u64> {
+        acts.iter().filter_map(|a| match a { Action::BroadcastTimeout(t) => Some(t.index), _ => None }).collect()
+    }
+
+    // Committee 8, quorum 6, six live. One member voted at view 5 and rebooted past it; the five left at
+    // 5 time out there. Without its timeout for 5 they hold five of six and nobody is f+1 ahead, for good.
+    #[test]
+    fn a_member_ahead_signs_the_view_it_left_and_the_tc_forms() {
+        let c = committee(8);
+        let mut ahead = CheckpointConsensus::new("n0".into(), c.clone());
+        ahead.restore_vote(5, 50, hh(5), false, 4, hh(4));
+        ahead.enter_first_votable_view();
+        assert_eq!(ahead.current_index, 6);
+        let mut stuck = CheckpointConsensus::new("n1".into(), c.clone());
+        stuck.current_index = 5;
+        let five: Vec<TimeoutMsg> = c[1..6].iter()
+            .map(|v| TimeoutMsg { index: 5, voter: v.clone(), high_qc_index: 4, signature: Vec::new() }).collect();
+        for tm in &five {
+            assert!(!stuck.on_timeout_msg(tm).iter().any(|a| matches!(a, Action::FormedTc(_))));
+        }
+        assert_eq!(stuck.current_index, 5, "five of six: no certificate, no jump");
+        // No helper before f+1 others are seen at the view.
+        assert_eq!(timeouts_of(&ahead.on_local_timeout()), vec![6]);
+        for tm in &five[..2] { ahead.on_timeout_msg(tm); }
+        assert_eq!(timeouts_of(&ahead.on_local_timeout()), vec![6], "two others are not f+1");
+        for tm in &five[2..] { ahead.on_timeout_msg(tm); }
+        let acts = ahead.on_local_timeout();
+        assert_eq!(timeouts_of(&acts), vec![5, 6], "the helper for 5 first, then its own view");
+        let helper = match &acts[0] { Action::BroadcastTimeout(t) => t.clone(), _ => unreachable!() };
+        let out = stuck.on_timeout_msg(&helper);
+        assert!(out.iter().any(|a| matches!(a, Action::FormedTc(t) if t.index == 5)), "the sixth timeout forms TC(5)");
+        assert_eq!(stuck.current_index, 6);
+        // The sender's own copy completes the quorum there too, below its view: it forms and relays no second
+        // certificate for 5, and nothing more is owed for 5.
+        assert!(!ahead.on_timeout_msg(&helper).iter().any(|a| matches!(a, Action::FormedTc(_))));
+        assert_eq!(ahead.current_index, 6, "a quorum below the view moves nothing");
+        assert_eq!(timeouts_of(&ahead.on_local_timeout()), vec![6]);
+    }
+
+    // A view this node left by adopting its certificate from a peer: its own tally reaching the quorum later forms
+    // no duplicate. At its own view the quorum forms exactly one certificate, and later timeouts add none.
+    #[test]
+    fn a_tc_forms_once_and_never_for_a_view_left() {
+        let c = committee(4); // quorum 3
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        let tm = |i: u64, v: &str| TimeoutMsg { index: i, voter: v.to_string(), high_qc_index: 0, signature: Vec::new() };
+        assert!(eng.on_timeout_cert(&TimeoutCertificate {
+            index: 1, timeouts: vec![tm(1, "n1"), tm(1, "n2"), tm(1, "n3")], high_qc: None,
+        }).iter().any(|a| *a == Action::EnterView(2)));
+        for v in ["n1", "n2", "n3"] {
+            assert!(!eng.on_timeout_msg(&tm(1, v)).iter().any(|a| matches!(a, Action::FormedTc(_))), "no TC for view 1 again");
+        }
+        assert_eq!(eng.current_index, 2);
+        let formed: usize = ["n1", "n2", "n3", "n0"].iter()
+            .map(|v| eng.on_timeout_msg(&tm(2, v)).iter().filter(|a| matches!(a, Action::FormedTc(t) if t.index == 2)).count())
+            .sum();
+        assert_eq!(formed, 1, "one certificate at the quorum-crossing timeout");
+        assert_eq!(eng.current_index, 3);
+    }
+
+    // No helper for a view this member already signed, nor for one a held certificate covers.
+    #[test]
+    fn no_helper_for_a_signed_or_certified_view() {
+        let c = committee(8);
+        let tmo = |v: &str, i: u64| TimeoutMsg { index: i, voter: v.into(), high_qc_index: 0, signature: Vec::new() };
+        let mut signed = CheckpointConsensus::new("n0".into(), c.clone());
+        signed.current_index = 5;
+        for v in &c[..4] { signed.on_timeout_msg(&tmo(v, 5)); }
+        signed.current_index = 6;
+        assert_eq!(timeouts_of(&signed.on_local_timeout()), vec![6], "its own timeout for 5 is in the tally");
+        let mut covered = CheckpointConsensus::new("n0".into(), c.clone());
+        covered.current_index = 5;
+        for v in &c[1..4] { covered.on_timeout_msg(&tmo(v, 5)); }
+        let tc = TimeoutCertificate { index: 5, timeouts: c[1..7].iter().map(|v| tmo(v, 5)).collect(), high_qc: None };
+        covered.on_timeout_cert(&tc);
+        assert_eq!(covered.current_index, 6);
+        assert_eq!(timeouts_of(&covered.on_local_timeout()), vec![6], "TC(5) is held");
+        // Non-members do not count toward f+1.
+        let mut outside = CheckpointConsensus::new("n0".into(), c.clone());
+        outside.current_index = 5;
+        for v in ["x1", "x2", "n1"] { outside.on_timeout_msg(&tmo(v, 5)); }
+        outside.current_index = 6;
+        assert_eq!(timeouts_of(&outside.on_local_timeout()), vec![6]);
     }
 
     #[test]

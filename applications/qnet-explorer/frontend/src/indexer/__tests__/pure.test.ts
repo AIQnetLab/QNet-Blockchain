@@ -3,7 +3,12 @@ import * as assert from 'node:assert/strict';
 import { quoteBigInts, uintString, transformTransaction, batchRowsOf, shapeBlock, blockRowFromHeader, toMs, merkleRootOf, SLOT_GAP_REANCHOR_GATE_HEIGHT } from '../transform';
 import { insertBatchTransfers, insertTransactions, insertBlocks, deltaOf, negate, mergeDelta } from '../sql';
 import { ranges, dedupeHeaders, flushGroups, FLUSH_BLOCKS, FLUSH_BATCH_ROWS } from '../chain';
-import { pickNetworkHeight, reduceHeaderViews, archiveFloor, HEIGHT_SLACK } from '../node-client';
+import { pickNetworkHeight, reduceHeaderViews, archiveFloor, HEIGHT_SLACK, NodeClient, wsRetryDelay, wsRefusalBackoff, retryAfterMs, nextWsEndpoint,
+  WS_RETRY_MAX_MS, WS_REFUSED_MIN_MS, WS_REFUSED_MAX_MS } from '../node-client';
+import { TOP_BLOCK_SQL } from '../sql';
+import * as http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { WebSocketServer } from 'ws';
 
 // A u64 amount above 2^53 survives the JSON hop exactly: quoted before parse, kept as a digit string.
 test('wide integers never pass through a double', () => {
@@ -238,4 +243,81 @@ test('archive reach needs as many archives as an agreed body', () => {
   assert.equal(archiveFloor([1_382_400, null, 0, 1_396_800, 14_400], 3), 1_382_400);
   assert.equal(archiveFloor([1_382_400, null, 1_382_400, null, null], 3), Number.POSITIVE_INFINITY);
   assert.equal(archiveFloor([], 1), Number.POSITIVE_INFINITY);
+});
+
+// The subscription's waits: exponential from 1 s and jittered between half and all of the step, capped at five minutes.
+test('subscription retries grow with jitter and stop at the cap', () => {
+  assert.equal(wsRetryDelay(0, () => 0), 500);
+  assert.equal(wsRetryDelay(0, () => 1), 1_000);
+  assert.equal(wsRetryDelay(3, () => 0.5), 6_000);
+  assert.equal(wsRetryDelay(40, () => 1), WS_RETRY_MAX_MS);
+  assert.equal(wsRetryDelay(40, () => 0), WS_RETRY_MAX_MS / 2);
+  for (let n = 0; n < 12; n++) {
+    const d = wsRetryDelay(n);
+    const step = Math.min(WS_RETRY_MAX_MS, 1_000 * 2 ** n);
+    assert.ok(d >= step / 2 && d <= step, `${n}: ${d}`);
+  }
+});
+
+// A node out of subscription slots answers the upgrade with 429: it is left alone for a minute or more, doubling per
+// refusal in a row, never less than its Retry-After and never past the cap.
+test('a refused upgrade backs that endpoint off, honouring Retry-After', () => {
+  assert.equal(wsRefusalBackoff(1, null, () => 0), WS_REFUSED_MIN_MS / 2);
+  assert.equal(wsRefusalBackoff(1, null, () => 1), WS_REFUSED_MIN_MS);
+  assert.equal(wsRefusalBackoff(3, null, () => 1), 4 * WS_REFUSED_MIN_MS);
+  assert.equal(wsRefusalBackoff(30, null, () => 1), WS_REFUSED_MAX_MS);
+  assert.equal(wsRefusalBackoff(1, 400_000, () => 0), 400_000);
+  assert.equal(wsRefusalBackoff(1, 10_000_000, () => 0), WS_REFUSED_MAX_MS, 'a Retry-After cannot park the subscription for good');
+  assert.equal(retryAfterMs('120'), 120_000);
+  assert.equal(retryAfterMs(['7']), 7_000);
+  assert.equal(retryAfterMs(new Date(1_000_000 + 30_000).toUTCString(), 1_000_000), 30_000);
+  assert.equal(retryAfterMs(undefined), null);
+  assert.equal(retryAfterMs('soon'), null);
+  const refused = new Map([['a', 50_000], ['b', 20_000]]);
+  assert.deepEqual(nextWsEndpoint(['a', 'b', 'c'], refused, 0, 10_000), { endpoint: 'c' });
+  assert.deepEqual(nextWsEndpoint(['a', 'b'], refused, 0, 10_000), { waitMs: 10_000 }, 'every endpoint refused: wait for the first to lapse');
+  assert.deepEqual(nextWsEndpoint(['a', 'b'], refused, 1, 30_000), { endpoint: 'b' });
+});
+
+// Real sockets against local servers: the subscription neither hammers a node that refuses it nor reopens a socket
+// every second when sockets open and drop without a tip block (what a halted chain looks like).
+async function countUpgrades(serve: (server: http.Server, count: () => void) => void, windowMs: number): Promise<number> {
+  let upgrades = 0;
+  const servers = [http.createServer(), http.createServer()];
+  for (const s of servers) {
+    serve(s, () => { upgrades += 1; });
+    await new Promise<void>(r => s.listen(0, '127.0.0.1', () => r()));
+  }
+  const before = process.env.QNET_API_URLS;
+  process.env.QNET_API_URLS = servers.map(s => `http://127.0.0.1:${(s.address() as AddressInfo).port}`).join(',');
+  const client = new NodeClient();
+  if (before === undefined) delete process.env.QNET_API_URLS; else process.env.QNET_API_URLS = before;
+  const stop = client.subscribe(() => undefined, () => undefined);
+  await new Promise(r => setTimeout(r, windowMs));
+  stop();
+  for (const s of servers) { s.closeAllConnections(); await new Promise(r => s.close(r)); }
+  return upgrades;
+}
+
+test('a node answering 429 is asked once, then left alone', async () => {
+  const n = await countUpgrades((s, count) => s.on('upgrade', (_req, socket) => {
+    count();
+    socket.end('HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+  }), 3_500);
+  assert.equal(n, 2, 'one attempt per endpoint, then the wait of the first refusal (at least 30 s)');
+});
+
+test('sockets dropped before any tip block reconnect slower and slower', async () => {
+  const n = await countUpgrades((s, count) => {
+    const wss = new WebSocketServer({ server: s });
+    wss.on('connection', ws => { count(); ws.close(1000); });
+    s.on('close', () => wss.close());
+  }, 5_000);
+  // Waits of 0.5–1, 1–2, 2–4 s: at most four sockets in five seconds (a reset at every open made one a second).
+  assert.ok(n >= 2 && n <= 4, `${n} sockets`);
+});
+
+// After a restart or a reorg the head is the highest block by number: ordered by the text column, '999999' beat 3508200.
+test('the head query orders by the height column, not its text', () => {
+  assert.match(TOP_BLOCK_SQL, /SELECT height::text, hash, timestamp::text FROM blocks ORDER BY blocks\.height DESC LIMIT 1/);
 });

@@ -86,10 +86,9 @@ export function genesisResponseUrl(url) {
 export const EXPLORER_API = 'https://aiqnet.io';
 
 /**
- * Public page of one transaction. One source, so a moved path is changed in one place. It opens in the system
- * browser with the site's app marker (?from=app), so the site shows its app view there, whose header leads only to
- * the explorer and the policies: no activation, payment, extension or APK page is a few taps from a store build's
- * history row or result card (R3-XPD-01).
+ * Public page of one transaction. One source, so a moved path is changed in one place. It opens in the system browser,
+ * an ordinary visit to the site; the `from=app` query only names where the visit came from, and the site shows the same
+ * page with or without it.
  */
 export const explorerTxUrl = (hash) => `${EXPLORER_API}/explorer/tx/${encodeURIComponent(hash || '')}?from=app`;
 

@@ -4,6 +4,8 @@
 // The new phrase is copied only by its own Copy button, with the warning next to it; there is no download.
 // While the wallet an earlier version of this extension kept is in this browser (M-4), the first screen offers to unlock
 // it with its password and move it into this version (vault.migrate), or to use the recovery phrase instead (Import).
+// The popup's first screen opens it straight at Create or Import (?flow=create, ?flow=import: owner, 11.10); without a
+// flow it starts at that first screen.
 import * as core from '../lib/qnet-core.js';
 import { DEFAULT_LANGUAGE, TIMINGS, languageForTag } from '../background/config.js';
 import {
@@ -44,6 +46,8 @@ let backoffUntil = null;
 let hideSecrets = null;
 let revealTimer = null;
 let idleTimer = null;
+// The step the popup asked for (?flow=), taken once vault.status answered (a retry after a failed read keeps it).
+let requestedFlow = new URLSearchParams(location.search).get('flow');
 
 function show(node) {
   hideSecrets = null;
@@ -102,7 +106,8 @@ const normalizeWord = (word) => word.normalize('NFKD').trim().toLowerCase();
 
 /**
  * Entry. vault.status → exists: a notice that setup is closed while a wallet exists (the only way is
- * Settings → Delete wallet) and nothing else; otherwise the welcome screen.
+ * Settings → Delete wallet) and nothing else; otherwise the step the popup asked for (create or import), else the
+ * welcome screen.
  * @returns {Promise<void>}
  */
 async function boot() {
@@ -150,7 +155,11 @@ async function start() {
   }
   earlierWallet = status.earlier === true;
   backoffUntil = Number.isSafeInteger(status.backoffUntil) ? status.backoffUntil : null;
+  const flow = requestedFlow;
+  requestedFlow = null;
   if (status.exists) renderExists();
+  else if (flow === 'create') renderCreate();
+  else if (flow === 'import') renderImport();
   else renderWelcome();
 }
 

@@ -16,7 +16,7 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const { WalletManager } = require('../src/components/WalletManager');
 const Pending = require('../src/services/PendingTx');
 const { spendableNano, spendableTokenBase, previewShort } = require('../src/browser/dappProvider');
-const { unreadKey } = require('../src/browser/DappSheet');
+const { unreadKey, unreadText } = require('../src/browser/DappSheet');
 const { TRANSFER_FEE_NANO, STORAGE_DEPOSIT_NANO } = require('../src/config/fees');
 const lc = require('../src/crypto/QcLightClient');
 const { translate } = require('../src/i18n');
@@ -254,6 +254,12 @@ describe('the two messages: no answer, or not confirmed yet', () => {
     expect(unreadKey('transfer', { balanceProblem: 'unconfirmed' })).toBe('balance_unconfirmed');
     expect(unreadKey('transfer', { balanceProblem: 'unanswered' })).toBe('dapp_send_preview_failed');
     expect(unreadKey('tokenTransfer', { balanceProblem: null, tokenProblem: 'foreign' })).toBe('balance_foreign_pending');
+    // While a long lineage walk is why the balance is not confirmed, the sheet says how far it is.
+    const en = (k, p) => translate('en', k, p);
+    expect(unreadText(en, 'transfer', { balanceProblem: 'unconfirmed', walkSteps: 57 }))
+      .toBe('Checking the balance against QNet Blockchain: 57 steps left.');
+    expect(unreadText(en, 'transfer', { balanceProblem: 'unconfirmed', walkSteps: null })).toBe(translate('en', 'balance_unconfirmed'));
+    expect(unreadText(en, 'transfer', { balanceProblem: 'unanswered', walkSteps: 57 })).toBe(translate('en', 'dapp_send_preview_failed'));
     for (const lang of ['en', 'zh-CN', 'ru', 'es', 'ko', 'ja', 'pt', 'fr', 'de', 'ar', 'it']) {
       for (const key of ['balance_unconfirmed', 'balance_foreign_pending', 'send_balance_unreadable']) {
         expect(translate(lang, key)).not.toBe(key);
@@ -267,10 +273,11 @@ describe('the two messages: no answer, or not confirmed yet', () => {
   it('the Send form refuses with the reason the check gave, for QNC and for a token, and counts own unconfirmed sends', () => {
     const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     const send = ws.slice(ws.indexOf('const handleSendTransaction = async () => {'), ws.indexOf('const pressSend = async'));
-    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error\) \}\);/);
-    expect(send).toMatch(/error: sendCheckError\(held && held\.error\)/);
+    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error, qncCheck\.walkSteps\) \}\);/);
+    expect(send).toMatch(/error: sendCheckError\(held && held\.error, held && held\.walkSteps\)/);
     expect(send).toMatch(/spendable = afterPending\(qncNano, qncCheck\.pending, replaceNonce\);/);
     expect(send).toMatch(/const tokenLeft = afterPending\(held\.balanceBase, held\.pending, replaceNonce\);/);
-    expect(ws).toMatch(/const sendCheckError = \(error\) => t\(error === 'foreign' \? 'balance_foreign_pending'\s*: error === 'unconfirmed' \? 'balance_unconfirmed' : 'send_balance_unreadable'\);/);
+    // Not confirmed while a long lineage walk runs says how far it is instead (plan Part 3, item 6).
+    expect(ws).toMatch(/const sendCheckError = \(error, walkSteps\) => \{\s*if \(error === 'unconfirmed' && Number\.isSafeInteger\(walkSteps\) && walkSteps > 0\) return t\('balance_verifying_steps', \{ steps: walkSteps \}\);\s*return t\(error === 'foreign' \? 'balance_foreign_pending' : error === 'unconfirmed' \? 'balance_unconfirmed' : 'send_balance_unreadable'\);/);
   });
 });

@@ -678,7 +678,7 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
 
     // Beautiful quantum node startup banner
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
+    println!("🔮 QNet Blockchain node initialized");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
     println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium3 (ML-DSA-65) signatures + X25519Kyber768 (ML-KEM-768) hybrid TLS KEX");
@@ -2450,7 +2450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("     -p 8001:8001 -p 9876:9876 -p 9877:9877 \\");
         eprintln!("     qnet-production");
         eprintln!("");
-        eprintln!("📱 For mobile nodes, download the QNet app:");
+        eprintln!("📱 For mobile nodes, download QNet Wallet:");
         eprintln!("   iOS: App Store");
         eprintln!("   Android: Google Play");
         std::process::exit(1);
@@ -2491,7 +2491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("═══════════════════════════════════════════════════════════════════════════");
             eprintln!("[FATAL] System clock is set before 2024!");
             eprintln!("[FATAL] Current timestamp: {} (expected > {})", system_time, MIN_VALID_TIMESTAMP);
-            eprintln!("[FATAL] Please sync your system clock with NTP before running QNet.");
+            eprintln!("[FATAL] Please sync your system clock with NTP before running a QNet Blockchain node.");
             eprintln!("");
             eprintln!("  Linux:   sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd");
             eprintln!("  Docker:  Ensure host has NTP sync (containers inherit host time)");
@@ -2504,7 +2504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("═══════════════════════════════════════════════════════════════════════════");
             eprintln!("[FATAL] System clock is set too far in the future!");
             eprintln!("[FATAL] Current timestamp: {} (expected < {})", system_time, MAX_REASONABLE_TIMESTAMP);
-            eprintln!("[FATAL] Please sync your system clock with NTP before running QNet.");
+            eprintln!("[FATAL] Please sync your system clock with NTP before running a QNet Blockchain node.");
             eprintln!("═══════════════════════════════════════════════════════════════════════════");
             std::process::exit(1);
         }
@@ -2611,7 +2611,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🌐 Network: {}", network_config.network_name());
     println!("   Environment: {:?}", network_config.environment);
     println!("   Chain ID: {}", qnet_state::transaction::QNET_CHAIN_ID);
-    println!("   QNet RPC: {}", network_config.endpoints.qnet_rpc);
+    println!("   QNet Blockchain RPC: {}", network_config.endpoints.qnet_rpc);
     println!("   Bridge API: {}", network_config.endpoints.bridge_api);
     println!("   Solana RPC: {}", network_config.solana.rpc_url);
     println!("   1DEV Token: {}", network_config.solana.onedev_mint);
@@ -2651,7 +2651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Record quantum-secure activation in QNet blockchain before node start
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
-        println!("🔐 Recording quantum-secure activation in QNet blockchain...");
+        println!("🔐 Recording quantum-secure activation on QNet Blockchain...");
         
         // PRODUCTION v2.51: Initialize crypto if not yet done (Genesis nodes skip decode_activation_code)
         use qnet_integration::node::{init_global_quantum_crypto, try_get_quantum_crypto};
@@ -2671,7 +2671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Record in QNet blockchain (replaces database storage)
         quantum_crypto.record_activation_in_blockchain(&activation_code, &payload, &node_pubkey).await?;
         
-        println!("✅ Quantum activation recorded in QNet blockchain successfully");
+        println!("✅ Quantum activation recorded on QNet Blockchain successfully");
         println!("   📝 Node: {}", node_pubkey);
         println!("   🔐 Quantum-secure: CRYSTALS-Dilithium3 (NIST FIPS 204)");
         println!("   🚫 Database: Not used - blockchain is source of truth");
@@ -4060,7 +4060,7 @@ fn determine_region_from_ip(ip: &std::net::Ipv4Addr) -> Option<Region> {
 async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     let mut counts = RealNodeCounts::default();
     
-    println!("🔍 Scanning QNet decentralized network...");
+    println!("🔍 Scanning QNet Blockchain for active nodes...");
     println!("   🌐 Using quantum-resistant P2P discovery");
     println!("   ⚡ No centralized bootstrap nodes");
     
@@ -4475,7 +4475,7 @@ async fn get_peers_from_node(node_ip: &str) -> Result<Vec<String>, String> {
         }
     }
     
-    Err(format!("No active QNet API found on {}", node_ip))
+    Err(format!("No active QNet Blockchain node API found on {}", node_ip))
 }
 
 // QUANTUM DECENTRALIZED: File caching functions removed
@@ -4500,7 +4500,7 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
         println!("🚀 GENESIS NODE DETECTED - Auto-activating as Super Node");
         println!("   [BOOTSTRAP] Node ID: {}", std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("AUTO".to_string()));
         println!("   [TYPE] Super Node (Genesis Bootstrap)");
-        println!("   [NETWORK] Initializing new QNet blockchain network");
+        println!("   [NETWORK] Initializing a new QNet Blockchain network from genesis");
         
         let genesis_code = match generate_genesis_activation_code() {
             Ok(code) => {
@@ -4633,7 +4633,7 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
     eprintln!("    -v $(pwd)/node_data:/app/data \\");
     eprintln!("    qnet-production");
     eprintln!("");
-    eprintln!("Get activation data from QNet Mobile App: Settings > Export Activation Codes");
+    eprintln!("The Overview of aiqnet.io/node for this wallet shows the code, the burn and the amount.");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     std::process::exit(1);
 }

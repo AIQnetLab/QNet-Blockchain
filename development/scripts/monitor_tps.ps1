@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # Monitor TPS in real-time
 
-Write-Host "=== QNet TPS Monitor ===" -ForegroundColor Cyan
+Write-Host "=== QNet Blockchain TPS Monitor ===" -ForegroundColor Cyan
 
 $lastHeight = 0
 $lastTime = Get-Date

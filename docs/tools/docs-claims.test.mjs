@@ -6,6 +6,7 @@
 // Run: node --test docs/tools/docs-claims.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -252,9 +253,13 @@ test('SD-R2-13: the protocol names the app-access-risk verdict a licensed store 
 // DEV-R2-01: every rate-limit bucket the node defines has its row, with the node's numbers.
 test('DEV-R2-01: the rate-limit table is the node\'s ApiRateLimiter', () => {
   const rpc = read('development/qnet-integration/src/rpc/mod.rs');
+  // A bucket named by a constant (`certified_proofs::CERTIFIED_PROOF_BUCKET`, `galc_api::GALC_CAPSULE_BUCKET`) is read
+  // as that constant's value in its module.
+  const bucketName = (literal, module, constant) => literal
+    ?? read(`development/qnet-integration/src/rpc/${module}.rs`).match(new RegExp(`const ${constant}: &str = "([a-z_]+)";`))?.[1];
   const configs = new Map([...rpc.matchAll(
-    /configs\.insert\("([a-z_]+)"\.to_string\(\), RateLimitConfig \{\s*max_requests: (\w+),\s*window_seconds: (\d+),\s*block_duration: (\d+),?\s*\}\);/g,
-  )].map((m) => [m[1], { max: m[2], window: m[3], block: m[4] }]));
+    /configs\.insert\((?:"([a-z_]+)"|(certified_proofs|galc_api)::([A-Z_]+))\.to_string\(\), RateLimitConfig \{\s*max_requests: (\w+),\s*window_seconds: (\d+),\s*block_duration: (\d+),?\s*\}\);/g,
+  )].map((m) => [bucketName(m[1], m[2], m[3]), { max: m[4], window: m[5], block: m[6] }]));
   // Every bucket the node inserts is read, so a bucket in a shape this pattern misses fails here.
   const inserts = (rpc.match(/configs\.insert\(/g) ?? []).length;
   assert.ok(configs.size > 0 && configs.size === inserts, `${configs.size} of ${inserts} buckets read from mod.rs`);
@@ -391,12 +396,12 @@ test('DEV-R1-09, DEV-R1-10: the burn contract and the RPC reference name who bur
 // says so, and never that the page points the user to where activation happens.
 test('SITE-R1-08: the protocol describes the cabinet in the app as InAppGuard does it', () => {
   const guard = read('applications/qnet-explorer/frontend/src/components/InAppGuard.tsx');
-  assert.match(guard, /if \(inApp\) router\.replace\(keepFromApp\(IN_APP_HOME, fromApp\)\);/);
+  assert.match(guard, /if \(inApp\) router\.replace\(IN_APP_HOME\);/);
   assert.match(guard, /if \(inApp\) return null;/);
   assert.match(read('applications/qnet-explorer/frontend/src/lib/activate-view.ts'), /export const IN_APP_HOME = '\/explorer';/);
   const p = flat('docs/protocols/qnet-link-v1.md');
   assert.doesNotMatch(p, /open aiqnet\.io in the device's browser/);
-  assert.match(p, /there it renders nothing and replaces the route with `\/explorer` \(keeping the marker\), with no text about where or how to activate/);
+  assert.match(p, /there it renders nothing and replaces the route with `\/explorer`, with no text about where or how to activate/);
   for (const file of OFFICIAL) assert.doesNotMatch(flat(file), /says to open aiqnet\.io/, file);
 });
 
@@ -579,7 +584,8 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   const overview = label('nav_overview');
   const move = label('claim_with_app');
   // Where the cabinet shows each: the connect button on a phone, the button every request opens the app with, the
-  // tabs, the Device tab's button (only for a wallet with a node) and the Overview's move.
+  // tabs, the Device tab's button (only for a wallet with a node) and the Overview's move (of a light or a super node's
+  // balance, owner 12.10).
   const cabinet = (file) => read(`applications/qnet-explorer/frontend/src/components/cabinet/${file}`);
   assert.match(cabinet('WalletChoice.tsx'), /\{t\(device\.phone \? 'connect_app_here' : 'connect_app_qr'\)\}/);
   assert.match(cabinet('LinkWaiting.tsx'), /<a className="qnet-button activate-primary" href=\{href\} onClick=\{opened\}>\{t\('link_open_app'\)\}<\/a>/);
@@ -588,7 +594,9 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   assert.match(frame, /device: 'nav_device',/);
   // The same button reads "Move the node to another device" while a device is linked (owner, 30.09).
   assert.match(cabinet('LinkDevice.tsx'), /const title: MessageKey = move \? 'devices_move_title' : 'action_link_device';/);
-  assert.match(cabinet('LinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\{t\(title\)\}<\/button>/);
+  // The button reads `label`: the title, except the Overview's Offline action (relink).
+  assert.match(cabinet('LinkDevice.tsx'), /const label: MessageKey = relink \? \(device && !device\.phone \? 'relink_button_qr' : 'relink_button'\) : title;/);
+  assert.match(cabinet('LinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\{t\(label\)\}<\/button>/);
   const devices = cabinet('NodeDevices.tsx');
   assert.match(devices, /if \(s === 'none' \|\| s === 'pending'\) return <NoNode pending=\{s === 'pending'\} \/>;/);
   assert.match(devices, /<LinkDevice onLinked=/);
@@ -607,6 +615,9 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   assert.equal(label('unlink_button'), unlink);
   const demo = notes.match(/DEMO\. (.*)/)[1];
   assert.ok(demo.includes(`then with A open https://aiqnet.io/node in Safari: "${connect}" > "${open}" (sheet 1), ${device} > "${linkDevice}" > "${open}" (sheet 3), "${unlink}" (sheet 5)`), demo);
+  // The Overview's move of the node balance opens the claim sheet, which names the wallet's light or super node.
+  assert.ok(demo.includes(`"${unlink}" (sheet 5); ${overview} > "${move}" (sheet 4)`), demo);
+  assert.match(notes, /\(4\) "[^"]+" \(the light or super node the website names\)/);
   assert.ok(demo.includes(`"${label('act_start')}" > "${open}" (sheet 2), send the amounts, "${label('act_burn')}", "${label('act_link_open')}" > "${open}" (sheet 3 with consent)`), demo);
   const activate = cabinet('NodeActivate.tsx');
   for (const key of ['act_start', 'act_burn']) assert.ok(activate.includes(`{t('${key}')}`), key);
@@ -619,6 +630,7 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
     `open the ${device} tab, tap '${linkDevice}', then '${open}'`,
     `on the ${device} tab, '${unlink}', then '${open}'`,
     `On the ${overview}, with a node balance of 1 QNC or more, '${move}', then '${open}'`,
+    `'${sheet('node_title_light')}' with its id ('${sheet('node_title_super')}'`,
   ]) assert.ok(play.includes(step), step);
   assert.doesNotMatch(play, /Ask QNet Wallet|Devices > /);
 });
@@ -729,7 +741,7 @@ test('SD-R2-09: the refused in-app pages are listed in full', () => {
   assert.ok(paths.length >= 8, paths.join(','));
   assert.match(url, /return path === '\/' \|\| WALLET_ONLY_RE\.test\(path\);/);
   const places = {
-    'docs/developers/dapp-integration.md': flat('docs/developers/dapp-integration.md').match(/\| QNet app, in-app browser \|[^|]*\|/)[0],
+    'docs/developers/dapp-integration.md': flat('docs/developers/dapp-integration.md').match(/\| QNet Wallet app, in-app browser \|[^|]*\|/)[0],
     // DEVP-R3-05: the developers' starting page too.
     'docs/developers/overview.md': flat('docs/developers/overview.md').match(/Where a page finds a wallet:.*?instead \(/)[0],
     'docs/protocols/qnet-link-v1.md': flat('docs/protocols/qnet-link-v1.md').match(/9\. The app's screens name no price.*?in place of any page it refuses\./)[0],
@@ -937,6 +949,12 @@ test('R1, R6: the documents state the activation registry as the site runs it', 
   assert.ok(site('src/components/cabinet/NextSteps.tsx').includes('-e QNET_PRODUCTION=1 -e DOCKER_ENV=1'), 'the Overview fills in the docker run command');
 });
 
+test('the super reward share follows the consensus-admitted set from its gate', () => {
+  assert.match(flat('docs/architecture/consensus.md'), /\| `super_reward_admission` \| a Super node earns an epoch's operator share only inside that epoch's consensus-admitted set/);
+  assert.match(read('core/qnet-state/src/feature_gates.rs'), /pub const SUPER_REWARD_ADMISSION_GATE_HEIGHT: u64 = /);
+  assert.match(flat('docs/economics/overview.md'), /the claim path checks the proof against the certified root and the watermark, never membership/);
+});
+
 // The registration doors answer pages of the live site only: the sandbox's site origin is added by the sandbox's own
 // build of the node, never by the repository, and no official text names it.
 test('the node and the documents name no sandbox site among the registration origins', () => {
@@ -948,4 +966,53 @@ test('the node and the documents name no sandbox site among the registration ori
   for (const file of OFFICIAL) assert.doesNotMatch(read(file), /sbx\.aiqnet\.io/, file);
   assert.match(flat('docs/developers/rpc-api.md'), /Only requests with no `Origin` header, or from `https:\/\/aiqnet\.io`, `https:\/\/www\.aiqnet\.io` or any `chrome-extension:\/\/` or `moz-extension:\/\/` origin, are served/);
   assert.match(flat('docs/protocols/light-node-messages.md'), /whose `Origin` is not `https:\/\/aiqnet\.io`, `https:\/\/www\.aiqnet\.io` or a `chrome-extension:\/\/` or `moz-extension:\/\/` origin is answered 403/);
+});
+
+// Owner, 12.10: a light or a super node's balance moves through the site too, whichever way the wallet is connected:
+// the `claim` request and qnet_claimNodeBalance name the node, and the documents say so as the site, the extension and
+// the known answers have it.
+test('the claim names the node: QNet Link, the extension, the site and the node claim vectors agree', () => {
+  const run = spawnSync(process.execPath, ['docs/protocols/tools/node-claim-vectors.mjs', '--check'], { cwd: REPO, encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const vectors = JSON.parse(read('docs/protocols/node-claim.vectors.json'));
+  assert.deepEqual(vectors.constants.requestKeys, ['walletHash', 'nodeId']);
+  const p = flat('docs/protocols/qnet-link-v1.md');
+  assert.ok(p.includes('| `claim` | `{"walletHash": <16 lowercase hex>, "nodeId": <the wallet\'s light node id or super node id>}` |'));
+  assert.match(p, /\| `qnet_claimNodeBalance` \| `\{nodeId\}`: the wallet's light node id or super node id \(section 14\.4\) \|/);
+  assert.match(p, /\[`node-claim\.vectors\.json`\]\(node-claim\.vectors\.json\) holds the `claim` request that names the node/);
+  assert.doesNotMatch(p, /retired \(owner, 12\.10\)|asks the extension for no move/);
+  assert.match(flat('docs/protocols/light-node-messages.md'), /\| `S` \| the super node id: `super_node_` ‖ first 16 hex of BLAKE3\(`SUPER_NODE_PRIVACY_` ‖ `W`\)/);
+  // The site's request and the extension's method, as the documents name them.
+  const site = read('applications/qnet-explorer/frontend/src/lib/qnet-link.ts');
+  assert.match(site, /claim: \['walletHash', 'nodeId'\]/);
+  assert.match(site, /callProvider\(provider, 'qnet_claimNodeBalance', CLAIM_TIMEOUT_MS, \{ nodeId \}\)/);
+  const router = read('applications/qnet-wallet/dist/background/router.js');
+  assert.match(router, /qnet_claimNodeBalance: providerEntry\(\{ nodeId: F\.claimNodeId \}, null, isActivationOrigin\),/);
+  assert.match(flat('applications/qnet-wallet/CONTRACTS.md'), /46\. \(Superseded by decision 47 the same day\.\)/);
+  assert.match(flat('applications/qnet-wallet/CONTRACTS.md'), /47\. Owner decision of 2026-10-12, replacing decision 46:/);
+  // The extension's popup has no move of a node balance: only its approval window, at aiqnet.io's request.
+  assert.doesNotMatch(read('applications/qnet-wallet/dist/ui/popup.js'), /claimNodeBalance|apClaim|claimView|claimForSite/);
+  assert.match(flat('docs/applications/browser-wallet.md'), /Its own popup offers no move of a node balance/);
+  assert.match(flat('docs/applications/explorer.md'), /a `claim` request to QNet Wallet that names the wallet and the node/);
+});
+
+// Owner, 12.10: the documents name the system "QNet Blockchain" and in no other way, and quote the node's own texts.
+test('the documents name the system QNet Blockchain and quote the node texts that name it', () => {
+  const files = [...markdownUnder('docs'), 'README.md', 'applications/qnet-mobile/store-listing/README.md',
+    'applications/qnet-cli/README.md'];
+  const others = [/QNet[- ](test )?[Nn]etwork/, /QNet blockchain/, /QNet [Cc]hain\b/, /Quantum (Blockchain|Network)\b/,
+    /Post-Quantum Blockchain/];
+  for (const file of files) {
+    const text = flat(file);
+    assert.deepEqual(others.map((re) => re.exec(text)).filter(Boolean).map((m) => m[0]), [], file);
+  }
+  assert.match(read('README.md'), /^# QNet Blockchain\n\nQNet Blockchain is a post-quantum layer-1 blockchain\./);
+  assert.match(read('docs/README.md'), /^# QNet Blockchain documentation\n\nThis directory is the documentation set for QNet Blockchain:/);
+  // The wallet-has-node refusal and the start-up refusal, as the node words them.
+  const door = read('development/qnet-integration/src/rpc/registration_door.rs');
+  const walletHasNode = door.match(/pub\(crate\) const WALLET_HAS_NODE_TEXT: &str = "([^"]+)";/)[1];
+  assert.match(walletHasNode, /on QNet Blockchain: one wallet, one node$/);
+  assert.ok(flat('docs/developers/rpc-api.md').includes(`error: "${walletHasNode}", node_id}`));
+  assert.ok(read('development/qnet-integration/src/node/activation.rs').includes('"This wallet already has a {} node on QNet Blockchain ({}).'));
+  assert.ok(flat('docs/operators/running-a-node.md').includes('("This wallet already has a light node on QNet Blockchain (...)", naming the other node)'));
 });

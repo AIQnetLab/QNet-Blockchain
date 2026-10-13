@@ -25,10 +25,13 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<!-- Standard algorithms (ML-DSA-65 and SHA-3 in the app's own native module, PBKDF2 and AES-256-GCM in its bundled
-	     crypto library, X25519/HKDF/AES-256-GCM and Ed25519 in its JS crypto libraries), not taken from the OS: non-exempt
-	     in Apple's classification. Without this key every build stops at "Missing Compliance". -->
+	     crypto library, X25519/HKDF/AES-256-GCM and Ed25519 in its JS crypto libraries), not taken from the OS. App Store
+	     Connect's encryption questionnaire, answered "standard algorithms" and "not available in France", requires no
+	     export compliance documentation and has that declared here as NO; a YES build is refused at upload without the
+	     ITSEncryptionExportComplianceCode of approved documentation. Offering the app in France takes the French
+	     encryption declaration first, then YES with that code (store-listing/README.md). -->
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	<false/>
 	<!-- HTTPS only, no exceptions: every host the app talks to serves TLS, and node URLs that are not https are
 	     dropped before any request (src/config/nodes.js). -->
 	<key>NSAppTransportSecurity</key>

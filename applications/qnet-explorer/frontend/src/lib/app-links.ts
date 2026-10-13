@@ -14,6 +14,10 @@ const TEAM_ID_RE = /^[A-Z0-9]{10}$/;
 export const ANDROID_PLAY_PACKAGE = 'io.aiqnet.wallet';
 // The live Google Play listing of that package (owner, 05.10: accepted into the store).
 export const ANDROID_PLAY_URL = `https://play.google.com/store/apps/details?id=${ANDROID_PLAY_PACKAGE}`;
+// The iOS app's store listing (https://apps.apple.com/app/id<numeric app id>) once it is published; until then null, and
+// the footer shows the badge without a link (owner, 12.10: a badge never opens a placeholder). Setting it turns that
+// badge into the link.
+export const IOS_APP_STORE_URL: string | null = null;
 export const ANDROID_PLAY_CERT_SHA256: string | null = '2A:A5:A0:B0:40:DD:D2:50:3A:EA:28:BC:AC:8D:47:89:24:7D:8A:E4:7A:20:B4:9B:6A:C6:B1:E1:BE:7D:D0:4A';
 
 // iOS: the Apple Developer Team ID of Orrery Group LLC.

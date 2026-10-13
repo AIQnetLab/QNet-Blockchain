@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_LANGUAGE, RTL_LANGUAGES, SUPPORTED_LANGUAGES, languageForTag,
 } from '../dist/background/config.js';
-import { ERROR_MESSAGES } from '../dist/background/errors.js';
+import { ERROR_MESSAGES, UNSUPPORTED_PARAM_MESSAGE } from '../dist/background/errors.js';
 import { LANGUAGE_NAMES, loadMessages } from '../dist/ui/i18n/index.js';
 
 const WALLET = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -28,7 +28,7 @@ const CHROME_LOCALES = {
 
 // Words that stay as they are in every language, wherever the English text has them.
 const TOKENS = [
-  /\bQNet\b/g, /\bSolana\b/g, /\b1DEV\b/g, /\bQNC\b/g, /\bSOL\b/g, /aiqnet\.io/g, /\bQNET_[A-Z_]+\b/g, /\bSPL\b/g,
+  /\bQNet Blockchain\b/g, /\bQNet\b/g, /\bSolana\b/g, /\b1DEV\b/g, /\bQNC\b/g, /\bSOL\b/g, /aiqnet\.io/g, /\bQNET_[A-Z_]+\b/g, /\bSPL\b/g,
   /\bLight\b/g, /\bSuper\b/g,
 ];
 
@@ -148,6 +148,111 @@ describe('i18n: manifest strings', () => {
       }
       assert.ok(messages.extName.message.length <= 45, `${dir}: name`);
       assert.ok(messages.extDescription.message.length <= 132, `${dir}: description`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------- the system's name
+
+// The system is named QNet Blockchain, exactly so and untranslated, in every text a user reads. Any other QNet in a
+// text is a product name, QNet Wallet or QNet Link, written so in every language.
+const SYSTEM = 'QNet Blockchain';
+const PRODUCT = 'QNet Wallet';
+// Other names of the system, in any language.
+const BANNED = [
+  /QNet[\s\-‐‑]*(?:network|netzwerk|netz\b|chain|ネットワーク|ブロックチェーン|네트워크|블록체인|网络|区块链)/iu,
+  /(?:blockchain|réseau|\bred|\brete|\brede|netzwerk|network|сет[ьиюейя]|сетью|блокчейн[а-яё]*|شبكة|سلسلة\s*(?:ال)?كتل)\s+(?:(?:de|da|di|du|del|della|do|of|von|der)\s+)?(?:la\s+|the\s+)?QNet/iu,
+  /Quantum\s+(?:Blockchain|Network)/i,
+  /QNet[’']s\b/,
+];
+const LOCALE_LANGUAGE = Object.fromEntries(Object.entries(CHROME_LOCALES).flatMap(([code, dirs]) => dirs.map((dir) => [dir, code])));
+
+/** The problems of one text a user reads in the language `code`: a banned name, a misspelt QNet Blockchain, a bare QNet. */
+function nameProblems(code, text) {
+  const found = BANNED.filter((re) => re.test(text)).map((re) => `banned ${re}`);
+  for (const [spelt] of text.matchAll(/QNet[\s\-‐‑]*blockchain/giu)) {
+    if (spelt !== SYSTEM) found.push(`spelt "${spelt}"`);
+  }
+  const allowed = [/QNet Blockchain/g, /QNet Wallet/g, /QNet Link/g];
+  const rest = allowed.reduce((left, re) => left.replace(re, '\u0000'), text);
+  if (/QNet/.test(rest)) found.push('a bare QNet');
+  return found;
+}
+
+// English: "network" is a fee, the label Network, or a back-reference after QNet Blockchain in the same text.
+function strayNetwork(text) {
+  if (text === 'Network') return false;
+  const rest = text.replace(/\bnetwork fees?\b/gi, '\u0000');
+  return [...rest.matchAll(/\bnetwork\b/gi)].some((m) => !rest.slice(0, m.index).includes(SYSTEM));
+}
+
+// Japanese and Chinese: a space or a punctuation mark sets QNet Blockchain apart from the characters beside it, as it
+// does every Latin word of those tables.
+const SPACED_LANGUAGES = new Set(['ja', 'zh-CN']);
+const CJK = '[\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}]';
+const TIGHT_SYSTEM = new RegExp(`${CJK}${SYSTEM}|${SYSTEM}${CJK}`, 'u');
+
+describe('i18n: the system is QNet Blockchain', () => {
+  it('the checks catch the other names, a misspelling and a bare QNet', () => {
+    for (const [code, text] of [
+      ['en', 'Recorded on the QNet network.'], ['en', 'Recorded on the QNet blockchain.'], ['en', 'QNet did not answer.'],
+      ['en', 'A wallet for QNet.'], ['en', 'Quantum Blockchain Explorer'], ['en', 'QNet’s own coin'], ['de', 'In der QNet-Blockchain.'],
+      ['de', 'Das QNet-Netzwerk antwortet nicht.'], ['fr', 'Sur la blockchain QNet.'], ['fr', 'Le réseau QNet.'], ['es', 'En la red de QNet.'],
+      ['it', 'Sulla rete QNet.'], ['pt', 'Na rede da QNet.'], ['ru', 'В сети QNet.'], ['ru', 'В блокчейне QNet.'], ['ja', 'QNetネットワーク'],
+      ['ko', 'QNet 네트워크'], ['zh-CN', 'QNet 网络'], ['ar', 'على شبكة QNet'], ['ar', 'على سلسلة كتل QNet'],
+      ['en', 'Your QNet address.'], ['ru', 'Неверный адрес QNet.'], ['ru', 'Настройка QNet Кошелька'],
+      ['fr', 'Configurer le Portefeuille QNet'], ['de', 'Ihre QNet-Adresse'], ['es', 'Cartera QNet'], ['ja', 'QNet ウォレット'],
+    ]) {
+      assert.notDeepEqual(nameProblems(code, text), [], `${code}: ${text}`);
+    }
+    for (const [code, text] of [
+      ['en', 'Recorded on QNet Blockchain.'], ['en', 'Your QNet Blockchain address.'], ['en', 'Runs in QNet Wallet.'],
+      ['ru', 'Неверный адрес QNet Blockchain.'], ['ru', 'Настройка QNet Wallet'], ['fr', 'Configurer QNet Wallet'],
+      ['de', 'Ihre Adresse auf QNet Blockchain'],
+    ]) {
+      assert.deepEqual(nameProblems(code, text), [], `${code}: ${text}`);
+    }
+    assert.equal(strayNetwork('The network did not answer.'), true);
+    assert.equal(strayNetwork('Network fee'), false);
+    assert.equal(strayNetwork('Recorded on QNet Blockchain with another burn: not the one the network holds.'), false);
+    for (const tight of ['QNet Blockchainに記録', 'QNet Blockchain上', '记录在QNet Blockchain']) assert.match(tight, TIGHT_SYSTEM, tight);
+    for (const spaced of ['QNet Blockchain に記録', '在 QNet Blockchain 上', 'QNet Blockchain、Solana']) {
+      assert.doesNotMatch(spaced, TIGHT_SYSTEM, spaced);
+    }
+  });
+
+  it('every table names the system QNet Blockchain and nothing else', () => {
+    for (const [code, table] of Object.entries(TABLES)) {
+      for (const [key, text] of Object.entries(table)) {
+        assert.deepEqual(nameProblems(code, text), [], `${code}.${key}: ${text}`);
+        if (SPACED_LANGUAGES.has(code)) assert.doesNotMatch(text, TIGHT_SYSTEM, `${code}.${key}: ${text}`);
+      }
+      assert.equal(table.recordTitle, SYSTEM, `${code}.recordTitle`);
+      assert.equal(table.networkQnet, SYSTEM, `${code}.networkQnet`);
+      assert.equal(table.appName, PRODUCT, `${code}.appName`);
+      // no bare "QNet" title: the header shows the logo alone, the lock screen the product's name
+      assert.equal(table.appShortName, undefined, `${code}.appShortName`);
+    }
+    for (const [key, text] of Object.entries(EN)) assert.equal(strayNetwork(text), false, `en.${key}: ${text}`);
+  });
+
+  it('every manifest string per Chrome locale does too', async () => {
+    for (const dir of (await readdir(path.join(WALLET, 'dist/_locales'))).sort()) {
+      const messages = JSON.parse(await read(`dist/_locales/${dir}/messages.json`));
+      for (const [key, { message }] of Object.entries(messages)) {
+        assert.deepEqual(nameProblems(LOCALE_LANGUAGE[dir], message), [], `${dir}.${key}: ${message}`);
+        if (dir === 'en') assert.equal(strayNetwork(message), false, `${dir}.${key}: ${message}`);
+        if (SPACED_LANGUAGES.has(LOCALE_LANGUAGE[dir])) assert.doesNotMatch(message, TIGHT_SYSTEM, `${dir}.${key}: ${message}`);
+      }
+      assert.ok(messages.extDescription.message.includes(SYSTEM), `${dir}: the description names ${SYSTEM}`);
+      assert.equal(messages.extName.message, PRODUCT, `${dir}: the name`);
+    }
+  });
+
+  it('every worker error message does too', () => {
+    for (const [code, message] of Object.entries({ ...ERROR_MESSAGES, UNSUPPORTED_PARAM_MESSAGE })) {
+      assert.deepEqual(nameProblems('en', message), [], `${code}: ${message}`);
+      assert.equal(strayNetwork(message), false, `${code}: ${message}`);
     }
   });
 });

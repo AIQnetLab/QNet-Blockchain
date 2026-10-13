@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { hasKey } from '../i18n';
+import { InfoField, InfoRow } from '../components/InfoRow';
 import {
   openSession, prepareOffer, performIntent, deliverAnswer, markHandled, groupCheckNumber, LinkRefusal,
 } from '../services/QNetLink';
@@ -204,21 +205,12 @@ export default function QNetLinkScreen({
   // Google Play's licence dialog, on the builds that carry its text (Android).
   const licenceFix = (reason) => reason === 'device_unlicensed' && onPlayDialog && hasKey('node_play_licence');
 
-  const row = (label, value, key) => (
-    <View style={s.row} key={key || label}>
-      <Text style={s.rowLabel}>{label}</Text>
-      <Text style={s.mono} selectable>{value}</Text>
-    </View>
-  );
-
-  // A whole address on one line: the font shrinks to fit the card before anything would wrap or be cut. A larger
-  // system text size counts up to 1.2 times, so half of that size still holds the address on a 320 dp screen.
-  const addressRow = (label, value) => (
-    <View style={s.row} key={label}>
-      <Text style={s.rowLabel}>{label}</Text>
-      <Text style={s.mono} selectable numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5} maxFontSizeMultiplier={1.2} testID="link-address">{value}</Text>
-    </View>
-  );
+  // What the sheet shows, label by label (components/InfoRow). The node id and a whole address each sit on one line
+  // under their label, the font shrinking to fit the card before anything would wrap or be cut: a larger system text
+  // size counts up to 1.2 times, so half of that size still holds the address on a 320 dp screen. A date or an amount
+  // sits beside its label.
+  const nodeField = (value) => <InfoField label={t('link_node')} value={value} mono fit t={t} />;
+  const addressField = (label, value) => <InfoField label={label} value={value} mono fit t={t} testID="link-address" />;
 
   const button = (label, onPress, kind = 'primary', disabled = false, pressIn = undefined) => (
     <TouchableOpacity
@@ -260,8 +252,8 @@ export default function QNetLinkScreen({
       return (
         <>
           <Text style={s.text}>{t('link_connect_body')}</Text>
-          {addressRow(t('link_qnet_address'), o.addresses.qnet)}
-          {addressRow(t('link_solana_address'), o.addresses.solana)}
+          {addressField(t('link_qnet_address'), o.addresses.qnet)}
+          {addressField(t('link_solana_address'), o.addresses.solana)}
         </>
       );
     }
@@ -270,8 +262,8 @@ export default function QNetLinkScreen({
       return (
         <>
           <Text style={s.text}>{t('link_reserve_body')}</Text>
-          {row(t('link_node'), o.nodeId)}
-          {addressRow(t('link_wallet'), o.qnet)}
+          {nodeField(o.nodeId)}
+          {addressField(t('link_wallet'), o.qnet)}
         </>
       );
     }
@@ -281,9 +273,9 @@ export default function QNetLinkScreen({
       return (
         <>
           <Text style={s.text}>{t('link_unlink_wallet_body')}</Text>
-          {row(t('link_node'), o.nodeId)}
-          {addressRow(t('link_wallet'), o.qnet)}
-          {Number.isSafeInteger(o.since) ? row(t('link_unlink_linked_since'), dayText(o.since)) : null}
+          {nodeField(o.nodeId)}
+          {addressField(t('link_wallet'), o.qnet)}
+          {Number.isSafeInteger(o.since) ? <InfoRow label={t('link_unlink_linked_since')} value={dayText(o.since)} ltr /> : null}
         </>
       );
     }
@@ -292,9 +284,9 @@ export default function QNetLinkScreen({
       return (
         <>
           <Text style={s.text}>{t('link_unlink_body')}</Text>
-          {row(t('link_node'), o.nodeId)}
-          {addressRow(t('link_wallet'), o.qnet)}
-          {Number.isSafeInteger(o.since) ? row(t('link_unlink_since'), dayText(o.since)) : null}
+          {nodeField(o.nodeId)}
+          {addressField(t('link_wallet'), o.qnet)}
+          {Number.isSafeInteger(o.since) ? <InfoRow label={t('link_unlink_since')} value={dayText(o.since)} ltr /> : null}
         </>
       );
     }
@@ -302,18 +294,22 @@ export default function QNetLinkScreen({
       return (
         <>
           <Text style={s.text}>{t(o.mode === 'device' ? 'link_link_existing_body' : 'link_link_body')}</Text>
-          {row(t('link_node'), o.nodeId)}
-          {addressRow(t('link_wallet'), o.qnet)}
+          {nodeField(o.nodeId)}
+          {addressField(t('link_wallet'), o.qnet)}
           {o.switchFrom ? <Text style={s.warning}>{t('link_switch_other', { wallet: shortAddress(o.switchFrom) })}</Text> : null}
           {deviceBlock(o)}
         </>
       );
     }
+    // A move of the balance of the node the request names, this wallet's light or super node: its kind and id above the
+    // amount.
     return (
       <>
         {o.kind === 'claim' ? null : <Text style={s.text}>{t('link_claim_empty')}</Text>}
-        {o.kind === 'claim' ? row(t('link_claim_amount'), qncText(o.amountNano)) : null}
-        {addressRow(t('link_wallet'), o.qnet)}
+        <InfoField label={t(o.nodeType === 'super' ? 'node_title_super' : 'node_title_light')} value={o.nodeId} mono fit t={t}
+          testID="link-claim-node" />
+        {o.kind === 'claim' ? <InfoRow label={t('link_claim_amount')} value={qncText(o.amountNano)} ltr fit /> : null}
+        {addressField(t('link_wallet'), o.qnet)}
       </>
     );
   };
@@ -465,7 +461,7 @@ const s = StyleSheet.create({
   },
   scroll: { flexGrow: 1, justifyContent: 'center', padding: 16 },
   card: {
-    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 20,
+    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 16,
     borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
   },
   origin: { color: '#888888', fontSize: 13, textAlign: 'center', marginBottom: 6 },
@@ -477,10 +473,6 @@ const s = StyleSheet.create({
   hint: { color: '#888888', fontSize: 12, lineHeight: 17, marginTop: 6 },
   block: { marginTop: 4, marginBottom: 6 },
   check: { color: '#ffffff', fontSize: 20, fontWeight: '700', textAlign: 'center', marginVertical: 8 },
-  row: { marginBottom: 10 },
-  rowLabel: { color: '#888888', fontSize: 12, marginBottom: 2 },
-  // Addresses and hashes stay left-to-right in every language.
-  mono: { color: '#ffffff', fontSize: 13, fontFamily: 'monospace', writingDirection: 'ltr', textAlign: 'left' },
   busy: { alignItems: 'center', paddingVertical: 12, gap: 10 },
   actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   button: {

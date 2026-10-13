@@ -26,7 +26,7 @@ const SECRET_INPUT_ATTRIBUTES = Object.freeze({
 export class UiError extends Error {
   /**
    * @param {string} code an ERROR_MESSAGES key
-   * @param {{message?: string, retryAfterMs?: number, field?: string}} [details]
+   * @param {{message?: string, retryAfterMs?: number, field?: string, walkSteps?: number}} [details]
    */
   constructor(code, details = {}) {
     super(typeof details.message === 'string' ? details.message : code);
@@ -34,6 +34,7 @@ export class UiError extends Error {
     this.code = code;
     if (Number.isSafeInteger(details.retryAfterMs)) this.retryAfterMs = details.retryAfterMs;
     if (typeof details.field === 'string') this.field = details.field;
+    if (Number.isSafeInteger(details.walkSteps) && details.walkSteps > 0) this.walkSteps = details.walkSteps;
   }
 }
 
@@ -376,11 +377,17 @@ export function holdToReveal(control, target, secret, options = {}) {
   return dispose;
 }
 
+// The steps setup opens at when the popup names one (setup.html?flow=).
+const SETUP_FLOWS = Object.freeze(['create', 'import']);
+
 /**
- * Opens ui/setup.html in a tab (chrome.tabs.create needs no permission) and closes the popup.
+ * Opens ui/setup.html in a tab (chrome.tabs.create needs no permission) and closes the popup. With `flow` 'create' or
+ * 'import' setup opens straight at that step; without one, at its first screen.
+ * @param {'create'|'import'|null} [flow]
  * @returns {Promise<void>}
  */
-export async function openSetup() {
-  await chrome.tabs.create({ url: chrome.runtime.getURL(UI_PAGES.setup) });
+export async function openSetup(flow = null) {
+  const query = SETUP_FLOWS.includes(flow) ? `?flow=${flow}` : '';
+  await chrome.tabs.create({ url: `${chrome.runtime.getURL(UI_PAGES.setup)}${query}` });
   window.close();
 }

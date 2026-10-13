@@ -1,28 +1,32 @@
 /**
  * The Node side of a QNet Link request (services/QNetLink prepareOffer and performIntent): what the sheets read before
- * the user decides (the node's status from its shard owners, whether this device can run a node, this device's binding,
- * the node balance) and the things a confirmed request does (the reservation of the light node for the page's one-time
- * address, consent and a pending binding, a binding of this device, the end of the node's binding, a move of the
- * balance). The wallet screen makes one for the open wallet; every wallet-key signature is made by its WalletManager.
+ * the user decides (the light node's status from its shard owners, whether the chain lists the wallet's super node,
+ * whether this device can run a node, this device's binding, the node balance) and the things a confirmed request does
+ * (the reservation of the light node for the page's one-time address, consent and a pending binding, a binding of this
+ * device, the end of the node's binding, a move of the balance of the node the request names, the wallet's light or
+ * super node). The wallet screen makes one for the open wallet; every wallet-key signature is made by its WalletManager.
  * The end of a binding this device holds is signed by the node's ping key here (PushService.stopLightNode); the end of
  * a binding another device holds, by the wallet key, from any device that has the wallet (`unlinkByWallet`).
  */
-import { postUnbind, readNodeStatus } from './LightNode';
+import { postUnbind, readNodeStatus, readServerNodeListed } from './LightNode';
 import {
   bindThisDevice, getPendingRewards, linkWithConsent, localBinding, localNode, signStatusWithPingKey, stopLightNode,
 } from './PushService';
 import { checkDevice } from './NodeDeviceKey';
 import { readNodeRecordState } from './NodeRecordRead';
+import { acceptedBalance } from './ClaimTransit';
+import { ownNodeType } from '../crypto/NodePreimages';
 
 const TX_HASH_RE = /^[0-9a-f]{64}$/;
 
-// The node balance (nanoQNC): the largest of three genesis answers, as the Node tab reads it (a claim is re-verified on
-// chain, so an honest node can only under-report). null when none answered.
-async function quorumBalance(nodeId) {
-  const answers = (await Promise.all(
+// The node balance (nanoQNC) from three genesis answers, as the Node tab reads it: the largest of those not behind the
+// wallet's last certified claim watermark `floor` (ClaimTransit.acceptedBalance: a node behind it still holds a moved
+// amount). null when none counts.
+async function quorumBalance(nodeId, floor = null) {
+  const answers = await Promise.all(
     Array.from({ length: 3 }, () => getPendingRewards(nodeId).catch(() => ({ success: false }))),
-  )).filter((r) => r && r.success && Number.isSafeInteger(r.pendingRewards));
-  return answers.length > 0 ? answers.reduce((m, r) => Math.max(m, r.pendingRewards), 0) : null;
+  );
+  return acceptedBalance(answers, floor);
 }
 
 // A move's outcome as the `claim` answer takes it (qnet-link-v1 section 14.7).
@@ -44,10 +48,16 @@ function claimAnswer(result) {
 /**
  * The actions for the open wallet: `walletManager` holds it and `credential` opens it (the password, or the screen
  * lock's secret); `serverNode` whether the wallet has a super or genesis node; `claimBusy()` whether a move of its node
- * balance is running on the Node tab; `onUnlinked()` runs once this device's binding ended (the Node tab reads again).
+ * balance is running on the Node tab or in transit; `onUnlinked()` runs once this device's binding ended (the Node tab
+ * reads again); `onClaimed(nodeId, result, balanceNano)` once the network took a move (claimRewards' `result`, from the
+ * node balance the sheet showed): the move is in transit from then on, as one from the Node tab (services/ClaimTransit);
+ * `claimFloor()` the wallet's last certified claim watermark (null: none known), which the balance read is judged by.
+ * The node balance, a move running and a move in transit are the wallet's, whichever of its node ids a move names: one
+ * started for the super node holds a move of the light node's balance too, and the reverse.
  */
 export function nodeLinkActions({
-  walletManager, credential, serverNode = false, claimBusy = () => false, onUnlinked = () => {},
+  walletManager, credential, serverNode = false, claimBusy = () => false, onUnlinked = () => {}, onClaimed = () => {},
+  claimFloor = () => null,
 }) {
   let moving = false;
   const walletStatus = (nodeId) => readNodeStatus(nodeId, { signStatus: (id, ts) => walletManager.signNodeStatus(credential, id, ts) });
@@ -81,6 +91,8 @@ export function nodeLinkActions({
     // aiqnet.io's record of the wallet's burn ({ state, nodeType }), null when it cannot be read (NodeRecordRead).
     record: (qnet) => readNodeRecordState(qnet).catch(() => null),
     status: (nodeId) => readNodeStatus(nodeId),
+    // Whether the chain lists the wallet's super node, as two genesis nodes say alike (true, false, or null).
+    serverListed: (nodeId) => readServerNodeListed(nodeId).catch(() => null),
     // The status signed with this device's ping key, which tells whether the network names this device's binding.
     pingStatus: (nodeId) => readNodeStatus(nodeId, { signStatus: signStatusWithPingKey }),
     device: () => checkDevice().catch(() => ({ capable: false, reason: 'device_unsupported' })),
@@ -115,7 +127,7 @@ export function nodeLinkActions({
         onUnlinked();
       }
     },
-    balance: quorumBalance,
+    balance: (nodeId) => quorumBalance(nodeId, claimFloor()),
     claimBusy: () => moving || claimBusy(),
     reserve: ({ burner, time }) => walletManager.signNodeReservation(credential, { burner, time }),
     // `burner`: the wallet's own Solana address that made the burn, whose key signs its owner bind with the consent.
@@ -123,11 +135,20 @@ export function nodeLinkActions({
       signer: walletManager, credential, nodeId, burnTx, burner, device, features, interactive: true,
     }),
     useDevice: ({ nodeId, device }) => bindThisDevice({ signer: walletManager, credential, nodeId, device, interactive: true }),
+    // The move of the balance of the node the request names: the wallet's light or super node, whose id the quote the
+    // wallet key signs and the claim both carry (claimRewards); any other id is refused before anything is signed.
     claim: async ({ nodeId, qnet, amountNano }) => {
+      const nodeType = ownNodeType(nodeId, qnet);
+      if (nodeType === null) return { status: 'error', error: 'WALLET_MISMATCH' };
       if (moving || claimBusy()) return { status: 'error', error: 'CLAIM_BUSY' };
       moving = true;
       try {
-        return claimAnswer(await walletManager.claimRewards('light', qnet, credential, amountNano, nodeId));
+        const result = await walletManager.claimRewards(nodeType, qnet, credential, amountNano, nodeId);
+        const answer = claimAnswer(result);
+        if (answer.status === 'ok') {
+          try { onClaimed(nodeId, result, amountNano); } catch (_) { /* the screen's record never changes the answer */ }
+        }
+        return answer;
       } catch (e) {
         // No answer in time: the move may have gone through, and the site reads the chain for it. The wire says NETWORK
         // (the protocol has no code for an unknown outcome); `unknown` tells this device's screen never to say that

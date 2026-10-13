@@ -59,6 +59,15 @@ const WS_EVENT_SILENCE_MS = 45_000;  // no tip block for this long ⇒ the socke
 const WS_MAX_EVENTS_PER_SEC = 500;   // a socket streaming faster than any replay is torn down
 const FANOUT_GRACE_MS = 6_000;       // after a quorum answered, how long the rest may take
 export const HEIGHT_SLACK = 600;     // a single source may lead the agreed network height by this much
+// Subscription retries. Every socket a node accepts holds one of its subscription slots until the node notices the
+// close, so a retry loop that opens sockets faster than that fills the node up: the waits grow until a socket has
+// delivered a tip block, not merely opened (on a halted chain every socket is dropped as silent).
+export const WS_RETRY_BASE_MS = 1_000;
+export const WS_RETRY_MAX_MS = 300_000;
+// An upgrade refused with 429/503: the node is out of subscription slots. That node is left alone at least this long
+// (or its Retry-After), doubling per refusal in a row; the other endpoints are tried meanwhile.
+export const WS_REFUSED_MIN_MS = 60_000;
+export const WS_REFUSED_MAX_MS = 900_000;
 
 // The network height from per-endpoint answers: the quorum-th highest, so no minority can inflate it
 // and a lagging node cannot deflate it. Below a quorum of answers there is nothing to lean on and the
@@ -67,6 +76,30 @@ export function pickNetworkHeight(values: number[], quorum: number): number {
   const ok = values.filter(h => Number.isSafeInteger(h) && h >= 0).sort((a, b) => b - a);
   if (ok.length === 0) return -1;
   return ok[Math.min(Math.max(quorum, 1), ok.length) - 1];
+}
+
+// Half fixed, half random: indexers restarted together do not come back in step.
+const jitter = (cap: number, rand: () => number): number => Math.round(cap / 2 + Math.min(Math.max(rand(), 0), 1) * cap / 2);
+
+/// The wait before the next subscription attempt after `failures` attempts without a tip block.
+export function wsRetryDelay(failures: number, rand: () => number = Math.random): number {
+  return jitter(Math.min(WS_RETRY_MAX_MS, WS_RETRY_BASE_MS * 2 ** Math.min(Math.max(failures, 0), 20)), rand);
+}
+
+/// How long an endpoint that refused the upgrade `refusals` times in a row is not asked again: never less than its
+/// Retry-After, never more than WS_REFUSED_MAX_MS.
+export function wsRefusalBackoff(refusals: number, retryAfterMs: number | null, rand: () => number = Math.random): number {
+  const cap = Math.min(WS_REFUSED_MAX_MS, WS_REFUSED_MIN_MS * 2 ** Math.min(Math.max(refusals - 1, 0), 10));
+  return Math.min(WS_REFUSED_MAX_MS, Math.max(jitter(cap, rand), retryAfterMs ?? 0));
+}
+
+/// A Retry-After header (delta-seconds or an HTTP date) in ms from `now`, or null when absent or unreadable.
+export function retryAfterMs(header: string | string[] | undefined, now: number = Date.now()): number | null {
+  const v = (Array.isArray(header) ? header[0] : header)?.trim();
+  if (!v) return null;
+  if (/^\d{1,9}$/.test(v)) return Number(v) * 1000;
+  const at = Date.parse(v);
+  return Number.isFinite(at) ? Math.max(0, at - now) : null;
 }
 
 // The body up to `maxBytes`, aborting the stream past it; Content-Length is a claim, not a bound.
@@ -351,27 +384,32 @@ export class NodeClient {
     };
   }
 
-  // Block subscription: one socket at a time, exponential reconnect, and a watchdog that drops a
-  // socket delivering no TIP block for WS_EVENT_SILENCE_MS — a wedged node still answers pings and a
-  // replaying node streams old heights — so the subscription rotates to the next endpoint.
+  // Block subscription: one socket at a time, a jittered exponential reconnect (wsRetryDelay) reset only by a tip block,
+  // an endpoint that refuses the upgrade left alone for wsRefusalBackoff, and a watchdog that drops a socket delivering
+  // no TIP block for WS_EVENT_SILENCE_MS — a wedged node still answers pings and a replaying node streams old heights —
+  // so the subscription rotates to the next endpoint.
   subscribe(onBlock: (ev: NewBlockEvent) => void, onState: (connected: boolean, endpoint: string) => void): () => void {
     let stopped = false;
-    let delay = 1_000;
+    let failures = 0;
     let idx = 0;
     let hb: NodeJS.Timeout | null = null;
     let reconnectTimer: NodeJS.Timeout | null = null;
+    const refusedUntil = new Map<string, number>();
+    const refusals = new Map<string, number>();
 
     const clearHb = () => { if (hb) { clearInterval(hb); hb = null; } };
-    const scheduleReconnect = (why: string) => {
+    const scheduleReconnect = (why: string, waitMs?: number) => {
       if (stopped || reconnectTimer) return;
-      log.warn('NODE', 'ws_reconnect', { in_ms: delay, why });
-      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
-      delay = Math.min(delay * 2, 30_000);
+      const inMs = waitMs ?? wsRetryDelay(failures++);
+      log.warn('NODE', 'ws_reconnect', { in_ms: inMs, why });
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, inMs);
     };
     const connect = () => {
       if (stopped) return;
       const candidates = this.healthy().length > 0 ? this.healthy() : (this.admitted().length > 0 ? this.admitted() : this.endpoints);
-      const endpoint = candidates[idx++ % candidates.length];
+      const next = nextWsEndpoint(candidates, refusedUntil, idx++, Date.now());
+      if ('waitMs' in next) { scheduleReconnect('every endpoint refused the upgrade', next.waitMs); return; }
+      const endpoint = next.endpoint;
       const url = endpoint.replace(/^http/, 'ws') + '/ws/subscribe?channels=blocks';
       let sock: WebSocket;
       try { sock = new WebSocket(url, { headers: this.headers }); } catch (e) { scheduleReconnect(errText(e)); return; }
@@ -379,8 +417,23 @@ export class NodeClient {
       const opened = Date.now();
       let windowStart = opened;
       let windowEvents = 0;
+      let live = false;
+      sock.on('unexpected-response', (_req, res) => {
+        const status = res.statusCode ?? 0;
+        if (status === 429 || status === 503) {
+          const n = (refusals.get(endpoint) ?? 0) + 1;
+          refusals.set(endpoint, n);
+          const wait = wsRefusalBackoff(n, retryAfterMs(res.headers['retry-after']));
+          refusedUntil.set(endpoint, Date.now() + wait);
+          log.warn('NODE', 'ws_refused', { endpoint, status, refusals: n, retry_in_ms: wait });
+        } else {
+          log.warn('NODE', 'ws_unexpected_response', { endpoint, status });
+        }
+        sock.terminate();   // aborts the handshake: 'close' follows and schedules the next attempt
+      });
       sock.on('open', () => {
-        delay = 1_000;
+        refusals.delete(endpoint);
+        refusedUntil.delete(endpoint);
         this.wsEndpoint = endpoint;
         this.lastTipEventAt = 0;
         onState(true, endpoint);
@@ -413,7 +466,10 @@ export class NodeClient {
           return;
         }
         // Only a block at the network tip proves the source is live; a replay of old heights does not.
-        if (height >= this.maxSeen - 1) this.lastTipEventAt = now;
+        if (height >= this.maxSeen - 1) {
+          this.lastTipEventAt = now;
+          if (!live) { live = true; failures = 0; }
+        }
         this.noteHeight(height);
         onBlock({ height, hash: d.hash, timestamp: Number(d.timestamp) || 0, tx_count: Number(d.tx_count) || 0, producer: String(d.producer || ''), endpoint });
       });
@@ -434,6 +490,15 @@ export class NodeClient {
       if (this.wsSocket) { try { this.wsSocket.close(); } catch { /* closing */ } }
     };
   }
+}
+
+// The endpoint of subscription attempt `turn`: the next in rotation that has not refused an upgrade recently, or, when
+// every one has, how long until the first of them may be asked again.
+export function nextWsEndpoint(candidates: readonly string[], refusedUntil: ReadonlyMap<string, number>, turn: number, now: number): { endpoint: string } | { waitMs: number } {
+  const open = candidates.filter(e => (refusedUntil.get(e) ?? 0) <= now);
+  if (open.length > 0) return { endpoint: open[turn % open.length] };
+  if (candidates.length === 0) return { waitMs: WS_RETRY_BASE_MS };
+  return { waitMs: Math.max(WS_RETRY_BASE_MS, Math.min(...candidates.map(e => refusedUntil.get(e) ?? now)) - now) };
 }
 
 // The lowest height `honestOne` archives all reach: a body below the retention window is served by

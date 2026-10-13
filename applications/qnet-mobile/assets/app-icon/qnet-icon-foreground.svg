@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="disc" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="180.27"><stop offset="0" stop-color="#133c55"/><stop offset="0.971" stop-color="#211d41"/><stop offset="0.979" stop-color="#211d41"/><stop offset="1" stop-color="#211d41" stop-opacity="0"/></radialGradient>
+    <linearGradient id="outer" gradientUnits="userSpaceOnUse" x1="-347.04" y1="-347.04" x2="347.04" y2="347.04"><stop offset="0" stop-color="#00d4ff"/><stop offset="1" stop-color="#9e47ff"/></linearGradient>
+    <linearGradient id="q" gradientUnits="userSpaceOnUse" x1="-99.31" y1="-99.31" x2="99.31" y2="99.31"><stop offset="0" stop-color="#00d4ff"/><stop offset="0.5" stop-color="#9e47ff"/><stop offset="1" stop-color="#00a2de"/></linearGradient>
+    <linearGradient id="tail" gradientUnits="userSpaceOnUse" x1="58.3" y1="58.3" x2="99.49" y2="99.49"><stop offset="0" stop-color="#00d4ff"/><stop offset="0.5" stop-color="#9e47ff"/><stop offset="1" stop-color="#00b2eb"/></linearGradient>
+  </defs>
+  <g transform="translate(128 128) scale(0.75)">
+    <g transform="translate(512 512) scale(1 1)">
+      <circle r="248.16" fill="#22264e" fill-opacity="0.063"/>
+      <circle r="180.27" fill="url(#disc)"/>
+      <circle r="347.04" fill="none" stroke="url(#outer)" stroke-width="19.47"/>
+      <circle r="248.16" fill="none" stroke="#803ae1" stroke-width="13.39"/>
+      <circle r="99.31" fill="none" stroke="url(#q)" stroke-width="19.2"/>
+      <path d="M58.3 58.3L99.49 99.49" stroke="url(#tail)" stroke-width="18.67" stroke-linecap="round"/>
+      <circle cx="58.3" cy="58.3" r="9.33" fill="#00d4ff"/>
+    </g>
+  </g>
+</svg>

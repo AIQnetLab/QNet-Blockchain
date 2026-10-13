@@ -1022,6 +1022,8 @@ impl BlockchainNode {
                 // a stale-network capsule is rejected by the network_id check) so a restarted/dormant-
                 // return node roots + serves from it immediately. No-op on fresh genesis.
                 crate::galc::load_persisted(&galc_storage).await;
+                // The wallet capsule (v2) the same way; the route checks it binds before serving.
+                crate::galc::load_persisted_v2(&galc_storage).await;
                 let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(15));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -3349,9 +3351,31 @@ impl BlockchainNode {
                 // cache divergence (the v22 root cause of the h=4742 fork) is
                 // structurally impossible after this commit. Cache the ABSOLUTE round (matches the
                 // election above and the A1 gate's block.timeout_round+carried_baseline reconstruction).
-                cache_expected_producer(next_block_height, &current_producer, certified_abs);
+                // Node policy (election_abstain_reason): an election made from a seal the network moved past is no
+                // authority here, so nothing is cached and ingest takes the soft path for the slot.
+                let local_seal = storage.last_sealed_mb_index();
+                let frozen_here = next_block_height > GENESIS_STATIC_ROSTER_LAST_HEIGHT
+                    && Self::roster_mode(&storage, window_of_height(next_block_height)) == RosterMode::Frozen;
+                let abstain = election_abstain_reason(
+                    next_block_height, local_seal,
+                    local_seal.saturating_mul(90).max(qc_verified_frontier_cached()),
+                    LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst), frozen_here);
+                cache_expected_producer(next_block_height,
+                                        if abstain.is_some() { "" } else { current_producer.as_str() }, certified_abs);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
+                if abstain == Some("seal_behind_finality") {
+                    // No production only on proof that peers sealed past this node's seal; a seal lagging on every
+                    // node at once keeps A1 production, whose later commits are what release a held seal.
+                    let peers_sealed = peer_sealed_past(local_seal);
+                    static ABSTAIN_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    if ABSTAIN_NOTED.swap(next_block_height, Ordering::Relaxed) != next_block_height && is_warn() {
+                        println!("[WARN][PROD] election_abstain h={} reason=seal_behind_finality sealed={} finalized={} elected={} peers_sealed_past={}",
+                                 next_block_height, local_seal, LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst), current_producer, peers_sealed);
+                    }
+                    if peers_sealed { is_my_turn_to_produce = false; }
+                    crate::sync_manager::nudge_sync_check();
+                }
 
                 // A tip block stamped with a failover round above what this node certified proves a
                 // certificate it has not adopted; electing on the lower round makes it the leader of a
@@ -4394,6 +4418,15 @@ impl BlockchainNode {
                                 return (hash, tx, ok, if ok { None } else { Some("heartbeat_stale_or_bad_anchor".to_string()) });
                             }
                             let is_benchmark = benchmark_mode_enabled && tx.from.starts_with("EON1benchmark");
+                            // A claim naming an epoch the wallet already claimed would land as a partial or empty
+                            // credit: drop it from the pool (node policy; such a block stays valid).
+                            if tx.is_merkle_reward_claim() {
+                                let stale = tx.to.as_ref().map_or(true, |w|
+                                    Self::claim_is_stale(&tx, state_snapshot.get_last_claimed_epoch(w)));
+                                if stale {
+                                    return (hash, tx, false, Some("claim_stale".to_string()));
+                                }
+                            }
                             
                             // v2.66: System TX bypass nonce/balance validation (like submit_transaction)
                             // v2.71: NodeRegistration TX also bypasses (nonce=0, gas=0, no balance needed)
@@ -4636,6 +4669,14 @@ impl BlockchainNode {
                             kept.push(tx);
                         }
                         txs = kept;
+                    }
+                    // One merkle claim per wallet: a second credits only what the first leaves.
+                    {
+                        let (kept, dropped) = Self::keep_first_claim_per_wallet(txs);
+                        txs = kept;
+                        if dropped > 0 && is_info() {
+                            println!("[INFO][PRODUCER] claim_dropped reason=one_per_wallet count={}", dropped);
+                        }
                     }
                     // From the wallet_one_node gate: one registration per wallet, the first kept in lane order, so
                     // the block never carries the pair validators reject (same_block_wallet_conflict).

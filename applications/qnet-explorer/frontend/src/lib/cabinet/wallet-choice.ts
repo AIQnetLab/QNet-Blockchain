@@ -6,8 +6,9 @@ import { isEonAddress, isSolanaAddress, type WalletAccounts, type WalletChannel 
 import { lightNodeId, walletHash } from '../qnet-link.ts';
 
 // extension: qnet_requestAccounts, or qnet_accounts once the extension approved this site (extensionReconnect);
-// entered: typed by the visitor; app: a QNet Link `connect` opened on this device; app-qr: a `connect` shown as a QR
-// code, which anyone who saw the code could have answered.
+// entered: an address typed only to look (a view, never a connection, never remembered as the wallet); app: a QNet
+// Link `connect` opened on this device; app-qr: a `connect` shown as a QR code, which anyone who saw the code could
+// have answered.
 export const WALLET_SOURCES = ['extension', 'entered', 'app', 'app-qr'] as const;
 export type WalletSource = (typeof WALLET_SOURCES)[number];
 
@@ -44,7 +45,9 @@ export function parseChoice(text: string | null | undefined): WalletChoice | nul
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
     const { qnet, source, solana, ...rest } = value as Record<string, unknown>;
     if (Object.keys(rest).length > 0 || !isEonAddress(qnet) || !(WALLET_SOURCES as readonly unknown[]).includes(source)) return null;
-    if (solana !== undefined && (!isSolanaAddress(solana) || source === 'entered')) return null;
+    // A typed address is a view (VIEW_KEY): one kept here before is no connected wallet.
+    if (source === 'entered') return null;
+    if (solana !== undefined && !isSolanaAddress(solana)) return null;
     return solana === undefined ? { qnet, source: source as WalletSource } : { qnet, source: source as WalletSource, solana };
   } catch {
     return null;
@@ -97,6 +100,28 @@ export function saveDisconnected(storage: Pick<Storage, 'setItem' | 'removeItem'
   }
 }
 
+// An address typed only to look (View by address): kept for this tab alone (sessionStorage), apart from the connected
+// wallet, so the header never shows it and no other tab sees it; a wallet connected with a tap ends it.
+export const VIEW_KEY = 'qnet.cabinet.view';
+
+export function loadViewing(storage: Pick<Storage, 'getItem'> | null | undefined): string | null {
+  try {
+    const value = storage?.getItem(VIEW_KEY);
+    return isEonAddress(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveViewing(storage: Pick<Storage, 'setItem' | 'removeItem'> | null | undefined, qnet: string | null): void {
+  try {
+    if (qnet) storage?.setItem(VIEW_KEY, qnet);
+    else storage?.removeItem(VIEW_KEY);
+  } catch {
+    // storage blocked: the view lasts for this page only
+  }
+}
+
 // The wallet the cabinet takes up by itself from the QNet extension, or null for no change. `accounts` come from the
 // silent qnet_accounts, so the extension approved this site before; the page never asks it on its own. Taken only when
 // no wallet is chosen and Disconnect was not the last word in this browser; a wallet chosen another way stays. An
@@ -112,6 +137,30 @@ export function extensionReconnect(
   if (choice === null) return disconnected ? null : taken;
   if (choice.source === 'extension' && (choice.qnet !== accounts.qnet || choice.solana !== accounts.solana)) return taken;
   return null;
+}
+
+// What the cabinet shows from what it holds (the remembered wallet, the Disconnect mark, the address this tab views):
+// the connected wallet, the remembered one or the extension's taken up by itself (`taken`, extensionReconnect; never
+// while an address is viewed), else the viewed address, read only (`viewOnly`, source `entered`), which is never the
+// connected wallet. The header shows `connected` alone.
+export interface ShownWallet {
+  taken: WalletChoice | null;
+  connected: WalletChoice | null;
+  current: WalletChoice | null;
+  viewOnly: boolean;
+}
+
+export function shownWallet(
+  choice: WalletChoice | null,
+  viewing: string | null,
+  channel: WalletChannel | null,
+  accounts: WalletAccounts | null,
+  disconnected: boolean,
+): ShownWallet {
+  const taken = viewing ? null : extensionReconnect(choice, channel, accounts, disconnected);
+  const connected = taken ?? choice;
+  const viewOnly = connected === null && viewing !== null;
+  return { taken, connected, current: connected ?? (viewOnly ? { qnet: viewing as string, source: 'entered' } : null), viewOnly };
 }
 
 // Whether the cabinet shows nothing yet because the extension's first answer may still set its wallet: none is chosen

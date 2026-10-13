@@ -64,9 +64,9 @@ export default function DaoPage() {
     <div className="page-dao">
       <section className="explorer-section">
         <div className="explorer-header">
-          <h2 className="section-title">QNet DAO</h2>
+          <h2 className="section-title">QNet Blockchain DAO</h2>
           <p className="section-subtitle">
-            Decentralized governance for QNet protocol development and treasury management
+            Decentralized governance for QNet Blockchain protocol development and treasury management
           </p>
           <div style={{ 
             background: 'rgba(147, 51, 234, 0.1)', 

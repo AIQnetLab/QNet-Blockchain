@@ -389,7 +389,7 @@ describe('MN-R1-06: the link sheet reuses the key the network holds, as Use this
 
 describe('MN-R1-07: no claim is signed that cannot be reported', () => {
   const quote = (over) => ({
-    success: true, needs_signature: true, claims_data: JSON.stringify({ claims: [{ epoch: 5 }] }), sign_message: 'x',
+    success: true, needs_signature: true, claims_data: JSON.stringify({ claims: [{ epoch: 5, amount: 970000000 }] }), sign_message: 'x',
     last_claimed_epoch: 4, amount_nano: '970000000', claim_timestamp: 1790000000, stopped_at_epoch: null, ...over,
   });
   const manager = (q) => {
@@ -397,8 +397,9 @@ describe('MN-R1-07: no claim is signed that cannot be reported', () => {
     wm.loadWallet = async () => ({ qnetAddress: WALLET });
     wm._walletDilithiumKeys = async () => ({ secretKey: 'sk', publicKey: 'pk' });
     wm.getTrustedNodes = () => ['https://a', 'https://b', 'https://c'];
+    // The other nodes' head, and the node balance a whole batch is held to: the quote's own total.
     wm._hedged = jest.fn(async (p) => (p === '/api/v1/rewards/claim'
-      ? { ok: true, data: q, base: 'https://a' } : { ok: true, data: { first_unclaimed_epoch: 5 } }));
+      ? { ok: true, data: q, base: 'https://a' } : { ok: true, data: { first_unclaimed_epoch: 5, pending_rewards_nano: String(q.amount_nano) } }));
     wm._submitClaim = jest.fn(async () => ({ ok: true, data: { success: true, tx_hash: 'cd'.repeat(32) } }));
     return wm;
   };
@@ -417,6 +418,49 @@ describe('MN-R1-07: no claim is signed that cannot be reported', () => {
     expect(await a.claim({ nodeId: NODE, qnet: WALLET, amountNano: 1_020_000_000 })).toEqual({ status: 'empty' });
   });
 
+  // Owner, 11.10: a move is in transit until a certified read shows the wallet's watermark at the batch's last epoch, so
+  // the answer names the epoch below the batch's first one, its last epoch and its parts (services/ClaimTransit), all
+  // from the batch signed: the quoting node's other words (its watermark, its total) never decide what is followed.
+  const CLAIMS = [{ epoch: 5, amount: 1000000000 }, { epoch: 6, amount: 1500000000 }, { epoch: 9, amount: 500000000 }];
+  it('a move names the epoch below its batch, the last epoch and the parts of the batch signed', async () => {
+    const { sha3_256 } = require('js-sha3');
+    // The quoting node says the watermark is 0 while the wallet's is 4 (its batch starts at 5, as a second node says):
+    // the move is followed from the batch, so the first certified read (watermark 4) never takes it as gone through.
+    const q = quote({ claims_data: JSON.stringify({ claims: CLAIMS }), amount_nano: '3000000000', last_claimed_epoch: 0 });
+    q.sign_message = `q1337|qnet_claim_v1:${WALLET}:${q.claim_timestamp}:${sha3_256(q.claims_data)}`;
+    const wm = manager(q);
+    const r = await wm.claimRewards('light', WALLET, 'pw', 3_000_000_000, NODE);
+    expect(r).toMatchObject({
+      success: true, amountNano: '3000000000', prevWatermark: 4, lastEpoch: 9, txHash: 'cd'.repeat(32),
+      parts: [[5, '1000000000'], [6, '1500000000'], [9, '500000000']],
+    });
+    const { transitRecord, settleMoves, addMove, emptyTransit } = require('../src/services/ClaimTransit');
+    const move = transitRecord({ nodeId: NODE, result: r, balanceNano: 3_500_000_000, now: 1000 });
+    expect(move).toEqual({
+      nodeId: NODE, amountNano: '3000000000', restNano: 500_000_000, prevWatermark: 4, lastEpoch: 9,
+      parts: [[5, '1000000000'], [6, '1500000000'], [9, '500000000']], txHash: 'cd'.repeat(32), time: 1000,
+    });
+    expect(settleMoves(addMove(emptyTransit(WALLET), move), { lastClaimedEpoch: 4, now: 2000 }).settled).toEqual([]);
+  });
+
+  it('a quote whose total is not the sum of its signed amounts, or whose amounts are not exact, is not signed', async () => {
+    const { sha3_256 } = require('js-sha3');
+    const { signWithDilithium } = require('../src/crypto/DilithiumCrypto');
+    for (const over of [
+      { claims_data: JSON.stringify({ claims: CLAIMS }), amount_nano: '9000000000' }, // a total the batch does not credit
+      { claims_data: JSON.stringify({ claims: [{ epoch: 5 }] }), amount_nano: '970000000' }, // no amount to credit
+      { claims_data: '{"claims":[{"epoch":5,"amount":1,"amount":2}]}', amount_nano: '2' }, // a repeated key
+    ]) {
+      const q = quote(over);
+      q.sign_message = `q1337|qnet_claim_v1:${WALLET}:${q.claim_timestamp}:${sha3_256(q.claims_data)}`;
+      const wm = manager(q);
+      signWithDilithium.mockClear();
+      await expect(wm.claimRewards('light', WALLET, 'pw', 3_000_000_000, NODE)).rejects.toThrow();
+      expect(signWithDilithium.mock.calls.every((c) => !String(c[0]).includes('qnet_claim_v1'))).toBe(true);
+      expect(wm._submitClaim).not.toHaveBeenCalled();
+    }
+  });
+
   it('a capped part below 1 QNC still moves: the whole balance can always be moved in several claims', async () => {
     const { sha3_256 } = require('js-sha3');
     const q = quote({ stopped_at_epoch: 7 });
@@ -428,15 +472,12 @@ describe('MN-R1-07: no claim is signed that cannot be reported', () => {
   });
 });
 
-describe('MN-R1-08: the counted row says what the node counts', () => {
-  it('"n of the last m" in every language, and no "since registration" key left', () => {
+describe('MN-R1-08, then 11.10: the app counts no epochs', () => {
+  it('no "Counted epochs" row and no key for it in any language: the site\'s node cabinet keeps the per-epoch history', () => {
     const translations = require('../src/i18n/translations').default;
     for (const [lang, t] of Object.entries(translations)) {
-      expect([lang, typeof t.node_counted_last === 'string' && t.node_counted_last.includes('{n}') && t.node_counted_last.includes('{m}')]).toEqual([lang, true]);
-      expect([lang, t.node_counted_since]).toEqual([lang, undefined]);
+      expect([lang, t.node_counted, t.node_counted_last, t.node_counted_since]).toEqual([lang, undefined, undefined, undefined]);
     }
-    expect(translations.en.node_counted).toBe('Counted epochs:');
-    expect(translations.en.node_counted_last).toBe('{n} of the last {m}');
   });
 });
 

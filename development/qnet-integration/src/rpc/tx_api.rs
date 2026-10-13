@@ -2,16 +2,11 @@
 
 use super::*;
 
+/// The per-address limit ("transaction") is applied by the route (`route_limit`), on either plane.
 pub(super) async fn handle_transaction_submit(
     tx_request: TransactionRequest,
-    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    // SECURITY: IP-based rate limiting
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "transaction") {
-        return Ok(rate_limit_response);
-    }
-    
     // SECURITY: Validate EON addresses before processing
     if let Err(e) = validate_eon_address_with_error(&tx_request.from) {
         return Ok(warp::reply::json(&json!({

@@ -21,7 +21,7 @@ module.exports = {
         QNET_API_URL: 'http://162.244.25.114:8001',
         QNET_API_KEY: '<explorer api key>',
         DB_SSL: 'false',
-        // '1' lets the node cabinet send QNet Wallet its link and claim requests; off until app builds that
+        // '1' lets the node cabinet send QNet Wallet its link, reserve, unlink and claim requests; off until app builds that
         // answer them are installed (src/server/phone-flows.ts).
         CABINET_PHONE_FLOWS: '0',
         // The https address of QNet Wallet's Android file, the Play-signed build, that /wallet offers; empty offers

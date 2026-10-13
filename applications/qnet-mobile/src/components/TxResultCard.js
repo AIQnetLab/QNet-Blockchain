@@ -4,9 +4,7 @@ import Clipboard from '@react-native-clipboard/clipboard';
 import { explorerTxUrl } from '../config/nodes';
 import { tr } from '../i18n';
 import styles from '../screens/WalletScreen.styles';
-
-const shortMiddle = (s, head, tail) =>
-  !s || s.length <= head + tail + 3 ? String(s || '') : `${s.slice(0, head)}...${s.slice(-tail)}`;
+import { InfoField } from './InfoRow';
 
 const ICON = {
   success: { box: 'txSuccessIcon', text: 'txSuccessIconText', glyph: '✓' },
@@ -55,8 +53,12 @@ export default function TxResultCard({
         </Text>
       ) : null}
 
+      {/* The recipient whole on one line under its label, and the hash shortened in its middle, as every screen shows
+          them (components/InfoRow). */}
       {counterparty ? (
-        <Text style={styles.txResultTo}>{counterpartyLabel || t('tx_to')}: {shortMiddle(counterparty, 12, 8)}</Text>
+        <View style={styles.txResultTo}>
+          <InfoField label={counterpartyLabel || t('tx_to')} value={counterparty} mono fit divider={false} t={t} />
+        </View>
       ) : null}
 
       {note ? <Text style={styles.txResultNote}>{note}</Text> : null}
@@ -64,8 +66,7 @@ export default function TxResultCard({
 
       {hash ? (
         <TouchableOpacity style={styles.txHashContainer} activeOpacity={0.7} onPress={open} onLongPress={copy}>
-          <Text style={styles.txHashLabel}>{t('tx_label')}</Text>
-          <Text style={[styles.txHashValue, styles.ltr]} numberOfLines={1}>{shortMiddle(hash, 20, 12)}</Text>
+          <InfoField label={t('tx_label')} value={hash} mono middle divider={false} t={t} />
           <Text style={styles.txHashHint}>{t(explorer ? 'tx_hash_hint' : 'common_tap_to_copy')}</Text>
         </TouchableOpacity>
       ) : null}

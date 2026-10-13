@@ -192,7 +192,7 @@ impl SimplifiedP2P {
         let _node_type = self.node_type.clone();
 
         handle.spawn(async move {
-            if crate::node::is_info() { println!("[INFO][P2P] Searching for QNet peers with cryptographic verification..."); }
+            if crate::node::is_info() { println!("[INFO][P2P] Searching for QNet Blockchain peers with cryptographic verification..."); }
             
             let mut discovered_peers = Vec::new();
             
@@ -231,7 +231,7 @@ impl SimplifiedP2P {
                  }
              }
              
-             if crate::node::is_info() { println!("[INFO][P2P] Quantum network bootstrap: {} total nodes configured", known_node_ips.len()); }
+             if crate::node::is_info() { println!("[INFO][P2P] Network bootstrap: {} total nodes configured", known_node_ips.len()); }
             
             // EXISTING: Use existing Genesis constants to avoid code duplication
             let our_external_ip = if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
@@ -363,7 +363,7 @@ impl SimplifiedP2P {
                 }
             }
             
-            if crate::node::is_info() { println!("[INFO][P2P] Quantum network discovery: {} nodes found | All connections post-quantum secured", discovered_peers.len()); }
+            if crate::node::is_info() { println!("[INFO][P2P] Network discovery: {} nodes found | All connections post-quantum secured", discovered_peers.len()); }
             
             // CRITICAL: Validate activation codes before adding peers
             let validated_peers = Self::validate_activation_codes_static(&discovered_peers);

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QNet CLI - Command line interface for QNet blockchain.
+QNet CLI - Command line interface for QNet Blockchain.
 """
 
 import click
@@ -54,9 +54,9 @@ config = Config()
 
 
 @click.group()
-@click.option('--node-url', default=None, help='QNet node URL')
+@click.option('--node-url', default=None, help='QNet Blockchain node URL')
 def cli(node_url):
-    """QNet CLI - Manage your QNet node and wallet."""
+    """QNet Blockchain CLI - Manage your QNet Blockchain node and wallet."""
     if node_url:
         config.node_url = node_url
         config.save()
@@ -74,7 +74,7 @@ def node():
 @click.option('--region', default='auto', help='Geographic region')
 @click.option('--data-dir', default='./data', help='Data directory')
 def start(node_type, region, data_dir):
-    """Start a QNet node."""
+    """Start a QNet Blockchain node."""
     click.echo(f"Starting {node_type} node in region {region}...")
     
     # TODO: Implement actual node start logic
@@ -280,7 +280,7 @@ def claim():
         # holds no key and has no post-quantum signer, so it cannot produce either. Say so plainly
         # instead of posting a request the node will reject.
         click.echo("❌ Claiming requires your wallet's ML-DSA-65 key, which this CLI does not hold.", err=True)
-        click.echo("   Claim from the QNet wallet app.")
+        click.echo("   Claim from the QNet Wallet app.")
         click.echo(f"   Node: {config.node_url}  node_id: {node_id}  wallet: {wallet_address}")
             
     except Exception as e:
@@ -344,9 +344,9 @@ def stats():
 
 @cli.command()
 def version():
-    """Show QNet CLI version."""
-    click.echo("QNet CLI v0.1.0")
-    click.echo("QNet Protocol v1.0.0")
+    """Show the QNet Blockchain CLI version."""
+    click.echo("QNet Blockchain CLI v0.1.0")
+    click.echo("QNet Blockchain protocol v1.0.0")
 
 
 @cli.group()

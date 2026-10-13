@@ -32,7 +32,8 @@ pub use aux_db::AUX_QUEUE_CAP_BYTES;
 pub use node_records::{FcmEntry, PingKeyWrite};
 pub use light_device::DeviceWrite;
 pub use roster::{LightUptime, LIGHT_UPTIME_WINDOW};
-pub use boundary_snapshot::is_snapshot_boundary;
+pub use registry::RegistryDump;
+pub use boundary_snapshot::{is_snapshot_boundary, LAST_BOUNDARY_WORK_MS};
 pub use history_archive::{HistoryArchive, SegmentMeta, SEGMENT_BLOCKS as ARCHIVE_SEGMENT_BLOCKS};
 
 pub(crate) use rocksdb::{DB, Options, ColumnFamily, ColumnFamilyDescriptor, WriteBatch};

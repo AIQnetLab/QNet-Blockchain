@@ -9,6 +9,10 @@ import type { BlockRow, TxRow, BatchRow } from './transform';
 
 export interface Statement { text: string; values: unknown[] }
 
+// The highest stored block, its height read as text. Ordered by the column: a bare `height` in ORDER BY names the
+// text output column, where '999999' sorts above '3508200'.
+export const TOP_BLOCK_SQL = 'SELECT height::text, hash, timestamp::text FROM blocks ORDER BY blocks.height DESC LIMIT 1';
+
 function column<T, K extends keyof T>(rows: T[], k: K): T[K][] {
   return rows.map(r => r[k]);
 }

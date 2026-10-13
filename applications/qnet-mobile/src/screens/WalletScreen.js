@@ -52,6 +52,7 @@ import {
   stopLightNode,
   bindThisDevice,
   localBinding,
+  localNode,
   signStatusWithPingKey,
   resendPendingBinding,
   enrolAgainIfUnleased,
@@ -71,16 +72,17 @@ import { checkDevice, isThisDevice, showPlayDialog } from '../services/NodeDevic
 import { noteStatus as noteDeviceStatus } from '../services/DeviceEnrolment';
 import { nodeLinkActions } from '../services/NodeLinkActions';
 import { LEGACY_MOVE, NEW_APP_PLAY_URL, NEW_APP_SITE_URL } from '../config/legacy';
-import NodeTab, { linkedHere } from './NodeTab';
+import NodeTab, { keptServerStatus, linkedHere } from './NodeTab';
 import { getRandomGenesisNode, EXPLORER_API, explorerTxUrl, solanaExplorerTxUrl, ONE_DEV_MINT } from '../config/nodes';
 import TxResultCard from '../components/TxResultCard';
+import { FIGURE_LINE, InfoRow, SettingRow, figureFitsIn } from '../components/InfoRow';
 import { tokenIconUri } from '../components/TokenIcons';
 import { DayHeader, HistoryRow, TxDetail, dateTime } from './HistoryTab';
 import {
   txDirection,
   HISTORY_PAGE, fmtTokenBaseUnits, historyRowKey, tokenRowFromEvent, splitExplorerItems,
   mergeHistory, appendHistory, cacheableHistory, nodeNativeRow, txLookupState, historyEntries, historySections,
-  rowsDueToDrop,
+  rowsDueToDrop, withListing, checkedCachedRows,
 } from '../utils/txHistory';
 import { TRANSFER_FEE_NANO, TRANSFER_FEE_QNC } from '../config/fees';
 import { amountShare } from '../utils/sendAmount';
@@ -100,10 +102,14 @@ import { groupAddress } from '../utils/addressDisplay';
 import { createGrantStore } from '../browser/grants';
 import { describeOrigin, handedOverByBrowser } from '../browser/url';
 import { mergeTokenBalances, optimisticTokenRow } from '../utils/balanceMerge';
+import {
+  acceptedBalance, addMove, emptyTransit, readTransit, settleMoves, shownTransitNano, transitRecord, transitTotal,
+  withMoveStates, writeTransit,
+} from '../services/ClaimTransit';
 import { autoSendable, refusalHeals } from '../services/PendingTx';
 import { loadCachedHistory, saveCachedHistory } from '../services/HistoryCache';
 import {
-  LANGUAGES, makeT, isRTL, languageName, isSupported, deviceLanguage, setCurrentLanguage, errorText,
+  LANGUAGES, makeT, isRTL, languageName, isSupported, deviceLanguage, setCurrentLanguage, errorText, CHAIN_NAME,
 } from '../i18n';
 import styles from './WalletScreen.styles';
 import logger from '../utils/logger';
@@ -121,6 +127,10 @@ const walletAddresses = (wallet) => (wallet
 
 // A balance read that started less than this long ago serves a new call for the same wallet (WalletScreen loadBalance).
 const BALANCE_SHARE_MS = 1000;
+// The line under the figures on Assets says they are not updated only after QNC reads failed this many times in a row
+// over at least this long (owner, 11.10: it never flashes with each read; the first read that lands takes it away).
+const STALE_AFTER_FAILS = 2;
+const STALE_AFTER_MS = 2 * 60_000;
 // History checks token transfers against the committee this many at a time, after the balance read (loadTxHistory).
 const HISTORY_PROOF_CONCURRENCY = 2;
 
@@ -170,8 +180,14 @@ const SITE_RECORD_FIRST_WAIT_MS = 60_000;
 const SITE_RECORD_MAX_WAIT_MS = 15 * 60_000;
 // How often the open Node tab reads a server node's counted and missed epochs again (an epoch is about four hours).
 const SERVER_EPOCHS_MS = 5 * 60_000;
+// While a move of a node balance is in transit, a certified read of the wallet every minute on any tab (Assets reads on
+// its own pace), so the read that shows the move ends it, never the clock (services/ClaimTransit).
+const TRANSIT_READ_MS = 60_000;
 // How often a kept transaction the wallet still sends by itself is looked at away from the Assets tab (MB-R2-01).
 const KEPT_SWEEP_MS = 15_000;
+// The foreground follow (WalletManager.followTick, wallet-galc plan 2.4): one tick this often while the wallet is open
+// and the app in front keeps a verified checkpoint at the head and a send proof by it, so a send is checked at once.
+const FOLLOW_MS = 90_000;
 // How often the Node tab's epoch clock moves on from the last height read (local: no request).
 const CLOCK_TICK_MS = 15_000;
 
@@ -263,11 +279,25 @@ async function fetchCachedBlockHeight() {
 const fmtAmount = (value, decimals) =>
   (Number(value) || 0).toFixed(decimals).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 
-// Published by Orrery Group LLC on aiqnet.io; the app shows the same pages, it does not keep its own copy.
-// Opened in the system browser with the site's app marker (?from=app): there the site shows its app view, whose
-// header leads only to the explorer and the policies, so no link of a store build is a few taps from the activation
-// page, the extension or the APK downloads (CROSS-R2-08). The explorer's transaction pages, which every history row
-// and result card open, carry the same marker (config/nodes explorerTxUrl, R3-XPD-01).
+// A balance on Assets stays beside its token while it fits two fifths of the row at its smallest (tokenBalance: 98 dp on
+// a 320 dp screen, at the largest text size a row follows); otherwise it takes a line of its own under the token, whole:
+// an exact figure (a QRC-20 balance has up to 18 decimals) is never cut.
+const TOKEN_FIGURE_ROOM = 98;
+const TOKEN_FIGURE_SIZE = 16;
+const balanceBeside = (text) => figureFitsIn(text, TOKEN_FIGURE_ROOM, TOKEN_FIGURE_SIZE);
+const tokenRowStyle = (text) => [styles.tokenItemClickable, !balanceBeside(text) && styles.tokenItemWrap];
+function TokenBalance({ text }) {
+  const beside = balanceBeside(text);
+  return (
+    <View style={beside ? styles.tokenBalance : styles.tokenBalanceUnder}>
+      <Text style={styles.tokenAmount} {...(beside ? FIGURE_LINE : null)}>{text}</Text>
+    </View>
+  );
+}
+
+// Published by Orrery Group LLC on aiqnet.io; the app shows the same pages, it does not keep its own copy. Opened in the
+// system browser, an ordinary visit to the site. The `from=app` query only names where the visit came from; the site
+// shows the same page with or without it.
 const LEGAL_LINKS = [
   ['legal_privacy', 'https://aiqnet.io/privacy?from=app'],
   ['legal_terms', 'https://aiqnet.io/terms?from=app'],
@@ -333,11 +363,19 @@ const WalletScreen = () => {
   // what is shown: MOBNET-R3-04).
   const shownBalancesRef = useRef(tokenBalances);
   shownBalancesRef.current = tokenBalances;
-  // Where the figures on Assets stand for `owner`: 'updating' while this session's first read runs (nothing is shown
-  // for it: the last figures stay on screen), 'fresh' once a QNC read of this session landed, 'stale' when that first
-  // read failed. `known` names the figures that are real (read now, or the last verified ones kept from an earlier
-  // session): the others show a dash, never a 0 nobody read. `at`: when the QNC figure shown was read.
-  const [balanceStatus, setBalanceStatus] = useState({ owner: null, state: 'idle', at: 0, known: {} });
+  // Where the figures on Assets stand for `owner` (owner, 11.10): 'fresh' once a QNC read of this session landed (a 0
+  // like any other figure), 'stale' once QNC reads failed STALE_AFTER_FAILS times in a row over STALE_AFTER_MS at least,
+  // which the line under them says until the first read that lands; 'idle' before either. A read that starts changes
+  // nothing, so the line never comes and goes with the reads. `known` names the figures that are real (read now, or the
+  // last verified ones kept from an earlier session): the others show a dash, never a 0 nobody read. `at`: when the QNC
+  // figure shown was read. `paused`: the network stopped certifying ({ since }, WalletManager.networkPause), which the
+  // line says instead.
+  const [balanceStatus, setBalanceStatus] = useState({ owner: null, state: 'idle', at: 0, known: {}, paused: null });
+  const qncFailsRef = useRef({ owner: null, count: 0, since: 0 }); // the QNC reads that failed in a row, and since when
+  // The moves of a node balance in transit to this wallet (services/ClaimTransit), for Assets, the Node tab and History.
+  const [transit, setTransit] = useState(() => emptyTransit());
+  const transitRef = useRef(transit);
+  transitRef.current = transit;
   // Which figures a read of this session has put on screen for `owner`: a cached figure never replaces one of them.
   const freshFiguresRef = useRef({ owner: null });
   const balanceRunRef = useRef(null); // { owner, promise } of the balance read in flight: one at a time per wallet
@@ -416,6 +454,7 @@ const WalletScreen = () => {
   const [showDeletePrompt, setShowDeletePrompt] = useState(false); // Android: the password before Delete
   const [deletePassword, setDeletePassword] = useState('');
   const [showEraseConfirm, setShowEraseConfirm] = useState(false); // type ERASE, then a fresh authentication
+  const [eraseNodeHere, setEraseNodeHere] = useState(false); // the wallet's node runs here: the erase says it stops
   const [eraseText, setEraseText] = useState('');
   const [deviceCompromised, setDeviceCompromised] = useState(false);
   const backgroundedAtRef = useRef(0); // 0, or { wall, mono } of the moment the app went to the background
@@ -505,10 +544,13 @@ const WalletScreen = () => {
   const [deviceCheck, setDeviceCheck] = useState(null);
   const deviceCheckAskedRef = useRef(false);
   const lastHistoryAddrRef = useRef(null); // wallet the loaded history belongs to (a switch clears it, an unlock does not)
+  // The height the certified QNC read last covered: { owner, height } (noteCovered; History's receive labels).
+  const coveredRef = useRef({ owner: null, height: -1 });
   const currentOwnerRef = useRef(null); // QNet address of the wallet on screen; late reads for another are dropped
   useEffect(() => { if (wallet?.qnetAddress) currentOwnerRef.current = wallet.qnetAddress; }, [wallet]);
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Super node network status
-  // The server node's counted and missed epochs (PushService.getNodeEpochs): { owner, nodeId, counted, missed, at }.
+  // The server node's counted, missed and not admitted epochs (PushService.getNodeEpochs): { owner, nodeId, counted,
+  // missed, notAdmitted, at }.
   const [serverEpochs, setServerEpochs] = useState(null);
   // What aiqnet.io records of the wallet's node (services/NodeRecordRead): { owner, state, nodeType }; null until read,
   // and after a read that failed.
@@ -523,9 +565,10 @@ const WalletScreen = () => {
     && serverNodeStatus.success === true && serverNodeStatus.registered !== false;
   const lightOnChainRef = useRef(false);
   lightOnChainRef.current = !!lightNodeStatus && !!lightNodeStatus.status && lightNodeStatus.status.onChain === true;
-  // The light node has a card under a server node: on the chain, or a link of it pending here.
+  // The light node has a card under a server node: on the chain and bound here, or a link of it pending here (a light
+  // node shows only on the device it is bound to: owner, 11.10).
   const lightShownRef = useRef(false);
-  lightShownRef.current = lightOnChainRef.current || !!(lightNodeStatus && lightNodeStatus.pending);
+  lightShownRef.current = (lightOnChainRef.current && !!lightNodeStatus.local) || !!(lightNodeStatus && lightNodeStatus.pending);
   const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
   const [biometricEnabled, setBiometricEnabled] = useState(false);
@@ -922,7 +965,8 @@ const WalletScreen = () => {
       // The Background row: read again with every status, so a change made in the system settings shows on return.
       readBackground().then((bg) => setBgState((prev) => (JSON.stringify(prev) === JSON.stringify(bg) ? prev : bg)))
         .catch(() => {});
-      if (status.onChain === true) loadLightBalance(nodeId, owner, { force: rewards });
+      // The balance only of a node this device shows (bound here, or being linked here: NodeTab lightShownHere).
+      if (status.onChain === true && (local || pending)) loadLightBalance(nodeId, owner, { force: rewards });
       // A latest miss the owners put down to no push address (or a binding made without a push token) sends this device's
       // push token again, as an open of the app does.
       if (local && status.onChain === true && linkedHere(status, local)) readdressIfOwed(nodeId, status).catch(() => {});
@@ -939,20 +983,23 @@ const WalletScreen = () => {
     }
   };
 
-  // The light node's balance: the largest of three genesis answers (a claim is re-verified on chain against the
-  // certified reward root, so an honest node can only under-report). No answer keeps the last figure. Once per epoch and
-  // node (requestPace.balanceDue: it changes only when an epoch settles), now when `force` (pull-to-refresh, a move).
+  // The light node's balance (the wallet's: every node id of it gives the same figure) from three genesis answers:
+  // the largest of those not behind the wallet's last certified claim watermark (ClaimTransit.acceptedBalance: a node
+  // behind it still counts epochs the wallet moved, so it never brings a moved amount back). No answer that counts keeps
+  // the last figure. Once per epoch and node (requestPace.balanceDue: it changes only when an epoch settles), now when
+  // `force` (pull-to-refresh, a move). While a move of the wallet is in transit nothing is read (the tab shows the rest
+  // the move left) and nothing is locked.
   const loadLightBalance = async (nodeId, owner, { force = false } = {}) => {
+    if (transitTotal(transitRef.current) > 0) return;
     const height = estimatedHeight(heightRead());
     if (!force && !balanceDue(lightBalanceReadRef.current, nodeId, height)) return;
     lightBalanceReadRef.current = balanceRead(nodeId, height);
-    const answers = (await Promise.all(
+    const answers = await Promise.all(
       Array.from({ length: 3 }, () => getPendingRewards(nodeId).catch(() => ({ success: false })))
-    )).filter(r => r && r.success && r.pendingRewards != null);
-    if (answers.length === 0) lightBalanceReadRef.current = null; // the next status read asks again
-    if (answers.length > 0 && currentOwnerRef.current === owner) {
-      setLightBalance(answers.reduce((m, r) => Math.max(m, r.pendingRewards), 0));
-    }
+    );
+    const figure = acceptedBalance(answers, claimFloor(owner));
+    if (figure === null) lightBalanceReadRef.current = null; // the next status read asks again
+    if (figure !== null && currentOwnerRef.current === owner && transitTotal(transitRef.current) === 0) setLightBalance(figure);
   };
   
   // What aiqnet.io records of this wallet's node, read while the Node tab is open and while the network lists no node of
@@ -986,12 +1033,15 @@ const WalletScreen = () => {
     if (!fresh && last && last.owner === owner && last.nodeId === nodeId && Date.now() - last.at < SERVER_EPOCHS_MS) return;
     const epochs = await getNodeEpochs(nodeId, { walletAddress: owner, registeredHeight: reg.heights[nodeId] }).catch(() => null);
     if (currentOwnerRef.current !== owner || !epochs) return;
-    setServerEpochs({ owner, nodeId, counted: epochs.counted, missed: epochs.missed, at: Date.now() });
+    setServerEpochs({ owner, nodeId, counted: epochs.counted, missed: epochs.missed, notAdmitted: epochs.notAdmitted || 0, at: Date.now() });
   };
 
   // Load Server node (Super/Genesis) network status
   // This single API call returns ALL info: status, heartbeats, rewards. The balance is read once per epoch and node
   // (`rewards`: now, as pull-to-refresh and a move ask).
+  // A move of the wallet's balance in transit, and the answers that count, as for the light node (loadLightBalance).
+  // A read that fails keeps the last status of the same node on screen, marked stale, so the card never turns into
+  // another one and back on a hiccup.
   const loadServerNodeStatus = async ({ rewards = false } = {}) => {
     if (!wallet) return;
 
@@ -1050,17 +1100,23 @@ const WalletScreen = () => {
       const resolvedId = status?.nodeId || nodeId;
       const kept = serverRewardsRef.current && serverRewardsRef.current.nodeId === resolvedId ? serverRewardsRef.current : null;
       const height = estimatedHeight(heightRead());
-      if (resolvedId && status && !rewards && kept && !balanceDue(kept, resolvedId, height)) {
+      const inTransit = transitTotal(transitRef.current) > 0;
+      if (resolvedId && status && inTransit) {
+        // Nothing read or locked while a move is in transit: the tab shows the rest the move left.
+        if (kept) status.pendingRewards = kept.value;
+      } else if (resolvedId && status && !rewards && kept && !balanceDue(kept, resolvedId, height)) {
         status.pendingRewards = kept.value; // read in this epoch already
       } else if (resolvedId && status) {
-        // Quorum the claimable (max of a few nodes): a claim proof is re-verified on-chain against the
-        // 2f+1 reward_root so no node can inflate it; an honest node only under-reports (local shard lag),
-        // so max = the certified amount — routes around a lagging node and removes the pending flicker.
-        const prs = (await Promise.all(
+        // Quorum the claimable: a claim proof is re-verified on-chain against the 2f+1 reward_root so no node can
+        // inflate it, and among nodes not behind the wallet's certified claim watermark an honest one only
+        // under-reports (local shard lag), so the largest of those routes around a lagging node; one behind that
+        // watermark still holds a moved amount and does not count (loadLightBalance, ClaimTransit.acceptedBalance).
+        const prs = await Promise.all(
           Array.from({ length: 3 }, () => getPendingRewards(resolvedId).catch(() => ({ success: false })))
-        )).filter(r => r && r.success && r.pendingRewards != null);
-        if (prs.length > 0) {
-          status.pendingRewards = prs.reduce((m, r) => Math.max(m, r.pendingRewards), 0);
+        );
+        const figure = acceptedBalance(prs, claimFloor(walletAddress));
+        if (figure !== null) {
+          status.pendingRewards = figure;
           serverRewardsRef.current = { ...balanceRead(resolvedId, height), value: status.pendingRewards };
         } else if (kept) {
           status.pendingRewards = kept.value; // hiccup: keep last-known, don't shrink
@@ -1069,7 +1125,8 @@ const WalletScreen = () => {
         }
       }
 
-      setServerNodeStatus(status);
+      // A failed read keeps the last good status of this node (stale); with none, the failure shows as such.
+      setServerNodeStatus((prev) => keptServerStatus(prev, status, resolvedId));
       if (status.success && status.nodeId) loadServerEpochs(adopt || status.nodeId);
 
       if (status.success) {
@@ -1087,7 +1144,7 @@ const WalletScreen = () => {
         }
       }
     } catch (error) {
-      setServerNodeStatus({ success: false, error: 'network' });
+      setServerNodeStatus((prev) => keptServerStatus(prev, { success: false, error: 'network' }, prev && prev.nodeId));
     }
   };
   
@@ -1173,7 +1230,7 @@ const WalletScreen = () => {
             linkGenesisNode(bootstrapId, walletAddress);
             try {
               const status = await checkServerNodeStatus(genesisNode.node_id);
-              setServerNodeStatus(status);
+              setServerNodeStatus((prev) => keptServerStatus(prev, status, genesisNode.node_id));
               if (status.success) {
                 AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
                   ...status, cachedAt: Date.now()
@@ -1205,7 +1262,7 @@ const WalletScreen = () => {
             if (nodeId) {
               try {
                 const status = await checkServerNodeStatus(nodeId);
-                setServerNodeStatus(status);
+                setServerNodeStatus((prev) => keptServerStatus(prev, status, nodeId));
                 if (status.success) {
                   AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
                     ...status, cachedAt: Date.now()
@@ -1485,13 +1542,17 @@ const WalletScreen = () => {
   const freshQncNano = async () => {
     const addr = wallet && (wallet.qnetAddress || wallet.address);
     const r = addr ? await walletManager.certifiedQncForSend(addr).catch(() => null) : null;
-    return r && r.ok && r.verified && /^\d+$/.test(String(r.balanceNano)) ? r : { error: (r && r.error) || 'unanswered' };
+    return r && r.ok && r.verified && /^\d+$/.test(String(r.balanceNano)) ? r
+      : { error: (r && r.error) || 'unanswered', walkSteps: r ? r.walkSteps : undefined };
   };
 
   // Why a send check found no balance to decide by, said as it is: a transaction from another device not confirmed yet,
-  // a balance not confirmed yet (try again in a minute), or no answer from the network.
-  const sendCheckError = (error) => t(error === 'foreign' ? 'balance_foreign_pending'
-    : error === 'unconfirmed' ? 'balance_unconfirmed' : 'send_balance_unreadable');
+  // a balance not confirmed yet (try again in a minute; while a long lineage walk is why, how far it is: wallet-galc
+  // plan, Part 3 item 6), or no answer from the network.
+  const sendCheckError = (error, walkSteps) => {
+    if (error === 'unconfirmed' && Number.isSafeInteger(walkSteps) && walkSteps > 0) return t('balance_verifying_steps', { steps: walkSteps });
+    return t(error === 'foreign' ? 'balance_foreign_pending' : error === 'unconfirmed' ? 'balance_unconfirmed' : 'send_balance_unreadable');
+  };
 
   // What the send may still spend (BigInt): the checked balance less what this wallet's unsettled transactions may
   // still take, the one a replacement signs over excepted (at most one of the two can apply).
@@ -2082,14 +2143,14 @@ const WalletScreen = () => {
       isQnetSend ? walletManager.sentRecipients().catch(() => []) : [],
     ]);
     if (isQnetSend && qncCheck.error) {
-      setTxResult({ success: false, title: t('send_cannot_title'), error: sendCheckError(qncCheck.error) });
+      setTxResult({ success: false, title: t('send_cannot_title'), error: sendCheckError(qncCheck.error, qncCheck.walkSteps) });
       return;
     }
     const qncNano = isQnetSend ? String(qncCheck.balanceNano) : null;
     const qncNow = qncNano !== null ? Number(qncNano) / 1e9 : null;
     if (isTokenSend) {
       if (!held || !held.ok || !/^\d+$/.test(String(held.balanceBase))) {
-        setTxResult({ success: false, title: t('send_cannot_title'), error: sendCheckError(held && held.error) });
+        setTxResult({ success: false, title: t('send_cannot_title'), error: sendCheckError(held && held.error, held && held.walkSteps) });
         return;
       }
       if (BigInt(tokenAmountBase) > BigInt(held.balanceBase)) {
@@ -2119,10 +2180,10 @@ const WalletScreen = () => {
       }
     }
 
-    // A recipient that is a contract as two genesis nodes agree (a built-in token, the token being sent included, a WASM
-    // contract) keeps what it is paid for good: no contract sends QNC or a token on. Refused before the review (read
-    // above, with the balance) and read again just before signing, as the extension's confirm does; a recipient no two
-    // nodes agree on is not paid either (MOB-BR-R3-01).
+    // A recipient that is a contract by its certified account leaf (a built-in token, the token being sent included, a
+    // WASM contract) keeps what it is paid for good: no contract sends QNC or a token on. Refused before the review (read
+    // above, with the balance) and read again just before signing, as the extension's confirm does; a recipient no
+    // certified answer came for in time is not paid either (MOB-BR-R3-01).
     const recipientRefused = async (known) => {
       if (sendingToken.network !== 'qnet') return false;
       const problem = known !== undefined ? known : await walletManager.payableRecipientProblem(sendAddress, myQnetAddress);
@@ -2195,10 +2256,11 @@ const WalletScreen = () => {
     const feeText = feeNano === null ? '—' : `${fmtAmount(feeNano / 1e9, 6)} QNC`;
     const reviewed = await reviewSend({
       to: sendAddress,
-      network: isQnetSend ? 'QNet' : 'Solana',
+      network: isQnetSend ? CHAIN_NAME : 'Solana',
       amount: `${sendAmount} ${sendingToken.symbol}`,
       fee: feeText,
-      total: isTokenSend ? `${sendAmount} ${sendingToken.symbol} + ${feeText}`
+      // A token's total in two currencies: a line for each (components/InfoRow).
+      total: isTokenSend ? [`${sendAmount} ${sendingToken.symbol}`, `+ ${feeText}`]
         : `${((Math.round(amount * 1e9) + TRANSFER_FEE_NANO) / 1e9).toFixed(6)} ${sendingToken.symbol}`,
       warnings,
     });
@@ -2413,7 +2475,7 @@ const WalletScreen = () => {
     const owner = wallet && (wallet.solanaAddress || wallet.address);
     setTxResult({
       ...(outcome === 'unknown'
-        ? { unknown: true, title: t('tx_awaiting_title'), note: t('tx_note_unknown') }
+        ? { unknown: true, title: t('tx_awaiting_title'), note: t('tx_note_unknown_solana') }
         : { success: true, title: t('tx_sent_title'), confirming: true }),
       amount: entry.amount,
       symbol: entry.symbol,
@@ -2427,10 +2489,94 @@ const WalletScreen = () => {
     if (wallet && wallet.publicKey) loadBalance(wallet.publicKey);
   };
 
+  // The moves in transit on screen and in its ref at once: a read in the same tick already sees the change.
+  const applyTransit = (state) => {
+    transitRef.current = state;
+    setTransit(state);
+  };
+
+  // The moves of a node balance in transit to the wallet on screen (services/ClaimTransit), read when it opens.
+  const transitOwner = wallet ? wallet.qnetAddress : null;
+  useEffect(() => {
+    if (!transitOwner) return undefined;
+    let live = true;
+    readTransit(transitOwner).then((s) => {
+      if (live && currentOwnerRef.current === transitOwner) applyTransit(s);
+    }).catch(() => {});
+    return () => { live = false; };
+  }, [transitOwner]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // While a move is in transit the wallet is read every TRANSIT_READ_MS on every tab but Assets (which reads on its own
+  // pace), in front only: the certified read that shows the move is what ends it, wherever the user stays.
+  const transitHeld = !!transitOwner && transit.owner === transitOwner && transitTotal(transit) > 0;
+  useEffect(() => {
+    if (!transitHeld || !wallet || !wallet.publicKey || activeTab === 'assets') return undefined;
+    const timer = setInterval(() => {
+      if (AppState.currentState === 'active') loadBalance(wallet.publicKey);
+    }, TRANSIT_READ_MS);
+    return () => clearInterval(timer);
+  }, [transitHeld, wallet, activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A move the network took (the Node tab's card, or a QNet Link claim sheet), held until a certified read shows it
+  // through (owner, 11.10). `balanceNano`: the node balance it was made from, whose rest the tab shows meanwhile.
+  const recordMove = (nodeId, result, balanceNano) => {
+    const owner = currentOwnerRef.current;
+    const move = owner ? transitRecord({ nodeId, result, balanceNano }) : null;
+    if (!move) return false;
+    const cur = transitRef.current;
+    const next = addMove(cur && cur.owner === owner ? cur : emptyTransit(owner), move);
+    applyTransit(next);
+    writeTransit(next);
+    return true;
+  };
+
+  // The wallet's last certified claim watermark (ClaimTransit `floor`), which every node balance read is judged by; null
+  // for another wallet, or while none is known.
+  const claimFloor = (owner) => {
+    const cur = transitRef.current;
+    return cur && cur.owner === owner && Number.isSafeInteger(cur.floor) ? cur.floor : null;
+  };
+
+  // What a read tells of the moves in transit: `lastClaimedEpoch` the wallet's claim watermark in a state the committee
+  // certified (null: the read certified none). A move seen through, in whole or in part, leaves; any other stays in
+  // transit, however long: no clock and no node's live answer ends it (ClaimTransit.settleMoves: QNet transactions have
+  // no consensus expiry yet). The amount is never in two places nor in none.
+  const settleTransit = (owner, lastClaimedEpoch) => {
+    const cur = transitRef.current;
+    if (!owner || !cur || cur.owner !== owner) return;
+    const { state, settled } = settleMoves(cur, { lastClaimedEpoch });
+    if (state !== cur) {
+      applyTransit(state);
+      writeTransit(state);
+    }
+    if (settled.length > 0) afterSettled(owner, settled);
+  };
+
+  // A move that left: the node balance (the wallet's, on whichever card shows it) is the rest the move left plus the part
+  // the network did not apply, until it is read again at once, with no epoch lock.
+  const afterSettled = (owner, settled) => {
+    let shown = null;
+    for (const { move, returnedNano } of settled) {
+      if (move.restNano !== null && move.restNano !== undefined) shown = move.restNano + (returnedNano || 0);
+    }
+    if (currentOwnerRef.current !== owner) return;
+    if (shown !== null) {
+      setLightBalance(shown);
+      const kept = serverRewardsRef.current;
+      if (kept) serverRewardsRef.current = { ...kept, value: shown };
+      setServerNodeStatus((prev) => (prev && prev.success ? { ...prev, pendingRewards: shown } : prev));
+    }
+    lightBalanceReadRef.current = null;
+    if (lightShownRef.current) loadLightBalance(walletManager.generateLightNodePseudonym(owner), owner, { force: true }).catch(() => {});
+    if (serverNodeTypeOf(activatedNodeTypeRef.current)) loadServerNodeStatus({ rewards: true }).catch(() => {});
+  };
+
   // Move to wallet: the node balance (nanoQNC) becomes spendable QNC through a claim the wallet key signs. The same for
-  // a server node and for this wallet's light node, wherever that node runs.
+  // a server node and for this wallet's light node on this device. Once the network took it, the move is in transit
+  // (recordMove) until a certified read of the wallet shows it through.
+  // The balance and its watermark are the wallet's, so one move in transit holds every card's button.
   const moveNodeBalance = async ({ nodeType, nodeId, balanceNano, reload }) => {
-    if (!(balanceNano > 0) || processingValidation) return;
+    if (!(balanceNano > 0) || processingValidation || transitTotal(transitRef.current) > 0) return;
 
     setProcessingValidation(true);
     try {
@@ -2438,6 +2584,7 @@ const WalletScreen = () => {
       const result = await walletManager.claimRewards(nodeType, walletAddress, password, balanceNano, nodeId);
 
       if (result.success) {
+        recordMove(nodeId, result, balanceNano);
         // The batch actually submitted (result.amount is QNC), not the displayed pending figure.
         const claimedAmount = Number(result.amount || 0).toFixed(4);
         
@@ -2874,6 +3021,25 @@ const WalletScreen = () => {
     return undefined;
   }, [wallet, hasWallet, autoLockTime, onboardingSecret]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The foreground follow (wallet-galc plan 2.4): while a wallet is open and the app in front, one
+  // WalletManager.followTick every FOLLOW_MS (the certified head, one walk step toward it, the open wallet's QNC proof
+  // kept for the next send by its macroblock, the anchors and the capsule kept), on every tab. Its progress note and
+  // the height its certified read covers follow (noteWalk, noteCovered). Locked, there is no wallet here and no session
+  // there: nothing runs.
+  useEffect(() => {
+    const owner = wallet && wallet.qnetAddress;
+    if (!owner) return undefined;
+    const timer = setInterval(() => {
+      if (AppState.currentState !== 'active' || (currentOwnerRef.current && currentOwnerRef.current !== owner)) return;
+      Promise.resolve().then(() => walletManager.followTick(owner)).then((r) => {
+        if (!r || !r.ok || (currentOwnerRef.current && currentOwnerRef.current !== owner)) return;
+        noteWalk(owner, r.verified);
+        if (r.verified && r.balance) noteCovered(owner, Number(r.balance.blockHeight));
+      }).catch(() => {});
+    }, FOLLOW_MS);
+    return () => clearInterval(timer);
+  }, [wallet?.qnetAddress]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // The Assets tab reads the balances on opening, then every ASSETS_SOCKET_MS while the address socket is open (its
   // events ask for a read as soon as this wallet's balance changes) and every ASSETS_POLL_MS while it is not
   // (requestPace); nothing while the app is not in front.
@@ -2987,7 +3153,8 @@ const WalletScreen = () => {
         const nodeType = activatedNodeTypeRef.current;
         const jobs = [];
         if (tab === 'history' && wallet?.qnetAddress) jobs.push(loadTxHistory(true));
-        if (tab === 'assets' && wallet?.publicKey) jobs.push(loadBalance(wallet.publicKey));
+        // A move in transit is read for on every tab: the certified read that shows it ends it.
+        if ((tab === 'assets' || transitTotal(transitRef.current) > 0) && wallet?.publicKey) jobs.push(loadBalance(wallet.publicKey));
         if (tab === 'node') {
           jobs.push(refreshHeight());
           jobs.push(loadAllUserNodes());
@@ -3027,8 +3194,9 @@ const WalletScreen = () => {
       // held every transaction.
       // Nothing shown yet for this wallet: put the cached rows up while the fetch is in flight.
       if (lastHistoryAddrRef.current !== wallet.qnetAddress && wallet.qnetAddress) {
+        // A row an older build kept as confirmed on the archive's word alone reads as unverified (checkedCachedRows).
         loadCachedHistory(wallet.qnetAddress).then(cached => {
-          if (cached.length) setTxHistory(prev => (prev.length ? prev : cached));
+          if (cached.length) setTxHistory(prev => (prev.length ? prev : checkedCachedRows(cached)));
         }).catch(() => {});
       }
       if (lastHistoryAddrRef.current && lastHistoryAddrRef.current !== wallet.qnetAddress) {
@@ -3808,12 +3976,15 @@ const WalletScreen = () => {
           return;
         }
         const bal = await walletManager.getTokenBalanceOf(contract, qnetAddress, dec);
+        // A read that failed is no 0: the row keeps the figure it showed for this wallet, else a dash (null).
+        const shownRow = (qrcTokensRef.current || []).find((row) => row && row.contract === contract);
+        const kept = shownRow && currentOwnerRef.current === qnetAddress && typeof shownRow.balance === 'string' ? shownRow : null;
         byContract.set(contract, {
           contract,
           name: c.name || c.symbol || '',
           symbol: c.symbol || '',
           decimals: dec,
-          balance: bal.balance != null ? bal.balance : '0',
+          balance: bal.balance != null ? bal.balance : (kept ? kept.balance : null),
           logo: c.logo || '',
           decimalsTrusted: true,
         });
@@ -3883,13 +4054,23 @@ const WalletScreen = () => {
 
   // Privacy: mask every displayed amount when balances are hidden (persisted 'qnet_hide_balances').
   const maskAmt = (s) => (balancesHidden ? '••••' : s);
+  // A token row's figure, or a dash while none was read for it (a failed read is never a 0).
+  const tokenFigure = (tk) => (tk && tk.balance != null ? String(tk.balance) : '—');
   // A figure of the wallet on screen ('qnc', 'sol', 'oneDev'), or a dash while none was read or kept for it.
   const figureKnown = (field) => !!(wallet && balanceStatus.owner === wallet.qnetAddress && balanceStatus.known[field]);
   const figure = (field, text) => maskAmt(figureKnown(field) ? text : '—');
-  // The line under Send and Receive, only when this session's first read found nothing: when the figures shown were
-  // read (or that none could be). While a read runs nothing is said; the last figures stay on screen.
+  // The line under Send and Receive (owner, 11.10), steady while it holds: the network stopped certifying, with the
+  // time of its last certified state once this device verified it (with no time before); else, once QNC reads failed
+  // for a sustained time, when the figures shown were read (or that none could be). Reads that start or end with
+  // nothing new change nothing on it. While a long lineage walk keeps QNC from being certified, the line says how far
+  // it is (wallet-galc plan, Part 3 item 6).
   const balanceLine = () => {
     if (!wallet || balanceStatus.owner !== wallet.qnetAddress) return null;
+    if (balanceStatus.paused) {
+      return Number.isFinite(balanceStatus.paused.since)
+        ? t('balance_network_paused', { time: dateTime(balanceStatus.paused.since) }) : t('balance_network_paused_untimed');
+    }
+    if (balanceStatus.walk) return t('balance_verifying_steps', { steps: balanceStatus.walk });
     if (balanceStatus.state !== 'stale') return null;
     return balanceStatus.known.qnc && balanceStatus.at
       ? t('balance_stale', { time: dateTime(balanceStatus.at) }) : t('balance_unavailable');
@@ -3944,35 +4125,80 @@ const WalletScreen = () => {
   }, []);
 
   // A figure ('qnc', 'sol', 'oneDev') a read of this session put on screen for `owner`: a cached one never replaces it.
-  // `done`: the QNC read is over (its proof decided), and the figures are no longer being updated. `readAt`: when the QNC
-  // answer was read (its figure and its proof are one read). When nothing changed the status object stays the same, so
-  // the screen does not render again for it.
-  const noteFreshFigure = (owner, field, done = true, readAt = Date.now()) => {
+  // A QNC figure (early or decided, a 0 too) is a read that landed: the failures in a row start over and the line goes.
+  // `readAt`: when the QNC answer was read (its figure and its proof are one read). When nothing changed the status
+  // object stays the same, so the screen does not render again for it.
+  const noteFreshFigure = (owner, field, readAt = Date.now()) => {
     if (freshFiguresRef.current.owner !== owner) freshFiguresRef.current = { owner };
     freshFiguresRef.current[field] = true;
+    if (field === 'qnc') qncFailsRef.current = { owner, count: 0, since: 0 };
     setBalanceStatus((prev) => {
       const same = prev.owner === owner;
-      const state = field === 'qnc' && done ? 'fresh' : (same ? prev.state : 'updating');
+      const state = field === 'qnc' ? 'fresh' : (same ? prev.state : 'idle');
       const at = field === 'qnc' ? readAt : (same ? prev.at : 0);
       if (same && prev.known[field] && prev.state === state && prev.at === at) return prev;
-      return { owner, state, at, known: { ...(same ? prev.known : {}), [field]: true } };
+      return { owner, state, at, known: { ...(same ? prev.known : {}), [field]: true }, paused: same ? prev.paused : null };
+    });
+  };
+
+  // A QNC read of `owner` that landed nothing: one more failure in a row. The line says the figures are not updated only
+  // once STALE_AFTER_FAILS of them came over STALE_AFTER_MS at least, and stays until a read lands (noteFreshFigure).
+  const noteQncFailure = (owner, now = Date.now()) => {
+    const last = qncFailsRef.current.owner === owner ? qncFailsRef.current : { owner, count: 0, since: 0 };
+    const fails = { owner, count: last.count + 1, since: last.since || now };
+    qncFailsRef.current = fails;
+    if (fails.count < STALE_AFTER_FAILS || now - fails.since < STALE_AFTER_MS) return;
+    setBalanceStatus((prev) => (prev.owner === owner && prev.state !== 'stale' ? { ...prev, state: 'stale' } : prev));
+  };
+
+  // How far the lineage walk is while QNC is not certified (WalletManager.walkSteps: null for a short walk), noted
+  // after each QNC read and follow tick: the line says it while it holds; a certified read takes it away.
+  const noteWalk = (owner, verified) => {
+    Promise.resolve().then(() => (verified ? null : walletManager.walkSteps())).catch(() => null).then((steps) => {
+      const walk = Number.isSafeInteger(steps) && steps > 0 ? steps : null;
+      setBalanceStatus((prev) => (prev.owner !== owner || (prev.walk || null) === walk ? prev : { ...prev, walk }));
+    });
+  };
+
+  // The height the certified QNC read last covered for `owner` (its checkpoint's): a received transfer in a block at or
+  // below it is credited, one above it is in a block and not credited yet (utils/txHistory withListing).
+  const noteCovered = (owner, height) => {
+    if (!owner || !Number.isSafeInteger(height) || height < 0) return;
+    const cur = coveredRef.current;
+    if (cur.owner === owner && cur.height >= height) return;
+    coveredRef.current = { owner, height };
+    if (currentOwnerRef.current && currentOwnerRef.current !== owner) return;
+    setTxHistory((prev) => {
+      const next = withListing(prev, null, height);
+      return next.every((r, i) => r === prev[i]) ? prev : next;
+    });
+  };
+
+  // Whether the network stopped certifying, asked after each read (WalletManager.networkPause): the line says so while
+  // it holds. A head that could not be read keeps what was known.
+  const notePause = async (owner) => {
+    const pause = await Promise.resolve().then(() => walletManager.networkPause()).catch(() => undefined);
+    if (pause === undefined || (currentOwnerRef.current && currentOwnerRef.current !== owner)) return;
+    const next = pause ? { since: Number.isFinite(pause.since) ? pause.since : null } : null;
+    setBalanceStatus((prev) => {
+      if (prev.owner !== owner) return prev;
+      const same = next ? !!prev.paused && prev.paused.since === next.since : !prev.paused;
+      return same ? prev : { ...prev, paused: next };
     });
   };
 
   // The last verified balances of this wallet, kept from an earlier session (WalletManager.loadBalanceSnapshot), on
-  // screen the moment it opens, marked as being updated; a figure this session already read stays. Figures already on
-  // screen for this wallet (an unlock after a lock) are only marked as being updated.
+  // screen the moment it opens; a figure this session already read stays. Figures already on screen for this wallet (an
+  // unlock after a lock) stay as they are, and so does the line under them.
   const showKeptBalances = async (owner) => {
     if (!owner) return;
-    setBalanceStatus((prev) => (prev.owner === owner
-      ? { ...prev, state: prev.state === 'fresh' || prev.state === 'stale' ? 'updating' : prev.state }
-      : { owner, state: 'updating', at: 0, known: {} }));
+    setBalanceStatus((prev) => (prev.owner === owner ? prev : { owner, state: 'idle', at: 0, known: {}, paused: null }));
     const snap = await Promise.resolve().then(() => walletManager.loadBalanceSnapshot(owner)).catch(() => null);
     if (!snap || (currentOwnerRef.current && currentOwnerRef.current !== owner)) return;
     const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
     const fresh = freshFiguresRef.current.owner === owner ? freshFiguresRef.current : {};
     const kept = { qnc: fresh.qnc ? null : num(snap.qnc), sol: fresh.sol ? null : num(snap.sol), oneDev: fresh.oneDev ? null : num(snap.oneDev) };
-    setTokenBalances((prev) => mergeTokenBalances(prev, { owner, qnc: kept.qnc, sol: kept.sol, oneDev: kept.oneDev, verified: true }));
+    setTokenBalances((prev) => mergeTokenBalances(prev, { owner, qnc: kept.qnc, sol: kept.sol, oneDev: kept.oneDev, verified: true, qncLce: null }));
     if (kept.sol !== null) setBalance(kept.sol);
     const tokens = Array.isArray(snap.tokens) ? snap.tokens.filter((tk) => tk && typeof tk.contract === 'string'
       && typeof tk.balance === 'string' && /^\d+(\.\d+)?$/.test(tk.balance)) : [];
@@ -4053,9 +4279,9 @@ const WalletScreen = () => {
       // applies nothing.
       const gone = () => !!(currentOwnerRef.current && qnetAddr && qnetAddr !== currentOwnerRef.current);
       const owner = qnetAddr || null;
+      // A read that starts says nothing (owner, 11.10): only another wallet's figures are cleared.
       if (owner) {
-        setBalanceStatus((prev) => (prev.owner !== owner ? { owner, state: 'updating', at: 0, known: {} }
-          : prev.state === 'stale' || prev.state === 'idle' ? { ...prev, state: 'updating' } : prev));
+        setBalanceStatus((prev) => (prev.owner !== owner ? { owner, state: 'idle', at: 0, known: {}, paused: null } : prev));
       }
 
       const got = { sol: null, oneDev: null }; // what this read got from Solana, for the kept figures
@@ -4096,8 +4322,12 @@ const WalletScreen = () => {
           if (gone() || !owner || !Number.isFinite(f.balance)) return;
           const { q, optimistic } = held(f.balance, false);
           figureAt = Date.now();
-          setTokenBalances((prev) => mergeTokenBalances(prev, { owner, qnc: q, verified: false, optimistic }));
-          noteFreshFigure(owner, 'qnc', false, figureAt);
+          // The figure's own watermark goes on screen with it: Assets' in-transit line leaves out what this figure holds
+          // already, so the amount is never shown twice; the move itself ends only by a certified read (ClaimTransit).
+          setTokenBalances((prev) => mergeTokenBalances(prev, {
+            owner, qnc: q, verified: false, optimistic, qncLce: optimistic ? undefined : f.figureClaimedEpoch,
+          }));
+          noteFreshFigure(owner, 'qnc', figureAt);
         },
       });
 
@@ -4137,11 +4367,17 @@ const WalletScreen = () => {
       // "last-known" is only ever this same address's; another wallet's balances start from zero.
       setTokenBalances(prev => mergeTokenBalances(prev, {
         owner, qnc: qncToApply, verified: isBalanceVerified, optimistic, agreed,
+        qncLce: optimistic ? undefined : (agreed ? null : (qncOk ? qncResult.figureClaimedEpoch : undefined)),
       }));
-      if (owner && qncOk) noteFreshFigure(owner, 'qnc', true, figureAt || Date.now());
-      if (owner && !qncOk) {
-        // The first read of this session found no figure: the screen says the figures shown are not updated.
-        setBalanceStatus((prev) => (prev.owner === owner && prev.state === 'updating' ? { ...prev, state: 'stale' } : prev));
+      if (owner && qncOk) noteFreshFigure(owner, 'qnc', figureAt || Date.now());
+      // No figure: one more failure in a row; the line comes only once they last (noteQncFailure).
+      if (owner && !qncOk) noteQncFailure(owner);
+      if (owner) noteWalk(owner, qncOk && isBalanceVerified);
+      if (owner && qncOk && isBalanceVerified) noteCovered(owner, Number(qncResult.blockHeight));
+      if (owner) {
+        // A move in transit ends only by a watermark the committee certified, in the update that shows its figure.
+        settleTransit(owner, qncOk && isBalanceVerified && !optimistic ? qncResult.lastClaimedEpoch : null);
+        notePause(owner);
       }
 
       await Promise.all([solRead, oneDevRead]);
@@ -4386,14 +4622,24 @@ const WalletScreen = () => {
 
       // The span the explorer page vouches for: all of history on its last page, down to its oldest row
       // otherwise. Without the explorer nothing already shown is dropped.
-      const archivedTimes = [...archived.native, ...tokenTxs.filter(row => row.status === 'confirmed')].map(row => row.timestamp || 0);
+      const archivedTimes = [...archived.native, ...tokenTxs.filter(row => row.status !== 'pending')].map(row => row.timestamp || 0);
       const coveredFromMs = !explorerPage ? Infinity
         : (explorerPage.next_cursor && archivedTimes.length ? Math.min(...archivedTimes) : 0);
       if (explorerPage && historyCursorRef.current === undefined) historyCursorRef.current = explorerPage.next_cursor || null;
 
+      // What genesis nodes list (receive labels, wallet-galc plan P1): an archive row is 'unverified' and one node's
+      // 'reported' until two genesis nodes list it alike; received QNC is credited only once the certified balance
+      // covers its block (utils/txHistory withListing). Asked on a refresh the user asked for, and on any other that
+      // brought a row one node reports which no earlier read found listed (the extension asks on every History read).
+      const covered = coveredRef.current.owner === address ? coveredRef.current.height : null;
+      const listedBefore = new Set((txHistoryRef.current || []).filter((row) => row.listed).map((row) => String(row.hash).toLowerCase()));
+      const unlisted = nativeTxs.some((row) => row.status === 'reported' && !listedBefore.has(String(row.hash).toLowerCase()));
+      const listed = fresh || unlisted ? await walletManager.agreedHistoryRows(address).catch(() => null) : null;
+      if (lastHistoryAddrRef.current !== address) return;
+
       // A send about to be marked not found is asked about by its nonce first (L-10): it may have landed under fifty
       // newer rows, or as a hedged copy under another hash. No answer keeps it pending for a later refresh.
-      const freshRows = [...nativeTxs, ...tokenTxs, ...nodeEventTxs];
+      const freshRows = withListing([...nativeTxs, ...tokenTxs, ...nodeEventTxs], listed, covered);
       const settled = new Map();
       await Promise.all(rowsDueToDrop(txHistoryRef.current, freshRows, { myAddress, nowMs: Date.now() })
         .filter((r) => r.settle && Number.isSafeInteger(r.settle.nonce) && r.settle.from)
@@ -4418,10 +4664,11 @@ const WalletScreen = () => {
         return merged;
       });
 
-      // P4: verify each token transfer's inclusion against a committee-QC-anchored logs_root. 'verified'
-      // → confirmed + trust badge; 'consistent' → confirmed but unverified (real on-chain row below the
-      // trust floor); 'rejected'/'pending' → unchanged. Only rows a node can still prove are asked about:
-      // an archived transfer older than the node's window has no proof left to fetch.
+      // P4: verify each token transfer's inclusion against a committee-QC-anchored logs_root. 'verified' → confirmed +
+      // trust badge; 'consistent' (its leaf folds to the root a node claimed, which no committee signature anchors now)
+      // → unverified, as the archive's word is (wallet-galc plan P1); 'rejected'/'pending' → unchanged. Only rows a
+      // node can still prove are asked about: an archived transfer older than the node's window has no proof left to
+      // fetch.
       const provable = tokenTxs.filter(row => (row.timestamp || 0) > Date.now() - 24 * 3600 * 1000);
       if (provable.length) {
         // After the balance read in flight, and HISTORY_PROOF_CONCURRENCY at a time: each check may walk to an old
@@ -4448,7 +4695,10 @@ const WalletScreen = () => {
         if (statuses.size) {
           setTxHistory(prev => prev.map(tx => {
             const s = tx.tokenContract ? statuses.get(tx.hash + ':' + tx.tokenLogIndex) : undefined;
-            return s ? { ...tx, status: 'confirmed', verified: s === 'verified' } : tx;
+            if (!s) return tx;
+            // A row proven on an earlier pass stays proven (mergeHistory keeps it too).
+            if (s === 'consistent') return tx.status === 'confirmed' && tx.verified ? tx : { ...tx, status: 'unverified', verified: false };
+            return { ...tx, status: 'confirmed', verified: true };
           }));
         }
       }
@@ -4696,7 +4946,9 @@ const WalletScreen = () => {
     historyCursorRef.current = undefined;
     setTxDetail(null);
     setTokenBalances({ owner: nextQnetAddress, qnc: 0, sol: 0, '1dev': 0 });
-    setBalanceStatus({ owner: nextQnetAddress, state: 'idle', at: 0, known: {} });
+    setBalanceStatus({ owner: nextQnetAddress, state: 'idle', at: 0, known: {}, paused: null });
+    qncFailsRef.current = { owner: null, count: 0, since: 0 };
+    applyTransit(emptyTransit(nextQnetAddress));
     freshFiguresRef.current = { owner: null };
     balanceRunRef.current = null;
     snapshotSavedRef.current = { text: '', at: 0 };
@@ -4759,11 +5011,32 @@ const WalletScreen = () => {
     }
   };
 
-  // Settings → Delete wallet: confirm, then a fresh authentication (the password, or the screen lock).
+  // Whether this wallet's light node runs on this device (its binding is here): deleting or erasing the wallet, the only
+  // way to another wallet on this device, stops it here, which the confirmation says first in one sentence (owner,
+  // 11.10). One wallet per device, so a node record here is this wallet's.
+  const nodeRunsHere = async () => {
+    try {
+      const n = await localNode();
+      return !!(n && await localBinding(n.nodeId));
+    } catch (_) {
+      return false;
+    }
+  };
+  // The erase screen (Forgot? Reset the wallet, the recovery screen) says the same when it opens.
+  useEffect(() => {
+    if (!showEraseConfirm) return undefined;
+    let live = true;
+    nodeRunsHere().then((here) => { if (live) setEraseNodeHere(here); });
+    return () => { live = false; setEraseNodeHere(false); };
+  }, [showEraseConfirm]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Settings → Delete wallet: confirm (with the node sentence when this wallet's node runs here), then a fresh
+  // authentication (the password, or the screen lock).
   const deleteWallet = async () => {
+    const here = await nodeRunsHere();
     showAlert(
       `⚠️ ${t('delete_wallet')}`,
-      t('delete_wallet_confirm'),
+      here ? `${t('node_stops_here')}\n\n${t('delete_wallet_confirm')}` : t('delete_wallet_confirm'),
       [
         { text: t('cancel'), style: 'cancel' },
         {
@@ -5194,6 +5467,7 @@ const WalletScreen = () => {
         <View style={styles.modalBox}>
           <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
             <Text style={styles.modalTitle}>{t('erase_title')}</Text>
+            {eraseNodeHere ? <Text style={styles.modalWarning} testID="erase-node-here">{t('node_stops_here')}</Text> : null}
             <Text style={styles.modalWarning}>{t('erase_warning')}</Text>
             <Text style={styles.modalContent}>{t('erase_type_confirm', { word: 'ERASE' })}</Text>
             <TextInput
@@ -5325,9 +5599,18 @@ const WalletScreen = () => {
     // The Node side of the request, for the open wallet (none while there is no wallet: the request answers only that).
     const node = wallet && !LEGACY_MOVE ? nodeLinkActions({
       walletManager, credential: password, serverNode: !!serverNodeTypeOf(activatedNodeType),
-      claimBusy: () => movingRef.current,
+      // A move running on the Node tab, or one in transit to the wallet: another one waits for it.
+      claimBusy: () => movingRef.current || transitTotal(transitRef.current) > 0,
       // An unlink this device confirmed: the Node tab reads the network again.
       onUnlinked: () => { loadLightNodeStatus(); },
+      // A move from the sheet is in transit as one from the Node tab, which reads the node again (owner, 11.10).
+      onClaimed: (nodeId, result, balanceNano) => {
+        recordMove(nodeId, result, balanceNano);
+        if (serverNodeTypeOf(activatedNodeType)) loadServerNodeStatus({ rewards: true });
+        loadLightNodeStatus({ rewards: true });
+      },
+      // The sheet's balance read counts only nodes not behind the wallet's certified claim watermark.
+      claimFloor: () => claimFloor(wallet.qnetAddress),
     }) : null;
     return (
       <QNetLinkScreen
@@ -6106,15 +6389,18 @@ const WalletScreen = () => {
                 );
               })()}
 
-              {/* Balance Info; a token names its contract (and one named after QNet is marked as not QNC), as on Assets. */}
+              {/* The balance beside its label, as every figure (components/InfoRow); a token names its contract under it (and
+                  one named after QNet is marked as not QNC), as on Assets. */}
               <View style={styles.sendBalanceInfo}>
-                <Text style={styles.sendBalanceLabel}>{t('send_available')}</Text>
-                <Text style={styles.sendBalanceAmount}>{maskAmt(fmtAmount(sendingToken.balance, 5))} {sendingToken.symbol}</Text>
+                <InfoRow label={t('send_available')} value={`${maskAmt(fmtAmount(sendingToken.balance, 5))} ${sendingToken.symbol}`}
+                  tone="accent" ltr fit divider={false} />
                 {sendingToken.contract ? (
-                  <Text style={styles.tokenPrice}>{t('tok_contract_id', { id: contractShortId(sendingToken.contract) })}</Text>
-                ) : null}
-                {sendingToken.contract && (sendingToken.reserved || usesReservedName(sendingToken.symbol, '')) ? (
-                  <Text style={[styles.tokenPrice, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text>
+                  <View style={styles.sendBalanceNotes}>
+                    <Text style={styles.tokenPrice}>{t('tok_contract_id', { id: contractShortId(sendingToken.contract) })}</Text>
+                    {sendingToken.reserved || usesReservedName(sendingToken.symbol, '') ? (
+                      <Text style={[styles.tokenPrice, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text>
+                    ) : null}
+                  </View>
                 ) : null}
               </View>
               
@@ -6195,25 +6481,22 @@ const WalletScreen = () => {
                 </View>
               </View>
               
-              {/* Network Fee */}
-              <View style={styles.sendFeeContainer}>
-                <Text style={styles.sendFeeLabel}>{t('send_network_fee')}</Text>
-                <Text style={styles.sendFeeValue}>
-                  {feePreviewNano == null ? '—' : `${fmtAmount(feePreviewNano / 1e9, 6)} QNC`}
-                </Text>
-              </View>
-              
-              {/* Total Cost: the sum the balance check charges (amount + fee for QNC; a QRC-20 send pays its fee in QNC). */}
-              {sendAmount && parseFloat(sendAmount) > 0 && (
-                <View style={styles.sendTotalContainer}>
-                  <Text style={styles.sendTotalLabel}>{t('send_total')}</Text>
-                  <Text style={styles.sendTotalValue}>
-                    {sendingToken.contract
-                      ? `${sendAmount} ${sendingToken.symbol} + ${feePreviewNano == null ? '—' : fmtAmount(feePreviewNano / 1e9, 6)} QNC`
+              {/* The network fee, and the total the balance check charges (amount + fee for QNC; a QRC-20 send pays its fee
+                  in QNC, on a line of its own), each beside its label (components/InfoRow). */}
+              <View style={styles.sendFigures}>
+                <InfoRow label={t('send_network_fee')} value={feePreviewNano == null ? '—' : `${fmtAmount(feePreviewNano / 1e9, 6)} QNC`} ltr fit />
+                {sendAmount && parseFloat(sendAmount) > 0 ? (
+                  <InfoRow
+                    label={t('send_total')}
+                    value={sendingToken.contract
+                      ? [`${sendAmount} ${sendingToken.symbol}`, `+ ${feePreviewNano == null ? '—' : fmtAmount(feePreviewNano / 1e9, 6)} QNC`]
                       : `${((Math.round(parseFloat(sendAmount) * 1e9) + TRANSFER_FEE_NANO) / 1e9).toFixed(6)} ${sendingToken.symbol}`}
-                  </Text>
-                </View>
-              )}
+                    ltr
+                    fit
+                    total
+                  />
+                ) : null}
+              </View>
               
               {/* Send Button: busy, with a spinner, from the tap until the send is over (pressSend). */}
               <TouchableOpacity
@@ -6241,7 +6524,7 @@ const WalletScreen = () => {
 
         // Normal Assets View
         return (
-          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, balanceVerified, balanceStatus, copiedAddress, qrcTokens, hiddenTokens, shownTokens, customTokens, balancesHidden, keptTxs, language]} render={() => (
+          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, balanceVerified, balanceStatus, copiedAddress, qrcTokens, hiddenTokens, shownTokens, customTokens, balancesHidden, keptTxs, language, transit]} render={() => (
           <ScrollView
             style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
@@ -6282,7 +6565,7 @@ const WalletScreen = () => {
                   }
                 }}
               >
-                <Text style={[styles.networkTabText, selectedNetwork === 'qnet' && styles.networkTabTextActive]}>QNet</Text>
+                <Text style={[styles.networkTabText, selectedNetwork === 'qnet' && styles.networkTabTextActive]}>{CHAIN_NAME}</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.networkTab, selectedNetwork === 'solana' && styles.networkTabActive]}
@@ -6351,11 +6634,11 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
 
-            {/* One quiet line only when this session's first read found nothing; while a read runs the last figures
-                stay without a word. */}
+            {/* One quiet line, steady while it holds: the network stopped certifying, or QNC reads failed for a sustained
+                time (balanceLine); reads that start and end say nothing. */}
             {(() => {
               const line = balanceLine();
-              return line ? <Text style={styles.balanceStatusLine} numberOfLines={2} testID="balance-status">{line}</Text> : null;
+              return line ? <Text style={styles.balanceStatusLine} numberOfLines={3} testID="balance-status">{line}</Text> : null;
             })()}
 
             {/* This wallet's signed transactions that have not settled (MOBNET-R3-01): listed until they do, with
@@ -6385,7 +6668,7 @@ const WalletScreen = () => {
                 {/* QNC Token - Clickable to open Send screen. Hidden if toggled off in the token manager. */}
                 {!hiddenTokens.has('native:qnc') && (
                 <TouchableOpacity
-                  style={styles.tokenItemClickable}
+                  style={tokenRowStyle(figure('qnc', fmtAmount(tokenBalances.qnc, 5)))}
                   onPress={() => openSendModal('QNC', tokenBalances.qnc, 'qnet')}
                   activeOpacity={0.6}
                 >
@@ -6401,11 +6684,21 @@ const WalletScreen = () => {
                       <Text style={styles.tokenName}>QNC</Text>
                     </View>
                   </View>
-                  <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{figure('qnc', fmtAmount(tokenBalances.qnc, 5))}</Text>
-                  </View>
+                  <TokenBalance text={figure('qnc', fmtAmount(tokenBalances.qnc, 5))} />
                 </TouchableOpacity>
                 )}
+                {/* A move of a node balance in transit, on its own line and never inside the QNC figure, until a
+                    certified read shows it in the wallet; what the figure on screen holds already is left out of it
+                    (services/ClaimTransit shownTransitNano). */}
+                {(() => {
+                  const nano = transit.owner === wallet.qnetAddress && tokenBalances.owner === wallet.qnetAddress
+                    ? shownTransitNano(transit, tokenBalances.qncLce) : (transit.owner === wallet.qnetAddress ? transitTotal(transit) : 0);
+                  return nano > 0 ? (
+                    <Text style={styles.transitLine} testID="qnc-transit">
+                      {t('transit_line', { amount: maskAmt(fmtAmount(nano / 1e9, 5)) })}
+                    </Text>
+                  ) : null;
+                })()}
 
                 {/* QRC-20 holdings + custom tokens (deduped, hidden filtered via ⋮ manager); tap=Send, long-press=hide. */}
                 {qrcTokens.filter((tk) => isTokenShown(tk.contract)).map((tk) => {
@@ -6413,12 +6706,12 @@ const WalletScreen = () => {
                   return (
                   <TouchableOpacity
                     key={tk.contract}
-                    style={styles.tokenItemClickable}
+                    style={tokenRowStyle(maskAmt(tokenFigure(tk)))}
                     onPress={() => openSendModal(
                       tokenTitle(tk),
                       parseFloat(tk.balance) || 0,
                       'qnet',
-                      { contract: tk.contract, decimals: tk.decimals, balanceText: tk.balance, reserved }
+                      { contract: tk.contract, decimals: tk.decimals, balanceText: typeof tk.balance === 'string' ? tk.balance : null, reserved }
                     )}
                     onLongPress={() => {
                       const label = tokenTitle(tk);
@@ -6450,6 +6743,7 @@ const WalletScreen = () => {
                         );
                       })()}
                       <View style={styles.tokenDetails}>
+                        {/* A token's symbol and name wrap rather than lose their ends (where a look-alike differs). */}
                         <Text style={styles.tokenName}>{tokenTitle(tk)}</Text>
                         {!!tk.name && tk.name !== tk.symbol && (
                           <Text style={styles.tokenPrice}>{tokenLabel(tk.name)}</Text>
@@ -6459,11 +6753,7 @@ const WalletScreen = () => {
                         {reserved && <Text style={[styles.tokenPrice, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text>}
                       </View>
                     </View>
-                    <View style={styles.tokenBalance}>
-                      <Text style={styles.tokenAmount}>
-                        {maskAmt(`${tk.balance}`)}
-                      </Text>
-                    </View>
+                    <TokenBalance text={maskAmt(tokenFigure(tk))} />
                   </TouchableOpacity>
                   );
                 })}
@@ -6481,7 +6771,7 @@ const WalletScreen = () => {
               <View style={styles.tokenList}>
                 {/* SOL Token - opens its Send screen */}
                 <TouchableOpacity
-                  style={styles.tokenItemClickable}
+                  style={tokenRowStyle(figure('sol', fmtAmount(balance, 4)))}
                   onPress={() => openSendModal('SOL', balance, 'solana')}
                   activeOpacity={0.6}
                   testID="solana-row-SOL"
@@ -6503,13 +6793,11 @@ const WalletScreen = () => {
                       <Text style={styles.tokenPrice}>{t('solana_devnet')}</Text>
                     </View>
                   </View>
-                  <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{figure('sol', fmtAmount(balance, 4))}</Text>
-                  </View>
+                  <TokenBalance text={figure('sol', fmtAmount(balance, 4))} />
                 </TouchableOpacity>
                 {/* 1DEV Token - opens its Send screen */}
                 <TouchableOpacity
-                  style={styles.tokenItemClickable}
+                  style={tokenRowStyle(figure('oneDev', fmtAmount(tokenBalances['1dev'], 4)))}
                   onPress={() => openSendModal('1DEV', tokenBalances['1dev'], 'solana')}
                   activeOpacity={0.6}
                   testID="solana-row-1DEV"
@@ -6531,9 +6819,7 @@ const WalletScreen = () => {
                       <Text style={styles.tokenPrice}>{t('solana_devnet')}</Text>
                     </View>
                   </View>
-                  <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{figure('oneDev', fmtAmount(tokenBalances['1dev'], 4))}</Text>
-                  </View>
+                  <TokenBalance text={figure('oneDev', fmtAmount(tokenBalances['1dev'], 4))} />
                 </TouchableOpacity>
               </View>
             )}
@@ -6630,11 +6916,13 @@ const WalletScreen = () => {
         const onQnet = selectedNetwork === 'qnet';
         const unaskedRows = onQnet ? txHistory.filter((row) => !rowVisible(row)).length : 0;
         const solanaOwner = wallet ? (wallet.solanaAddress || wallet.address) : null;
+        // The row of a move of a node balance in transit says so, as Assets and the Node tab do (services/ClaimTransit).
+        const moveState = transit.owner === wallet?.qnetAddress ? transit : null;
         const listed = historySections(historyEntries(onQnet
-          ? txHistory.filter(rowVisible)
+          ? withMoveStates(txHistory, moveState).filter(rowVisible)
           : solanaSends.sends.map((e) => solanaHistoryRow(e, solanaOwner))));
         return (
-          <TabBox key="history" deps={[txHistory, solanaSends.sends, selectedNetwork, refreshing, balancesHidden, historyLoadingOlder, hiddenTokens, shownTokens, customTokens, language]} render={() => (
+          <TabBox key="history" deps={[txHistory, solanaSends.sends, selectedNetwork, refreshing, balancesHidden, historyLoadingOlder, hiddenTokens, shownTokens, customTokens, language, transit]} render={() => (
           <FlatList
             key="history-tab"
             style={styles.content}
@@ -6649,7 +6937,7 @@ const WalletScreen = () => {
                 <Text style={[styles.sectionTitle, { marginBottom: 16 }]}>{t('hist_title')}</Text>
                 {/* The same network selector as Assets, sharing its choice. */}
                 <View style={styles.networkSelector}>
-                  {[['qnet', 'QNet'], ['solana', 'Solana']].map(([key, name]) => (
+                  {[['qnet', CHAIN_NAME], ['solana', 'Solana']].map(([key, name]) => (
                     <TouchableOpacity
                       key={key}
                       style={[styles.networkTab, selectedNetwork === key && styles.networkTabActive]}
@@ -6723,7 +7011,7 @@ const WalletScreen = () => {
           ...(lightNodeStatus && lightNodeStatus.status && lightNodeStatus.status.onChain === true ? ['light'] : []),
         ]) : null;
         return (
-          <TabBox key="node" deps={[refreshing, activatedNodeType, nodePseudonym, lightNodeStatus, lightBalance, serverNodeStatus, serverEpochs, siteRecord, currentBlockHeight, processingValidation, nodeUseBusy, useRefusal, balancesHidden, bgState, deviceCheck, copiedAddress, language]} render={() => (
+          <TabBox key="node" deps={[refreshing, activatedNodeType, nodePseudonym, lightNodeStatus, lightBalance, serverNodeStatus, serverEpochs, siteRecord, currentBlockHeight, processingValidation, nodeUseBusy, useRefusal, balancesHidden, bgState, deviceCheck, copiedAddress, language, transit]} render={() => (
           <ScrollView
             key="node-tab"
             style={styles.content}
@@ -6781,6 +7069,7 @@ const WalletScreen = () => {
               onOpenBackground={() => { openBackgroundSettings().catch(() => {}); }}
               onCopy={(id) => copyToClipboard(id)}
               nodeTitle={(type) => nodeTitle(t, type)}
+              transit={transit.owner === wallet?.qnetAddress ? transit : null}
             />
             )}
           </ScrollView>
@@ -6804,35 +7093,19 @@ const WalletScreen = () => {
             <View style={styles.settingGroup}>
               <Text style={styles.settingGroupTitle}>{t('general')}</Text>
               
-              <View style={styles.settingItem}>
-                <View style={styles.settingInfo}>
-                  <Text style={styles.settingTitle}>{t('auto_lock_timer')}</Text>
-                  <Text style={styles.settingSubtitle}>{t('auto_lock_subtitle')}</Text>
-                </View>
-                <TouchableOpacity 
-                  style={styles.settingDropdown}
-                  onPress={() => setShowAutoLockPicker(true)}
-                >
-                  <Text style={styles.settingValue}>
-                    {t(`autolock_${autoLockTime}`)}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.settingItem}>
-                <View style={styles.settingInfo}>
-                  <Text style={styles.settingTitle}>{t('language')}</Text>
-                  <Text style={styles.settingSubtitle}>{t('language_subtitle')}</Text>
-                </View>
-                <TouchableOpacity 
-                  style={styles.settingDropdown}
-                  onPress={() => setShowLanguagePicker(true)}
-                >
-                  <Text style={styles.settingValue}>
-                    {languageName(language)}
-                  </Text>
-                </TouchableOpacity>
-              </View>
+              {/* Each setting's title and its value on one line (components/InfoRow SettingRow). */}
+              <SettingRow
+                title={t('auto_lock_timer')}
+                subtitle={t('auto_lock_subtitle')}
+                value={t(`autolock_${autoLockTime}`)}
+                onPress={() => setShowAutoLockPicker(true)}
+              />
+              <SettingRow
+                title={t('language')}
+                subtitle={t('language_subtitle')}
+                value={languageName(language)}
+                onPress={() => setShowLanguagePicker(true)}
+              />
             </View>
 
             {/* Security Settings - Lazy loaded */}
@@ -6914,22 +7187,17 @@ const WalletScreen = () => {
                 const d = describeOrigin(site.origin);
                 const name = d ? `${d.host}${d.port ? `:${d.port}` : ''}` : site.origin;
                 return (
-                  <View key={site.origin} style={styles.settingItem}>
-                    <View style={styles.settingInfo}>
-                      <Text style={styles.settingTitle} numberOfLines={1}>{name}</Text>
-                      <Text style={[styles.settingSubtitle, { writingDirection: 'ltr' }]} numberOfLines={2}>
-                        {d && d.idn ? `${site.origin} · ${t('sites_idn')}` : site.origin}
-                      </Text>
-                    </View>
-                    <TouchableOpacity
-                      style={styles.settingDropdown}
-                      onPress={() => revokeSite(site.origin)}
-                      accessibilityRole="button"
-                      accessibilityLabel={`${t('sites_revoke')} ${name}`}
-                    >
-                      <Text style={styles.settingValue}>{t('sites_revoke')}</Text>
-                    </TouchableOpacity>
-                  </View>
+                  <SettingRow
+                    key={site.origin}
+                    title={name}
+                    host
+                    subtitle={d && d.idn ? `${site.origin} · ${t('sites_idn')}` : site.origin}
+                    subtitleLines={2}
+                    ltrSubtitle
+                    value={t('sites_revoke')}
+                    onPress={() => revokeSite(site.origin)}
+                    accessibilityLabel={`${t('sites_revoke')} ${name}`}
+                  />
                 );
               })}
             </View>
@@ -6939,12 +7207,7 @@ const WalletScreen = () => {
             <View style={styles.settingGroup}>
               <Text style={styles.settingGroupTitle}>{t('network')}</Text>
 
-              <View style={styles.settingItem}>
-                <View style={styles.settingInfo}>
-                  <Text style={styles.settingTitle}>{t('current_network')}</Text>
-                  <Text style={styles.settingSubtitle}>QNet Testnet · {t('solana_devnet')}</Text>
-                </View>
-              </View>
+              <SettingRow title={t('current_network')} subtitle={`${CHAIN_NAME} testnet · ${t('solana_devnet')}`} />
             </View>
 
             {/* The published texts, one tap from the app (the stores require the privacy policy in-app too). */}
@@ -7019,7 +7282,10 @@ const WalletScreen = () => {
           <View style={styles.txResultOverlay}>
             <ScrollView style={styles.content} contentContainerStyle={styles.scrollContentContainer} onScroll={handleUserActivity} scrollEventThrottle={500}>
               <TxDetail
-                tx={txDetail.nodeType ? { ...txDetail, nodeTypeTitle: nodeTitle(t, txDetail.nodeType) } : txDetail}
+                tx={(() => {
+                  const [row] = withMoveStates([txDetail], transit.owner === wallet?.qnetAddress ? transit : null);
+                  return row.nodeType ? { ...row, nodeTypeTitle: nodeTitle(t, row.nodeType) } : row;
+                })()}
                 t={t}
                 hideAmounts={balancesHidden}
                 copied={copiedAddress}
@@ -7233,7 +7499,7 @@ const WalletScreen = () => {
                     </View>
                     <View style={styles.mgrRowInfo}>
                       <Text style={styles.mgrRowSym} numberOfLines={1}>{title}</Text>
-                      <Text style={styles.mgrRowBal}>{addable ? t('tok_not_tracked') : maskAmt(tk.balance)}</Text>
+                      <Text style={styles.mgrRowBal}>{addable ? t('tok_not_tracked') : maskAmt(tokenFigure(tk))}</Text>
                       {!isQnc && !addable ? <Text style={styles.mgrRowBal}>{t('tok_contract_id', { id: contractShortId(tk.contract) })}</Text> : null}
                       {reserved ? <Text style={[styles.mgrRowBal, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text> : null}
                     </View>

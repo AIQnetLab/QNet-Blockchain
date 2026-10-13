@@ -217,9 +217,9 @@ impl QNetNetworkConfig {
     /// Get current network name for display
     pub fn network_name(&self) -> &str {
         match self.environment {
-            NetworkEnvironment::Testnet => "QNet Testnet",
-            NetworkEnvironment::Mainnet => "QNet Mainnet", 
-            NetworkEnvironment::Local => "QNet Local",
+            NetworkEnvironment::Testnet => "QNet Blockchain testnet",
+            NetworkEnvironment::Mainnet => "QNet Blockchain mainnet", 
+            NetworkEnvironment::Local => "QNet Blockchain local network",
         }
     }
     

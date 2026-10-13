@@ -6,7 +6,7 @@ exact text each one signs, the gas it needs, what it costs, the request a node a
 follow it afterwards.
 
 There is one implementation of these formats: `applications/qnet-mobile/src/crypto/TxBuilders.js`
-(with the signed texts in `WalletIdentity.js`). The QNet app imports it, the browser extension's
+(with the signed texts in `WalletIdentity.js`). The QNet Wallet app imports it, the browser extension's
 bundle and `@aiqnet/sdk` compile it. Its known answers are in
 `applications/qnet-mobile/src/crypto/__vectors__/tx-vectors.json`, checked by the app, the extension
 and the SDK; `applications/qnet-mobile/__tests__/TxSourcePin.test.js` fails when the node's own
@@ -231,6 +231,11 @@ Recorded from `https://node2.aiqnet.io` on 2026-09-25 (a reward payment):
 {"status":"found","transaction":{"amount":13942206823306,"block_height":2208291,"effective_gas_cost":0,"finality_indicators":{"confirmations":2622,"level":"FullyFinalized","risk_assessment":"safe_for_any_amount","safety_percentage":100.0,"time_to_finality":0},"from":"system_rewards_pool","gas_limit":0,"gas_price":0,"hash":"f7d6c1ea3936b29b399cdfcc3eaae2b68d78c54127ea775db430ece2f5ee2bea","is_quantum_signed":true,"nonce":0,"quantum_security":{"algorithm":"CRYSTALS-Dilithium3 (NIST FIPS 204)","dilithium_pubkey_present":true,"dilithium_signature_present":true,"gas_premium":"50%","quantum_resistant":true},"signature_type":"Dilithium3 (ML-DSA-65)","status":"confirmed","timestamp":1790358572,"to":"3ea41975abd7681e7e1eon5257cf41fa26cbf9bbd32ad","tx_type":"RewardDistribution"},"tx_hash":"f7d6c1ea3936b29b399cdfcc3eaae2b68d78c54127ea775db430ece2f5ee2bea"}
 ```
 
+A reward claim is the exception: apply records what it credited, so a claim in a block that credited nothing
+(a repeat of an applied claim) reads `no_effect` with `amount` 0, here and in the address history routes
+(`status` on each row), and a claim that credited part of its batch shows the part. Claims applied before a node
+kept these records, or older than its transaction index, read `confirmed`.
+
 `confirmed` means "in a block", not "applied": the node stores no result. What happened follows from
 the account and the contract:
 
@@ -251,7 +256,7 @@ transaction is in the site archive: `GET https://aiqnet.io/api/tx/{hash}`.
 ## System transactions
 
 The node builds the system transactions of a block itself; a wallet never sends one. From the
-`tx_target_bound` gate (height 2,851,200, [consensus](../architecture/consensus.md#consensus-feature-gates)) a
+`tx_target_bound` gate (its height is in the [consensus gate table](../architecture/consensus.md#consensus-feature-gates)) a
 commitment-class system transaction carries, in each envelope field its signature leaves out, the one
 value its builder writes (`check_commitment_envelope` in `core/qnet-state/src/transaction.rs`), so a relay's
 copy has the same hash:

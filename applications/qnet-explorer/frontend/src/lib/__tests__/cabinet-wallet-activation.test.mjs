@@ -27,7 +27,10 @@ const light = (over = {}) => ({
   registered: false, pending: false, deviceBound: false, answeredThisEpoch: false, needsReactivation: false,
   counted: { sinceRegistration: 0, counted: 0, lastCountedEpoch: null }, features: [], balanceNano: null, ...over,
 });
-const superS = (over = {}) => ({ registered: false, online: false, lastSeenAt: null, heartbeats: null, banned: false, balanceNano: null, ...over });
+const superS = (over = {}) => ({
+  registered: false, online: false, lastSeenAt: null, heartbeats: null, banned: false, balanceNano: null, admission: null, admitted: null, onPace: null,
+  networkHeight: null, serverHeight: null, connected: false, ...over,
+});
 const record = (over = {}) => ({
   wallet: W, state: 'none', nodeType: null, way: null, burner: null, burnTx: null, burnAmount: null, code: null, until: null, recordedAt: null, scan: null, ...over,
 });
@@ -236,11 +239,42 @@ test('the network\'s and the super node\'s answers are read exactly', () => {
   assert.deepEqual(parseWalletNode({ state: 'none' }), { state: 'none' });
   assert.deepEqual(parseWalletNode({ state: 'registered', nodeId: lightNodeId(W), nodeType: 'light' }), { state: 'registered', nodeId: lightNodeId(W), nodeType: 'light' });
   for (const bad of [{ state: 'none', x: 1 }, { state: 'registered', nodeId: 'X Y', nodeType: 'light' }, { state: 'registered', nodeId: 'a', nodeType: 'full' }, null]) assert.equal(parseWalletNode(bad), null);
-  const online = superS({ registered: true, online: true, lastSeenAt: 1_790_000_000_000, heartbeats: { current: 7, required: 9 }, balanceNano: '2500000000' });
+  const online = superS({
+    registered: true, online: true, lastSeenAt: 1_790_000_000_000, heartbeats: { current: 7, required: 9 }, balanceNano: '2500000000', admitted: true, onPace: true,
+    networkHeight: 3_508_200, serverHeight: null,
+  });
   assert.deepEqual(parseSuperStatus(online), online);
   assert.equal(superState(online), 'online');
   assert.equal(superState(superS({ registered: true })), 'offline');
-  for (const bad of [{ ...online, extra: 1 }, { ...online, heartbeats: { current: 1, required: 0 } }, superS({ online: true }), { ...online, balanceNano: '01' }]) {
+  // Owner, 11.10: registered, its server answering and outside the network's eligible set is waiting for admission, not
+  // Offline. Offline wins: the network drops a silent admitted node from the set too, so a stopped server never reads
+  // as waiting; a barred node (also out of the set) reads Online with its own row. An unread set says nothing.
+  assert.equal(superState({ ...online, admitted: false }), 'waiting');
+  assert.equal(superState(superS({ registered: true, admitted: false })), 'offline');
+  assert.equal(superState({ ...online, admitted: false, banned: true }), 'online');
+  assert.equal(superState(superS({ registered: true, admitted: false, banned: true })), 'offline');
+  assert.equal(superState(superS({ registered: true, online: true, admitted: null })), 'online');
+  // The node's own admission settles it when the node names one (the eligible set is then not read): waiting, admitted,
+  // or no admission rule this epoch; offline and barred still come first.
+  assert.equal(superState({ ...online, admitted: null, admission: 'waiting' }), 'waiting');
+  assert.equal(superState({ ...online, admitted: false, admission: 'admitted' }), 'online');
+  assert.equal(superState({ ...online, admitted: false, admission: 'not_required' }), 'online');
+  assert.equal(superState(superS({ registered: true, admission: 'waiting' })), 'offline');
+  assert.equal(superState({ ...online, admission: 'waiting', banned: true }), 'online');
+  const av = (over) => activationView(base(over));
+  assert.equal(c9Name(av({ superStatus: ok({ ...online, admitted: false }) })), 'super-waiting');
+  assert.equal(c9Name(av({ superStatus: ok(superS({ registered: true, admitted: false })) })), 'super-offline');
+  assert.deepEqual(journey(true, av({ superStatus: ok({ ...online, admitted: false }) })), { done: 3, current: 3, nodeType: 'super' });
+  assert.equal(c9Name(av({ superStatus: ok({ ...online, admitted: null, admission: 'waiting' }) })), 'super-waiting');
+  // Not registered yet: the network may see its server, and says nothing else of it.
+  const seen = superS({ connected: true });
+  assert.deepEqual(parseSuperStatus(seen), seen);
+  assert.equal(av({ superStatus: ok(seen) }).superConnected, true);
+  for (const bad of [
+    { ...online, extra: 1 }, { ...online, heartbeats: { current: 1, required: 0 } }, superS({ online: true }), { ...online, balanceNano: '01' },
+    { ...online, admitted: 'yes' }, { ...online, onPace: 1 }, { ...online, networkHeight: -1 }, { ...online, serverHeight: 1.5 }, { ...online, connected: true },
+    superS({ admitted: true }), superS({ networkHeight: 5 }), superS({ onPace: false }), { ...online, connected: undefined },
+  ]) {
     assert.equal(parseSuperStatus(bad), null, JSON.stringify(bad));
   }
 });

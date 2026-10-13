@@ -325,7 +325,8 @@ export function createLinkRelay(options: LinkRelayOptions = {}): LinkRelay {
 }
 
 // The process's relay, on globalThis so every route bundle shares one store, with an unref'd sweep. It opens `link`,
-// `claim` and `reserve` sessions only while the cabinet's phone flows are on (phone-flows.ts).
+// `claim`, `reserve` and `unlink` sessions only while the cabinet's phone flows are on (phone-flows.ts); a `claim` session
+// names the wallet and its light or super node (qnet-link.ts checkRequest).
 const GLOBAL_KEY = Symbol.for('qnet.linkRelay');
 
 export function linkRelay(): LinkRelay {

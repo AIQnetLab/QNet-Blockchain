@@ -1,8 +1,10 @@
 /**
- * The bytes a light node's wallet key, ping key and device key sign (docs/protocols/light-node-messages.md), one
- * copy for the app and the extension's crypto bundle. Pure JS, no native calls: every builder checks its fields, so
- * nothing malformed is ever signed. Known answers: docs/protocols/light-node.vectors.json
- * (__tests__/LightNodeVectors.test.js; the extension's test/light-node-vectors.test.mjs).
+ * The bytes a light node's wallet key, ping key and device key sign (docs/protocols/light-node-messages.md), and the
+ * claim quote of the wallet's light or super node, one copy for the app and the extension's crypto bundle. Pure JS, no
+ * native calls: every builder checks its fields, so nothing malformed is ever signed. Known answers:
+ * docs/protocols/light-node.vectors.json (__tests__/LightNodeVectors.test.js; the extension's
+ * test/light-node-vectors.test.mjs) and docs/protocols/node-claim.vectors.json (__tests__/NodeClaimVectors.test.js; the
+ * extension's test/node-claim-vectors.test.mjs).
  */
 
 import { blake3 } from '@noble/hashes/blake3.js';
@@ -17,6 +19,7 @@ export const EPOCH_BLOCKS = 14400;
 export const DEVICE_PLATFORM_BYTE = Object.freeze({ ios: 1, android: 2 });
 
 const NODE_ID_RE = /^light_mobile_[0-9a-f]{16}$/;
+const SUPER_NODE_ID_RE = /^super_node_[0-9a-f]{16}$/;
 const HEX32_RE = /^[0-9a-f]{64}$/;
 const PROOF_RE = /^[0-9a-f]{32}$/;
 const MLDSA_PK_RE = /^[0-9a-f]{3904}$/;
@@ -51,6 +54,8 @@ function heightOf(value) {
 }
 
 const nodeIdOf = (v) => match(v, NODE_ID_RE, 'nodeId');
+// The node a claim quote names: the wallet's light or super node (a site's move names either: qnet-link-v1 section 14.4).
+const claimNodeIdOf = (v) => (typeof v === 'string' && SUPER_NODE_ID_RE.test(v) ? v : nodeIdOf(v));
 const walletOf = (v) => (isValidQnetAddress(v) ? v : fail('wallet'));
 const sha3Hex = (x) => bytesToHex(sha3_256(typeof x === 'string' ? utf8ToBytes(x) : x));
 
@@ -85,6 +90,24 @@ function b64urlBytes(text, name) {
 /** The light node id of a wallet: "light_mobile_" + first 16 hex of BLAKE3("LIGHT_NODE_PRIVACY_" + wallet). */
 export function lightNodeId(wallet) {
   return `light_mobile_${bytesToHex(blake3(utf8ToBytes(`LIGHT_NODE_PRIVACY_${walletOf(wallet)}`))).slice(0, 16)}`;
+}
+
+/**
+ * The super node id of a wallet: "super_node_" + first 16 hex of BLAKE3("SUPER_NODE_PRIVACY_" + wallet), the node's
+ * generate_super_node_pseudonym (a domain of its own, so a wallet's light and super ids never collide).
+ */
+export function superNodeId(wallet) {
+  return `super_node_${bytesToHex(blake3(utf8ToBytes(`SUPER_NODE_PRIVACY_${walletOf(wallet)}`))).slice(0, 16)}`;
+}
+
+/**
+ * Which of `wallet`'s nodes `nodeId` is: 'light' for its light node id, 'super' for its super node id, null for any other
+ * id (another wallet's node, a genesis node, a malformed one) or a malformed wallet. A site's move names one of them.
+ */
+export function ownNodeType(nodeId, wallet) {
+  if (typeof nodeId !== 'string' || !isValidQnetAddress(wallet)) return null;
+  if (nodeId === lightNodeId(wallet)) return 'light';
+  return nodeId === superNodeId(wallet) ? 'super' : null;
 }
 
 /** The registration proof: first 32 hex of BLAKE3("{burnTx}:{nodeId}:{wallet}"). */
@@ -156,8 +179,9 @@ export function answerChallenge(height, hash) {
   return `selfattest:${heightOf(height)}:${match(hash, HEX32_RE, 'hash')}`;
 }
 
+/** Step 1 of a move of the node balance: the quote of the wallet's light or super node `nodeId`. */
 export function claimQuotePreimage(nodeId, wallet) {
-  return `${QNET_CHAIN_TAG}claim_rewards:${nodeIdOf(nodeId)}:${walletOf(wallet)}`;
+  return `${QNET_CHAIN_TAG}claim_rewards:${claimNodeIdOf(nodeId)}:${walletOf(wallet)}`;
 }
 
 /** The claim payload: `claimsData` is the exact string the node quoted. */

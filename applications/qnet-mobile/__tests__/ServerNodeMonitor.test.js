@@ -40,6 +40,19 @@ describe('the node status of a server node', () => {
       expect(s).toMatchObject({ lastSeen: 1790000000, lastSeenAgoSeconds: 42, heartbeatCount: 4, requiredHeartbeats: 9 });
     }
   });
+
+  it('carries the super node\'s admission when the node reports one; nothing for a missing or unknown value', async () => {
+    const body = (over) => ({ success: true, node_id: 'super_node_60a735f53dd87f1b', node_type: 'super', is_online: true,
+      last_seen: 1790000000, last_seen_ago_seconds: 42, heartbeat_count: 4, required_heartbeats: 9, pending_rewards: 0, ...over });
+    for (const [over, admission] of [
+      [{ admission: 'admitted' }, 'admitted'], [{ admission: 'waiting' }, 'waiting'], [{ admission: 'not_required' }, 'not_required'],
+      [{ admission: null }, undefined], [{ admission: 'maybe' }, undefined], [{}, undefined],
+    ]) {
+      global.fetch = jest.fn(() => reply(body(over)));
+      const s = await checkServerNodeStatus('super_node_60a735f53dd87f1b', null, 1);
+      expect([over, s.admission]).toEqual([over, admission]);
+    }
+  });
 });
 
 describe('the chain\'s registrations of the wallet\'s nodes (node-events)', () => {
@@ -96,11 +109,11 @@ describe('a server node\'s counted and missed epochs', () => {
       ] });
     });
     // Registered at a height in epoch 145: epochs 144 and 143 are before it, and 145 (its own) is not missed.
-    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 145 * 14400 + 77 })).toEqual({ counted: 3, missed: 1 });
+    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 145 * 14400 + 77 })).toEqual({ counted: 3, missed: 1, notAdmitted: 0 });
     expect(calls[0]).toMatch(new RegExp(`/api/v1/rewards/history/${ID}\\?limit=64$`));
     expect(calls).toHaveLength(1); // every epoch served: one node is enough
     // Registered in epoch 0 (a genesis node): every epoch is its.
-    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 0 })).toEqual({ counted: 4, missed: 3 });
+    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 0 })).toEqual({ counted: 4, missed: 3, notAdmitted: 0 });
   });
 
   it('a second genesis node fills the epochs the first could not serve; unavailable is neither counted nor missed', async () => {
@@ -109,8 +122,16 @@ describe('a server node\'s counted and missed epochs', () => {
       { node_id: ID, wallet: W, history: [row(150, 'not_eligible'), row(149, 'claimed'), row(148, 'unavailable')] },
     ];
     global.fetch = jest.fn(() => reply(answers.shift()));
-    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 0 })).toEqual({ counted: 1, missed: 1 });
+    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 0 })).toEqual({ counted: 1, missed: 1, notAdmitted: 0 });
     expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  // A super node outside the epoch's admitted set earned nothing by the network's admission, not by missed heartbeats.
+  it('an epoch outside the admitted set is counted as not admitted, never as missed', async () => {
+    global.fetch = jest.fn(() => reply({ node_id: ID, wallet: W, history: [
+      row(150, 'claimable'), row(149, 'not_admitted'), row(148, 'not_admitted'), row(147, 'not_eligible'),
+    ] }));
+    expect(await getNodeEpochs(ID, { walletAddress: W, registeredHeight: 0 })).toEqual({ counted: 1, missed: 1, notAdmitted: 2 });
   });
 
   it('an answer for another wallet counts for nothing; no answer is unknown (null)', async () => {

@@ -1,6 +1,6 @@
-# QNet contracts
+# QNet Blockchain contracts
 
-Rust sources for WebAssembly contracts on QNet, and a tool that checks every module against the
+Rust sources for WebAssembly contracts on QNet Blockchain, and a tool that checks every module against the
 node's own deploy rules. This is a Cargo workspace of its own, separate from the node workspace
 at the repository root; its only link to the node is a path dependency on `core/qnet-vm`.
 
@@ -34,7 +34,7 @@ $env:GAME_ITEMS_OWNER = "<address>"; cargo build-contracts game-items  # PowerSh
 ```
 
 A template declares such variables in `[package.metadata.qnet.env]`; one declared with `kind = "address"`
-must be a valid QNet address, its SHA3-256 checksum included, or `cargo build-contracts` builds nothing. A
+must be a valid QNet Blockchain address, its SHA3-256 checksum included, or `cargo build-contracts` builds nothing. A
 contract's code can never be replaced after deploy, so a mistyped owner would leave a contract that can never
 mint. Unset, the variable only earns a note (a `game-items` built without it can never mint).
 

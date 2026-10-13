@@ -24,7 +24,7 @@ import {
   recordsLightNode,
 } from '@/lib/cabinet/extension-view';
 import { isLinkedState, nodeState } from '@/lib/cabinet/node-view';
-import { SITE_ORIGIN, lightNodeId, type ActivationAnswer, type ActivationErrorCode, type ExtensionFailure, type NodeType } from '@/lib/qnet-link';
+import { SITE_ORIGIN, lightNodeId, superNodeId, type ActivationAnswer, type ActivationErrorCode, type ExtensionFailure, type NodeType } from '@/lib/qnet-link';
 import { solanaTxUrl } from '@/lib/one-dev';
 import CopyButton from './CopyButton';
 import { useCabinet } from './CabinetProvider';
@@ -79,8 +79,8 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 // for the cabinet's wallet (wallet-activation.ts); until then its record on the network, then, by itself, Link your
 // phone. `since`: when the page got the answer.
 function LightNext({ qnet, since, burnFinal }: { qnet: string; since: number; burnFinal: boolean }) {
-  const { ready, choice, choose, view } = useCabinet();
-  const { state } = useNodeStatus(lightNodeId(qnet));
+  const { ready, choice, choose, viewOnly, view } = useCabinet();
+  const { state } = useNodeStatus(lightNodeId(qnet), viewOnly);
   // The extension's wallet becomes the cabinet's wallet when none was chosen.
   useEffect(() => {
     if (ready && !choice) choose({ qnet, source: 'extension' });
@@ -166,7 +166,7 @@ function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; reque
       {recordsLightNode(answer) && requested === 'light' ? (
         <LightNext qnet={answer.qnet} since={at} burnFinal={answer.status !== 'pending'} />
       ) : answer.nodeType === 'super' && answer.code ? (
-        <SuperNext code={answer.code} burnTx={burnTx} burnAmount={burnAmount} />
+        <SuperNext code={answer.code} burnTx={burnTx} burnAmount={burnAmount} nodeId={answer.qnet ? superNodeId(answer.qnet) : null} />
       ) : null}
     </div>
   );

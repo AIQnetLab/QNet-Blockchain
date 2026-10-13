@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import ExplorerLink from '@/components/ExplorerLink';
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import TokenIcon from '@/components/TokenIcon';
 import { useActivationContent } from '@/contexts/AppContext';
@@ -97,9 +97,9 @@ const AddrLink = ({ addr }: { addr: string }) => {
   const full = useActivationContent();
   const isValid = addr && addr.length > 10 && addr.includes('eon');
   return isValid ? (
-    <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">
+    <Link href={`/explorer/address/${addr}`} className="address-link">
       {truncate(addr, 6, 4)}
-    </ExplorerLink>
+    </Link>
   ) : (
     <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
   );
@@ -368,9 +368,9 @@ export default function TokenPage() {
               {data.transfers.map((t, idx) => (
                 <tr key={`${t.hash}-${idx}`}>
                   <td>
-                    <ExplorerLink href={`/explorer/tx/${t.hash}`} className="address-link">
+                    <Link href={`/explorer/tx/${t.hash}`} className="address-link">
                       {truncate(t.hash, 6, 4)}
-                    </ExplorerLink>
+                    </Link>
                   </td>
                   <td>
                     <span className={`type-badge type-${t.method.toLowerCase()}`}>{t.method}</span>
@@ -385,9 +385,9 @@ export default function TokenPage() {
                   </td>
                   <td>{t.fee}</td>
                   <td>
-                    <ExplorerLink href={`/explorer/block/${t.block}`} className="address-link">
+                    <Link href={`/explorer/block/${t.block}`} className="address-link">
                       {t.block}
-                    </ExplorerLink>
+                    </Link>
                   </td>
                   <td>{formatTimeAgo(t.timestamp)}</td>
                 </tr>
@@ -424,8 +424,8 @@ export default function TokenPage() {
           <div className="detail-row">
             <span className="detail-label" />
             <span className="detail-value" style={{ opacity: 0.8, fontSize: '0.9em', lineHeight: 1.55 }}>
-              Native QNet {tokenStd} token — it runs the protocol&apos;s canonical token logic,
-              not custom bytecode. Its behavior is defined by the QNet protocol, so no
+              Native QNet Blockchain {tokenStd} token — it runs the protocol&apos;s canonical token logic,
+              not custom bytecode. Its behavior is defined by the QNet Blockchain protocol, so no
               per-contract source verification is required.
             </span>
           </div>

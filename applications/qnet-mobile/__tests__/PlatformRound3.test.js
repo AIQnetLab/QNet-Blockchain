@@ -1,6 +1,7 @@
 // Round-3 platform findings: the recovery-phrase field exports nothing and a paste leaves the clipboard (MPLAT-R3-01),
-// the integrity check runs when a phrase is shown or typed (MPLAT-R3-02), the store builds' outbound links open the
-// site's app view (R3-XPD-01, R3-XPD-03), and any spelling of a phrase imports as the wallet it names (R3-XPD-07).
+// the integrity check runs when a phrase is shown or typed (MPLAT-R3-02), the store builds' outbound links carry the
+// same `from=app` query, which only names where a visit came from (R3-XPD-01, R3-XPD-03), and any spelling of a phrase
+// imports as the wallet it names (R3-XPD-07).
 const fs = require('fs');
 const path = require('path');
 const { SEED_INPUT_PROPS, SEED_FIELD_ID, looksPasted, insertedText } = require('../src/utils/sensitiveInput');
@@ -76,15 +77,15 @@ describe('MPLAT-R3-02: the integrity check runs when a phrase is shown or typed'
   });
 });
 
-describe('R3-XPD-01 / R3-XPD-03: outbound links of the store builds open the site\'s app view', () => {
+describe('R3-XPD-01 / R3-XPD-03: outbound links of the store builds carry the same query', () => {
   it('every history row and result card opens the explorer with the marker', () => {
     expect(explorerTxUrl('f00d')).toBe('https://aiqnet.io/explorer/tx/f00d?from=app');
     const nodes = read('src/config/nodes.js');
     const line = nodes.split('\n').find((l) => l.includes('export const explorerTxUrl'));
-    expect(line.trimEnd().endsWith('?from=app`;')).toBe(true); // the site's release check reads this line
+    expect(line.trimEnd().endsWith('?from=app`;')).toBe(true);
   });
 
-  it('every aiqnet.io URL given to Play carries the marker, and the developer website is a page of the app view', () => {
+  it('every aiqnet.io URL given to Play carries the query, and the developer website is the explorer', () => {
     const play = read('store-listing/google-play-description.txt');
     const urls = [...play.matchAll(/https:\/\/aiqnet\.io[^\s)]*/g)].map((m) => m[0]);
     expect(urls.length).toBeGreaterThanOrEqual(2);

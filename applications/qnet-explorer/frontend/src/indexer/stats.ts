@@ -1,5 +1,6 @@
 import type { Pool } from 'pg';
 import { log } from './log';
+import { TOP_BLOCK_SQL } from './sql';
 
 // explorer_stats is maintained incrementally by every commit. A full rebuild runs once (rebuilt_at is
 // null) and whenever an operator clears rebuilt_at; it is the only place that scans the tables.
@@ -21,8 +22,7 @@ export async function rebuildStatsIfNeeded(pool: Pool): Promise<void> {
     for (const r of tx.rows) { byType[r.tx_type] = Number(r.c); total += Number(r.c); emission += BigInt(r.e); }
     const blocks = Number((await client.query<{ c: string }>('SELECT count(*) AS c FROM blocks')).rows[0].c);
     const batch = Number((await client.query<{ c: string }>('SELECT count(*) AS c FROM batch_transfers')).rows[0].c);
-    const head = (await client.query<{ height: string; hash: string | null; timestamp: string }>(
-      'SELECT height::text, hash, timestamp::text FROM blocks ORDER BY height DESC LIMIT 1')).rows[0];
+    const head = (await client.query<{ height: string; hash: string | null; timestamp: string }>(TOP_BLOCK_SQL)).rows[0];
     await client.query(
       `UPDATE explorer_stats SET tx_total = $1, tx_by_type = $2::jsonb, blocks_total = $3, batch_transfers_total = $4,
          emission_total = $5::numeric, head_height = $6, head_hash = $7, head_timestamp = $8, rebuilt_at = now(), updated_at = now()

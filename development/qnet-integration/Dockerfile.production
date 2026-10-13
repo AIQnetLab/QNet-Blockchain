@@ -83,9 +83,10 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "   TCP 9876  - P2P Network"\n\
 echo "   TCP 9877  - Gossip Protocol"\n\
 echo "   TCP 8001  - REST API"\n\
+echo "   TCP 443   - Public RPC for wallets (host 443 -> container 8443; installer flag --no-public-rpc turns it off)"\n\
 echo "   UDP 10876 - QUIC Transport ⚡ (Required for v2.19.22+)"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
-echo "⚠️  RUN ON HOST: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp"\n\
+echo "⚠️  RUN ON HOST: sudo ufw allow 9876,9877,8001,443/tcp && sudo ufw allow 10876/udp"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
 echo ""\n\
 set +e\n\
@@ -140,8 +141,11 @@ if [ "$(id -u)" = "0" ]; then\n\
   fi\n\
   \n\
   echo "Fixing data directory permissions..."\n\
+  # The public RPC keys are made owner-only first and left out of the wide pass, so they are never\n\
+  # readable by others, not even for the moments a recursive pass over the store takes.\n\
+  if [ -d "$DATA_DIR/wallet_tls" ]; then chmod -R go-rwx "$DATA_DIR/wallet_tls"; fi\n\
   chown -R qnet:qnet "$DATA_DIR"\n\
-  chmod -R 755 "$DATA_DIR"\n\
+  find "$DATA_DIR" -path "$DATA_DIR/wallet_tls" -prune -o -exec chmod 755 {} +\n\
   \n\
   # A seed file mounted from the host keeps its host owner and mode (0600, root), which the qnet user cannot\n\
   # read: the node gets a copy it owns, in memory (/dev/shm), and the variable names the copy.\n\
@@ -179,7 +183,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 # 9877 - P2P gossip
 # 8001 - REST API
 # 10876 - QUIC transport (9876 + 1000)
-EXPOSE 9876 9877 8001 10876
+# 8443 - public RPC for wallets over HTTPS; the installer publishes host 443 to it (the node runs
+#        unprivileged, so it cannot bind 443 itself)
+EXPOSE 9876 9877 8001 10876 8443
 
 # Production startup command with automatic permission fixing
 # tini as PID 1 reaps orphaned children (exec'd tools, docker exec sessions); the node stays PID 2.

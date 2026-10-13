@@ -345,11 +345,13 @@ pub(super) async fn handle_account_transactions(
                     Some(got) if tx.from != address => (Some(address.clone()), got),
                     _ => crate::rpc::tx_display_to_amount(tx),
                 };
+                let (status, amount) = crate::rpc::claim_outcome_display(&storage, tx).unwrap_or(("confirmed", amount));
                 json!({
                     "hash": tx.hash,
                     "from": tx.from,
                     "to": to,
                     "amount": amount,
+                    "status": status,
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
@@ -503,20 +505,21 @@ pub(super) fn logs_window_gate(storage: &crate::storage::Storage, end: u64, appl
 /// GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer-inclusion proof. Returns the
 /// merkle sibling path from the event leaf to the window's logs_root; the client recomputes the root
 /// and checks it equals the QC-anchored `Checkpoint.logs_root` it independently verified for [start,end].
+/// The per-address limit is applied by the route (`route_limit`), on either plane. On the wallet
+/// plane (`typed`) a refusal is typed with its real status; port 8001 keeps the bodies old clients read.
 pub(super) async fn handle_log_proof(
     q: LogProofQuery,
-    remote_addr: Option<std::net::SocketAddr>,
+    typed: bool,
     blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+) -> Result<warp::reply::Response, Rejection> {
     if q.tx_hash.len() != 64 || !q.tx_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Ok(warp::reply::json(&json!({"error": "Invalid tx_hash"})));
+        return Ok(log_proof_refusal(typed, "Invalid tx_hash", json!({"error": "Invalid tx_hash"})));
     }
     let target_li = q.log_index.unwrap_or(0);
     let storage = blockchain.get_storage();
     let h = match storage.get_transaction_block_height(&q.tx_hash).await {
         Ok(h) if h > 0 => h,
-        _ => return Ok(warp::reply::json(&json!({"error": "Transaction not found"}))),
+        _ => return Ok(log_proof_refusal(typed, "Transaction not found", json!({"error": "Transaction not found"}))),
     };
     // Macroblock window [start,end] (90 microblocks) whose Checkpoint.logs_root commits this height —
     // same window keying as the consensus signal (K=90). Leaves via the SHARED builder (no drift).
@@ -524,7 +527,7 @@ pub(super) async fn handle_log_proof(
     let start = end.saturating_sub(89).max(1);
     let macroblock_index = match logs_window_gate(&storage, end, blockchain.get_height().await) {
         Ok(j) => j,
-        Err(body) => return Ok(warp::reply::json(&body)),
+        Err(body) => return Ok(log_proof_refusal(typed, "window_not_finalized", body)),
     };
     // Lower bound: blocklogs below the prune floor are physically gone (get_block_logs → empty), so a
     // straddling window rebuilds a truncated-suffix leaf set whose root is NOT the QC-committed
@@ -533,7 +536,8 @@ pub(super) async fn handle_log_proof(
     // window has partial leaves; start < floor gates exactly that window and every fully-pruned older one.
     let log_floor = storage.log_prune_floor();
     if start < log_floor {
-        return Ok(warp::reply::json(&json!({"error": "window_pruned", "window_start": start, "window_end": end, "oldest_available": log_floor})));
+        return Ok(log_proof_refusal(typed, "window_pruned",
+            json!({"error": "window_pruned", "window_start": start, "window_end": end, "oldest_available": log_floor})));
     }
     // SHARDED 2-level proof — the SCALE fix: rebuild ONLY block h's leaves for level-1 (leaf → this
     // block's sub-root), then fold the window's per-block sub-roots for level-2 (sub-root → the committed
@@ -542,7 +546,8 @@ pub(super) async fn handle_log_proof(
     let block_h_logs = storage.get_block_logs(h);
     let belongs = block_h_logs.get(target_li).map(|(lt, _, _)| lt == &q.tx_hash).unwrap_or(false);
     if !belongs {
-        return Ok(warp::reply::json(&json!({"error": "Log not found in window", "window_start": start, "window_end": end})));
+        return Ok(log_proof_refusal(typed, "Log not found in window",
+            json!({"error": "Log not found in window", "window_start": start, "window_end": end})));
     }
     let block_leaves: Vec<Vec<u8>> = block_h_logs.iter().enumerate()
         .map(|(i, (tx, contract, data))| qnet_state::wasm_exec::log_leaf(tx, i as u32, contract, data)).collect();
@@ -565,7 +570,34 @@ pub(super) async fn handle_log_proof(
         "block_root": hex::encode(block_root),
         "window_proof": l2,                     // level 2: block_root → logs_root
         "logs_root": hex::encode(window_root),
-    })))
+    })).into_response())
+}
+
+/// A log-proof refusal: on port 8001 the 200 body old clients read (`legacy`); typed on the wallet
+/// plane, with the legacy body's other fields: 400 `bad_parameter`, 404 `tx_not_found`,
+/// `log_not_found` and `window_not_finalized` (the window's checkpoint is not certified here yet), 410
+/// `window_pruned`.
+pub(crate) fn log_proof_refusal(typed: bool, legacy_error: &str, legacy: Value) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    if !typed {
+        return warp::reply::json(&legacy).into_response();
+    }
+    let (status, error, retry) = match legacy_error {
+        "Invalid tx_hash" => (StatusCode::BAD_REQUEST, "bad_parameter", None),
+        "Transaction not found" => (StatusCode::NOT_FOUND, "tx_not_found", None),
+        "Log not found in window" => (StatusCode::NOT_FOUND, "log_not_found", None),
+        "window_pruned" => (StatusCode::GONE, "window_pruned", None),
+        _ => (StatusCode::NOT_FOUND, "window_not_finalized", Some(30)),
+    };
+    let mut extra = match legacy {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    extra.remove("error");
+    if status == StatusCode::BAD_REQUEST {
+        extra.insert("parameter".into(), json!("tx_hash"));
+    }
+    error_response(status, error, extra, retry)
 }
 
 /// GET /api/v1/token/{contract}/transfers?limit=&before= — decoded transfers for one token (newest first).
@@ -730,11 +762,13 @@ pub(super) async fn handle_transaction_history(
                     Some(got) if direction == "received" => (Some(query.address.clone()), got),
                     _ => crate::rpc::tx_display_to_amount(tx),
                 };
+                let (status, amount) = crate::rpc::claim_outcome_display(&storage, tx).unwrap_or(("confirmed", amount));
                 json!({
                     "hash": tx.hash,
                     "from": tx.from,
                     "to": to,
                     "amount": amount,
+                    "status": status,
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
@@ -1227,31 +1261,292 @@ pub(super) async fn handle_macroblock_by_index(
     }
 }
 
+/// Encoded macroblock-proof bodies kept for repeat reads: a body names one irrevocable checkpoint.
+pub(crate) const MB_PROOF_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// A macroblock proof body is valid forever (an archive-served body is the same checkpoint).
+pub(crate) const CACHE_IMMUTABLE_FOREVER: &str = "public, max-age=31536000, immutable";
+/// Macroblock-proof cache misses built at once node-wide, whichever port asked.
+const MB_BUILDS: usize = 2;
+/// How long a plane request waits for a build slot (or a registry request for the scan) before it is
+/// answered `busy`.
+const PLANE_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const WALLET_MB_PROOF_BUCKET: &str = "wallet_mb_proof";
+pub(crate) const WALLET_REGISTRY_BUCKET: &str = "wallet_registry";
+/// The client's registry cap: a bigger body is not built.
+pub(crate) const REGISTRY_BODY_MAX: usize = 16 * 1024 * 1024;
+/// Registry bodies are kept by bytes (two at the cap, hundreds at today's size); the entry bound only
+/// limits the map for the tiny oversize markers.
+const REGISTRY_CACHE_ENTRIES: usize = 4096;
+const REGISTRY_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const CACHE_REGISTRY: &str = "public, max-age=86400, immutable";
+
+/// A byte- and entry-bounded LRU of encoded bodies.
+pub(crate) struct BodyLru<K> {
+    cap_bytes: usize,
+    cap_entries: usize,
+    inner: parking_lot::Mutex<LruInner<K>>,
+}
+
+pub(crate) struct LruInner<K> {
+    map: HashMap<K, (bytes::Bytes, u64)>,
+    order: std::collections::BTreeMap<u64, K>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> BodyLru<K> {
+    pub(crate) fn new(cap_bytes: usize, cap_entries: usize) -> Self {
+        Self { cap_bytes, cap_entries, inner: parking_lot::Mutex::new(LruInner { map: HashMap::new(), order: Default::default(), bytes: 0, tick: 0 }) }
+    }
+
+    pub(crate) fn get(&self, k: &K) -> Option<bytes::Bytes> {
+        let mut g = self.inner.lock();
+        let inner = &mut *g;
+        inner.tick += 1;
+        let tick = inner.tick;
+        let (body, old) = match inner.map.get_mut(k) {
+            Some((b, t)) => (b.clone(), std::mem::replace(t, tick)),
+            None => return None,
+        };
+        if let Some(key) = inner.order.remove(&old) {
+            inner.order.insert(tick, key);
+        }
+        Some(body)
+    }
+
+    pub(crate) fn insert(&self, k: K, v: bytes::Bytes) {
+        if v.len() > self.cap_bytes {
+            return;
+        }
+        let mut g = self.inner.lock();
+        let inner = &mut *g;
+        if let Some((old, t)) = inner.map.remove(&k) {
+            inner.order.remove(&t);
+            inner.bytes -= old.len();
+        }
+        while inner.bytes + v.len() > self.cap_bytes || inner.map.len() >= self.cap_entries {
+            let Some((_, oldest)) = inner.order.pop_first() else { break };
+            if let Some((old, _)) = inner.map.remove(&oldest) {
+                inner.bytes -= old.len();
+            }
+        }
+        inner.tick += 1;
+        let tick = inner.tick;
+        inner.bytes += v.len();
+        inner.order.insert(tick, k.clone());
+        inner.map.insert(k, (v, tick));
+    }
+
+    /// A held body's size, without touching its recency (the egress estimate reads it).
+    pub(crate) fn peek_len(&self, k: &K) -> Option<usize> {
+        self.inner.lock().map.get(k).map(|(b, _)| b.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().map.len()
+    }
+}
+
+pub(crate) static MB_PROOF_CACHE: Lazy<BodyLru<u64>> = Lazy::new(|| BodyLru::new(MB_PROOF_CACHE_BYTES, usize::MAX));
+/// One build per index at a time: a burst of requests for a new index costs one build.
+static MB_PROOF_INFLIGHT: Lazy<DashMap<u64, Arc<tokio::sync::Mutex<()>>>> = Lazy::new(DashMap::new);
+static MB_BUILD_SLOTS: Lazy<tokio::sync::Semaphore> = Lazy::new(|| tokio::sync::Semaphore::new(MB_BUILDS));
+
+/// The cached proof body's size for `index`, if the node holds one (the plane's egress estimate).
+pub(crate) fn cached_macroblock_proof_len(index: u64) -> Option<usize> {
+    MB_PROOF_CACHE.peek_len(&index)
+}
+
+/// One request's share of its index's flight entry. The last share out removes the entry, also when
+/// the request is dropped while it waits (its client went away), so an abandoned request for any
+/// index leaves nothing behind.
+struct FlightShare {
+    index: u64,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl FlightShare {
+    fn join(index: u64) -> Self {
+        let lock = Arc::clone(MB_PROOF_INFLIGHT.entry(index).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).value());
+        Self { index, lock: Some(lock) }
+    }
+
+    /// The index's build lock, owned, so it can move into the build task.
+    async fn lock_owned(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(self.lock.as_ref().expect("held until drop")).lock_owned().await
+    }
+}
+
+impl Drop for FlightShare {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        // A share taken meanwhile holds its own count, so the entry stays for it.
+        MB_PROOF_INFLIGHT.remove_if(&self.index, |_, m| Arc::strong_count(m) == 1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mb_proof_flights_open(index: u64) -> bool {
+    MB_PROOF_INFLIGHT.contains_key(&index)
+}
+
+/// The outcome of building one macroblock proof.
+pub(crate) enum MbProof {
+    /// The body, and whether it may be cached: only when every QC signer's key is in it.
+    Body { bytes: bytes::Bytes, cacheable: bool },
+    NotFound,
+    NoCheckpointQc,
+    QcDecodeFailed,
+    QcSigsPruned,
+    BannedDecodeFailed,
+}
+
 /// Light-client QC proof for macroblock {index}: the checkpoint fields, the QC (signers + sigs), the
 /// committee + its consensus pubkeys, and the N-2 eligible_producers + beacon (so the client derives the
 /// committee). Immutable per index ⇒ cacheable/CDN. The client recomputes Checkpoint::hash, derives the
 /// committee, binds pubkeys to the QC-signed registry_root, and verifies a sampled set of QC signatures.
+///
+/// A complete success carries `Cache-Control: public, max-age=31536000, immutable` and comes from a
+/// byte-bounded cache, built once per index; an incomplete one is `no-store`. Errors are typed on the
+/// wallet plane or with `form=2`; elsewhere old clients get today's bodies.
 pub(super) async fn handle_macroblock_proof(
     index: u64,
+    query: Vec<(String, String)>,
     remote_addr: Option<std::net::SocketAddr>,
+    plane: Option<WalletPlane>,
     blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
+) -> Result<warp::reply::Response, Rejection> {
+    let typed = plane.is_some() || query.iter().any(|(k, v)| k == "form" && v == "2");
+    if let Err(r) = route_limit(remote_addr, plane, "read_only", WALLET_MB_PROOF_BUCKET, typed) {
+        return Ok(r);
+    }
+    let build = move || async move { build_macroblock_proof(index, &blockchain).await };
+    match macroblock_proof_flight(&MB_PROOF_CACHE, index, plane.is_some(), build).await {
+        Ok(outcome) => Ok(macroblock_proof_reply(index, outcome, typed)),
+        Err(busy) => Ok(busy),
+    }
+}
+
+/// The cache and single flight around one build: a cached body at once; otherwise one build per index
+/// at a time (a burst for a new index costs one build), at most two at once node-wide on either port,
+/// and only a key-complete body stored. A plane request waits a bounded time for a build slot (Err is
+/// its `busy`); one on port 8001 queues. The build runs as a task of its own holding the slot, the
+/// index's lock and a flight share, so a request dropped meanwhile neither frees them early (a second
+/// build of the index, a third build node-wide) nor throws the finished body away.
+pub(crate) async fn macroblock_proof_flight<F, Fut>(cache: &'static BodyLru<u64>, index: u64, plane: bool, build: F) -> Result<MbProof, warp::reply::Response>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = MbProof> + Send + 'static,
+{
+    if let Some(body) = cache.get(&index) {
+        wallet_plane::PLANE_STATS.mb_cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(MbProof::Body { bytes: body, cacheable: true });
+    }
+    let share = FlightShare::join(index);
+    let one_build = share.lock_owned().await;
+    if let Some(body) = cache.get(&index) {
+        return Ok(MbProof::Body { bytes: body, cacheable: true });
+    }
+    let slot = if plane {
+        match tokio::time::timeout(PLANE_BUILD_WAIT, MB_BUILD_SLOTS.acquire()).await {
+            Ok(Ok(p)) => p,
+            _ => return Err(wallet_plane::plane_busy(1)),
+        }
+    } else {
+        match MB_BUILD_SLOTS.acquire().await {
+            Ok(p) => p,
+            Err(_) => return Ok(MbProof::QcDecodeFailed),
+        }
+    };
+    let task_share = FlightShare::join(index);
+    let task = tokio::spawn(async move {
+        let built = build().await;
+        if let MbProof::Body { bytes, cacheable: true } = &built {
+            cache.insert(index, bytes.clone());
+        }
+        // The lock before the share: the last share out removes the index's entry.
+        drop(one_build);
+        drop(slot);
+        drop(task_share);
+        built
+    });
+    drop(share);
+    Ok(task.await.unwrap_or_else(|e| {
+        eprintln!("[ERR][PROOFVIEW] macroblock_proof_build_failed index={} err={}", index, e);
+        MbProof::QcDecodeFailed
+    }))
+}
+
+/// A proof body with its cache header: immutable for a year only when the node judged it complete
+/// (the same rule as its own cache); an incomplete one `no-store`, since the next build may complete it.
+fn macroblock_proof_ok(body: bytes::Bytes, cacheable: bool) -> warp::reply::Response {
+    let mut r = warp::reply::Response::new(warp::hyper::Body::from(body));
+    let h = r.headers_mut();
+    h.insert(warp::http::header::CONTENT_TYPE, warp::http::HeaderValue::from_static("application/json"));
+    h.insert(warp::http::header::CACHE_CONTROL, warp::http::HeaderValue::from_static(if cacheable { CACHE_IMMUTABLE_FOREVER } else { CACHE_NONE }));
+    r
+}
+
+/// The answer for a built (or refused) proof: typed errors on the plane or with `form=2`, the
+/// legacy 200 bodies otherwise.
+pub(crate) fn macroblock_proof_reply(index: u64, outcome: MbProof, typed: bool) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    let at = |extra: &[(&str, Value)]| {
+        let mut f = fields(&[("index", json!(index))]);
+        for (k, v) in extra {
+            f.insert(k.to_string(), v.clone());
+        }
+        f
+    };
+    let (status, error, extra, retry): (StatusCode, &str, Vec<(&str, Value)>, Option<u64>) = match outcome {
+        MbProof::Body { bytes, cacheable } => return macroblock_proof_ok(bytes, cacheable),
+        MbProof::NotFound => (StatusCode::NOT_FOUND, "macroblock_not_found", vec![], None),
+        MbProof::NoCheckpointQc => (StatusCode::NOT_FOUND, "no_checkpoint_qc", vec![], None),
+        MbProof::QcSigsPruned => (StatusCode::GONE, "qc_sigs_pruned", vec![("action", json!("repin_recent_anchor"))], None),
+        MbProof::QcDecodeFailed => (StatusCode::SERVICE_UNAVAILABLE, "qc_decode_failed", vec![], Some(5)),
+        MbProof::BannedDecodeFailed => (StatusCode::SERVICE_UNAVAILABLE, "banned_decode_failed", vec![], Some(5)),
+    };
+    if typed {
+        return error_response(status, error, at(&extra), retry);
+    }
+    let mut legacy = serde_json::Map::new();
+    legacy.insert("error".into(), json!(error));
+    legacy.insert("index".into(), json!(index));
+    for (k, v) in extra {
+        legacy.insert(k.to_string(), v);
+    }
+    warp::reply::json(&Value::Object(legacy)).into_response()
+}
+
+/// Build the proof body for `index` (the bytes `warp::reply::json` wrote for it before the cache). The
+/// decoding and the serialization (megabytes at a full committee) run on the blocking pool, never on
+/// the async workers of either runtime.
+pub(crate) async fn build_macroblock_proof(index: u64, blockchain: &Arc<BlockchainNode>) -> MbProof {
+    let storage = blockchain.get_storage();
+    let mb = match blockchain.get_macroblock(index).await {
+        Ok(Some(m)) => m,
+        _ => return MbProof::NotFound,
+    };
+    tokio::task::spawn_blocking(move || macroblock_proof_body(index, mb, &storage))
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[ERR][PROOFVIEW] macroblock_proof_build_failed index={} err={}", index, e);
+            MbProof::QcDecodeFailed
+        })
+}
+
+fn macroblock_proof_body(index: u64, mut mb: qnet_state::MacroBlock, storage: &Arc<crate::storage::Storage>) -> MbProof {
     type Certified = (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate);
     let decode_qc = |mb: &qnet_state::MacroBlock| -> Option<Certified> {
         mb.consensus_data.checkpoint_qc.as_ref().and_then(|b| bincode::deserialize(b).ok())
     };
-    let storage = blockchain.get_storage();
-    let mut mb = match blockchain.get_macroblock(index).await {
-        Ok(Some(m)) => m,
-        _ => return Ok(warp::reply::json(&json!({"error": "macroblock_not_found", "index": index}))),
-    };
     if mb.consensus_data.checkpoint_qc.is_none() {
-        return Ok(warp::reply::json(&json!({"error": "no_checkpoint_qc", "index": index})));
+        return MbProof::NoCheckpointQc;
     }
     let (mut cp, mut qc) = match decode_qc(&mb) {
         Some(v) => v,
-        None => return Ok(warp::reply::json(&json!({"error": "qc_decode_failed", "index": index}))),
+        None => return MbProof::QcDecodeFailed,
     };
     // Past the retention horizon the node has stripped the committee signatures; a history archive keeps
     // the signed copy and its signers' keys. Without one, serving the proof would hand the device a QC it
@@ -1265,9 +1560,7 @@ pub(super) async fn handle_macroblock_proof(
                 qc = aqc;
                 archived_keys = keys;
             }
-            _ => return Ok(warp::reply::json(&json!({
-                "error": "qc_sigs_pruned", "index": index, "action": "repin_recent_anchor"
-            }))),
+            _ => return MbProof::QcSigsPruned,
         }
     }
     // At the window head the certificate covers - mb.height is the macroblock index here, and read
@@ -1305,18 +1598,22 @@ pub(super) async fn handle_macroblock_proof(
         None => Vec::new(),
         Some(b) => match bincode::deserialize::<Vec<String>>(b) {
             Ok(v) => v,
-            Err(_) => return Ok(warp::reply::json(&json!({"error": "banned_decode_failed", "index": index}))),
+            Err(_) => return MbProof::BannedDecodeFailed,
         },
     };
     let checkpoint = checkpoint_json(&cp);
     let recovery_anchor_checkpoint = recovery_anchor_json(&storage, &cp);
+    // A body missing a signer's key, or the anchor checkpoint its pin names, is served but never
+    // cached (here or downstream): the next build may find either.
+    let cacheable = qc.signers.iter().all(|s| committee_pubkeys.contains_key(s))
+        && (cp.recovery_anchor.is_none() || !recovery_anchor_checkpoint.is_null());
     let qc_json = json!({
         "signers": qc.signers,
         // sigs are the ASCII "dilithium_sig_<id>_<b64>" strings; lossless from_utf8 drops any non-UTF8
         // element to "" (client rejects it) rather than silently corrupting bytes with U+FFFD.
         "sigs": qc.sigs.iter().map(|s| String::from_utf8(s.clone()).unwrap_or_default()).collect::<Vec<_>>(),
     });
-    Ok(warp::reply::json(&json!({
+    let body = json!({
         "index": index,
         "epoch": epoch,
         "checkpoint": checkpoint,
@@ -1329,7 +1626,11 @@ pub(super) async fn handle_macroblock_proof(
         // must still resolve the pin. Serve the ANCHOR CHECKPOINT so one round trip is enough; the
         // device re-digests it and compares against the QC-signed pin, so nothing here is trusted.
         "recovery_anchor_checkpoint": recovery_anchor_checkpoint,
-    })))
+    });
+    match serde_json::to_vec(&body) {
+        Ok(bytes) => MbProof::Body { bytes: bytes::Bytes::from(bytes), cacheable },
+        Err(_) => MbProof::QcDecodeFailed,
+    }
 }
 
 /// Canonical light-client JSON for a Checkpoint. Field-for-field the preimage `checkpointHash` folds,
@@ -1381,14 +1682,178 @@ pub(super) fn recovery_anchor_json(storage: &crate::storage::Storage, cp: &qnet_
 /// Light-client registry dump as of {height}: the chain-confirmed roster (node_id, wallet, reg_height,
 /// burn, vrf_pk_sha3) + the LtHash registry_root over them — byte-identical to the QC-signed
 /// registry_root sealed at that height. The client recomputes the root and binds committee pubkeys to it.
+///
+/// Only a checkpoint head at or below the applied tip is answered: only a head has a QC-signed
+/// registry_root to bind the body to, and above the tip there is none yet. Each such height is built
+/// once (one build at a time node-wide, written straight into its JSON body and never past the 16 MiB
+/// client cap) and kept in a byte-bounded cache. A roster over the cap answers 413
+/// `registry_oversize` with the rows counted before the build stopped (at least that many); once a
+/// head is oversize every later head is too (the roster only grows), so those answer without a build.
 pub(super) async fn handle_registry_height(
     height: u64,
     remote_addr: Option<std::net::SocketAddr>,
+    plane: Option<WalletPlane>,
     blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
-    let (entries, root) = blockchain.get_storage().registry_entries_as_of(height);
-    Ok(warp::reply::json(&json!({"registry_root": root, "entries": entries})))
+) -> Result<warp::reply::Response, Rejection> {
+    let typed = plane.is_some();
+    if let Err(r) = route_limit(remote_addr, plane, "read_only", WALLET_REGISTRY_BUCKET, typed) {
+        return Ok(r);
+    }
+    if let Some(refusal) = registry_height_refusal(height, crate::node::local_height()) {
+        return Ok(registry_reply(refusal, typed));
+    }
+    if let Some(known) = registry_known(height) {
+        return Ok(registry_reply(known, typed));
+    }
+    // One build at a time node-wide; a request on either port waits a bounded time for it.
+    let scan = match tokio::time::timeout(PLANE_BUILD_WAIT, REGISTRY_SCAN.lock()).await {
+        Ok(g) => g,
+        Err(_) => return Ok(registry_reply(RegistryBody::Busy, typed)),
+    };
+    if let Some(known) = registry_known(height) {
+        return Ok(registry_reply(known, typed));
+    }
+    let storage = blockchain.get_storage();
+    // The scan lock and the result move into the build: a request dropped meanwhile frees neither
+    // early (a second build at once) nor throws the body away; waiters find it in the cache.
+    let built = tokio::task::spawn_blocking(move || {
+        let _one_build = scan;
+        let built = registry_body(storage.registry_dump_as_of(height, REGISTRY_BODY_MAX));
+        registry_remember(height, &built);
+        built
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("[ERR][PROOFVIEW] registry_build_failed height={} err={}", height, e);
+        RegistryBody::Unavailable
+    });
+    Ok(registry_reply(built, typed))
+}
+
+/// Why `height` gets no registry body without any read, or None: not a checkpoint head, or above the
+/// applied tip.
+pub(crate) fn registry_height_refusal(height: u64, applied_tip: u64) -> Option<RegistryBody> {
+    if height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL != 0 {
+        return Some(RegistryBody::NotHead);
+    }
+    if height > applied_tip {
+        return Some(RegistryBody::NotApplied);
+    }
+    None
+}
+
+/// The answer already known for `height`: its cached body or marker, or the oversize floor below it.
+fn registry_known(height: u64) -> Option<RegistryBody> {
+    if let Some(b) = REGISTRY_CACHE.get(&height) {
+        return Some(RegistryBody::decode(b));
+    }
+    REGISTRY_OVERSIZE_FLOOR.lock().filter(|(h, _)| *h <= height).map(|(_, rows)| RegistryBody::Oversize(rows))
+}
+
+/// Keep a build's outcome: a body or an oversize marker in the cache, and the lowest oversize head as
+/// the floor every later head is judged by. A failed build is kept nowhere.
+fn registry_remember(height: u64, built: &RegistryBody) {
+    if let Some(b) = built.encode() {
+        REGISTRY_CACHE.insert(height, b);
+    }
+    if let RegistryBody::Oversize(rows) = built {
+        let mut floor = REGISTRY_OVERSIZE_FLOOR.lock();
+        if floor.map_or(true, |(h, _)| height < h) {
+            *floor = Some((height, *rows));
+        }
+    }
+}
+
+/// The answer for a build's result. A build that failed (an iterator error, a missing column family)
+/// has no root at all, never the root of an empty set: that is no answer, and never cached.
+pub(crate) fn registry_body(dump: crate::storage::RegistryDump) -> RegistryBody {
+    use crate::storage::RegistryDump;
+    match dump {
+        RegistryDump::Body(b) => RegistryBody::Body(bytes::Bytes::from(b)),
+        RegistryDump::Oversize(rows) => RegistryBody::Oversize(rows),
+        RegistryDump::Failed => {
+            if is_warn() {
+                println!("[WARN][PROOFVIEW] registry_scan_failed action=unavailable");
+            }
+            RegistryBody::Unavailable
+        }
+    }
+}
+
+/// The cached registry body's size for `height`, if the node holds one (the plane's egress estimate).
+pub(crate) fn cached_registry_len(height: u64) -> Option<usize> {
+    REGISTRY_CACHE.peek_len(&height)
+}
+
+static REGISTRY_CACHE: Lazy<BodyLru<u64>> = Lazy::new(|| BodyLru::new(REGISTRY_CACHE_BYTES, REGISTRY_CACHE_ENTRIES));
+static REGISTRY_SCAN: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+/// The lowest head found oversize, with its row count.
+static REGISTRY_OVERSIZE_FLOOR: Lazy<parking_lot::Mutex<Option<(u64, usize)>>> = Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// A registry answer: the body, a roster too big to serve (rows counted, at least), a failed build, a
+/// refused height, or no build slot in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegistryBody {
+    Body(bytes::Bytes),
+    Oversize(usize),
+    Unavailable,
+    NotHead,
+    NotApplied,
+    Busy,
+}
+
+impl RegistryBody {
+    /// Cache form: a body is JSON (starts with `{`); an oversize marker is `!` and the row count. A
+    /// failed scan has none: it is never cached.
+    fn encode(&self) -> Option<bytes::Bytes> {
+        match self {
+            RegistryBody::Body(b) => Some(b.clone()),
+            RegistryBody::Oversize(rows) => Some(bytes::Bytes::from(format!("!{}", rows))),
+            RegistryBody::Unavailable | RegistryBody::NotHead | RegistryBody::NotApplied | RegistryBody::Busy => None,
+        }
+    }
+
+    fn decode(b: bytes::Bytes) -> Self {
+        match b.strip_prefix(b"!").and_then(|r| std::str::from_utf8(r).ok()).and_then(|r| r.parse().ok()) {
+            Some(rows) => RegistryBody::Oversize(rows),
+            None => RegistryBody::Body(b),
+        }
+    }
+}
+
+/// Every body answered is for a head at or below the applied tip, so it is immutable and says so.
+/// Refusals carry their real status: typed on the wallet plane, `{error, ...}` on port 8001.
+pub(crate) fn registry_reply(body: RegistryBody, typed: bool) -> warp::reply::Response {
+    use warp::http::{header, HeaderValue, StatusCode};
+    let (status, error, extra, retry): (StatusCode, &str, Vec<(&str, Value)>, Option<u64>) = match body {
+        RegistryBody::Body(b) => {
+            let mut r = warp::reply::Response::new(warp::hyper::Body::from(b));
+            r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE_REGISTRY));
+            return r;
+        }
+        RegistryBody::Oversize(rows) => (StatusCode::PAYLOAD_TOO_LARGE, "registry_oversize", vec![("rows", json!(rows))], None),
+        RegistryBody::NotHead => (StatusCode::NOT_FOUND, "registry_height_not_head",
+                                  vec![("interval", json!(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL))], None),
+        RegistryBody::NotApplied => (StatusCode::NOT_FOUND, "registry_height_not_applied", vec![], Some(5)),
+        RegistryBody::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable", vec![], Some(5)),
+        RegistryBody::Busy if typed => return wallet_plane::plane_busy(2),
+        RegistryBody::Busy => (StatusCode::SERVICE_UNAVAILABLE, "busy", vec![], Some(2)),
+    };
+    if typed {
+        return error_response(status, error, fields(&extra), retry);
+    }
+    let mut legacy = serde_json::Map::new();
+    legacy.insert("error".into(), json!(error));
+    for (k, v) in extra {
+        legacy.insert(k.to_string(), v);
+    }
+    let mut r = warp::reply::with_status(warp::reply::json(&Value::Object(legacy)), status).into_response();
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE_NONE));
+    if let Some(secs) = retry {
+        r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(secs));
+    }
+    r
 }
 
 /// GET /api/v1/debug/consensus-position — the scalars that reveal a boundary-fork stall at a glance.
@@ -1660,5 +2125,266 @@ mod recent_feed_reply_tests {
         release_tx.send(()).expect("release");
         let freed = tokio::time::timeout(std::time::Duration::from_secs(5), slots.acquire()).await;
         assert!(freed.is_ok(), "the slot comes back once the read ends");
+    }
+}
+
+#[cfg(test)]
+mod wallet_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use warp::http::StatusCode;
+
+    async fn parts(r: warp::reply::Response) -> (StatusCode, warp::http::HeaderMap, Vec<u8>) {
+        let s = r.status();
+        let h = r.headers().clone();
+        (s, h, warp::hyper::body::to_bytes(r.into_body()).await.unwrap().to_vec())
+    }
+
+    #[tokio::test]
+    async fn macroblock_proof_cache_and_headers() {
+        // A complete success is immutable for a year, on both planes; an incomplete one (a signer's key
+        // or the pinned anchor missing) is served but stored by no cache.
+        let body = bytes::Bytes::from_static(b"{\"index\":9}");
+        for typed in [false, true] {
+            for (cacheable, header) in [(true, "public, max-age=31536000, immutable"), (false, "no-store")] {
+                let (s, h, b) = parts(macroblock_proof_reply(9, MbProof::Body { bytes: body.clone(), cacheable }, typed)).await;
+                assert_eq!((s, b.as_slice()), (StatusCode::OK, &b"{\"index\":9}"[..]));
+                assert_eq!(h.get("cache-control").unwrap(), header, "cacheable={}", cacheable);
+                assert_eq!(h.get("content-type").unwrap(), "application/json");
+            }
+        }
+        let src = include_str!("queries_api.rs").replace("\r\n", "\n");
+        let b = &src[src.find("pub(crate) async fn build_macroblock_proof").unwrap()..];
+        assert!(b.contains("&& (cp.recovery_anchor.is_none() || !recovery_anchor_checkpoint.is_null())"),
+                "a pin whose anchor could not be loaded makes the body incomplete");
+        // Errors: typed (plane or form=2) with real statuses and no-store; legacy bodies byte for byte otherwise.
+        let cases = [
+            ((|| MbProof::NotFound) as fn() -> MbProof, StatusCode::NOT_FOUND, "macroblock_not_found", None, json!({"error": "macroblock_not_found", "index": 9})),
+            (|| MbProof::NoCheckpointQc, StatusCode::NOT_FOUND, "no_checkpoint_qc", None, json!({"error": "no_checkpoint_qc", "index": 9})),
+            (|| MbProof::QcSigsPruned, StatusCode::GONE, "qc_sigs_pruned", None,
+             json!({"error": "qc_sigs_pruned", "index": 9, "action": "repin_recent_anchor"})),
+            (|| MbProof::QcDecodeFailed, StatusCode::SERVICE_UNAVAILABLE, "qc_decode_failed", Some("5"), json!({"error": "qc_decode_failed", "index": 9})),
+            (|| MbProof::BannedDecodeFailed, StatusCode::SERVICE_UNAVAILABLE, "banned_decode_failed", Some("5"),
+             json!({"error": "banned_decode_failed", "index": 9})),
+        ];
+        for (make, status, error, retry, legacy) in cases {
+            let (s, h, b) = parts(macroblock_proof_reply(9, make(), true)).await;
+            let v: Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!((s, v["error"].clone(), v["proof_format"].clone(), v["index"].clone()), (status, json!(error), json!(2), json!(9)));
+            assert_eq!(h.get("cache-control").unwrap(), "no-store");
+            assert_eq!(h.get("retry-after").map(|x| x.to_str().unwrap()), retry);
+            let (s, h, b) = parts(macroblock_proof_reply(9, make(), false)).await;
+            assert_eq!(s, StatusCode::OK, "old clients keep a 200");
+            assert_eq!(b, legacy.to_string().into_bytes(), "legacy bytes for {}", error);
+            assert!(h.get("cache-control").is_none());
+        }
+        // The cache: built once per index under a burst, and only a key-complete body is stored.
+        static CACHE: Lazy<BodyLru<u64>> = Lazy::new(|| BodyLru::new(1 << 20, usize::MAX));
+        let cache: &'static BodyLru<u64> = &CACHE;
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut joins = Vec::new();
+        static SHARED: Lazy<BodyLru<u64>> = Lazy::new(|| BodyLru::new(1 << 20, usize::MAX));
+        for _ in 0..8 {
+            let b = Arc::clone(&builds);
+            joins.push(tokio::spawn({
+                async move {
+                    macroblock_proof_flight(&SHARED, 900_001, false, || async move {
+                        b.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        MbProof::Body { bytes: bytes::Bytes::from_static(b"{\"index\":900001}"), cacheable: true }
+                    }).await
+                }
+            }));
+        }
+        for j in joins {
+            assert!(matches!(j.await.unwrap(), Ok(MbProof::Body { .. })));
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "single flight per index");
+        let incomplete = macroblock_proof_flight(cache, 900_002, false, || async {
+            MbProof::Body { bytes: bytes::Bytes::from_static(b"{}"), cacheable: false }
+        }).await;
+        assert!(matches!(incomplete, Ok(MbProof::Body { cacheable: false, .. })));
+        assert!(cache.get(&900_002).is_none(), "a body missing a signer's key is served but never cached");
+        let _ = macroblock_proof_flight(cache, 900_003, true, || async {
+            MbProof::Body { bytes: bytes::Bytes::from_static(b"{}"), cacheable: true }
+        }).await.unwrap();
+        assert_eq!(cache.get(&900_003).as_deref(), Some(&b"{}"[..]));
+        // An error outcome is never cached.
+        let _ = macroblock_proof_flight(cache, 900_004, false, || async { MbProof::NotFound }).await;
+        assert!(cache.get(&900_004).is_none());
+        assert_eq!(MB_PROOF_CACHE_BYTES, 64 * 1024 * 1024);
+        assert!(!mb_proof_flights_open(900_001) && !mb_proof_flights_open(900_004), "finished flights leave no entry");
+        // A request dropped mid-build does not cancel the build: it keeps its slot and the index's lock
+        // until it ends, its body still lands in the cache, and then the entry is gone.
+        let dropped = macroblock_proof_flight(cache, 900_005, false, || async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            MbProof::Body { bytes: bytes::Bytes::from_static(b"{\"index\":900005}"), cacheable: true }
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(30), dropped).await.is_err());
+        assert!(mb_proof_flights_open(900_005), "the build runs on after its request went away");
+        let mut landed = false;
+        for _ in 0..100 {
+            if cache.get(&900_005).is_some() && !mb_proof_flights_open(900_005) {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(landed, "the orphaned build cached its body and left no entry");
+        // A request dropped while it waits behind another's build leaves the builder's entry alone.
+        let builder = tokio::spawn(async {
+            macroblock_proof_flight(&SHARED, 900_006, false, || async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                MbProof::Body { bytes: bytes::Bytes::from_static(b"{}"), cacheable: true }
+            }).await.is_ok()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waiter = macroblock_proof_flight(&SHARED, 900_006, false, || async { MbProof::NotFound });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(30), waiter).await.is_err(), "it waits behind the build");
+        assert!(mb_proof_flights_open(900_006), "the builder still holds it");
+        assert!(builder.await.unwrap());
+        assert!(!mb_proof_flights_open(900_006), "the last share out removes it");
+        // Both ports share the node-wide build slots; the handler builds off the async workers.
+        assert_eq!(MB_BUILDS, 2);
+        let flight = &src[src.find("pub(crate) async fn macroblock_proof_flight").unwrap()..];
+        let flight = &flight[..flight.find("\n}\n").unwrap()];
+        assert!(flight.contains("MB_BUILD_SLOTS.acquire()).await") && flight.contains("match MB_BUILD_SLOTS.acquire().await"),
+                "a bounded wait on the plane, a queue on port 8001, the same slots");
+        let build = &src[src.find("pub(crate) async fn build_macroblock_proof").unwrap()..];
+        let build = &build[..build.find("\n}\n").unwrap()];
+        assert!(build.contains("spawn_blocking(move || macroblock_proof_body("));
+    }
+
+    #[test]
+    fn body_lru_is_byte_and_entry_bounded() {
+        let lru = BodyLru::<u64>::new(10, 3);
+        lru.insert(1, bytes::Bytes::from_static(b"aaaa"));
+        lru.insert(2, bytes::Bytes::from_static(b"bbbb"));
+        assert!(lru.get(&1).is_some(), "touch 1, so 2 is the oldest");
+        lru.insert(3, bytes::Bytes::from_static(b"cccc"));
+        assert!(lru.get(&2).is_none() && lru.get(&1).is_some() && lru.get(&3).is_some(), "byte cap evicts the least recent");
+        lru.insert(4, bytes::Bytes::from_static(b"d"));
+        lru.insert(5, bytes::Bytes::from_static(b"e"));
+        assert_eq!(lru.len(), 3, "entry cap");
+        lru.insert(6, bytes::Bytes::from(vec![0u8; 11]));
+        assert!(lru.get(&6).is_none(), "a body above the cap is not kept");
+    }
+
+    #[tokio::test]
+    async fn registry_body_cache_and_cap() {
+        // A body (always a head at or below the applied tip) is immutable for a day.
+        let body = RegistryBody::Body(bytes::Bytes::from_static(b"{\"entries\":[],\"registry_root\":\"ab\"}"));
+        for typed in [false, true] {
+            let (s, h, b) = parts(registry_reply(body.clone(), typed)).await;
+            assert_eq!((s, h.get("cache-control").unwrap().to_str().unwrap()), (StatusCode::OK, "public, max-age=86400, immutable"));
+            assert_eq!(b, b"{\"entries\":[],\"registry_root\":\"ab\"}".to_vec());
+        }
+        // Above the client's 16 MiB cap: 413 with the rows counted, typed on the plane.
+        let (s, h, b) = parts(registry_reply(RegistryBody::Oversize(123_456), true)).await;
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!((s, v["error"].clone(), v["rows"].clone(), v["proof_format"].clone()), (StatusCode::PAYLOAD_TOO_LARGE, json!("registry_oversize"), json!(123_456), json!(2)));
+        assert_eq!(h.get("cache-control").unwrap(), "no-store");
+        let (s, _, b) = parts(registry_reply(RegistryBody::Oversize(7), false)).await;
+        assert_eq!((s, serde_json::from_slice::<Value>(&b).unwrap()), (StatusCode::PAYLOAD_TOO_LARGE, json!({"error": "registry_oversize", "rows": 7})));
+        // The cached form round-trips both outcomes, so an oversize height is not rebuilt either.
+        assert_eq!(RegistryBody::decode(body.encode().unwrap()), body);
+        assert_eq!(RegistryBody::decode(RegistryBody::Oversize(42).encode().unwrap()), RegistryBody::Oversize(42));
+        // A failed build (no root at all) is no answer: never cached, never immutable, a 503.
+        assert_eq!(registry_body(crate::storage::RegistryDump::Failed), RegistryBody::Unavailable);
+        for refusal in [RegistryBody::Unavailable, RegistryBody::NotHead, RegistryBody::NotApplied, RegistryBody::Busy] {
+            assert_eq!(refusal.encode(), None, "{:?} is never cached", refusal);
+        }
+        // Refusals: real statuses on both ports, typed on the plane, never stored.
+        let cases = [
+            (RegistryBody::Unavailable, StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable", Some("5")),
+            (RegistryBody::NotHead, StatusCode::NOT_FOUND, "registry_height_not_head", None),
+            (RegistryBody::NotApplied, StatusCode::NOT_FOUND, "registry_height_not_applied", Some("5")),
+            (RegistryBody::Busy, StatusCode::SERVICE_UNAVAILABLE, "busy", Some("2")),
+        ];
+        for (refusal, status, error, retry) in cases {
+            for typed in [true, false] {
+                let (s, h, b) = parts(registry_reply(refusal.clone(), typed)).await;
+                let v: Value = serde_json::from_slice(&b).unwrap();
+                assert_eq!((s, v["error"].clone()), (status, json!(error)), "{:?} typed={}", refusal, typed);
+                assert_eq!(h.get("cache-control").unwrap(), "no-store");
+                assert_eq!(h.get("retry-after").map(|x| x.to_str().unwrap()), retry, "{:?}", refusal);
+                assert_eq!(v["proof_format"] == json!(2), typed);
+            }
+        }
+        // Only a checkpoint head at or below the applied tip is built at all.
+        assert_eq!(registry_height_refusal(1_080, 2_000), None);
+        assert_eq!(registry_height_refusal(0, 0), None, "the genesis head");
+        assert_eq!(registry_height_refusal(1_081, 2_000), Some(RegistryBody::NotHead));
+        assert_eq!(registry_height_refusal(2_010, 2_000), Some(RegistryBody::NotApplied));
+        // Once a head is oversize, every later head answers so without a build; earlier ones still build.
+        registry_remember(900_000_030, &RegistryBody::Oversize(70_000));
+        assert_eq!(registry_known(900_000_090), Some(RegistryBody::Oversize(70_000)));
+        assert_eq!(registry_known(900_000_030), Some(RegistryBody::Oversize(70_000)));
+        assert_eq!(registry_known(900_000_000), None);
+        registry_remember(900_000_000, &RegistryBody::Oversize(69_000));
+        assert_eq!(registry_known(900_000_060), Some(RegistryBody::Oversize(69_000)), "the floor only moves down");
+        registry_remember(899_999_970, &RegistryBody::Unavailable);
+        assert_eq!(registry_known(899_999_970), None, "a failed build is kept nowhere");
+        assert_eq!(REGISTRY_BODY_MAX, 16 * 1024 * 1024);
+        assert_eq!((REGISTRY_CACHE_ENTRIES, REGISTRY_CACHE_BYTES), (4096, 32 * 1024 * 1024));
+        // The height check and the cache before any build; one build at a time on either port, with a
+        // bounded wait; the lock and the result move into the blocking build.
+        let src = include_str!("queries_api.rs").replace("\r\n", "\n");
+        let h = &src[src.find("pub(super) async fn handle_registry_height").unwrap()..];
+        let h = &h[..h.find("\n}\n").unwrap()];
+        let at = |needle: &str| h.find(needle).unwrap_or_else(|| panic!("{}", needle));
+        assert!(at("registry_height_refusal(") < at("registry_known(height)"));
+        assert!(at("registry_known(height)") < at("registry_dump_as_of"));
+        assert!(h.contains("tokio::time::timeout(PLANE_BUILD_WAIT, REGISTRY_SCAN.lock())") && !h.contains("REGISTRY_SCAN.lock().await"));
+        let build = &h[at("spawn_blocking(move ||")..];
+        assert!(build.contains("let _one_build = scan;") && build.contains("registry_remember(height, &built)"));
+    }
+
+    #[test]
+    fn registry_dump_streams_under_its_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let cf = st.registry_cf_for_test();
+        let idx = |h: u64, wallet: &str| {
+            let mut v = h.to_be_bytes().to_vec();
+            v.extend_from_slice(&0u32.to_be_bytes());
+            v.extend_from_slice(wallet.as_bytes());
+            v
+        };
+        let row = |h: u64, ty: &str, w: &str| format!(
+            r#"{{"node_type":"{}","wallet":"{}","reputation":70,"reg_height":{},"burn":"b\"q","vrf_pk_sha3":"","reg_index":0}}"#, ty, w, h);
+        for (id, h) in [("super_node_aa", 30u64), ("super_node_bb", 60), ("genesis_node_001", 0)] {
+            st.put_registry_row_for_test(&cf, format!("node_{}", id).as_bytes(), row(h, "super", "w").as_bytes());
+            st.put_registry_row_for_test(&cf, format!("srtr_{}", id).as_bytes(), &idx(h, "w"));
+        }
+        for i in 0..40u64 {
+            let id = format!("light_node_{:04}", i);
+            st.put_registry_row_for_test(&cf, format!("node_{}", id).as_bytes(), row(30 + i, "light", "lw").as_bytes());
+            st.put_registry_row_for_test(&cf, format!("lrtr_{}", id).as_bytes(), &idx(30 + i, "lw"));
+        }
+        // An id under both indices counts once; a test row without a decodable index value is read in full.
+        st.put_registry_row_for_test(&cf, b"lrtr_super_node_aa", &idx(30, "w"));
+        st.put_registry_row_for_test(&cf, b"node_super_node_cc", row(45, "super", "w").as_bytes());
+        st.put_registry_row_for_test(&cf, b"srtr_super_node_cc", b"x");
+        let crate::storage::RegistryDump::Body(body) = st.registry_dump_as_of(60, REGISTRY_BODY_MAX) else { panic!("a body") };
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        // Supers at or below 60 (aa, bb, genesis, cc), then the lights up to height 60 (31 of them).
+        assert_eq!(entries.len(), 4 + 31);
+        assert!(entries.iter().all(|e| e["reg_height"].as_u64().unwrap() <= 60));
+        assert_eq!(entries.iter().filter(|e| e["node_id"] == json!("super_node_aa")).count(), 1);
+        // The bytes a JSON value of the same rows gives, keys in order, and the root the chain seals.
+        let as_values = serde_json::to_vec(&json!({"entries": entries, "registry_root": v["registry_root"]})).unwrap();
+        assert_eq!(body, as_values);
+        assert_eq!(v["registry_root"], json!(hex::encode(st.compute_registry_root(60).unwrap())));
+        assert_eq!(entries[0], json!({"burn": "b\"q", "node_id": "genesis_node_001", "node_type": "super", "reg_height": 0,
+                                       "reg_index": 0, "vrf_pk_sha3": "", "wallet": "w"}));
+        // Over the cap the build stops at once and reports what it counted, never the full roster.
+        match st.registry_dump_as_of(60, 1_000) {
+            crate::storage::RegistryDump::Oversize(rows) => assert!(rows > 0 && rows < 35, "{}", rows),
+            other => panic!("{:?}", other),
+        }
+        let crate::storage::RegistryDump::Body(early) = st.registry_dump_as_of(0, REGISTRY_BODY_MAX) else { panic!() };
+        assert_eq!(serde_json::from_slice::<Value>(&early).unwrap()["entries"].as_array().unwrap().len(), 1, "only genesis at 0");
     }
 }

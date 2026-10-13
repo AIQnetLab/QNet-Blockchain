@@ -163,10 +163,10 @@ describe('the scan sheet on the Solana Send screen', () => {
     const onAddress = jest.fn();
     let tree;
     await act(async () => { tree = renderer.create(<QrScanSheet t={t} onAddress={onAddress} onClose={() => {}} />); });
-    expect(texts(tree)).toContain('Scan a QNet address');
+    expect(texts(tree)).toContain('Scan a QNet Blockchain address');
     for (const other of [ADDR, `solana:${ADDR}?amount=1`]) {
       await read(tree, other);
-      expect(texts(tree)).toContain('Not a QNet address');
+      expect(texts(tree)).toContain('Not a QNet Blockchain address');
     }
     expect(onAddress).not.toHaveBeenCalled();
     await read(tree, QNET);
@@ -220,15 +220,23 @@ describe('whole addresses fit one line', () => {
       expect(widestFit(n.props.children, st)).toBeLessThanOrEqual(inner);
     }
     const src = fs.readFileSync(path.join(ROOT, 'src/screens/QNetLinkScreen.js'), 'utf8');
-    expect(src.match(/addressRow\(t\('link_wallet'\), o\.qnet\)/g)).toHaveLength(5); // reserve, unlink (this device, and by the wallet key), link, claim
+    expect(src.match(/addressField\(t\('link_wallet'\), o\.qnet\)/g)).toHaveLength(5); // reserve, unlink (this device, and by the wallet key), link, claim
     act(() => tree.unmount());
   });
 
   it('a site\'s connect sheet, the Assets card and Receive: one line, the font shrinking, never cut', () => {
     const dapp = fs.readFileSync(path.join(ROOT, 'src/browser/DappSheet.js'), 'utf8');
-    expect(dapp).toMatch(/addressRow\(t\('dapp_qnet_address'\)/);
-    expect(dapp).toMatch(/addressRow\(t\('dapp_solana_address'\)/);
-    expect(dapp).toMatch(/const addressRow = [\s\S]{0,200}numberOfLines=\{1\} adjustsFontSizeToFit minimumFontScale=\{0\.5\} maxFontSizeMultiplier=\{1\.2\}/);
+    expect(dapp).toMatch(/addressField\(t\('dapp_qnet_address'\)/);
+    expect(dapp).toMatch(/addressField\(t\('dapp_solana_address'\)/);
+    expect(dapp).toMatch(/const addressField = \(label, value\) => <InfoField label=\{label\} value=\{value\} mono fit /);
+    // A stacked field that fits (components/InfoRow): one line, the font shrinking to half, a larger text size counted
+    // up to 1.2 times.
+    const { InfoField, infoStyles } = require('../src/components/InfoRow');
+    let field;
+    act(() => { field = renderer.create(<InfoField label="QNet" value={QNET} mono fit testID="fit" />); });
+    expect(field.root.find((n) => n.type === Text && n.props.testID === 'fit').props)
+      .toMatchObject({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.5, maxFontSizeMultiplier: 1.2 });
+    act(() => field.unmount());
     const screen = fs.readFileSync(path.join(ROOT, 'src/screens/WalletScreen.js'), 'utf8');
     const card = screen.slice(screen.indexOf('testID="address-card"'), screen.indexOf('{cardAddress}', screen.indexOf('testID="address-card"')));
     expect(card).toMatch(/numberOfLines=\{1\}\s*adjustsFontSizeToFit\s*minimumFontScale=\{0\.5\}\s*maxFontSizeMultiplier=\{1\.2\}/);
@@ -249,7 +257,7 @@ describe('whole addresses fit one line', () => {
       expect(width(text, st) * 0.5).toBeLessThanOrEqual(receiveInner);
       expect(widestFit(text, st)).toBeLessThanOrEqual(receiveInner);
       expect(widestFit(text, st)).toBeLessThanOrEqual(cardInner);
-      expect(widestFit(text, flat(sheetStyles.mono))).toBeLessThanOrEqual(sheetInner);
+      expect(widestFit(text, flat(infoStyles.mono))).toBeLessThanOrEqual(sheetInner);
     }
     expect(associatedTokenAddress(ADDR, ONE_DEV_MINT).length).toBeLessThanOrEqual(44);
   });

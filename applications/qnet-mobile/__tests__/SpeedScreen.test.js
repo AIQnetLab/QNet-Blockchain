@@ -261,7 +261,7 @@ describe('the Send button', () => {
     await act(async () => { sendButton(tree).props.onPress(); });
     await flush(6);
     expect(texts(tree)).toContain(t('send_balance_unreadable'));
-    expect(t('send_balance_unreadable')).toMatch(/network did not answer/);
+    expect(t('send_balance_unreadable')).toMatch(/QNet Blockchain did not answer/);
     expect(texts(tree)).not.toContain(t('send_review_title'));
     // Over: the button is free again.
     expect(byTestId(tree, 'send-busy')).toEqual([]);

@@ -6,7 +6,7 @@ param(
     [int]$StartPort = 9876
 )
 
-Write-Host "=== Starting QNet Network with $NodeCount nodes ===" -ForegroundColor Green
+Write-Host "=== Starting QNet Blockchain with $NodeCount nodes ===" -ForegroundColor Green
 
 # Kill any existing nodes
 Write-Host "Stopping any existing nodes..." -ForegroundColor Yellow

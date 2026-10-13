@@ -73,9 +73,10 @@ test('the Device tab names the device as "{model} · {platform}", the platform a
   assert.doesNotMatch(rows, /device_platform_/);
 });
 
-// H-1 (06.10): a typed address is only viewed, so the Device tab shows its platform without the model.
-test('a typed address: the platform alone, never the model', () => {
+// Owner, 13.10: an address only viewed shows no device details at all, its platform included; they are the owner's
+// (the status read for a view leaves them out too: cabinet-view-mode.test.mjs).
+test('an address only viewed: no platform, no model', () => {
   const rows = read(SRC, 'components/cabinet/NodeStatus.tsx');
-  assert.match(rows, /const named = device && viewOnly \? \{ platform: device\.platform, model: null \} : device;/);
+  assert.match(rows, /const named = viewOnly \? null : device;/);
   assert.equal(deviceName({ platform: 'android', model: null }), TEXTS.device_platform_android);
 });

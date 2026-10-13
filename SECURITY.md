@@ -1,7 +1,7 @@
 # Security policy
 
-This document explains how to report a security vulnerability in QNet, what is in scope, and what
-to expect after you report. QNet is pre-launch, experimental software under active development. It
+This document explains how to report a security vulnerability in QNet Blockchain, what is in scope, and what
+to expect after you report. QNet Blockchain is pre-launch, experimental software under active development. It
 has not completed an independent external audit. Treat any deployment as experimental and do not
 place value at risk that you cannot afford to lose.
 
@@ -18,7 +18,7 @@ A useful report contains:
 - The commit hash or release you tested, and the affected crate, file and function.
 - A description of the flaw and the concrete impact — what an attacker gains, and under what
   assumptions (number of nodes controlled, reputation or committee membership held, network
-  position). QNet has no stake: committee membership is a uniform sortition over the eligible node set, and
+  position). QNet Blockchain has no stake: committee membership is a uniform sortition over the eligible node set, and
   eligibility rests on registration and recent on-chain heartbeats; a proven equivocation bans a node permanently.
 - Reproduction steps, ideally a failing test or a minimal proof of concept against a local network.
 - Any suggested fix, if you have one.

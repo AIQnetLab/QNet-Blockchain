@@ -161,9 +161,10 @@ jobs:
             applications/qnet-mobile/build/Logs
           if-no-files-found: ignore
 
-  # A signed Release archive of the QNetMobile scheme, uploaded to TestFlight, on a manual run only. Signing is
-  # automatic for team 33H36C42XS through the App Store Connect API key (secrets ASC_KEY_ID, ASC_ISSUER_ID,
-  # ASC_KEY_P8); the build number is the project's CURRENT_PROJECT_VERSION, so every upload needs a new one.
+  # A signed Release archive of the QNetMobile scheme, uploaded to TestFlight, on a manual or [testflight] run.
+  # Team 33H36C42XS signs with a distribution certificate and App Store profile the run makes through the App Store
+  # Connect API key (secrets ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8, Admin role); the build number is the project's
+  # CURRENT_PROJECT_VERSION, so every upload needs a new one.
   # The secrets reach only the steps that use them, nothing prints them, and the key file is deleted at the end.
   testflight:
     needs: checks
@@ -268,24 +269,62 @@ jobs:
             || { rm -f "$key"; echo "::error::ASC_KEY_P8 is not the .p8 key text"; exit 1; }
           echo "ASC_KEY_PATH=$key" >> "$GITHUB_ENV"
 
-      - name: Archive
+      # Automatic signing archives with a development profile, which needs a device registered to the team, so
+      # this run makes its own distribution certificate and App Store profile through the API key
+      # (scripts/asc-signing.py) and signs the app target by hand with them; the pods keep their own settings.
+      - name: Create this run's signing identity
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          BUNDLE_ID: com.qnetmobile
+          RUN_TAG: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          sign="$RUNNER_TEMP/signing"
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          install -d -m 0700 "$sign"
+          python3 scripts/asc-signing.py prepare "$sign" > "$sign/env"
+          cat "$sign/env" >> "$GITHUB_ENV"
+          set -a; . "$sign/env"; set +a
+          pw=$(/usr/bin/openssl rand -hex 24)
+          /usr/bin/openssl x509 -inform der -in "$sign/cert.cer" -out "$sign/cert.pem"
+          /usr/bin/openssl pkcs12 -export -inkey "$sign/key.pem" -in "$sign/cert.pem" -out "$sign/identity.p12" -passout "pass:$pw"
+          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o "$sign/wwdr.cer"
+          security create-keychain -p "$pw" "$kc"
+          echo "SIGNING_KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security import "$sign/wwdr.cer" -k "$kc"
+          security import "$sign/identity.p12" -k "$kc" -P "$pw" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm -f "$sign/key.pem" "$sign/csr.pem" "$sign/identity.p12"
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            install -d "$dir"
+            cp "$sign/profile.mobileprovision" "$dir/$PROFILE_UUID.mobileprovision"
+          done
+          bundle exec ruby -e '
+            require "xcodeproj"
+            project = Xcodeproj::Project.open("ios/QNetMobile.xcodeproj")
+            target = project.targets.find { |t| t.name == "QNetMobile" } or abort "no QNetMobile target"
+            target.build_configurations.find { |c| c.name == "Release" }.build_settings.merge!(
+              "CODE_SIGN_STYLE" => "Manual",
+              "DEVELOPMENT_TEAM" => ENV.fetch("TEAM_ID"),
+              "CODE_SIGN_IDENTITY" => "Apple Distribution",
+              "CODE_SIGN_IDENTITY[sdk=iphoneos*]" => "Apple Distribution",
+              "PROVISIONING_PROFILE_SPECIFIER" => ENV.fetch("PROFILE_NAME"))
+            project.save'
+          security find-identity -v -p codesigning "$kc"
+
+      - name: Archive
         run: |
           set -o pipefail
           xcodebuild -workspace ios/QNetMobile.xcworkspace -scheme QNetMobile -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/QNetMobile.xcarchive" -derivedDataPath build \
-            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic COMPILER_INDEX_STORE_ENABLE=NO \
-            archive 2>&1 | tee xcodebuild.log | tail -n 200
+            COMPILER_INDEX_STORE_ENABLE=NO archive 2>&1 | tee xcodebuild.log | tail -n 200
 
       # manageAppVersionAndBuildNumber off: the uploaded build number is CURRENT_PROJECT_VERSION as archived.
       - name: Export for App Store Connect
-        env:
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -o pipefail
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
@@ -295,7 +334,9 @@ jobs:
           <dict>
             <key>method</key><string>app-store-connect</string>
             <key>teamID</key><string>$TEAM_ID</string>
-            <key>signingStyle</key><string>automatic</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict><key>com.qnetmobile</key><string>$PROFILE_NAME</string></dict>
             <key>destination</key><string>export</string>
             <key>manageAppVersionAndBuildNumber</key><false/>
             <key>uploadSymbols</key><true/>
@@ -303,10 +344,7 @@ jobs:
           </plist>
           EOF
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/QNetMobile.xcarchive" -exportPath "$RUNNER_TEMP/export" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
-            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            2>&1 | tee xcodebuild-export.log | tail -n 100
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" 2>&1 | tee xcodebuild-export.log | tail -n 100
           ipa=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -n 1)
           [ -n "$ipa" ] || { echo "::error::the export wrote no .ipa"; exit 1; }
           shipped=$(unzip -p "$ipa" 'Payload/*.app/Info.plist' | plutil -extract CFBundleVersion raw -o - -)
@@ -319,6 +357,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           xcrun altool --upload-app --type ios --file "$IPA" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          echo "UPLOADED=1" >> "$GITHUB_ENV"
           {
             echo '## Uploaded to TestFlight'
             echo "QNet Wallet $APP_VERSION ($BUILD_NUMBER), bundle com.qnetmobile. App Store Connect processes the build before testers see it."
@@ -348,6 +387,19 @@ jobs:
             applications/qnet-mobile/xcodebuild-export.log
             applications/qnet-mobile/build/Logs
           if-no-files-found: ignore
+
+      # A run that uploaded keeps its certificate until the next run removes it (scripts/asc-signing.py).
+      - name: Remove this run's signing identity
+        if: always()
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          [ -z "${SIGNING_KEYCHAIN:-}" ] || security delete-keychain "$SIGNING_KEYCHAIN" || true
+          rm -rf "$RUNNER_TEMP/signing"
+          if [ -n "${CERT_ID:-}" ] && [ "${UPLOADED:-}" != 1 ]; then
+            python3 scripts/asc-signing.py discard "$CERT_ID" "$PROFILE_ID" || true
+          fi
 
       - name: Delete the API key
         if: always()

@@ -86,8 +86,9 @@ test('the Overview shows what is known of the wallet\'s activation, from the net
   assert.match(home, /if \(view\.state !== 'node'\) return <NoNode pending=\{view\.state === 'recording'\} overview \/>;/);
   assert.match(home, /const known = useWalletActivation\('light'\);/);
   assert.match(home, /const known = useWalletActivation\('super'\);/);
-  // Recorded: the node, its balance with Move, the details, the latest epochs; a super node's own summary (R4).
-  for (const part of ["t('overview_title')", "t('claim_title')", '<NodeDetails nodeId={nodeId}', '<Epochs nodeId={nodeId} show="recent" />', "t('super_title')", "t('super_move')"]) assert.ok(home.includes(part), part);
+  // Recorded: the node, its balance with Move, the details, the latest epochs; a super node's own summary with its
+  // balance and Move too (R4; owner, 12.10).
+  for (const part of ["t('overview_title')", "t('balance_title')", '<NodeDetails nodeId={nodeId}', '<Epochs nodeId={nodeId} show="recent" />', "t('super_title')", "t('balance_lead')", '<Move']) assert.ok(home.includes(part), part);
   const details = code('components/cabinet/NodeDetails.tsx');
   for (const key of ['details_title', 'code_field_status', 'ext_field_type', 'act_code', 'act_burn_tx', 'code_field_amount']) assert.ok(details.includes(`t('${key}')`), key);
   assert.match(home, /lightStatusText\(state, known\.facts\?\.height \?\? null\)/);

@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # Start additional isolated network
 
-Write-Host "=== Starting Additional QNet Network (4 nodes) ===" -ForegroundColor Green
+Write-Host "=== Starting additional QNet Blockchain network (4 nodes) ===" -ForegroundColor Green
 Write-Host "These nodes will NOT know about the first network initially" -ForegroundColor Yellow
 
 # Start nodes on different ports

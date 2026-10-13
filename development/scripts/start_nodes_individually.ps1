@@ -1,6 +1,6 @@
 # Start nodes individually with verification
 
-Write-Host "Starting QNet nodes individually..." -ForegroundColor Cyan
+Write-Host "Starting QNet Blockchain nodes individually..." -ForegroundColor Cyan
 
 # Node 1
 Write-Host "`nStarting Node 1..." -ForegroundColor Yellow

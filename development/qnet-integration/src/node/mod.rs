@@ -13,6 +13,8 @@ mod state_apply;
 
 mod rewards;
 mod device;
+// N2: the super node's public IPv4, 443 probe, certificate schedule, ServeCert and endpoint commit.
+pub(crate) mod public_rpc;
 
 /// Concatenated source of every file in this module. Source-scanning invariant tests use it
 /// so a method moving between submodules cannot silently disarm them.
@@ -22,7 +24,7 @@ mod device;
 #[cfg(test)]
 pub(crate) fn node_sources_manifest() -> &'static [&'static str] {
     &["mod.rs", "activation.rs", "committee.rs", "consensus.rs", "device.rs", "leader.rs", "lifecycle.rs",
-      "monitoring.rs", "production.rs", "registration.rs", "rewards.rs", "state_apply.rs",
+      "monitoring.rs", "production.rs", "public_rpc.rs", "registration.rs", "rewards.rs", "state_apply.rs",
       "sync.rs", "transactions.rs"]
 }
 
@@ -38,6 +40,7 @@ pub(crate) fn node_sources() -> String {
         include_str!("lifecycle.rs"),
         include_str!("monitoring.rs"),
         include_str!("production.rs"),
+        include_str!("public_rpc.rs"),
         include_str!("registration.rs"),
         include_str!("rewards.rs"),
         include_str!("state_apply.rs"),
@@ -158,9 +161,13 @@ pub const MAX_MACROBLOCK_DECOMPRESSED: usize = 16 * 1024 * 1024;
 /// runtime, and `setenv`/`unsetenv` are not thread-safe against a concurrent `getenv`, so
 /// removing it would be undefined behaviour in a live process. Nothing is cached either — the
 /// secret is read on demand and dropped, rather than held in a process-lifetime map.
+///
+/// The buffers this function reads into are wiped before they are freed; the caller owns (and wipes)
+/// only the trimmed copy it returns. The file itself, and the variable in the process environment,
+/// stay as they are.
 pub fn load_wallet_seed(var: &str) -> Option<String> {
     if let Ok(path) = std::env::var(format!("{}_FILE", var)) {
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(&path).map(zeroize::Zeroizing::new) {
             Ok(s) => {
                 let seed = s.trim().to_string();
                 if !seed.is_empty() {
@@ -173,7 +180,7 @@ pub fn load_wallet_seed(var: &str) -> Option<String> {
             }
         }
     }
-    match std::env::var(var) {
+    match std::env::var(var).map(zeroize::Zeroizing::new) {
         Ok(seed) if !seed.trim().is_empty() => {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -243,6 +250,11 @@ mod producer_cache {
     // DashMap provides concurrent read/write without blocking tokio runtime
     pub static CACHED_PRODUCER_SELECTION: Lazy<DashMap<u64, (String, Vec<(String, f64)>)>> = 
         Lazy::new(|| DashMap::new());
+
+    /// The local seal (`last_sealed_mb_index`) each cached selection was computed at. A frozen roster derives from
+    /// that seal, so a selection computed before the seal moved is recomputed rather than reused for the rest of
+    /// its round, and is no authority at ingest meanwhile.
+    pub static CACHED_SELECTION_SEAL: Lazy<DashMap<u64, u64>> = Lazy::new(|| DashMap::new());
 }
 
 // PRODUCTION v4.0: Global VRF instance for static access in select_producer
@@ -871,6 +883,9 @@ pub(crate) fn test_seed_producer_selection(leadership_round: u64, round0: &str, 
 pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
     let lr = if height <= ROTATION_INTERVAL_BLOCKS { 0 }
              else { (height - 1) / ROTATION_INTERVAL_BLOCKS };
+    if let (Some(at), Some(s)) = (producer_cache::CACHED_SELECTION_SEAL.get(&lr), try_get_storage()) {
+        if *at != s.last_sealed_mb_index() { return None; }
+    }
     let entry = producer_cache::CACHED_PRODUCER_SELECTION.get(&lr)?;
     let (round0_producer, candidates) = entry.value();
     if candidates.is_empty() { return None; }
@@ -1957,12 +1972,19 @@ fn phase2a_eligible_additions(
     let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
     regs.sort();
     let mut out: Vec<qnet_state::EligibleProducer> = Vec::new();
+    let mut allowlist_dropped = 0usize;
     for reg in regs {
         if already_eligible.contains(reg) { continue; }
         // Restart bar, enforced here too: this arm re-admits any registered heartbeating identity, so
         // filtering only the carry-over would return every barred node on the next window.
         if crate::genesis_constants::restart_excludes(reg) { continue; }
         if !recent_hb.contains(reg) { continue; }
+        // The emergency allowlist, at the same boundary as the carry-over arm, for the same reason. After
+        // the heartbeat check, so the count names heartbeating identities it kept out.
+        if crate::genesis_constants::allowlist_excludes(reg, scan_end) {
+            allowlist_dropped += 1;
+            continue;
+        }
         // Buried by the activation warmup before scan_end. The pool is already height-bounded at the
         // source, so this is the warmup rule alone. Genesis (reg_height 0) is exempt.
         match storage.node_reg_height(reg) {
@@ -1977,6 +1999,9 @@ fn phase2a_eligible_additions(
             .clamp(0.0, 100.0) * 100.0).round() as u32;
         if rep < min_reputation_bp { continue; }
         out.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
+    }
+    if allowlist_dropped > 0 && is_info() {
+        println!("[INFO][SNAP] allowlist_excluded mb={} count={} arm=readmit", scan_end / 90, allowlist_dropped);
     }
     out
 }
@@ -2494,6 +2519,44 @@ pub(crate) fn production_throttle_reason(next_block_height: u64, last_finalized:
         * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
     let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_DERIVED_BLOCKS;
     if seal_over { Some("roster_derivation_horizon") } else { None }
+}
+
+/// Node policy, never a change to who the schedule names: why this node's election for `next_block_height` must not
+/// stand as the slot's authority here (the Category-B expectation ingest enforces against other producers), or None.
+///   - "past_derivation_horizon": the height lies past this node's own frozen-roster horizon (production parks
+///     there too). A node there can only have elected from a seal the network has moved past: on 12.10, nodes still
+///     at seal 38948 elected from its eight members while the rest elected from the six of 38949 and later, and
+///     hard-rejected the new heights.
+///   - "seal_behind_finality": the window's roster is frozen here (macroblock w-2 is not sealed locally and no newer
+///     certified macroblock is held) while this node's certified finality runs more than the unsealed tail past its
+///     seal. Its frozen anchor is its own newest seal, and peers that sealed further elect from newer macroblocks.
+///     It stops producing too only on proof that they did (`peer_sealed_past`): a seal held or refused on every node
+///     at once looks the same from here, and there A1 production off the common frozen anchor must go on, since
+///     only later commits release a held seal. In a genuine finality stall finality does not run ahead at all.
+pub(crate) fn election_abstain_reason(next_block_height: u64, last_sealed: u64, seal_base: u64,
+                                      finalized: u64, frozen: bool) -> Option<&'static str> {
+    if production_throttle_reason(next_block_height, 0, seal_base).is_some() {
+        return Some("past_derivation_horizon");
+    }
+    let mb = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let tail = (MAX_UNSEALED_WINDOWS + 1).saturating_mul(mb);
+    if frozen && finalized > last_sealed.saturating_mul(mb).saturating_add(tail) {
+        return Some("seal_behind_finality");
+    }
+    None
+}
+
+/// Highest macroblock index whose certificate this node verified on receipt from a peer: proof that the network
+/// sealed that far, whatever this node managed to store. Node policy only (`seal_behind_finality`).
+static PEER_CERTIFIED_MB: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_peer_certified_macroblock(index: u64) {
+    PEER_CERTIFIED_MB.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a peer's certified macroblock above `seal` verified here.
+pub(crate) fn peer_sealed_past(seal: u64) -> bool {
+    PEER_CERTIFIED_MB.load(std::sync::atomic::Ordering::Relaxed) > seal
 }
 
 /// Local right-to-produce precondition — the companion to production_throttle_reason.
@@ -5235,6 +5298,8 @@ impl BlockchainNode {
             // Reward shards, so a gap cannot outlive the process that opened it. Root-verified: an
             // epoch is only healed when the rebuilt leaf-set hashes to the committed reward_root.
             Self::backfill_reward_shards(&storage);
+            // The recipient index an epoch needs before the shard cache may drop it.
+            Self::index_reward_recipients(&storage);
             // Macroblocks are never pruned on a Super (archival role), so their committee signatures
             // are the one store with no horizon. Strip them past the cold-join walk budget; the
             // checkpoint half every stored reader uses stays.
@@ -5894,7 +5959,10 @@ mod tests {
         assert!(include_str!("production.rs").contains("mempool.mark_commitment_finalized(key, height_for_storage);"));
         assert_eq!(include_str!("transactions.rs").matches("crate::node::refuse_held_commitment(&self.state, &tx)").count(), 2,
                    "the gossip door and the RPC submit both refuse what the state holds");
-        for (name, src) in [("registration_api.rs", include_str!("../rpc/registration_api.rs")),
+        // The reactivation door is `submit_self_reactivation` (registration.rs), which the operator route
+        // (registration_api.rs) and the automatic endpoint commit both call.
+        assert!(include_str!("../rpc/registration_api.rs").contains("blockchain.submit_self_reactivation("));
+        for (name, src) in [("registration.rs", include_str!("registration.rs")),
                             ("activation_validation.rs", include_str!("../activation_validation.rs")),
                             ("activation.rs", include_str!("activation.rs")), ("lifecycle.rs", include_str!("lifecycle.rs"))] {
             assert!(src.contains("refuse_held_commitment(") || src.contains("commitment_backed_by_state("),
@@ -10004,6 +10072,45 @@ mod tests {
             "post-genesis without N-2 committee must REJECT, not fall back to the genesis set");
     }
 
+    /// The emergency allowlist reaches registration through the committee. From the first window whose
+    /// committee derives from a snapshot built under the gate, only the six attest a burn, 5 of 6. An outside
+    /// member's signature no longer counts.
+    #[tokio::test]
+    async fn registration_attestation_follows_the_allowlisted_committee() {
+        let g = qnet_state::feature_gates::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT;
+        let epoch = g / 90 + 2; // its committee derives from snapshot g/90, the first built under the gate
+        let h = (epoch - 1) * 90 + 1;
+        let six: Vec<String> = crate::genesis_constants::EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect();
+        let outsider = "super_node_22020ba893c62e34".to_string();
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        let elig: Vec<qnet_state::EligibleProducer> = six.iter()
+            .map(|id| qnet_state::EligibleProducer { node_id: id.clone(), reputation: 7000 }).collect();
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.eligible_producers = Some(bincode::serialize(&elig).unwrap());
+        cd.randomness_beacon = Some([9u8; 32]);
+        storage.save_macroblock(epoch - 2, &qnet_state::MacroBlock::new(epoch - 2, 0, [0u8; 32], vec![], [1u8; 32], cd))
+            .await.expect("save");
+        let mut sorted = six.clone();
+        sorted.sort();
+        assert_eq!(BlockchainNode::committee_for_height(&storage, h), Some(sorted), "the six are the committee");
+        assert_eq!(qnet_consensus::checkpoint_bft::quorum_size(six.len()), 5);
+        let burn_tx = "solBurnAllowlist";
+        let amount = 1500u64;
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, &burn_owner().0, &burn_beneficiary(), amount, &qnet_state::NodeType::Super, amount, epoch);
+        let mut sigs: Vec<(String, String)> = Vec::new();
+        for id in six.iter().chain(std::iter::once(&outsider)) {
+            let (pk, sk) = burn_gen_genesis(id);
+            storage.save_vrf_public_key(id, &hex::encode(&pk)).unwrap();
+            sigs.push((id.clone(), burn_sign(id, &pk, &sk, &msg)));
+        }
+        let tx = burn_reg_tx_epoch("burn", burn_tx, amount, sigs[..5].to_vec(), epoch);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, h, &storage).await.is_ok(), "5 of the six attest");
+        let mixed: Vec<(String, String)> = sigs[..4].iter().cloned().chain(std::iter::once(sigs[6].clone())).collect();
+        let tx = burn_reg_tx_epoch("burn", burn_tx, amount, mixed, epoch);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, h, &storage).await.is_err(), "the outsider does not count");
+    }
+
     const TARGET_GATE: u64 = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
 
     /// A native super registration in the client form, signed by its wallet key: vrf_pk and the endpoint
@@ -11793,5 +11900,548 @@ mod slot_gap_rule_tests {
         assert!(!slot_timestamp_valid(G, Some(parent), h, parent + 1 + SLOT_GAP_MIN_SECS - 1, Some(parent + 10_000)));
         assert!(!slot_timestamp_valid(G, Some(parent), h, parent, Some(parent + 10_000)));
         assert!(!slot_timestamp_valid(G, Some(parent), h, parent - 5, Some(parent + 10_000)));
+    }
+}
+
+#[cfg(test)]
+mod emergency_allowlist_tests {
+    use super::*;
+    use crate::genesis_constants::{allowlist_excludes, EMERGENCY_COMMITTEE_ALLOWLIST};
+
+    /// Two outside supers of the 10.10 committee.
+    const OUTSIDERS: [&str; 2] = ["super_node_22020ba893c62e34", "super_node_d0590f220be03d34"];
+
+    fn gate() -> u64 { qnet_state::feature_gates::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT }
+
+    fn allowed() -> Vec<String> {
+        let mut v: Vec<String> = EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn everyone() -> Vec<String> {
+        let mut v: Vec<String> = EMERGENCY_COMMITTEE_ALLOWLIST.iter().chain(OUTSIDERS.iter()).map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn ids(v: &[qnet_state::EligibleProducer]) -> Vec<String> { v.iter().map(|p| p.node_id.clone()).collect() }
+
+    /// Every member registered and heartbeating in the subwindow before the gate's: recent for the snapshot one
+    /// window below the gate (its current subwindow) and for the one at it (its previous).
+    fn seed(storage: &crate::storage::Storage) -> Vec<String> {
+        let all = everyone();
+        for id in &all {
+            let reg_h = if id.starts_with("genesis_node_") { 0 } else { 100 };
+            storage.save_node_registration_at_height(id, "super", &format!("w_{}", id), 90.0, reg_h).unwrap();
+        }
+        let anchor = (gate() / HB_SUBWINDOW_BLOCKS - 1) * HB_SUBWINDOW_BLOCKS + 10;
+        for id in &all { storage.index_heartbeat_inclusion(id, anchor, anchor + 5).unwrap(); }
+        all
+    }
+
+    /// A sealed snapshot carrying `members`, as one built before the gate does.
+    fn snapshot_mb(idx: u64, members: &[String]) -> qnet_state::MacroBlock {
+        let elig: Vec<qnet_state::EligibleProducer> = members.iter()
+            .map(|id| qnet_state::EligibleProducer { node_id: id.clone(), reputation: 7000 }).collect();
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.eligible_producers = Some(bincode::serialize(&elig).unwrap());
+        cd.randomness_beacon = Some([idx as u8; 32]);
+        qnet_state::MacroBlock::new(idx, 0, [0u8; 32], vec![], [1u8; 32], cd)
+    }
+
+    #[test]
+    fn the_allowlist_is_the_six_and_bars_nobody_before_its_gate() {
+        let g = gate();
+        assert_eq!(g % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL, 0, "a snapshot boundary");
+        assert_eq!(g / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL, 38_949, "the first snapshot unsealed at the halt");
+        assert_eq!(allowed(), EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                   "sorted and deduplicated");
+        assert_eq!(EMERGENCY_COMMITTEE_ALLOWLIST.len(), 6);
+        for id in OUTSIDERS {
+            assert!(!allowlist_excludes(id, g - 1), "{} is untouched below the gate", id);
+            assert!(allowlist_excludes(id, g), "{} is barred from the gate", id);
+        }
+        for id in EMERGENCY_COMMITTEE_ALLOWLIST { assert!(!allowlist_excludes(id, u64::MAX)); }
+    }
+
+    /// The snapshot builder: one window below the gate it is what it always was; from the gate's own boundary it
+    /// holds only the allowlist, through both arms (the carry-over and the Phase-2A re-admission, which would
+    /// otherwise put every heartbeating outsider straight back), and every node derives the same set whatever
+    /// order it holds the participants in. The registry keeps every identity.
+    #[tokio::test]
+    async fn the_snapshot_admits_only_the_allowlist_from_its_gate() {
+        let g = gate();
+        let st = qnet_state::State::new();
+        let mut views = Vec::new();
+        for reversed in [false, true] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+            let mut all = seed(&storage);
+            if reversed { all.reverse(); }
+            let before = BlockchainNode::create_eligible_producers_snapshot(&all, g / 90 - 1, &storage, &st).await;
+            let after = BlockchainNode::create_eligible_producers_snapshot(&all, g / 90, &storage, &st).await;
+            views.push((ids(&before), ids(&after)));
+            let registry: Vec<String> = storage.super_registrations_as_of(g).expect("registry")
+                .into_iter().map(|(id, _)| id).collect();
+            for o in OUTSIDERS { assert!(registry.iter().any(|r| r == o), "the registry keeps {}", o); }
+        }
+        assert_eq!(views[0].0, everyone(), "below the gate nothing changes");
+        assert_eq!(views[0].1, allowed(), "from the gate only the allowlist");
+        assert_eq!(views[0], views[1], "every node derives the same sets");
+    }
+
+    /// Every derived set reads the stored snapshot as it is, the way a light client samples committee(j) out of
+    /// eligible(j-2). The window right above the gate derives from a snapshot sealed before it and keeps
+    /// everyone. The next derives from the first snapshot built under it and holds the six. The frozen arm
+    /// reads its anchor's set the same way. Were a derived set filtered again, the committee the node folds
+    /// into epoch_commitment would differ from the one every light client derives, and the light walk would
+    /// stop at that macroblock for good.
+    #[tokio::test]
+    async fn derived_sets_read_the_stored_snapshot_as_light_clients_do() {
+        let g = gate();
+        let w = g / 90; // the first snapshot built under the gate
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let stored = |idx: u64| if idx >= w { allowed() } else { everyone() };
+        for idx in [w - 2, w - 1, w] { storage.save_macroblock(idx, &snapshot_mb(idx, &stored(idx))).await.expect("save"); }
+        for (window, want) in [(w, everyone()), (w + 1, everyone()), (w + 2, allowed())] {
+            let light = qnet_consensus::checkpoint_bft::sample_committee(
+                &stored(window - 2), window, &[(window - 2) as u8; 32],
+                BlockchainNode::COMMITTEE_THRESHOLD, BlockchainNode::CONSENSUS_COMMITTEE_SIZE);
+            assert_eq!(light, want, "window {} as a light client derives it", window);
+            for h in [(window - 1) * 90 + 1, window * 90] {
+                assert_eq!(BlockchainNode::committee_for_height(&storage, h), Some(light.clone()), "h={}", h);
+            }
+        }
+        assert_eq!(BlockchainNode::frozen_committee(&snapshot_mb(w - 1, &everyone()), w + 3), everyone());
+        assert_eq!(BlockchainNode::frozen_committee(&snapshot_mb(w, &allowed()), w + 3), allowed());
+    }
+
+    /// The allowlist is asked only where the stored set is built: the carry-over arm and the genesis floor of
+    /// the snapshot builder, and the Phase-2A re-admission arm, which would otherwise put every heartbeating
+    /// outsider straight back. No derived committee or roster asks it.
+    #[test]
+    fn the_allowlist_lives_only_where_the_stored_set_is_built() {
+        let src = include_str!("committee.rs");
+        let start = src.find("async fn create_eligible_producers_snapshot(").expect("snapshot builder");
+        let end = start + src[start..].find("const CONSENSUS_COMMITTEE_SIZE").expect("builder end");
+        let at: Vec<usize> = src.match_indices("allowlist_excludes(").map(|(i, _)| i).collect();
+        assert_eq!(at.len(), 2, "the carry-over arm and the genesis floor");
+        assert!(at.iter().all(|i| *i > start && *i < end), "both inside the snapshot builder");
+        assert!(!include_str!("leader.rs").contains("allowlist_excludes("), "no derived roster or frozen committee");
+        assert!(!include_str!("../consensus_v2_node.rs").contains("allowlist_excludes("), "no consensus-loop committee");
+        let src = include_str!("mod.rs");
+        let f = src.find("fn phase2a_eligible_additions(").expect("Phase-2A arm");
+        let body: String = src[f..].chars().take(3000).collect();
+        assert!(body.contains("allowlist_excludes(reg, scan_end)"), "the re-admission arm applies it at its boundary");
+    }
+
+    /// Every super the chain knew at the 10.10 halt, with its registration height. The five rows at height 1
+    /// never heartbeat.
+    const REAL_REGS: [(&str, u64); 15] = [
+        ("genesis_node_001", 0), ("genesis_node_002", 0), ("genesis_node_003", 0), ("genesis_node_004", 0),
+        ("genesis_node_005", 0), ("super_node_c78c3017a4f93464", 15_534), ("super_node_2a5c3e98273eb14f", 3_246_651),
+        ("super_node_22020ba893c62e34", 3_288_127), ("super_node_ccb8e28717bfa6ec", 3_345_268),
+        ("super_node_d0590f220be03d34", 3_494_491), ("super_node_60a735f53dd87f1b", 1), ("super_node_76d638f2b358fc9f", 1),
+        ("super_node_79c06fc7b9acf713", 1), ("super_node_9c99212c8b53e7b8", 1), ("super_node_ae6902011dbf469b", 1),
+    ];
+
+    /// Every heartbeat in blocks 3503521..=3508200 as (node, anchor, block): all that snapshots 38949-38980 read
+    /// (subwindows 2433-2436). Two outside members that missed most of their producer slots heartbeat at
+    /// 3505902 and 3506098.
+    const REAL_HEARTBEATS: [(&str, u64, u64); 28] = [
+        ("super_node_d0590f220be03d34", 3_503_588, 3_503_591), ("genesis_node_003", 3_503_632, 3_503_635),
+        ("genesis_node_002", 3_503_663, 3_503_666), ("genesis_node_001", 3_503_927, 3_503_930),
+        ("super_node_22020ba893c62e34", 3_503_985, 3_504_001), ("genesis_node_005", 3_504_087, 3_504_090),
+        ("genesis_node_004", 3_504_446, 3_504_449), ("super_node_c78c3017a4f93464", 3_504_643, 3_504_646),
+        ("genesis_node_004", 3_504_969, 3_504_972), ("genesis_node_002", 3_505_124, 3_505_127),
+        ("genesis_node_001", 3_505_242, 3_505_246), ("genesis_node_003", 3_505_696, 3_505_699),
+        ("super_node_d0590f220be03d34", 3_505_720, 3_505_723), ("genesis_node_005", 3_505_814, 3_505_817),
+        ("super_node_ccb8e28717bfa6ec", 3_505_868, 3_505_902), ("super_node_22020ba893c62e34", 3_505_953, 3_505_956),
+        ("super_node_2a5c3e98273eb14f", 3_506_094, 3_506_098), ("super_node_c78c3017a4f93464", 3_506_270, 3_506_273),
+        ("genesis_node_004", 3_506_552, 3_506_555), ("genesis_node_001", 3_506_567, 3_506_570),
+        ("genesis_node_005", 3_506_616, 3_506_619), ("super_node_c78c3017a4f93464", 3_506_626, 3_506_629),
+        ("genesis_node_003", 3_506_777, 3_506_780), ("genesis_node_002", 3_506_966, 3_506_969),
+        ("super_node_22020ba893c62e34", 3_507_404, 3_507_407), ("super_node_d0590f220be03d34", 3_507_418, 3_507_421),
+        ("genesis_node_004", 3_507_990, 3_507_993), ("super_node_22020ba893c62e34", 3_508_013, 3_508_016),
+    ];
+
+    /// The halted chain's own backlog, replayed from its real heartbeats and registrations. Snapshots 38947-38948
+    /// are sealed with the eight. Each later snapshot is built from the roster of its window, the way the window
+    /// end builds it, and sealed for the next. Without the rule, the outside heartbeats at 3505902 and 3506098
+    /// would put 9-10 members into windows 38957-38977, quorum 7. With it, every backlog window up to 38981
+    /// (the first above the halted tip) has a committee the six certify alone: the eight at quorum 6 for
+    /// windows 38949-38950, then the six at quorum 5.
+    #[tokio::test]
+    async fn the_six_alone_certify_every_window_of_the_10_10_backlog() {
+        use qnet_consensus::checkpoint_bft::quorum_size;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let st = qnet_state::State::new();
+        for (id, reg_h) in REAL_REGS { storage.save_node_registration_at_height(id, "super", &format!("w_{}", id), 90.0, reg_h).unwrap(); }
+        for (id, anchor, block) in REAL_HEARTBEATS { storage.index_heartbeat_inclusion(id, anchor, block).unwrap(); }
+        // The outside heartbeats are live where the old rule would have re-admitted them.
+        let live = |mb: u64| recent_heartbeat_senders(&storage, mb * 90).expect("index intact");
+        assert!(live(38_955).contains("super_node_ccb8e28717bfa6ec"));
+        assert!(live(38_957).contains("super_node_2a5c3e98273eb14f"));
+        let eight = everyone();
+        for idx in [38_947u64, 38_948] { storage.save_macroblock(idx, &snapshot_mb(idx, &eight)).await.expect("save"); }
+        let mut sets: std::collections::BTreeMap<u64, Vec<String>> = [(38_947u64, eight.clone()), (38_948, eight.clone())].into();
+        for mb in 38_949u64..=38_979 {
+            let roster = sets[&(mb - 2)].clone();
+            let snap = ids(&BlockchainNode::create_eligible_producers_snapshot(&roster, mb, &storage, &st).await);
+            assert_eq!(snap, allowed(), "snapshot {} holds the six", mb);
+            storage.save_macroblock(mb, &snapshot_mb(mb, &snap)).await.expect("save");
+            sets.insert(mb, snap);
+        }
+        for w in 38_949u64..=38_981 {
+            let c = BlockchainNode::committee_for_height(&storage, (w - 1) * 90 + 1).expect("committee");
+            let ours = c.iter().filter(|id| EMERGENCY_COMMITTEE_ALLOWLIST.contains(&id.as_str())).count();
+            assert_eq!(ours, 6, "window {}: all six are members", w);
+            assert!(quorum_size(c.len()) <= ours, "window {}: quorum {} of {} is out of the six's reach", w, quorum_size(c.len()), c.len());
+            let want = if w <= 38_950 { (8, 6) } else { (6, 5) };
+            assert_eq!((c.len(), quorum_size(c.len())), want, "window {}", w);
+        }
+    }
+}
+
+#[cfg(test)]
+mod super_reward_admission_tests {
+    use super::*;
+    use super::registration::SuperRewardAdmission;
+    use crate::genesis_constants::EMERGENCY_COMMITTEE_ALLOWLIST;
+
+    const EPOCH: u64 = 14_400;
+    const ALL_SLOTS: u16 = 0x03FF;
+
+    /// The six with their real registration heights, and four outside supers that heartbeat on the live chain.
+    const REGS: [(&str, u64); 10] = [
+        ("genesis_node_001", 0), ("genesis_node_002", 0), ("genesis_node_003", 0), ("genesis_node_004", 0),
+        ("genesis_node_005", 0), ("super_node_c78c3017a4f93464", 15_534), ("super_node_2a5c3e98273eb14f", 3_246_651),
+        ("super_node_22020ba893c62e34", 3_288_127), ("super_node_ccb8e28717bfa6ec", 3_345_268),
+        ("super_node_d0590f220be03d34", 3_494_491),
+    ];
+
+    fn gate() -> u64 { qnet_state::feature_gates::SUPER_REWARD_ADMISSION_GATE_HEIGHT }
+    /// The first epoch the rule governs, and the last one it does not.
+    fn on() -> u64 { gate() / EPOCH }
+    fn off() -> u64 { on() - 1 }
+    fn settle(epoch: u64) -> u64 { (epoch + 1) * EPOCH + HB_ANCHOR_MAX_LAG }
+    fn reward_key(epoch: u64) -> u64 { (epoch + 1) * crate::reward_epoch::MB_PER_EPOCH }
+    fn wallet(id: &str) -> String { format!("w_{}", id) }
+    fn admitted(id: &str) -> bool { EMERGENCY_COMMITTEE_ALLOWLIST.contains(&id) }
+
+    fn storage() -> (tempfile::TempDir, crate::storage::Storage) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        for (id, h) in REGS { storage.save_node_registration_at_height(id, "super", &wallet(id), 90.0, h).unwrap(); }
+        (dir, storage)
+    }
+
+    fn acct(epoch: u64, slots: u16) -> qnet_state::Account {
+        let mut a = qnet_state::Account::default();
+        a.heartbeat_final_epoch = epoch;
+        a.heartbeat_final_slots = slots;
+        a
+    }
+
+    /// Every super with all ten subwindows of `epoch`, `tweak` overriding some.
+    fn accounts(epoch: u64, tweak: &[(&str, qnet_state::Account)]) -> Vec<(String, qnet_state::Account)> {
+        REGS.iter().map(|(id, _)| {
+            let a = tweak.iter().find(|(t, _)| t == id).map(|(_, a)| a.clone()).unwrap_or_else(|| acct(epoch, ALL_SLOTS));
+            (id.to_string(), a)
+        }).collect()
+    }
+
+    fn state_with(accts: &[(String, qnet_state::Account)]) -> qnet_state::State {
+        let st = qnet_state::State::new();
+        for (id, a) in accts { st.accounts.insert(id.clone(), a.clone()); }
+        st
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> { v.sort(); v }
+
+    /// The rule before this gate, spelled out: registered by the settle point, not banned, at least nine.
+    fn reference(storage: &crate::storage::Storage, accts: &[(String, qnet_state::Account)], epoch: u64) -> Vec<String> {
+        let regs = storage.super_registrations_as_of(settle(epoch)).expect("regs");
+        sorted(regs.into_iter().map(|(id, _)| id).filter(|id| {
+            accts.iter().find(|(a, _)| a == id).map_or(false, |(_, a)| a.banned_at_height == 0
+                && BlockchainNode::account_heartbeat_count(a, epoch) >= 9)
+        }).collect())
+    }
+
+    fn pairs(ids: &[String]) -> Vec<(String, String)> { ids.iter().map(|id| (id.clone(), wallet(id))).collect() }
+
+    fn six() -> Vec<String> { sorted(EMERGENCY_COMMITTEE_ALLOWLIST.iter().map(|s| s.to_string()).collect()) }
+    fn everyone() -> Vec<String> { sorted(REGS.iter().map(|(id, _)| id.to_string()).collect()) }
+
+    fn settle_block(h: u64) -> qnet_state::MicroBlock {
+        qnet_state::MicroBlock {
+            height: h, timestamp: 0, transactions: vec![], producer: "genesis_node_001".to_string(),
+            signature: vec![0u8; 64], merkle_root: [0u8; 32], previous_hash: [0u8; 32],
+            vrf_output: None, vrf_proof: None, fees_collected: 0,
+            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        }
+    }
+
+    /// Below the gate the set and the reward root are exactly what the old rule gives, outside supers included.
+    #[test]
+    fn gate_off_epoch_is_byte_identical() {
+        let (_d, storage) = storage();
+        let accts = accounts(off(), &[]);
+        let st = state_with(&accts);
+        let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, off()).expect("set");
+        assert_eq!(sorted(set.clone()), reference(&storage, &accts, off()));
+        assert_eq!(sorted(set.clone()), everyone(), "outside supers earn below the gate");
+        storage.save_super_eligible_batch(off(), &set).unwrap();
+        let k = reward_key(off());
+        let total = crate::reward_epoch::canonical_total(k);
+        let (_, _, root) = BlockchainNode::compute_epoch_reward_root(&storage, k, total, None).expect("root");
+        let (_, want) = BlockchainNode::distribute_split_rewards(&pairs(&everyone()), &[], total, k);
+        assert_eq!(root, want, "the same reward root as before the rule");
+    }
+
+    /// From the gate the set is the admitted members that cleared the bar, and nobody else.
+    #[test]
+    fn gate_on_epoch_is_the_intersection() {
+        let (_d, storage) = storage();
+        let n = on();
+        let accts = accounts(n, &[
+            ("super_node_2a5c3e98273eb14f", acct(n, 0x01FF)), // outside, 9
+            ("genesis_node_001", acct(n, 0x00FF)),            // admitted, 8
+            ("genesis_node_002", acct(n, 0x01FF)),            // admitted, exactly 9
+        ]);
+        let st = state_with(&accts);
+        let set = sorted(BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set"));
+        let want: Vec<String> = six().into_iter().filter(|id| id != "genesis_node_001").collect();
+        assert_eq!(set, want);
+        let old: Vec<String> = reference(&storage, &accts, n).into_iter().filter(|id| admitted(id)).collect();
+        assert_eq!(set, old, "the old set intersected with the admitted set");
+    }
+
+    #[test]
+    fn banned_admitted_super_earns_nothing() {
+        let (_d, storage) = storage();
+        for n in [off(), on()] {
+            let mut banned = acct(n, ALL_SLOTS);
+            banned.banned_at_height = 1_000;
+            let st = state_with(&accounts(n, &[("genesis_node_003", banned)]));
+            let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set");
+            assert!(!set.iter().any(|id| id == "genesis_node_003"), "epoch {}", n);
+        }
+    }
+
+    /// The epoch below the gate settles above it and keeps the old rule: the rule is keyed on the epoch's first
+    /// block, never on the height asking.
+    #[test]
+    fn epoch_straddling_the_gate_is_keyed_on_its_first_block() {
+        let (_d, storage) = storage();
+        assert_eq!(BlockchainNode::super_reward_admission(&storage, off()), SuperRewardAdmission::Open);
+        assert_eq!(BlockchainNode::super_reward_admission(&storage, on()), SuperRewardAdmission::Allowlist { at: gate() });
+        let st = state_with(&accounts(off(), &[]));
+        let (e, set) = BlockchainNode::compute_super_eligible_at_settle(&st, &storage, gate() + HB_ANCHOR_MAX_LAG).expect("settle");
+        assert_eq!((e, sorted(set)), (off(), everyone()), "settled above the gate, filed under the old rule");
+        let st = state_with(&accounts(on(), &[]));
+        let (e, set) = BlockchainNode::compute_super_eligible_at_settle(&st, &storage, gate() + EPOCH + HB_ANCHOR_MAX_LAG).expect("settle");
+        assert_eq!((e, sorted(set)), (on(), six()));
+    }
+
+    /// The producer, a replica and a snapshot joiner deriving anywhere in the next epoch file the same rows and
+    /// the same reward root, on both sides of the gate.
+    #[test]
+    fn producer_replica_and_snapshot_joiner_file_the_same_rows() {
+        for n in [off(), on()] {
+            let accts = accounts(n, &[]);
+            let h = settle(n);
+            let k = reward_key(n);
+            let total = crate::reward_epoch::canonical_total(k);
+            // Producer: the settle set, filed by the single writer.
+            let (_dp, producer) = storage();
+            let st = state_with(&accts);
+            let side = BlockSideIndices {
+                super_eligible: BlockchainNode::compute_super_eligible_at_settle(&st, &producer, h),
+                ..Default::default()
+            };
+            BlockchainNode::flush_block_side_indices(&producer, h, &side);
+            let want = producer.load_super_eligible(n).unwrap();
+            assert_eq!(sorted(want.clone()), if n >= on() { six() } else { everyone() }, "epoch {}", n);
+            let root = BlockchainNode::compute_epoch_reward_root(&producer, k, total, None);
+            assert!(root.is_some());
+            // Replica: the apply path of the settle block.
+            let (_dr, replica) = storage();
+            let st = state_with(&accts);
+            let r = BlockchainNode::apply_block_to_state(&st, &settle_block(h), &replica, None);
+            BlockchainNode::flush_block_side_indices(&replica, h, &r.side_indices);
+            assert_eq!(replica.load_super_eligible(n).unwrap(), want, "replica, epoch {}", n);
+            assert_eq!(BlockchainNode::compute_epoch_reward_root(&replica, k, total, None), root, "replica root");
+            // Joiners: registrations and on-disk accounts only, nothing resident, no rows.
+            for at in [h + 7_000, (n + 2) * EPOCH - 1] {
+                let (_dj, joiner) = storage();
+                joiner.mirror_block_delta(1, accts.clone(), Vec::new());
+                joiner.mirror_barrier();
+                assert!(joiner.load_super_eligible(n).unwrap().is_empty());
+                assert_eq!(BlockchainNode::backfill_settle_indices(&qnet_state::State::new(), &joiner, at), 1);
+                assert_eq!(joiner.load_super_eligible(n).unwrap(), want, "joiner at {}, epoch {}", at, n);
+                assert_eq!(BlockchainNode::compute_epoch_reward_root(&joiner, k, total, None), root, "joiner root at {}", at);
+            }
+        }
+    }
+
+    /// An outside super's leaf in the last epoch below the gate stays provable and creditable after the rule
+    /// excludes it, also once its shards are pruned and rebuilt. The next epoch simply has no leaf for it.
+    #[test]
+    fn earned_rewards_of_an_excluded_super_stay_claimable() {
+        let (_d, storage) = storage();
+        let outsider = "super_node_22020ba893c62e34";
+        let w = wallet(outsider);
+        let mut roots = Vec::new();
+        for n in [off(), on()] {
+            let st = state_with(&accounts(n, &[]));
+            let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set");
+            storage.save_super_eligible_batch(n, &set).unwrap();
+            let k = reward_key(n);
+            let (_, _, root) = BlockchainNode::compute_epoch_reward_root(
+                &storage, k, crate::reward_epoch::canonical_total(k), Some(k)).expect("root");
+            let mut rb = [0u8; 32];
+            rb.copy_from_slice(&hex::decode(&root).unwrap());
+            storage.seed_epoch_root_for_test(k, rb);
+            roots.push((k, root));
+        }
+        let (k_off, root_off) = roots[0].clone();
+        let (k_on, root_on) = roots[1].clone();
+        let proven = |storage: &crate::storage::Storage| match BlockchainNode::reward_proof_from_shard(storage, k_off, &root_off, &w, true) {
+            ShardClaim::Proof(amount, proof) => {
+                assert!(qnet_core::crypto::merkle::verify_merkle_proof(
+                    &BlockchainNode::reward_leaf_hash_hex(&w, k_off, amount), &root_off, &proof), "the proof verifies");
+                amount
+            }
+            other => panic!("the earned epoch must stay provable, got {:?}", other),
+        };
+        let amount = proven(&storage);
+        assert!(amount > 0);
+        assert!(matches!(BlockchainNode::reward_proof_from_shard(&storage, k_on, &root_on, &w, false), ShardClaim::NotRecipient),
+                "no leaf from the gate, and the quote loop continues past it");
+        storage.prune_epoch_reward_shards(k_on + 1).unwrap();
+        assert!(matches!(BlockchainNode::reward_proof_from_shard(&storage, k_off, &root_off, &w, false), ShardClaim::Absent));
+        assert_eq!(BlockchainNode::backfill_reward_shards(&storage), 2, "both epochs rebuild to their certified roots");
+        assert_eq!(proven(&storage), amount, "the rebuild serves the same amount");
+        let sg = qnet_state::State::new();
+        sg.credit_rewards_pool(amount);
+        assert!(sg.claim_reward(&w, k_off, amount), "the claim credits it");
+        assert_eq!(sg.get_account(&w).map(|a| a.balance), Some(amount));
+    }
+
+    /// A reorg into the settle window clears the epoch's rows, and the forward re-apply files the admitted set again.
+    #[test]
+    fn reorg_reconcile_re_derives_the_filtered_set() {
+        let (_d, storage) = storage();
+        let n = on();
+        let h = settle(n);
+        let st = state_with(&accounts(n, &[]));
+        let file = |storage: &crate::storage::Storage| {
+            let side = BlockSideIndices {
+                super_eligible: BlockchainNode::compute_super_eligible_at_settle(&st, storage, h),
+                ..Default::default()
+            };
+            BlockchainNode::flush_block_side_indices(storage, h, &side);
+        };
+        file(&storage);
+        assert_eq!(sorted(storage.load_super_eligible(n).unwrap()), six());
+        assert!(storage.reconcile_reward_indices_above_epoch(h - 1).unwrap() > 0);
+        assert!(storage.load_super_eligible(n).unwrap().is_empty(), "cleared");
+        file(&storage);
+        assert_eq!(sorted(storage.load_super_eligible(n).unwrap()), six(), "no outside super comes back");
+    }
+
+    /// The light share is untouched: from the gate an outside super's wallet that also holds a light id still
+    /// receives its light share, and the leaf set is the split of the admitted supers and every eligible light.
+    #[test]
+    fn light_branch_is_untouched() {
+        let (_d, storage) = storage();
+        let outsider = "super_node_ccb8e28717bfa6ec";
+        let mut lights: Vec<(String, String)> = Vec::new();
+        for w in ["wl_a".to_string(), "wl_b".to_string(), wallet(outsider)] {
+            let id = crate::rpc::generate_light_node_pseudonym(&w);
+            storage.save_node_registration_at_height_burn(&id, "light", &w, 1.0, 100, "b").unwrap();
+            lights.push((id, w));
+        }
+        for n in [off(), on()] {
+            for (id, _) in &lights {
+                storage.save_light_bitmap(n, light_shard_of(id), n * EPOCH + 1, &[0xFF; 4]).unwrap();
+            }
+            let st = state_with(&accounts(n, &[]));
+            let set = BlockchainNode::compute_super_eligible_for_epoch(&st, &storage, n).expect("set");
+            storage.save_super_eligible_batch(n, &set).unwrap();
+            let k = reward_key(n);
+            let total = crate::reward_epoch::canonical_total(k);
+            let supers = if n >= on() { six() } else { everyone() };
+            let want = BlockchainNode::distribute_split_rewards(&pairs(&supers), &lights, total, k);
+            let got = BlockchainNode::compute_epoch_reward_distribution(&storage, k, total).expect("distribution");
+            assert_eq!(got, want, "epoch {}", n);
+            let paid = got.0.iter().find(|(w, _)| *w == wallet(outsider)).map(|(_, a)| *a).unwrap_or(0);
+            let light_only = got.0.iter().find(|(w, _)| w == "wl_a").map(|(_, a)| *a).unwrap_or(0);
+            assert!(light_only > 0);
+            if n >= on() {
+                assert!(paid.abs_diff(light_only) <= 1, "light share only (one unit of remainder apart), epoch {}", n);
+            } else {
+                assert!(paid > light_only + 1, "both shares below the gate");
+            }
+        }
+    }
+
+    /// The status label: nothing required below the gate, admitted for the six and waiting for an outside super
+    /// from it.
+    #[test]
+    fn the_status_label_follows_the_admitted_set() {
+        let (_d, storage) = storage();
+        for (id, _) in REGS {
+            assert_eq!(BlockchainNode::super_admission_label(&storage, id, off()), "not_required");
+            assert_eq!(BlockchainNode::super_admission_label(&storage, id, on()),
+                       if admitted(id) { "admitted" } else { "waiting" }, "{}", id);
+        }
+    }
+
+    fn body<'a>(src: &'a str, sig: &str, close: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{} not found", sig));
+        let end = start + src[start..].find(close).unwrap_or_else(|| panic!("end of {} not found", sig));
+        &src[start..end]
+    }
+
+    /// Reward membership is decided once, where super_elig_{N} is computed. Every reader, the claim path and the
+    /// light code read the filed rows; producer eligibility keeps the snapshot rule alone.
+    #[test]
+    fn the_reward_admission_is_asked_once_at_the_settle_writer() {
+        const ASK: &str = "super_reward_admission(";
+        const LIST: &str = "allowlist_excludes(";
+        // Line ends as checked out: a Windows checkout reads CRLF.
+        let lf = |s: &str| s.replace("\r\n", "\n");
+        let reg = lf(include_str!("registration.rs"));
+        let reg = reg.as_str();
+        assert!(body(reg,"pub(crate) fn compute_super_eligible_for_epoch(", "\n    }\n").contains(ASK));
+        assert_eq!(reg.matches(LIST).count(), 1, "only SuperRewardAdmission::admits asks the allowlist");
+        assert!(body(reg, "impl SuperRewardAdmission {", "\n}\n").contains(LIST));
+        for sig in ["pub(super) fn apply_merkle_claims(", "pub(super) fn claim_proofs_admissible(",
+                    "pub(crate) fn backfill_reward_shards(", "pub(crate) fn backfill_settle_indices("] {
+            let b = body(reg, sig, "\n    }\n");
+            assert!(!b.contains(ASK) && !b.contains(LIST), "{}", sig);
+        }
+        let rewards = include_str!("rewards.rs");
+        assert!(!rewards.contains(ASK) && !rewards.contains(LIST), "no reward reader asks again");
+        let api = lf(include_str!("../rpc/rewards_api.rs"));
+        let api = api.as_str();
+        let claim = body(api, "pub(super) async fn handle_claim_rewards(", "\n}\n");
+        assert!(!claim.contains(ASK) && !claim.contains("super_admission_label("), "the claim path never asks");
+        for (name, src) in [("committee.rs", include_str!("committee.rs")), ("leader.rs", include_str!("leader.rs")),
+                            ("consensus_v2_node.rs", include_str!("../consensus_v2_node.rs"))] {
+            assert!(!src.contains(ASK), "{} keeps producer eligibility on the snapshot rule", name);
+        }
+        let node = include_str!("mod.rs");
+        let f = node.find("fn phase2a_eligible_additions(").expect("Phase-2A arm");
+        assert!(!node[f..].chars().take(3000).collect::<String>().contains(ASK));
+        for (name, src) in [("rpc/rewards_api.rs", api), ("rpc/light_nodes.rs", include_str!("../rpc/light_nodes.rs")),
+                            ("rpc/light_status.rs", include_str!("../rpc/light_status.rs"))] {
+            assert!(!src.contains(LIST), "{} does not ask the allowlist", name);
+        }
     }
 }

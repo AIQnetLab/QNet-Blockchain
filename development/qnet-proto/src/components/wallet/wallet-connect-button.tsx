@@ -15,7 +15,7 @@ export default function WalletConnectButton() {
       setQnetWalletConnected(true);
     } catch (error) {
       console.error('ERROR Failed to open QNet wallet:', error);
-      showErrorNotification('Failed to connect QNet wallet');
+      showErrorNotification('Failed to connect QNet Wallet');
     }
     setIsConnecting(false);
   };
@@ -47,8 +47,8 @@ export default function WalletConnectButton() {
         <h4 style="margin: 0 0 12px 0; font-weight: 600;">QNet Wallet Instructions</h4>
         <ol style="margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.6;">
           <li>Buy 1DEV tokens on any Solana DEX</li>
-          <li>In QNet wallet: Import → Paste your Solana seed phrase</li>
-          <li>QNet wallet will auto-filter to show only 1DEV tokens</li>
+          <li>In QNet Wallet: Import → Paste your Solana seed phrase</li>
+          <li>QNet Wallet will auto-filter to show only 1DEV tokens</li>
           <li>Go to Node tab → Select node type → One-click activate</li>
           <li>Done! Start earning rewards every 4 hours</li>
         </ol>

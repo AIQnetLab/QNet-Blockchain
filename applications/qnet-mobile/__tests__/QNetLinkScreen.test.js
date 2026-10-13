@@ -307,12 +307,14 @@ describe('the outcome outlives a lock', () => {
   });
 });
 
-// Revision 2: the link sheet discloses the device check before Confirm and names what happens; the claim sheet shows the
-// amount the app read itself; the check number appears only once the relay took the answer.
+// Revision 2: the link sheet discloses the device check before Confirm and names what happens; the claim sheet names the
+// node whose balance moves (the wallet's light or super node) and shows the amount the app read itself; the check number
+// appears only once the relay took the answer.
 describe('the link and claim sheets', () => {
   const LINK_L = { id: 'e'.repeat(32), sitePub: 'd'.repeat(43), intent: 'link', reqHash: 'f'.repeat(43) };
   const CLAIM_L = { id: 'a'.repeat(32), sitePub: 'd'.repeat(43), intent: 'claim', reqHash: 'b'.repeat(43) };
   const NODE_ID = 'light_mobile_6526ab8fd00ff8ca';
+  const SUPER_ID = 'super_node_f3e187d8752f4514';
   const CAPABLE = { capable: true, platform: 'ios', flags: 'mac=0,vision=0,idiom=phone', report: null };
   const consentOffer = (over = {}) => ({
     kind: 'link', mode: 'consent', nodeId: NODE_ID, qnet: ADDRESSES.qnet, burnTx: 'b', device: CAPABLE, features: [], switchFrom: null, ...over,
@@ -434,14 +436,20 @@ describe('the link and claim sheets', () => {
     await act(async () => { refused.unmount(); });
   });
 
-  it('the claim sheet shows the amount the app read, and the done screen the move', async () => {
-    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, qnet: ADDRESSES.qnet, amountNano: 12500000000 });
+  it('the claim sheet names the light node and shows the amount the app read, and the done screen the move', async () => {
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, nodeType: 'light', qnet: ADDRESSES.qnet, amountNano: 12500000000 });
     QNetLink.performIntent.mockResolvedValue({
       status: 'ok', qnet: ADDRESSES.qnet, nodeId: NODE_ID, amountNano: '12500000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: '160',
     });
     const tree = await mount(CLAIM_L);
-    for (const s of [t('link_title_claim'), t('link_claim_amount'), '12.5 QNC']) expect(texts(tree)).toContain(s);
+    for (const s of [t('link_title_claim'), t('node_title_light'), NODE_ID, t('link_claim_amount'), '12.5 QNC']) expect(texts(tree)).toContain(s);
     expect(texts(tree)).not.toContain(t('link_claim_empty'));
+    expect(texts(tree)).not.toContain(t('node_title_super'));
+    // The node, then the amount, then the wallet.
+    const shown = texts(tree);
+    expect(shown.indexOf(NODE_ID)).toBeLessThan(shown.indexOf('12.5 QNC'));
+    expect(shown.indexOf('12.5 QNC')).toBeLessThan(shown.indexOf(ADDRESSES.qnet));
+    expect(tree.root.findAllByProps({ testID: 'link-claim-node' }).some((n) => n.props.children === NODE_ID)).toBe(true);
     await wait(ARMED);
     await act(async () => { await press(button(tree, 'Confirm')); });
     expect(props.authenticate).toHaveBeenCalledWith(t('link_auth_claim'));
@@ -450,11 +458,33 @@ describe('the link and claim sheets', () => {
     await act(async () => { tree.unmount(); });
   });
 
+  it('the claim sheet of the wallet\'s super node names it, "Super node" with its id, above the amount', async () => {
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: SUPER_ID, nodeType: 'super', qnet: ADDRESSES.qnet, amountNano: 48000000000 });
+    QNetLink.performIntent.mockResolvedValue({
+      status: 'ok', qnet: ADDRESSES.qnet, nodeId: SUPER_ID, amountNano: '48000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null,
+    });
+    const tree = await mount(CLAIM_L);
+    const shown = texts(tree);
+    for (const s of [t('link_title_claim'), t('node_title_super'), SUPER_ID, t('link_claim_amount'), '48 QNC', ADDRESSES.qnet]) expect(shown).toContain(s);
+    expect(shown).not.toContain(t('node_title_light'));
+    expect(shown.indexOf(SUPER_ID)).toBeLessThan(shown.indexOf('48 QNC'));
+    expect(tree.root.findAllByProps({ testID: 'link-claim-node' }).some((n) => n.props.children === SUPER_ID)).toBe(true);
+    await wait(ARMED);
+    await act(async () => { await press(button(tree, 'Confirm')); });
+    expect(props.authenticate).toHaveBeenCalledWith(t('link_auth_claim'));
+    expect(QNetLink.performIntent).toHaveBeenCalledWith(CLAIM_L, expect.objectContaining({ nodeId: SUPER_ID, nodeType: 'super' }), expect.any(Object));
+    expect(texts(tree)).toContain(t('link_result_claim', { amount: '48 QNC' }));
+    expect(texts(tree)).toContain(t('claim_credited_on_block'));
+    await act(async () => { tree.unmount(); });
+  });
+
   it('below 1 QNC there is nothing to move, and the answer after Confirm says so', async () => {
-    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim_empty', nodeId: NODE_ID, qnet: ADDRESSES.qnet });
-    QNetLink.performIntent.mockResolvedValue({ status: 'empty', qnet: ADDRESSES.qnet, nodeId: NODE_ID });
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim_empty', nodeId: SUPER_ID, nodeType: 'super', qnet: ADDRESSES.qnet });
+    QNetLink.performIntent.mockResolvedValue({ status: 'empty', qnet: ADDRESSES.qnet, nodeId: SUPER_ID });
     const tree = await mount(CLAIM_L);
     expect(texts(tree)).toContain(t('link_claim_empty'));
+    expect(texts(tree)).toContain(t('node_title_super'));
+    expect(texts(tree)).toContain(SUPER_ID);
     await wait(ARMED);
     await act(async () => { await press(button(tree, 'Confirm')); });
     expect(texts(tree)).toContain(t('link_result_claim_empty'));
@@ -545,7 +575,7 @@ describe('an outcome nobody answered', () => {
   const CAPABLE = { capable: true, platform: 'ios', flags: 'mac=0,vision=0,idiom=phone', report: null };
 
   it('a claim: the unknown note, not "could not be reached. Nothing changed."', async () => {
-    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, qnet: ADDRESSES.qnet, amountNano: 12500000000 });
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, nodeType: 'light', qnet: ADDRESSES.qnet, amountNano: 12500000000 });
     QNetLink.performIntent.mockResolvedValue({ status: 'error', error: 'NETWORK', unknown: true });
     const tree = await mount(CLAIM_U);
     await wait(ARMED);

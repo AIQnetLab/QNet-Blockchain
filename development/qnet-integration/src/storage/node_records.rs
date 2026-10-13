@@ -1532,6 +1532,10 @@ impl Storage {
                 Some(floor) => (current_height - TX_INDEX_RETENTION_BLOCKS).min(floor),
                 None => current_height - TX_INDEX_RETENTION_BLOCKS,
             };
+            // Claim outcomes go with the rows they describe, at the same height.
+            if let Err(e) = self.prune_claim_outcomes(prune_before) {
+                if crate::node::is_warn() { println!("[WARN][CLEANUP] claim_outcome_prune_failed err={}", e); }
+            }
             self.prune_old_transactions(prune_before).unwrap_or(0)
         } else {
             0

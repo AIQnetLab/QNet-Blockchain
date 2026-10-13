@@ -8,9 +8,9 @@ import { LINK_HOST, requestHost } from '@/lib/hosts';
 import type { Metadata, Viewport } from 'next';
 
 export const metadata: Metadata = {
-  title: 'QNet - Post-Quantum Blockchain',
-  description: 'An experimental blockchain designed by one person and built with AI assistance. No funding. No team. No corporate backing. The architecture and every protocol decision are one person\'s; the code is written with AI tools under that direction.',
-  keywords: 'blockchain, quantum-resistant, post-quantum, cryptocurrency, decentralized, QNet',
+  title: 'QNet Blockchain',
+  description: 'QNet Blockchain is an experimental blockchain designed by one person and built with AI assistance. No funding. No team. No corporate backing. The architecture and every protocol decision are one person\'s; the code is written with AI tools under that direction.',
+  keywords: 'QNet Blockchain, blockchain, quantum-resistant, post-quantum, cryptocurrency, decentralized',
   authors: [{ name: 'Orrery Group LLC', url: 'https://aiqnet.io' }],
   creator: 'Orrery Group LLC',
   publisher: 'Orrery Group LLC',
@@ -33,16 +33,16 @@ export const metadata: Metadata = {
   // './' resolves against each page's own path, so every page names itself without its query string.
   alternates: { canonical: './' },
   openGraph: {
-    title: 'QNet - Post-Quantum Blockchain',
+    title: 'QNet Blockchain',
     description: 'The next generation of decentralized technology with quantum resistance.',
     url: 'https://aiqnet.io',
-    siteName: 'QNet',
+    siteName: 'QNet Blockchain',
     locale: 'en_US',
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'QNet - Post-Quantum Blockchain',
+    title: 'QNet Blockchain',
     description: 'The next generation of decentralized technology with quantum resistance.',
   },
 };

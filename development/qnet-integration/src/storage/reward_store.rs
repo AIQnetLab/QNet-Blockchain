@@ -78,6 +78,191 @@ impl Storage {
         Ok(())
     }
 
+    /// Epochs whose shard cache (meta row) is present here, ascending.
+    pub fn reward_shard_meta_epochs(&self) -> IntegrationResult<Vec<u64>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let prefix = b"epoch_shardmeta_";
+        let mut out = Vec::new();
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+            let (k, _) = item.map_err(|e| IntegrationError::StorageError(format!("shardmeta_iter: {}", e)))?;
+            if !k.starts_with(prefix) { break; }
+            if let Some(e) = std::str::from_utf8(&k[prefix.len()..]).ok().and_then(|d| d.parse::<u64>().ok()) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    fn claim_outcome_key(hash: &str) -> String { format!("claim_out_{}", hash) }
+    /// The outcome row's height-ordered twin, so the prune reads only the rows it deletes.
+    fn claim_outcome_order_key(height: u64, hash: &str) -> String { format!("claim_oh_{:020}_{}", height, hash) }
+
+    /// What an applied merkle claim credited: (height, amount, epochs). Written by apply for every claim in a
+    /// block, so a claim that credited nothing is not shown as a confirmed credit of its amount. Node-local
+    /// display data, kept as long as the transaction index keeps the claim.
+    pub fn save_claim_outcome(&self, hash: &str, height: u64, credited: u64, epochs: u32) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let mut v = Vec::with_capacity(20);
+        v.extend_from_slice(&height.to_le_bytes());
+        v.extend_from_slice(&credited.to_le_bytes());
+        v.extend_from_slice(&epochs.to_le_bytes());
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, Self::claim_outcome_key(hash).as_bytes(), &v);
+        batch.put_cf(&cf, Self::claim_outcome_order_key(height, hash).as_bytes(), b"");
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// The stored outcome of the claim `hash`: (height, credited, epochs credited).
+    pub fn load_claim_outcome(&self, hash: &str) -> Option<(u64, u64, u32)> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")?;
+        let v = self.persistent.db.get_cf(&cf, Self::claim_outcome_key(hash).as_bytes()).ok()??;
+        if v.len() != 20 { return None; }
+        Some((u64::from_le_bytes(v[..8].try_into().ok()?), u64::from_le_bytes(v[8..16].try_into().ok()?),
+              u32::from_le_bytes(v[16..20].try_into().ok()?)))
+    }
+
+    /// Drop claim outcomes applied below `below_height`: the transaction index's own prune height, so a claim it
+    /// still lists keeps its outcome. Walks the height-ordered rows and stops at the first one it keeps. An outcome
+    /// rewritten at another height (a claim re-applied after a rollback) is kept until its own height passes.
+    pub fn prune_claim_outcomes(&self, below_height: u64) -> IntegrationResult<usize> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let prefix = b"claim_oh_";
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut n = 0usize;
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+            let (k, _) = item.map_err(|e| IntegrationError::StorageError(format!("claim_oh_iter: {}", e)))?;
+            if !k.starts_with(prefix) { break; }
+            let rest = std::str::from_utf8(&k[prefix.len()..]).unwrap_or("");
+            let (h, hash) = match rest.split_once('_') {
+                Some((h, hash)) => (h.parse::<u64>().unwrap_or(0), hash),
+                None => (0, ""),
+            };
+            if h >= below_height { break; }
+            batch.delete_cf(&cf, &k);
+            if !hash.is_empty() && self.load_claim_outcome(hash).map_or(false, |(oh, _, _)| oh == h) {
+                batch.delete_cf(&cf, Self::claim_outcome_key(hash).as_bytes());
+                n += 1;
+            }
+        }
+        self.persistent.db.write(batch)?;
+        Ok(n)
+    }
+
+    /// The fingerprint the recipient index keys a wallet by. 16 bytes, because an index hit is acted on as a leaf
+    /// (the claim door refuses a batch that skips it, the head epoch is reported from it): at 10M recipients and 10M
+    /// claimants a false hit is about 3e-25 per epoch, where 8 bytes gave about 5e-6.
+    pub fn reward_recipient_fingerprint(wallet: &str) -> u128 {
+        use sha3::{Digest, Sha3_256};
+        let mut h = Sha3_256::new();
+        h.update(b"QNET_RCPX_v1");
+        h.update(wallet.as_bytes());
+        let d = h.finalize();
+        u128::from_be_bytes(d[..16].try_into().unwrap_or([0u8; 16]))
+    }
+
+    fn recipient_index_meta_key(epoch: u64) -> String { format!("rcpx_meta_{:010}", epoch) }
+    fn recipient_index_bucket_key(epoch: u64, bucket: usize) -> String { format!("rcpx_bkt_{:010}_{:06}", epoch, bucket) }
+
+    /// Durable per-epoch recipient index: each wallet holding a leaf in `epoch`, with its amount. It outlives the
+    /// shard cache, so a claim walk passes an epoch a wallet was not paid in without rebuilding the epoch, and the
+    /// balance routes still count an epoch whose shards were pruned. Buckets of (16-byte fingerprint, amount) of
+    /// about RECIPIENT_BUCKET wallets each, so a lookup reads one meta row and one bucket. Amounts are a class byte
+    /// into the meta row's table (an equal split has a handful of distinct amounts), or the full u64 when there are
+    /// more than 255. Stored with the certified root it was built from, in one write batch replacing any earlier
+    /// index of the epoch. Node-local: no frame or root carries it.
+    pub fn save_reward_recipient_index(&self, epoch: u64, root: &[u8; 32], mut entries: Vec<(u128, u64)>) -> IntegrationResult<()> {
+        const RECIPIENT_BUCKET: usize = 1024;
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        entries.sort_unstable();
+        entries.dedup_by_key(|e| e.0);
+        let mut table: Vec<u64> = entries.iter().map(|e| e.1).collect();
+        table.sort_unstable();
+        table.dedup();
+        let wide = table.len() > 255;
+        if wide { table.clear(); }
+        let nb = ((entries.len() + RECIPIENT_BUCKET - 1) / RECIPIENT_BUCKET).max(1).next_power_of_two();
+        let mut buckets: Vec<Vec<u8>> = vec![Vec::new(); nb];
+        // Entries are sorted by fingerprint, so each bucket receives its own in ascending order.
+        for (fp, amount) in &entries {
+            let b = &mut buckets[(*fp as usize) & (nb - 1)];
+            b.extend_from_slice(&fp.to_le_bytes());
+            if wide {
+                b.extend_from_slice(&amount.to_le_bytes());
+            } else {
+                b.push(table.binary_search(amount).unwrap_or(0) as u8);
+            }
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range_cf(&cf, Self::recipient_index_bucket_key(epoch, 0).as_bytes(),
+                              Self::recipient_index_bucket_key(epoch + 1, 0).as_bytes());
+        for (i, b) in buckets.iter().enumerate() {
+            if !b.is_empty() { batch.put_cf(&cf, Self::recipient_index_bucket_key(epoch, i).as_bytes(), b); }
+        }
+        let mut meta = Vec::with_capacity(46 + table.len() * 8);
+        meta.extend_from_slice(root);
+        meta.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        meta.extend_from_slice(&(nb as u32).to_le_bytes());
+        meta.push(wide as u8);
+        meta.push(table.len() as u8);
+        for a in &table { meta.extend_from_slice(&a.to_le_bytes()); }
+        batch.put_cf(&cf, Self::recipient_index_meta_key(epoch).as_bytes(), &meta);
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// The certified root the epoch's recipient index was built from, if one is stored.
+    pub fn reward_recipient_index_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")?;
+        let v = self.persistent.db.get_cf(&cf, Self::recipient_index_meta_key(epoch).as_bytes()).ok()??;
+        if v.len() < 46 { return None; }
+        v[..32].try_into().ok()
+    }
+
+    /// `wallet` in the epoch's recipient index built from `root`: Some(Some(amount)) when it holds a leaf,
+    /// Some(None) when it does not, None when no index for that root is stored or a row is unreadable.
+    pub fn reward_recipient_lookup(&self, epoch: u64, root: &[u8; 32], wallet: &str) -> Option<Option<u64>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")?;
+        let meta = self.persistent.db.get_cf(&cf, Self::recipient_index_meta_key(epoch).as_bytes()).ok()??;
+        if meta.len() < 46 || &meta[..32] != root { return None; }
+        let nb = u32::from_le_bytes(meta[40..44].try_into().ok()?) as usize;
+        let (wide, ncls) = (meta[44] == 1, meta[45] as usize);
+        if nb == 0 || !nb.is_power_of_two() || meta.len() != 46 + ncls * 8 { return None; }
+        let fp = Self::reward_recipient_fingerprint(wallet);
+        let bucket = match self.persistent.db.get_cf(&cf, Self::recipient_index_bucket_key(epoch, (fp as usize) & (nb - 1)).as_bytes()) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Some(None), // written in one batch with the meta row: an absent bucket is empty
+            Err(_) => return None,
+        };
+        let rec = if wide { 24 } else { 17 };
+        if bucket.len() % rec != 0 { return None; }
+        let fp_at = |i: usize| u128::from_le_bytes(bucket[i * rec..i * rec + 16].try_into().unwrap_or([0u8; 16]));
+        let (mut lo, mut hi) = (0usize, bucket.len() / rec);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match fp_at(mid).cmp(&fp) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let at = mid * rec + 16;
+                    let amount = if wide {
+                        u64::from_le_bytes(bucket[at..at + 8].try_into().ok()?)
+                    } else {
+                        let c = bucket[at] as usize;
+                        if c >= ncls { return None; }
+                        u64::from_le_bytes(meta[46 + c * 8..54 + c * 8].try_into().ok()?)
+                    };
+                    return Some(Some(amount));
+                }
+            }
+        }
+        Some(None)
+    }
+
     /// Persist a Light-node eligibility bitmap (decompressed) keyed by (epoch, genesis_idx),
     /// indexed at apply so the emission recompute reads ≤5 keys, not a 14400-block scan. Last
     /// write per (epoch,gidx) wins — identical to the in-order block scan it replaces, and it

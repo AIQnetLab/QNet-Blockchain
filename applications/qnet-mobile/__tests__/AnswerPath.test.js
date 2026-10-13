@@ -944,7 +944,7 @@ describe('the Node tab\'s one line for the last missed epoch', () => {
       + 'since the device restarted. Open it once after every restart.');
     // The app answered that wake: never said as "did not answer", and nothing for this device to change.
     expect(reached({ deliveredAt: at0 + 20, deliveryDelaySecs: 20, appOutcome: 'answered' })).toBe(t('node_miss_answered'));
-    expect(t('node_miss_answered')).toBe('This device answered the wake, but the network did not count the answer in that epoch. '
+    expect(t('node_miss_answered')).toBe('This device answered the wake, but QNet Blockchain did not count the answer in that epoch. '
       + 'Nothing needs doing on this device.');
     // The app's record shows no push of that epoch reached it.
     expect(missText(t, status(miss('not_delivered', { wokenAt: at0 }))))

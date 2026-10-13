@@ -1,4 +1,4 @@
-# Building on QNet
+# Building on QNet Blockchain
 
 This is the starting point for developers: what the public testnet offers today, which pieces a web
 page, a server and a contract author use, and where each one is described. Every statement here is
@@ -22,10 +22,10 @@ There is no public QNC faucet. Test QNC comes from a wallet that already holds s
 ## Who talks to what
 
 ```
-web page ── provider requests ──▶ QNet wallet (browser extension, or the app's in-app browser)
+web page ── provider requests ──▶ QNet Blockchain wallet (browser extension, or the app's in-app browser)
                                         │ builds, shows, signs
                                         ▼
-your server / CLI ── HTTPS ─────▶ QNet node REST API ◀── wallet submits and reads
+your server / CLI ── HTTPS ─────▶ QNet Blockchain node REST API ◀── wallet submits and reads
 ```
 
 - **A web page talks to the wallet for everything it signs or sends.** A page connects to the user's
@@ -45,7 +45,7 @@ your server / CLI ── HTTPS ─────▶ QNet node REST API ◀── w
 | Task | How | Document |
 | --- | --- | --- |
 | Connect a page to the user's wallet, react to account changes | provider announcement event, `qnet_requestAccounts`, `accountsChanged` | [dApp integration](dapp-integration.md) |
-| Sign users in with their QNet address | a sign-in text the wallet signs for the page's origin, checked on your server | [Sign-in](sign-in.md) |
+| Sign users in with their QNet Blockchain address | a sign-in text the wallet signs for the page's origin, checked on your server | [Sign-in](sign-in.md) |
 | Ask the user to send QNC, a built-in token or a contract call | `qnet_sendTransaction` with `type` `transfer`, `tokenTransfer` or `contractCall` | [dApp integration](dapp-integration.md), [Transactions](transactions.md) |
 | Follow a transaction the user sent | `qnet_getTransactionStatus` by (`from`, `nonce`) | [dApp integration](dapp-integration.md) |
 | Read balances, tokens, events and transactions from a server | node REST API, verified reads where a proof exists | [RPC API](rpc-api.md), [SDK](sdk.md) |
@@ -53,7 +53,7 @@ your server / CLI ── HTTPS ─────▶ QNet node REST API ◀── w
 | Write, build, check and deploy a WebAssembly contract | `contracts/` templates and tool, `qnet deploy` | [Smart contracts](smart-contracts.md), [CLI](cli.md) |
 
 Where a page finds a wallet: the browser extension offers its provider on `https://aiqnet.io` and
-`https://games.aiqnet.io` only; the QNet app's in-app browser offers it on every HTTPS page it opens. For
+`https://games.aiqnet.io` only; the QNet Wallet app's in-app browser offers it on every HTTPS page it opens. For
 any page of `link.aiqnet.io`, and for the site's home page and its `/node`, `/activate`, `/wallet`, `/l`,
 `/docs`, `/dao`, `/testnet` and `/qnet-wallet-extension` pages, the app opens `https://aiqnet.io/explorer`
 instead ([dApp integration](dapp-integration.md#where-a-page-gets-a-provider)).

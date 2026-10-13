@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "next dev -H 0.0.0.0",
     "dev:turbo": "next dev -H 0.0.0.0 --turbopack",
+    "prebuild": "node scripts/light-pin.mjs --build",
     "build": "next build",
     "start": "next start -H 127.0.0.1",
     "lint": "bunx biome lint --write && bunx tsc --noEmit",

@@ -1,7 +1,7 @@
 # Light node messages
 
-Status: normative, version 1. This document defines the bytes that the QNet app, the web cabinet on aiqnet.io,
-the QNet browser extension, the genesis nodes and the device oracle sign and check for a light node:
+Status: normative, version 1. This document defines the bytes that the QNet Wallet app, the web cabinet on aiqnet.io,
+the QNet Wallet browser extension, the genesis nodes and the device oracle sign and check for a light node:
 
 - the node's identity (section 3);
 - the messages signed with the wallet key and with the node's ping key (section 4);
@@ -16,9 +16,9 @@ MAY are used as in RFC 2119.
 
 | Party | Role |
 | --- | --- |
-| **App** | QNet Wallet on iPhone, iPad, Android phones and Android tablets: the wallet, the node client and every confirmation |
-| **Cabinet** | aiqnet.io/node in a browser: payment, activation code, claim, devices (link, move, unlink), "I'm back"; it opens requests that the app confirms and never handles device evidence |
-| **Extension** | the QNet browser extension: burn, record on the network, claim; it never runs a node |
+| **App** | QNet Wallet on iPhone, iPad, Android phones and Android tablets: the wallet, the node client and every confirmation, the claim of a node balance among them (its Node tab, or the cabinet's `claim` request) |
+| **Cabinet** | aiqnet.io/node in a browser: payment, activation code, claim of a light or a super node's balance (it asks the extension or the app, which sign), devices (link, move, unlink, and running the node on a phone again); it opens requests that the app confirms and never handles device evidence |
+| **Extension** | the QNet Wallet browser extension: burn, record on QNet Blockchain, claim of a light or a super node's balance at the cabinet's request (its own window confirms it; its popup has no claim); it never runs a node |
 | **Genesis nodes** | the five genesis nodes: shard owners of the light nodes and, with a quorum of 4, the attestors of device statements |
 | **Device oracle** | a service run by the network operator: holds the vendor credentials, keeps the per-device slot lease and signs lease statements; its hosts are configuration |
 
@@ -62,6 +62,7 @@ device runs one node, and one wallet has one node.
 | `K` | the wallet's ML-DSA-65 public key, `KeyGen(xi)` |
 | `W` | the wallet's EON address: SHA-512(`K`) as hex → first 19 characters ‖ `eon` ‖ next 15 ‖ first 8 hex of SHA3-256 of those 37 characters |
 | `N` | the light node id: `light_mobile_` ‖ first 16 hex of BLAKE3(`LIGHT_NODE_PRIVACY_` ‖ `W`) |
+| `S` | the super node id: `super_node_` ‖ first 16 hex of BLAKE3(`SUPER_NODE_PRIVACY_` ‖ `W`), the id the node gives a super node of `W` (only the claim below names it) |
 | `proof` | first 32 hex of BLAKE3(`{burnTx}:{N}:{W}`), where `burnTx` is the base58 signature of the burn |
 | Attest root tag | `hex(sha3(K))` |
 | `walletHash` | first 16 hex of SHA3-256(`qnet-link-wallet:` ‖ `W`) (QNet Link requests) |
@@ -150,6 +151,11 @@ so that the wallet key stays locked. `pp` is its public key.
   `retry_after_seconds`. A request whose signatures verify spends nothing there and is limited per node instead (bind
   and unbind 5 an hour, the token refresh 6; bind and the token refresh count only a request that changes something).
 - `h` is the height of a canonical block of the current epoch at most the node's tip and `hash` its 64-hex hash.
+- In the claim quote `N` is the node whose balance moves: the wallet's light node id, or its super node id `S` when the
+  claim is the super node's (the cabinet's `claim` request and the extension's `qnet_claimNodeBalance` name it, [QNet
+  Link v1](qnet-link-v1.md) section 14.4). The node takes it only for a node the chain registered to `W`; the rewards the
+  claim pays are `W`'s, whichever of its nodes the quote names. A signer computes `N` and `S` from the wallet and signs
+  for no other node.
 - `claims_data` is the exact string the node quoted in step 1: the JSON object
   `{"claims":[{"amount":n,"epoch":n,"proof":[["<64 hex>",b],...]},...]}` with its keys sorted, one entry per epoch
   (the amount in nano-QNC, the reward proof as pairs of a sibling hash and whether that sibling is on the left). The
@@ -485,7 +491,8 @@ count (paused, its lease lapsed, its rotation overdue) is neither pushed nor wok
 node. It stays as it is while the device layer is off; whether the lease and rotation states, which the device repairs
 at its next wake, are still pushed is an open decision of the owner before the device layer is turned on.
 
-**"I'm back"** is `POST /api/v1/light-node/wake` with `{"node_id": N}`: one silent push (`"action": "wake"`) to the
+**The wake route** is `POST /api/v1/light-node/wake` with `{"node_id": N}` (the site no longer calls it: a phone that
+holds the node answers once QNet Wallet is open on it, and one whose push address is gone is linked again): one silent push (`"action": "wake"`) to the
 bound device, or, for a device without a push channel, a challenge for its next poll; it is unsigned and the dormant
 rule does not apply to it. Every answer is
 
@@ -839,7 +846,7 @@ The other routes' `reason` values:
 - token refresh: `stale_seq`, `bind_v2_required` (a legacy refresh for a node with a v2 binding), `bad_signature`,
   `expired` (outside ±300 s, or older than the message that last set the channel), `rate_limited`, `not_registered`,
   `bad_request`.
-- ping reply: `superseded` when a later binding replaced this device's ("The node runs on another device").
+- ping reply: `superseded` when a later binding replaced this device's.
 - the legacy `/light-node/register` for a node on chain: `bind_v2_required` when the node has a v2 binding, told only to
   a caller that presents the node's committed key and that key's signature over the wallet address; any other caller
   gets the inert `already_registered`, whatever is bound. For a node not on chain yet, a wallet that derives from

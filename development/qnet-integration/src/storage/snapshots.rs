@@ -167,6 +167,8 @@ impl Storage {
     }
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
+    pub fn put_galc_v2_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_v2_held(bytes) }
+    pub fn get_galc_v2_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_v2_held() }
     /// The macroblock index this node cold-joined at, or 0 for a from-genesis node.
     ///
     /// This is the ONE honest test for "the data is missing because *I* joined late" versus "the data is
@@ -1771,12 +1773,20 @@ impl Storage {
             _ => false,
         };
         if capsule_dropped { batch.delete_cf(&meta, b"galc_held"); }
+        let wallet_capsule_dropped = match self.get_galc_v2_held() {
+            Ok(Some(b)) => bincode::deserialize::<crate::galc::GenesisCheckpointV2>(&b).ok()
+                .map_or(false, |c| c.mb_index.saturating_mul(mi) > target),
+            _ => false,
+        };
+        if wallet_capsule_dropped { batch.delete_cf(&meta, b"galc_v2_held"); }
         if let Err(e) = self.persistent.db.write(batch) {
             println!("[WARN][ROLLBACK] abandon_batch_failed target={} err={}", target, e);
             return;
         }
-        println!("[INFO][ROLLBACK] claims_abandoned target={} votes={} capsule_dropped={}",
-                 target, votes, capsule_dropped);
+        // And the copies held in RAM, with the v2 partials and mint marks above the target.
+        crate::galc::on_rollback(target);
+        println!("[INFO][ROLLBACK] claims_abandoned target={} votes={} capsule_dropped={} wallet_capsule_dropped={}",
+                 target, votes, capsule_dropped, wallet_capsule_dropped);
     }
 
     pub fn get_latest_snapshot_height(&self) -> IntegrationResult<Option<u64>> {
@@ -3813,16 +3823,25 @@ mod tests_rollback_retraction {
             minted_at_height: 0, sigs: Vec::new(),
         }).expect("ser");
         st.put_galc_held(&capsule(9640)).expect("galc");
+        let wallet_capsule = |mb_index: u64| bincode::serialize(&crate::galc::GenesisCheckpointV2 {
+            version: 2, network_id: [0u8; 32], mb_index, mb_hash: [0u8; 32],
+            committee_digest_anchor: [0u8; 32], committee_digest_pred: [0u8; 32],
+            minted_at_height: mb_index * 90, cp_hash_anchor: [0u8; 32], cp_hash_pred: [0u8; 32], sigs: Vec::new(),
+        }).expect("ser");
+        st.put_galc_v2_held(&wallet_capsule(9600)).expect("galc v2");
 
         st.abandon_chain_claims_above(target);
         let kept: Vec<u64> = st.load_checkpoint_votes().expect("votes").into_iter().map(|v| v.0).collect();
         assert_eq!(kept, vec![28_785], "only the vote at the target's own head remains");
         assert!(st.get_galc_held().expect("get").is_none(), "a capsule above the target describes nothing");
+        assert!(st.get_galc_v2_held().expect("get").is_none(), "nor does a wallet capsule above it");
 
         // A capsule at or below the target is a trust root this node keeps.
         st.put_galc_held(&capsule(9000)).expect("galc");
+        st.put_galc_v2_held(&wallet_capsule(9590)).expect("galc v2");
         st.abandon_chain_claims_above(target);
         assert!(st.get_galc_held().expect("get").is_some());
+        assert!(st.get_galc_v2_held().expect("get").is_some());
     }
 
     /// The total-supply seal is the registry-root seal's sibling: same head, same "Some means this

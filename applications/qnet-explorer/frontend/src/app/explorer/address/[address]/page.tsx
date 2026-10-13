@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import ExplorerLink from '@/components/ExplorerLink';
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useChainHead } from '@/hooks/useChainHead';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
@@ -181,7 +181,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
             </>
           )}
           <div className="verification-note">
-            The balance is proven against the state root that the network&apos;s validator committee signed for this
+            The balance is proven against the state root that the validator committee of QNet Blockchain signed for this
             checkpoint. The site checks the committee&apos;s signatures itself, so no single node is trusted. The proven
             balance is the account&apos;s balance at that checkpoint, which is certified about one to two minutes after its
             block; the balance shown above is the latest the explorer read and can be newer.
@@ -215,9 +215,9 @@ const OtherTokens = ({
             <div key={token.contract_address || idx} className="token-row-expanded">
               <span className="token-symbol">
                 {token.contract_address ? (
-                  <ExplorerLink href={`/explorer/token/${token.contract_address}`} className="address-link">
+                  <Link href={`/explorer/token/${token.contract_address}`} className="address-link">
                     {token.symbol || truncate(token.contract_address, 6, 4)}
-                  </ExplorerLink>
+                  </Link>
                 ) : (
                   token.symbol
                 )}
@@ -470,9 +470,9 @@ export default function AddressPage() {
                   return (
                     <tr key={idx}>
                       <td>
-                        <ExplorerLink href={`/explorer/tx/${tx.hash}`} className="address-link">
+                        <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
                           {truncate(tx.hash, 6, 4)}
-                        </ExplorerLink>
+                        </Link>
                       </td>
                       <td>
                         <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
@@ -485,9 +485,9 @@ export default function AddressPage() {
                           const addr = isSend ? tx.to : tx.from;
                           const isValid = addr && addr.length > 10 && addr.includes('eon');
                           return isValid ? (
-                            <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">
+                            <Link href={`/explorer/address/${addr}`} className="address-link">
                               {truncate(addr, 6, 4)}
-                            </ExplorerLink>
+                            </Link>
                           ) : (
                             <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
                           );
@@ -495,19 +495,19 @@ export default function AddressPage() {
                       </td>
                       <td className={isSend ? 'amount-out' : 'amount-in'}>
                         {tx.amount.includes('QNC') ? (
-                          <ExplorerLink href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                             <TokenIcon native size={16} />
                             <span>{isSend ? '-' : '+'}{tx.amount}</span>
-                          </ExplorerLink>
+                          </Link>
                         ) : (
                           // No value moved (Heartbeat/Registration/etc.): bare amount, no +/- sign.
                           <span>{tx.amount}</span>
                         )}
                       </td>
                       <td>
-                        <ExplorerLink href={`/explorer/block/${tx.block}`} className="address-link">
+                        <Link href={`/explorer/block/${tx.block}`} className="address-link">
                           {tx.block}
-                        </ExplorerLink>
+                        </Link>
                       </td>
                       <td>{formatTimeAgo(tx.timestamp)}</td>
                     </tr>
@@ -564,16 +564,16 @@ export default function AddressPage() {
                 return (
                   <tr key={`${t.hash}-${idx}`}>
                     <td>
-                      <ExplorerLink href={`/explorer/tx/${t.hash}`} className="address-link">
+                      <Link href={`/explorer/tx/${t.hash}`} className="address-link">
                         {truncate(t.hash, 6, 4)}
-                      </ExplorerLink>
+                      </Link>
                     </td>
                     <td>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <TokenIcon logo={t.logo} symbol={t.symbol} address={t.contract} size={16} />
-                        <ExplorerLink href={`/explorer/token/${t.contract}`} className="address-link">
+                        <Link href={`/explorer/token/${t.contract}`} className="address-link">
                           {t.symbol || truncate(t.contract, 6, 4)}
-                        </ExplorerLink>
+                        </Link>
                       </span>
                     </td>
                     <td className={isOut ? 'amount-out' : 'amount-in'}>
@@ -583,17 +583,17 @@ export default function AddressPage() {
                     <td>
                       <span className={isOut ? 'tx-out' : 'tx-in'}>{isOut ? '→ ' : '← '}</span>
                       {counterValid ? (
-                        <ExplorerLink href={`/explorer/address/${counter}`} className="address-link">
+                        <Link href={`/explorer/address/${counter}`} className="address-link">
                           {truncate(counter, 6, 4)}
-                        </ExplorerLink>
+                        </Link>
                       ) : (
                         <span className="address-link">{t.kind === 'mint' ? 'Mint' : t.kind === 'burn' ? '🔥 Burn' : txPartyLabel(counter || 'N/A', full)}</span>
                       )}
                     </td>
                     <td>
-                      <ExplorerLink href={`/explorer/block/${t.block}`} className="address-link">
+                      <Link href={`/explorer/block/${t.block}`} className="address-link">
                         {t.block}
-                      </ExplorerLink>
+                      </Link>
                     </td>
                     <td>{formatTimeAgo(t.timestamp)}</td>
                   </tr>

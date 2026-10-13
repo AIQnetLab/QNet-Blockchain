@@ -320,7 +320,7 @@ describe('MA2-04: every unlock answer is said, and a flag that cannot be read ne
 
 describe('MN2-03: a claim the node\'s quote capped may be below 1 QNC (owner decision 6)', () => {
   const W = require('../../../docs/protocols/light-node.vectors.json').wallets[0];
-  const view = { intent: 'claim', request: { walletHash: W.walletHash } };
+  const view = { intent: 'claim', request: { walletHash: W.walletHash, nodeId: W.nodeId } };
   const ok = (over) => ({ status: 'ok', qnet: W.address, nodeId: W.nodeId, txHash: 'ab'.repeat(32), ...over });
 
   it('a capped part below 1 QNC is answered as sent; an uncapped one below 1 QNC, or nothing, is not', () => {
@@ -350,8 +350,9 @@ describe('SD-R2-03: no reward wording reaches the screen through an error', () =
   });
 
   it('the QNet Link claim says "empty" or "busy" for those codes, not a refusal', async () => {
+    const W = require('../../../docs/protocols/light-node.vectors.json').wallets[0];
     const actions = (err) => nodeLinkActions({ walletManager: { claimRewards: async () => { throw err; } }, credential: 'c' });
-    const claim = (err) => actions(err).claim({ nodeId: 'n', qnet: 'q', amountNano: 1 });
+    const claim = (err) => actions(err).claim({ nodeId: W.nodeId, qnet: W.address, amountNano: 1 });
     expect(await claim(Object.assign(new Error('x'), { code: 'NO_REWARDS' }))).toEqual({ status: 'empty' });
     expect(await claim(Object.assign(new Error('x'), { code: 'CLAIM_BUSY' }))).toEqual({ status: 'error', error: 'CLAIM_BUSY' });
     expect(await claim(Object.assign(new Error('x'), { code: 'NOT_REGISTERED' }))).toEqual({ status: 'error', error: 'CLAIM_REFUSED' });

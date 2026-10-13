@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { IN_APP_NAV } from '../activate-view.ts';
 import { ACTIVATION_NETWORK } from '../one-dev.ts';
+import { TEXTS } from '../texts.ts';
 
 const SRC = new URL('../../', import.meta.url);
 const read = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
@@ -28,7 +29,7 @@ test('the header: Explorer, My node, Wallet, Testnet and the Docs menu; the logo
   assert.match(code('app/testnet/layout.tsx'), /if \(ACTIVATION_NETWORK !== 'testnet'\) notFound\(\);\s*return <InAppGuard>\{children\}<\/InAppGuard>;/);
   assert.match(code('app/sitemap.ts'), /const pages = ACTIVATION_NETWORK === 'testnet' \? \[\.\.\.PAGES\.slice\(0, 9\), '\/testnet', \.\.\.PAGES\.slice\(9\)\] : PAGES;/);
   // Home is the logo; Privacy and Terms are no header links.
-  assert.match(HEADER, /<Link href=\{inApp \? keepFromApp\(IN_APP_HOME, fromApp\) : '\/'\} className="qnet-logo">QNET<\/Link>/);
+  assert.match(HEADER, /<Link href=\{inApp \? IN_APP_HOME : '\/'\} className="qnet-logo">QNET<\/Link>/);
   assert.doesNotMatch(section('MAIN_NAV') + section('DOCS_MENU'), /'\/privacy'|'\/terms'|label: 'Home'/);
   // One Docs menu, only outside the app's view, inside the one nav the phone's menu opens too.
   const nav = HEADER.slice(HEADER.indexOf('<nav className={`qnet-nav'), HEADER.indexOf('</nav>'));
@@ -57,18 +58,42 @@ test('the Docs menu: a button that opens its list, closing on a link, outside, E
   assert.doesNotMatch(css + read('app/mobile-fixes.css'), /@media \(max-width: 1200px\) \{\n {2}\.qnet-header/);
 });
 
-test('the footer: Privacy, Terms and Support on every page, with the app\'s marker in its view', () => {
+test('the footer: Privacy and Terms on every page, in the small line under it', () => {
   const footer = code('components/Footer.tsx');
   assert.deepEqual(links(footer.slice(footer.indexOf('const FOOTER_LINKS'), footer.indexOf('];', footer.indexOf('const FOOTER_LINKS')))), [
-    ['/privacy', 'Privacy'], ['/terms', 'Terms'], ['/support', 'Support'],
+    ['/privacy', 'Privacy'], ['/terms', 'Terms'],
   ]);
-  assert.match(footer, /<Link key=\{link\.href\} href=\{keepFromApp\(link\.href, fromApp\)\} className="footer-link">\{link\.label\}<\/Link>/);
+  // Owner, 12.10: Support lives in the Docs menu, not twice; the legal links sit in one small line with the copyright.
+  assert.match(footer, /<div className="footer-legal">\s*<span className="footer-copyright">© 2026 Orrery Group LLC<\/span>\s*<nav className="footer-links"/);
+  assert.match(footer, /<Link key=\{link\.href\} href=\{link\.href\} className="footer-link">\{link\.label\}<\/Link>/);
   // Shown in the app's view too: the policies are pages of that view.
   assert.doesNotMatch(footer, /\{full && \(?<nav className="footer-links"/);
   for (const [href] of [['/privacy'], ['/terms'], ['/support']]) assert.ok(IN_APP_NAV.some((l) => l.href === href), href);
-  // Owner, 05.10: the live Google Play listing, off the app's view like every other off-site link.
-  assert.match(footer, /\{full && \(<a href=\{ANDROID_PLAY_URL\} target="_blank" rel="noopener noreferrer" className="footer-link">Google Play<\/a>\)\}/);
+  // Owner, 05.10 and 11.10: the live Android listing as its official store badge, off the app's view like every other
+  // off-site link. Owner, 12.10: the iOS badge shows now beside it, the same size and with no caption, not a link until
+  // IOS_APP_STORE_URL names the live listing. Both sit in one group that a phone wraps whole under the icons.
+  const badges = footer.slice(footer.indexOf('{full && (<div className="store-badges">'), footer.indexOf('</div>)}', footer.indexOf('className="store-badges"')));
+  assert.ok(badges.length > 0, 'the store badges in one group, off the app\'s view');
+  assert.match(badges, /<a href=\{ANDROID_PLAY_URL\} target="_blank" rel="noopener noreferrer" className="google-play-badge">\s*<img src="\/badges\/google-play\.png" alt=\{t\('store_badge_android'\)\} width=\{646\} height=\{250\} \/>\s*<\/a>/);
+  assert.match(badges, /\{IOS_APP_STORE_URL \? \(<a href=\{IOS_APP_STORE_URL\} target="_blank" rel="noopener noreferrer" className="app-store-badge">\s*<img src="\/badges\/app-store\.svg" alt=\{t\('store_badge_ios'\)\} className="store-badge" width=\{120\} height=\{40\} \/>/);
+  const ios = badges.match(/\) : \((<span className="app-store-badge">[\s\S]*?<\/span>)\)\}/);
+  assert.ok(ios, 'the iOS badge before its listing');
+  assert.match(ios[1], /^<span className="app-store-badge">\s*<img src="\/badges\/app-store\.svg" alt=\{t\('store_badge_ios'\)\} className="store-badge" width=\{120\} height=\{40\} \/>\s*<\/span>$/);
+  assert.doesNotMatch(ios[1], /href|<a\b|onClick|soon/i);
+  assert.equal(TEXTS.store_soon, undefined);
+  assert.doesNotMatch(footer, />Google Play<\/a>/);
   assert.match(read('lib/app-links.ts'), /export const ANDROID_PLAY_URL = `https:\/\/play\.google\.com\/store\/apps\/details\?id=\$\{ANDROID_PLAY_PACKAGE\}`;/);
+  assert.match(read('lib/app-links.ts'), /export const IOS_APP_STORE_URL: string \| null = null;/);
+  for (const file of ['google-play.png', 'app-store.svg']) assert.ok(existsSync(new URL(`../public/badges/${file}`, SRC)), file);
+  // The row wraps on a narrow phone instead of being cut at the page's edge.
+  assert.match(footer, /className="social-links badge-row">/);
+  assert.match(read('app/globals.css'), /@media \(max-width: 768px\) \{[\s\S]*?\.badge-row \{\n {4}flex-wrap: wrap;/);
+  // No rule stretches every link to the store: an inline link to it stays in its sentence.
+  const css = read('app/globals.css');
+  assert.doesNotMatch(css, /^a\[href\*="play\.google\.com"\]/m);
+  assert.match(css, /\.google-play-badge img \{\n {2}height: 66px !important;/);
+  assert.match(css, /\.app-store-badge \{\n {2}display: flex;\n {2}align-items: center;\n {2}min-height: 44px;\n\}/);
+  assert.match(css, /\.store-badges \{\n {2}display: flex;\n {2}align-items: center;\n {2}gap: 0\.75rem;\n\}/);
 });
 
 test('every page of before is still there, and the app\'s view keeps its short header', () => {
@@ -76,5 +101,5 @@ test('every page of before is still there, and the app\'s view keeps its short h
     assert.ok(existsSync(new URL(`app/${page}`, SRC)), page);
   }
   assert.deepEqual(IN_APP_NAV.map((l) => l.href), ['/explorer', '/privacy', '/terms', '/support']);
-  assert.match(HEADER, /const navLinks = inApp\s*\? IN_APP_NAV\.map\(\(link\) => \(\{ \.\.\.link, href: keepFromApp\(link\.href, fromApp\) \}\)\)\s*: MAIN_NAV;/);
+  assert.match(HEADER, /const navLinks = inApp \? IN_APP_NAV : MAIN_NAV;/);
 });

@@ -15,11 +15,20 @@ name: Build & Deploy QNet Production
 #      pulling a bad build at once is not a risk worth taking for convenience.
 #   3. Super nodes   — self-update via Watchtower (polls :latest, installed by install-super-node.sh)
 #   4. Light nodes   — mobile APK (separate release process)
+#
+# A push builds and publishes only :<sha>. :latest moves to a build only through the promote job below,
+# run after the genesis fleet runs that build and passed its gate (deploy-genesis.sh), so no auto-updating
+# node runs code the genesis fleet has not taken first.
 # ─────────────────────────────────────────────────────────────
 on:
   push:
     branches: [testnet]
   workflow_dispatch:
+    inputs:
+      promote_sha:
+        description: 'Point :latest at this already published :<sha> (after the genesis fleet passed its gate)'
+        required: false
+        default: ''
 
 env:
   # Public image — any node operator can docker pull without auth
@@ -32,6 +41,7 @@ jobs:
   # ───────────────────────────────────────────────────────────
   build:
     name: Build Docker image
+    if: github.event_name == 'push' || github.event.inputs.promote_sha == ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -50,7 +60,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (versioned + latest)
+      - name: Build and push (versioned only)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -59,10 +69,8 @@ jobs:
           # Stamped into the runtime image so every node reports the commit it runs on /healthz.
           build-args: |
             QNET_BUILD_ID=${{ github.sha }}
-          # :latest — for Watchtower auto-updates on all community nodes
-          # :sha    — pinned version for rollback
+          # :sha only — the genesis roll pins it; :latest moves later through the promote job
           tags: |
-            ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
           # GitHub Actions layer cache — second build takes ~2 min instead of 20
           cache-from: type=gha
@@ -94,9 +102,42 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Tag | Image |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| latest | \`${{ env.IMAGE }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| commit | \`${{ env.IMAGE }}:${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Genesis nodes** — NOT automatic. Roll them with \`scripts/deploy-genesis.sh\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Super nodes**   — auto-update via Watchtower (within 5 min)" >> $GITHUB_STEP_SUMMARY
-          echo "**Immediate genesis deploy** — run \`scripts/deploy-genesis.sh\` locally" >> $GITHUB_STEP_SUMMARY
+          echo "**:latest** — unchanged. It moves to this build only after the genesis fleet passed its gate (promote job)" >> $GITHUB_STEP_SUMMARY
+
+  # ───────────────────────────────────────────────────────────
+  # Promote: point :latest at an already published :<sha>, without a rebuild. Run by deploy-genesis.sh
+  # (gh workflow run deploy.yml -f promote_sha=<sha>) once every genesis node runs that build and passed
+  # its gate. Refuses a sha that was never published.
+  # ───────────────────────────────────────────────────────────
+  promote:
+    name: Promote :latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.promote_sha != ''
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Check the sha
+        env:
+          SHA: ${{ github.event.inputs.promote_sha }}
+        run: |
+          echo "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "promote_sha must be a full 40-hex commit"; exit 1; }
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point :latest at the published build
+        env:
+          SHA: ${{ github.event.inputs.promote_sha }}
+        run: |
+          docker buildx imagetools inspect "${{ env.IMAGE }}:$SHA" > /dev/null
+          docker buildx imagetools create -t "${{ env.IMAGE }}:latest" "${{ env.IMAGE }}:$SHA"
+          echo "## :latest → \`${{ env.IMAGE }}:$SHA\`" >> $GITHUB_STEP_SUMMARY

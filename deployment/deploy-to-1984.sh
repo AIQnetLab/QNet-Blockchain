@@ -139,7 +139,7 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: 3000,
       NEXT_TELEMETRY_DISABLED: 1,
-      // '1' lets the node cabinet send QNet Wallet its link and claim requests (src/server/phone-flows.ts).
+      // '1' lets the node cabinet send QNet Wallet its link, reserve, unlink and claim requests (src/server/phone-flows.ts).
       CABINET_PHONE_FLOWS: '0',
       // The https address of QNet Wallet's Android file that /wallet offers; empty offers none (src/server/wallet-apk.ts).
       WALLET_APK_URL: ''

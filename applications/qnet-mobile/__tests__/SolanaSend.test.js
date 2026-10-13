@@ -443,7 +443,7 @@ describe('the Send screen flow (runSolanaSend): review, fresh check, signature, 
     const out = await runSolanaSend(d);
     expect(d.reviewSend).toHaveBeenCalledWith({
       to: TO, network: 'Solana devnet', amount: '2 1DEV', fee: '0.000005 SOL', account: '0.00203928 SOL', memo: null,
-      total: '2 1DEV + 0.00204428 SOL', warnings: { firstTime: true, lookAlike: false },
+      total: ['2 1DEV', '+ 0.00204428 SOL'], warnings: { firstTime: true, lookAlike: false },
     });
     expect(d.confirmFresh).toHaveBeenCalledWith('Confirm sending 2 1DEV', null, TO);
     expect(d.reviewSend.mock.invocationCallOrder[0]).toBeLessThan(d.confirmFresh.mock.invocationCallOrder[0]);
@@ -528,10 +528,11 @@ describe('the Send screen itself, against the network in memory', () => {
     await act(async () => { byId(tree, 'solana-send-amount').props.onChangeText('2,5000001'); });
     expect(byId(tree, 'solana-send-amount').props.value).toBe('2.500000'); // six decimals at most, a comma read as a point
     expect(texts(tree)).toContain('0.000005 SOL');
-    expect(texts(tree)).toContain('2.5 1DEV + 0.000005 SOL');
+    // The total in two currencies, a line for each.
+    expect(texts(tree)).toContain('2.5 1DEV\n+ 0.000005 SOL');
     await act(async () => { await byId(tree, 'solana-send-button').props.onPress(); });
     expect(reviewSend).toHaveBeenCalledTimes(1);
-    expect(reviewSend.mock.calls[0][0]).toMatchObject({ to: TO, amount: '2.5 1DEV', account: '0.00203928 SOL', total: '2.5 1DEV + 0.00204428 SOL' });
+    expect(reviewSend.mock.calls[0][0]).toMatchObject({ to: TO, amount: '2.5 1DEV', account: '0.00203928 SOL', total: ['2.5 1DEV', '+ 0.00204428 SOL'] });
     expect(confirmFresh).toHaveBeenCalledWith('Confirm sending 2.5 1DEV', null, TO);
     expect(sign).toHaveBeenCalledTimes(1);
     expect(rpc.st.sent).toHaveLength(1);

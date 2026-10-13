@@ -1,12 +1,12 @@
-// The QNet app's view of the site (src/lib/activate-view.ts): its in-app browser, a page it opened with
-// ?from=app, and every page before the wallet is detected (the server's render included). The header, the
-// footer and each page reachable there (IN_APP_NAV and the explorer) are walked for links and for text
-// about activation or its cost; the pages about those subjects leave the app's view. Run: npm run test:wallet
+// The QNet app's view of the site (src/lib/activate-view.ts): its in-app browser, and every page before the
+// wallet is detected (the server's render included). The header, the footer and each page reachable there
+// (IN_APP_NAV and the explorer) are walked for links and for text about activation or its cost; the pages
+// about those subjects leave the app's view. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { IN_APP_EXCLUDED_PAGES, IN_APP_HOME, IN_APP_NAV, keepFromApp } from '../activate-view.ts';
+import { IN_APP_EXCLUDED_PAGES, IN_APP_HOME, IN_APP_NAV } from '../activate-view.ts';
 import { TEXTS } from '../texts.ts';
 
 const SRC = new URL('../../', import.meta.url);
@@ -49,11 +49,11 @@ const ACTIVATION_POINTERS = [
 // Links whose landing page describes activation and its cost: the repository's front page and its docs.
 const REPOSITORY_PAGES = /github\.com\/AIQnetLab\/QNet-Blockchain(\/(tree|blob)[^"'`\s]*)?["'`]/;
 
-test('the header in the app\'s view: the explorer and the policies, the marker kept, nothing else before detection', () => {
+test('the header in the app\'s view: the explorer and the policies, nothing else before detection', () => {
   const header = code('components/Header.tsx');
   assert.match(header, /const inApp = !useActivationContent\(\);/);
-  assert.match(header, /const navLinks = inApp\s*\? IN_APP_NAV\.map\(\(link\) => \(\{ \.\.\.link, href: keepFromApp\(link\.href, fromApp\) \}\)\)\s*: MAIN_NAV;/);
-  assert.match(header, /<Link href=\{inApp \? keepFromApp\(IN_APP_HOME, fromApp\) : '\/'\} className="qnet-logo">QNET<\/Link>/);
+  assert.match(header, /const navLinks = inApp \? IN_APP_NAV : MAIN_NAV;/);
+  assert.match(header, /<Link href=\{inApp \? IN_APP_HOME : '\/'\} className="qnet-logo">QNET<\/Link>/);
   assert.doesNotMatch(header, /isInAppBrowser/, 'the header uses the one rule, not the channel alone');
   // Every header link is a same-origin path (no second host of the site).
   for (const m of header.matchAll(/href: '([^']*)'/g)) assert.match(m[1], /^\/[a-z-]+(\/[a-z-]+)*$/, m[1]);
@@ -65,18 +65,17 @@ test('the header in the app\'s view: the explorer and the policies, the marker k
   for (const excluded of IN_APP_EXCLUDED_PAGES) assert.equal(IN_APP_PATHS.has(excluded), false, excluded);
 });
 
-// R3-XPD-02: the header's wallet control is shown in the app's view too. In a phone browser without a wallet
-// (a page the app opened with ?from=app) an install fallback would do a full navigation to /wallet without
-// the marker, and the next page would be the full site. There the control shows nothing instead. Outside that
-// view it has one way to connect, My node's; the install pointer lives on My node's connect screen.
+// R3-XPD-02: the header's wallet control is shown in the app's view too, where only the app's own provider
+// connects and no install target or page about the wallet is offered. Outside that view it has one way to
+// connect, My node's; the install pointer lives on My node's connect screen.
 test('the header wallet control offers no install target, and leads to My node only outside the app\'s view', () => {
   const button = code('components/wallet/connect-wallet-button.tsx');
   assert.match(button, /const fullView = useActivationContent\(\);/);
   assert.doesNotMatch(button, /installTarget|window\.open|location\.assign/);
-  // Every link to My node is inside the branch that runs outside the app's view; the app's view past it shows
-  // nothing without a wallet.
+  // Every link to My node is inside the branch that runs outside the app's view; past it the in-app browser's
+  // provider connects.
   const full = button.indexOf('if (fullView) {');
-  const rest = button.indexOf("if (providerStatus === 'missing') return null;");
+  const rest = button.indexOf('if (!accounts || !address) {');
   assert.ok(full > 0 && rest > full);
   const links = [...button.matchAll(/href=\{?[`'"]\/node/g)].map((m) => m.index);
   assert.equal(links.length, 2);
@@ -98,9 +97,8 @@ test('Privacy, Terms and Support in the app\'s view: no pointer to activation or
     const words = withTexts(view);
     for (const pattern of ACTIVATION_POINTERS) assert.doesNotMatch(words, pattern, `${file}: ${pattern}`);
     assert.doesNotMatch(view, REPOSITORY_PAGES, `${file}: repository page`);
-    // Same-site links carry the marker, and lead only to pages of the app's view.
-    assert.doesNotMatch(view, /href="\//, `${file}: a same-site link without the marker`);
-    for (const m of view.matchAll(/(?:keepFromApp|here)\('([^']+)'/g)) {
+    // Same-site links lead only to pages of the app's view.
+    for (const m of view.matchAll(/href=(?:"|\{[`'])(\/[^"`'#?]*)/g)) {
       assert.ok(IN_APP_PATHS.has(m[1]), `${file} links ${m[1]}`);
     }
   }
@@ -161,7 +159,7 @@ test('the explorer (the in-app browser\'s bookmark) links only within the explor
       const target = m[1] ?? m[2];
       assert.match(target, /^\/explorer(\/|$)/, `${url.pathname.split('/src/')[1]} links ${target}`);
     }
-    for (const m of src.matchAll(/router\.push\(keep\(`([^`]*)`/g)) assert.match(m[1], /^\/explorer\//);
+    for (const m of src.matchAll(/router\.push\(`([^`]*)`/g)) assert.match(m[1], /^\/explorer\//);
     assert.doesNotMatch(src, REPOSITORY_PAGES);
     for (const pattern of ACTIVATION_POINTERS) assert.doesNotMatch(src, pattern, `${url.pathname}: ${pattern}`);
   }
@@ -208,16 +206,15 @@ test('the explorer in the app\'s view names reward and activation types by what 
 });
 
 // SITE-R2-01: the indexer stores a registration's burn facts in tx_type_data, and the transaction page drew every key
-// of it, so a registration opened from the app (?from=app) or in its in-app browser showed 'Burn Tx', 'Burn Wallet'
-// and 'Burn Amount 1500'. In the app's view the data card shows only the neutral facts.
+// of it, so a registration opened in the app's in-app browser showed 'Burn Tx', 'Burn Wallet' and 'Burn Amount 1500'.
+// In the app's view the data card shows only the neutral facts.
 test('the transaction data card shows no burn fact in the app\'s view', async () => {
   const { txDataEntries } = await import('../tx-labels.ts');
   const { showsActivationContent } = await import('../activate-view.ts');
   const registration = { node_id: 'light_abc', node_type: 'Light', burn_tx: '5sig', burn_wallet: 'SoLwallet', burn_amount: 1500 };
   const views = [
-    ['opened with ?from=app', showsActivationContent('available', 'extension', true)],
-    ['the in-app browser', showsActivationContent('available', 'mobile', false)],
-    ['before detection', showsActivationContent('detecting', null, false)],
+    ['the in-app browser', showsActivationContent('available', 'mobile')],
+    ['before detection', showsActivationContent('detecting', null)],
   ];
   for (const [name, full] of views) {
     assert.equal(full, false, name);
@@ -230,7 +227,7 @@ test('the transaction data card shows no burn fact in the app\'s view', async ()
   // The bitmap and batch facts stay, and outside the app's view every key is still shown.
   assert.deepEqual(txDataEntries({ genesis_id: 'g1', epoch: 2, eligible_count: 9 }, false).length, 3);
   assert.deepEqual(txDataEntries({ batch_id: 'b', transfer_count: 4 }, false).length, 2);
-  assert.equal(txDataEntries(registration, showsActivationContent('available', 'extension', false)).length, 5);
+  assert.equal(txDataEntries(registration, showsActivationContent('available', 'extension')).length, 5);
   assert.deepEqual(txDataEntries(null, false), []);
   // The page draws the card from these entries only.
   const page = code('app/explorer/tx/[hash]/page.tsx');
@@ -238,33 +235,13 @@ test('the transaction data card shows no burn fact in the app\'s view', async ()
   assert.equal(page.match(/Object\.entries\(tx\.tx_type_data\)/g), null);
 });
 
-// R5-XPD-06: explorer pages the store builds open (/explorer/tx/<hash>?from=app) linked every address, block,
-// token and transaction without the marker, so after one tap a reload or a new tab showed the full site. Every
-// link, push and navigation between explorer pages now keeps it.
-test('every link and navigation of the explorer keeps the app\'s marker', () => {
-  let links = 0;
-  for (const url of files(new URL('app/explorer/', SRC))) {
+// Owner, 11.10: the site hides activation only in the app's in-app browser. A page the app opens in the system
+// browser (its links still carry ?from=app) is an ordinary visit: no source of the site reads that query.
+test('a page\'s query never puts the site in the app\'s view', () => {
+  for (const url of files(SRC)) {
     const name = url.pathname.split('/src/')[1];
-    const src = readFileSync(url, 'utf8').replace(/\r\n/g, '\n');
-    // No plain Next.js link, anchor or router call that could drop it.
-    assert.doesNotMatch(src, /from 'next\/link'|<Link[\s>]|<a\s/, name);
-    for (const m of src.matchAll(/router\.(push|replace)\(([^)]*)/g)) assert.match(m[2], /^keep\(/, `${name}: ${m[0]}`);
-    for (const m of src.matchAll(/window\.location(?:\.href)?\s*=\s*([^;]+);/g)) assert.match(m[1], /^keep\(/, `${name}: ${m[0]}`);
-    assert.doesNotMatch(src, /window\.location\.(assign|replace)\(/, name);
-    if (/<ExplorerLink[\s>]/.test(src)) assert.match(src, /^import ExplorerLink from '@\/components\/ExplorerLink';$/m, name);
-    if (/\bkeep\(/.test(src)) assert.match(src, /const keep = useKeepFromApp\(\);/, name);
-    // Every href is on an ExplorerLink.
-    for (const m of src.matchAll(/<(\w+)\s[^>]*?\bhref=/g)) assert.equal(m[1], 'ExplorerLink', `${name}: <${m[1]} href=`);
-    links += (src.match(/<ExplorerLink[\s>]/g) ?? []).length;
+    assert.doesNotMatch(readFileSync(url, 'utf8'), /from=app|[fF]romApp|FROM_APP|ExplorerLink/, name);
   }
-  assert.ok(links >= 37, `${links} explorer links`);
-  // ExplorerLink puts the marker on through the one rule (keepFromApp), with the visit's flag.
-  const component = code('components/ExplorerLink.tsx');
-  assert.match(component, /const keep = useKeepFromApp\(\);\s*return <Link href=\{keep\(href\)\} \{\.\.\.rest\} \/>;/);
-  const context = code('contexts/AppContext.tsx');
-  assert.match(context, /export function useKeepFromApp\(\): \(href: string\) => string \{\s*const \{ fromApp \} = useWallet\(\);\s*return useCallback\(\(href: string\) => keepFromApp\(href, fromApp\), \[fromApp\]\);/);
-  assert.equal(keepFromApp('/explorer/address/abc', true), '/explorer/address/abc?from=app');
-  assert.equal(keepFromApp('/explorer/address/abc', false), '/explorer/address/abc');
 });
 
 test('the pages about activation, the node cabinet, the faucet, the DAO, the extension and the docs leave the app\'s view', () => {
@@ -288,8 +265,8 @@ test('the pages about activation, the node cabinet, the faucet, the DAO, the ext
   assert.equal(IN_APP_NAV.some((l) => l.href.startsWith('/node')), false);
   assert.match(code('components/Header.tsx'), /\{ href: '\/node', label: 'My node' \}/);
   const guard = code('components/InAppGuard.tsx');
-  assert.match(guard, /const inApp = fromApp \|\| isInAppBrowser\(providerChannel\);/);
-  assert.match(guard, /if \(inApp\) router\.replace\(keepFromApp\(IN_APP_HOME, fromApp\)\);/);
+  assert.match(guard, /const inApp = isInAppBrowser\(providerChannel\);/);
+  assert.match(guard, /if \(inApp\) router\.replace\(IN_APP_HOME\);/);
   assert.match(guard, /if \(inApp\) return null;/);
 });
 

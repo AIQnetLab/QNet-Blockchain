@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Who may earn the super share of a finalized epoch: the one membership decision for super rewards, built by
+/// `BlockchainNode::super_reward_admission`. Asked by the settle writer of super_elig_{N} and the status routes,
+/// never by the claim path. Earned membership adds its arm here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SuperRewardAdmission {
+    /// No membership rule governs the epoch: every qualifying super earns (the rule below the gate).
+    Open,
+    /// The emergency allowlist, asked at the epoch's first block.
+    Allowlist { at: u64 },
+}
+
+impl SuperRewardAdmission {
+    pub(crate) fn admits(&self, node_id: &str) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Allowlist { at } => !crate::genesis_constants::allowlist_excludes(node_id, *at),
+        }
+    }
+}
+
 impl BlockchainNode {
     /// Create NodeRegistration transaction for on-chain binding
     /// This TX is included in blocks and visible to all nodes
@@ -203,6 +223,43 @@ impl BlockchainNode {
 
         println!("[INFO][REACTIVATION] signed dilithium3={} node={}",
             tx.dilithium_signature.is_some(), node_id);
+    }
+
+    /// Build, sign with this node's consensus key, admit and broadcast a NodeReactivation for this node:
+    /// the one path the operator route and the automatic endpoint commit (node/public_rpc.rs) share, so
+    /// both produce the same transaction. Ok(tx hash); Err(the reason, as the route answers it).
+    pub(crate) async fn submit_self_reactivation(
+        &self,
+        node_id: &str,
+        current_height: u64,
+        last_macroblock_hash: &str,
+        last_macroblock_index: u64,
+        api_endpoint: &str,
+    ) -> Result<String, String> {
+        // The block-validity check's own validator, so a bad address is refused here instead of being
+        // signed, gossiped and rejected network-wide.
+        qnet_state::transaction::validate_public_api_endpoint(api_endpoint)?;
+        let mut react_tx = Self::create_node_reactivation_tx(
+            node_id, current_height, last_macroblock_hash, last_macroblock_index, api_endpoint);
+        // Pure ML-DSA-65: the node's registered post-quantum identity key.
+        let wallet_identity = self.get_wallet_identity();
+        Self::sign_reactivation_tx(&mut react_tx, node_id, wallet_identity.as_deref());
+        let tx_hash = react_tx.hash.clone();
+        let tx_bytes = bincode::serialize(&react_tx).unwrap_or_default();
+        let state = self.get_state_manager();
+        super::refuse_held_commitment(&state, &react_tx).await?;
+        if !self.get_mempool().add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), react_tx.gas_price) {
+            return Err("Failed to add TX to mempool (duplicate or mempool full)".to_string());
+        }
+        if is_info() {
+            println!("[INFO][NODE-REACTIVATION] tx_added node={} h={} mb={} hash={}",
+                     node_id, current_height, last_macroblock_index, qnet_state::char_prefix(&tx_hash, 16));
+        }
+        // Broadcast to all peers for fast inclusion.
+        if let Some(p2p) = self.get_unified_p2p() {
+            let _ = p2p.broadcast_transaction(tx_bytes);
+        }
+        Ok(tx_hash)
     }
 
     /// v12.0: Get consensus hash of macroblock from storage.
@@ -988,9 +1045,36 @@ impl BlockchainNode {
             .map(|e| (finalized_epoch, e))
     }
 
-    /// The popcount>=9 super set for a FINALIZED epoch, read from committed account tallies. Valid at
-    /// any height inside epoch `finalized_epoch + 1`: the account keeps the finalized epoch's count
-    /// until the next roll, which is what lets a snapshot-joined node reproduce the row it never saw.
+    /// The admitted set governing the super share of `finalized_epoch`. Both gates are read at the epoch's first
+    /// block, never at the height asking, so the producer, replicas and a snapshot joiner deriving anywhere inside
+    /// the next epoch get one answer.
+    /// Total on purpose: there is no abstain here. A node with no answer would file no super_elig_{N} rows, and
+    /// gather_epoch_reward_sets reads an empty index on a from-genesis node as "no super cleared the bar", a root
+    /// every peer rejects. So an arm may use only what every node holds at the settle point: a compiled list keyed
+    /// on height, or committed rows bounded by it. Earned membership adds its arm here; if its read can fail, it
+    /// first needs an explicit "cannot reproduce" marker that the settle writer files and gather abstains on.
+    pub(crate) fn super_reward_admission(_storage: &crate::storage::Storage, finalized_epoch: u64) -> SuperRewardAdmission {
+        let epoch_start = finalized_epoch.saturating_mul(14_400);
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::SUPER_REWARD_ADMISSION, epoch_start) {
+            return SuperRewardAdmission::Open;
+        }
+        SuperRewardAdmission::Allowlist { at: epoch_start }
+    }
+
+    /// A super's reward admission for `epoch`, as the status routes report it: "not_required" when no membership
+    /// rule governs the epoch, else "admitted" or "waiting". Display only.
+    pub(crate) fn super_admission_label(storage: &crate::storage::Storage, node_id: &str, epoch: u64) -> &'static str {
+        match Self::super_reward_admission(storage, epoch) {
+            SuperRewardAdmission::Open => "not_required",
+            a if a.admits(node_id) => "admitted",
+            _ => "waiting",
+        }
+    }
+
+    /// The popcount>=9 super set for a FINALIZED epoch, read from committed account tallies, within the
+    /// epoch's admitted set (super_reward_admission). Valid at any height inside epoch `finalized_epoch + 1`:
+    /// the account keeps the finalized epoch's count until the next roll, which is what lets a snapshot-joined
+    /// node reproduce the row it never saw.
     pub(crate) fn compute_super_eligible_for_epoch(
         state_guard: &StateManager,
         storage: &crate::storage::Storage,
@@ -1000,13 +1084,18 @@ impl BlockchainNode {
         // which are committed in reward_root, so it must not include a registration applied after the
         // epoch it is settling. Registrations land at most at the settle height of epoch+1.
         let settle_end = (finalized_epoch + 1) * 14_400 + HB_ANCHOR_MAX_LAG;
+        // The only place reward membership is decided: every reader takes the rows filed here.
+        let admission = Self::super_reward_admission(storage, finalized_epoch);
         let supers = match storage.super_registrations_as_of(settle_end) { Ok(s) => s, Err(_) => return None };
         let mut eligible: Vec<String> = Vec::new();
+        let mut not_admitted = 0usize;
         // Resident supers: read the committed tally from RAM (authoritative). Evicted (inactive) ones:
         // collect for ONE batched disk read below — avoids N sequential cold reads stalling the
         // boundary block at scale. That read is the raw mirror: the leaf gate of warm_* does not cover it.
         let mut evicted: Vec<String> = Vec::new();
         for (node_id, _wallet) in &supers {
+            // Outside the admitted set: no share, and no account read.
+            if !admission.admits(node_id) { not_admitted += 1; continue; }
             match state_guard.accounts.get(node_id) {
                 Some(acct) => {
                     // A banned identity earns nothing. The ban is read from ACCOUNT state — which the
@@ -1030,6 +1119,9 @@ impl BlockchainNode {
                     }
                 }
             }
+        }
+        if not_admitted > 0 && is_info() {
+            println!("[INFO][REWARDS] super_elig_not_admitted epoch={} count={}", finalized_epoch, not_admitted);
         }
         Some(eligible)
     }
@@ -1154,8 +1246,13 @@ impl BlockchainNode {
         // one it cannot serve, so the oldest gap is the one truncating the total. Repairing the newest
         // first would leave the figure unchanged for as many passes as there are gaps.
         let epochs = storage.reward_epochs_from(0).unwrap_or_default();
+        // Below the retention floor every node prunes the shard cache, so no peer serves the leaf set there: such an
+        // epoch is served from the recipient index and a rebuild on the signed claim path, never pulled. Listing it
+        // would also pin the head of this ascending list on epochs no pass can repair.
+        let floor = epochs.last().map_or(0, |n| Self::reward_shard_retention_floor(*n));
         let mut out = Vec::new();
         for &epoch in epochs.iter() {
+            if epoch < floor { continue; }
             let root = match storage.load_epoch_root(epoch) {
                 Ok(Some(r)) if r != [0u8; 32] => hex::encode(r),
                 _ => continue, // absent, or an epoch that certifiably distributed nothing
@@ -1236,6 +1333,9 @@ impl BlockchainNode {
                     continue;
                 }
                 Self::save_epoch_reward_sharded(storage, epoch, &set);
+                if let Some(raw) = hex::decode(&committed_root).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+                    Self::index_epoch_recipients(storage, epoch, &raw, &set);
+                }
                 healed += 1;
                 println!("[INFO][REWARDS] epoch_repaired_from_peer epoch={} peer={} recipients={}",
                          epoch, ip, set.len());
@@ -1432,6 +1532,35 @@ impl BlockchainNode {
         Self::chain_bind(&format!("qnet_claim_v1:{}:{}:{}", to, timestamp, hex::encode(h.finalize())))
     }
 
+    /// The epochs a merkle claim's payload names, in payload order; None when it names none or is unreadable.
+    pub(crate) fn claim_payload_epochs(tx: &qnet_state::Transaction) -> Option<Vec<u64>> {
+        let parsed = serde_json::from_str::<serde_json::Value>(tx.data.as_deref()?).ok()?;
+        let epochs: Vec<u64> = parsed.get("claims")?.as_array()?.iter()
+            .filter_map(|e| e.get("epoch").and_then(|v| v.as_u64())).collect();
+        (!epochs.is_empty()).then_some(epochs)
+    }
+
+    /// A claim that cannot credit what it was quoted for: it names an epoch at or below the wallet's watermark, so
+    /// it was quoted before an earlier claim landed (or is one already applied), and applied it credits only what
+    /// that claim left, often nothing. Node policy for the doors and the producer; apply still credits every epoch
+    /// above the watermark, so a block carrying one stays valid.
+    pub(crate) fn claim_is_stale(tx: &qnet_state::Transaction, last_claimed: u64) -> bool {
+        Self::claim_payload_epochs(tx).map_or(true, |e| e.iter().any(|ep| *ep <= last_claimed))
+    }
+
+    /// One merkle claim per wallet in a block, the first in block order kept: every claim a wallet signs starts at
+    /// its watermark, so a second beside the first credits only what the first leaves. Returns the kept TXs and
+    /// the number dropped.
+    pub(crate) fn keep_first_claim_per_wallet(txs: Vec<qnet_state::Transaction>) -> (Vec<qnet_state::Transaction>, usize) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let before = txs.len();
+        let kept: Vec<qnet_state::Transaction> = txs.into_iter().filter(|tx| {
+            !tx.is_merkle_reward_claim() || tx.to.as_ref().map_or(true, |w| seen.insert(w.clone()))
+        }).collect();
+        let dropped = before - kept.len();
+        (kept, dropped)
+    }
+
     /// Credits proof-verified reward claims. Shared by apply_block_to_state and the producer's
     /// inline apply so both reach the same state.
     ///
@@ -1455,6 +1584,7 @@ impl BlockchainNode {
                 if is_warn() {
                     println!("[WARN][REWARDS] claim_refused h={} reason={} action=skip_tx", height, e);
                 }
+                let _ = storage.save_claim_outcome(&tx.hash, height, 0, 0);
                 continue;
             }
             let to = match &tx.to { Some(w) => w, None => continue };
@@ -1464,6 +1594,7 @@ impl BlockchainNode {
                     println!("[WARN][REWARDS] claim_unauthorized wallet={} action=skip_tx",
                              qnet_state::char_prefix(to, 16));
                 }
+                let _ = storage.save_claim_outcome(&tx.hash, height, 0, 0);
                 continue;
             }
             let parsed = match serde_json::from_str::<serde_json::Value>(data) { Ok(p) => p, Err(_) => continue };
@@ -1487,6 +1618,9 @@ impl BlockchainNode {
                     &[to.clone(), StateManager::REWARDS_POOL.to_string()]);
             }
 
+            // What this claim credited, kept for the history routes: a claim that credits nothing is still in
+            // its block, and must not read as a confirmed credit of its amount. Node-local, never hashed.
+            let (mut credited, mut credited_epochs) = (0u64, 0u32);
             for (epoch, amount, proof) in &claims {
                 match crate::reward_epoch::root_for_apply(storage, *epoch, height) {
                     crate::reward_epoch::ApplyRoot::Root(root) => {
@@ -1506,9 +1640,13 @@ impl BlockchainNode {
                             }
                             break;
                         }
-                        if state_guard.claim_reward(to, *epoch, *amount) && is_info() {
-                            println!("[INFO][REWARDS] claim_credited wallet={} epoch={} amount={}",
-                                     qnet_state::char_prefix(to, 16), epoch, amount);
+                        if state_guard.claim_reward(to, *epoch, *amount) {
+                            credited = credited.saturating_add(*amount);
+                            credited_epochs += 1;
+                            if is_info() {
+                                println!("[INFO][REWARDS] claim_credited wallet={} epoch={} amount={}",
+                                         qnet_state::char_prefix(to, 16), epoch, amount);
+                            }
                         }
                     }
                     // Rule says no: identical verdict on every node, so skipping is safe.
@@ -1521,6 +1659,13 @@ impl BlockchainNode {
                         return Err(certifying_mb);
                     }
                 }
+            }
+            if credited_epochs == 0 && is_warn() {
+                println!("[WARN][REWARDS] claim_no_effect wallet={} hash={} h={}",
+                         qnet_state::char_prefix(to, 16), qnet_state::char_prefix(&tx.hash, 16), height);
+            }
+            if let Err(e) = storage.save_claim_outcome(&tx.hash, height, credited, credited_epochs) {
+                if is_warn() { println!("[WARN][REWARDS] claim_outcome_write_failed hash={} err={}", qnet_state::char_prefix(&tx.hash, 16), e); }
             }
         }
         Ok(())
@@ -1544,13 +1689,12 @@ impl BlockchainNode {
             _ => return false,
         };
         // Cheapest gates first, so junk cannot buy an ML-DSA-65 verify or a merkle walk. Bound the
-        // entry count, then require the batch to still be worth applying: without the watermark check a
-        // credited payload stays admissible forever and can be re-flooded as a free no-op.
+        // entry count, then require every epoch above the watermark (claim_is_stale): a credited payload
+        // would otherwise stay admissible forever and could be re-flooded as a free no-op, and one quoted
+        // before an earlier claim landed would apply as a partial or empty credit shown as confirmed.
         const MAX_CLAIM_ENTRIES: usize = 512;
         if entries.len() > MAX_CLAIM_ENTRIES { return false; }
-        if !entries.iter().any(|e| e.get("epoch").and_then(|v| v.as_u64()).map_or(false, |ep| ep > last_claimed)) {
-            return false;
-        }
+        if Self::claim_is_stale(tx, last_claimed) { return false; }
         if !Self::claim_authorized(tx, to, data) { return false; }
         for e in &entries {
             let (epoch, amount) = match (e.get("epoch").and_then(|v| v.as_u64()), e.get("amount").and_then(|v| v.as_u64())) {
@@ -1604,8 +1748,9 @@ impl BlockchainNode {
                 crate::reward_epoch::ApplyRoot::Root(r) if r != [0u8; 32] => hex::encode(r),
                 _ => continue, // distributed nothing, or undecidable here: not this node's call
             };
+            // The recipient index answers for an epoch whose shards were pruned.
             if let crate::node::ShardClaim::Proof(amount, _) =
-                Self::reward_proof_from_shard(storage, epoch, &root_hex, to, false) {
+                Self::reward_claim_at(storage, epoch, &root_hex, to, false) {
                 if amount > 0 {
                     println!("[WARN][REWARDS] claim_skips_paid_epoch wallet={}.. skipped={} batch_ends={} action=refuse",
                              qnet_state::char_prefix(to, 16), epoch, last);

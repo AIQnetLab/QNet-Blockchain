@@ -9,7 +9,9 @@ import { sha3_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex, hexToBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 import * as sdk from '../dist/index.js';
 import * as node from '../dist/node.js';
-import { fixture, mockNode, runCli, STRONG_PASSWORD, template, tempHome, testLineage, V, vector, wasmModule, T } from './helpers.mjs';
+import {
+  fixture, mockNode, recordedAbovePin, runCli, STRONG_PASSWORD, template, tempHome, testLineage, V, vector, wasmModule, T,
+} from './helpers.mjs';
 
 const GOLDEN = V.wallet.address;
 const RECORDED = '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d';
@@ -670,10 +672,12 @@ describe('qnet against a mock node', () => {
     });
 
   it('reads a balance, a transaction and a token', async () => {
+    const { proof, tip } = await recordedAbovePin();
+    const P = proof.block_height;
     const mock = await serve((r) => {
       if (r.path === `/api/v1/account/${RECORDED}`) return { json: fixture('account.json') };
-      if (r.path === `/api/v1/account/${RECORDED}/balance/proof`) return { json: fixture('balproof.json') };
-      if (r.path === '/api/v1/height') return { json: fixture('height.json') };
+      if (r.path === `/api/v1/account/${RECORDED}/balance/proof`) return { json: proof };
+      if (r.path === '/api/v1/height') return { json: tip };
       if (r.path.startsWith('/api/v1/transaction/')) return { json: fixture('tx.json') };
       if (r.path === `/api/v1/token/${TOKEN}`) {
         return { json: { success: true, source: 'blockchain_state', token: { contract_address: TOKEN, standard: 'qrc20', name: 'Gold', symbol: 'GLD',
@@ -688,15 +692,16 @@ describe('qnet against a mock node', () => {
     assert.match(bal.stdout, /Nonce:\s+2/);
     const verified = await runCli(['balance', RECORDED, '--verified', '--node', mock.url, '--home', home]);
     assert.equal(verified.code, 1);
-    assert.match(verified.stdout, /Not verified: the proof is consistent, but its checkpoint could not be checked now \(height 2210909, 0 blocks below the chain's tip \(2210863\)\)/);
+    assert.ok(verified.stdout.includes(`Not verified: the proof is consistent, but its checkpoint could not be checked now (height ${P}, 0 blocks below the chain's tip (${tip.height}))`), said(verified));
     // DEVP-R1-02: a check that could not go on says what to do next.
+    assert.ok(mock.requests.some((r) => /^\/api\/v1\/macroblock\/\d+\/proof$/.test(r.path)));
     assert.match(verified.stderr, /no checkpoint could be checked this time .* Run the command again in a few minutes\./);
     // DEV-R2-07: a proof far below the tip another node reports is not taken, and the lag is printed.
     const ahead = await serve((r) => (r.path === '/api/v1/height'
-      ? { json: { blocks_behind: 0, height: 2211909, is_syncing: false, network_height: 2211909 } } : undefined));
+      ? { json: { blocks_behind: 0, height: P + 1000, is_syncing: false, network_height: P + 1000 } } : undefined));
     const stale = await runCli(['balance', RECORDED, '--verified', '--node', mock.url, '--node', ahead.url, '--home', home]);
     assert.equal(stale.code, 1);
-    assert.match(stale.stdout, /Not verified: the proof is of height 2210909, 1000 blocks below the chain's tip \(2211909\); it may show a balance since spent\./);
+    assert.ok(stale.stdout.includes(`Not verified: the proof is of height ${P}, 1000 blocks below the chain's tip (${P + 1000}); it may show a balance since spent.`), said(stale));
     const tx = await runCli(['tx', 'f7d6c1ea3936b29b399cdfcc3eaae2b68d78c54127ea775db430ece2f5ee2bea', '--node', mock.url]);
     assert.equal(tx.code, 0, tx.stderr);
     assert.match(tx.stdout, /Status:\s+in block 2208291 \(FullyFinalized\)/);

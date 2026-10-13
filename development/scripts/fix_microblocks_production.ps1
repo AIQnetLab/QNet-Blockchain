@@ -7,7 +7,7 @@ param(
     [switch]$CleanStart = $false
 )
 
-Write-Host "=== QNet Microblock Diagnostic and Fix Tool ===" -ForegroundColor Cyan
+Write-Host "=== QNet Blockchain Microblock Diagnostic and Fix Tool ===" -ForegroundColor Cyan
 Write-Host "Identifying and fixing microblock activation issues" -ForegroundColor Yellow
 
 # Kill all existing processes
@@ -21,7 +21,7 @@ $binaryPath = ".\target\debug\qnet-node.exe"
 $needsRecompile = $ForceRecompile -or (-not (Test-Path $binaryPath))
 
 if ($needsRecompile) {
-    Write-Host "Recompiling QNet with microblock fixes..." -ForegroundColor Yellow
+    Write-Host "Recompiling QNet Blockchain with microblock fixes..." -ForegroundColor Yellow
     cargo build --workspace 2>&1 | Out-Null
     if (-not (Test-Path $binaryPath)) {
         Write-Host "ERROR: Compilation failed!" -ForegroundColor Red

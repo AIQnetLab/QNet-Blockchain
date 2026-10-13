@@ -67,7 +67,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="hero-content">
           <div className="hero-text">
             <h1 className="hero-title">
-              <span className="title-main">Quantum Network</span>
+              <span className="title-main">QNet Blockchain</span>
               <span className="subtitle">An experimental blockchain designed by one person and built with AI assistance</span>
             </h1>
 
@@ -81,7 +81,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             
             <div className="action-buttons">
               <Link href="/wallet" className="qnet-button large secondary">Get Mobile App</Link>
-              <Link href="/explorer" className="qnet-button secondary large">Explore Network</Link>
+              <Link href="/explorer" className="qnet-button secondary large">Open Explorer</Link>
             </div>
           </div>
           
@@ -305,7 +305,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="technology-grid expanded">
           <div className="tech-item">
             <h4 className="tech-title">Presence, Not Proof-of-Work</h4>
-            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Between requests the app only sends one signed attestation per epoch. No hashing and no proof-of-work: each answer is one signature, so the phone does no sustained work.</p>
+            <p>A light node answers a signed status request from QNet Blockchain a few times per four-hour epoch. Between requests the app only sends one signed attestation per epoch. No hashing and no proof-of-work: each answer is one signature, so the phone does no sustained work.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">One App on Every Phone and Tablet</h4>
@@ -317,7 +317,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
           </div>
           <div className="tech-item">
             <h4 className="tech-title">How Emission Is Split</h4>
-            <p>For each epoch the chain records which nodes were online. The protocol adds a share of that epoch&apos;s emission to their node balance — three quarters among light nodes, one quarter among super nodes — and the wallet moves it into itself with an ordinary transaction.</p>
+            <p>For each epoch QNet Blockchain records which nodes were online. The protocol adds a share of that epoch&apos;s emission to their node balance — three quarters among light nodes, one quarter among super nodes — and the wallet moves it into itself with an ordinary transaction.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">11 Languages Supported</h4>
@@ -369,7 +369,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Phase 1 on Solana</h4>
-            <p>Activation burns 1DEV, an SPL token, on Solana; QNet nodes verify the burn transaction themselves. No bridge and no wrapped assets — Phase 2 moves activation to native QNC.</p>
+            <p>Activation burns 1DEV, an SPL token, on Solana; the nodes of QNet Blockchain verify the burn transaction themselves. No bridge and no wrapped assets — Phase 2 moves activation to native QNC.</p>
           </div>
         </div>
       </section>

@@ -25,18 +25,28 @@ const placeholders = (text) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1])
 const sources = (dir) => readdirSync(new URL(dir, SRC), { recursive: true })
   .map((n) => `${dir}${n.replace(/\\/g, '/')}`)
   .filter((n) => /\.(tsx?|css)$/.test(n) && !n.includes('__tests__') && !n.includes('__release__'));
+// The forms that name the system other than "QNet Blockchain" (owner, 12.10). An article stays only before the noun
+// the name qualifies ("the QNet Blockchain protocol").
+const OTHER_NAMES = [
+  /QNet('s)?\s+(test\s+)?network|QNet\s+chain\b|Quantum\s+(Blockchain|Network)|\bthe\s+QNet\s+Blockchain\b(?!\s+(protocol|testnet|Explorer|DAO|nodes?|transactions?|history)\b)/i,
+  /QNet\s+blockchain/,
+];
+const otherName = (text) => OTHER_NAMES.find((re) => re.test(text));
+// "QNet" alone, where it would stand for the system: allowed only in the product and brand names.
+const BARE_QNET = /\bQNet\b(?![-_])(?!\s+(Wallet|Blockchain|Link)\b)/;
 
 test('placeholders are filled by name, numbers are English, a sentence splits around its links', () => {
   assert.equal(format('Node balance: {amount} QNC', { amount: '1.5' }), 'Node balance: 1.5 QNC');
   assert.equal(format('{a} of {b}', { a: 1 }), '1 of {b}');
   assert.equal(format('{constructor}', {}), '{constructor}');
   assert.equal(t('balance', { amount: '12.5' }), 'Node balance: 12.5 QNC');
-  assert.equal(t('counted', { counted: 3, total: 64 }), 'Counted epochs: 3 of the last 64');
+  assert.equal(t('history_span', { start: 'Oct 10, 08:13', end: '12:13' }), 'Oct 10, 08:13 – 12:13');
+  assert.deepEqual(placeholders(TEXTS.history_span), ['end', 'start']);
   // A key looked up by code that has no text shows as the key itself.
   assert.equal(t('link_error_NOPE'), 'link_error_NOPE');
   assert.equal(number(1234567), '1,234,567');
   assert.equal(number(18446744073709551615n), '18,446,744,073,709,551,615');
-  assert.equal(pageTitle('activate_title', 'cabinet_title'), `${TEXTS.activate_title} - My node - QNet`);
+  assert.equal(pageTitle('activate_title', 'cabinet_title'), `${TEXTS.activate_title} - My node - QNet Blockchain`);
   assert.deepEqual(templateParts('Install it (see {walletPage}), then {nodePage}.'), ['Install it (see ', { name: 'walletPage' }, '), then ', { name: 'nodePage' }, '.']);
   assert.deepEqual(templateParts('{a}'), [{ name: 'a' }]);
 });
@@ -55,13 +65,15 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   const label = (s) => s.replace(/\s*:$/, '');
   const same = (site, appText, key) => assert.equal(norm(site), norm(appText), key);
   same(TEXTS.no_node, APP.node_none, 'no_node');
-  same(TEXTS.no_device, APP.node_no_device, 'no_device');
+  // The node on no device: the site's own sentence; QNet Wallet shows a light node only on the device it is linked to and
+  // has none for it (owner, 11.10).
+  assert.equal(APP.node_no_device, undefined, 'no_device');
   same(TEXTS.badge_online, APP.node_status_online, 'badge_online');
   same(TEXTS.badge_offline, APP.node_status_offline, 'badge_offline');
   same(TEXTS.action_move, APP.node_move, 'action_move');
   if (APP.node_move_min !== undefined) same(TEXTS.balance_min, APP.node_move_min, 'balance_min');
   same(TEXTS.ui_app_node_tab, APP.tab_node, 'ui_app_node_tab');
-  same(TEXTS.claim_title, label(APP.node_balance), 'claim_title');
+  same(TEXTS.balance_title, label(APP.node_balance), 'balance_title');
   same(TEXTS.ext_type_light, APP.node_title_light, 'ext_type_light');
   same(TEXTS.ext_type_super, APP.node_title_super, 'ext_type_super');
   same(TEXTS.wallet_enter_label, APP.link_qnet_address, 'wallet_enter_label');
@@ -76,35 +88,64 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   for (const [key, value] of [['answered_yes', APP.node_answered_yes_untimed], ['answered_no', APP.node_answered_no]]) {
     assert.ok(norm(TEXTS[key]).startsWith(norm(APP.node_answered)) && norm(TEXTS[key]).endsWith(norm(value)), key);
   }
-  // The app's label and count. A genesis counts over the epochs it indexed, the last 64 at most, so neither the app
-  // nor the page says "since registration".
-  same(TEXTS.counted, `${APP.node_counted} ${APP.node_counted_last.replace('{n}', '{counted}').replace('{m}', '{total}')}`, 'counted');
-  assert.doesNotMatch(TEXTS.counted, /since registration/);
+  // Owner, 11.10: no count over a window of recent epochs; History lists the epochs themselves
+  // (cabinet-layout.test.mjs).
+  for (const key of ['counted', 'super_epochs']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);
+  for (const [key, text] of Object.entries(TEXTS)) assert.doesNotMatch(text, /of the last|settled lately/i, key);
   // Unified plan section 3.1: the English of the words the app and the cabinet share.
   assert.equal(TEXTS.no_node, 'This wallet has no node.');
   assert.equal(TEXTS.no_device, 'The node does not run on any device now.');
   assert.equal(TEXTS.badge_online, 'Online');
   assert.equal(TEXTS.badge_offline, 'Offline');
   assert.equal(TEXTS.answered_no, 'Answered this epoch: Not yet');
-  assert.equal(TEXTS.counted, 'Counted epochs: {counted} of the last {total}');
-  assert.deepEqual(placeholders(TEXTS.counted), ['counted', 'total']);
   assert.equal(TEXTS.balance, 'Node balance: {amount} QNC');
   assert.equal(TEXTS.action_move, 'Move to wallet');
   assert.equal(TEXTS.balance_min, 'The node balance can be moved to the wallet once it reaches 1 QNC.');
   assert.equal(TEXTS.action_link_device, 'Link a device');
-  assert.equal(TEXTS.unreachable, 'The QNet network could not be reached.');
-  assert.equal(TEXTS.eligibility, 'A light node runs on one phone or tablet at a time, in QNet Wallet; a super node runs on a server with the QNet node software.');
+  assert.equal(TEXTS.unreachable, 'QNet Blockchain could not be reached.');
+  // The system is named "QNet Blockchain" and in no other way (owner, 12.10), the ui_ labels quoted from the app and the
+  // extension included.
+  for (const [key, text] of Object.entries(TEXTS)) {
+    assert.equal(otherName(text), undefined, key);
+    assert.doesNotMatch(text, BARE_QNET, key);
+    // A status line opens with QNet Blockchain, never with "The network".
+    assert.doesNotMatch(text, /(^|[.:!?] )The network\b/, key);
+  }
+  assert.equal(TEXTS.eligibility, 'A light node runs on one phone or tablet at a time, in QNet Wallet; a super node runs on a server with the QNet Blockchain node software.');
+});
+
+test('every page, its metadata and the manifest name the system QNet Blockchain', () => {
+  const files = [...sources('app/'), ...sources('components/')].filter((n) => /\.tsx?$/.test(n));
+  assert.ok(files.length > 50);
+  for (const file of files) {
+    const src = code(file);
+    assert.equal(otherName(src), undefined, file);
+    assert.doesNotMatch(src, BARE_QNET, file);
+  }
+  const layout = code('app/layout.tsx');
+  assert.equal([...layout.matchAll(/title: 'QNet Blockchain',/g)].length, 3);
+  assert.match(layout, /siteName: 'QNet Blockchain',/);
+  for (const file of ['app/explorer/ExplorerClient.tsx', 'app/explorer/loading.tsx']) assert.match(code(file), /<h1>QNet Blockchain Explorer<\/h1>/, file);
+  assert.match(code('app/HomeClient.tsx'), /<span className="title-main">QNet Blockchain<\/span>/);
+  const manifest = JSON.parse(readFileSync(new URL('../public/manifest.json', SRC), 'utf8'));
+  assert.equal(manifest.name, 'QNet Blockchain Explorer');
+  assert.equal(manifest.short_name, 'QNet Blockchain');
+  for (const value of [manifest.name, manifest.short_name, manifest.description]) {
+    assert.equal(otherName(value), undefined, value);
+    assert.doesNotMatch(value, BARE_QNET, value);
+  }
 });
 
 test('the extension\'s buttons, tabs and fields are named as the extension names them', () => {
   const has = (text, part, what) => assert.ok(norm(text).includes(norm(part)), what);
   for (const key of ['code_no_registration']) has(TEXTS[key], EXT.recordButton, key);
   // The extension's own "Recover my code" (XC-09), named only where its Activate tab shows it: beside a check that could
-  // not finish. Elsewhere the code is simply on that tab once known (it finds a burn of the wallet by itself), so those
-  // texts send there, not to a button.
+  // not finish. Elsewhere the code is simply in its Settings once known (popup.js codeSection; it finds a burn of the
+  // wallet by itself), so those texts send there, not to a button, and never to the Activate tab, which shows no code.
   has(TEXTS.check_solana, `"${EXT.recoverButton}"`, 'check_solana');
   for (const key of ['ext_fact_recover', 'ext_lead_pending', 'ext_in_flight']) {
-    has(TEXTS[key], `${EXT.tab_activate} tab`, key);
+    has(TEXTS[key], `in its ${EXT.tab_settings}`, key);
+    assert.ok(!norm(TEXTS[key]).includes(norm(`${EXT.tab_activate} tab`)), key);
     assert.ok(!norm(TEXTS[key]).includes(norm(EXT.recoverButton)), key);
   }
   // The step that runs a light node reads "Link a device", the extension's and QNet Wallet's word for it.
@@ -113,8 +154,14 @@ test('the extension\'s buttons, tabs and fields are named as the extension names
   assert.equal(norm(TEXTS.act_code), norm(EXT.codeLabel), 'act_code');
 });
 
+// Owner, 13.10: the one exception is the node's "Total earned", the sum moved to the wallet plus the node balance
+// (NodeHistory.tsx Earned); its texts say that phrase and no other word of the kind.
 test('no text speaks of earnings: the node balance is what it is', () => {
-  for (const [key, text] of Object.entries(TEXTS)) assert.doesNotMatch(text, /reward|\bmining\b|\bearn|\bincome\b|\bprofit/i, key);
+  for (const [key, text] of Object.entries(TEXTS)) {
+    const said = key.startsWith('earned_') ? text.replace(/^Total earned: /, '') : text;
+    assert.doesNotMatch(said, /reward|\bmining\b|\bearn|\bincome\b|\bprofit/i, key);
+  }
+  assert.deepEqual(Object.keys(TEXTS).filter((k) => /\bearn/i.test(TEXTS[k])), ['earned_total', 'earned_reading', 'earned_unknown']);
 });
 
 // The page as the QNet app's view renders it: every `{full && …}` block (shown only outside that view) removed.
@@ -141,7 +188,7 @@ test('the Support page in the app\'s view names no platform and points to no act
   assert.doesNotMatch(page, /SupportRequest/);
   const shown = new Set(keysIn(inAppView(page)));
   const hidden = keysIn(page).filter((k) => !shown.has(k));
-  assert.deepEqual(hidden.sort(), ['support_contact_bugs', 'support_contact_bugs_link', 'support_contact_community', 'support_contact_docs', 'support_epochs_android', 'support_epochs_apple', 'support_epochs_wake', 'support_epochs_wake_link', 'support_move', 'support_move_title', 'support_move_wallet_link']);
+  assert.deepEqual(hidden.sort(), ['support_contact_bugs', 'support_contact_bugs_link', 'support_contact_community', 'support_contact_docs', 'support_epochs_android', 'support_epochs_apple', 'support_move', 'support_move_title', 'support_move_wallet_link']);
   for (const key of shown) {
     assert.doesNotMatch(TEXTS[key], /iPhone|iPad|Android|\biOS\b|aiqnet\.io\/(docs|activate)|\/node\b/, key);
     assert.doesNotMatch(TEXTS[key], /activat|\bburn|1DEV/i, key);
@@ -151,7 +198,7 @@ test('the Support page in the app\'s view names no platform and points to no act
   for (const [key, text] of Object.entries(TEXTS).filter(([k]) => !/^support_(form|case)_/.test(k))) {
     assert.doesNotMatch(text, /a person reviews|ask for a review|appeal/i, key);
   }
-  assert.match(TEXTS.support_device_lead, /run it on another phone or tablet: install QNet Wallet there from the app store, open this wallet with its recovery phrase and tap Use this device on the Node tab\./);
+  assert.match(TEXTS.support_device_lead, /run it on another phone or tablet: install QNet Wallet there from the app store, open this wallet with its recovery phrase and link the node to that device\./);
 });
 
 test('every key a page uses has its text, and they show text only through it', () => {

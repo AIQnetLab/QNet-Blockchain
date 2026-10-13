@@ -12,7 +12,7 @@ import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { t, type MessageKey } from '@/lib/texts';
 import { computerGuide, phoneGuide, superGuide, type GuideStep } from '@/lib/cabinet/guide';
 import { ACTIVATION_NETWORK } from '@/lib/one-dev';
-import { useHeldWallet } from './CabinetProvider';
+import { endView, useHeldWallet } from './CabinetProvider';
 import GuideArt from './GuideArt';
 
 type Way = 'phone' | 'computer' | 'super';
@@ -23,8 +23,10 @@ const WAY_INTRO: Record<Way, MessageKey> = { phone: 'guide_phone_intro', compute
 const FAQ: [MessageKey, MessageKey][] = [
   ['faq_one_q', 'faq_one_a'],
   ['faq_move_q', 'faq_move_a'],
+  ['faq_stop_q', 'faq_stop_a'],
   ['faq_code_q', 'faq_code_a'],
   ['faq_back_q', 'faq_back_a'],
+  ['faq_server_q', 'faq_server_a'],
   ['faq_words_q', 'faq_words_a'],
 ];
 
@@ -49,7 +51,8 @@ function Steps({ steps }: { steps: GuideStep[] }) {
 }
 
 function Guide({ phoneFlows }: { phoneFlows: boolean }) {
-  // The wallet My node shows, if any: without one the page ends with the way to connect it.
+  // The wallet My node shows, if any: without one the page ends with the way to connect it (an address only viewed is
+  // none, and the way ends the view, so the connect screen shows).
   const held = useHeldWallet();
   const device = useDeviceKind();
   const [picked, setPicked] = useState<Way | null>(null);
@@ -99,7 +102,7 @@ function Guide({ phoneFlows }: { phoneFlows: boolean }) {
       </section>
       {!held && (
         <div className="guide-connect">
-          <Link href="/node" className="qnet-button activate-primary">{t('connect_first_button')}</Link>
+          <Link href="/node" className="qnet-button activate-primary" onClick={endView}>{t('connect_first_button')}</Link>
         </div>
       )}
     </>

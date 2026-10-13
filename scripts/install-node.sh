@@ -31,7 +31,7 @@ echo -e "${BLUE}${BOLD}                    🚀 QNET NODE INSTALLER v2.19.22    
 echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "${CYAN}This installer will set up a Full or Super node on your server.${NC}"
-echo -e "${CYAN}You need an activation code from https://qnet.io${NC}"
+echo -e "${CYAN}You need an activation code: the Overview of https://aiqnet.io/node shows it for your wallet${NC}"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -81,7 +81,7 @@ if ! docker images | grep -q "qnet-production"; then
             docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
         else
             echo -e "${RED}❌ Dockerfile.production not found!${NC}"
-            echo "Please run this script from QNet project root directory"
+            echo "Please run this script from the QNet Blockchain repository root directory"
             exit 1
         fi
     else
@@ -145,7 +145,7 @@ echo ""
 echo -e "${GREEN}📋 Step 2: Enter Activation Code${NC}"
 echo ""
 echo -e "${CYAN}Your activation code should look like: QNET-XXXXXX-XXXXXX-XXXXXX${NC}"
-echo -e "${CYAN}You can get one at: https://qnet.io/activate${NC}"
+echo -e "${CYAN}The Overview of https://aiqnet.io/node shows it for your wallet${NC}"
 echo ""
 
 while true; do
@@ -324,7 +324,7 @@ echo "  Stop node:         docker stop $NODE_NAME"
 echo "  Start node:        docker start $NODE_NAME"
 echo "  Restart node:      docker restart $NODE_NAME"
 echo ""
-echo -e "${YELLOW}⏳ The node will take 30-60 seconds to initialize and connect to the network.${NC}"
+echo -e "${YELLOW}⏳ The node will take 30-60 seconds to initialize and connect to QNet Blockchain.${NC}"
 echo ""
 echo -e "${CYAN}Need help? Visit: https://x.com/AIQnetLab${NC}"
 echo ""

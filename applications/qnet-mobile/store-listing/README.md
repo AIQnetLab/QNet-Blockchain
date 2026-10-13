@@ -22,13 +22,13 @@ phones and Android tablets, so the answers are the same too.
 
 What leaves the device:
 
-- **Transactions the user signs** — transfers, token calls and moves of a node balance on QNet, and SOL and Solana
+- **Transactions the user signs** — transfers, token calls and moves of a node balance on QNet Blockchain, and SOL and Solana
   token transfers from the wallet's Solana address: public blockchain data by design. The app submits no node
   registration; a registration the website submits carries the wallet's consent.
-- **Addresses in read queries** — the QNet address to the genesis nodes and the explorer, automatically while the app
+- **Addresses in read queries** — the wallet's QNet Blockchain address to the genesis nodes and the explorer, automatically while the app
   is open (balances every 15 s, history), and to aiqnet.io for the state of the wallet's node there while the Node tab
-  is open and the network lists no node for the wallet (every 30 s; the app keeps only that state and the node type),
-  and once before the QNet Link sheet offers a node consent. Every request that names a QNet address goes only to servers the publisher
+  is open and QNet Blockchain lists no node for the wallet (every 30 s; the app keeps only that state and the node type),
+  and once before the QNet Link sheet offers a node consent. Every request that names a QNet Blockchain address goes only to servers the publisher
   operates: the five genesis nodes (`src/services/NodePool.js`) and the explorer (`EXPLORER_API`, `src/config/nodes.js`);
   a third-party node that two genesis nodes list serves only the committee-certified checkpoints the wallet verifies
   proofs against, which name no address.
@@ -38,8 +38,9 @@ What leaves the device:
 - **Requests from aiqnet.io (QNet Link)** — only when the user opens an `https://link.aiqnet.io/l` link and confirms on
   the app's own sheet: one answer, end-to-end encrypted to the page that asked, through the publisher's relay (which
   keeps the ciphertext in memory for at most ten minutes and sees the IP address for rate limiting only). The answer
-  carries the QNet and Solana addresses (`connect`); the node id, the wallet's public key and its consent signature
-  (`link`); or the node id and the moved amount and transaction (`claim`) (`src/services/QNetLink.js`). Nothing about
+  carries the wallet's QNet Blockchain and Solana addresses (`connect`); the node id, the wallet's public key and its consent signature
+  (`link`); or the id of the node the request named (the wallet's light or super node) and the moved amount and
+  transaction (`claim`) (`src/services/QNetLink.js`). Nothing about
   the device goes through aiqnet.io.
 - **Light node binding, only while a node is linked to this device** — sent to the node's shard owners among the
   genesis nodes: the node id, the wallet address and public key, the device's answer key, the signed binding, the push
@@ -64,13 +65,13 @@ What leaves the device:
 - **Firebase** — the app takes a push token only when a node is linked to this device (`firebase.json` turns automatic
   token issue off), and deletes it when the node stops here.
 - **The in-app browser** — pages the user opens are fetched by the system WebView straight from those sites; the app
-  sends nothing about them to the publisher. A site sees the wallet's QNet and Solana addresses only after the user
+  sends nothing about them to the publisher. A site sees the wallet's QNet Blockchain and Solana addresses only after the user
   connects it on the app's own sheet, and gets a message signature, a QNC or token send or a contract call only after
   the user confirms it there (`src/browser/`). Its cookies and site data start empty in each session; the list of recent pages stays on the device.
 - **GitHub** — the SOL token logo; no address, the IP address only.
 - **The camera (the scan icon in the recipient field of a Send screen)** — only after the user taps that icon and
   allows the camera. Frames are decoded on the device and never stored or sent; what is read goes into the Send form and
-  nowhere else: a QNet address on the QNet Send screen, a Solana address or payment request (its recipient, token and
+  nowhere else: a QNet Blockchain address on the Send screen for QNet Blockchain, a Solana address or payment request (its recipient, token and
   amount) on the Solana one. On iOS the system decodes (AVFoundation); on Android an open-source QR decoder
   bundled in the app, which makes no network connection. The scanner sends nothing, not even diagnostics, on either
   platform.
@@ -82,7 +83,7 @@ Therefore:
 | Question | Answer |
 |---|---|
 | Does the app collect or share user data? | Yes. |
-| Personal info → User IDs | Collected and **shared**: the QNet and Solana addresses; the Solana address reaches public Solana RPC endpoints automatically. Purpose: App functionality. Required. |
+| Personal info → User IDs | Collected and **shared**: the wallet's QNet Blockchain and Solana addresses; the Solana address reaches public Solana RPC endpoints automatically. Purpose: App functionality. Required. |
 | Financial info → Purchase history (and Other financial info) | Collected: the transactions the user signs reach the nodes and stay on the public chain. Not shared (user-initiated). Purpose: App functionality. Required. |
 | Device or other IDs | Collected **only while a node is linked**: the push token and Firebase installation ID, the device key's public part and the device-check token. **Optional.** **Not shared**: the genesis nodes and the device service are the publisher's; Google and Apple act as service providers. Purposes: App functionality; Fraud prevention, security, and compliance. |
 | App activity → Installed apps | Collected **only while a node is linked, on Android**: Google Play's app-access-risk verdict, which says whether apps are running that could view the screen, show themselves over other apps or control the device, and whether other apps are installed (it names no app). **Not processed ephemerally**: the device service decides only on whether the verdict is present, and keeps it with its labels, sealed, 7 days (up to 90 days for a refused, suspect or paused case) for review of an appeal. **Optional.** **Not shared** (Google acts as a service provider). Purpose: Fraud prevention, security, and compliance. |
@@ -104,7 +105,7 @@ policy names them, and the App Store table declares them as Other Data Types.
 
 | Data type | Linked to the user | Used for tracking | Purpose |
 |---|---|---|---|
-| Identifiers → User ID (QNet and Solana addresses) | Yes | No | App Functionality |
+| Identifiers → User ID (QNet Blockchain and Solana addresses) | Yes | No | App Functionality |
 | Identifiers → Device ID (push token and the device check, only while a node is linked) | Yes | No | App Functionality |
 | Financial Info → Other Financial Info (transactions the user signs) | Yes | No | App Functionality |
 | Other Data → Other Data Types (the device's platform and model name, only while a node is linked) | Yes | No | App Functionality |
@@ -120,12 +121,19 @@ analytics. App Attest and DeviceCheck need no required-reason entry and ask the 
 
 ## Export compliance (App Store Connect)
 
-- `ITSAppUsesNonExemptEncryption` = YES (`ios/QNetMobile/Info.plist`).
+- `ITSAppUsesNonExemptEncryption` = NO (`ios/QNetMobile/Info.plist`). App Store Connect's encryption questionnaire
+  (App Information > App Encryption Documentation), answered "standard encryption algorithms" and "not available in
+  France", requires no documentation and tells the developer to declare that in Info.plist. A YES build is refused at
+  upload ("Invalid Export Compliance Code") unless it carries the `ITSEncryptionExportComplianceCode` of approved
+  documentation.
+- France is left out of the App Store availability until the French encryption declaration to ANSSI is made. Then the
+  declaration goes into App Store Connect as the app's encryption documentation, Info.plist gets YES with the code
+  Apple issues, and France is added.
 - The app implements standard algorithms outside Apple's frameworks: ML-DSA-65 (FIPS 204) and SHA-3/SHAKE in its own
   native module; PBKDF2-SHA256 and AES-256-GCM for keys at rest through its bundled native crypto library; in its
   JavaScript crypto libraries X25519 with HKDF-SHA256 and AES-256-GCM for the end-to-end encrypted answers to
   aiqnet.io's requests, and Ed25519 for Solana transfers; the device key of App Attest is Apple's own. In Apple's table that is "industry standard algorithm, not provided within the Apple operating system":
-  no CCATS; a French encryption declaration only if the app is offered in France.
+  no CCATS; the French encryption declaration only for the App Store in France.
 - The same classification (mass-market encryption, License Exception ENC) carries a US obligation: an annual
   self-classification report to BIS and the ENC Encryption Request Coordinator by 1 February for the previous year.
   Filing it is the publisher's task, not the app's.
@@ -135,7 +143,7 @@ analytics. App Attest and DeviceCheck need no required-reason entry and ask the 
 Declared: **Cryptocurrency wallet** only. A node balance is QNC, a fungible coin, not a tokenized digital asset (NFT);
 the app sells, trades and awards no NFTs. Declaring the NFT category as well disables the non-custodial exemption and
 demands a crypto licence in every targeted jurisdiction. No build sells anything, and no screen of the app offers a
-node, a burn or a code or names a price: a light node is registered on aiqnet.io in a browser or with the QNet browser
+node, a burn or a code or names a price: a light node is registered on aiqnet.io in a browser or with the QNet Wallet browser
 extension, a super node with the extension only, and the app only confirms its own wallet's light node on sheets that a
 verified link opens. Its SOL and 1DEV sends are ordinary wallet transfers to any address the
 user enters or scans, the website's one-time payment address included ("Payments" below). There is no purchase or
@@ -175,34 +183,40 @@ never `.../releases/latest/download/...`, which could resolve to this old-key bu
   (`armeabi-v7a`, `arm64-v8a`): Play requires every 64-bit library to be 16 KB-aligned; debug builds keep every ABI for
   emulators. A release build first runs the light-client pin gate and the bundle scan (`scripts/release-check.js`,
   `scripts/bundle-check.js`).
-- A build signed with the upload key (a local test) runs the whole app; the network marks its device check as a test
+- A build signed with the upload key (a local test) runs the whole app; QNet Blockchain marks its device check as a test
   build, which only a testnet node accepts.
-- The public store listings name neither the extension nor the burn, and their URLs open the site with its app marker
-  (`?from=app`), where the site shows only the explorer and the policies. The App Review notes (not public) describe
-  the five QNet Link sheets and where a node comes from, so review is told of every screen the build has (Guideline
-  2.3.1).
+- The public store listings name neither the extension nor the burn. Their URLs carry `?from=app`, which only names
+  where the visit came from: the site shows the same pages with or without it. The App Review notes (not public)
+  describe the five QNet Link sheets and where a node comes from, so review is told of every screen the build has
+  (Guideline 2.3.1).
 
 **App access** (Play Console; the owner pastes the phrases into the credential fields, never into this repository):
 
 1. *Wallet with a node*: "No account. Open the app, accept the terms, tap 'Import Existing Wallet', paste the phrase,
-   tap 'Import Wallet', unlock with the screen lock. Node tab: 'The node runs on another device'. Tap 'Use this
-   device' and confirm: status Online, 'Answered this epoch: Yes' followed by the time. Node balance is above 1 QNC: 'Move to wallet' moves
-   it.
+   tap 'Import Wallet', unlock with the screen lock. The node runs on the publisher's test device, and the Node tab
+   shows a light node only on the device it is linked to, so it says 'This wallet has no node' until the node is linked
+   here with the first two steps of set 3 (the sheets 'Share this wallet's addresses' and 'Link this wallet's node to
+   this device'). The Node tab then shows status Online and, after its first answer, 'Answered this epoch: Yes'
+   followed by the time. Node balance is above 1 QNC: 'Move to wallet' moves it.
    The node needs a physical, Play-certified phone or tablet; on an emulator the Node tab says 'This device can't run
-   a node.' Test network: QNC has no market value."
+   a node.' QNet Blockchain testnet: QNC has no market value."
 2. *Wallet without a node*: "Import the phrase. The Node tab says 'This wallet has no node' with nothing to tap. Node
-   registrations are made on the QNet website, outside the app; the app sells nothing."
+   registrations are made on the aiqnet.io website, outside the app; the app sells nothing."
 3. *Website request sheets*: "With the wallet of set 1 (the one with a node), on the same device open
    https://aiqnet.io/node in Chrome. Tap 'QNet Wallet on this phone', then 'Open QNet Wallet', and confirm the sheet
    'Share this wallet's addresses' in the app. Back in Chrome, open the Device tab, tap 'Move the node to another device', then 'Open
    QNet Wallet', and confirm the sheet 'Link this wallet's node to this device'. On the Overview, with a node balance
    of 1 QNC or more, 'Move with QNet Wallet', then 'Open QNet Wallet', opens the sheet 'Move node balance to this
-   wallet'. Last, on the Device tab, 'Unlink this device', then 'Open QNet Wallet', opens the sheet 'Unlink this wallet's
-   node from this device'; after it the Node tab says 'The node does not run on any device now.'"
+   wallet': it names the node the site asks for, here 'Light node' with its id ('Super node' for a wallet whose node is
+   a super node), above the amount, and 'Confirm' moves that node's balance, as the Node tab's own 'Move to wallet'
+   does. Last, on the Device tab, 'Unlink this device', then 'Open QNet Wallet', opens the sheet 'Unlink this wallet's
+   node from this device'; after it the Node tab says 'This wallet has no node.'"
 
-Owner note, not pasted: set 3's link, move and unlink steps need `CABINET_PHONE_FLOWS=1` on aiqnet.io when the build is
-submitted (`docs/applications/explorer.md`; the deploy default is off). If it is off, paste set 3 with only its first
-two sentences, the connect sheet: with the flag off the Device tab and the move say the flow "opens soon". The labels
+Owner note, not pasted: set 3's link, move and unlink steps (set 1 links its node with the first two) need
+`CABINET_PHONE_FLOWS=1` on aiqnet.io when the build is submitted (`docs/applications/explorer.md`; the deploy default is
+off). The app shows a light node only on the device it is linked to and offers no way to link it from inside (owner,
+11.10), so with the flag off the review device cannot show wallet A's node at all: the Device tab and the move say the
+flow "opens soon". The labels
 above are the restructured site's (tabs Overview · Device · History); paste them once that site is live, and replace
 the set 3 text already in Play Console at the same time. Check the pasted text against the App access field's length.
 
@@ -222,11 +236,11 @@ the set 3 text already in Play Console at the same time. Check the pasted text a
 - **Earning claims.** The listing makes none: any node balance is set by the protocol, not guaranteed, and QNC has no
   market value.
 - **Privacy policy inside the app.** The terms screen, Settings, the link sheet and "Use this device" link to
-  https://aiqnet.io/privacy?from=app (the site's app view).
+  https://aiqnet.io/privacy?from=app (the same page as without the query).
 - **Accuracy of the listing.** Licences (apps Apache-2.0, node BSL 1.1), the cryptography, the network stage (testnet),
   a QR code shown and a QR scan on the Send screens that takes an address (and on Solana a payment request) into the
   form, 11 languages; screenshots show only what the build has.
-- **Prices.** None: the app shows no fiat value on any build while QNet is a test network.
+- **Prices.** None: the app shows no fiat value on any build while QNet Blockchain is a testnet.
 - **Permissions.** INTERNET, ACCESS_NETWORK_STATE, USE_BIOMETRIC, USE_FINGERPRINT, WAKE_LOCK, RECEIVE_BOOT_COMPLETED,
   HIDE_OVERLAY_WINDOWS, CAMERA, the FCM receive permission, and SCHEDULE_EXACT_ALARM with maxSdkVersion 33 from
   react-native-background-fetch. CAMERA is asked for only when the user taps the scan icon on a Send screen,
@@ -249,8 +263,8 @@ Play's IARC questionnaire the same way where it asks about web access.
 
 ## Before submission
 
-- Play Console → the app → Play Integrity API: turn on the app-access-risk verdict ("environment details"). The
-  network's device check refuses a licensed Android install whose integrity verdict lacks it (`device_desktop`,
+- Play Console → the app → Play Integrity API: turn on the app-access-risk verdict ("environment details"). QNet
+  Blockchain's device check refuses a licensed Android install whose integrity verdict lacks it (`device_desktop`,
   `docs/protocols/light-node-messages.md` section 9), since its presence is what tells a phone or tablet from other
   devices. Answer Data safety as above in the same release (App activity → Installed apps), and
   keep the privacy policy's device-check section saying the same.

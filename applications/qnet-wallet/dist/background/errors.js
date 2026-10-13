@@ -9,7 +9,7 @@ export const ERROR_MESSAGES = Object.freeze({
   FORBIDDEN_SENDER: 'Request not allowed from this sender',
   INVALID_PARAMS: 'Invalid parameters',
   // a contract call carries no QNC value and no access list: the network accepts neither today
-  UNSUPPORTED_PARAM: 'The network does not accept this parameter',
+  UNSUPPORTED_PARAM: 'QNet Blockchain does not accept this parameter',
   // vault and session
   NO_VAULT: 'No wallet exists',
   VAULT_EXISTS: 'A wallet already exists',
@@ -21,9 +21,11 @@ export const ERROR_MESSAGES = Object.freeze({
   VAULT_CORRUPT: 'Wallet data failed its integrity check',
   ADDRESS_MISMATCH: 'Derived addresses do not match the wallet',
   SIGNING_DISABLED: 'Signing is disabled: the crypto self-test failed',
-  RESTORE_EXPIRED: 'The restore step expired, start again',
+  RESET_EXPIRED: 'The reset step expired, start again',
+  // a reset erases only a locked wallet: an unlocked one's password is known, and Delete wallet takes it
+  UNLOCKED: 'Wallet is unlocked',
   // network
-  NETWORK: 'Network unavailable',
+  NETWORK: 'QNet Blockchain could not be reached',
   NODE_REJECTED: 'A node refused the transaction; it may still apply, so the wallet keeps it and the next transfer takes its place',
   SOLANA_UNAVAILABLE: 'Solana could not be read',
   HISTORY_TOO_LONG: 'The Solana history is too long to search in one go, try again to continue',
@@ -64,13 +66,14 @@ export const ERROR_MESSAGES = Object.freeze({
   ACTIVATION_RECORDED: 'aiqnet.io holds a burn of this wallet',
   ACTIVATION_RESERVED: 'An activation of this wallet is starting elsewhere',
   RECORD_UNAVAILABLE: 'aiqnet.io could not be reached',
-  // the light node (nodes.js)
-  NO_NODE: 'This wallet has no light node on the QNet network',
-  CLAIM_REFUSED: 'The QNet network refused to move the node balance',
+  // a node of this wallet (nodes.js claimForSite: the light or super node a site names)
+  NO_NODE: 'QNet Blockchain does not list this node of the wallet',
+  CLAIM_REFUSED: 'QNet Blockchain refused to move the node balance',
   CLAIM_BUSY: 'A move of this node balance is already running',
+  WALLET_MISMATCH: 'The node does not belong to this wallet',
   // the wallet key's unbind of the light node's device (decision 38)
   NOT_LINKED: 'The light node runs on no device',
-  UNLINK_REFUSED: 'The QNet network refused to unlink the device',
+  UNLINK_REFUSED: 'QNet Blockchain refused to unlink the device',
   // provider, approvals
   NOT_FOUND: 'Request not found',
   USER_REJECTED: 'Request rejected',
@@ -132,7 +135,8 @@ export const UNSUPPORTED_PARAM_MESSAGE = 'Unsupported parameter';
 export class WalletError extends Error {
   /**
    * @param {string} code key of ERROR_MESSAGES
-   * @param {{retryAfterMs?: number, field?: string}} [extra] retryAfterMs for BACKOFF; field for INVALID_PARAMS
+   * @param {{retryAfterMs?: number, field?: string, walkSteps?: number}} [extra] retryAfterMs for BACKOFF; field for
+   *   INVALID_PARAMS; walkSteps for BALANCE_UNCONFIRMED (the walk steps still to go: qnet.walkSteps)
    */
   constructor(code, extra = {}) {
     super(code);
@@ -140,6 +144,7 @@ export class WalletError extends Error {
     this.code = code;
     if (Number.isSafeInteger(extra.retryAfterMs) && extra.retryAfterMs > 0) this.retryAfterMs = extra.retryAfterMs;
     if (typeof extra.field === 'string') this.field = extra.field;
+    if (Number.isSafeInteger(extra.walkSteps) && extra.walkSteps > 0) this.walkSteps = extra.walkSteps;
   }
 }
 
@@ -159,13 +164,14 @@ const isCoreError = (error) => error?.name === 'CoreError' && typeof error.code 
  * The error half of a UI envelope. Only WalletError and qnet-core CoreError codes pass through; any
  * other error becomes INTERNAL.
  * @param {unknown} error
- * @returns {{code: string, message: string, retryAfterMs?: number, field?: string}}
+ * @returns {{code: string, message: string, retryAfterMs?: number, field?: string, walkSteps?: number}}
  */
 export function toUiError(error) {
   const code = (error instanceof WalletError || isCoreError(error)) && isKnownCode(error.code) ? error.code : 'INTERNAL';
   const out = { code, message: ERROR_MESSAGES[code] };
   if (code === 'BACKOFF' && error.retryAfterMs) out.retryAfterMs = error.retryAfterMs;
   if (code === 'INVALID_PARAMS' && typeof error.field === 'string') out.field = error.field;
+  if (code === 'BALANCE_UNCONFIRMED' && Number.isSafeInteger(error.walkSteps)) out.walkSteps = error.walkSteps;
   return out;
 }
 

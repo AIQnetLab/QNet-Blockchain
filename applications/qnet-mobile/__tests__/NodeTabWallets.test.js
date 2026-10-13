@@ -1,9 +1,9 @@
 /**
  * 29.09, the Node tab of the real wallet screen for both node types (R4): a light node record an older build kept on this
  * device never keeps the wallet's super node from being linked (gap b); a wallet with a super and a light node on the
- * chain shows both cards, the server's first (gap a); and before the network lists a node, what aiqnet.io records of
- * it is said, while a record that cannot be read leaves the tab as it was (gap d). The app only reads: nothing here
- * burns, shows a code or opens a page.
+ * chain shows both cards, the server's first (gap a), the light one only on the device it is bound to (owner, 11.10);
+ * and before the network lists a super node, what aiqnet.io records of it is said, while a record that cannot be read
+ * leaves the tab as it was (gap d). The app only reads: nothing here burns, shows a code or opens a page.
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
@@ -174,25 +174,48 @@ describe('the wallet\'s nodes on the Node tab', () => {
       // The by-wallet answer lists only the light node; the chain's registrations name the super node too.
       byWallet: { success: true, nodes: [{ node_id: mockLIGHT, node_type: 'light', status: 'online' }] },
       events: { success: true, nodes: [{ nodeId: mockSUPER, nodeType: 'super', height: 2_000_123 }, { nodeId: mockLIGHT, nodeType: 'light', height: 2_100_000 }] },
+      // The light node is bound to this device: the network names this device's binding.
+      lightStatus: lightStatus({ bindingSeqAgreed: 1790000000 }),
+    });
+    require('../src/services/PushService').localBinding.mockImplementation(async (id) => (id === mockLIGHT
+      ? { nodeId: mockLIGHT, seq: 1790000000, pushType: 'fcm', hw: false, boundAt: null } : null));
+    try {
+      const tree = await nodeTab();
+      // Linked only on two genesis nodes' word, and kept as the wallet's node record.
+      expect(mockState.confirmed).toContainEqual({ nodeType: 'super', nodeId: mockSUPER });
+      expect(mockState.saved).toContainEqual({ nodeType: 'super', pseudonym: mockSUPER, walletAddress: mockQNET });
+      const text = texts(tree);
+      expect(text).toContain(mockSUPER);
+      expect(text).toContain(mockLIGHT);
+      expect(text.indexOf(mockSUPER)).toBeLessThan(text.indexOf(mockLIGHT));
+      expect(text).toContain(t('node_last_seen'));
+      expect(text).toContain(t('node_heartbeats_of', { n: 5, m: 9 }));
+      // The epochs are read from the super node's registration on (node-events), never before it.
+      expect(mockState.epochCalls).toContainEqual([mockSUPER, { walletAddress: mockQNET, registeredHeight: 2_000_123 }]);
+      expect(text).toContain(`${t('node_missed')}\n2`);
+      // Neither card counts epochs or names a device model: the site's cabinet does (owner, 11.10).
+      expect(text).not.toMatch(/Counted epochs|\bDevice\b/);
+    } finally {
+      require('../src/services/PushService').localBinding.mockImplementation(async () => null);
+    }
+  });
+
+  it('the light node bound to another device has no card here, under the super node or alone (owner, 11.10)', async () => {
+    Object.assign(mockState, {
+      node: { nodeType: 'light', pseudonym: mockLIGHT },
+      events: { success: true, nodes: [{ nodeId: mockSUPER, nodeType: 'super', height: 2_000_123 }, { nodeId: mockLIGHT, nodeType: 'light', height: 2_100_000 }] },
       lightStatus: lightStatus(),
     });
     const tree = await nodeTab();
-    // Linked only on two genesis nodes' word, and kept as the wallet's node record.
-    expect(mockState.confirmed).toContainEqual({ nodeType: 'super', nodeId: mockSUPER });
-    expect(mockState.saved).toContainEqual({ nodeType: 'super', pseudonym: mockSUPER, walletAddress: mockQNET });
     const text = texts(tree);
     expect(text).toContain(mockSUPER);
-    expect(text).toContain(mockLIGHT);
-    expect(text.indexOf(mockSUPER)).toBeLessThan(text.indexOf(mockLIGHT));
-    expect(text).toContain(t('node_last_seen'));
-    expect(text).toContain(t('node_heartbeats_of', { n: 5, m: 9 }));
-    // The epochs are read from the super node's registration on (node-events), never before it.
-    expect(mockState.epochCalls).toContainEqual([mockSUPER, { walletAddress: mockQNET, registeredHeight: 2_000_123 }]);
-    expect(text).toContain(t('node_counted_last', { n: 7, m: 9 }));
-    expect(text).toContain(`${t('node_missed')}\n2`);
-    // The light card: its node runs on another device here, with Use this device.
-    expect(text).toContain(t('node_other_device'));
-    expect(tree.root.findAll((n) => n.props.testID === 'node-use' && typeof n.props.onPress === 'function').length).toBeGreaterThan(0);
+    expect(text).not.toContain(mockLIGHT);
+    expect(text).not.toContain(t('node_none')); // nothing under the super node's card
+    expect(tree.root.findAll((n) => n.props.testID === 'node-use')).toEqual([]);
+    // The super node's card, its balance and its move, on every device that holds the wallet.
+    const moves = tree.root.findAll((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function');
+    expect(moves.length).toBeGreaterThan(0);
+    expect(new Set(moves.map((n) => n.props.onPress)).size).toBe(1); // one card's button
   });
 
   it('a super node two genesis nodes do not confirm is not linked: the light card alone, as the network records it', async () => {
@@ -204,19 +227,23 @@ describe('the wallet\'s nodes on the Node tab', () => {
     const tree = await nodeTab();
     expect(mockState.saved.filter((r) => r.nodeType === 'super')).toEqual([]);
     expect(texts(tree)).not.toContain(mockSUPER);
-    expect(texts(tree)).toContain(t('node_other_device'));
+    // Its light node is bound to another device: the tab says what a wallet without a node says.
+    expect(texts(tree)).toContain(t('node_none'));
+    expect(texts(tree)).not.toContain(mockLIGHT);
   });
 
-  it('before the network lists it, a node aiqnet.io recorded is said for its type; an unreadable record changes nothing', async () => {
+  it('before the network lists it, a super node aiqnet.io recorded is said; a light one not bound here is not; an unreadable record changes nothing', async () => {
     mockState.record = { state: 'recorded', nodeType: 'super' };
     let tree = await nodeTab();
     expect(texts(tree)).toContain(t('node_not_on_network_super'));
     expect(texts(tree)).not.toContain(t('node_none'));
     await act(async () => { mounted.pop().unmount(); });
 
+    // A light node aiqnet.io recorded is bound to no device yet: not this device's to show (owner, 11.10).
     mockState.record = { state: 'sending', nodeType: 'light' };
     tree = await nodeTab();
-    expect(texts(tree)).toContain(t('node_not_on_network_light'));
+    expect(texts(tree)).toContain(t('node_none'));
+    expect(texts(tree)).not.toMatch(/light node is not on the QNet network/);
     await act(async () => { mounted.pop().unmount(); });
 
     mockState.record = null; // the site could not be read

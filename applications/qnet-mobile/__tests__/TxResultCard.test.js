@@ -8,7 +8,7 @@ import { matchesAsset } from '../src/utils/txHistory';
 const texts = (tree) => tree.root.findAllByType(Text).map((t) => t.props.children).flat(Infinity).join('');
 
 describe('transaction result surface', () => {
-  // With the site's app marker, so the page opens in the site's app view (R3-XPD-01).
+  // With the `from=app` query every link of the app carries; the site shows the same page with or without it.
   it('points at the explorer page of this transaction', () => {
     expect(explorerTxUrl('abc')).toBe(`${EXPLORER_API}/explorer/tx/abc?from=app`);
     expect(explorerTxUrl('')).toBe(`${EXPLORER_API}/explorer/tx/?from=app`);

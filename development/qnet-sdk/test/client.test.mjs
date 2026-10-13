@@ -10,7 +10,7 @@ import { sha3_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex, concatBytes, hexToBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 import * as sdk from '../dist/index.js';
 import { DEFAULT_WALK_TIME_MS, LADDER_BAND, NodeClient, logLeaf } from '../dist/node.js';
-import { fixture, mockNode, tempHome, testLineage, V, vector } from './helpers.mjs';
+import { fixture, mockNode, recordedAbovePin, tempHome, testLineage, V, vector } from './helpers.mjs';
 
 const RECORDED = '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d';
 const CONTRACT = vector('tokenTransfer').input.token;
@@ -87,25 +87,30 @@ describe('node client', () => {
   });
 
   it('folds a recorded balance proof and then asks the committee lineage for its checkpoint', async () => {
+    const { proof, tip } = await recordedAbovePin();
     const node = await serve((r) => {
-      if (r.path.endsWith('/balance/proof')) return { json: fixture('balproof.json') };
-      if (r.path === '/api/v1/height') return { json: fixture('height.json') };
+      if (r.path.endsWith('/balance/proof')) return { json: proof };
+      if (r.path === '/api/v1/height') return { json: tip };
       return undefined;
     });
     const client = new NodeClient({ nodes: [node.url] });
     const v = await client.getVerifiedAccount(RECORDED);
     assert.equal(v.balanceNano, '2909459674650000');
     assert.equal(v.nonce, '2');
-    assert.equal(v.blockHeight, 2210909);
+    assert.equal(v.blockHeight, proof.block_height);
     // The recorded tip is below the proof's height (recorded a moment earlier): not behind at all.
-    assert.deepEqual([v.tipHeight, v.behindBlocks], [2210863, 0]);
+    assert.ok(tip.height < proof.block_height);
+    assert.deepEqual([v.tipHeight, v.behindBlocks], [tip.height, 0]);
     assert.equal(v.proofFolds, true);
     // The mock serves no macroblock proofs, so the checkpoint cannot be verified.
     assert.equal(v.verified, false);
     assert.ok(node.requests.some((r) => /^\/api\/v1\/macroblock\/\d+\/proof$/.test(r.path)));
 
-    const forged = await serve(() => ({ json: fixture('balproof.json').replace('"balance":2909459674650000', '"balance":2909459674650001') }));
+    // A tip is known and the proof is fresh: only the fold keeps the walk from starting.
+    const bad = { ...proof, balance: proof.balance + 1 };
+    const forged = await serve((r) => ({ json: r.path === '/api/v1/height' ? tip : bad }));
     const f = await new NodeClient({ nodes: [forged.url] }).getVerifiedAccount(RECORDED);
+    assert.deepEqual([f.tipHeight, f.behindBlocks], [tip.height, 0]);
     assert.equal(f.proofFolds, false);
     assert.equal(f.verified, false);
     assert.ok(!forged.requests.some((r) => r.path.includes('macroblock')));
@@ -114,12 +119,14 @@ describe('node client', () => {
   // DEV-R2-07: a verified balance is the account's as of the proof's height. A node that kept an old state can prove
   // a balance since spent, so a proof far below the tip the other nodes report is never verified.
   it('never verifies a proof far below the chain\'s tip, nor one whose age no node can tell', async () => {
-    const PROVED = 2210909;
-    const prover = await serve((r) => {
-      if (r.path.endsWith('/balance/proof')) return { json: fixture('balproof.json') };
+    const { proof } = await recordedAbovePin();
+    const PROVED = proof.block_height;
+    const proving = (r) => {
+      if (r.path.endsWith('/balance/proof')) return { json: proof };
       if (r.path === '/api/v1/height') return { json: { blocks_behind: 0, height: PROVED, is_syncing: false, network_height: PROVED } };
       return undefined;
-    });
+    };
+    const prover = await serve(proving);
     const tipAt = (height) => serve((r) => (r.path === '/api/v1/height'
       ? { json: { blocks_behind: 0, height, is_syncing: false, network_height: height } } : undefined));
     const walked = (...nodes) => nodes.some((n) => n.requests.some((r) => r.path.includes('macroblock')));
@@ -137,12 +144,14 @@ describe('node client', () => {
     const fresh = await new NodeClient({ nodes: [prover.url, near.url], archive: null }).getVerifiedAccount(RECORDED);
     assert.deepEqual([fresh.tipHeight, fresh.behindBlocks], [PROVED + 100, 100]);
     assert.equal(walked(prover, near), true);
-    const strict = await new NodeClient({ nodes: [prover.url, (await tipAt(PROVED + 100)).url], archive: null })
+    const [again, narrow] = [await serve(proving), await tipAt(PROVED + 100)];
+    const strict = await new NodeClient({ nodes: [again.url, narrow.url], archive: null })
       .getVerifiedAccount(RECORDED, { maxAgeBlocks: 50 });
-    assert.equal(strict.verified, false);
+    assert.deepEqual([strict.behindBlocks, strict.verified], [100, false]);
+    assert.equal(walked(again, narrow), false);
 
     // No node tells the tip: the age is unknown and nothing is verified.
-    const mute = await serve((r) => (r.path.endsWith('/balance/proof') ? { json: fixture('balproof.json') } : undefined));
+    const mute = await serve((r) => (r.path.endsWith('/balance/proof') ? { json: proof } : undefined));
     const unknown = await new NodeClient({ nodes: [mute.url], archive: null }).getVerifiedAccount(RECORDED);
     assert.deepEqual([unknown.tipHeight, unknown.behindBlocks, unknown.verified], [null, null, false]);
     assert.equal(walked(mute), false);
@@ -677,7 +686,7 @@ describe('the checkpoints kept between processes', () => {
     return { results, asked };
   }
 
-  it('goes on from the kept ladder: the same checkpoint in one step, an older one within a band, never from the anchor', async () => {
+  it('goes on from the kept ladder: the same checkpoint with no step, an older one within a band, never from the anchor', async () => {
     const L = await testLineage();
     const B = L.base;
     const node = await serve((r) => (r.path === '/mark' ? { json: {} } : L.route(r)));
@@ -705,12 +714,15 @@ describe('the checkpoints kept between processes', () => {
     assert.ok(rungs.includes(T) && rungs.includes(T - 2));
     assert.equal(LADDER_BAND, 64);
     assert.ok(rungs.length <= 2 + Math.ceil(280 / LADDER_BAND) + 1, rungs.join(','));
+    // A rung the walk verified is kept with its certified roots.
+    const { state_root: stateRoot, logs_root: logsRoot } = L.proof(T).checkpoint;
+    assert.deepEqual([kept[T].state_root, kept[T].logs_root], [stateRoot, logsRoot]);
+    assert.match(kept[T].checkpoint_hash, /^[0-9a-f]{64}$/);
 
-    // Second process, from the file alone: T again (the old export kept only T, so this walked from the release's
-    // anchor), then a window between.
+    // Second process, from the file alone: T again, answered from the roots kept with it, then a window between.
     const second = await readInNewProcess(node, file, [L.event(T), L.event(middle)]);
     assert.deepEqual(second.results, ['verified', 'verified']);
-    assert.deepEqual(second.asked[0], [T]);
+    assert.deepEqual(second.asked[0], []);
     assert.ok(second.asked[1].length >= 1 && second.asked[1].length <= 33, `middle window: ${second.asked[1].length} steps`);
     assert.ok(Math.min(...second.asked[1]) > B + 2);
     assert.equal(Math.max(...second.asked[1]), middle);

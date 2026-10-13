@@ -242,7 +242,7 @@ describe('approve page', () => {
     const page = await openPage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     const values = () => texts(page, 'ap-row-value');
-    assert.deepEqual(values(), ['QNet testnet (q1337)', '2.5 QNC', '0.00015 QNC', '2.50015 QNC', '5', '10 QNC']);
+    assert.deepEqual(values(), ['QNet Blockchain testnet (q1337)', '2.5 QNC', '0.00015 QNC', '2.50015 QNC', '5', '10 QNC']);
     assert.ok(page.app.textContent.includes(ACCOUNTS.qnet), 'the full recipient address');
     // no always-on compare-the-characters line (owner, 28.09)
     assert.ok(!page.app.textContent.includes('first and last characters'));
@@ -402,7 +402,7 @@ describe('approve page', () => {
     }
     // the burn is irreversible: the acknowledgement is its one confirmation line, with no warning list (owner, 28.09)
     for (const removed of ['Read before you burn', 'Nobody receives them', 'cannot be undone', 'this wallet can never get another code',
-      'records its light node on the QNet network']) {
+      'records its light node on QNet Blockchain']) {
       assert.ok(!text.includes(removed), removed);
     }
     assert.deepEqual(page.app.byClass('ap-warning'), []);
@@ -544,13 +544,13 @@ describe('approve page', () => {
     const page = await openPage(w, await w.shown());
     await until(() => page.app.button('Share the code') !== null);
     const text = page.app.textContent;
-    assert.ok(text.includes('recorded on the QNet network with another 1DEV burn'), text);
+    assert.ok(text.includes('recorded on QNet Blockchain with another 1DEV burn'), text);
     assert.ok(!text.includes('the wallet records it too'), text);
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     page.app.button('Share the code').click();
     await until(() => page.app.textContent.includes('The site received this wallet’s activation code.'));
     assert.ok(page.app.textContent.includes('The burn made here recorded nothing'), page.app.textContent);
-    assert.ok(!page.app.textContent.includes('Recorded on the QNet network for this wallet'));
+    assert.ok(!page.app.textContent.includes('Recorded on QNet Blockchain for this wallet'));
     assert.equal((await replyTo(port, 'o')).result.status, 'exists');
   });
 
@@ -559,7 +559,7 @@ describe('approve page', () => {
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     for (const [nodeType, title, line, not] of [
       ['light', 'Activate a Light node?', 'Runs in QNet Wallet on a phone or tablet.', 'own server'],
-      ['super', 'Activate a Super node?', 'Runs on your own server with the QNet node software.', 'phone or tablet'],
+      ['super', 'Activate a Super node?', 'Runs on your own server with the QNet Blockchain node software.', 'phone or tablet'],
     ]) {
       const w = createWorld();
       const port = w.connect(`${SITE}/activate`);
@@ -593,7 +593,7 @@ describe('approve page', () => {
     await until(() => page.app.button('Share the code') !== null);
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     page.app.button('Share the code').click();
-    await until(() => page.app.textContent.includes('The QNet network refused the record: this wallet already has a node. One wallet, one node.'));
+    await until(() => page.app.textContent.includes('QNet Blockchain refused the record: this wallet already has a node. One wallet, one node.'));
     assert.ok(!page.app.textContent.includes('Try again later'), page.app.textContent);
     assert.equal((await replyTo(port, 'w')).result.status, 'exists');
     // a refusal of another kind keeps its own line
@@ -608,7 +608,7 @@ describe('approve page', () => {
     await until(() => otherPage.app.button('Share the code') !== null);
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     otherPage.app.button('Share the code').click();
-    await until(() => otherPage.app.textContent.includes('The QNet network did not accept the record.'));
+    await until(() => otherPage.app.textContent.includes('QNet Blockchain did not accept the record.'));
     await settleAll();
     assert.ok(!otherPage.app.textContent.includes('One wallet, one node'));
   });
@@ -818,7 +818,7 @@ describe('approve page', () => {
     const tx = core.buildTokenTransfer({ from: ACCOUNTS.qnet, token: TOKEN, to: ACCOUNTS.qnet, amount: '2500000', nonce: '5' });
     const qnc = (nano) => `${formatUnits(BigInt(nano), 9)} QNC`;
     assert.deepEqual(values, [
-      'QNet testnet (q1337)', '2.5 GOLD', qnc(tx.maxFeeNano), '0.01 QNC', qnc(BigInt(tx.maxFeeNano) + 10000000n), '5000 GOLD', '5',
+      'QNet Blockchain testnet (q1337)', '2.5 GOLD', qnc(tx.maxFeeNano), '0.01 QNC', qnc(BigInt(tx.maxFeeNano) + 10000000n), '5000 GOLD', '5',
       '10 QNC',
     ]);
     const text = page.app.textContent;
@@ -850,7 +850,7 @@ describe('approve page', () => {
     const page = await openPage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     const text = page.app.textContent;
-    assert.ok(text.includes('named after QNet’s own coin, but it is not QNC'));
+    assert.ok(text.includes('named after the native coin of QNet Blockchain, but it is not QNC'));
     assert.ok(text.includes('This address destroys every token sent to it'));
     assert.ok(text.includes('The token balance does not cover the amount.'));
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS * 2);
@@ -866,7 +866,7 @@ describe('approve page', () => {
     const why = {
       BALANCE_FOREIGN_PENDING: 'A transaction from another device is not confirmed yet. Try again in a minute.',
       BALANCE_UNCONFIRMED: 'The balance is not confirmed yet. Try again in a minute.',
-      NETWORK: 'The QNet nodes could not be reached. Try again.',
+      NETWORK: 'QNet Blockchain could not be reached. Try again.',
     };
     for (const [code, text] of Object.entries(why)) {
       const w = createWorld();
@@ -878,7 +878,7 @@ describe('approve page', () => {
       assert.equal((await shown.get()).result.details.balanceProblem, code);
       const page = await openPage(w, shown);
       await until(() => page.app.textContent.includes(text));
-      assert.ok(!page.app.textContent.includes('Reading the account from the network'), code);
+      assert.ok(!page.app.textContent.includes('Reading the account from QNet Blockchain'), code);
       t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS * 2);
       assert.ok(page.app.button('Send') === null || page.app.button('Send').disabled, code);
       // the balance certified again: the window reads it and offers the confirm
@@ -921,7 +921,7 @@ describe('approve page', () => {
     assert.deepEqual(texts(page, 'ap-args'), [args, 'move e2e4']);
     const tx = core.buildContractCall({ from: ACCOUNTS.qnet, contract: GAME, method: 'play', args, nonce: '5' });
     const values = texts(page, 'ap-row-value');
-    assert.deepEqual(values.slice(0, 2), ['QNet testnet (q1337)', tx.gasLimit]);
+    assert.deepEqual(values.slice(0, 2), ['QNet Blockchain testnet (q1337)', tx.gasLimit]);
     assert.ok(texts(page, 'ap-mono').includes('play'), 'the method, whole');
     const text = page.app.textContent;
     assert.ok(text.includes(GAME));
@@ -999,7 +999,7 @@ describe('approve page: the one-code checks (decision 35)', () => {
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'k', method: 'qnet_activateNode', params: { nodeType: 'super' } });
     const page = await openPage(w, await w.shown());
-    await until(() => page.app.textContent.includes('Checking this wallet: the QNet network, Solana and aiqnet.io…'));
+    await until(() => page.app.textContent.includes('Checking this wallet: QNet Blockchain, Solana and aiqnet.io…'));
     assert.deepEqual(page.app.querySelectorAll('button').map((button) => button.textContent), ['Reject']);
     assert.equal(page.app.querySelectorAll('input').length, 0, 'no acknowledgement, no burn');
     assert.ok(!/1500 1DEV/.test(page.app.textContent), 'no price while checking');

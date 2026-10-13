@@ -66,7 +66,7 @@ impl SubmitCode {
 
 /// The text of the one-node refusal (`wallet_has_node`) at every door that answers it: the submit door and the
 /// legacy light register route.
-pub(crate) const WALLET_HAS_NODE_TEXT: &str = "This wallet already has a node on the QNet network: one wallet, one node";
+pub(crate) const WALLET_HAS_NODE_TEXT: &str = "This wallet already has a node on QNet Blockchain: one wallet, one node";
 
 /// A refused submit: its code, the reason the log names, and the answer (`success: false`, `code`,
 /// `error`, and whatever figures the refusal carries).
@@ -230,7 +230,7 @@ pub(crate) fn check_client_submit(req: &NodeRegistrationClientRequest, now: u64,
     // not refused.
     if v2 && !bind_v2 {
         return Err(SubmitRefusal::new(BindV2Pending, "bind_v2_pending",
-            "owner bind without a time is not accepted by the network yet; retry once nodes list owner_bind_v2"));
+            "owner bind without a time is not accepted by QNet Blockchain yet; retry once nodes list owner_bind_v2"));
     }
     Ok(CheckedSubmit {
         reg_tx,

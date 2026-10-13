@@ -1,7 +1,8 @@
 // The page's relay client end to end in one process: the page (link-client.ts) opens a session with its
 // request on the relay (link-relay.ts), an app written with node:crypto reads it from the link, checks the
 // request against the link's hash and answers, the page polls, decrypts and checks the answer and gets the check
-// number. A session kept in the browser (link-store.ts) comes back after a reload. Run: npm run test:wallet
+// number. A session kept in the browser (link-store.ts) comes back after a reload. A `claim` request names the wallet and
+// its light or super node (owner, 12.10). Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,9 +11,9 @@ import bs58 from 'bs58';
 import { createLinkRelay } from '../../server/link-relay.ts';
 import { pollAnswer, readAnswer, startLinkSession } from '../link-client.ts';
 import { clearSession, loadSession, purgeSessions, saveSession } from '../link-store.ts';
-import { lightNodeId, parseLink } from '../qnet-link.ts';
+import { lightNodeId, parseLink, superNodeId, walletHash } from '../qnet-link.ts';
 import { openAnswer } from '../qnet-link-crypto.ts';
-import { LINK, appSeal, bodyOf } from './link-helpers.mjs';
+import { CLAIM, LINK, appSeal, bodyOf } from './link-helpers.mjs';
 import { verifyReserveAnswer } from '../cabinet/burn-record.ts';
 
 const ORIGIN = 'https://aiqnet.io';
@@ -50,7 +51,7 @@ async function app(fetchFn, link, answer) {
   assert.equal(session.intent, parsed.intent);
   assert.equal(session.reqHash, parsed.reqHash);
   if (parsed.reqHash) {
-    const keys = parsed.intent === 'link' ? ['burnTx', 'walletHash', 'check'] : ['walletHash'];
+    const keys = parsed.intent === 'link' ? ['burnTx', 'walletHash', 'check'] : parsed.intent === 'claim' ? ['walletHash', 'nodeId'] : ['walletHash'];
     const bytes = JSON.stringify(Object.fromEntries(keys.map((k) => [k, session.request[k]])));
     assert.equal(createHash('sha256').update(bytes).digest('base64url'), parsed.reqHash);
   }
@@ -108,12 +109,12 @@ test('link with a known wallet: the request travels, a linked answer for another
 // Owner decision 27.09 (EXT-R1-03 option (a)): below 1 QNC only for a capped claim (stoppedAtEpoch set), never zero.
 test('claim: an answer with a stoppedAtEpoch may move less than 1 QNC; a full claim may not', async () => {
   const { fetchFn } = world();
-  const read = async (answer) => {
-    const { session } = await startLinkSession('claim', { walletHash: null }, { fetchFn });
+  const read = async (answer, nodeId = superNodeId(WALLET)) => {
+    const { session } = await startLinkSession('claim', { walletHash: walletHash(WALLET), nodeId }, { fetchFn });
     await app(fetchFn, session.link, answer);
     return readAnswer(session, (await pollAnswer(session, { fetchFn })).body, NOW);
   };
-  const ok = { status: 'ok', qnet: WALLET, nodeId: lightNodeId(WALLET), amountNano: '1000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: '155' };
+  const ok = { status: 'ok', qnet: WALLET, nodeId: superNodeId(WALLET), amountNano: '1000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: '155' };
   assert.equal((await read(ok)).ok, true);
   const capped = await read({ ...ok, amountNano: '400000000' });
   assert.equal(capped.ok, true);
@@ -122,11 +123,17 @@ test('claim: an answer with a stoppedAtEpoch may move less than 1 QNC; a full cl
   assert.deepEqual(await read({ ...ok, amountNano: '999999999', stoppedAtEpoch: null }), { ok: false });
   assert.deepEqual(await read({ ...ok, amountNano: '0' }), { ok: false });
   assert.deepEqual(await read({ ...ok, amountNano: '0', stoppedAtEpoch: null }), { ok: false });
+  // the light node's move, and an answer naming the other node of the wallet than the request named
+  assert.equal((await read({ ...ok, nodeId: lightNodeId(WALLET) }, lightNodeId(WALLET))).ok, true);
+  assert.deepEqual(await read({ ...ok, nodeId: lightNodeId(WALLET) }), { ok: false });
+  // the earlier request, which named no node, is never started
+  await assert.rejects(startLinkSession('claim', { walletHash: null }, { fetchFn }), /request/);
+  await assert.rejects(startLinkSession('claim', { walletHash: walletHash(WALLET) }, { fetchFn }), /request/);
 });
 
 test('a second device answering first: the real app gets 409, the page reads the first answer', async () => {
   const { fetchFn } = world();
-  const { session } = await startLinkSession('claim', { walletHash: null }, { fetchFn });
+  const { session } = await startLinkSession('claim', { walletHash: walletHash(WALLET), nodeId: superNodeId(WALLET) }, { fetchFn });
   assert.equal((await app(fetchFn, session.link, { status: 'rejected' })).status, 201);
   const late = appSeal({ id: session.id, intent: 'claim', sitePub: session.sitePub, plaintext: '{"v":1,"intent":"claim","status":"rejected"}', reqHash: session.reqHash });
   const res = await fetchFn(`${ORIGIN}/api/link/sessions/${session.id}/response`, {
@@ -154,7 +161,9 @@ test('an answer sealed for another session, another request or swapped by the re
 });
 
 test('the vectors\' answers read through the client, check number included', async () => {
-  for (const c of LINK.cases.filter((x) => x.intent !== 'link' || JSON.parse(x.plaintext).status !== 'ok')) {
+  // The earlier `claim` request named no node: the node claim vectors' requests stand in for it.
+  const cases = [...LINK.cases.filter((x) => x.intent !== 'claim'), ...CLAIM.cases];
+  for (const c of cases.filter((x) => x.intent !== 'link' || JSON.parse(x.plaintext).status !== 'ok')) {
     const { siteSession } = await import('../qnet-link-crypto.ts');
     const s = siteSession(c.sessionId, c.intent, c.request, Uint8Array.from(Buffer.from(c.sitePrivateKey, 'hex')));
     // A `reserve` answer is read with the site's verifier of the wallet's signed reservation, as the activation page does.

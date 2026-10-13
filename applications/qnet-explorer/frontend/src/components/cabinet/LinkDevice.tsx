@@ -5,7 +5,9 @@
 // the node; the one linked before it stops. Its button on this phone or tablet, or its QR code for another device; a
 // QR request for a wallet the page learned from a QR answer carries the check number (section 14.4). The answer is
 // QNet Wallet's report: the device rows follow the chain. `move`: a device is linked, and the card reads as moving the
-// node to another device (the Device tab, beside Unlink the device); the request is the same.
+// node to another device (the Device tab, beside Unlink the device); `relink`: the Offline device's one action inside
+// the Overview's status card, with no card of its own, "Run the node on this phone" (owner, 11.10; "that phone" on a
+// computer, where it shows a QR code). The request is the same.
 
 import { useEffect, useRef } from 'react';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
@@ -23,8 +25,8 @@ function answerKey(answer: LinkAnswer): MessageKey {
   return 'link_answer_rejected';
 }
 
-export default function LinkDevice({ onLinked, move = false }: { onLinked: () => void; move?: boolean }) {
-  const { choice, walletHash, phoneFlows } = useCabinet();
+export default function LinkDevice({ onLinked, move = false, relink = false }: { onLinked: () => void; move?: boolean; relink?: boolean }) {
+  const { choice, walletHash, viewOnly, phoneFlows } = useCabinet();
   const device = useDeviceKind();
   // The button on this device, and a request shown as a QR code: two sessions, never one.
   const button = useLinkSession({ slot: 'devices' });
@@ -38,7 +40,10 @@ export default function LinkDevice({ onLinked, move = false }: { onLinked: () =>
     if (linked) onLinkedRef.current();
   }, [linked]);
 
+  // An address only viewed is never offered a link.
+  if (viewOnly) return null;
   // Until the site sends link requests, the way is the app's own Node tab: said in the card's own words, not as a note.
+  if (!phoneFlows && relink) return <p className="activate-note">{t('relink_closed')}</p>;
   if (!phoneFlows) {
     return (
       <div className="activate-card">
@@ -62,14 +67,15 @@ export default function LinkDevice({ onLinked, move = false }: { onLinked: () =>
 
   const done = active?.state.phase === 'done' ? active.state : null;
   const title: MessageKey = move ? 'devices_move_title' : 'action_link_device';
+  // On a computer the request shows a QR code for the phone, so the button does not say "this phone".
+  const label: MessageKey = relink ? (device && !device.phone ? 'relink_button_qr' : 'relink_button') : title;
   const checked = done !== null && (done.request as LinkDeviceRequest | null)?.check === true && done.answer.status === 'linked';
 
-  return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t(title)}</h3>
-      <p className="activate-note">{t(move ? 'devices_move_lead' : 'devices_link_lead')}</p>
+  const body = (
+    <>
+      <p className="activate-note">{t(relink ? 'relink_lead' : move ? 'devices_move_lead' : 'devices_link_lead')}</p>
       {!active || active.state.phase === 'idle' ? (
-        <button type="button" className="qnet-button activate-primary" onClick={ask} disabled={!device}>{t(title)}</button>
+        <button type="button" className="qnet-button activate-primary" onClick={ask} disabled={!device}>{t(label)}</button>
       ) : done ? (
         <>
           <p className="activate-note" role="status">{t(answerKey(done.answer))}</p>
@@ -86,6 +92,13 @@ export default function LinkDevice({ onLinked, move = false }: { onLinked: () =>
           onRetry={active === qr ? () => void qr.start('link', request(true)) : () => void button.start('link', request(false))}
         />
       )}
+    </>
+  );
+  if (relink) return <div className="cabinet-choice">{body}</div>;
+  return (
+    <div className="activate-card">
+      <h3 className="activate-step">{t(title)}</h3>
+      {body}
     </div>
   );
 }

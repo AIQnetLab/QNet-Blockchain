@@ -1,7 +1,7 @@
 {
   "name": "@aiqnet/sdk",
   "version": "2.0.0",
-  "description": "QNet developer kit: wallet connection and sign-in for web pages, transaction builders, a node client and the qnet command line",
+  "description": "QNet Blockchain developer kit: wallet connection and sign-in for web pages, transaction builders, a node client and the qnet command line",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {

@@ -4,22 +4,22 @@ Business Source License 1.1
 SUMMARY (not a substitute for the terms below, but it is what they mean)
 
   YOU MAY, freely and commercially, with no agreement to sign and no fee:
-    - run QNet nodes of any type and earn network rewards;
+    - run QNet Blockchain nodes of any type and earn network rewards;
     - serve RPC/API/WebSocket endpoints from your nodes, publicly, free or paid;
     - run explorers, faucets, dashboards, indexers, bridges and bots;
     - write, deploy and operate smart contracts, tokens and applications;
     - use it inside your company, and study or security-test it.
 
   YOU MAY NOT:
-    - use this code to launch a blockchain network other than QNet;
+    - use this code to launch a blockchain network other than QNet Blockchain;
     - sell "we host your node" as a product built on this code
       (running your own nodes and serving them publicly is fine);
     - ship modified copies of this software as a replacement for it;
     - strip the notices.
 
-  If you are running nodes or building on QNet, everything you need is already
-  granted. The restrictions exist to stop the network being cloned, not to stop
-  it being used.
+  If you are running nodes or building on QNet Blockchain, everything you need
+  is already granted. The restrictions exist to stop the network being cloned,
+  not to stop it being used.
 
 
 Parameters
@@ -30,17 +30,18 @@ Licensed Work:        QNet Blockchain Node Software
 Additional Use Grant: You may use the Licensed Work in production, including
                       commercially, for all of the following:
 
-                      (a) Running one or more QNet nodes of any type (super,
-                          full, light) that participate in the QNet network,
-                          including earning network rewards for doing so.
+                      (a) Running one or more QNet Blockchain nodes of any
+                          type (super, full, light) that participate in QNet
+                          Blockchain, including earning network rewards for
+                          doing so.
                       (b) Operating public endpoints from such a node — RPC,
                           API, WebSocket, explorers, faucets, dashboards and
                           similar services — for your own use or for the public,
                           free or paid.
                       (c) Developing, deploying and operating smart contracts,
                           tokens, wallets, SDKs, bots, indexers, bridges and
-                          any other applications that interact with the QNet
-                          network.
+                          any other applications that interact with QNet
+                          Blockchain.
                       (d) Internal business use, evaluation, testing, research,
                           education, and security research.
 
@@ -52,9 +53,10 @@ Change License:       N/A
 
 Additional Restrictions:
                       1. You may not use the Licensed Work, or any derivative of
-                         it, to operate a blockchain network other than QNet.
-                         This is the core restriction: the grant above is for
-                         participating in QNet, not for launching a copy of it.
+                         it, to operate a blockchain network other than QNet
+                         Blockchain. This is the core restriction: the grant
+                         above is for participating in QNet Blockchain, not for
+                         launching a copy of it.
                       2. You may not offer the Licensed Work itself to third
                          parties as a managed or hosted product (for example,
                          "node hosting as a service" where the customer's node
@@ -159,4 +161,4 @@ written consent.
 
 ---
 
-For commercial licensing inquiries, contact: support@qnet.io
+For commercial licensing inquiries, contact: support@aiqnet.io

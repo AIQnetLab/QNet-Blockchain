@@ -1,6 +1,6 @@
 # @aiqnet/sdk
 
-The QNet developer kit: wallet connection and sign-in for web pages, the transaction builders the wallets use, a
+The QNet Blockchain developer kit: wallet connection and sign-in for web pages, the transaction builders the wallets use, a
 client for the nodes' HTTP API, encrypted key files, and the `qnet` command line. Version 2.0.0, ES modules with
 type declarations, Node 20 or later and current browsers.
 
@@ -15,7 +15,7 @@ chain data it reads from the nodes' public routes, which allow any origin, or th
 
 ## Install
 
-The package is not published to the npm registry, and no registry name is QNet's until it is: never run
+The package is not published to the npm registry, and no registry name is the project's until it is: never run
 `npm install @aiqnet/sdk` (or any other name) against the registry, since whoever holds that name would run code
 beside your keys. Build it from this repository and install the file:
 
@@ -46,7 +46,7 @@ The transaction formats are not copied here. `build.mjs` compiles them from thei
 ```js
 import { findWallet } from '@aiqnet/sdk';
 
-const wallet = await findWallet();                 // null when no QNet wallet is installed
+const wallet = await findWallet();                 // null when no QNet Blockchain wallet is installed
 const { qnet } = await wallet.connect();           // the user approves the site once
 const sent = await wallet.sendTransfer({ to: '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d', amount: '1.5' });
 // (sent.from, sent.nonce) is the transaction's identity; sent.txHash is one node's name for its copy.

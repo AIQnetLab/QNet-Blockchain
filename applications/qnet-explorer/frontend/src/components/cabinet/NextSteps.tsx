@@ -28,13 +28,12 @@ import { RUNNING_A_NODE } from '@/lib/cabinet/guide';
 import type { ConsentBody, SubmitBody, SubmitOutcome } from '@/lib/cabinet/registration';
 import { TAB_HREF } from '@/lib/cabinet/tabs';
 import { nextStep, type Check, type KnownBurn } from '@/lib/cabinet/wallet-activation';
-import { walletHash, type ActivationErrorCode, type LinkAnswer, type LinkDeviceRequest } from '@/lib/qnet-link';
+import { superNodeId, walletHash, type ActivationErrorCode, type LinkAnswer, type LinkDeviceRequest } from '@/lib/qnet-link';
 import { shortAddress } from '@/lib/qnet-provider';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
 import { useCabinet } from './CabinetProvider';
-import ConnectFirst from './ConnectFirst';
 import CopyButton from './CopyButton';
 import LinkDevice from './LinkDevice';
 import LinkWaiting from './LinkWaiting';
@@ -71,7 +70,7 @@ function Step({ at, children }: { at: 'done' | 'now' | 'ahead'; children: ReactN
 export function Recording({ qnet, since, burnFinal = true, pending = false, askAgain = true }: {
   qnet: string; since: number | null; burnFinal?: boolean; pending?: boolean; askAgain?: boolean;
 }) {
-  const { choice, view, keepActivation, refreshActivation } = useCabinet();
+  const { choice, viewOnly, view, keepActivation, refreshActivation } = useCabinet();
   const { providerStatus, providerChannel, accounts, activateNode } = useWallet();
   const [shown] = useState(() => Date.now());
   const [now, setNow] = useState(() => Date.now());
@@ -118,7 +117,7 @@ export function Recording({ qnet, since, burnFinal = true, pending = false, askA
       {view.networkDown && choice?.qnet === qnet && <p className="activate-note" role="status">{t('next_network_down')}</p>}
       {/* Asking again is the extension's own way: a browser without it waits for the network, and a burn that does not
           end up registered comes back with Continue in QNet Wallet. */}
-      {late && askAgain && extension && (
+      {late && askAgain && extension && !viewOnly && (
         <div className="cabinet-choice">
           {holds ? (
             <>
@@ -184,20 +183,20 @@ export function LinkPhone({ onLinked }: { onLinked?: () => void }) {
         {!onLinked && phoneFlows && !viewOnly && <Link href={TAB_HREF.device} className="qnet-button activate-primary">{t('action_link_device')}</Link>}
         <p className="activate-note">{t('next_link_done')}</p>
       </div>
-      {onLinked && phoneFlows && (viewOnly ? <div className="activate-card"><ConnectFirst /></div> : <LinkDevice onLinked={onLinked} />)}
+      {onLinked && phoneFlows && !viewOnly && <LinkDevice onLinked={onLinked} />}
     </>
   );
 }
 
 // A wallet with a node, on a page that is not the Overview (Activate): the step it is on, right here (nextStep): Link your
-// phone with one tap to the Device tab; otherwise the Overview, where I'm back is for an Offline device, with the words
-// of the step (a new device waiting for its first answer, a running node, a super node's server, or a node whose status
-// is not read yet).
+// phone with one tap to the Device tab; otherwise the Overview, where an Offline device's phone runs the node again, with
+// the words of the step (a new device waiting for its first answer, a running node, a super node's server, or a node
+// whose status is not read yet).
 export function NodeNext() {
   const { view } = useCabinet();
   const step = nextStep(view);
   if (step === 'link') return <LinkPhone />;
-  const text: MessageKey = step === 'wake' ? 'next_offline' : step === 'answer' ? 'next_device_pending' : step === 'running' ? 'next_running'
+  const text: MessageKey = step === 'offline' ? 'next_offline' : step === 'answer' ? 'next_device_pending' : step === 'running' ? 'next_running'
     : step === 'server' ? 'next_super' : 'act_wallet_has_node';
   return (
     <div className="activate-card">
@@ -217,60 +216,99 @@ function Command({ text }: { text: string }) {
   );
 }
 
-// The node software's repository and the branch its image is built from (docs/operators/running-a-node.md).
-const NODE_REPOSITORY = 'https://github.com/AIQnetLab/QNet-Blockchain.git';
-const NODE_BRANCH = 'testnet';
+// The node software's image, public and built for every release of the testnet branch (.github/workflows/deploy.yml):
+// the server downloads it, no build there. Its own folder on the server holds the recovery phrase and the chain data.
+const NODE_IMAGE = 'ghcr.io/aiqnetlab/qnet-production:latest';
+const NODE_DIR = '/opt/qnet';
+const NODE_CONTAINER = 'qnet-super';
+// One IPv4 octet, 0 to 255, and the ranges that are not a public address, as bash regular expressions.
+const OCTET = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
+const PRIVATE_IPV4 = '^(0|10|127)\\.|^169\\.254\\.|^172\\.(1[6-9]|2[0-9]|3[01])\\.|^192\\.168\\.|^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.|^(22[4-9]|2[3-5][0-9])\\.';
 
-// A super node's server, after its burn (R3): every step, each with its commands (docs/operators/running-a-node.md: the
-// ports, the image, the recovery phrase in a file, the settings with the code and the burn, the start and its check).
-// Never a phone.
-export function SuperNext({ code, burnTx, burnAmount }: { code: string; burnTx: string; burnAmount: number }) {
-  const ports = 'sudo ufw allow 9876,9877,8001/tcp\nsudo ufw allow 10876/udp';
-  const build = [
-    `git clone ${NODE_REPOSITORY}`,
-    'cd QNet-Blockchain',
-    `git checkout ${NODE_BRANCH}`,
-    'docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .',
+// A super node's server, after its burn (R3): every step with its commands, as the node and its image do them today
+// (owner, 11.10; docs/operators/running-a-node.md): the server and its provider's firewall (the node's pre-flight cannot
+// see a closed inbound port, and published ports bypass the host's own firewall), the recovery phrase in a root-only
+// file typed with no shell history, the server's public IPv4 (written on the network at registration; peers then take
+// this node's connections from that address only), the image pulled and started with absolute paths, the check (its
+// height, its catching up, its activation and registration in the log, and what each failure means), a new release, and
+// the timeline. Never a phone. `nodeId`: the super node's id the log names, when known.
+export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: string; burnTx: string; burnAmount: number; nodeId?: string | null }) {
+  const server = 'free -m\ntimedatectl show -p NTPSynchronized --value';
+  const seed = [
+    `install -d -m 700 ${NODE_DIR}`,
+    `(umask 077; read -rs -p 'Recovery phrase: ' P; echo; printf %s "$P" > ${NODE_DIR}/qnet_seed; unset P)`,
   ].join('\n');
-  const seed = 'printf %s "your recovery phrase words" > ./qnet_seed\nchmod 600 ./qnet_seed';
-  const settings = `QNET_ACTIVATION_CODE=${code}\nQNET_BURN_TX_HASH=${burnTx}\nQNET_BURN_AMOUNT=${burnAmount}\nQNET_WALLET_SEED_FILE=/run/secrets/qnet_seed`;
-  const command = [
-    'docker run -d --name qnet-super --restart=always \\',
-    '  --log-opt max-size=200m --log-opt max-file=50 \\',
+  // The address is committed at registration with no later change, so the step lists the server's own addresses and
+  // takes only a dotted public IPv4 (no private, loopback, link-local, shared or multicast range), asked again until it
+  // is one.
+  const address = [
+    "ip -4 -o addr show scope global | awk '{print $4}'",
+    "while read -r -p 'Public IPv4 address of this server: ' QNET_IP; do",
+    `  [[ $QNET_IP =~ ^(${OCTET}\\.){3}${OCTET}$ ]] && ! [[ $QNET_IP =~ ${PRIVATE_IPV4} ]] && break`,
+    "  echo 'Not a public IPv4 address. Type it again.'; unset QNET_IP",
+    'done',
+  ].join('\n');
+  // The limit counts the chain data already in /opt/qnet/data with the free space, so a start after an update keeps the
+  // first one's limit (free space alone shrinks it by the data, and the node refuses new blocks at 95% of it).
+  const start = [
+    `docker pull ${NODE_IMAGE}`,
+    `FREE_GB=$(df -BG --output=avail ${NODE_DIR} | tail -n 1 | tr -dc 0-9)`,
+    `DATA_GB=$(du -s -BG ${NODE_DIR}/data 2>/dev/null | cut -f 1 | tr -dc 0-9)`,
+    'QNET_GB=$(( (FREE_GB + ${DATA_GB:-0}) * 8 / 10 ))',
+    `docker run -d --name ${NODE_CONTAINER} --restart=always \\`,
+    '  --log-opt max-size=100m --log-opt max-file=10 \\',
     '  -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \\',
+    '  -e QNET_PUBLIC_IP="${QNET_IP:?run the address step first}" \\',
     `  -e QNET_ACTIVATION_CODE="${code}" \\`,
     `  -e QNET_BURN_TX_HASH="${burnTx}" \\`,
     `  -e QNET_BURN_AMOUNT="${burnAmount}" \\`,
-    '  -v $(pwd)/qnet_seed:/run/secrets/qnet_seed:ro -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \\',
-    '  -p 8001:8001 -p 9876:9876 -p 9877:9877 -p 10876:10876/udp \\',
-    '  -v $(pwd)/qnet_data:/app/data qnet-production',
+    '  -e QNET_MAX_STORAGE_GB="$QNET_GB" \\',
+    `  -v ${NODE_DIR}/qnet_seed:/run/secrets/qnet_seed:ro -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \\`,
+    // The API on IPv4 only, as docs/operators/running-a-node.md and scripts/install-super-node.sh publish it: over IPv6
+    // the container runtime's proxy hides the client's address, and the node would take a header that client wrote.
+    '  -p 0.0.0.0:8001:8001 -p 9876:9876 -p 9877:9877 -p 10876:10876/udp \\',
+    `  -v ${NODE_DIR}/data:/app/data ${NODE_IMAGE}`,
   ].join('\n');
-  const check = 'curl -s http://localhost:8001/healthz';
+  const check = [
+    'curl -s http://localhost:8001/healthz',
+    'curl -s http://localhost:8001/api/v1/sync/status',
+    // A burn the network does not find and a refused start are logged untagged (activation_code_save_failed, and
+    // blockchain_node_failed or start_failed with "Insufficient RAM"), so the filter names them too.
+    `docker logs ${NODE_CONTAINER} 2>&1 | grep -E '\\[ACTIVATION\\]|\\[REG\\]|activation_code_save_failed|blockchain_node_failed|start_failed'`,
+  ].join('\n');
+  const update = `docker pull ${NODE_IMAGE}\ndocker stop -t 60 ${NODE_CONTAINER} && docker rm ${NODE_CONTAINER}`;
   return (
     <div className="activate-next">
       <h4>{t('super_steps_title')}</h4>
       <ol className="activate-facts">
         <li>
           <p>{t('super_step_server')}</p>
-          <Command text={ports} />
-        </li>
-        <li>
-          <p>{t('super_step_build')}</p>
-          <Command text={build} />
+          <Command text={server} />
+          <p className="activate-note">{t('super_step_firewall')}</p>
         </li>
         <li>
           <p>{t('super_step_seed')}</p>
           <Command text={seed} />
           <p className="activate-note">{t('ext_super_spelling')}</p>
+          <p className="activate-note">{t('super_step_dedicated')}</p>
+        </li>
+        <li>
+          <p>{t('super_step_ip')}</p>
+          <Command text={address} />
         </li>
         <li>
           <p>{t('super_step_start')}</p>
-          <Command text={settings} />
-          <Command text={command} />
+          <Command text={start} />
         </li>
         <li>
           <p>{t('super_step_check')}</p>
           <Command text={check} />
+          {nodeId && <p className="activate-note">{t('super_step_node_id', { id: nodeId })}</p>}
+          <p className="activate-note">{t('super_step_errors')}</p>
+        </li>
+        <li>
+          <p>{t('super_step_update')}</p>
+          <Command text={update} />
         </li>
       </ol>
       <p className="activate-note">{t('super_step_joined')}</p>
@@ -374,7 +412,7 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
     void post(consent);
   }, [answer, usable, qnet, burn.burnTx, burn.burnAmount, burner, post]);
 
-  if (viewOnly) return <div className="activate-card"><p>{t('burned_payment_lead')}</p><ConnectFirst /></div>;
+  if (viewOnly) return <div className="activate-card"><p>{t('burned_payment_lead')}</p></div>;
   if (outcome && (outcome.result === 'admitted' || outcome.result === 'registered')) {
     return <Recording qnet={qnet} since={null} pending={outcome.result === 'registered'} askAgain={false} />;
   }
@@ -416,7 +454,7 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
 // is registered with QNet Wallet from this browser, whatever it is; only a burn the extension here just made and
 // records itself waits for it.
 function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
-  const { activation, choice } = useCabinet();
+  const { activation, choice, viewOnly, view } = useCabinet();
   const { providerStatus, providerChannel, accounts } = useWallet();
   const records = usePaymentRecords();
   const here = (records ?? []).some((r) => isUnfinished(r) && r.burn?.tx === burn.burnTx && r.stage !== 'closing');
@@ -429,11 +467,17 @@ function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
     <>
       <CodeCard burn={burn} />
       {next.step === 'server' ? (
-        burn.code && <div className="activate-card"><SuperNext code={burn.code} burnTx={burn.burnTx} burnAmount={burn.burnAmount} /></div>
+        burn.code && (
+          <div className="activate-card">
+            {/* The network sees the server before its registration lands: it is catching up (best effort, never a no). */}
+            {view.superConnected && <p className="activate-status" role="status">{t('super_connected')}</p>}
+            <SuperNext code={burn.code} burnTx={burn.burnTx} burnAmount={burn.burnAmount} nodeId={superNodeId(qnet)} />
+          </div>
+        )
       ) : next.step === 'resume' ? (
         <div className="activate-card">
           <p>{t('next_resume')}</p>
-          <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>
+          {!viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
         </div>
       ) : next.step === 'finish' ? (
         <FinishLight qnet={qnet} burn={burn} burner={next.burner} />
@@ -481,7 +525,7 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
       return card(view.here ? (
         <>
           <p>{t('state_reserved_here')}</p>
-          <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>
+          {!viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
         </>
       ) : <p>{t('state_reserved', { time: shownTime(view.until) })}</p>);
     case 'sending':
@@ -509,7 +553,8 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
       return card(
         <>
           <p>{t('no_node')}</p>
-          {viewOnly ? <ConnectFirst /> : (
+          {/* An address only viewed is offered no activation: only the wallet itself starts one. */}
+          {!viewOnly && (
             <div className="cabinet-actions">
               <Link href={`${TAB_HREF.activate}?type=light`} className="qnet-button activate-primary">{t('action_activate_light')}</Link>
               <Link href={`${TAB_HREF.activate}?type=super`} className="qnet-button secondary">{t('action_activate_super')}</Link>

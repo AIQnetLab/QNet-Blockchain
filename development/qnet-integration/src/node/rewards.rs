@@ -299,16 +299,114 @@ impl BlockchainNode {
     /// root/super_elig_/light_bm_ stay, so an older claim self-heals through backfill_reward_shards.
     /// Called from every shard writer so no path can forget it.
     pub(super) fn prune_reward_shard_cache(storage: &crate::storage::Storage, epoch: u64) {
+        let floor = Self::recipient_index_hold(storage, Self::reward_shard_retention_floor(epoch));
+        if floor > 0 {
+            if let Err(e) = storage.prune_epoch_reward_shards(floor) {
+                println!("[WARN][REWARD] shard_prune_failed before_epoch={} err={}", floor, e);
+            }
+        }
+    }
+
+    /// The lowest epoch key the shard cache keeps once `newest` is written; 0 while nothing is due.
+    pub(crate) fn reward_shard_retention_floor(newest: u64) -> u64 {
         // Retention is in EPOCHS, but the key is a macroblock index that advances by MB_PER_EPOCH per
         // emission — subtracting the epoch count directly kept ~1.6 epochs, not 256.
         const SHARD_CACHE_RETAIN_EPOCHS: u64 = 256;
-        let span = SHARD_CACHE_RETAIN_EPOCHS.saturating_mul(crate::reward_epoch::MB_PER_EPOCH);
-        if let Some(floor) = epoch.checked_sub(span) {
-            if floor > 0 {
-                if let Err(e) = storage.prune_epoch_reward_shards(floor) {
-                    println!("[WARN][REWARD] shard_prune_failed before_epoch={} err={}", floor, e);
+        newest.saturating_sub(SHARD_CACHE_RETAIN_EPOCHS.saturating_mul(crate::reward_epoch::MB_PER_EPOCH))
+    }
+
+    /// The prune floor lowered to the oldest cached epoch that still waits for its recipient index: an epoch
+    /// leaves the cache only once a claim walk can pass it from the index. One whose shards do not recombine to
+    /// its certified root can get no index and is not held. The hold is bounded, so an index pass that never
+    /// runs cannot grow the cache without limit.
+    pub(crate) fn recipient_index_hold(storage: &crate::storage::Storage, floor: u64) -> u64 {
+        const HOLD_MAX_EPOCHS: u64 = 64;
+        let lowest_held = floor.saturating_sub(HOLD_MAX_EPOCHS.saturating_mul(crate::reward_epoch::MB_PER_EPOCH));
+        for e in storage.reward_shard_meta_epochs().unwrap_or_default() {
+            if e >= floor { break; }
+            if e < lowest_held || storage.reward_recipient_index_root(e).is_some() { continue; }
+            if Self::certified_shards_root(storage, e).is_some() { return e; }
+        }
+        floor
+    }
+
+    /// The epoch's certified root when its cached shard roots recombine to it.
+    fn certified_shards_root(storage: &crate::storage::Storage, epoch: u64) -> Option<[u8; 32]> {
+        let root = storage.load_epoch_root(epoch).ok().flatten().filter(|r| *r != [0u8; 32])?;
+        let (roots, bounds) = storage.load_epoch_shard_meta(epoch).ok().flatten()?;
+        (!roots.is_empty() && bounds.len() == roots.len()
+            && qnet_core::crypto::merkle::merkle_continue_root(&roots) == root).then_some(root)
+    }
+
+    /// Write the epoch's recipient index from a leaf set already checked against `root`.
+    pub(crate) fn index_epoch_recipients(storage: &crate::storage::Storage, epoch: u64, root: &[u8; 32], wallets: &[(String, u64)]) -> bool {
+        let entries = wallets.iter()
+            .map(|(w, a)| (crate::storage::Storage::reward_recipient_fingerprint(w), *a)).collect();
+        match storage.save_reward_recipient_index(epoch, root, entries) {
+            Ok(()) => true,
+            Err(e) => {
+                println!("[WARN][REWARD] recipient_index_write_failed epoch={} err={}", epoch, e);
+                false
+            }
+        }
+    }
+
+    /// Index one epoch from its cached shards, read one shard at a time. False when the shards are not all here
+    /// or do not recombine to the certified root.
+    pub(crate) fn index_epoch_recipients_from_shards(storage: &crate::storage::Storage, epoch: u64) -> bool {
+        let Some(root) = Self::certified_shards_root(storage, epoch) else { return false };
+        let shards = match storage.load_epoch_shard_meta(epoch) { Ok(Some((r, _))) => r.len(), _ => return false };
+        let mut entries: Vec<(u128, u64)> = Vec::new();
+        for s in 0..shards {
+            match storage.load_epoch_reward_shard(epoch, s) {
+                Ok(Some(shard)) => entries.extend(shard.iter()
+                    .map(|(w, a)| (crate::storage::Storage::reward_recipient_fingerprint(w), *a))),
+                _ => return false,
+            }
+        }
+        match storage.save_reward_recipient_index(epoch, &root, entries) {
+            Ok(()) => true,
+            Err(e) => {
+                println!("[WARN][REWARD] recipient_index_write_failed epoch={} err={}", epoch, e);
+                false
+            }
+        }
+    }
+
+    /// Index the cached epochs that have no recipient index yet, oldest first, a few per pass. Off the apply path
+    /// (the periodic cleanup and boot); the prune holds an epoch until it is indexed.
+    pub(crate) fn index_reward_recipients(storage: &crate::storage::Storage) -> u32 {
+        const PER_PASS: u32 = 4;
+        let mut done = 0u32;
+        for e in storage.reward_shard_meta_epochs().unwrap_or_default() {
+            if done >= PER_PASS { break; }
+            if storage.reward_recipient_index_root(e).is_some() { continue; }
+            if Self::index_epoch_recipients_from_shards(storage, e) { done += 1; }
+        }
+        if done > 0 && is_info() { println!("[INFO][REWARD] recipient_index_built epochs={}", done); }
+        done
+    }
+
+    /// `reward_proof_from_shard`, falling back to the recipient index when the epoch's shards are not here: a wallet
+    /// the index has no entry for reads NotRecipient, and an amount-only ask gets the indexed amount. A proof still
+    /// needs the shards (Absent), so the claim path rebuilds only epochs the wallet holds a leaf in.
+    pub(crate) fn reward_claim_at(
+        storage: &crate::storage::Storage,
+        epoch: u64,
+        committed_root: &str,
+        wallet: &str,
+        want_proof: bool,
+    ) -> ShardClaim {
+        match Self::reward_proof_from_shard(storage, epoch, committed_root, wallet, want_proof) {
+            ShardClaim::Absent => {
+                let root = hex::decode(committed_root).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                match root.and_then(|r| storage.reward_recipient_lookup(epoch, &r, wallet)) {
+                    Some(None) => ShardClaim::NotRecipient,
+                    Some(Some(amount)) if !want_proof => ShardClaim::Proof(amount, Vec::new()),
+                    _ => ShardClaim::Absent,
                 }
             }
+            other => other,
         }
     }
 
@@ -763,4 +861,203 @@ impl BlockchainNode {
         }
     }
 
+}
+
+#[cfg(test)]
+mod recipient_index_tests {
+    use super::*;
+
+    const MB: u64 = crate::reward_epoch::MB_PER_EPOCH;
+
+    fn storage() -> (tempfile::TempDir, crate::storage::Storage) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        (dir, s)
+    }
+
+    fn root_bytes(hex_root: &str) -> [u8; 32] {
+        <[u8; 32]>::try_from(hex::decode(hex_root).unwrap().as_slice()).unwrap()
+    }
+
+    /// Epoch `epoch` paying `fillers` filler wallets plus `extra`; certified root seeded, shard cache written.
+    fn seed_epoch(s: &crate::storage::Storage, epoch: u64, fillers: usize, extra: &[(&str, u64)]) -> String {
+        let mut set: Vec<(String, u64)> = (0..fillers).map(|i| (format!("eonfill{:04}_{:06}", i, epoch), 1_000)).collect();
+        set.extend(extra.iter().map(|(w, a)| (w.to_string(), *a)));
+        set.sort();
+        let root = BlockchainNode::epoch_reward_merkle_root(&set, epoch);
+        s.seed_epoch_root_for_test(epoch, root_bytes(&root));
+        BlockchainNode::save_epoch_reward_sharded(s, epoch, &set);
+        root
+    }
+
+    // The index answers recipient, amount and absence exactly, only for the root it was built from, and keeps
+    // full amounts when an epoch has more distinct amounts than a class byte holds.
+    #[test]
+    fn the_index_answers_for_its_own_root_only() {
+        let (_d, s) = storage();
+        let root = [7u8; 32];
+        let entries: Vec<(u128, u64)> = (0..3000u64)
+            .map(|i| (crate::storage::Storage::reward_recipient_fingerprint(&format!("w{}", i)), 10 + i % 3)).collect();
+        s.save_reward_recipient_index(320, &root, entries).unwrap();
+        assert_eq!(s.reward_recipient_lookup(320, &root, "w7"), Some(Some(11)));
+        assert_eq!(s.reward_recipient_lookup(320, &root, "w2999"), Some(Some(10 + 2999 % 3)));
+        assert_eq!(s.reward_recipient_lookup(320, &root, "nobody"), Some(None));
+        assert_eq!(s.reward_recipient_lookup(320, &[8u8; 32], "w7"), None, "another root: no answer");
+        assert_eq!(s.reward_recipient_lookup(480, &root, "w7"), None, "no index for that epoch");
+        assert_eq!(s.reward_recipient_index_root(320), Some(root));
+
+        let wide: Vec<(u128, u64)> = (0..400u64)
+            .map(|i| (crate::storage::Storage::reward_recipient_fingerprint(&format!("v{}", i)), 1_000 + i)).collect();
+        s.save_reward_recipient_index(320, &root, wide).unwrap();
+        assert_eq!(s.reward_recipient_lookup(320, &root, "v399"), Some(Some(1_399)), "full amounts past 255 classes");
+        assert_eq!(s.reward_recipient_lookup(320, &root, "w7"), Some(None), "a rewrite replaces the epoch's index");
+    }
+
+    // A wallet that never claimed (watermark 0) and is paid only in an epoch far above, after the shard cache of
+    // every earlier epoch was pruned: the walk passes each of them from the index with no rebuild, reaches the
+    // paid epoch, and the balance routes count an indexed epoch's amount. Without an index the epoch reads Absent.
+    #[test]
+    fn a_never_claimed_wallet_passes_pruned_epochs_without_rebuilds() {
+        let (_d, s) = storage();
+        let w = "eonwallet_first_paid_late";
+        let epochs: Vec<u64> = (1..=7u64).map(|i| i * MB).collect();
+        let mut roots = std::collections::HashMap::new();
+        for (i, e) in epochs.iter().enumerate() {
+            let extra: Vec<(&str, u64)> = match i { 2 => vec![("eonsometimes", 5)], 6 => vec![(w, 777)], _ => vec![] };
+            roots.insert(*e, seed_epoch(&s, *e, 40, &extra));
+        }
+        let unindexed = epochs[1];
+        while BlockchainNode::index_reward_recipients(&s) > 0 {}
+        // One epoch's index names another root, as an index this node cannot use.
+        s.save_reward_recipient_index(unindexed, &[9u8; 32], Vec::new()).unwrap();
+        let last = *epochs.last().unwrap();
+        s.prune_epoch_reward_shards(last).unwrap();
+
+        let mut absent = Vec::new();
+        let mut first_paid = None;
+        for e in crate::reward_epoch::grid_epochs_after(&s, 0) {
+            match BlockchainNode::reward_claim_at(&s, e, &roots[&e], w, true) {
+                ShardClaim::NotRecipient => {}
+                ShardClaim::Absent => absent.push(e),
+                ShardClaim::Proof(a, _) => { first_paid = Some((e, a)); break; }
+                other => panic!("epoch {} {:?}", e, other),
+            }
+        }
+        assert_eq!(absent, vec![unindexed], "only the epoch without a usable index needs a rebuild");
+        assert_eq!(first_paid, Some((last, 777)));
+
+        let paid_pruned = epochs[2];
+        assert!(matches!(BlockchainNode::reward_claim_at(&s, paid_pruned, &roots[&paid_pruned], "eonsometimes", false),
+                         ShardClaim::Proof(5, ref p) if p.is_empty()), "the balance routes count it");
+        assert!(matches!(BlockchainNode::reward_claim_at(&s, paid_pruned, &roots[&paid_pruned], "eonsometimes", true),
+                         ShardClaim::Absent), "a proof still needs the shards");
+    }
+
+    // The prune keeps an epoch whose shards recombine to its root until it has an index, and does not hold one
+    // whose shards cannot give one.
+    #[test]
+    fn the_prune_waits_for_the_index() {
+        let (_d, s) = storage();
+        let e1 = MB;
+        let e2 = 2 * MB;
+        seed_epoch(&s, e1, 10, &[]);
+        seed_epoch(&s, e2, 10, &[]);
+        s.seed_epoch_root_for_test(e2, [3u8; 32]); // its shards no longer recombine to the certified root
+        let floor = 3 * MB;
+        assert_eq!(BlockchainNode::recipient_index_hold(&s, floor), e1, "unindexed and indexable: held");
+        assert!(BlockchainNode::index_epoch_recipients_from_shards(&s, e1));
+        assert!(!BlockchainNode::index_epoch_recipients_from_shards(&s, e2), "no index from shards off the root");
+        assert_eq!(BlockchainNode::recipient_index_hold(&s, floor), floor, "indexed, and the other cannot be");
+        BlockchainNode::prune_reward_shard_cache(&s, floor + 256 * MB);
+        assert!(s.load_epoch_shard_meta(e1).unwrap().is_none(), "pruned once indexed");
+        assert!(s.reward_recipient_index_root(e1).is_some(), "the index outlives the shards");
+    }
+
+    // Below the retention floor no peer serves the leaf set, so those epochs are no gap to pull.
+    #[test]
+    fn pruned_epochs_are_not_repair_targets() {
+        let (_d, s) = storage();
+        let newest = 260 * MB;
+        for i in 1..=260u64 { s.seed_epoch_root_for_test(i * MB, [1u8; 32]); }
+        let floor = BlockchainNode::reward_shard_retention_floor(newest);
+        assert_eq!(floor, 4 * MB);
+        let targets = BlockchainNode::unservable_reward_epochs(&s, 2);
+        assert_eq!(targets.iter().map(|t| t.0).collect::<Vec<_>>(), vec![4 * MB, 5 * MB]);
+    }
+
+    fn claim(wallet: &str, ts: u64, epochs: &[u64]) -> qnet_state::Transaction {
+        let entries: Vec<String> = epochs.iter().map(|e| format!(r#"{{"epoch":{},"amount":1,"proof":[]}}"#, e)).collect();
+        crate::rpc::merkle_claim_tx(wallet, &format!(r#"{{"claims":[{}]}}"#, entries.join(",")), "sig", Some("ab"), ts)
+            .expect("claim")
+    }
+
+    // A claim naming any epoch at or below the watermark is stale; one wallet keeps one claim per block.
+    #[test]
+    fn stale_and_second_claims_are_refused() {
+        let c = claim("eonA", 1, &[320, 480]);
+        assert!(!BlockchainNode::claim_is_stale(&c, 160));
+        assert!(BlockchainNode::claim_is_stale(&c, 320), "the head is already claimed");
+        assert!(BlockchainNode::claim_is_stale(&c, 480));
+        let transfer = qnet_state::Transaction::new("eonX".into(), Some("eonY".into()), 1, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from: "eonX".into(), to: "eonY".into(), amount: 1 }, None);
+        let (kept, dropped) = BlockchainNode::keep_first_claim_per_wallet(vec![
+            claim("eonA", 1, &[320]), transfer, claim("eonA", 2, &[320]), claim("eonB", 1, &[320])]);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.iter().map(|t| (t.to.clone().unwrap_or_default(), t.timestamp)).collect::<Vec<_>>(),
+                   vec![("eonA".to_string(), 1), ("eonY".to_string(), 0), ("eonB".to_string(), 1)]);
+    }
+
+    // A repeat of an applied claim credits nothing; apply records that, and the routes show it as no_effect, 0.
+    #[test]
+    fn a_repeat_claim_is_recorded_as_no_effect() {
+        use pqcrypto_mldsa::mldsa65 as d3;
+        use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
+        let (_d, s) = storage();
+        let (pk, sk) = d3::keypair();
+        let wallet = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(pk.as_bytes()).expect("eon");
+        let epoch = 2 * MB;
+        let amount = 100u64;
+        let leaf = {
+            let mut h = Sha3_256::new();
+            h.update(wallet.as_bytes()); h.update(&epoch.to_le_bytes()); h.update(&amount.to_le_bytes());
+            h.finalize()
+        };
+        let root: [u8; 32] = { let mut h = Sha3_256::new(); h.update([0u8]); h.update(leaf); h.finalize().into() };
+        s.seed_epoch_root_for_test(epoch, root);
+        let data = format!(r#"{{"claims":[{{"epoch":{},"amount":{},"proof":[]}}]}}"#, epoch, amount);
+        let signed = |ts: u64| {
+            let sig = hex::encode(d3::detached_sign(BlockchainNode::claim_sign_message(&wallet, &data, ts).as_bytes(), &sk).as_bytes());
+            crate::rpc::merkle_claim_tx(&wallet, &data, &sig, Some(&hex::encode(pk.as_bytes())), ts).expect("claim")
+        };
+        let (first, repeat) = (signed(1_780_000_000), signed(1_780_000_001));
+        assert_ne!(first.hash, repeat.hash);
+        let h = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT + 1;
+        let sg = StateManager::new();
+        sg.credit_rewards_pool(1_000_000);
+        assert_eq!(BlockchainNode::apply_merkle_claims(&sg, &s, std::slice::from_ref(&first), h, None), Ok(()));
+        assert_eq!(s.load_claim_outcome(&first.hash), Some((h, amount, 1)));
+        assert_eq!(crate::rpc::claim_outcome_display(&s, &first), Some(("confirmed", amount)));
+        assert!(BlockchainNode::claim_is_stale(&repeat, sg.get_last_claimed_epoch(&wallet)), "the doors refuse it now");
+
+        assert_eq!(BlockchainNode::apply_merkle_claims(&sg, &s, std::slice::from_ref(&repeat), h + 1, None), Ok(()));
+        assert_eq!(sg.get_account(&wallet).map(|a| a.balance), Some(amount), "credited once");
+        assert_eq!(s.load_claim_outcome(&repeat.hash), Some((h + 1, 0, 0)));
+        assert_eq!(crate::rpc::claim_outcome_display(&s, &repeat), Some(("no_effect", 0)));
+
+        assert_eq!(s.prune_claim_outcomes(h + 1).unwrap(), 1, "the older outcome goes with the index retention");
+        assert!(s.load_claim_outcome(&first.hash).is_none());
+        assert!(s.load_claim_outcome(&repeat.hash).is_some());
+
+        // A claim re-applied at another height keeps its outcome until that height passes.
+        s.save_claim_outcome(&repeat.hash, h + 5, 0, 0).unwrap();
+        assert_eq!(s.prune_claim_outcomes(h + 2).unwrap(), 0);
+        assert_eq!(s.load_claim_outcome(&repeat.hash), Some((h + 5, 0, 0)));
+        assert_eq!(s.prune_claim_outcomes(h + 6).unwrap(), 1);
+        assert!(s.load_claim_outcome(&repeat.hash).is_none());
+        // Pruned with the transaction rows, at their height (which waits for the archive).
+        let src = include_str!("../storage/node_records.rs").replace("\r\n", "\n");
+        let tx = &src[src.find("let tx_pruned = if").expect("tx prune")..];
+        let tx = &tx[..tx.find("} else {").expect("end")];
+        assert!(tx.contains("self.prune_claim_outcomes(prune_before)"));
+    }
 }

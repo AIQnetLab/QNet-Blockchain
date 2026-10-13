@@ -8,6 +8,12 @@ mod queries_api;
 use queries_api::*;
 mod certified_proofs;
 use certified_proofs::*;
+mod galc_api;
+// N2: the wallet plane (HTTPS on host 443), its certificates, and the node's serving identity.
+pub(crate) mod wallet_plane;
+use wallet_plane::{WalletPeer, WalletPlane};
+pub(crate) mod acme;
+pub(crate) mod node_serve;
 #[cfg(test)]
 mod certified_e2e_tests;
 mod rewards_api;
@@ -71,6 +77,15 @@ pub(crate) fn tx_display_to_amount(tx: &qnet_state::Transaction) -> (Option<Stri
         _ if tx.moves_no_envelope_value() => (None, 0),
         _ => (tx.to.clone(), tx.amount),
     }
+}
+
+/// A merkle claim's shown status and amount, from what its apply recorded: "no_effect" and 0 when it credited
+/// nothing (a repeat of an applied claim), else "confirmed" and what it credited. None for any other TX, or for a
+/// claim with no recorded outcome (applied before outcomes were kept, or past their retention).
+pub(crate) fn claim_outcome_display(storage: &crate::storage::Storage, tx: &qnet_state::Transaction) -> Option<(&'static str, u64)> {
+    if !tx.is_merkle_reward_claim() { return None; }
+    let (_height, credited, epochs) = storage.load_claim_outcome(&tx.hash)?;
+    Some(if epochs == 0 { ("no_effect", 0) } else { ("confirmed", credited) })
 }
 
 /// What `address` receives from a batch: the sum of its transfers to it, or None if it is no recipient.
@@ -266,43 +281,31 @@ impl WsRateLimiter {
         }
     }
     
-    /// Check if new connection is allowed from this IP
-    fn check_connection(&self, ip: Option<IpAddr>) -> bool {
-        let total = self.total_connections.load(std::sync::atomic::Ordering::Relaxed);
-        
-        // Check total limit
+    /// Take a connection slot for `ip` when both limits allow, in one step: the check and the count cannot
+    /// interleave with another connection's, so concurrent upgrades never pass a limit together. The slot is
+    /// released when the returned guard drops.
+    fn try_acquire(&'static self, ip: Option<IpAddr>) -> Option<WsSlot> {
+        use std::sync::atomic::Ordering;
+        let total = self.total_connections.fetch_add(1, Ordering::SeqCst);
         if total >= self.max_total {
-            println!("[WS] 🚫 Total connection limit reached ({}/{})", total, self.max_total);
-            return false;
+            self.total_connections.fetch_sub(1, Ordering::SeqCst);
+            if is_warn() { println!("[WARN][WS] connection_refused reason=total_limit total={} max={}", total, self.max_total); }
+            return None;
         }
-        
-        // Check per-IP limit
         if let Some(ip_addr) = ip {
-            let current = self.connections_per_ip.get(&ip_addr)
-                .map(|v| *v)
-                .unwrap_or(0);
-            
-            if current >= self.max_per_ip {
-                println!("[WS] 🚫 Per-IP limit reached for {} ({}/{})", ip_addr, current, self.max_per_ip);
-                return false;
+            let mut count = self.connections_per_ip.entry(ip_addr).or_insert(0);
+            if *count >= self.max_per_ip {
+                let current = *count;
+                drop(count);
+                self.total_connections.fetch_sub(1, Ordering::SeqCst);
+                if is_warn() { println!("[WARN][WS] connection_refused reason=per_ip_limit ip={} count={} max={}", ip_addr, current, self.max_per_ip); }
+                return None;
             }
+            *count += 1;
         }
-        
-        true
+        Some(WsSlot { limiter: self, ip })
     }
-    
-    /// Register new connection
-    fn add_connection(&self, ip: Option<IpAddr>) {
-        self.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
-        if let Some(ip_addr) = ip {
-            self.connections_per_ip
-                .entry(ip_addr)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-        }
-    }
-    
+
     /// Unregister connection on close
     fn remove_connection(&self, ip: Option<IpAddr>) {
         self.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -331,6 +334,23 @@ impl WsRateLimiter {
 
 /// Global WebSocket rate limiter
 static WS_RATE_LIMITER: Lazy<WsRateLimiter> = Lazy::new(|| WsRateLimiter::new());
+
+/// One WebSocket connection slot, released when dropped: when the connection ends, when its handler unwinds, and
+/// when the upgrade never completes (warp drops the upgrade callback that owns it). Before this guard the slot was
+/// counted before the upgrade and released only at the end of a handler that might never run or never end, so
+/// dead slots accumulated until every connection from a shared address was refused.
+pub(super) struct WsSlot {
+    limiter: &'static WsRateLimiter,
+    ip: Option<IpAddr>,
+}
+
+impl WsSlot {
+    pub(super) fn ip(&self) -> Option<IpAddr> { self.ip }
+}
+
+impl Drop for WsSlot {
+    fn drop(&mut self) { self.limiter.remove_connection(self.ip); }
+}
 
 /// Rate limit configuration per endpoint type
 #[derive(Clone)]
@@ -510,6 +530,49 @@ impl ApiRateLimiter {
         });
         configs.insert(certified_proofs::CERTIFIED_STATE_BUCKET.to_string(), RateLimitConfig {
             max_requests: 600,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+
+        // The wallet plane's own buckets (N2; their names are the routes' constants, pinned by
+        // tests_wallet_buckets): a macroblock proof is up to ~8 MB, a registry body a full scan, a
+        // serve-proof one ML-DSA-65 signature, a whoami probe a connect-back. On the plane every
+        // per-address key is an IPv4 address or an IPv6 /64 (`client_addr`). The 600/min certified
+        // buckets above serve the plane's proof and state reads.
+        configs.insert("wallet_mb_proof".to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+        configs.insert("wallet_registry".to_string(), RateLimitConfig {
+            max_requests: 6,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        configs.insert("serve_proof".to_string(), RateLimitConfig {
+            max_requests: 6,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        configs.insert("nodes_rpc".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        configs.insert("whoami".to_string(), RateLimitConfig {
+            max_requests: 2,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+        // The GALC v2 capsule (~21 KB, cached): a wallet asks a node about once in 10 minutes, the site
+        // follows it with If-None-Match. One bucket off the plane, one on it.
+        configs.insert(galc_api::GALC_CAPSULE_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+        configs.insert(galc_api::WALLET_GALC_CAPSULE_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 120,
             window_seconds: 60,
             block_duration: 30,
         });
@@ -735,10 +798,19 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 /// appended — the last one, so a value the client wrote into the header itself is never taken. Every
 /// other peer is what the socket says. Without this every proxied request would look like localhost,
 /// which the limiter whitelists, and the per-address limits would not exist for the public at all.
+///
+/// On the wallet plane the TLS socket's own peer is the client and X-Forwarded-For is ignored
+/// entirely: the plane has no proxy in front of it. It is given as its limit key (an IPv4 address,
+/// an IPv6 /64, or the shared bucket of a masked peer, `wallet_plane::plane_key`), so every
+/// per-address limit on the plane counts a /64 as one source.
 fn client_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
-    warp::addr::remote()
+    warp::ext::optional::<WalletPeer>()
+        .and(warp::addr::remote())
         .and(warp::header::optional::<String>("x-forwarded-for"))
-        .map(|peer: Option<std::net::SocketAddr>, xff: Option<String>| forwarded_client(peer, xff.as_deref()))
+        .map(|plane_peer: Option<WalletPeer>, peer: Option<std::net::SocketAddr>, xff: Option<String>| match plane_peer {
+            Some(p) => Some(std::net::SocketAddr::new(p.key, 0)),
+            None => forwarded_client(peer, xff.as_deref()),
+        })
 }
 
 /// Port 0 marks a forwarded address; every consumer keys on the IP alone. A request the local proxy
@@ -836,9 +908,14 @@ fn gate_client(client: Option<std::net::SocketAddr>, from_page: bool) -> Option<
 }
 
 /// client_addr for the routes that answer only local, whitelisted or genesis callers (served outside the
-/// CORS filter): gate_client of the request.
+/// CORS filter): gate_client of the request. A request that came through the wallet plane is nobody in
+/// particular whatever its peer: the plane's allowlist already refuses these routes, and this keeps them
+/// refused if a path ever slipped through it.
 fn gate_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
-    client_addr().and(from_page()).map(gate_client)
+    client_addr().and(from_page()).and(warp::ext::optional::<WalletPlane>())
+        .map(|client: Option<std::net::SocketAddr>, from_page: bool, plane: Option<WalletPlane>| {
+            gate_client(client, from_page || plane.is_some())
+        })
 }
 
 /// The paths of the gate_addr routes, which `start_rpc_server` serves outside the CORS filter. A preflight for
@@ -889,6 +966,25 @@ fn api_rate_limit_retry(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -
     }
     let (allowed, retry_after) = API_RATE_LIMITER.check_rate_limit(ip_addr, endpoint_type);
     if allowed { Ok(()) } else { Err(retry_after) }
+}
+
+/// The per-address limit of a route that answers on both planes. On the wallet plane the plane's own
+/// bucket applies and the refusal is a typed 429 (every refusal there is typed); elsewhere the route's
+/// bucket, typed when the caller asked for the typed form, else the legacy 200 body.
+fn route_limit(
+    remote: Option<std::net::SocketAddr>,
+    plane: Option<WalletPlane>,
+    plain_bucket: &str,
+    plane_bucket: &str,
+    typed: bool,
+) -> Result<(), warp::reply::Response> {
+    let bucket = if plane.is_some() { plane_bucket } else { plain_bucket };
+    match api_rate_limit_retry(remote, bucket) {
+        Ok(()) => Ok(()),
+        Err(retry) if plane.is_some() => Err(wallet_plane::plane_rate_limited(retry)),
+        Err(retry) if typed => Err(certified_proofs::rate_limited(retry)),
+        Err(retry) => Err(warp::reply::json(&rate_limit_body(retry)).into_response()),
+    }
 }
 
 fn rate_limit_body(retry_after: u64) -> Value {
@@ -1722,7 +1818,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_token_transfers_range);
 
-    // GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer inclusion proof.
+    // GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer inclusion proof. On the wallet
+    // plane it counts in the certified-proof bucket and refuses typed.
     let log_proof = api_v1
         .and(warp::path("logs"))
         .and(warp::path("proof"))
@@ -1730,8 +1827,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(warp::query::<LogProofQuery>())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
-        .and_then(handle_log_proof);
+        .and_then(|q: LogProofQuery, remote: Option<std::net::SocketAddr>, plane: Option<WalletPlane>, bc: Arc<BlockchainNode>| async move {
+            if let Err(r) = route_limit(remote, plane, "read_only", certified_proofs::CERTIFIED_PROOF_BUCKET, false) {
+                return Ok::<_, Rejection>(r);
+            }
+            handle_log_proof(q, plane.is_some(), bc).await
+        });
 
     // Extended transaction history with pagination and filters
     // GET /api/v1/transactions/history?address=XXX&page=1&per_page=20&type=transfer
@@ -1806,16 +1909,31 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
 
-    // Light-client QC proof: /macroblock/{idx}/proof (cacheable, immutable per index)
+    // Light-client QC proof: /macroblock/{idx}/proof (cacheable, immutable per index). Typed errors on
+    // the wallet plane or with `form=2`.
     let macroblock_proof = api_v1
         .and(warp::path("macroblock"))
         .and(warp::path::param::<u64>())
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_proof);
+
+    // GALC v2 wallet capsule (galc_api.rs): typed 404/503, ETag, cached 60 s.
+    let galc_capsule = api_v1
+        .and(warp::path("galc"))
+        .and(warp::path("capsule"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("if-none-match"))
+        .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
+        .and(blockchain_filter.clone())
+        .and_then(galc_api::handle_galc_capsule);
 
     // Light-client registry dump as of a height: /registry/height/{h}
     let registry_height = api_v1
@@ -1825,6 +1943,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
         .and_then(handle_registry_height);
 
@@ -1890,6 +2009,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
 
     // Transaction endpoints with IP-based rate limiting
     // SECURITY: Limit transaction body to 64KB (typical TX is <1KB)
+    // The per-address limit sits here, not in the handler, so the wallet plane can refuse typed.
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
         .and(warp::path::end())
@@ -1897,8 +2017,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
         .and(blockchain_filter.clone())
-        .and_then(handle_transaction_submit);
+        .and_then(|req: TransactionRequest, remote: Option<std::net::SocketAddr>, plane: Option<WalletPlane>, bc: Arc<BlockchainNode>| async move {
+            if let Err(r) = route_limit(remote, plane, "transaction", "transaction", false) {
+                return Ok::<_, Rejection>(r);
+            }
+            handle_transaction_submit(req, bc).await.map(|r| r.into_response())
+        });
     
     // v6.0: Client-created NodeRegistration TX submit (producer-aware routing)
     let node_registration_submit = api_v1
@@ -2918,6 +3044,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(block_by_hash)
         .or(macroblock_by_index)
         .or(macroblock_proof)
+        .or(galc_capsule)
         .or(registry_height)
         .or(debug_consensus_position)
         .or(snapshot_latest)
@@ -2951,7 +3078,41 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let bundle_routes = bundle_submit
         .or(bundle_status);
         
+    // N2 (node_serve.rs): the serving identity (wallet plane only; 404 here), the committed-endpoint hints
+    // for ids a client chose, and the caller's address with the optional 443 connect-back.
+    let serve_proof = api_v1
+        .and(warp::path("node"))
+        .and(warp::path("serve-proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
+        .and(warp::ext::optional::<WalletPlane>())
+        .and(blockchain_filter.clone())
+        .and_then(node_serve::handle_serve_proof);
+    let nodes_rpc = api_v1
+        .and(warp::path("nodes"))
+        .and(warp::path("rpc"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(node_serve::handle_nodes_rpc);
+    let whoami = api_v1
+        .and(warp::path("whoami"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
+        .and(warp::ext::optional::<WalletPeer>())
+        // The raw socket peer: the only address a probe may connect back to.
+        .and(warp::addr::remote())
+        .and_then(node_serve::handle_whoami);
+    let wallet_plane_routes = serve_proof.or(nodes_rpc).or(whoami).boxed();
+
     let node_routes = node_discovery
+        .or(wallet_plane_routes)
         .or(node_health)
         .or(gas_recommendations)
         .or(auth_challenge)
@@ -3204,19 +3365,16 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // Extract IP for rate limiting
             let ip = remote_addr.map(|addr| addr.ip());
             
-            // SECURITY: Check rate limit before upgrading connection
-            if !WS_RATE_LIMITER.check_connection(ip) {
-                // Return 429 Too Many Requests
-                return warp::reply::with_status(
+            // The slot is taken before the upgrade, so a refusal is a 429, and it rides in the upgrade
+            // callback: released when the connection ends, or with the callback if the upgrade never completes.
+            let slot = match WS_RATE_LIMITER.try_acquire(ip) {
+                Some(s) => s,
+                None => return warp::reply::with_status(
                     "WebSocket connection limit exceeded",
                     warp::http::StatusCode::TOO_MANY_REQUESTS
-                ).into_response();
-            }
-            
-            // Register connection and upgrade
-            WS_RATE_LIMITER.add_connection(ip);
-            
-            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, query, blockchain, ip))
+                ).into_response(),
+            };
+            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, query, blockchain, slot))
                 .into_response()
         });
     
@@ -3272,6 +3430,21 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // WebSocket and the gated routes before the REST routes; a preflight for a gated path is refused before the
     // CORS filter would answer it.
     let routes = ws_subscribe.or(gated_preflight()).or(gated_routes).or(rest_routes);
+
+    // N2: the wallet plane, on its own runtime, for a super node that serves wallets. It hands requests
+    // to these same routes (handlers are not duplicated) behind its allowlist and a typed recover.
+    match wallet_plane::plane_off_reason(blockchain.get_node_type(), &blockchain.get_node_id()) {
+        None => {
+            let plane_routes: wallet_plane::PlaneRoutes = routes.clone()
+                .recover(wallet_plane::recover_rejection)
+                .map(|r| warp::Reply::into_response(r))
+                .boxed();
+            wallet_plane::start(plane_routes);
+        }
+        Some(reason) => if is_info() {
+            println!("[INFO][WALLETRPC] public_rpc_off reason={}", reason);
+        },
+    }
 
 
     // PORT BIND RETRY: survive TIME_WAIT after fast Docker restart (same pattern as Genesis signal_listener)
@@ -4307,7 +4480,7 @@ async fn tx_submit(
     if dilithium_signature.is_none() {
         return Err(RpcError {
             code: -32602,
-            message: "dilithium_signature required (pure-PQ; Ed25519 not accepted on QNet)".to_string(), data: None,
+            message: "dilithium_signature required (pure-PQ; Ed25519 not accepted on QNet Blockchain)".to_string(), data: None,
         });
     }
     // FIX-5 pk-elision: the pubkey may be OMITTED once it is committed on-chain (the first-use TX carries
@@ -4487,7 +4660,7 @@ async fn mempool_submit(
         // (address = SHA512(dilithium_pk)); Ed25519 is Solana-only and not accepted on a QNet path.
         let dil_sig = tx_data["dilithium_signature"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing dilithium_signature - QNet TX require an ML-DSA-65 signature".to_string(), data: None,
+            message: "Missing dilithium_signature - transactions on QNet Blockchain require an ML-DSA-65 signature".to_string(), data: None,
         })?;
         let dil_pk = tx_data["dilithium_public_key"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,

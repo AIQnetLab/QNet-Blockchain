@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "=== QNet NPM Security Fix ==="
+echo "=== QNet Blockchain NPM Security Fix ==="
 echo "Fixing vulnerabilities in dependencies..."
 
 # Navigate to application directory

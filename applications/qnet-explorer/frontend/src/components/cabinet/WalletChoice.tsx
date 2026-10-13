@@ -3,7 +3,7 @@
 // The ways to connect a wallet: QNet Wallet asked with a QNet Link `connect` request (docs/protocols/qnet-link-v1.md
 // section 14): its button on this phone or tablet, or its QR code for another device; the QNet extension
 // (qnet_requestAccounts), or where to get it on a computer without it; on a phone or tablet, where to get QNet Wallet
-// when it is not installed yet; and an address typed here, only to look. An
+// when it is not installed yet; and an address typed here, only to look (a read-only view, no connection). An
 // address from a QR request is marked as such (src/lib/cabinet/wallet-choice.ts). The first way offered is the one
 // primary button.
 
@@ -27,7 +27,7 @@ function answerText(answer: LinkAnswer): MessageKey {
 const buttonClass = (primary: boolean) => (primary ? 'qnet-button activate-primary' : 'qnet-button secondary');
 
 export default function WalletChoice() {
-  const { choose } = useCabinet();
+  const { choose, viewAddress } = useCabinet();
   const { providerStatus, providerChannel, accounts, connect, connecting, error } = useWallet();
   const device = useDeviceKind();
   // The button on this device, and a request shown as a QR code: two sessions, never one.
@@ -69,7 +69,8 @@ export default function WalletChoice() {
       setInvalid(true);
       return;
     }
-    choose({ qnet: value, source: 'entered' });
+    // Only to look: a view, never a connected wallet (CabinetProvider viewAddress).
+    viewAddress(value);
   };
 
   const ask = () => {

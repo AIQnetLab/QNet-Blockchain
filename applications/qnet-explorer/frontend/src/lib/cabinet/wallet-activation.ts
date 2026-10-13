@@ -89,8 +89,11 @@ export interface ActivationView {
   // The wallet's light node on the network: pending (being recorded), no_device, device_pending (a device linked that has
   // not answered yet), online, offline; null without one.
   light: NodeState | null;
-  // Its super node: online or offline; `registered` while the network lists it and its status is not read yet.
+  // Its super node: online, offline, or registered and waiting for the network's admission; `registered` while the
+  // network lists it and its status is not read yet.
   superNode: SuperState | 'registered' | null;
+  // A super node not registered yet whose server the network sees (it is catching up before its registration).
+  superConnected: boolean;
   // The id the network lists the super node by (super_node_… or a genesis node's), when it lists one.
   superId: string | null;
   // The node types the network lists for the wallet: both only for a wallet registered with both before the network's
@@ -110,8 +113,8 @@ export interface ActivationView {
 }
 
 const BLANK: Omit<ActivationView, 'state'> = {
-  missing: [], until: null, light: null, superNode: null, superId: null, nodes: [], burn: null, here: false, extensionUpdate: false, lockedBy: null, unusable: false,
-  networkDown: false,
+  missing: [], until: null, light: null, superNode: null, superId: null, superConnected: false, nodes: [], burn: null, here: false, extensionUpdate: false,
+  lockedBy: null, unusable: false, networkDown: false,
 };
 
 const isRegistered = (s: NodeState) => s === 'no_device' || isLinkedState(s);
@@ -206,7 +209,8 @@ export function activationView(inputs: ActivationInputs): ActivationView {
   const nodes: NodeType[] = [];
   if ((lightNode !== null && isRegistered(lightNode)) || (listed?.nodeType === 'light' && lightNode !== 'pending')) nodes.push('light');
   if (superNode !== null) nodes.push('super');
-  const base = { ...BLANK, light: lightNode, superNode, superId, nodes, burn, unusable, networkDown: network.phase === 'unavailable' };
+  const superConnected = superNode === null && superRead?.connected === true;
+  const base = { ...BLANK, light: lightNode, superNode, superId, superConnected, nodes, burn, unusable, networkDown: network.phase === 'unavailable' };
 
   if (nodes.length > 0) return { ...base, state: 'node' };
   if (lightNode === 'pending') return { ...base, state: 'recording' };
@@ -266,7 +270,7 @@ export function c9Name(view: ActivationView): string {
       else if (view.light === 'no_device') names.push('light-not-linked');
       else if (view.light === 'device_pending') names.push('light-linking');
       else if (view.light === 'offline') names.push('light-offline');
-      if (view.superNode === 'online' || view.superNode === 'offline') names.push(`super-${view.superNode}`);
+      if (view.superNode === 'online' || view.superNode === 'offline' || view.superNode === 'waiting') names.push(`super-${view.superNode}`);
       else if (view.superNode === 'registered') names.push('super');
       return names.join('+') || 'node';
     }
@@ -292,10 +296,11 @@ export function lightSectionState(status: NodeStatusView, view: ActivationView):
 
 // The step the wallet is on, which every page leads with (owner, 30.09: the page moves on by itself and shows the
 // steps): `record`, a light node's known burn or registration waiting for the network; `link`, a light node the network
-// lists with no device on it; `answer`, a device just linked that has not answered yet; `wake`, a linked device the
-// network asks to come back; `running`; `server`, a super node from its burn until the network counts its server online.
-// Null before a burn, or while the node's status is not read.
-export type NextStep = 'record' | 'link' | 'answer' | 'wake' | 'running' | 'server';
+// lists with no device on it; `answer`, a device just linked that has not answered yet; `offline`, a linked device the
+// network asks to come back (the phone answers once QNet Wallet is open on it, or runs the node again); `running`;
+// `server`, a super node from its burn until the network counts its server online. Null before a burn, or while the
+// node's status is not read.
+export type NextStep = 'record' | 'link' | 'answer' | 'offline' | 'running' | 'server';
 
 export function nextStep(view: ActivationView): NextStep | null {
   switch (view.state) {
@@ -307,7 +312,7 @@ export function nextStep(view: ActivationView): NextStep | null {
       if (view.nodes.includes('light')) {
         if (view.light === 'no_device') return 'link';
         if (view.light === 'device_pending') return 'answer';
-        if (view.light === 'offline') return 'wake';
+        if (view.light === 'offline') return 'offline';
         return view.light === 'online' ? 'running' : null;
       }
       return view.superNode === 'online' ? 'running' : 'server';

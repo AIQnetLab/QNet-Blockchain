@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Send transaction to QNet blockchain
+Send a transaction to QNet Blockchain
 """
 
 import json

@@ -1,13 +1,16 @@
 // The site's balance check (src/server/light): a balance counts as verified only when its proof folds to the state root
-// of a macroblock whose committee certificate the site verified itself, walking up from the wallets' pin; the certified
-// form (?mb=) first, the legacy live-root proof of an old node only when its root is a certified one; never node
-// agreement, never an answer without a proof. Run: npm run test:wallet
+// of a macroblock whose committee certificate the site verified itself, walking up from the wallets' pin or from a GALC
+// v2 capsule four genesis keys signed (galc.ts: the shared vectors, a capsule as a faster root that never replaces what
+// the site verified, today's 405 falling back to the pin); the certified form (?mb=) first, the legacy live-root proof
+// of an old node only when its root is a certified one; never node agreement, never an answer without a proof.
+// Run: npm run test:wallet
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import {
-  ATTACKER, IDS, NODES, accountLeaf, addressKey, buildTree, coBucket, core, network, pinAt, plainAccount, proofFor, read,
-  sha3Hex, smtFold,
+  ATTACKER, CAPSULE_OPTIONS, GALC_V, IDS, NODES, TEST_GENESIS_KEYS, accountLeaf, addressKey, buildTree, capsuleAt, capsuleText, coBucket, core,
+  network, pinAt, plainAccount, proofFor, read, sha3Hex, smtFold,
 } from './light-helpers.mjs';
 import {
   checkpointHash, checkpointQuorum, decodeEligibleNodeIds, epochCommitment, parseDilithiumSig, quorumSize, recomputeRegistryRoot,
@@ -17,9 +20,14 @@ import {
   accountKey, accountLeafHash, storageKey, storageLeaf, verifyAbsence, verifyAbsenceInBucket, verifyInclusion,
 } from '../../server/light/smt.ts';
 import { parseStrictJson, u64Text } from '../../server/light/strict-json.ts';
-import { createLightClient } from '../../server/light/lineage.ts';
+import { LINEAGE_REFUSALS, createLightClient } from '../../server/light/lineage.ts';
 import { createBalanceProver, isLegacyBody } from '../../server/light/balance-proof.ts';
-import { WS_CHECKPOINT } from '../../server/light/pin.ts';
+import { GALC_V2_MINT_INTERVAL, NETWORK_ID, WS_CHECKPOINT } from '../../server/light/pin.ts';
+import {
+  CAPSULE_MISS_TTL_MS, CAPSULE_PATH, CAPSULE_ROOT_NODES, OWN_ROOT_WALK_STEPS, capsuleEtag, capsulePreimage, capsuleProblem, capsuleRootOf,
+  capsuleSigned, capsuleSigners,
+} from '../../server/light/galc.ts';
+import { GENESIS_CONSENSUS_PKS } from '../../server/light/genesis-keys.ts';
 
 const SRC = new URL('../../', import.meta.url);
 
@@ -64,9 +72,30 @@ test('the committee, registry and epoch checks agree with the wallets\' light cl
   for (const bad of ['', 'dilithium_sig_', 'dilithium_sig_x_AAAA', 42]) assert.equal(parseDilithiumSig(bad), null);
 });
 
-test('the site walks from the wallets\' release pin, the same block of the same file', () => {
+test('the site walks from the wallets\' release pin, or from one proven from it or from the pin it was proven from', () => {
   const marked = (text) => /\/\/ <ws-pin>[\s\S]*?\/\/ <\/ws-pin>/.exec(text)[0];
-  assert.equal(marked(read('applications/qnet-explorer/frontend/src/server/light/pin.ts')), marked(read('applications/qnet-mobile/src/config/genesisConsensus.js')));
+  const site = marked(read('applications/qnet-explorer/frontend/src/server/light/pin.ts'));
+  const app = marked(read('applications/qnet-mobile/src/config/genesisConsensus.js'));
+  // Either refreshes its pin on its own (scripts/light-pin.mjs --write-pin here, the app's scripts/ws-pin.js there):
+  // one lineage means the same block, one pin naming the other as the pin it was proven from, or both naming one pin.
+  const pinOf = (block) => ({
+    at: `${/^\s*index: (\d+),$/m.exec(block)[1]}:${/^\s*hash: '([0-9a-f]{64})',$/m.exec(block)[1]}`,
+    from: (/^\s*provenFrom: \{ index: (\d+), hash: '([0-9a-f]{64})' \},$/m.exec(block) ?? []).slice(1).join(':') || null,
+  });
+  const [s, a] = [pinOf(site), pinOf(app)];
+  assert.ok(site === app || s.at === a.at || s.from === a.at || a.from === s.at || (s.from !== null && s.from === a.from), `site ${JSON.stringify(s)}, app ${JSON.stringify(a)}`);
+  // The same macroblock: the same committee anchors of K and K-1.
+  const anchorsOf = (block) => [...block.matchAll(/^\s*(\d+): \{\r?\n\s*eligible_raw: '([0-9a-f]+)',\r?\n\s*beacon: '([0-9a-f]{64})',\r?\n\s*registry_root: '([0-9a-f]{64})',/gm)]
+    .map((m) => m.slice(1).join('|'));
+  assert.equal(anchorsOf(site).length, 2);
+  if (s.at === a.at) assert.deepEqual(anchorsOf(app), anchorsOf(site));
+  // One chain: block 0's hash and the capsule cadence, as the app's block has them, in the same lines.
+  const tail = (block) => block.slice(block.indexOf('\n};\n') + 3);
+  assert.equal(tail(site), tail(app));
+  assert.match(site, /\nexport const NETWORK_ID = '([0-9a-f]{64})';\n/);
+  assert.equal(NETWORK_ID, /export const NETWORK_ID = '([0-9a-f]{64})';/.exec(app)[1]);
+  assert.equal(GALC_V2_MINT_INTERVAL, Number(/export const GALC_V2_MINT_INTERVAL = (\d+);/.exec(app)[1]));
+  assert.equal(pinOf(site).at, `${WS_CHECKPOINT.index}:${WS_CHECKPOINT.hash}`);
   assert.ok(WS_CHECKPOINT.index > 2);
   assert.ok(createLightClient({ nodes: () => NODES, fetchText: async () => { throw new Error('no network'); } }).trustFloorIndex() === WS_CHECKPOINT.index + 1);
 });
@@ -289,6 +318,267 @@ test('the certified head is the second highest node answer; old nodes give their
   assert.equal(await light(two).certifiedHead(), null);
   const none = network({ nodes: NODES, top: TOP, stateRootOf: rootOf, handlers: Object.fromEntries(NODES.map((n) => [n, () => 'throw'])) });
   assert.equal(await light(none).certifiedHead(), null);
+});
+
+// ------------------------------------------------------------------------------------------------ GALC v2 capsules
+
+const testVerify = (message, sigHex, pkHex) => {
+  try {
+    return ml_dsa65.verify(Buffer.from(sigHex, 'hex'), new TextEncoder().encode(message), Buffer.from(pkHex, 'hex'));
+  } catch {
+    return false;
+  }
+};
+const wireOf = (c) => ({ ...c, sigs: c.sigs.map(([id, name]) => [id, GALC_V.signatures[name]]) });
+// The vectors' K (38960) sits above the pin the release pin was proven from (38944) and below the release pin itself, which
+// refuses it as below_pin: the vector tests judge it against a pin at that older index.
+const VECTOR_PIN = pinAt(WS_CHECKPOINT.provenFrom.index);
+const VECTOR_RULES = { networkId: GALC_V.networkId, interval: GALC_V.constants.mintInterval, pinIndex: VECTOR_PIN.index, keys: TEST_GENESIS_KEYS };
+
+test('the genesis keys are the node\'s and the wallets\', byte for byte', () => {
+  const app = Object.fromEntries([.../export const GENESIS_CONSENSUS_PKS = \{([\s\S]*?)\};/.exec(read('applications/qnet-mobile/src/config/genesisConsensus.js'))[1]
+    .matchAll(/(genesis_node_\d{3}): '([0-9a-f]+)'/g)].map((m) => [m[1], m[2]]));
+  const node = Object.fromEntries([.../pub const GENESIS_CONSENSUS_PKS: &\[\(&str, &str\)\] = &\[([\s\S]*?)\];/.exec(read('development/qnet-integration/src/genesis_constants.rs'))[1]
+    .matchAll(/\("(genesis_node_\d{3})", "([0-9a-f]+)"\)/g)].map((m) => [m[1], m[2]]));
+  assert.equal(Object.keys(GENESIS_CONSENSUS_PKS).length, 5);
+  assert.deepEqual({ ...GENESIS_CONSENSUS_PKS }, app);
+  assert.deepEqual({ ...GENESIS_CONSENSUS_PKS }, node);
+  for (const pk of Object.values(GENESIS_CONSENSUS_PKS)) assert.equal(pk.length, 1952 * 2);
+});
+
+test('the shared vectors: the preimage, the hashes, and every capsule accepted or refused for the reason the spec names', async () => {
+  assert.match(GALC_V.testKeys, /^TEST KEYS\./);
+  for (const k of GALC_V.keys) assert.ok(!Object.values(GENESIS_CONSENSUS_PKS).includes(k.publicKey), `${k.id} is a test key`);
+  for (const { fields, preimage } of GALC_V.preimages) {
+    assert.equal(capsulePreimage(fields), preimage);
+    assert.equal(capsuleText(fields), preimage);
+  }
+  for (const j of Object.keys(GALC_V.roots)) {
+    const root = GALC_V.roots[j];
+    assert.equal(checkpointHash(root.checkpoint), GALC_V.checkpointHashes[j]);
+    assert.equal(epochCommitment(Buffer.from(root.eligible_raw, 'hex'), root.committee, root.banned), GALC_V.epochCommitments[j]);
+  }
+  assert.deepEqual(wireOf(GALC_V.cases[0].capsule), GALC_V.capsule);
+  const judge = async (c, headHint, roots) => {
+    const problem = capsuleProblem(c, VECTOR_RULES, headHint);
+    if (problem) return problem;
+    if (!(await capsuleSigned(c, TEST_GENESIS_KEYS, testVerify))) return 'signatures';
+    for (const [j, cpHash] of [[c.mb_index, c.cp_hash_anchor], [c.mb_index - 1, c.cp_hash_pred]]) {
+      const r = capsuleRootOf(j, roots[j], cpHash);
+      if ('problem' in r) return r.problem;
+    }
+    return 'accepted';
+  };
+  assert.equal(GALC_V.cases.length, 23);
+  for (const c of GALC_V.cases) assert.equal(await judge(wireOf(c.capsule), c.headHint, c.roots ?? GALC_V.roots), c.expect, c.name);
+  // The refusals of the cheap checks the vectors leave out: the pin, and anything not a capsule.
+  assert.equal(capsuleProblem(GALC_V.capsule, { ...VECTOR_RULES, pinIndex: GALC_V.capsule.mb_index }, null), 'below_pin');
+  assert.equal(capsuleProblem(GALC_V.capsule, { ...VECTOR_RULES, pinIndex: WS_CHECKPOINT.index }, null), 'below_pin');
+  for (const bad of [null, [], 'x', 7]) assert.equal(capsuleProblem(bad, VECTOR_RULES, null), 'shape');
+  assert.equal(capsuleProblem({ ...GALC_V.capsule, sigs: [...GALC_V.capsule.sigs.slice(0, 3), ['genesis_node_005', 5]] }, VECTOR_RULES, null), 'shape');
+  // Five valid signatures stop at the quorum; a signature over the right preimage by the wrong key counts for no one.
+  assert.deepEqual((await capsuleSigners(GALC_V.capsule, TEST_GENESIS_KEYS, testVerify)).length, 4);
+  assert.equal(await capsuleSigned(GALC_V.capsule, GENESIS_CONSENSUS_PKS, testVerify), false, 'the embedded keys sign no test capsule');
+  assert.equal(capsuleEtag(38960, GALC_V.capsule.cp_hash_anchor), `"2-38960-${GALC_V.capsule.cp_hash_anchor.slice(0, 8)}"`);
+});
+
+// Scripted nodes serving the vectors' capsule above VECTOR_PIN (38944), with the vectors' proofs of K and K-1.
+function vectorNetwork(capsuleBody, roots = GALC_V.roots, head = GALC_V.headHint) {
+  const proofs = Object.fromEntries(Object.entries(roots).map(([j, r]) => [`/api/v1/macroblock/${j}/proof`, r]));
+  const handler = (path, honest) => {
+    if (path === CAPSULE_PATH) return { body: capsuleBody };
+    if (proofs[path]) return { body: proofs[path] };
+    if (path === '/api/v1/state/certified') return { body: { proof_format: 2, newest_certified_index: head } };
+    return honest(path);
+  };
+  return network({ nodes: NODES, top: head, stateRootOf: () => 'ab'.repeat(32), handlers: Object.fromEntries(NODES.map((n) => [n, handler])) });
+}
+const vectorClient = (net, extra = {}) => createLightClient({
+  nodes: () => NODES, fetchText: net.fetchText, pin: VECTOR_PIN, ...CAPSULE_OPTIONS, verifySignature: testVerify, ...extra,
+});
+
+test('a capsule the vectors accept roots K and K-1 above the pin: their roots answer, the trust floor stays at the pin', async () => {
+  const net = vectorNetwork(GALC_V.capsule);
+  const lc = vectorClient(net);
+  // Its own walk from the pin is 10 steps at most: no capsule is asked for unless forced.
+  assert.deepEqual(await lc.refreshCapsule(), { ok: false, reason: 'not_needed' });
+  assert.equal(net.asked.filter(([, p]) => p === CAPSULE_PATH).length, 0);
+  assert.deepEqual(await lc.refreshCapsule({ force: true }), { ok: true, index: 38960 });
+  assert.equal(lc.heldCapsuleIndex(), 38960);
+  assert.equal(net.asked.filter(([, p]) => p === CAPSULE_PATH).length, CAPSULE_ROOT_NODES, 'two nodes asked at once');
+  // Each root confirmed by two nodes.
+  for (const j of [38960, 38959]) assert.equal(net.asked.filter(([, p]) => p === `/api/v1/macroblock/${j}/proof`).length, 2, `${j}`);
+  for (const j of [38960, 38959]) {
+    assert.deepEqual(await lc.certifiedRootAt(j, 1000), { root: GALC_V.roots[j].checkpoint.state_root });
+    assert.equal(lc.verifiedCheckpoint(j).checkpointHash, GALC_V.checkpointHashes[j]);
+  }
+  assert.equal(lc.highestVerifiedIndex(), 38960);
+  assert.equal(lc.highestVerifiedIndex(1), 38959);
+  assert.equal(lc.trustFloorIndex(), VECTOR_PIN.index + 1);
+  // Held: the same capsule again is no newer (and no request is made while no newer one can exist).
+  const before = net.asked.length;
+  assert.deepEqual(await lc.refreshCapsule({ force: true }), { ok: false, reason: 'current' });
+  assert.equal(net.asked.length, before);
+});
+
+test('refused capsules are no root and blame no node: the network, the head, the signatures, the roots, a lineage verified here', async () => {
+  const caseNamed = (name) => GALC_V.cases.find((c) => c.name === name);
+  const refusedFor = async (name, reason) => {
+    const c = caseNamed(name);
+    const lc = vectorClient(vectorNetwork(wireOf(c.capsule), c.roots ?? GALC_V.roots));
+    assert.deepEqual(await lc.refreshCapsule({ force: true }), { ok: false, reason }, name);
+    assert.equal(lc.heldCapsuleIndex(), 0, name);
+  };
+  await refusedFor('another network', 'invalid');
+  await refusedFor('K not a multiple of the interval', 'invalid');
+  await refusedFor('a signer that is no genesis node', 'invalid');
+  await refusedFor('the id in the signature string differs from the listed one', 'invalid');
+  // Two nodes whose proofs of K hash to another checkpoint than the signed one: a conflict, the capsule dropped.
+  await refusedFor('the proof of K hashes to another checkpoint', 'conflict');
+  await refusedFor('the signed checkpoint of K carries a recovery anchor', 'invalid');
+  // Proofs that do not bind (another eligible set): unrooted for now.
+  await refusedFor('the eligible set of K-1 does not match its epoch commitment', 'unrooted');
+  // K more than two above the head the nodes report.
+  const high = vectorClient(vectorNetwork(GALC_V.capsule, GALC_V.roots, GALC_V.capsule.mb_index - 3));
+  assert.deepEqual(await high.refreshCapsule({ force: true }), { ok: false, reason: 'invalid' });
+  // The embedded keys sign no test capsule: the site's own rules refuse the vectors.
+  const real = createLightClient({ nodes: () => NODES, fetchText: vectorNetwork(GALC_V.capsule).fetchText, pin: VECTOR_PIN, networkId: GALC_V.networkId, capsuleInterval: 10 });
+  assert.deepEqual(await real.refreshCapsule({ force: true }), { ok: false, reason: 'invalid' });
+});
+
+// The synthetic chain (light-helpers.mjs) rooted at pinAt(K = 100), its proofs signed by its committee; a capsule of it at
+// KC, signed by the vectors' test genesis keys.
+const KC = 140;
+const CAP_TOP = KC + 11;
+function capsuleNet({ top = CAP_TOP, capsule = capsuleAt(KC, rootOf), handlers = {} } = {}) {
+  const serve = (path, honest, headers) => {
+    if (path === CAPSULE_PATH) return typeof capsule === 'function' ? capsule(headers) : { body: capsule };
+    return honest(path);
+  };
+  const all = Object.fromEntries(NODES.map((n) => [n, handlers[n] ? (path, honest, headers) => handlers[n](path, (p) => serve(p, honest, headers), headers) : serve]));
+  return network({ nodes: NODES, top, stateRootOf: rootOf, handlers: all });
+}
+const capsuleLight = (net, extra = {}) => light(net, { ...CAPSULE_OPTIONS, ...extra });
+
+test('from a capsule the walk to the head takes at most ceil(interval / 2) + 1 steps a parity, and every step is verified', async () => {
+  const net = capsuleNet();
+  const lc = capsuleLight(net);
+  assert.ok((CAP_TOP - (K - 1)) / 2 > OWN_ROOT_WALK_STEPS, 'the walk from the pin is long');
+  assert.deepEqual(await lc.refreshCapsule(), { ok: true, index: KC });
+  const confirming = new Set(proofRequests(net));
+  assert.deepEqual([...confirming].sort((a, b) => a - b), [KC - 1, KC]);
+  assert.deepEqual(await lc.certifiedRootAt(CAP_TOP, 20_000), { root: ROOT });
+  assert.deepEqual(await lc.certifiedRootAt(CAP_TOP - 1, 20_000), { root: ROOT });
+  const steps = [...new Set(proofRequests(net))].filter((j) => !confirming.has(j)).sort((a, b) => a - b);
+  assert.deepEqual(steps, [141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151]);
+  assert.ok(steps.filter((j) => j % 2 === 1).length <= Math.ceil(GALC_V.constants.mintInterval / 2) + 1);
+  // Below K the walk still goes from the pin, as before: the trust floor stays at the pin.
+  assert.equal(lc.trustFloorIndex(), K + 1);
+  assert.deepEqual(await lc.certifiedRootAt(K + 4, 20_000), { root: ROOT });
+  assert.ok(proofRequests(net).includes(K + 2), 'walked up from the pin');
+});
+
+test('a long walk from the pin jumps to a capsule held while it runs, and goes on from its root', async () => {
+  // Slow proofs below the capsule: the walk from the pin is still low when the capsule is rooted.
+  const slow = (path, honest) => (/\/macroblock\/1[0-2]\d\/proof$/.test(path) ? new Promise((r) => setTimeout(() => r(honest(path)), 60)) : honest(path));
+  const net = capsuleNet({ handlers: Object.fromEntries(NODES.map((n) => [n, slow])) });
+  const lc = capsuleLight(net);
+  const walking = lc.certifiedRootAt(CAP_TOP, 30_000);
+  assert.deepEqual(await lc.refreshCapsule(), { ok: true, index: KC });
+  assert.deepEqual(await walking, { root: ROOT });
+  const asked = new Set(proofRequests(net));
+  assert.ok(asked.has(K + 1), 'it started from the pin');
+  assert.ok(!asked.has(KC - 3) && !asked.has(KC - 5), 'and did not walk on to the capsule\'s root');
+  for (const j of [141, 143, 145, 147, 149, 151]) assert.ok(asked.has(j), `${j}`);
+});
+
+test('nodes of today answer 405: the walk is the pin\'s, each node probed once per ten minutes, never more', async () => {
+  let t = 5_000_000;
+  const net = network({ nodes: NODES, top: CAP_TOP, stateRootOf: rootOf });
+  const lc = light(net, { ...CAPSULE_OPTIONS, now: () => t });
+  const probes = () => net.asked.filter(([, p]) => p === CAPSULE_PATH).map(([b]) => b);
+  assert.deepEqual(await lc.refreshCapsule(), { ok: false, reason: 'no_capsule' });
+  assert.deepEqual(probes(), NODES.slice(0, 2));
+  assert.deepEqual(await lc.refreshCapsule(), { ok: false, reason: 'no_capsule' });
+  assert.deepEqual(await lc.refreshCapsule(), { ok: false, reason: 'no_capsule' });
+  assert.deepEqual(await lc.refreshCapsule(), { ok: false, reason: 'no_capsule' });
+  assert.deepEqual(probes().sort(), [...NODES].sort(), 'each node once');
+  t += CAPSULE_MISS_TTL_MS;
+  await lc.refreshCapsule();
+  assert.equal(probes().length, NODES.length + 2, 'asked again after the TTL');
+  assert.equal(lc.heldCapsuleIndex(), 0);
+  assert.deepEqual(await lc.certifiedRootAt(CAP_TOP, 20_000), { root: ROOT });
+  assert.ok(proofRequests(net).includes(K + 1), 'walked up from the pin');
+  // A 404 is the same: no capsule on that node yet.
+  const none = capsuleLight(capsuleNet({ capsule: () => ({ status: 404, body: { error: 'no_capsule' } }) }));
+  assert.deepEqual(await none.refreshCapsule(), { ok: false, reason: 'no_capsule' });
+  // Capsules off (a new pin's walk): nothing is asked at all.
+  const off = network({ nodes: NODES, top: CAP_TOP, stateRootOf: rootOf });
+  assert.deepEqual(await light(off, { ...CAPSULE_OPTIONS, capsules: false }).refreshCapsule({ force: true }), { ok: false, reason: 'disabled' });
+  assert.equal(off.asked.length, 0);
+});
+
+test('a capsule is a faster root, never a replacement: a walk from the site\'s own anchor near the head, a checkpoint verified here', async () => {
+  // A capsule naming another checkpoint at K than the one the site verified is refused before its roots are asked for.
+  const forged = capsuleAt(KC, rootOf, { cpOf: (j) => (j === KC ? 'cd'.repeat(32) : core.checkpointHash(proofFor(j, rootOf(j)).checkpoint)) });
+  const net = capsuleNet({ capsule: forged });
+  const other = capsuleLight(net, { pin: pinAt(130) });
+  assert.deepEqual(await other.certifiedRootAt(KC, 20_000), { root: ROOT });
+  const asked = proofRequests(net).length;
+  assert.deepEqual(await other.refreshCapsule({ force: true }), { ok: false, reason: 'conflict' });
+  assert.equal(proofRequests(net).length, asked, 'no root asked for');
+  // Another checkpoint of K the nodes served while the capsule was rooted (same state, another time), then a walk from
+  // the site's own anchor (within OWN_ROOT_WALK_STEPS) verifies the honest K: the capsule goes, the verified data stays.
+  let forging = true;
+  const otherCp = (j) => proofFor(j, rootOf(j), { edit: (p) => { p.checkpoint.timestamp = 1_800_000_000; } });
+  const lying = (path, honest) => (forging && path === `/api/v1/macroblock/${KC}/proof` ? { body: otherCp(KC) } : honest(path));
+  const swapped = capsuleNet({
+    capsule: capsuleAt(KC, rootOf, { cpOf: (j) => core.checkpointHash((j === KC ? otherCp(j) : proofFor(j, rootOf(j))).checkpoint) }),
+    handlers: Object.fromEntries(NODES.map((n) => [n, lying])),
+  });
+  const lw = capsuleLight(swapped, { pin: pinAt(130) });
+  assert.deepEqual(await lw.refreshCapsule({ force: true }), { ok: true, index: KC });
+  forging = false;
+  assert.deepEqual(await lw.certifiedRootAt(KC + 10, 20_000), { root: ROOT });
+  assert.ok(proofRequests(swapped).filter((j) => j === 132).length > 0, 'walked from the pin 130, 10 steps');
+  assert.equal(lw.heldCapsuleIndex(), 0, 'the capsule of another checkpoint is dropped');
+  assert.deepEqual(await lw.refreshCapsule({ force: true }), { ok: false, reason: 'conflict' }, 'and not taken again soon');
+});
+
+test('a capsule whose root the nodes\' next step refuses is dropped, no node blamed, and the walk roots at the pin at once', async () => {
+  // K's checkpoint as the nodes served it while the capsule was rooted names a registry root no node holds: the first
+  // step above it cannot bind its committee's keys at any node.
+  let forging = true;
+  const otherRegistry = (j) => {
+    const p = proofFor(j, rootOf(j), { edit: (x) => { x.checkpoint.registry_root = 'ee'.repeat(32); } });
+    return p;
+  };
+  const lying = (path, honest) => (forging && path === `/api/v1/macroblock/${KC}/proof` ? { body: otherRegistry(KC) } : honest(path));
+  const net = capsuleNet({
+    capsule: capsuleAt(KC, rootOf, { cpOf: (j) => core.checkpointHash((j === KC ? otherRegistry(j) : proofFor(j, rootOf(j))).checkpoint) }),
+    handlers: Object.fromEntries(NODES.map((n) => [n, lying])),
+  });
+  const lc = capsuleLight(net);
+  assert.deepEqual(await lc.refreshCapsule(), { ok: true, index: KC });
+  forging = false;
+  assert.ok(LINEAGE_REFUSALS <= NODES.length);
+  assert.deepEqual(await lc.certifiedRootAt(KC + 2, 30_000), { root: ROOT });
+  assert.equal(lc.heldCapsuleIndex(), 0);
+  assert.ok(proofRequests(net).includes(K + 2), 'rooted at the pin');
+  // K-1 stays as verified from the pin now, and the odd chain was never touched by the drop.
+  assert.deepEqual(await lc.certifiedRootAt(KC + 1, 30_000), { root: ROOT });
+});
+
+test('If-None-Match: a node holding the same capsule answers 304, and is not asked again for ten minutes', async () => {
+  const capsule = capsuleAt(KC, rootOf);
+  const tag = capsuleEtag(KC, capsule.cp_hash_anchor);
+  const net = capsuleNet({ capsule: (headers) => (headers['If-None-Match'] === tag ? { status: 304, text: '', retryAfterS: null } : { body: capsule }) });
+  const lc = capsuleLight(net);
+  assert.deepEqual(await lc.refreshCapsule(), { ok: true, index: KC });
+  assert.deepEqual(net.asked.filter(([, p]) => p === CAPSULE_PATH).map(([, , h]) => h['If-None-Match'] ?? null), [null, null]);
+  assert.deepEqual(await lc.refreshCapsule({ force: true }), { ok: false, reason: 'stale' });
+  assert.deepEqual(net.asked.filter(([, p]) => p === CAPSULE_PATH).slice(2).map(([, , h]) => h['If-None-Match']), [tag, tag]);
+  assert.equal(lc.heldCapsuleIndex(), KC);
 });
 
 // ------------------------------------------------------------------------------------------------ the balance check

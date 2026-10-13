@@ -374,11 +374,11 @@ describe('the detail screen names the network\'s own senders in words (M-2)', ()
     expect(words).toContain(t('hist_genesis'));
     expect(words).not.toContain('genesis');
     words = said(await detail(native({ from: 'system_emission', to: ME, type: 'receive', txType: 'Transfer' })));
-    expect(words).toContain('Network');
+    expect(words).toContain('QNet Blockchain');
     expect(words.filter((w) => /system_/.test(w))).toEqual([]);
     // The bare "system" sender core also uses.
     words = said(await detail(native({ from: 'system', to: ME, type: 'receive', txType: 'Transfer' })));
-    expect(words).toContain('Network');
+    expect(words).toContain('QNet Blockchain');
     expect(words).not.toContain('system');
   });
 

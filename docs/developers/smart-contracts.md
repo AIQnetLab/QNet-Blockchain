@@ -1,6 +1,6 @@
 # Smart contracts
 
-QNet runs contracts in a deterministic WebAssembly interpreter (`core/qnet-vm`), called from block
+QNet Blockchain runs contracts in a deterministic WebAssembly interpreter (`core/qnet-vm`), called from block
 application, and implements two token standards, QRC-20 (fungible) and QRC-721 (collections),
 natively in the Rust apply code rather than as WebAssembly. This document describes the module a
 contract must be, the host functions it can call, how it is deployed and called, what it costs, its

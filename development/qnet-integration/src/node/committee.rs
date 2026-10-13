@@ -517,10 +517,17 @@ impl BlockchainNode {
             None => return Vec::new(),
         };
         let decidable = liveness_decidable_at(live_scan_end);
+        // Counted apart from the heartbeat shrink, so the log never reports a heartbeating outsider as silent.
+        let mut allowlist_dropped = 0usize;
         let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
             .filter(|node_id| {
                 // Restart bar first, so a compromised genesis identity can also be retired.
                 if crate::genesis_constants::restart_excludes(node_id) { return false; }
+                // Emergency allowlist, evaluated at this snapshot's own boundary.
+                if crate::genesis_constants::allowlist_excludes(node_id, live_scan_end) {
+                    allowlist_dropped += 1;
+                    return false;
+                }
                 // Genesis is NOT carved out. Its standing is a floor on set SIZE (applied below), not
                 // permanent membership: an id that stops answering otherwise stays in the quorum
                 // denominator forever and raises the threshold for everyone still running. Re-entry is
@@ -542,10 +549,13 @@ impl BlockchainNode {
             .filter(|p| p.reputation >= MIN_REPUTATION_BP)
             .collect();
         if is_info() {
-            let dropped = consensus_participants.len().saturating_sub(eligible.len());
+            let dropped = consensus_participants.len().saturating_sub(eligible.len()).saturating_sub(allowlist_dropped);
             if dropped > 0 {
                 println!("[INFO][SNAP] inactivity_shrink mb={} carried={} dropped={} reason=no_recent_heartbeat",
                          macroblock_index, eligible.len(), dropped);
+            }
+            if allowlist_dropped > 0 {
+                println!("[INFO][SNAP] allowlist_excluded mb={} count={} arm=carry", macroblock_index, allowlist_dropped);
             }
         }
 
@@ -659,6 +669,7 @@ impl BlockchainNode {
                 // Without this the one mechanism for retiring a compromised GENESIS key is a silent
                 // no-op, i.e. the set with the most authority is the only one a restart cannot clean.
                 if crate::genesis_constants::restart_excludes(&gid) { continue; }
+                if crate::genesis_constants::allowlist_excludes(&gid, live_scan_end) { continue; }
                 if eligible_ids.insert(gid.clone()) {
                     eligible.push(qnet_state::EligibleProducer { node_id: gid, reputation: GENESIS_FLOOR_REP_BP });
                 }

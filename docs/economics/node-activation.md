@@ -1,6 +1,6 @@
 # Node activation
 
-This document describes how a QNet node comes into existence: the node types the protocol defines,
+This document describes how a QNet Blockchain node comes into existence: the node types the protocol defines,
 the two-phase activation model, how a Phase 1 burn on the external Solana chain is verified and bound
 to a single node identity, the Phase 2 native-token path, how the on-chain registration transaction
 writes the node registry, the rules that keep one payment tied to one node, and the reputation values
@@ -72,7 +72,7 @@ height-dependent gate, so it applies at admission, producer-include and block va
 | Phase | Payment | Effect on the payer |
 | --- | --- | --- |
 | `Phase1` | 1DEV burn on Solana (external chain) | Burned on Solana; the on-chain `amount` field must be 0 |
-| `Phase2` | QNC debited from the payer | Debited on QNet; `total_supply` is unchanged |
+| `Phase2` | QNC debited from the payer | Debited on QNet Blockchain; `total_supply` is unchanged |
 
 The phase is a pure function of burn progress and time.
 
@@ -120,7 +120,7 @@ mints and burns against the devnet one; the node cabinet and the mobile app comp
 
 The Phase 1 burn is made in one of two places:
 
-- The QNet [browser extension](../applications/browser-wallet.md) burns with the wallet's own Solana key, from
+- The QNet Wallet [browser extension](../applications/browser-wallet.md) burns with the wallet's own Solana key, from
   its Activate tab or when the node cabinet at aiqnet.io/node asks it (`qnet_activateNode`,
   [QNet Link](../protocols/qnet-link-v1.md) section 10).
 - The node cabinet at aiqnet.io/node burns in the browser with a one-time payment key it creates there, for a Light
@@ -141,7 +141,7 @@ The Phase 1 burn is made in one of two places:
 Either reads the price from `GET /api/v1/activation/price`, burns that whole number of 1DEV with a
 `QNET_NODE_TYPE:LIGHT` or `QNET_NODE_TYPE:SUPER` memo, and derives the code from the node type, the address the
 code names, the burn signature and the amount, byte-identical to the node's generator. The code names the wallet
-the burn is for: the extension's own Solana address for its burn, the wallet's QNet address for a payment-key burn
+the burn is for: the extension's own Solana address for its burn, the wallet's QNet Blockchain address for a payment-key burn
 ([QNet Link](../protocols/qnet-link-v1.md) section 3), which is found through the node's registration record (burn
 to wallet), never through the payment key's address. A wallet gets one code. A Light node needs no code of its
 own: its registration carries the burn, the wallet's consent and the owner bind ([registration
@@ -157,7 +157,7 @@ burn is made by the cabinet's payment key or by the extension; a Super node's on
 wallet, since the node's server runs with the same recovery phrase (the cabinet's payment key burns for Light nodes
 only, and no phone activates a Super node). The cabinet, the extension and QNet Wallet keep that rule together
 through the site's activation record (`applications/qnet-explorer/frontend/src/server/cabinet/activation-registry.ts`,
-one row per QNet wallet in the explorer database; [block explorer](../applications/explorer.md#activation-registry)):
+one row per QNet Blockchain wallet in the explorer database; [block explorer](../applications/explorer.md#activation-registry)):
 
 - **Before a burn, every source.** A client offers or builds a burn only when every source it has answered "none":
   the network (a node of either type for the wallet, `/api/v1/verify-activation` and the Light node's status), the
@@ -305,7 +305,7 @@ judge the producer and block validation run, at the next height.
 
 ## Phase 2: native QNC activation
 
-In Phase 2 the activation payment is native QNC, debited from the payer on the QNet chain. Phase 2
+In Phase 2 the activation payment is native QNC, debited from the payer on QNet Blockchain. Phase 2
 pricing is type-differentiated.
 
 | Node type | Base cost | Chain floor constant | Chain floor |
@@ -470,8 +470,9 @@ node's own registration epoch; one stamped in the closing 150 blocks joins from 
   move of that node, not as a way to run a second one: bring the old host down first, so the two are
   never both trying to serve the identity.
 - **One device per Light node.** A Light node runs on one phone or tablet at a time, bound to a hardware
-  key of one app install; one device runs one node, never several devices at once. "Use this device" (or the link
-  sheet) on another device replaces the binding, and the earlier device stops. The binding goes to
+  key of one app install; one device runs one node, never several devices at once. The link sheet confirmed on another
+  device (from aiqnet.io) replaces the binding, and the earlier device stops; the app shows a light node only on the
+  device it is bound to, so "Use this device" is offered only there. The binding goes to
   `POST /api/v1/light-node/bind` at the node's shard owners, signed by the wallet key (delegation and attach) with a
   sequence that must beat the stored one, and carries the device's enrolment ([light node
   messages](../protocols/light-node-messages.md) sections 4, 5 and 8). The node is counted only while QNet Wallet

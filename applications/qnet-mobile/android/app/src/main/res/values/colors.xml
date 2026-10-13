@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Splash Screen Background - dark theme like QNet -->
-    <color name="splash_background_color">#0a0a14</color>
+    <!-- Splash background: the app's main background, the same value as the iOS launch screen -->
+    <color name="splash_background_color">#11131f</color>
     <!-- QNet brand color -->
     <color name="qnet_blue">#00d4ff</color>
     <color name="primary">#00d4ff</color>

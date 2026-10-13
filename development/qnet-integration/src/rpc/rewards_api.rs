@@ -175,8 +175,11 @@ pub(super) async fn handle_claim_rewards(
         let mut total_amount: u64 = 0;
         // Reported so a wallet knows WHY the batch ended and can retry elsewhere.
         let mut stopped_at: Option<(u64, &'static str)> = None;
-        // One O(roster) rebuild per request: this endpoint must not amplify into repeated full walks.
-        let mut rebuilt = false;
+        // Rebuilds are bounded by the leaves they produce, so this endpoint cannot amplify into repeated full
+        // walks: one rebuild always fits, and more while the epochs rebuilt are small (the early ones are).
+        const REBUILD_LEAF_BUDGET: usize = 65_536;
+        let mut rebuilt_leaves: usize = 0;
+        let mut rebuilt_any = false;
         const MAX_BATCH: usize = 512; // bound the TX size; the wallet re-calls for any remainder
         // The quote goes back out over the wire signed, so it must be bounded in BYTES: proof depth
         // grows with the recipient count, so an epoch count alone cannot keep the body under the route
@@ -200,9 +203,10 @@ pub(super) async fn handle_claim_rewards(
                 None => { stopped_at = Some((epoch, "root_not_here")); break; }
             };
             // Resolve from the shard cache (one shard + meta, never the whole leaf set); the shard
-            // roots are re-verified against the certified root before proving. Absent = cache miss,
-            // rebuildable from durable indices — bounded to one rebuild per request.
-            let claim = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true) {
+            // roots are re-verified against the certified root before proving. An epoch the cache no
+            // longer holds is passed from the recipient index when the wallet has no leaf in it; Absent =
+            // a leaf may be there, rebuildable from durable indices within the rebuild budget.
+            let claim = match crate::node::BlockchainNode::reward_claim_at(&storage, epoch, &committed_root, &wallet_address, true) {
                 crate::node::ShardClaim::Absent => {
                     const REBUILD_RETRY_SECS: u64 = 3600;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -211,10 +215,14 @@ pub(super) async fn handle_claim_rewards(
                         stopped_at = Some((epoch, "local_corruption"));
                         break;
                     }
-                    if rebuilt { stopped_at = Some((epoch, "rebuild_budget")); break; }
-                    rebuilt = true;
+                    if rebuilt_any && rebuilt_leaves >= REBUILD_LEAF_BUDGET {
+                        stopped_at = Some((epoch, "rebuild_budget"));
+                        break;
+                    }
+                    rebuilt_any = true;
                     let w = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, ctotal)
                         .map(|x| x.0).unwrap_or_default();
+                    rebuilt_leaves = rebuilt_leaves.saturating_add(w.len().max(1));
                     if crate::node::BlockchainNode::epoch_reward_merkle_root(&w, epoch) != committed_root {
                         // Inputs present but they do not reproduce the certified root: local data is
                         // corrupt, not merely missing. Alarm and stop; a resync is the repair.
@@ -224,6 +232,11 @@ pub(super) async fn handle_claim_rewards(
                         break;
                     }
                     crate::node::BlockchainNode::save_epoch_reward_sharded(&storage, epoch, &w);
+                    // The set matched the certified root, so it also gives the epoch its recipient index:
+                    // no later walk rebuilds it to learn that a wallet has no leaf there.
+                    if let Some(raw) = hex::decode(&committed_root).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+                        crate::node::BlockchainNode::index_epoch_recipients(&storage, epoch, &raw, &w);
+                    }
                     crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true)
                 }
                 other => other,
@@ -360,7 +373,7 @@ pub(super) async fn wallet_first_unclaimed_epoch(blockchain: &BlockchainNode, wa
             Some(_) => continue, // epoch distributed nothing
             None => return None, // cannot resolve here; reporting a later epoch would be a lie
         };
-        match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &root, wallet, false) {
+        match crate::node::BlockchainNode::reward_claim_at(&storage, epoch, &root, wallet, false) {
             crate::node::ShardClaim::Proof(_, _) => return Some(epoch),
             crate::node::ShardClaim::NotRecipient => continue,
             _ => return None,
@@ -396,7 +409,7 @@ pub(super) async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &s
         // O(N) leaf-set rebuild (the Absent self-heal is the sig-gated claim path's job) — otherwise a
         // cheap public request could amplify into a full-roster recompute. On Absent/Divergent skip the
         // epoch; the figure self-corrects once the shards are present (via apply/finalization or a claim).
-        let amt = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, wallet, false) {
+        let amt = match crate::node::BlockchainNode::reward_claim_at(&storage, epoch, &committed_root, wallet, false) {
             crate::node::ShardClaim::Proof(a, _) => a,
             crate::node::ShardClaim::NotRecipient => continue, // no leaf here — the claim path keeps batching
             _ => break,                                       // unservable: the claim path stops here
@@ -453,8 +466,9 @@ pub(super) async fn handle_get_pending_rewards(
     // unforgeable source — not the removed local recorder. The bitmap records which subwindows were
     // live this epoch, not per-heartbeat timestamps.
     let hb_epoch = current_height / 14400;
-    let heartbeat_count = blockchain.get_account(&node_id).await.ok().flatten()
-        .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch) as usize)
+    let account = blockchain.get_account(&node_id).await.ok().flatten();
+    let heartbeat_count = account.as_ref()
+        .map(|a| crate::node::BlockchainNode::account_heartbeat_count(a, hb_epoch) as usize)
         .unwrap_or(0);
     
     // Calculate eligibility based on REAL heartbeat count
@@ -464,7 +478,12 @@ pub(super) async fn handle_get_pending_rewards(
         "Light" => 1,
         _ => 10, // Unknown nodes can never be eligible
     };
-    let is_eligible = heartbeat_count >= required_heartbeats;
+    // A super earns the running epoch's share only unbanned and inside the network's admitted set as well,
+    // as the settle writer files it.
+    let admission = (node_type == "Super").then(|| crate::node::BlockchainNode::super_admission_label(
+        &blockchain.get_storage(), &node_id, hb_epoch));
+    let super_banned = node_type == "Super" && account.as_ref().map_or(false, |a| a.banned_at_height != 0);
+    let is_eligible = heartbeat_count >= required_heartbeats && admission != Some("waiting") && !super_banned;
     
     // The claimable total is the merkle reward_root sum for this node's ON-CHAIN wallet — the same
     // number the claim endpoint quotes and apply credits. Emission is pure Pool-1, so pool1 IS the
@@ -531,6 +550,8 @@ pub(super) async fn handle_get_pending_rewards(
         },
         "is_active": is_active,
         "is_eligible": is_eligible,
+        // Super only: "not_required" | "admitted" | "waiting" (registered, no super share while outside).
+        "admission": admission,
         "is_claimable": is_claimable  // v2.75: True if pending >= 1 QNC
     });
     
@@ -581,10 +602,13 @@ pub(super) struct LeafsetQuery {
 /// epoch. Then a zero is not the node's doing: the epoch's reward root was sealed without that shard,
 /// and no later block can add it (the owners were all silent through the commit window). Reporting it
 /// as "not_eligible" told the owner they had missed their pings when they had not.
+/// `admitted` is Some(false) only for a SUPER outside the epoch's admitted set (super_reward_admission): its zero
+/// is the network's admission, not missed heartbeats.
 fn reward_history_status(servable: bool, amount: u64, epoch: u64, last_claimed: u64,
-                         shard_certified: Option<bool>) -> &'static str {
+                         shard_certified: Option<bool>, admitted: Option<bool>) -> &'static str {
     if !servable { "unavailable" }
     else if amount == 0 && shard_certified == Some(false) { "shard_not_certified" }
+    else if amount == 0 && admitted == Some(false) { "not_admitted" }
     else if amount == 0 { "not_eligible" }
     else if epoch <= last_claimed { "claimed" }
     else { "claimable" }
@@ -629,6 +653,7 @@ pub(super) async fn handle_get_reward_history(
     // A super node has no light shard, so the shard verdict below must not be applied to it.
     let is_light = blockchain.get_unified_p2p()
         .map_or(false, |p| p.get_light_node(&node_id).is_some());
+    let is_super = !is_light && (node_id.starts_with("super_") || node_id.starts_with("genesis_"));
 
     let mut epochs_history = Vec::new();
     for &epoch in epochs.iter().skip(offset).take(limit) {
@@ -637,7 +662,7 @@ pub(super) async fn handle_get_reward_history(
         // Amount + servability in one resolution, verified against the 2f+1-committed root.
         let (amount, servable) = match storage.load_epoch_root(epoch) {
             Ok(Some(r)) if r != [0u8; 32] && !wallet.is_empty() => {
-                match crate::node::BlockchainNode::reward_proof_from_shard(
+                match crate::node::BlockchainNode::reward_claim_at(
                     &storage, epoch, &hex::encode(r), &wallet, false) {
                     crate::node::ShardClaim::Proof(a, _) => (a, true),
                     crate::node::ShardClaim::NotRecipient => (0, true),
@@ -655,7 +680,12 @@ pub(super) async fn handle_get_reward_history(
             let bitmap_epoch = crate::reward_epoch::work_epoch_of(epoch);
             Some(storage.load_light_bitmaps(bitmap_epoch).map(|m| m.contains_key(&shard)).unwrap_or(false))
         } else { None };
-        let status = reward_history_status(servable, amount, epoch, last_claimed, shard_certified);
+        // The same: a super's zero this node can serve, against the admitted set of the epoch it paid for.
+        let admitted = if servable && amount == 0 && is_super {
+            Some(crate::node::BlockchainNode::super_reward_admission(&storage, crate::reward_epoch::work_epoch_of(epoch))
+                .admits(&node_id))
+        } else { None };
+        let status = reward_history_status(servable, amount, epoch, last_claimed, shard_certified, admitted);
         epochs_history.push(json!({
             "epoch": epoch,
             "block_range": format!("{}-{}", start_h, end_h),
@@ -1236,11 +1266,26 @@ mod tests_reward_history {
     /// An epoch below the watermark in which the wallet had no leaf was never claimed by it.
     #[test]
     fn zero_amount_epochs_are_not_eligible_even_below_the_watermark() {
-        assert_eq!(reward_history_status(true, 0, 160, 13_600, None), "not_eligible");
-        assert_eq!(reward_history_status(true, 5, 160, 13_600, None), "claimed");
-        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, None), "claimable");
-        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None), "not_eligible");
-        assert_eq!(reward_history_status(false, 5, 160, 13_600, None), "unavailable", "an unservable epoch says so first");
+        assert_eq!(reward_history_status(true, 0, 160, 13_600, None, None), "not_eligible");
+        assert_eq!(reward_history_status(true, 5, 160, 13_600, None, None), "claimed");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, None, None), "claimable");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None, None), "not_eligible");
+        assert_eq!(reward_history_status(false, 5, 160, 13_600, None, None), "unavailable", "an unservable epoch says so first");
+    }
+
+    /// A super outside the admitted set earned nothing because the network has not admitted it, not because it
+    /// missed heartbeats. A paid epoch stays paid whatever its admission.
+    #[test]
+    fn a_super_outside_admission_is_not_admitted_not_missed() {
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None, Some(false)), "not_admitted");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, None, Some(false)), "claimable",
+                   "an earned epoch stays claimable outside admission");
+        assert_eq!(reward_history_status(true, 5, 160, 13_600, None, Some(false)), "claimed");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None, Some(true)), "not_eligible",
+                   "admitted and still zero: that one IS on the node");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None, None), "not_eligible");
+        assert_eq!(reward_history_status(false, 0, 13_760, 13_600, None, Some(false)), "unavailable",
+                   "an epoch this node cannot serve says so first");
     }
 
     /// A light whose shard published no bitmap earned nothing THROUGH NO FAULT OF ITS OWN. Calling
@@ -1248,12 +1293,12 @@ mod tests_reward_history {
     /// sealed without their shard, and no later block can add it.
     #[test]
     fn a_shard_with_no_bitmap_is_not_the_nodes_fault() {
-        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(false)), "shard_not_certified");
-        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(true)), "not_eligible",
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(false), None), "shard_not_certified");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(true), None), "not_eligible",
                    "the shard committed and this node still earned nothing - that one IS on the node");
-        assert_eq!(reward_history_status(false, 0, 13_760, 13_600, Some(false)), "unavailable",
+        assert_eq!(reward_history_status(false, 0, 13_760, 13_600, Some(false), None), "unavailable",
                    "an epoch this node cannot serve says so first, whatever the shard did");
-        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, Some(false)), "claimable",
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, Some(false), None), "claimable",
                    "a paid epoch is paid; the shard verdict only explains a zero");
     }
 }

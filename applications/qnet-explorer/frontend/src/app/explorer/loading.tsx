@@ -3,7 +3,7 @@ export default function Loading() {
   return (
     <div className="explorer-page">
       <div className="explorer-header">
-        <h1>Quantum Blockchain Explorer</h1>
+        <h1>QNet Blockchain Explorer</h1>
         <p>All transactions from Genesis to Now • Block Height: ...</p>
       </div>
 

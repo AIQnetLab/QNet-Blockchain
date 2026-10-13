@@ -1,6 +1,6 @@
 # RPC and HTTP API reference
 
-This document is the reference for the HTTP surface a QNet node exposes. Every node runs a single
+This document is the reference for the HTTP surface a QNet Blockchain node exposes. Every node runs a single
 HTTP server, started by `start_rpc_server(blockchain, port)` in
 `development/qnet-integration/src/rpc/mod.rs`, and that one server carries four surfaces: two plain-text
 liveness probes, a WebSocket subscription endpoint, a JSON-RPC 2.0 endpoint registered at two paths,
@@ -52,6 +52,7 @@ curl -s https://node1.aiqnet.io/api/v1/height
 | JSON-RPC path | `POST /rpc` and `POST /` |
 | REST base | `http://<host>:<port>/api/v1/` |
 | WebSocket | `ws://<host>:<port>/ws/subscribe` |
+| Wallet plane (super nodes that serve wallets) | `https://<node IPv4>/` on host port 443, published to container port 8443 ([Wallet plane](#wallet-plane)) |
 
 The listener is plain HTTP. Deployments that need HTTPS terminate TLS in a reverse proxy or load
 balancer in front of the node — see the proxy note under [Rate limiting](#rate-limiting), because
@@ -133,9 +134,17 @@ address in that header, the one the TLS proxy on the same host appended (`client
 | `archive` | 30 | 60 s | 60 s | `GET /api/v1/archive`, `GET /api/v1/archive/segment/{epoch}`; a valid API key bypasses it |
 | `certified_proof` | 600 | 60 s | 30 s | the certified form (`?mb=`) of `/api/v1/account/{address}/balance/proof` and `/api/v1/token/{contract}/{holder}/balance/proof`; an IPv6 address counts by its /64; refused with HTTP 429 ([Certified state proofs](#certified-state-proofs)) |
 | `certified_state` | 600 | 60 s | 30 s | `GET /api/v1/state/certified`; an IPv6 address counts by its /64; refused with HTTP 429 |
+| `wallet_mb_proof` | 120 | 60 s | 30 s | `GET /api/v1/macroblock/{index}/proof` on the [wallet plane](#wallet-plane) (elsewhere `read_only`); refused with HTTP 429 |
+| `wallet_registry` | 6 | 60 s | 60 s | `GET /api/v1/registry/height/{height}` on the wallet plane (elsewhere `read_only`); refused with HTTP 429 |
+| `serve_proof` | 6 | 60 s | 60 s | `GET /api/v1/node/serve-proof` (wallet plane only); refused with HTTP 429 |
+| `nodes_rpc` | 30 | 60 s | 60 s | `GET /api/v1/nodes/rpc`, on both planes; refused with HTTP 429 |
+| `whoami` | 2 | 60 s | 60 s | `GET /api/v1/whoami`, on both planes; refused with HTTP 429 |
+| `galc_capsule` | 120 | 60 s | 30 s | `GET /api/v1/galc/capsule` on port 8001; refused with HTTP 429 |
+| `wallet_galc_capsule` | 120 | 60 s | 30 s | `GET /api/v1/galc/capsule` on the wallet plane; refused with HTTP 429 |
 
 `tx_rate` is `QNET_API_RATE_LIMIT`, parsed as requests per minute and clamped to `1..=10_000`,
-default `100`. The two certified buckets do not scale with it.
+default `100`. The certified and wallet-plane buckets do not scale with it. On the wallet plane every
+bucket keys an IPv4 address or an IPv6 /64, and `/api/v1/logs/proof` counts in `certified_proof`.
 
 Once a bucket is exceeded, `blocked_until = now + block_duration` is set, so requests are refused for
 the entire block window regardless of how the client slows down afterwards. Stale limiter state is
@@ -160,7 +169,11 @@ the HTTP status. The retry hint is the `retry_after_seconds` field. Two paths an
 instead: the WebSocket upgrade refusal, carrying the plain body `WebSocket connection limit exceeded`,
 and the certified routes (the `?mb=` form of the balance proofs and `/api/v1/state/certified`), which
 answer `{"proof_format": 2, "error": "rate_limited", "retry_after_seconds": N}` with `Retry-After` and
-`Cache-Control: no-store`, so a client never takes a refusal for a legacy proof body.
+`Cache-Control: no-store`, so a client never takes a refusal for a legacy proof body. Every read refusal on
+the [wallet plane](#wallet-plane) takes that typed form, whatever the route, and so do `/api/v1/node/serve-proof`,
+`/api/v1/nodes/rpc` and `/api/v1/whoami` on either plane. The one exception is the submit,
+`POST /api/v1/transaction`: its own answers keep their `{"success": false, "error": ...}` body on both
+planes (the plane's refusals in front of it, a rate limit, an oversize or unsized body, are typed).
 
 ### Whitelisting and the proxy note
 
@@ -184,7 +197,11 @@ is seen as one client, so enforce rate limiting at that proxy.
   `/api/v1/internal/light-device-attest` (403), `/api/v1/internal/light-device-sync` (403/400),
   `/api/v1/internal/light-device-get` (403) and `/api/v1/internal/light-reach-get` (403/400). The
   certified form of the two balance-proof routes (400, 404, 410, 429, 503) and `/api/v1/state/certified`
-  (429) answer with real statuses too ([Certified state proofs](#certified-state-proofs)).
+  (429) answer with real statuses too ([Certified state proofs](#certified-state-proofs)), as do
+  `/api/v1/registry/height/{height}` (404, 413 `registry_oversize`, 503), the typed form of
+  `/api/v1/macroblock/{index}/proof` (404, 410, 429, 503), `/api/v1/galc/capsule` (404, 429, 503),
+  `/api/v1/node/serve-proof`, `/api/v1/nodes/rpc` and `/api/v1/whoami` (400, 429, 503), and every refusal of the
+  [wallet plane](#wallet-plane).
 - **The HTTP layer's own refusals are plain text**, not JSON: HTTP 400 for a JSON body or query that
   does not deserialize (a missing required field, an integer sent as a string, a number above the
   64-bit range), 413 above a route's body cap, 415 for a body that is not JSON, 405 for a known path
@@ -393,8 +410,9 @@ commits to.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/macroblock/{index}/proof` | Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned, recovery_anchor_checkpoint}`. `committee_pubkeys` covers the derived committee union the QC's actual signers. Past the QC-signature retention the signatures and any signer key the node can no longer resolve come from its history archive, when it keeps one and the archived checkpoint hashes the same. |
-| GET | `/api/v1/registry/height/{height}` | `{registry_root, entries}` — the chain-confirmed roster as of that height plus its LtHash root |
+| GET | `/api/v1/macroblock/{index}/proof` | Optional `?form=2` asks for the typed errors below. Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned, recovery_anchor_checkpoint}`. `committee_pubkeys` covers the derived committee union the QC's actual signers. Past the QC-signature retention the signatures and any signer key the node can no longer resolve come from its history archive, when it keeps one and the archived checkpoint hashes the same. A success carries `Cache-Control: public, max-age=31536000, immutable` (the body for an index never changes) and is served from a 64 MiB cache, built once per index (at most two builds at once node-wide, whichever port asked: port 8001 queues for one, the wallet plane waits at most 3 s, then `busy`; a build runs to the end and is cached even when its request went away); a body missing a QC signer's key, or the anchor checkpoint its recovery pin names, is served with `Cache-Control: no-store` and never cached, since the next build may complete it. |
+| GET | `/api/v1/registry/height/{height}` | `{registry_root, entries}` — the chain-confirmed roster as of that height plus its LtHash root. Only a checkpoint head (a multiple of 30) at or below the applied tip is answered, the heights a checkpoint's QC-signed `registry_root` covers: any other height is HTTP 404 `registry_height_not_head`, one above the tip 404 `registry_height_not_applied` (with `Retry-After`), with no read. A height is built once (one build at a time node-wide; a request waits at most 3 s for it, else 503 `busy`), written straight into its body and kept in a 32 MiB cache; the answer carries `Cache-Control: public, max-age=86400, immutable`. A body above 16 MiB (the client's cap) is not built: the build stops at the cap and answers HTTP 413 `{error: "registry_oversize", rows}`, `rows` being the rows counted before it stopped (at least that many); every later head answers the same without a build, since the roster only grows. A build that fails answers HTTP 503 `{error: "registry_unavailable"}` and is not cached. Refusals carry `Cache-Control: no-store`, and on the wallet plane the typed form |
+| GET | `/api/v1/galc/capsule` | The GALC v2 capsule ([galc-capsule-v2](../protocols/galc-capsule-v2.md)): `{version, network_id, mb_index, mb_hash, committee_digest_anchor, committee_digest_pred, minted_at_height, cp_hash_anchor, cp_hash_pred, sigs[[id, sig]]}`, at least four genesis signatures in the compact form, about 21 KB. Served only while macroblocks K and K-1 decode on the node to the checkpoints it names and K is at most its finalized macroblock (re-read at most once a minute); otherwise HTTP 503 `capsule_unbound` with `Retry-After: 60`. HTTP 404 `no_capsule` when the node holds none; only genesis nodes hold one. A success carries `Cache-Control: public, max-age=60` and the ETag `"2-<K>-<first 8 hex of cp_hash_anchor>"`; a matching `If-None-Match` answers 304. Errors are typed |
 | GET | `/api/v1/validators/proof` | `{validators[], epoch, merkle_root, last_update_height, current_height, total_validators, active_validators}`; the root is SHA3-256 over the tag `QNET_VALIDATOR_SET:` + epoch + each sorted validator's fields, computed by the answering node over its own list and not tied to any checkpoint, so it is a plain read, not a proof |
 | GET | `/api/v1/account/{address}/balance/proof?mb=latest\|{j}` | The certified form: the account at macroblock j, proven against that checkpoint's `state_root` ([Certified state proofs](#certified-state-proofs)) |
 | GET | `/api/v1/token/{contract}/{holder}/balance/proof?mb=latest\|{j}` | The certified form of the two-level QRC-20 balance proof |
@@ -406,6 +424,10 @@ commits to.
 The macroblock proof endpoint has five distinct error returns: `macroblock_not_found`,
 `no_checkpoint_qc`, `qc_decode_failed`, `banned_decode_failed`, and `qc_sigs_pruned` (with
 `action: "repin_recent_anchor"`; only when neither the database nor the history archive holds the signatures).
+Without `form=2`, off the wallet plane, they are HTTP 200 bodies `{error, index[, action]}` as old clients expect;
+with `form=2` or on the wallet plane they are typed (`proof_format: 2`, `Cache-Control: no-store`): 404
+`macroblock_not_found` and `no_checkpoint_qc`, 410 `qc_sigs_pruned`, 503 `qc_decode_failed` and
+`banned_decode_failed` with `Retry-After: 5`, and 429 `rate_limited`.
 The log-proof endpoint answers `{error:"window_not_finalized", window_end}` until this node both stores
 macroblock `window_end / 90` and has applied the window, and a pruned window with
 `{error:"window_pruned", oldest_available}`.
@@ -532,6 +554,210 @@ A client:
     and marks that node old for at most 10 minutes, since nodes upgrade during a roll; nothing else marks a
     node old.
 
+## Wallet plane
+
+A super node that serves wallets opens a second listener: HTTPS on host port 443, which the installer
+publishes to container port 8443 (the node runs unprivileged, so it cannot bind 443 itself). Wallets read
+certified data from it. Port 8001 keeps all its routes, and the macroblock-proof and registry caches and
+headers ([REST: light-client proofs](#rest-light-client-proofs)), the buckets of
+[Rate limiting](#rate-limiting) and the `whoami` and `nodes/rpc` routes below apply there too; the installer
+publishes it on IPv4 only. The code is `rpc/wallet_plane.rs` (listener),
+`rpc/acme.rs` (certificate), `rpc/node_serve.rs` (serving identity and hints) and `node/public_rpc.rs`
+(address, schedule, endpoint commit).
+
+- **Where it runs.** Super nodes only: never a genesis identity, never a Light node, never under
+  `QNET_HIDE_IP`. It has its own runtime (`qnet-wallet-rt`, a quarter of the cores, 2 to 4 threads), so
+  wallet traffic never takes a worker from consensus. IPv4 only.
+- **TLS.** TLS 1.3, and TLS 1.2 with ECDHE-ECDSA AES-GCM or ChaCha20-Poly1305 only; key exchange prefers
+  the hybrid ML-KEM group, then X25519, then P-256; session tickets from a rotating ticketer; no 0-RTT;
+  ALPN `h2` and `http/1.1`. Wallets connect by IP literal, so they send no SNI. A renewal swaps the
+  certificate in place without dropping a connection. A certificate outside its validity is never
+  offered: without a valid one the handshake fails at the node.
+- **Certificate.** A short-lived (about 160 hours) certificate for the node's bare IPv4 from a public ACME
+  certificate authority, which the node obtains and renews itself, validated by tls-alpn-01 on the same
+  listener (no DNS name, no port 80). Before the first order, and before any new one, the node asks the
+  genesis nodes (in random order, until two agree) to probe its host port 443 (`whoami` below) and orders
+  only when the probe saw this very process. One exception: when every genesis that answers runs a
+  binary without the probe (during the roll before genesis runs it), a node with a configured address
+  (`QNET_PUBLIC_IP`, `EXTERNAL_IP` or `HOST_IP`) orders under the same backoff without a probe; one
+  without waits for genesis to probe it. A probe no genesis could answer (busy, rate-limited,
+  unreachable) is neither a refusal nor a permission: it is asked again after a random 5 to 10 minutes,
+  growing to 3 to 6 hours while it lasts. A negative probe is asked again after 5 to 7 hours. The CA
+  account is created at the first order, after a positive probe (or under the exception above); the first
+  order waits a uniform random 0 to 6 hours, with no probes during the wait and a fresh one right before
+  it; renewals follow the CA's renewal-information window (about every 80 hours, at a random time inside
+  it, at once when the window is already past) and always name the certificate they replace (an order
+  whose link the CA refuses, because that certificate was replaced already or another account ordered
+  it, goes again without the link); without
+  renewal information they happen at half the lifetime, plus or minus an hour. A renewal does not probe
+  while validations succeed, since each issuance re-proves reachability; after a failed validation,
+  every later order, renewals included, waits for a fresh positive probe. Failures back off 15 minutes, 1 hour, 6 hours, then 24 hours,
+  never shorter than the CA's `Retry-After`, with at most 3 failed authorizations per hour. The CA's
+  directory is read afresh for each issuance. The schedule, the account, the certificate and the
+  serving key live in `<data_dir>/wallet_tls/` (directory 0700, files 0600); each attempt is written
+  there as a failure before its first request (and its challenge as a failed authorization before it is
+  posted), then replaced by its outcome, so a restart, even one that kills the process mid-attempt,
+  never asks the CA early. An account key that cannot be read is left alone (the attempt fails and
+  backs off); a missing or undecodable one is replaced, and its account URL removed first, so a new key
+  never signs under the old account. When the CA does not take the held account URL, the key is
+  registered again, which returns its own account. A certificate whose key file does not hold its
+  key (a crash between the two writes) is neither served nor held: the next order starts from none.
+- **Address.** The node's public IPv4 is the configured one, else the one two genesis `whoami` answers
+  agree on, re-checked about every 30 minutes (plus or minus a quarter). It is sticky: genesis being down,
+  busy or split keeps it, and only two answers agreeing on another address move it. Before any answer, a
+  valid installed certificate's address is used. So genesis trouble never stops a node with a valid
+  certificate from serving, renewing or applying the lapse rule; it only holds back new endpoint commits.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/healthz` | as on port 8001 |
+| GET | `/api/v1/state/certified` | [Certified state proofs](#certified-state-proofs) |
+| GET | `/api/v1/account/{address}/balance/proof` | only with `mb`; the legacy form is refused |
+| GET | `/api/v1/token/{contract}/{holder}/balance/proof` | only with `mb` |
+| GET | `/api/v1/logs/proof` | counted in `certified_proof`; typed errors |
+| GET | `/api/v1/macroblock/{index}/proof` | `index` decimal; typed errors |
+| GET | `/api/v1/galc/capsule` | light route, own bucket; a super holds no capsule, so it answers 404 `no_capsule` |
+| GET | `/api/v1/registry/height/{height}` | checkpoint heads at or below the tip; body cache; 413 above 16 MiB |
+| GET | `/api/v1/node/serve-proof` | served on the wallet plane only |
+| GET | `/api/v1/nodes/rpc` | also on port 8001 |
+| GET | `/api/v1/whoami` | also on port 8001 |
+| POST | `/api/v1/transaction` | 64 KiB, with a `Content-Length` |
+| OPTIONS | the paths above | CORS preflight, any origin, no credentials |
+
+Everything else is refused with a typed 404 before it reaches a handler: the legacy proof forms, every
+unproven read, `/api/v1/validators/proof`, `/api/v1/peers`, `/api/v1/nodes/discovery`, `/api/v1/height`,
+the WebSocket, the registration, activation, device and ping routes, and every gated path.
+
+- **Client address.** The TLS socket's own peer; `X-Forwarded-For` is never read there. Every
+  per-address limit keys an IPv4 address or an IPv6 /64. A peer inside the container's own networks (the
+  container runtime hid the client) counts as one shared bucket and is logged as
+  `[WARN][WALLETRPC] client_ip_masked`, at most hourly. The gated routes refuse any request that came
+  through the plane.
+- **Limits** (code constants):
+
+  | Item | Bound |
+  | --- | --- |
+  | Connections | 8,192 per node, 32 per IPv4 address or IPv6 /64; over the cap, closed at accept |
+  | Handshakes | 256 in flight node-wide and 4 per IPv4 address or IPv6 /64; over either, closed at accept. A connection that sends no byte of its hello within 2 s is closed; a handshake has 5 s |
+  | HTTP | headers within 10 s (on HTTP/1 also the next request on a kept-alive connection; on either protocol a new connection's first request) and at most 16 KiB; 32 HTTP/2 streams per connection; POST bodies 64 KiB |
+  | Progress | only requests and answer bytes the transport takes count, never what a client sends (HTTP/2 pings, window updates, settings, a trickled body). A connection with no request in flight for 60 s is closed; a GET must be answered within 30 s, a POST's body read and answered within 10 s; an answer must hand a piece (64 KiB at most) to the transport at least every 20 s and all of it within 30 s plus its length at 64 KiB/s. One request missing any of these closes its connection. A connection takes no new request after 10 minutes and is closed a minute later |
+  | In flight | macroblock proofs and registry bodies: 2 per IPv4 address or IPv6 /64 and 128 MiB node-wide (counted at the body's size once built, until it is handed over or dropped); over either, 503 `busy` |
+  | Per address | the `certified_proof`, `certified_state`, `wallet_mb_proof`, `wallet_registry`, `serve_proof`, `nodes_rpc`, `whoami` and `transaction` buckets ([Rate limiting](#rate-limiting)) |
+  | Node-wide | 20 serve-proof signatures a second; macroblock-proof cache misses built 2 at once on both ports together (one build per index); one registry build at a time |
+  | Egress | 12.5 MB/s (100 Mbit/s) with a 25 MB burst over response bodies, charged as the transport takes each piece, never when a body is built, so a client that does not read costs it nothing. A macroblock proof or registry body first reserves its expected size (the cached body's, else the last such answer's, else the clients' cap: 8 MiB and 16 MiB), at most a sixteenth of the burst, which its first bytes spend; what an answer never sent goes back when it ends. A request the budget cannot hold answers 503 `busy` with a `Retry-After` of the time until it can (1 to 60 s); an answer admitted against part of its size can leave the bucket in debt, which later heavy answers wait out |
+
+- **Refusals.** Always `{"proof_format": 2, "error": "...", "retry_after_seconds": N}` (the last only with a
+  wait) with `Cache-Control: no-store` and, where it applies, `Retry-After`: `not_found` (404),
+  `rate_limited` (429), `busy` (503), `payload_too_large` (413), `length_required` (411),
+  `method_not_allowed` (405), `bad_request` (400), `cors_forbidden` (403), and each route's own typed errors;
+  `/api/v1/logs/proof` answers 400 `bad_parameter`, 404 `tx_not_found`, `log_not_found` and
+  `window_not_finalized` (`Retry-After: 30`), and 410 `window_pruned`, each with the fields of its port-8001
+  body. `POST /api/v1/transaction` keeps its own `{"success": false, "error": ...}` answers on both planes.
+  The plane's own refusals carry `Access-Control-Allow-Origin: *`.
+- **Caching.** Complete macroblock proofs `public, max-age=31536000, immutable` (one missing a signer's
+  key or the anchor checkpoint its pin names `no-store`); settled registry bodies
+  `public, max-age=86400, immutable`; the certified routes keep their own headers; refusals and serve-proof
+  answers `no-store`.
+
+### Serving identity: `GET /api/v1/node/serve-proof`
+
+`?challenge=<64 lowercase hex>[&have=<64 lowercase hex>]`, nothing else (400 `bad_parameter` otherwise).
+Served only on the wallet plane; port 8001 answers 404.
+
+A **ServeCert** is the node wallet's delegation of a single-purpose serving key at one IP. Its body is
+composed entirely by the node, canonical and little-endian:
+
+| Field | Bytes |
+| --- | --- |
+| version | 1 (`1`) |
+| node_id | 1 length byte + ASCII, at most 64 |
+| wallet | 1 length byte + 45 ASCII |
+| ip | 16, the IPv4-mapped IPv6 form |
+| issued_at, not_after, seq | 8 each; `not_after - issued_at` at most 7 days; `seq = issued_at`, strictly increasing |
+| serve_pk | 1952 (ML-DSA-65) |
+| wallet_pk | 1952 (ML-DSA-65) |
+
+`cert_hash = SHA3-256(body)`. The wallet key signs (ML-DSA-65, detached, 3309 bytes)
+`q1337|node_serve_cert:{hex cert_hash}`. The serving key signs, per request,
+`q1337|node_serve_proof:{challenge}:{hex cert_hash}:{ip}` with the IP in dotted form. No transaction
+preimage uses either kind. The serving key is random, node-local and replaced every 30 days; the
+ServeCert is re-issued every 72 hours, on an IP change, on a serving-key rotation and when the held one
+names another node (a data volume kept under a new phrase). The wallet key is
+derived from the mounted phrase for that one signature; the node then wipes its own working copies of the
+phrase and of the key. The signing library's internal memory is beyond its reach, as are the mounted file,
+the image's in-memory copy of it and a `QNET_WALLET_SEED` environment variable.
+
+```json
+{ "v": 1,
+  "cert": "<base64 of body ‖ wallet signature>",
+  "cert_hash": "<64 hex>",
+  "sig": "<base64 of the serving signature>",
+  "newest_certified_index": 31234 }
+```
+
+`cert` is left out when `have` equals the current `cert_hash`. `newest_certified_index` is an unsigned
+hint. About 14 KB, or about 4.6 KB with `have`. A client admits the node only when the ServeCert decodes
+strictly, its node id is the one it sampled from a certified eligible list and equals
+`super_node_` + the first 16 hex digits of `blake3("SUPER_NODE_PRIVACY_" + wallet)`, the wallet is the EON
+of `wallet_pk`, the IP is the one it connected to, the lifetime holds, and both signatures verify. Errors:
+400 `bad_parameter`, 429 `rate_limited`, 503 `serve_unavailable` with `reason` `no_certificate`,
+`not_registered`, `no_wallet_key` or `busy`. The fixed vectors are in
+`docs/protocols/serve-cert.vectors.json`.
+
+### Endpoint hints: `GET /api/v1/nodes/rpc`
+
+`?ids=<id>,...`: 1 to 64 ids of the form `super_node_` + 16 lowercase hex, duplicates collapsed. The answer
+`{"v": 1, "entries": [{"node_id": "...", "ip": "a.b.c.d"}]}` lists, from O(ids) point reads of the
+committed endpoint rows, only the ids whose committed endpoint is `https://<public IPv4>` (no port or
+`:443`, no path); the others are left out. `Cache-Control: public, max-age=60`. It answers only for ids
+the caller chose, so a server cannot steer which nodes a client samples; the answer is a hint that only the
+serve-proof at that address can confirm.
+
+A node opts in by committing `https://<IPv4>` as its endpoint. Peers read only the IP from it, so the
+form changes no peer-to-peer behaviour. The node commits it itself, through the existing NodeReactivation
+transaction, once a certificate for that IP was issued, two genesis `whoami` answers equal it (within
+the last 90 minutes), and the node is registered; at most once per 100 macroblocks. With no valid
+certificate for 48 hours it commits `http://<same IP>:8001` again, only when the committed address is
+its own current one: an address it left behind is the operator's to move. A node that does not serve
+never changes its endpoint by itself. Under `QNET_HIDE_IP` nothing is committed automatically: a node
+that served and then hides keeps `https://<IP>` on chain until a reactivation with an explicit
+`"api_endpoint": "http://<IP>:8001"`, and logs `[WARN][WALLETRPC] hidden_node_endpoint_still_https`
+at each start until then.
+
+### Address and 443 probe: `GET /api/v1/whoami`
+
+Every node type, both planes. `{"ip": "<the caller as this node sees it>"}`, from the TLS peer on the
+wallet plane and from the client address rules on port 8001. With `probe=443` the node makes one
+connection to the caller's own address on port 443 (2 s, nothing sent beyond a TLS handshake) and adds
+`"tcp443": true|false`; with `marker=<32 lowercase hex>` as well it handshakes with the server name
+`<marker>.probe.invalid` and adds `"tls443": true` only when the certificate it is shown names that,
+proving that port 443 reaches the caller's own process rather than another server on the address. The
+connection goes only to the address the node's own socket gave it: a request whose socket peer is
+loopback or the container's gateway (a local terminator, or the container runtime's proxy) names its
+caller only in `X-Forwarded-For`, which whoever wrote it could aim anywhere, so it is not probed
+(`"probe": "caller_not_socket"`, no `tcp443` or `tls443`); a super node therefore asks a genesis node's
+plain port by address for its probe. A caller that is not a public address is not probed
+(`"probe": "caller_not_public"`). Limits: 2 a minute per address, one probe at a time per caller (freed
+when the request ends or is dropped), 20 probes a second per node. `Cache-Control: no-store`.
+
+### Log lines
+
+| Line | When |
+| --- | --- |
+| `[INFO][WALLETTLS] cert_issued ip= not_after= renewal=` | issuance or renewal |
+| `[WARN][WALLETTLS] acme_failed stage= reason= retry_in=` | any certificate failure; `stage` is `precheck`, `account`, `order`, `challenge`, `finalize`, `download` or `verify` |
+| `[WARN][WALLETTLS] cert_expiring hours_left=` | under 24 hours left |
+| `[INFO][WALLETRPC] public_rpc_off reason=` | `port_443_unreachable`, `genesis_busy` (no genesis could answer the probe; `retry_in=` minutes), `genesis_without_probe`, `hide_ip`, `no_public_ip`, `genesis_identity` or `light` |
+| `[WARN][WALLETRPC] public_ip_unusable reason=` / `public_ip_env_differs env= seen=` | resolving the public address |
+| `[INFO][WALLETRPC] public_ip_kept ip= reason=no_genesis_agreement` / `public_ip_changed from= to=` | the sticky address kept without an agreement, or moved by one |
+| `[WARN][WALLETRPC] hidden_node_endpoint_still_https endpoint= action=reactivate api_endpoint=` | at start under `QNET_HIDE_IP` while `https://<IP>` is still committed |
+| `[INFO][WALLETRPC] endpoint_commit from= to= reason=` | `serving` or `lapsed` |
+| `[WARN][WALLETRPC] endpoint_refused_by_validator ip=` | an address today's on-chain endpoint rule refuses |
+| `[WARN][WALLETRPC] client_ip_masked` | at most hourly |
+| `[WARN][WALLETRPC] serve_cert_unavailable reason=` | no ServeCert can be signed (`no_wallet_seed`, or a phrase whose wallet does not own the node id); serve-proof answers `no_wallet_key` |
+| `[INFO][WALLETRPC] plane_listening addr= threads=` / `[WARN][WALLETRPC] bind_failed addr= err= retry_in=60s` | the listener on 8443 opened, or its bind failed and is retried every minute |
+| `[INFO][WALLETRPC] stats` | every 300 s: connections, handshakes, refusals by cap, served, refused, rate-limited, busy, connections dropped for a stalled answer, a missed deadline or their age (`stalled`), heavy answers in flight in MB, egress in MB, serve-proofs, macroblock cache hits, certificate hours left |
+
 ## REST: snapshots
 
 | Method | Path | Purpose |
@@ -581,7 +807,7 @@ Balances are nano-QNC as JSON numbers, which pass 2^53: read them from the raw t
 | --- | --- | --- |
 | POST | `/api/v1/transaction` | Submit a signed transfer |
 | POST | `/api/v1/batch/transfer` | Up to 1000 transfers from one sender as one signed transaction: `{transfers[{from, to_address, amount, memo}], batch_id, nonce, gas_price, gas_limit, dilithium_signature, dilithium_public_key}` → `{success, batch_id, transaction_hash, signed_id, transfer_count, total_amount, from_address, message, processed_by}`. Every `from` is the same address, each `amount` is above 0, each `memo` at most 128 bytes, and `gas_limit` at least 10 000 (`gas_limits::TRANSFER`) per transfer; the signature covers the batch message under [Batch transfers](#batch-transfers), and `dilithium_public_key` may be elided as for a transfer |
-| GET | `/api/v1/transaction/{hash}` | `{tx_hash, transaction{...}, status}`; `status` is `found`, `not_found` or `error`, and a found transaction's own `status` is `pending` (in this node's pool) or `confirmed` (in a stored block). There is no failed state: see [Transactions](transactions.md#status-and-outcome) |
+| GET | `/api/v1/transaction/{hash}` | `{tx_hash, transaction{...}, status}`; `status` is `found`, `not_found` or `error`, and a found transaction's own `status` is `pending` (in this node's pool), `confirmed` (in a stored block) or, for a reward claim that credited nothing, `no_effect` with `amount` 0. There is no failed state: see [Transactions](transactions.md#status-and-outcome) |
 | GET | `/api/v1/transaction/by-nonce/{from}/{nonce}` | The value transaction (transfer, batch, deploy or call) `from` signed at `nonce`: `{success: true, status, from, nonce, hash, signed_id}` with `status` `pending` (in this node's pool) or `confirmed` (in the sender's history this node keeps, about 28 hours, at most its last 500 index rows; two of one sender in one block are both found), or `{success: false, status: "not_found", from, nonce}`; older ones are in the explorer. `hash` is the hash of the copy this node holds. `read_only` bucket |
 | GET | `/api/v1/transactions/recent?page=&per_page=` | `{success, transactions[{hash, from, to, amount, nonce, timestamp, type, gas_price, gas_limit, is_quantum_signed}], pagination{page, per_page, total_count, total_pages, has_next, has_prev}, current_height}`: the newest transactions, newest first (the higher block first, and within a block its last transaction first), from the last 3600 blocks up to and including `current_height` (about an hour), 1000 transactions at most. `total_count` counts that feed, not the chain's history, and a page past it is empty; older transactions are in the address history and the explorer. `type` is the transaction type with its fields as the node prints them. `read_only` bucket |
 | GET | `/api/v1/transactions/history?address=&page=&per_page=&tx_type=&direction=` | Filtered, paginated address history |
@@ -715,11 +941,11 @@ SHA3-256 over each transfer in order: the `to_address` bytes, the amount as 8 li
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/node/status` | Accepts `node_id`, `wallet` or `activation_code`; the wallet may also arrive in `X-QNet-Wallet`. The first given of `node_id`, `wallet` and `activation_code` is used; a wallet resolves to the first of its genesis, super and light node ids that has a registry row. A light node in this node's light registry reports `heartbeat_count` 1 once it holds an on-chain attestation from either of the two previous epochs (`required_heartbeats` 1), and `is_online` is also true when an owner genesis of its light shard reports it active on `/api/v1/light-node/status`. For a light node `last_seen` is the start of the epoch of its last answer (the status's `device.last_answer_epoch`: that epoch's first block's time), never the answer's own second, which only the signed status gives (0 when unknown), and `last_seen_ago_seconds` is counted from it (`null` when it is unknown). |
+| GET | `/api/v1/node/status` | Accepts `node_id`, `wallet` or `activation_code`; the wallet may also arrive in `X-QNet-Wallet`. The first given of `node_id`, `wallet` and `activation_code` is used; a wallet resolves to the first of its genesis, super and light node ids that has a registry row. A light node in this node's light registry reports `heartbeat_count` 1 once it holds an on-chain attestation from either of the two previous epochs (`required_heartbeats` 1), and `is_online` is also true when an owner genesis of its light shard reports it active on `/api/v1/light-node/status`. For a light node `last_seen` is the start of the epoch of its last answer (the status's `device.last_answer_epoch`: that epoch's first block's time), never the answer's own second, which only the signed status gives (0 when unknown), and `last_seen_ago_seconds` is counted from it (`null` when it is unknown). A Super node's reply carries `admission` for the running epoch: `not_required` while no admission rule governs it, `admitted`, or `waiting` (registered, outside the consensus-admitted set: no super share); `is_reward_eligible` is false while `waiting` or while the node is banned (`banned_at_height` set); while `waiting` a registered node's `message` reads `Registered, waiting for network admission: no super share while outside.` For a Light node `admission` is absent or `null`. |
 | POST | `/api/v1/light-node/bind` | Links a registered light node to one device, or takes a pending binding for a node whose registration has not applied yet: the wallet key's delegation and attach with a sequence that must beat the stored one, the push channel, an optional unsigned `platform` (`android` or `ios`) and `model` (a short marketing name of the device, 1 to 40 ASCII letters, digits, spaces and `. , + ( ) / -`, never an identifier), both kept with the binding, shown by the public status and never a reason to refuse, the consent for a pending binding, and,
  once the node serves `device_v1`, the device's enrolment (`device`). Answers `{success, bound, node_id, seq, device_fp}` for exactly the sequence sent (`bound: false, pending: true` for a pending binding), with `device_state` and `effective_epoch` for a device block; refusals carry a stable `reason` ([light node messages](../protocols/light-node-messages.md) sections 4, 5.3 and 8) |
 | POST | `/api/v1/light-node/unbind` | The end of the binding stored now, at its sequence: the bound device's ping key's `light_unbind` (`"signer": "ping"`), sent by the app on the node cabinet's `unlink` request that the user confirms on that device (QNet Link section 14), with the device key's release when the node holds it; or, from any device that holds the wallet, the wallet key's `light_unbind_wallet` (`"signer": "wallet"` with `identity_pubkey`, never a release), once two genesis nodes list `unbind_wallet`. Answers `{success: true, unbound: true, node_id, binding_seq, device_released}`; refusals carry a stable `reason` (light node messages sections 4, 5.7 and 8) |
-| POST | `/api/v1/light-node/wake` | "I'm back" from the node cabinet: `{node_id}`, a silent push to the linked device (or a challenge for a polling device's next poll), outside the dormant rule (light node messages section 5.10 and the wake of QNet Link section 14.1). Every answer is `{success, reason, node_id}` with `reason` one of `sent` (the only one with `success: true`), `already_answered`, `no_device`, `not_registered`, `cooldown`, and `retry_after_seconds` only with `cooldown` (the address limit, the node's three wakes an epoch 600 s apart, the commit window and the 60 s before it, a refused push, or no owner reachable). A genesis that does not own the node's light shard checks only `not_registered` and hands the wake to the owners in rank order (at most 2 s each, TLS only), answering with the first owner's answer; a shard owner behind the network answers `cooldown` with HTTP 503 so the caller asks the next owner; every other answer is HTTP 200 |
+| POST | `/api/v1/light-node/wake` | A wake of a light node's device on request (the site sends none): `{node_id}`, a silent push to the linked device (or a challenge for a polling device's next poll), outside the dormant rule (light node messages section 5.10 and the wake of QNet Link section 14.1). Every answer is `{success, reason, node_id}` with `reason` one of `sent` (the only one with `success: true`), `already_answered`, `no_device`, `not_registered`, `cooldown`, and `retry_after_seconds` only with `cooldown` (the address limit, the node's three wakes an epoch 600 s apart, the commit window and the 60 s before it, a refused push, or no owner reachable). A genesis that does not own the node's light shard checks only `not_registered` and hands the wake to the owners in rank order (at most 2 s each, TLS only), answering with the first owner's answer; a shard owner behind the network answers `cooldown` with HTTP 503 so the caller asks the next owner; every other answer is HTTP 200 |
 | GET | `/api/v1/light-node/device-challenge?node_id=&purpose=` | A one-time challenge for a device enrolment, rotation, release or rebind, from the node's shard owners (light node messages section 5.2) |
 | POST | `/api/v1/light-node/device-refresh` | The device key's lease refresh inside the window the signed status names (light node messages section 5.6) |
 | POST | `/api/v1/light-node/device-rotate` | The device key's rotation, signed by the old key over the new key's attestation (light node messages section 5.4) |
@@ -771,8 +997,8 @@ address. Token refresh, re-registration and relayed attestations resolve it the 
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/api/v1/node-registration/submit` | Accepts `node_type: "light"`; super-node registration is server-initiated. A registration that embeds a burn is refused, retryably, with `{success: false, error, height, head}` while this node's applied height trails the corroborated network head by more than `DEFICIT_BOUND` (45) blocks. The owner bind is the v1 form or, from the `wallet_one_node` gate at this node's next height, the form without a time. From that gate a wallet that already has another node on chain is refused, after the `already_registered` check and before any attestation round, with `{success: false, code: "wallet_has_node", error: "This wallet already has a node on the QNet network: one wallet, one node", node_id}` (the other node; not retryable). A light owner bind in the form without a time that verifies before that gate, on a submit that passes every other check, is refused `{success: false, code: "bind_v2_pending"}` (retryable; the node lists the `owner_bind_v2` feature in `/api/v1/light-node/status` once it takes that form). The node asks its own attestor in-process first and the other committee members only once that burn has verified here; an attestation counts only from the member asked, once, with a signature that verifies under that member's committed key over the message the registration carries. The gathered registration is then judged as the producer and every node judge it, at this node's next height, and pooled only if it passes; otherwise `quorum_pending` (retryable). Only requests with no `Origin` header, or from `https://aiqnet.io`, `https://www.aiqnet.io` or any `chrome-extension://` or `moz-extension://` origin, are served; any other `Origin` gets HTTP 403 `{success: false, error: "Origin not allowed"}` before any check (the CORS answer is unchanged). Refusal codes: [light node messages](../protocols/light-node-messages.md#8-states-and-refusals) |
-| POST | `/api/v1/node-reactivation/submit` | Reactivation. Takes `node_id`, `current_height`, `last_macroblock_hash`, `last_macroblock_index` and an optional `api_endpoint` that republishes the node's committed address; omitting it announces the node's own configured endpoint. Accepted for the node itself or from an internal caller address, and the endpoint is validated (`http(s)`, no loopback, RFC 1918 or link-local host) before it is signed. |
+| POST | `/api/v1/node-registration/submit` | Accepts `node_type: "light"`; super-node registration is server-initiated. A registration that embeds a burn is refused, retryably, with `{success: false, error, height, head}` while this node's applied height trails the corroborated network head by more than `DEFICIT_BOUND` (45) blocks. The owner bind is the v1 form or, from the `wallet_one_node` gate at this node's next height, the form without a time. From that gate a wallet that already has another node on chain is refused, after the `already_registered` check and before any attestation round, with `{success: false, code: "wallet_has_node", error: "This wallet already has a node on QNet Blockchain: one wallet, one node", node_id}` (the other node; not retryable). A light owner bind in the form without a time that verifies before that gate, on a submit that passes every other check, is refused `{success: false, code: "bind_v2_pending"}` (retryable; the node lists the `owner_bind_v2` feature in `/api/v1/light-node/status` once it takes that form). The node asks its own attestor in-process first and the other committee members only once that burn has verified here; an attestation counts only from the member asked, once, with a signature that verifies under that member's committed key over the message the registration carries. The gathered registration is then judged as the producer and every node judge it, at this node's next height, and pooled only if it passes; otherwise `quorum_pending` (retryable). Only requests with no `Origin` header, or from `https://aiqnet.io`, `https://www.aiqnet.io` or any `chrome-extension://` or `moz-extension://` origin, are served; any other `Origin` gets HTTP 403 `{success: false, error: "Origin not allowed"}` before any check (the CORS answer is unchanged). Refusal codes: [light node messages](../protocols/light-node-messages.md#8-states-and-refusals) |
+| POST | `/api/v1/node-reactivation/submit` | Reactivation. Takes `node_id`, `current_height`, `last_macroblock_hash`, `last_macroblock_index` and an optional `api_endpoint` that republishes the node's committed address; omitting it announces the node's own endpoint: `https://<IP>` while it serves the [wallet plane](#wallet-plane), else `http://<configured IP>:8001`, and nothing when today's endpoint rule refuses that address. The automatic endpoint commit of the wallet plane builds, signs and broadcasts the same transaction. Accepted for the node itself or from an internal caller address, and the endpoint is validated (`http(s)`, no loopback, RFC 1918 or link-local host) before it is signed. |
 | POST | `/api/v1/nodes` | Super-node registration. A light node is registered through `POST /api/v1/node-registration/submit` (by the node cabinet or the browser extension, below) and linked to its device through `/api/v1/light-node/bind`. |
 | GET | `/api/v1/verify-activation` | Resolves a wallet to the first of its genesis, super and light node ids whose registry row is chain-confirmed (`source: "storage_index"`; a row the node cached from RPC or discovery, with no registration height, never answers), then genesis wallet constants (`source: "genesis_constants"`). A wallet registered with both types before the one-node rule (`wallet_one_node`) answers its super node here; node-events lists both; `{verified, source, node_id, node_type, wallet_address}` or `{verified: false, authoritative, wallet_address, current_height, network_height, message}`; `authoritative` is false while this node is below the network height it has cached, so its negative answer does not settle the wallet |
 | GET | `/api/v1/activations/by-wallet` | With `node_type` omitted, the wallet's node (the first of its genesis, super and light node ids that has a registry row) and, for a genesis wallet, its genesis node; accepts `X-QNet-Wallet` |
@@ -783,9 +1009,9 @@ address. Token refresh, re-registration and relayed attestations resolve it the 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/api/v1/rewards/claim` | Claim accrued rewards |
-| GET | `/api/v1/rewards/pending/{node_id}` | node_type, phase, `pending_rewards` (QNC), `pending_rewards_nano`, `first_unclaimed_epoch`, pools breakdown, epoch range, `last_claim`, `heartbeats{current, required, remaining}`, `is_active`, `is_eligible`, `is_claimable` |
+| GET | `/api/v1/rewards/pending/{node_id}` | node_type, phase, `pending_rewards` (QNC), `pending_rewards_nano`, `first_unclaimed_epoch`, pools breakdown, epoch range, `last_claim`, `heartbeats{current, required, remaining}`, `is_active`, `is_eligible`, `admission`, `is_claimable`. For a Super node `admission` is `not_required`, `admitted` or `waiting` for the running epoch, and `is_eligible` needs the heartbeats, no ban and an admission other than `waiting`; `admission` is `null` for other ids |
 | POST | `/api/v1/rewards/pending/batch` | `{node_ids: [...]}`, at most 100 → `{success, current_epoch, total_pending_qnc, count, nodes[]}` |
-| GET | `/api/v1/rewards/history/{node_id}?offset=&limit=` | Per-epoch records, newest first. `block_range` is the work window the epoch paid for; `status` is `unavailable`, `not_eligible` (no reward that epoch), `claimed` or `claimable`. limit defaults to 10, capped at 100 |
+| GET | `/api/v1/rewards/history/{node_id}?offset=&limit=` | Per-epoch records, newest first. `block_range` is the work window the epoch paid for; `status` is `unavailable`, `shard_not_certified` (a light node's shard committed no bitmap that epoch), `not_admitted` (a Super node outside that epoch's admitted set), `not_eligible` (no reward that epoch), `claimed` or `claimable`. limit defaults to 10, capped at 100 |
 | GET | `/api/v1/rewards/pools/{node_id}` | `current_phase`, `phase_description`, pending-rewards pool breakdown, `epoch_accumulated` |
 | GET | `/api/v1/rewards/by-wallet/{wallet_address}` | `{wallet_address, total_nodes, total_pending_qnc, current_epoch, nodes[]}` for the wallet's node, resolved to the first of its genesis, super and light node ids that has a registry row |
 | GET | `/api/v1/rewards/network/stats` | `current_epoch`, `current_height`, `blocks_until_next_epoch`, `epoch_accumulated`, `network_totals`, `emission_rate`. Served from a 30-second cache. |
@@ -793,7 +1019,8 @@ address. Token refresh, re-registration and relayed attestations resolve it the 
 | GET | `/api/v1/rewards/epoch/{epoch}/leafset?shard=` | One shard of an epoch's reward leaf set: `{epoch, shard, shards, wallets[[address, amount]]}`; `shard` defaults to 0, and `{epoch, shards: 0, wallets: []}` means this node holds no shards for the epoch. A node that cannot serve an epoch assembles the set from genesis peers and keeps it only if it hashes to the `reward_root` in its own certified macroblock |
 
 The heartbeat requirement reported by `/api/v1/rewards/pending/{node_id}` is 9 for Super (`super_` and
-`genesis_` ids) and 1 for Light (`light_` ids). See [economics](../economics/overview.md).
+`genesis_` ids) and 1 for Light (`light_` ids). From the `super_reward_admission` gate a Super node also needs
+the epoch's network admission; rewards it already earned stay claimable either way. See [economics](../economics/overview.md).
 
 ### Claiming
 
@@ -823,19 +1050,24 @@ The call above returns a **quote**: `claims_data`, `sign_message`, `claim_timest
 `{success, tx_hash, amount_qnc, message}`.
 
 A quote walks the epoch grid strictly above `last_claimed_epoch`, ascending, and stops rather than skips at
-the first epoch it cannot serve. When it stops it carries `stopped_at_epoch` and `stopped_reason`:
+the first epoch it cannot serve. An epoch whose shard cache was pruned is passed from the node's recipient index
+when the wallet holds no leaf in it, and rebuilt when it does. When it stops it carries `stopped_at_epoch` and
+`stopped_reason`:
 
 | `stopped_reason` | Meaning | Client action |
 | --- | --- | --- |
 | `batch_full` | 512-epoch batch limit reached | re-call for the remainder |
 | `quote_byte_budget` | 128 KiB quote budget reached | re-call for the remainder |
 | `root_not_here` | this node holds no certified root for the epoch | retry against another node |
-| `rebuild_budget` | the one leaf-set rebuild allowed per request was spent | re-call |
+| `rebuild_budget` | the leaf-set rebuilds allowed per request were spent (65,536 rebuilt leaves, at least one rebuild) | re-call |
 | `local_corruption` | this node's inputs do not reproduce the certified root; the epoch is parked for 3600 s while the node resyncs | claim against another node |
 | `epoch_unservable` | the epoch yields no servable proof here | claim against another node |
 
 Proof generation is bounded at 16 concurrent generations node-wide, and a per-node in-progress lock
-refuses a second concurrent claim for the same `node_id`. See
+refuses a second concurrent claim for the same `node_id`. The submit is refused with `claim_stale` when the
+batch names an epoch at or below the wallet's watermark (it was quoted before an earlier claim landed: request a
+new quote), and with `claim_pending` while another claim of the same wallet waits in this node's pool (retry
+after it lands). See
 [economics](../economics/overview.md).
 
 ## REST: smart contracts and tokens

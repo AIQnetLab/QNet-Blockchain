@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" gradientUnits="userSpaceOnUse" cx="512" cy="512" r="676.53"><stop offset="0.181" stop-color="#121b2c"/><stop offset="0.672" stop-color="#111424"/><stop offset="1" stop-color="#11111d"/></radialGradient>
+    <radialGradient id="disc" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="180.27"><stop offset="0" stop-color="#133c55"/><stop offset="0.971" stop-color="#211d41"/><stop offset="0.979" stop-color="#211d41"/><stop offset="1" stop-color="#211d41" stop-opacity="0"/></radialGradient>
+    <linearGradient id="outer" gradientUnits="userSpaceOnUse" x1="-347.04" y1="-347.04" x2="347.04" y2="347.04"><stop offset="0" stop-color="#00d4ff"/><stop offset="1" stop-color="#9e47ff"/></linearGradient>
+    <linearGradient id="q" gradientUnits="userSpaceOnUse" x1="-99.31" y1="-99.31" x2="99.31" y2="99.31"><stop offset="0" stop-color="#00d4ff"/><stop offset="0.5" stop-color="#9e47ff"/><stop offset="1" stop-color="#00a2de"/></linearGradient>
+    <linearGradient id="tail" gradientUnits="userSpaceOnUse" x1="58.3" y1="58.3" x2="99.49" y2="99.49"><stop offset="0" stop-color="#00d4ff"/><stop offset="0.5" stop-color="#9e47ff"/><stop offset="1" stop-color="#00b2eb"/></linearGradient>
+  </defs>
+  <g transform="translate(128 128) scale(0.75)">
+    <rect x="-170.67" y="-170.67" width="1365.34" height="1365.34" fill="url(#bg)"/>
+  </g>
+</svg>

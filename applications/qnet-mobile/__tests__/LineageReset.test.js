@@ -7,6 +7,7 @@ const { sha3_256 } = require('js-sha3');
 let lc;
 let GENESIS_NODE_IDS;
 let GENESIS_CONSENSUS_PKS;
+let NETWORK_ID;
 jest.isolateModules(() => {
   jest.doMock('../src/config/genesisConsensus', () => ({
     ...jest.requireActual('../src/config/genesisConsensus'),
@@ -14,7 +15,7 @@ jest.isolateModules(() => {
   }));
   jest.doMock('../src/crypto/DilithiumCrypto', () => ({ verifyDilithium: jest.fn(async () => true) }));
   lc = require('../src/crypto/QcLightClient');
-  ({ GENESIS_NODE_IDS, GENESIS_CONSENSUS_PKS } = require('../src/config/genesisConsensus'));
+  ({ GENESIS_NODE_IDS, GENESIS_CONSENSUS_PKS, NETWORK_ID } = require('../src/config/genesisConsensus'));
 });
 
 jest.setTimeout(120000);
@@ -147,10 +148,42 @@ it('a kept anchor of this lineage is resumed from as before, and nothing is drop
   expect(resets).toEqual([]);
 });
 
-it('the chain identity is a fingerprint of the pinned genesis identities', () => {
+it('the chain identity is a fingerprint of the network identity and the pinned genesis identities', () => {
   const id = lc.chainIdentity();
   expect(id).toMatch(/^[0-9a-f]{32}$/);
+  expect(NETWORK_ID).toMatch(/^[0-9a-f]{64}$/);
   const ids = [...GENESIS_NODE_IDS].sort();
-  expect(id).toBe(sha3_256(Buffer.from(ids.map((n) => `${n}:${GENESIS_CONSENSUS_PKS[n]}`).join('|'), 'utf8')).slice(0, 32));
+  const parts = [`network:${NETWORK_ID}`, ...ids.map((n) => `${n}:${GENESIS_CONSENSUS_PKS[n]}`)];
+  expect(id).toBe(sha3_256(Buffer.from(parts.join('|'), 'utf8')).slice(0, 32));
   expect(lc.chainIdentity()).toBe(id);
+  // Records sealed by builds before NETWORK_ID named the chain by its genesis identities alone: they are dropped once.
+  expect(id).not.toBe(sha3_256(Buffer.from(parts.slice(1).join('|'), 'utf8')).slice(0, 32));
+});
+
+// GALC v2 (docs/protocols/galc-capsule-v2.md): the capsule root is not one of the kept anchors the reset drops. Signatures
+// pass here as every vote does (GalcCapsule.test.js verifies them for real).
+it('the capsule survives the reset of kept anchors, and the walk roots at it once they go', async () => {
+  const K = 20;
+  const parts = (j) => {
+    const p = proofFor(j);
+    return { index: j, checkpoint: p.checkpoint, eligible_raw: p.eligible_raw, banned: [], committee: lc.sampleCommittee([...IDS].sort(), j, BEACON) };
+  };
+  const capsule = {
+    version: 2, network_id: NETWORK_ID, mb_index: K, mb_hash: 'a1'.repeat(32), committee_digest_anchor: 'a2'.repeat(32),
+    committee_digest_pred: 'a3'.repeat(32), minted_at_height: K * 90, cp_hash_anchor: lc.checkpointHash(proofFor(K).checkpoint),
+    cp_hash_pred: lc.checkpointHash(proofFor(K - 1).checkpoint), sigs: IDS.slice(0, 4).map((id) => [id, wireSig(id)]),
+  };
+  serveChain();
+  await expect(lc.importCapsule({ capsule, roots: { [K]: parts(K), [K - 1]: parts(K - 1) } })).resolves.toEqual({ ok: true, index: K });
+  lc.importVerifiedAnchors({ 24: FOREIGN, 25: FOREIGN });
+  const resets = [];
+  const dropped = [];
+  const ok = await lc.verifyMacroblockStateRoot(stateRootOf(28), 28 * 90, () => [N1, N2],
+    { onLineageReset: () => resets.push(1), onCapsuleDropped: () => dropped.push(1) });
+  expect(ok).toBe(true);
+  expect([resets, dropped]).toEqual([[1], []]);
+  expect(lc.heldCapsuleIndex()).toBe(K);
+  expect(asked).toContain(22); // the second pass started at the capsule
+  expect(asked).not.toContain(2); // never at the root
+  lc.clearCapsule();
 });

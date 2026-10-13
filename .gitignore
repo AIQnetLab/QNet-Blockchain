@@ -254,6 +254,9 @@ perf.data.old
 core.*
 # Exclude core dumps but allow core/ directory
 !/core/
+# The extension's core test files are sources, not dumps
+!applications/qnet-wallet/test/core.test.mjs
+!applications/qnet-wallet/test/live/core.live.test.mjs
 
 # Archives
 *.tar
@@ -371,6 +374,8 @@ build/
 # Rust build artifacts
 debug/
 release/
+# A site route named release, not a build output
+!applications/qnet-explorer/frontend/src/app/api/cabinet/activation/release/
 
 # Python caches
 __pycache__/
@@ -612,6 +617,8 @@ testing/integration/*/OPTIONS-*backups/
 # Private scripts (not for public distribution)
 scripts/install-genesis.sh
 assets/
+# The app icon sources are public: every icon size is rendered from them.
+!applications/qnet-mobile/assets/
 
 applications/qnet-mobile/android/gradle/wrapper/gradle-*-bin/
 

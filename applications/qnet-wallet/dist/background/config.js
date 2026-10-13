@@ -6,7 +6,7 @@
 /** true only in dist-dev/, where scripts/build-dev.mjs rewrites this line; gates the logger. */
 export const DEV_BUILD = false;
 
-export const WALLET_VERSION = '3.1.0';
+export const WALLET_VERSION = '3.1.2';
 export const RELEASE_CHANNEL = 'testnet';
 
 export const QNET = Object.freeze({
@@ -116,6 +116,12 @@ export const STORAGE_KEYS = Object.freeze({
   APPROVAL_COOLDOWN: 'qnet_approval_cooldown_v3',
   // the popup's last balances and first history pages of this session (decision 39), gone with every lock
   VIEW_CACHE: 'qnet_view_cache_v3',
+  // the certified account figures a QNet send may stand on (qnet.js sendBase), by address and macroblock index, gone
+  // with every lock
+  SEND_PROOFS: 'qnet_send_proofs_v3',
+  // what a woken worker takes over of the light client (qnet.js lightHintsRead): the certified head last seen and until
+  // when no node is asked for a capsule; chain data, no wallet's
+  LIGHT_HINTS: 'qnet_light_hints_v1',
 });
 
 export const VAULT_DB = Object.freeze({ NAME: 'qnet-vault-v3', VERSION: 1, STORE: 'vault', KEY: 'main' });
@@ -201,9 +207,6 @@ export const TIMINGS = Object.freeze({
   APPROVAL_HEARTBEAT_MS: 20000,
   // While the popup is visible, the balances, the token list and the history on screen are read again this often.
   POPUP_REFRESH_MS: 15000,
-  // The popup's keepalive while the forgot-password reset waits for its confirmation: the one-time token lives
-  // in worker memory, and an idle MV3 worker stops after about 30 s (R2-ESM-06).
-  RESTORE_KEEPALIVE_MS: 20000,
   // An approval left open this long is rejected with 4001 and its window closed.
   APPROVAL_TIMEOUT_MS: 600000,
   // After the user rejects or closes an approval, its origin opens no other one for this long (none: a person
@@ -213,8 +216,9 @@ export const TIMINGS = Object.freeze({
   APPROVAL_COOLDOWN_LONG_MS: 60000,
   APPROVAL_COOLDOWN_WINDOW_MS: 600000,
   APPROVAL_BUDGET_SHORT_MS: 60000,
-  // The one-time token of the forgot-password restore (vault.restoreBegin → vault.restore).
-  RESTORE_TOKEN_TTL_MS: 600000,
+  // The one-time token of the forgot-password reset (vault.resetBegin → vault.reset): asked for when Reset wallet is
+  // pressed and spent at once.
+  RESET_TOKEN_TTL_MS: 60000,
   NODE_TIMEOUT_MS: 8000,
   SOLANA_TIMEOUT_MS: 15000,
   BURN_FINALIZE_TIMEOUT_MS: 90000,
@@ -249,3 +253,7 @@ export const TIMINGS = Object.freeze({
 export const AUTO_LOCK_ALARM = 'qnet-auto-lock';
 /** The alarm that resumes the light node's registration while one waits (nodes.js). */
 export const REGISTRATION_ALARM = 'qnet-register';
+/** The alarm that keeps a verified checkpoint at the certified head while the session is unlocked (qnet.js followTick). */
+export const FOLLOW_ALARM = 'qnet-follow';
+// Its period in minutes: the shortest chrome.alarms allows (30 s).
+export const FOLLOW_ALARM_MINUTES = 0.5;

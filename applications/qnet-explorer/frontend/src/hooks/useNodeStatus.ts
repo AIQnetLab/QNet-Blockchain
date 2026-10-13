@@ -3,10 +3,13 @@
 // A node's reads for the cabinet, from the site's routes (src/server/cabinet/node-proxy.ts, wallet-node.ts): a light
 // node's status and epochs, a super node's status, and whether a wallet has a node of either type. Read on load, when
 // the page is shown again, and every half minute while it is shown. The answer is checked again here. Every part of a
-// page that shows the same read shares one, and a section opened next shows the last answer while it reads again.
+// page that shows the same read shares one, and a section opened next shows the last answer while it reads again. A
+// node's older epochs are read a page at a time, on "Show more".
 
-import { useCallback, useEffect, useSyncExternalStore } from 'react';
-import { parseHistoryView, parseStatusView, parseSuperStatus, type HistoryView, type NodeStatusView, type SuperStatusView } from '@/lib/cabinet/node-view';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  joinPages, parseHistoryView, parseStatusView, parseSuperStatus, statusPath, type HistoryRow, type HistoryView, type NodeStatusView, type SuperStatusView,
+} from '@/lib/cabinet/node-view';
 import { parseWalletNode, type WalletNodeView } from '@/lib/cabinet/wallet-activation';
 
 const REFRESH_MS = 30_000;
@@ -117,13 +120,47 @@ export function useSharedRead<T>(url: string | null, parse: (body: unknown) => T
 
 const nodeUrl = (nodeId: string | null, path = '') => (nodeId ? `/api/cabinet/node/${encodeURIComponent(nodeId)}${path}` : null);
 
-export function useNodeStatus(nodeId: string | null) {
-  return useSharedRead<NodeStatusView>(nodeUrl(nodeId), parseStatusView, true);
+// `view`: an address only viewed, whose status comes without the device's details (node-view.ts publicStatus); its
+// own shared read, so a connected wallet's details never reach a view.
+export function useNodeStatus(nodeId: string | null, view: boolean) {
+  return useSharedRead<NodeStatusView>(nodeId ? statusPath(nodeId, view) : null, parseStatusView, true);
 }
 
-// A light or a super node's epochs.
+// A light or a super node's newest epochs, the first page.
 export function useNodeHistory(nodeId: string | null) {
   return useSharedRead<HistoryView>(nodeUrl(nodeId, '/history'), parseHistoryView, false);
+}
+
+export interface EpochList {
+  // Every epoch read so far, newest first, each once (node-view.ts joinPages).
+  rows: HistoryRow[];
+  more: boolean;
+  phase: 'idle' | 'reading' | 'failed';
+  showMore: () => void;
+}
+
+// The first page (`first`, the shared read) and the older pages read on showMore, one at a time, joined; a page that
+// fails keeps the rows and lets showMore ask for it again.
+export function useEpochList(nodeId: string, first: HistoryView): EpochList {
+  const [older, setOlder] = useState<HistoryView[]>([]);
+  const [phase, setPhase] = useState<EpochList['phase']>('idle');
+  const reading = useRef(false);
+  const last = older.length > 0 ? older[older.length - 1] : first;
+  const showMore = useCallback(() => {
+    if (reading.current || !last.more) return;
+    reading.current = true;
+    setPhase('reading');
+    void load(`${nodeUrl(nodeId, '/history')}?page=${older.length + 1}`, parseHistoryView).then((page) => {
+      reading.current = false;
+      if (page === null) {
+        setPhase('failed');
+        return;
+      }
+      setOlder((pages) => [...pages, page]);
+      setPhase('idle');
+    });
+  }, [nodeId, older.length, last.more]);
+  return { rows: joinPages([first, ...older]), more: last.more, phase, showMore };
 }
 
 export function useSuperStatus(nodeId: string | null) {

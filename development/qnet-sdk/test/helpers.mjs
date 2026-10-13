@@ -1,7 +1,8 @@
 // Shared test helpers: the app's known answers, a local mock node, the built command line, and a small builder of
 // WebAssembly modules. Fixtures under fixtures/ are answers recorded from the public testnet nodes with GET
-// requests (2026-09-25): account.json, balproof.json, tx.json, height.json. Shapes of POST answers and of routes with
-// no live example (deploy, token) are the node handlers' own (development/qnet-integration/src/rpc), noted where used.
+// requests (2026-09-25): account.json, balproof.json, tx.json, height.json; heights in them are below the pin, so tests
+// that walk the checkpoints use recordedAbovePin or testLineage. Shapes of POST answers and of routes with no live
+// example (deploy, token) are the node handlers' own (development/qnet-integration/src/rpc), noted where used.
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
@@ -48,6 +49,25 @@ export async function lightClientSource() {
   const file = path.join(await tempHome(), 'qc-light-client.mjs');
   writeFileSync(file, out.outputFiles[0].text);
   return import(pathToFileURL(file).href);
+}
+
+let floor = null;
+/** The light client's trust floor: the lowest macroblock it verifies, one above the release's pin. */
+export const trustFloor = () => (floor ??= lightClientSource().then((lc) => lc.trustFloorIndex()));
+
+/**
+ * The recorded balance proof (balproof.json) and tip (height.json), moved by whole macroblocks to just above the trust
+ * floor, which each release's pin raises: a proof at or below the pin is never walked. The proof folds to its state
+ * root at any height (the height is not in the account's leaf), and the tip keeps its distance from it.
+ */
+export async function recordedAbovePin() {
+  const proof = JSON.parse(fixture('balproof.json'));
+  const tip = JSON.parse(fixture('height.json'));
+  const lift = ((await trustFloor()) + 10 - Math.floor(proof.block_height / 90)) * 90;
+  return {
+    proof: { ...proof, block_height: proof.block_height + lift },
+    tip: { ...tip, height: tip.height + lift, network_height: tip.network_height + lift },
+  };
 }
 
 /**

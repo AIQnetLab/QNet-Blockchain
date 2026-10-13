@@ -2519,6 +2519,14 @@ export async function checkServerNodeStatus(nodeId = null, walletAddress = null,
           heartbeatCount: result.heartbeat_count || 0,
           requiredHeartbeats: requiredHeartbeats || 9, // Super nodes only
           isRewardEligible: result.is_reward_eligible,
+          // Whether the network admits the registered node to consensus: false only on the node's word (a rule that
+          // holds outside super nodes at registration), undefined when it says nothing (an older node: shown as before);
+          // false makes NodeTab say it waits for admission instead of Offline.
+          consensusAdmitted: typeof result.consensus_admitted === 'boolean' ? result.consensus_admitted : undefined,
+          // A super node's admission to the epoch's rewarded set, as the node reports it: 'admitted', 'waiting'
+          // (registered, no super share while outside) or 'not_required' (no admission rule governs the epoch);
+          // undefined when it says nothing (an older node) or something else. Shown on the Node tab when it says.
+          admission: ADMISSION_STATES.includes(result.admission) ? result.admission : undefined,
           reputation: result.reputation, // BLOCKCHAIN reputation from DeterministicReputationState
           currentBlockHeight: result.current_block_height,
           needsAttention: result.needs_attention,
@@ -2627,6 +2635,9 @@ export async function getPendingRewards(nodeId) {
       isEligible: !!r.is_eligible,
       currentEpoch: r.current_epoch,
       heartbeats: r.heartbeats,
+      // The first reward epoch the wallet has not claimed, as this node's state has it: a node past a move's last epoch
+      // has applied that move, so its figure no longer holds the amount moved (WalletScreen, after a move).
+      firstUnclaimedEpoch: Number.isSafeInteger(r.first_unclaimed_epoch) ? r.first_unclaimed_epoch : null,
     };
   } catch (error) {
     return { success: false, error: error.message };
@@ -2666,7 +2677,9 @@ export async function getWalletNodeEvents(walletAddress, ids) {
 const EPOCH_BLOCKS = 14400;
 const KEYS_PER_EPOCH = 160;
 const HISTORY_EPOCHS = 64;
-const HISTORY_STATUSES = ['claimable', 'claimed', 'not_eligible', 'shard_not_certified', 'unavailable'];
+const HISTORY_STATUSES = ['claimable', 'claimed', 'not_eligible', 'not_admitted', 'shard_not_certified', 'unavailable'];
+// The admission states a node's status reports for a super node (rewards_api.rs, light_nodes.rs).
+const ADMISSION_STATES = ['admitted', 'waiting', 'not_required'];
 
 // One node's per-epoch history for `nodeId`: { wallet, rows: [{ epoch, status }] } newest first, or null.
 function parseEpochHistory(body) {
@@ -2682,11 +2695,13 @@ function parseEpochHistory(body) {
 
 /**
  * A node's counted and missed epochs among the last 64 the network settled (GET /api/v1/rewards/history/{id}?limit=64):
- * paid (claimable, claimed) is counted, not eligible is missed; an epoch the answering node could not serve
- * (unavailable) or whose light group was not checked is neither. A second genesis node fills the epochs the first could
- * not serve (three are asked at most); an answer for another wallet than `walletAddress` counts for nothing. Epochs before the node's registration
- * (`registeredHeight`, from node-events) are left out, and its registration epoch is never missed. { counted, missed } or
- * null when no genesis node answered.
+ * paid (claimable, claimed) is counted, not eligible is missed; a super node's epoch outside the admitted set
+ * (not_admitted: the network's admission, not missed heartbeats) is counted apart as not admitted, never missed; an
+ * epoch the answering node could not serve (unavailable) or whose light group was not checked is none of these. A
+ * second genesis node fills the epochs the first could not serve (three are asked at most); an answer for another
+ * wallet than `walletAddress` counts for nothing. Epochs before the node's registration (`registeredHeight`, from
+ * node-events) are left out, and its registration epoch is never missed. { counted, missed, notAdmitted } or null when
+ * no genesis node answered.
  */
 export async function getNodeEpochs(nodeId, { walletAddress = null, registeredHeight = null } = {}) {
   if (!nodeId) return null;
@@ -2713,13 +2728,15 @@ export async function getNodeEpochs(nodeId, { walletAddress = null, registeredHe
   const seen = new Set();
   let counted = 0;
   let missed = 0;
+  let notAdmitted = 0;
   for (const r of got.rows) {
     if (seen.has(r.epoch) || (joined !== null && r.epoch < joined)) continue;
     seen.add(r.epoch);
     if (r.status === 'claimable' || r.status === 'claimed') counted += 1;
+    else if (r.status === 'not_admitted') notAdmitted += 1;
     else if (r.status === 'not_eligible' && r.epoch !== joined) missed += 1;
   }
-  return { counted, missed };
+  return { counted, missed, notAdmitted };
 }
 
 export default {

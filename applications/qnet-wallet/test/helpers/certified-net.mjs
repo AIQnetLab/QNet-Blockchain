@@ -124,11 +124,11 @@ function qcSig(checkpointHashHex) {
   return sig;
 }
 
-// The served proof of macroblock `index` whose checkpoint commits `stateRoot`, signed by the committee.
-function macroblockProof(index, stateRoot) {
+// The served proof of macroblock `index` whose checkpoint commits `stateRoot` and `logsRoot`, signed by the committee.
+function macroblockProof(index, stateRoot, logsRoot = ZERO) {
   const checkpoint = {
     index, window_head_height: index * 90, window_mb_hashes: [], state_root: stateRoot, beacon: BEACON, epoch_commitment: EPOCH_COMMITMENT,
-    reward_root: ZERO, registry_root: REGISTRY_ROOT, logs_root: ZERO, dilithium_pk_root: ZERO, reward_epoch_root: ZERO, total_supply: 0,
+    reward_root: ZERO, registry_root: REGISTRY_ROOT, logs_root: logsRoot, dilithium_pk_root: ZERO, reward_epoch_root: ZERO, total_supply: 0,
     timestamp: 0, proposer: MEMBER, recovery_anchor: null,
   };
   return {
@@ -148,8 +148,8 @@ export const jsonText = (body) => JSON.stringify(body, (key, value) => (value &&
   ? `<<num:${value.numberLiteral}>>` : value)).replace(/"<<num:(\d+)>>"/g, '$1');
 const json = (body, status = 200, headers = {}) => new Response(jsonText(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 
-// One certified state: {index, root, tree, accounts, tokens, storage} with every account's full fields.
-function buildState(index, accounts, tokens) {
+// One certified state: {index, root, tree, accounts, tokens, storage, logsRoot} with every account's full fields.
+function buildState(index, accounts, tokens, logsRoot = ZERO) {
   const fieldsOf = new Map();
   const storage = new Map();
   for (const [address, fields] of Object.entries(accounts)) fieldsOf.set(address, accountFields(fields));
@@ -163,7 +163,7 @@ function buildState(index, accounts, tokens) {
     fieldsOf.set(contract, accountFields({ ...token.account, is_contract: true, contract_code_hash: token.codeHash ?? 'c0de'.repeat(16), storage_root: tree.root }));
   }
   const tree = stateTree([...fieldsOf].map(([address, fields]) => [addrKey(address), core.certifiedAccountLeafHash(address, fields)]));
-  return { index, root: tree.root, tree, fieldsOf, storage };
+  return { index, root: tree.root, tree, fieldsOf, storage, logsRoot };
 }
 
 // The account fields as a certified body writes them (u64 as decimal text, the slots as numbers).
@@ -233,15 +233,15 @@ export function legacyTokenAnswer(state, contract, holder, blockHeight) {
 /**
  * A certified network over QNET.NODES.
  * @param {{accounts?: Record<string, object>, tokens?: Record<string, {holders?: Record<string, string>, account?: object,
- *   codeHash?: string}>, chain?: Record<string, {balance?: string, nonce?: string, pk?: boolean}>|null}} [options]
+ *   codeHash?: string}>, chain?: Record<string, {balance?: string, nonce?: string, pk?: boolean}>|null, logsRoot?: string}} [options]
  *   accounts: address -> leaf fields; tokens: contract -> holders (base units); chain: what GET /api/v1/account/{a} reports
- *   (the chain's nonce now; default: the newest certified state's)
+ *   (the chain's nonce now; default: the newest certified state's); logsRoot: the first state's checkpoint logs_root
  * @returns {object} the net: route(request), install(), certify(accounts, tokens), states, and knobs for node behaviour
  */
-export function certifiedNet({ accounts = {}, tokens = {}, chain = null } = {}) {
+export function certifiedNet({ accounts = {}, tokens = {}, chain = null, logsRoot = ZERO } = {}) {
   if (!NOBLE_INSTALLED) throw new Error('run npm run bundle:install: the committee signs with the bundle\'s ML-DSA-65');
   const net = {
-    states: [buildState(FIRST_INDEX, accounts, tokens)],
+    states: [buildState(FIRST_INDEX, accounts, tokens, logsRoot)],
     chain,
     // nodes that serve the older live-root bodies and no /api/v1/state/certified
     old: new Set(),
@@ -265,9 +265,16 @@ export function certifiedNet({ accounts = {}, tokens = {}, chain = null } = {}) 
       net.states.push(state);
       return state;
     },
-    /** A fresh light client rooted at the anchors two below the first certified macroblock (on both parity chains). */
+    /**
+     * A fresh light client rooted at the anchors two below the first certified macroblock (on both parity chains). A net
+     * is another chain than any installed before it: what the wallet kept of an earlier one (the anchors, now with their
+     * roots, the capsule and the send proofs of the installed environment) is not its.
+     */
     install() {
       core.clearQcCache();
+      core.clearCapsule();
+      const env = globalThis.__qnetChainsEnv;
+      if (env) Object.assign(env, { anchors: null, capsule: null, sendProofs: {} });
       const anchor = { eligible_ids: [MEMBER], beacon: BEACON, registry_root: REGISTRY_ROOT };
       core.importVerifiedAnchors({ [FIRST_INDEX - 2]: anchor, [FIRST_INDEX - 1]: anchor });
       return net;
@@ -304,7 +311,7 @@ export function certifiedNet({ accounts = {}, tokens = {}, chain = null } = {}) 
       const macro = /^\/api\/v1\/macroblock\/(\d+)\/proof$/.exec(p);
       if (macro) {
         const state = net.stateAt(Number(macro[1]));
-        return state === null ? json({ error: 'macroblock_not_found' }) : json(macroblockProof(state.index, state.root));
+        return state === null ? json({ error: 'macroblock_not_found' }) : json(macroblockProof(state.index, state.root, state.logsRoot));
       }
       if (/^\/api\/v1\/registry\/height\/\d+$/.test(p)) return json({ entries: ENTRIES });
       const accountProof = /^\/api\/v1\/account\/([0-9a-z]+)\/balance\/proof$/.exec(p);

@@ -7,7 +7,7 @@ param(
     [int]$DelayMs = 100
 )
 
-Write-Host "=== QNet Transaction Test ===" -ForegroundColor Cyan
+Write-Host "=== QNet Blockchain Transaction Test ===" -ForegroundColor Cyan
 Write-Host "Sending $Count transactions in batches of $BatchSize" -ForegroundColor Yellow
 
 # Function to send transaction

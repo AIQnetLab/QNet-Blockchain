@@ -138,6 +138,9 @@ impl BlockchainNode {
                     Some(w) => self.get_state_manager().read().await.get_last_claimed_epoch(w),
                     None => u64::MAX,
                 };
+                if let Some(refusal) = self.claim_door_refusal(&tx, last_claimed) {
+                    return Err(QNetError::ValidationError(refusal.to_string()));
+                }
                 if !Self::claim_proofs_admissible(&self.get_storage(), &tx, last_claimed) {
                     return Err(QNetError::ValidationError("Reward claim has no valid merkle proofs".to_string()));
                 }
@@ -363,6 +366,16 @@ impl BlockchainNode {
         // No external lock needed - eliminates 100K TPS bottleneck!
         // v2.66: Log if not added, but DON'T return Err (duplicate is OK in P2P)
         let added = self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
+        // A claim that lost the wallet's one pending slot to another claim since the door's check is not pooled:
+        // say so instead of returning a hash that never lands.
+        if !added && tx.is_merkle_reward_claim() {
+            if let Some(w) = tx.to.as_deref() {
+                if self.mempool.pending_claim_hash(w).map_or(false, |h| h != tx_hash) {
+                    return Err(QNetError::ValidationError(
+                        "A reward claim for this wallet is already pending (claim_pending): retry after it lands".to_string()));
+                }
+            }
+        }
         if !added {
             // This is NORMAL for P2P: same TX received from multiple peers
             // Only log for system TX (gas_price == u64::MAX) as those are important
@@ -416,15 +429,36 @@ impl BlockchainNode {
     /// This node's announced public API endpoint, or "" when it hides its IP or is Light. Deployment
     /// configuration, NOT a consensus parameter — the announcement is validated on-chain either way.
     /// ONE resolver so registration and reactivation always announce the same address.
+    ///
+    /// While the node serves the wallet plane (a valid certificate for its public IPv4 X) it is
+    /// `https://X`; otherwise `http://<configured ip>:8001` as before. Either form passes through the
+    /// on-chain validator first: one it refuses would make a registration fail forever, so "" is
+    /// announced instead and the node stays reachable by its peers' other paths.
     pub(crate) fn self_public_api_endpoint(node_type: NodeType) -> String {
         if node_type != NodeType::Super || std::env::var("QNET_HIDE_IP").is_ok() {
             return String::new();
         }
-        let public_ip = std::env::var("QNET_PUBLIC_IP")
-            .or_else(|_| std::env::var("EXTERNAL_IP"))
-            .or_else(|_| std::env::var("HOST_IP"))
-            .unwrap_or_default();
-        if public_ip.is_empty() { String::new() } else { format!("http://{}:8001", public_ip) }
+        let endpoint = super::public_rpc::serving_endpoint(crate::rpc::wallet_plane::unix_now()).unwrap_or_else(|| {
+            match super::public_rpc::configured_public_ip() {
+                Some(ip) => format!("http://{}:8001", ip),
+                None => String::new(),
+            }
+        });
+        Self::endpoint_or_empty(endpoint)
+    }
+
+    /// `endpoint` when the on-chain validator accepts it, else "" with a WARN.
+    pub(crate) fn endpoint_or_empty(endpoint: String) -> String {
+        match qnet_state::transaction::validate_public_api_endpoint(&endpoint) {
+            Ok(()) => endpoint,
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][WALLETRPC] endpoint_refused_by_validator ip={} err={}",
+                             crate::genesis_constants::endpoint_ip_only(&endpoint), e);
+                }
+                String::new()
+            }
+        }
     }
 
     /// Canonical sign-preimage BODY a returning node's identity key signs (the chain tag is added by
@@ -849,6 +883,21 @@ impl BlockchainNode {
         h.update(Self::build_canonical_verify_message(tx).as_bytes());
         h.update(sig);
         Some(hex::encode(h.finalize()))
+    }
+
+    /// Admission only, before the proof walk (no gate): a merkle claim that would apply as a partial or empty credit.
+    /// One naming an epoch at or below the wallet's watermark was quoted before an earlier claim landed, and one
+    /// beside another pending claim of the same wallet starts at the same watermark; either would land in a block
+    /// and read as confirmed while crediting little or nothing. The wallet re-quotes once the pending claim lands.
+    pub(crate) fn claim_door_refusal(&self, tx: &qnet_state::Transaction, last_claimed: u64) -> Option<&'static str> {
+        let wallet = tx.to.as_deref()?;
+        if Self::claim_is_stale(tx, last_claimed) {
+            return Some("Reward claim names an epoch already claimed (claim_stale): request a new quote");
+        }
+        match self.mempool.pending_claim_hash(wallet) {
+            Some(h) if h != tx.hash => Some("A reward claim for this wallet is already pending (claim_pending): retry after it lands"),
+            _ => None,
+        }
     }
 
     /// Admission only, before any verify (no gate): a relay's copy of a pooled commitment that differs from it
@@ -2146,6 +2195,9 @@ impl BlockchainNode {
                         Some(w) => self.get_state_manager().read().await.get_last_claimed_epoch(w),
                         None => u64::MAX,
                     };
+                    if let Some(refusal) = self.claim_door_refusal(&tx, last_claimed) {
+                        return Err(QNetError::ValidationError(refusal.to_string()));
+                    }
                     if !Self::claim_proofs_admissible(&self.get_storage(), &tx, last_claimed) {
                         return Err(QNetError::ValidationError(
                             "Reward claim has no valid merkle proofs".to_string()

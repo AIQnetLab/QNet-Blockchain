@@ -13,6 +13,7 @@ const UI_FILES = [
   'src/components/BottomBar.js',
   'src/components/TxResultCard.js',
   'src/components/SendReview.js',
+  'src/components/InfoRow.js',
   'src/components/ErrorBoundary.js',
   'src/browser/BrowserScreen.js',
   'src/browser/DappSheet.js',

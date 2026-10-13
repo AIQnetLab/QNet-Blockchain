@@ -35,10 +35,10 @@ test('the SOL asked is the burn\'s fee and the rent-exempt minimum, rounded up t
 });
 
 test('the payment requests: the address, the amount in whole tokens, the cluster\'s 1DEV mint for 1DEV, the label', () => {
-  assert.equal(REQUEST_LABEL, 'QNet activation');
-  assert.equal(oneDevRequest(PAYMENT, 1500), `solana:${PAYMENT}?amount=1500&spl-token=${ONE_DEV_MINT}&label=QNet%20activation`);
-  assert.equal(solRequest(PAYMENT), `solana:${PAYMENT}?amount=0.001&label=QNet%20activation`);
-  assert.equal(paymentRequest(PAYMENT, '2'), `solana:${PAYMENT}?amount=2&label=QNet%20activation`);
+  assert.equal(REQUEST_LABEL, 'QNet Blockchain node activation');
+  assert.equal(oneDevRequest(PAYMENT, 1500), `solana:${PAYMENT}?amount=1500&spl-token=${ONE_DEV_MINT}&label=QNet%20Blockchain%20node%20activation`);
+  assert.equal(solRequest(PAYMENT), `solana:${PAYMENT}?amount=0.001&label=QNet%20Blockchain%20node%20activation`);
+  assert.equal(paymentRequest(PAYMENT, '2'), `solana:${PAYMENT}?amount=2&label=QNet%20Blockchain%20node%20activation`);
   // Plain decimals: no grouping, no trailing zeros, no exponent.
   assert.equal(decimalAmount(1_000_000n, 9), '0.001');
   assert.equal(decimalAmount(1_234_500_000_000n, 9), '1234.5');
@@ -54,7 +54,7 @@ test('the payment card: who the node is for, the exact amounts, the two codes, n
   const card = steps.slice(steps.indexOf('export function Funding('), steps.indexOf('export function Receipt('));
   // Who the node belongs to: the QNet wallet that confirmed it in QNet Wallet, never the payment address.
   assert.match(card, /\{wallet && <p>\{t\('act_owner', \{ wallet: shortAddress\(wallet\) \}\)\}<\/p>\}/);
-  assert.equal(TEXTS.act_owner, 'The node is registered to your QNet wallet {wallet}; this one-time address only burns the 1DEV. Its key stays in this browser until what is left has gone back.');
+  assert.equal(TEXTS.act_owner, 'The node is registered to your QNet Blockchain wallet {wallet}; this one-time address only burns the 1DEV. Its key stays in this browser until what is left has gone back.');
   assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'act_owner_later'), false);
   assert.match(code('components/cabinet/NodeActivate.tsx'), /<Funding record=\{record\} price=\{price\} balance=\{balance\} wallet=\{named\} walletSolana=\{choice\?\.solana \?\? null\} phone=\{device\?\.phone === true\} \/>/);
   assert.match(code('components/cabinet/NodeActivate.tsx'), /const pinned = record \? pinnedWallet\(record\) : null;/);

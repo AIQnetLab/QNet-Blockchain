@@ -1,6 +1,6 @@
 # State and storage
 
-This document specifies how QNet represents chain state: the flat account model, the exact account
+This document specifies how QNet Blockchain represents chain state: the flat account model, the exact account
 leaf preimage the consensus state commitment hashes (a cross-implementation contract mirrored by the
 mobile light client), the sparse Merkle tree that produces `state_root`, the per-contract storage
 tree, the RocksDB storage engine and its column families, every index the node maintains, the node
@@ -45,7 +45,8 @@ Pool 3, not burned) — see [../economics/node-activation.md](../economics/node-
 
 The liveness fields work as follows. The 14,400-block epoch is split into 10 subwindows of 1,440
 blocks; a valid on-chain `Heartbeat` transaction sets the bit of its subwindow in `heartbeat_slots`,
-reward eligibility is `popcount(heartbeat_slots) >= 9`, and a heartbeat is admitted only within
+reward eligibility is `popcount(heartbeat_slots) >= 9` (from the `super_reward_admission` gate a super must
+also be in the epoch's admitted set, see [economics](../economics/overview.md#reward-eligibility)), and a heartbeat is admitted only within
 `HB_ANCHOR_MAX_LAG_BLOCKS = 90` blocks of its declared anchor. The recency test runs at apply, against
 the inclusion height: a heartbeat sets its bit when `anchor_height < h` and `h - anchor_height <= 90`,
 and otherwise leaves all four fields as they were. `heartbeat_final_epoch` and `heartbeat_final_slots`
@@ -489,6 +490,8 @@ cursor, the consensus round, timeout certificates and the sync resume point amon
 | Registered API endpoint | `node_registry` family, `api_{node_id}` | the endpoint a chain-confirmed super registered with, read once from the `NodeRegistration` in its registration block and indexed, empty when it registered without one; a boot task backfills missing rows, and the public-node list is served from it. A side index, not a `registry_root` input. |
 | Committed burn binding | `metadata` family, `cbw_{burn_tx}` | the node id a 1DEV burn is bound to on-chain. First-wins and immutable, read at block validation so a second registration cannot reuse the same burn under another identity. See [../economics/node-activation.md](../economics/node-activation.md). |
 | Reward shards | `epoch_wshard_` / `epoch_shardmeta_` keys | sharded leaf-set cache for epoch reward roots; separately prunable. |
+| Reward recipient index | `pending_rewards` family, `rcpx_meta_{epoch}` / `rcpx_bkt_{epoch}_{bucket}` | each epoch's recipients as (16-byte wallet fingerprint, amount), with the certified root it was built from; kept after the epoch's shards are pruned. Node-local, never in a frame or a root. |
+| Claim outcomes | `pending_rewards` family, `claim_out_{tx_hash}`, with `claim_oh_{height:020}_{tx_hash}` in height order | what an applied merkle claim credited (height, amount, epochs), pruned with the transaction index at its height (which waits for the archive); node-local display data. |
 
 Wallet-to-node lookup is resolved by deriving the node id from the wallet and point-reading
 `node_{id}`, so no mutable per-node slot can diverge across apply and gossip ordering.
@@ -686,8 +689,14 @@ assertion enforces that `MICROBLOCK_BODY_RETENTION_BLOCKS` exceeds both `SNAPSHO
 (1,500) and `SNAPSHOT_KEEP_COUNT × SNAPSHOT_INCREMENTAL_INTERVAL` (3 × 3,600), so a cold or lagging
 node can never need a pruned body — changing those constants is a compile error, not a silent sync
 break. `prune_epoch_reward_shards` range-deletes only the sharded leaf-set cache
-(`epoch_wshard_` / `epoch_shardmeta_`), leaving `epoch_root_`, `super_elig_` and `light_bm_` intact so
-a pruned epoch's claim path still works. Compaction is selective: only families with at least
+(`epoch_wshard_` / `epoch_shardmeta_`), leaving `epoch_root_`, `super_elig_` (an epoch's settled super set,
+admitted members only from the `super_reward_admission` gate) and `light_bm_` intact so
+a pruned epoch's claim path still works. The cache keeps the newest 256 epochs, and an older epoch leaves it only
+once its recipient index exists (a hold of at most 64 epochs, skipped for an epoch whose shards do not recombine to
+its certified root): the periodic cleanup and boot index up to four cached epochs a pass, and a claim's rebuild of a
+pruned epoch indexes it too. A claim walk then passes a pruned epoch the wallet holds no leaf in from the index,
+the balance routes count an indexed epoch's amount, and only an epoch the wallet was paid in needs a rebuild for
+its proof. Epochs below the retention floor are not repair targets: no peer serves their leaf set. Compaction is selective: only families with at least
 `COMPACT_MIN_ROWS` = 1,000 rows deleted are compacted, so a family holding no tombstones is not
 rewritten.
 
@@ -747,7 +756,7 @@ form; `calculate_hash` is SHA3-256 over those bytes, hex-encoded.
 262,144, signature 16,384, public key 4,096) plus per-variant limits, and runs on the block-validation
 path because `validate()` does not run it there; `NodeRegistration.vrf_pk` must be empty (Light) or
 exactly 1952 bytes. The one Ed25519 verification on the state path is the external burn-owner
-signature over `burn_owner_bind_message`, made with a Solana burner key that is outside QNet identity.
+signature over `burn_owner_bind_message`, made with a Solana burner key that is no QNet Blockchain identity.
 
 Both block hashes bind `state_root`: `MicroBlock::hash` binds height, timestamp, previous hash, merkle
 root, producer, `timeout_round`, carried baseline and `state_root` (not `fees_collected`, not

@@ -3,7 +3,8 @@ import { createLastHeartbeat } from '@/server/cabinet/epoch-archive';
 import { nodeProxy } from '@/server/cabinet/node-proxy';
 
 // The node cabinet: a super node's status from the genesis nodes, when it was last seen (from the nodes, else the
-// explorer archive's newest heartbeat), its heartbeats this epoch and its node balance (src/server/cabinet/node-proxy.ts).
+// explorer archive's newest heartbeat), its heartbeats this epoch, its node balance and whether the network's eligible
+// set admits it (src/server/cabinet/node-proxy.ts, eligible-set.ts).
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 

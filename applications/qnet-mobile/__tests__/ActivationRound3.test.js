@@ -38,7 +38,7 @@ describe('MOBACT-R3-03: a server node links on two genesis nodes\' word', () => 
     expect(screen).toMatch(/if \(still === false\) \{\s*setActivatedNodeType\(null\);[\s\S]{0,300}await walletManager\.forgetServerNodeRecord\(\);/);
     // The card of a server node the network has not confirmed (screens/NodeTab): a notice, nothing to press.
     const tab = fs.readFileSync(path.join(__dirname, '../src/screens/NodeTab.js'), 'utf8');
-    const start = tab.indexOf('if (!(status && status.success === true && status.registered !== false)) {');
+    const start = tab.indexOf('if (!serverRegistered(status)) {');
     expect(start).toBeGreaterThan(-1);
     const unconfirmed = tab.slice(start, tab.indexOf("{t('node_super_server_sub')}", start));
     expect(unconfirmed).toMatch(/t\('node_super_server'\)/);

@@ -1,6 +1,6 @@
 # Networking
 
-This document describes the QNet node-to-node layer: the QUIC transport and its TLS configuration, the application
+This document describes the node-to-node layer of QNet Blockchain: the QUIC transport and its TLS configuration, the application
 handshake that binds a peer identity to a connection, the bincode wire frame and the `NetworkMessage` catalogue, how
 peers are discovered and admitted, how blocks and transactions propagate, the layered denial-of-service defences, the
 HTTP calls nodes make to one another, the ports a node exposes, and the NAT and log-privacy facilities. The implementation lives in
@@ -394,6 +394,7 @@ in plain (`genesis_internal_call_tls`); a copy that fails is logged at WARN and 
 | `POST /api/v1/internal/light-device-sync` | `distribute` | Sends a final device statement or a signed state change to every other genesis, again from a persisted outbox until each has taken it |
 | `GET /api/v1/internal/light-device-get?node_id={id}` | `pull_device_record` | Fetches a node's device record from the genesis that holds it when a request or a change rests on a record this genesis lacks |
 | `GET /api/v1/rewards/epoch/{epoch}/leafset?shard={n}` | `repair_unservable_reward_epochs` | Fetches, shard by shard, the reward leaf set of a committed epoch this node cannot serve, trying each other genesis in turn, and keeps a set only when its merkle root equals the committed root |
+| `GET /api/v1/whoami[?probe=443&marker={m}]` | `genesis_whoami` (`node/public_rpc.rs`) | A Super node that serves wallets asks the genesis nodes, in random order until two agree, for its public IPv4 (over each genesis's HTTPS name first, then its plain port) and, before a certificate order, for a 443 probe (plain port first); the genesis then makes one TLS handshake back to the caller's own socket address on 443 ([whoami](../developers/rpc-api.md#address-and-443-probe-get-apiv1whoami)) |
 
 `check_block_exists_on_network` answers first from the signed heights already held in the peer table and falls back to
 the HTTP probe when that is inconclusive. The sample size scales with the peer count — 3 peers on networks of 5 or
@@ -422,6 +423,7 @@ challenge the relay carried, with at most 32 identity pulls in flight.
 | 10876 | UDP | QUIC peer-to-peer (`QUIC_PORT`) | Must be reachable inbound for a Super node |
 | 8001 | TCP | REST, JSON-RPC and WebSocket on one listener | Required for API clients and for the peer calls above; see [rpc-api.md](../developers/rpc-api.md) |
 | 8101 | TCP | Prometheus metrics on `GET /metrics`, served by a second warp server at API port + 100 | Bound on all interfaces for local and monitoring access |
+| 8443 | TCP | The wallet plane: HTTPS for wallets on a Super node that is not a genesis identity and does not set `QNET_HIDE_IP`, on its own runtime ([wallet plane](../developers/rpc-api.md#wallet-plane)) | Host port 443 published to it; optional |
 
 The QUIC endpoint binds `0.0.0.0:10876`. Peer addresses are recorded throughout as `ip:8001` and the QUIC socket
 address is derived by adding `QUIC_PORT_OFFSET` 2875 to that port, so the two ports move together: changing the API

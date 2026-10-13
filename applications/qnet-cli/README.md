@@ -1,6 +1,6 @@
-# QNet CLI
+# QNet Blockchain CLI
 
-Small Python command-line tool for interacting with a QNet node over its HTTP API.
+Small Python command-line tool for interacting with a QNet Blockchain node over its HTTP API.
 
 Full documentation: [docs/applications/cli.md](../../docs/applications/cli.md)
 

@@ -2,16 +2,18 @@
 
 // A node's state in the words QNet Wallet uses (unified plan section 3.1): nothing about a light node is shown as
 // final unless two genesis nodes said so, and "Online" never comes from anything but a linked device the network does
-// not ask to come back (src/lib/cabinet/node-view.ts); a super node's server status as the nodes report it.
+// not ask to come back (src/lib/cabinet/node-view.ts); a super node's server status as the nodes report it, with the
+// network's admission of it.
 // A node's latest epoch not counted shows as one line with the device rows (src/lib/cabinet/last-miss.ts): epochs and
 // reasons only, never the time of an answer or a wake.
 
 import type { ReactNode } from 'react';
 import { number, t, type MessageKey } from '@/lib/texts';
 import type { Loaded } from '@/hooks/useNodeStatus';
-import { canMove, deviceName, formatQnc, isLinkedState, nodeState, type NodeState, type NodeStatusView, type SuperStatusView } from '@/lib/cabinet/node-view';
-import { deviceMiss, missText, shownMiss, type WakePlace } from '@/lib/cabinet/last-miss';
-import { canWake } from '@/lib/cabinet/wake';
+import {
+  SERVER_SYNC_BLOCKS, canMove, deviceName, formatQnc, isLinkedState, nodeState, superState, type NodeState, type NodeStatusView, type SuperStatusView,
+} from '@/lib/cabinet/node-view';
+import { deviceMiss, missText, shownMiss } from '@/lib/cabinet/last-miss';
 
 // Checking, unreachable (with Try again), or the view itself.
 export function StatusGate({ state, retry, children }: { state: Loaded<NodeStatusView>; retry: () => void; children: (s: NodeStatusView) => ReactNode }) {
@@ -38,11 +40,11 @@ const DAY = new Intl.DateTimeFormat('en', { year: 'numeric', month: 'short', day
 
 // The latest epoch not counted, while it is newer than the last counted one; with `full` (the Device tab) also an
 // earlier one that carries the device's own account of the wake (deviceMiss): what happened in that epoch, whether the
-// wake reached the device when known, and what to do, in one line. `wake`: where I'm back is for the node.
-function MissLine({ status, wake, full }: { status: NodeStatusView; wake: WakePlace; full: boolean }) {
+// wake reached the device when known, and what to do, in one line.
+function MissLine({ status, full }: { status: NodeStatusView; full: boolean }) {
   const miss = full ? deviceMiss(status) : shownMiss(status);
   if (!miss) return null;
-  return <p>{missText(miss, status.device?.platform ?? null, wake)}</p>;
+  return <p>{missText(miss, status.device?.platform ?? null)}</p>;
 }
 
 // The device rows: the device's state (Online, Offline, or a new device waiting for its first answer; else no device)
@@ -50,8 +52,9 @@ function MissLine({ status, wake, full }: { status: NodeStatusView; wake: WakePl
 // (node-view.ts deviceName), the day it linked and the epoch of its last answer, from the public status's `device`
 // (none from a node of an earlier version: then the last counted epoch). Last, the latest epoch not counted: on the
 // Device tab for an Online or Offline device (also once counted again, when the device told what happened to the
-// wake), on the Overview beside the Offline state, where I'm back follows. `viewOnly` (a typed address): the platform,
-// the state and the epochs only, no model, no day it linked and no miss.
+// wake), on the Overview beside the Offline state, where running the node on the phone again follows. `viewOnly` (an
+// address only viewed, whose status comes without them, node-view.ts publicStatus): the network's facts only, the state
+// and the epochs; no platform, no model, no day it linked and no miss, which are the owner's device details.
 // Shown for a node on the network only, also one listed while its status still catches up.
 export function DeviceRows({ status, full = false, viewOnly = false }: { status: NodeStatusView; full?: boolean; viewOnly?: boolean }) {
   const state = nodeState(status);
@@ -60,8 +63,7 @@ export function DeviceRows({ status, full = false, viewOnly = false }: { status:
   const device = status.device ?? null;
   const last = device ? device.lastAnswerEpoch : status.counted.lastCountedEpoch;
   const missed = !viewOnly && (state === 'offline' || (full && state === 'online'));
-  const named = device && viewOnly ? { platform: device.platform, model: null } : device;
-  const wake: WakePlace = state === 'offline' && canWake(status) ? (full ? 'overview' : 'here') : null;
+  const named = viewOnly ? null : device;
   return (
     <>
       <p className="cabinet-badge-row">
@@ -74,17 +76,13 @@ export function DeviceRows({ status, full = false, viewOnly = false }: { status:
       {full && (device
         ? <p>{last === null ? t('device_no_answer') : t('device_last_answer', { epoch: number(last) })}</p>
         : <p>{last === null ? t('devices_not_counted') : t('devices_last_counted', { epoch: number(last) })}</p>)}
-      {missed && <MissLine status={status} wake={wake} full={full} />}
+      {missed && <MissLine status={status} full={full} />}
     </>
   );
 }
 
-export function CountedRow({ status }: { status: NodeStatusView }) {
-  return <p>{t('counted', { counted: number(status.counted.counted), total: number(status.counted.sinceRegistration) })}</p>;
-}
-
 // The balance of a light or a super node, and below 1 QNC the note that it moves from 1 QNC; the ways to move it follow
-// it (NodeClaim.tsx Move, or QNet Wallet's Node tab for a super node).
+// it (NodeClaim.tsx Move: the extension's window or QNet Wallet, for either node type; owner, 12.10).
 export function BalanceRow({ status }: { status: Pick<NodeStatusView, 'balanceNano'> }) {
   if (status.balanceNano === null) return <p>{t('balance_unknown')}</p>;
   return (
@@ -104,19 +102,43 @@ export function shownTime(ms: number | null): string {
   return ms - Date.now() < 12 * 3_600_000 ? TIME.format(ms) : DAY_TIME.format(ms);
 }
 
-// A super node's status rows (the Overview and the Device tab): online or not, when it was last seen, its heartbeats this
-// epoch, and whether the network bars it.
+// A time gone by (when a server was last seen): the hour within the last 12 hours, else the day too.
+function pastTime(ms: number): string {
+  return Date.now() - ms < 12 * 3_600_000 ? TIME.format(ms) : DAY_TIME.format(ms);
+}
+
+// A super node's status rows (the Overview and the Device tab): online or not, or registered with its server answering
+// and waiting for the network's admission (the node's own admission, which costs it the super node share, else outside
+// the eligible set; owner, 11.10: that, not Offline; node-view.ts superState), when it was last seen, its heartbeats
+// this epoch and whether they keep pace for it to count, the network's height and the server's own when the network
+// reports it, and whether the network bars it.
 export function SuperRows({ status }: { status: SuperStatusView }) {
-  const online = status.online;
+  const state = superState(status);
+  const badge = state === 'waiting' ? { tone: 'waiting', badge: 'badge_waiting', text: 'super_waiting' } as const
+    : state === 'online' ? { tone: 'online', badge: 'badge_online', text: 'super_online_note' } as const
+    : { tone: 'offline', badge: 'badge_offline', text: 'super_offline_note' } as const;
   return (
     <>
       <p className="cabinet-badge-row">
-        <span className={`cabinet-badge ${online ? 'online' : 'offline'}`}>{t(online ? 'badge_online' : 'badge_offline')}</span>
-        <span>{t(online ? 'super_online_note' : 'super_offline_note')}</span>
+        <span className={`cabinet-badge ${badge.tone}`}>{t(badge.badge)}</span>
+        <span>{t(badge.text)}</span>
       </p>
-      <p>{status.lastSeenAt === null ? t('super_last_seen_unknown') : t('super_last_seen', { time: shownTime(status.lastSeenAt) })}</p>
+      {state === 'waiting' && <p className="activate-note">{t(status.admission === 'waiting' ? 'super_waiting_note' : 'super_waiting_set_note')}</p>}
+      <p>{status.lastSeenAt === null ? t('super_last_seen_unknown') : t('super_last_seen', { time: pastTime(status.lastSeenAt) })}</p>
       <p>{status.heartbeats === null ? t('super_heartbeats_unknown') : t('super_heartbeats', { current: number(status.heartbeats.current), required: number(status.heartbeats.required) })}</p>
+      {status.onPace !== null && <p>{t(status.onPace ? 'super_on_pace' : 'super_behind')}</p>}
+      <HeightRow status={status} />
       {status.banned && <p className="activate-error">{t('super_barred')}</p>}
     </>
   );
+}
+
+// The server's height against the network's, when the network reports it; else the network's own height alone.
+function HeightRow({ status }: { status: SuperStatusView }) {
+  const { networkHeight: network, serverHeight: server } = status;
+  if (server !== null && network !== null) {
+    const behind = network - server;
+    return <p>{behind <= SERVER_SYNC_BLOCKS ? t('super_height_synced', { height: number(server) }) : t('super_height_behind', { height: number(server), behind: number(behind) })}</p>;
+  }
+  return network === null ? null : <p>{t('super_height_network', { height: number(network) })}</p>;
 }

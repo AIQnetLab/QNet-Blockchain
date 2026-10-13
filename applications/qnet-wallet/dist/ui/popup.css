@@ -225,15 +225,6 @@ img {
   border-radius: 6px;
 }
 
-.brand-name {
-  font-weight: 700;
-  font-size: 1.05rem;
-  background: var(--qnet-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
 .logo-lg {
   width: 88px;
   height: 88px;
@@ -691,13 +682,6 @@ img {
 
 .kv dd.kv-addr {
   text-align: start;
-}
-
-/* a wallet's two addresses under what happens to it (Reset wallet) */
-.wallet-pair {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
 }
 
 .addr {

@@ -2,10 +2,11 @@
  * This wallet's light node on the genesis nodes (docs/protocols/light-node-messages.md sections 4, 7 and 8): the status
  * the network keeps for it, and the binding that makes one device the one that answers for it. Only the node's shard
  * owners among the five genesis names are asked. Nothing here signs: callers pass signatures made over the preimages of
- * crypto/NodePreimages.
+ * crypto/NodePreimages. And whether the chain lists the wallet's super node, whose balance a site's move may name too
+ * (readServerNodeListed).
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { lightShardOwnerUrls } from '../config/nodes';
+import { GENESIS_NODES_HTTPS, lightShardOwnerUrls } from '../config/nodes';
 import { isModel } from './DeviceModel';
 
 // A status is the network's only when this many genesis nodes agree, and a client switches a form on only when this
@@ -356,6 +357,26 @@ export async function readNodeStatus(nodeId, { signStatus = null, timeoutMs = ST
   const agreed = [...seqs].filter(([, n]) => n >= MIN_AGREEMENT).map(([seq]) => seq);
   out.bindingSeqAgreed = agreed.length === 1 ? agreed[0] : null;
   return out;
+}
+
+/**
+ * Whether the chain lists the super node `nodeId`, as two genesis nodes say alike (GET /api/v1/node/status: its
+ * `onchain_registered`, else `registered`, in an answer with `success: true` that names that node or none): true, false,
+ * or null when no two agree (two say each, or fewer answer). The node a site's move of the node balance names when it
+ * is the wallet's super node (qnet-link-v1 section 14.8).
+ */
+export async function readServerNodeListed(nodeId, { timeoutMs = STATUS_MS } = {}) {
+  const words = await Promise.all(GENESIS_NODES_HTTPS.map((u) => call(`${u}/api/v1/node/status?node_id=${enc(nodeId)}`, { timeoutMs })
+    .then((a) => {
+      if (a.success !== true || (a.node_id !== nodeId && a.node_id !== null)) return null;
+      const listed = typeof a.onchain_registered === 'boolean' ? a.onchain_registered : a.registered;
+      return typeof listed === 'boolean' ? listed : null;
+    }, () => null)));
+  const yes = words.filter((w) => w === true).length;
+  const no = words.filter((w) => w === false).length;
+  if (yes >= MIN_AGREEMENT && no < MIN_AGREEMENT) return true;
+  if (no >= MIN_AGREEMENT && yes < MIN_AGREEMENT) return false;
+  return null;
 }
 
 /** Whether one genesis node says the node is on the chain: true, false, or null for no verdict. */

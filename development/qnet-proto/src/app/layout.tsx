@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Create Next App",
-  description: "QNet Protocol Interface",
+  description: "QNet Blockchain Protocol Interface",
 };
 
 export default function RootLayout({

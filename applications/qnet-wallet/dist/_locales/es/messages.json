@@ -1,10 +1,10 @@
 {
   "extName": {
-    "message": "Cartera QNet",
+    "message": "QNet Wallet",
     "description": "Extension name in the browser and the store."
   },
   "extDescription": {
-    "message": "Cartera QNet poscuántica (ML-DSA-65) con cuenta de Solana. Activa un nodo Light o Super de QNet y registra el nodo Light.",
+    "message": "Cartera poscuántica para QNet Blockchain (ML-DSA-65) con cuenta de Solana. Activa un nodo Light o Super y registra el nodo Light.",
     "description": "Store and extensions-page description, at most 132 characters."
   }
 }

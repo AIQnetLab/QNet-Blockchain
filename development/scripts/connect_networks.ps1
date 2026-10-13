@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # Connect two isolated networks
 
-Write-Host "=== Connecting Two QNet Networks ===" -ForegroundColor Green
+Write-Host "=== Connecting two QNet Blockchain networks ===" -ForegroundColor Green
 Write-Host "This will create a bridge node that knows about both networks" -ForegroundColor Yellow
 
 # Bridge node configuration

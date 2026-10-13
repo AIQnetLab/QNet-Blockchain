@@ -38,7 +38,7 @@ export function walletUnlink(status: NodeStatusView): boolean {
 }
 
 export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatusView; onUnlinked: () => void }) {
-  const { choice, walletHash, phoneFlows } = useCabinet();
+  const { choice, walletHash, viewOnly, phoneFlows } = useCabinet();
   const { providerStatus, providerChannel, accounts, unlinkNodeDevice } = useWallet();
   const device = useDeviceKind();
   // The button on this device, and a request shown as a QR code: two sessions, never one.
@@ -59,6 +59,8 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
   const extension = wallet && choice !== null && providerStatus === 'available' && providerChannel === 'extension'
     && (choice.source === 'extension' || accounts?.qnet === choice.qnet);
 
+  // An address only viewed is never offered an unlink.
+  if (viewOnly) return null;
   if (!phoneFlows && !extension) {
     return (
       <div className="activate-card">

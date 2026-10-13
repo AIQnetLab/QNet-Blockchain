@@ -1,16 +1,16 @@
 # 1DEV burn contract
 
 The 1DEV burn contract is an Anchor program deployed on Solana, the external chain that hosts the 1DEV
-SPL token. It serves Phase 1 of QNet node activation: 1DEV is burned in an ordinary SPL token
+SPL token. It serves Phase 1 of QNet Blockchain node activation: 1DEV is burned in an ordinary SPL token
 transaction with the Token program's `Burn` instruction, by the browser extension with the wallet's own
 key or, on a phone or any browser without the extension, by the aiqnet.io node cabinet with its
 one-time payment key, which burns for a light node only (a node also accepts a transfer to the Solana
 incinerator address), and the signature of that transaction — part of
-the key material of the activation code — is what a QNet node checks before accepting an activation.
+the key material of the activation code — is what a QNet Blockchain node checks before accepting an activation.
 The program itself never moves tokens; it has no CPI into the token program and no instruction debits a balance. The burn
 is a separate, prior transaction, and the program records that it happened, counts activations, tracks
 the share of the 1DEV supply burned, and holds the one-way flag that ends Phase 1. Phase 2 replaces
-the burn with a QNC payment on QNet itself; this program stores the Phase 2 amounts as constants but
+the burn with a QNC payment on QNet Blockchain itself; this program stores the Phase 2 amounts as constants but
 performs no Phase 2 operation. Two node types exist here, `Light` and `Super`, alongside a deprecated
 `full_nodes` counter that stays zero for layout compatibility.
 
@@ -77,7 +77,7 @@ base58-decodes to exactly 64 bytes; that `one_dev_amount` is at least the curren
 the pricing curve; that the burn address on the tracker equals the Solana incinerator constant
 compiled into the program; and that the mint equals the 1DEV mint constant compiled into the program.
 There is no RPC lookup of the burn transaction — the program validates format and addresses only, and
-the substantive check is left to the QNet node. It then writes an `activation_signature`: a 64-byte
+the substantive check is left to the QNet Blockchain node. It then writes an `activation_signature`: a 64-byte
 value formed from two chained Blake3 digests over the node key, burner key, burn transaction string,
 node type and amount. All of those inputs are public, so the value is a deterministic digest
 reproducible by anyone holding them; it is not a signature and does not prove control of the burner
@@ -115,7 +115,7 @@ since `genesis_timestamp`. Phase 2 constants stored for reporting are 10,000 QNC
 7,500 QNC for a Super node, at nine decimals. The economic reasoning behind these figures is in
 [../economics/tokenomics-1dev.md](../economics/tokenomics-1dev.md).
 
-## How a QNet node verifies a burn
+## How a QNet Blockchain node verifies a burn
 
 Verification lives in `verify_burn_transaction_exists` in
 `development/qnet-integration/src/rpc/registration_api.rs`. For Phase 1 the node:
@@ -131,7 +131,7 @@ Verification lives in `verify_burn_transaction_exists` in
    Solana address, or the cabinet's one-time payment key), the Solana address a Super node's server derives
    from its wallet's recovery phrase, or `solana_wallet` of a burn attestation request (`node_attestBurn`). A
    mismatch fails verification. This ties the burn to the key that paid for it, not to the
-   QNet wallet it is for: that link is the owner bind below.
+   QNet Blockchain wallet it is for: that link is the owner bind below.
 4. Requires a burn indicator: a parsed `burn` or `burnChecked` instruction among the outer or the
    inner instructions, or the Solana incinerator address among the account keys. A parsed `transfer`
    is not an indicator on its own, so a transfer to any other destination is refused.
@@ -153,7 +153,7 @@ A light-node registration (`POST /api/v1/node-registration/submit`, `check_clien
 itself. It carries `burn_wallet` and `owner_signature`, the burning key's Ed25519 signature over
 `burn_owner_bind_message(node_id, wallet_address, registration_proof, timestamp, wallet key, burn_tx)`, the
 string block validation rebuilds; a request without them is refused (`burn_wallet_or_owner_sig_missing`), and
-one whose signature does not verify against `burn_wallet` too (`owner_signature_invalid`). The QNet wallet
+one whose signature does not verify against `burn_wallet` too (`owner_signature_invalid`). The QNet Blockchain wallet
 must derive from the consenting ML-DSA-65 key or from the burning address (`wallet_not_derived`). This bind,
 not the fee-payer check, is what stops a second wallet from registering with someone else's public burn.
 
@@ -164,7 +164,7 @@ validation re-verifies deterministically, so the Solana read itself stays on the
 The node reads the burn transaction from Solana directly, so the program's accounts are an
 independent record rather than the oracle activation consults. The phase decision is
 `Transaction::is_phase2`: 90% of the original 1DEV supply burned, or five years since the committed
-QNet genesis-block timestamp. Burn progress comes from a `getTokenSupply` read on the mint, with the
+genesis-block timestamp of QNet Blockchain. Burn progress comes from a `getTokenSupply` read on the mint, with the
 shortfall against the one-billion genesis cap taken as the burned total.
 
 ## Configuration and addresses
@@ -231,7 +231,7 @@ python initialize_tracker.py <path-to-deployer-keypair.json>
 Read the script before running it. Its RPC endpoint, mint, incinerator and program constants are
 hard-coded, it assigns the deployer key to every authority slot including `verification_authority`,
 and it passes the current wall-clock time as the network genesis timestamp. For anything beyond a
-throwaway deployment, set the genesis timestamp to the real QNet genesis block time and give
+throwaway deployment, set the genesis timestamp to the real genesis block time of QNet Blockchain and give
 `verification_authority` a key you intend to keep, since the program cannot rotate it. The script is
 idempotent. Verify the result with `solana program show <program-id>` and by reading the tracker
 account at the derived PDA.

@@ -1,6 +1,6 @@
-# QNet documentation
+# QNet Blockchain documentation
 
-This directory is the documentation set for the QNet blockchain: the protocol the node implements,
+This directory is the documentation set for QNet Blockchain: the protocol the node implements,
 the economics it enforces, how to run a node, and the interfaces applications build against. Every
 document here was written against the source tree in this repository. Where a document and the code
 disagree, the code is authoritative — report the discrepancy rather than trusting the document.
@@ -61,6 +61,7 @@ types, `Light` and `Super`.
 | [1DEV burn contract](developers/1dev-burn-contract.md) | The Solana Anchor program behind Phase 1 activation burns |
 | [QNet Link v1](protocols/qnet-link-v1.md) | aiqnet.io ↔ wallet requests: the encrypted phone link, its relay, `qnet_activateNode`, test vectors |
 | [Light node messages](protocols/light-node-messages.md) | What the wallet key, the ping key and the device key sign for a light node: binding, answers, the device check, statements, status, test vectors |
+| [GALC v2 capsule](protocols/galc-capsule-v2.md) | The genesis-signed capsule a wallet roots its light-client walk at, a few macroblocks below the certified head: fields, signatures, the node route, client rules, test vectors |
 
 ## Use the applications
 

@@ -1304,6 +1304,17 @@ impl Storage {
     #[cfg(test)]
     pub fn registry_cf_for_test(&self) -> String { "node_registry".to_string() }
 
+    /// Every node_registry row, key (lossy UTF-8) to value. Test-only: lets a test see exactly which
+    /// rows an apply touched.
+    #[cfg(test)]
+    pub fn registry_rows_for_test(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let h = self.persistent.db.cf_handle("node_registry").expect("registry CF");
+        self.persistent.db.iterator_cf(&h, rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (String::from_utf8_lossy(&k).into_owned(), v.to_vec()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn delete_registry_row_for_test(&self, cf: &str, key: &[u8]) {
         let h = self.persistent.db.cf_handle(cf).expect("registry CF");

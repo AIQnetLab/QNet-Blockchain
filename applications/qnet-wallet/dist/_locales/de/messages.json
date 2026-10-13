@@ -4,7 +4,7 @@
     "description": "Extension name in the browser and the store."
   },
   "extDescription": {
-    "message": "Post-Quanten-Wallet für QNet (ML-DSA-65) mit Solana-Konto. Aktiviert QNet-Light- oder Super-Knoten, trägt Light-Knoten ein.",
+    "message": "Post-Quanten-Wallet für QNet Blockchain (ML-DSA-65) mit Solana-Konto. Aktiviert Light- oder Super-Knoten, trägt Light-Knoten ein.",
     "description": "Store and extensions-page description, at most 132 characters."
   }
 }

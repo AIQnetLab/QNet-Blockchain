@@ -454,7 +454,7 @@ export function formatDay(seconds) {
 }
 
 /**
- * The two fields of every screen that sets a new password (create, import, restore, change) and their live check:
+ * The two fields of every screen that sets a new password (create, import, change) and their live check:
  * the rule of both wallets, at least core.PASSWORD_MIN_LENGTH characters (core.passwordTooShort, the copy the app
  * uses too) typed twice, nothing else. The length line turns from × to ✓ as the password reaches the minimum; once
  * the second field has text, a line says whether the two match. The worker checks the length again.
@@ -621,6 +621,8 @@ export function errorText(error) {
   if (code === 'BACKOFF' && Number.isSafeInteger(error.retryAfterMs)) {
     return t('err_BACKOFF_wait', [Math.max(1, Math.ceil(error.retryAfterMs / 1000))]);
   }
+  // a balance not certified while a long walk runs says how far it is (qnet.walkSteps)
+  if (code === 'BALANCE_UNCONFIRMED' && Number.isSafeInteger(error.walkSteps)) return t('balanceVerifyingSteps', [error.walkSteps]);
   return codeText(code);
 }
 

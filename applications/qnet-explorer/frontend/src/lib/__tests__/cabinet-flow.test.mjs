@@ -1004,7 +1004,7 @@ test('the burn reads the price again and signs nothing when the network asks ano
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
   assert.match(page, /if \(result\.outcome === 'price_changed' && quote\) setSetup\(\(s\) => \(s\.phase === 'ready' \? \{ \.\.\.s, quote \} : s\)\);/);
   assert.match(page, /void act\.readPrice\(deps\)\.then\(\(quote\) => \{\s*if \(quote\) setSetup\(\(s\) => \(s\.phase === 'ready' && !sameQuote\(s\.quote, quote\) \? \{ \.\.\.s, quote \} : s\)\);/);
-  assert.equal(TEXTS.act_price_changed, 'The network now asks another amount for an activation. Nothing was burned: check the new amount, then press Burn again.');
+  assert.equal(TEXTS.act_price_changed, 'QNet Blockchain now asks another amount for an activation. Nothing was burned: check the new amount, then press Burn again.');
 });
 
 // SITE-R2-10 and A1: the burn is for the wallet that signed the reservation, only while it is the connected one, and
@@ -1437,7 +1437,7 @@ test('an answer to another activation\'s request is never taken; the v2 bind onl
   assert.equal(rb.submit, null);
   // A takes its own answer.
   assert.equal((await act.takeAnswer(ra, answerA, 1, ra.link.request, deps)).stage, 'consentVerified');
-  // A request that differs in any field, a claim request or none is another request.
+  // A request that differs in any field, one with a wallet hash only, or none is another request.
   for (const over of [{ burnTx: BURN_B.tx }, { walletHash: OTHER.walletHash }, { check: true }]) {
     assert.equal(act.isRecordRequest(ra, { ...ra.link.request, ...over }), false, JSON.stringify(over));
   }

@@ -3,7 +3,9 @@
 // as mobile sendQNC does, history from the explorer archive.
 import * as core from '../lib/qnet-core.js';
 import { U64_MAX, formatUnits, parseUnits } from './amount.js';
-import { DECIMALS, LIMITS, QNET, RECORD_PATH, TIMINGS } from './config.js';
+import {
+  DECIMALS, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, LIMITS, QNET, RECORD_PATH, STORAGE_KEYS, TIMINGS,
+} from './config.js';
 import { WalletError } from './errors.js';
 import * as keys from './keys.js';
 import { log } from './log.js';
@@ -19,6 +21,7 @@ import * as vault from './vault.js';
  * @property {'proof'|'none'} verification
  * @property {number|null} blockHeight the height of that certified state
  * @property {string} spendableNano the balance less what this wallet's own transactions since that state may take
+ * @property {number} [walkSteps] not verified yet: the walk steps still to go while the walk is long (walkSteps)
  *
  * @typedef {object} TransferPreview  what an approval or review screen shows
  * @property {string} from
@@ -69,8 +72,9 @@ const MAX_RESPONSE_CHARS = 1 << 20;
 const PROOF_ANSWER_MAX_BYTES = 64 * 1024;
 const MACROBLOCK_INTERVAL = 90;
 // The light client walks every other macroblock up from the nearest trusted root on the index's parity
-// chain: the release's weak-subjectivity pin, or a macroblock this wallet verified before (kept in the
-// vault database and imported at the first read, so a restarted worker goes on from there). One call walks
+// chain: the release's weak-subjectivity pin, a macroblock this wallet verified before (kept in the
+// vault database and imported at the first read, so a restarted worker goes on from there), or a root of the genesis
+// capsule when the walk from this wallet's own roots would be long (docs/protocols/galc-capsule-v2.md). One call walks
 // at most the light client's WALK_STEPS_PER_CALL steps, and every step it verifies is kept at once
 // (R3-EXTQ-02): a walk longer than that goes on over the next reads instead of never starting. A read waits
 // for the check at most QC_VERIFY_BUDGET_MS (the walk goes on in the background); a balance it did not certify in
@@ -85,11 +89,30 @@ const PROOF_DISPLAY_WAIT_MS = 1500;
 const PROOF_MAX_LAG_MACROBLOCKS = 2;
 // A certified head read is taken as recent this long (the light client's HEAD_HINT_TTL_MS).
 const HEAD_SEEN_MS = 60000;
+// With no recent certified head read, the newest verified macroblock is asked for first while its checkpoint is at most
+// this old: it is then still within PROOF_MAX_LAG_MACROBLOCKS of the head and nodes keep its view (the app's
+// RECENT_VERIFIED_MS).
+const RECENT_VERIFIED_MS = 4 * 60 * 1000;
+// A walk longer than this many steps is a long one: a balance not certified while it runs says how far it is
+// (walkSteps; the app's LONG_WALK_STEPS).
+const LONG_WALK_STEPS = 2;
+// After a capsule refresh that found no node with a capsule, none is asked again for this long, across worker restarts
+// too (the light client's CAPSULE_MISS_TTL_MS, which it keeps in worker memory only).
+const CAPSULE_QUIET_MS = 10 * 60 * 1000;
+// The light hints a woken worker takes over (lightHintsRead) are written at most this often while nothing else changed.
+const LIGHT_HINTS_WRITE_MS = 20000;
 // For this long after this wallet's own transaction its proofs ask for the newest certified state, so the send shows
 // once certified (the app's OWN_SEND_LATEST_MS).
 const OWN_SEND_LATEST_MS = 10 * 60 * 1000;
-// A verified proof read for a send is used again while it is at most this old (the app's SEND_PROOF_MAX_AGE_MS).
-const SEND_PROOF_MAX_AGE_MS = 30000;
+// The verified proofs kept for a send (sendBase), at most.
+const SEND_PROOFS_MAX = 8;
+// A follow tick (followTick) walks at most this many steps: once caught up one step per macroblock on one parity; while
+// far behind, the walk goes on over the next ticks and reads.
+const FOLLOW_STEPS_PER_TICK = 16;
+// A walk of more steps than this asks the pinned nodes for the genesis capsule first (the light client's
+// OWN_ROOT_WALK_STEPS: a walk from this wallet's own roots of at most that many steps is taken even when the capsule roots
+// higher).
+const CAPSULE_WALK_STEPS = 16;
 // The longest wait a node's Retry-After is honoured for.
 const RETRY_AFTER_MAX_MS = 60000;
 // A spend record (vault.spends) stays this long after the certified state took in its transaction: a certified state
@@ -471,31 +494,103 @@ async function withinBudget(promise, ms) {
 // ---------------------------------------------------------------- verified anchors (EXT-CHAINS-04)
 
 let anchorsLoaded = null;
-let persistedIndex = 0;
+// What the vault holds of the anchors (anchorsKey of what was last read or written): written again only when the
+// light client's export differs.
+let persistedKey = null;
+// The capsule index the vault holds (0: none).
+let capsuleKept = 0;
 
-// Once per worker (again after a failed read, e.g. while locked): the macroblocks verified in earlier
-// sessions root the next walks.
+// An export of the anchors as its indices, and whether each carries its roots.
+const anchorsKey = (anchors) => JSON.stringify(Object.entries(anchors).map(([j, a]) => [j, a.state_root !== undefined]).sort());
+
+// Once per worker (again after a failed read, e.g. while locked): the macroblocks verified in earlier sessions root the
+// next walks and answer at their own index, and then the kept genesis capsule, verified again in full, roots the walks
+// those anchors cannot shorten.
 function loadAnchors() {
   anchorsLoaded ??= (async () => {
+    await lightHintsRead();
     try {
       const stored = await vault.readLightAnchors();
       if (stored !== null) core.importVerifiedAnchors(stored);
-      persistedIndex = core.highestVerifiedIndex();
+      persistedKey = anchorsKey(core.exportVerifiedAnchors());
     } catch (error) {
       anchorsLoaded = null;
       log.warn('verified anchors unreadable', error?.code ?? error?.name);
+      return;
     }
+    await loadCapsule();
   })();
   return anchorsLoaded;
 }
 
-// After a walk got further than what is kept: keep the new highest macroblocks.
-async function persistAnchors() {
-  const highest = core.highestVerifiedIndex();
-  if (highest <= persistedIndex) return;
+// The capsule the vault keeps, taken when core.importCapsule verifies it again; one it refuses is deleted (a higher one
+// held already leaves it to persistCapsule).
+async function loadCapsule() {
+  let record = null;
   try {
-    await vault.writeLightAnchors(core.exportVerifiedAnchors());
-    persistedIndex = highest;
+    record = await vault.readCapsule();
+  } catch (error) {
+    log.warn('capsule unreadable', error?.code ?? error?.name);
+    return;
+  }
+  if (record === null) return;
+  const got = await core.importCapsule(record);
+  if (got.ok) {
+    capsuleKept = got.index;
+    return;
+  }
+  if (got.reason === 'stale') return;
+  log.warn('kept capsule refused', got.reason);
+  await forgetKeptCapsule();
+}
+
+// After a refresh took a newer capsule: keep it.
+async function persistCapsule() {
+  const index = core.heldCapsuleIndex();
+  if (index === 0 || index === capsuleKept) return;
+  const record = core.exportCapsule();
+  if (record === null) return;
+  try {
+    await vault.writeCapsule(record);
+    capsuleKept = index;
+  } catch (error) {
+    log.warn('capsule not kept', error?.code ?? error?.name);
+  }
+}
+
+// The kept copy goes: the light client dropped the capsule (another lineage than what the walk verified) or forgot it.
+async function forgetKeptCapsule() {
+  capsuleKept = 0;
+  await vault.writeCapsule(null).catch((error) => log.warn('kept capsule not dropped', error?.code ?? error?.name));
+}
+
+// Before a walk of more than CAPSULE_WALK_STEPS steps under the certified head `head`: the genesis capsule, asked of the
+// pinned nodes (core.refreshCapsule answers 'not_needed' while the walks from this wallet's own roots are short; a node
+// without one, today's 405, is not asked again for its TTL), so a fresh install or a wallet long closed walks a few steps from it instead of from the pin.
+// Without one the walk goes on from the pin and the anchors exactly as before.
+// After a refresh that found no node with one, none is asked for CAPSULE_QUIET_MS, also by the next worker (light hints).
+async function refreshCapsule(head) {
+  await lightHintsRead();
+  if (Date.now() < capsuleQuietUntil) return { ok: false, reason: 'no_capsule' };
+  const got = await core.refreshCapsule(() => shuffled(QNET.NODES), { headHint: head, proofNodes: () => proofOrder() })
+    .catch(() => ({ ok: false, reason: 'unrooted' }));
+  if (got.ok) await persistCapsule();
+  else if (got.reason === 'no_capsule') {
+    capsuleQuietUntil = Date.now() + CAPSULE_QUIET_MS;
+    keepLightHints(true);
+  }
+  return got;
+}
+
+// After a walk verified macroblocks the vault does not hold yet: keep the light client's export (the highest macroblock
+// of each parity, with its roots).
+async function persistAnchors() {
+  const anchors = core.exportVerifiedAnchors();
+  const key = anchorsKey(anchors);
+  if (key === persistedKey) return;
+  try {
+    await vault.writeLightAnchors(anchors);
+    persistedKey = key;
   } catch (error) {
     log.warn('verified anchors not kept', error?.code ?? error?.name);
   }
@@ -524,28 +619,35 @@ const pinIndex = () => core.genesisConsensus.WS_CHECKPOINT.index || 0;
 
 /**
  * Drops every macroblock this wallet verified (in memory and kept in the vault): they belong to a chain the pinned nodes
- * no longer serve (followChain, a lineage that no longer verifies). The next walk starts from the release's pin again;
- * dropping costs work, never trust.
+ * no longer serve (followChain, a lineage that no longer verifies). The next walk starts from the release's pin again, or
+ * from the genesis capsule, which stays (it is bound to this build's network and checked against everything verified
+ * later; forgetChain forgets it); dropping costs work, never trust.
  * @returns {Promise<void>}
  */
 async function dropAnchors() {
   core.clearQcCache();
   anchorsLoaded = Promise.resolve();
-  persistedIndex = core.highestVerifiedIndex();
   headHintSeen = null;
+  keepLightHints(true);
+  persistedKey = anchorsKey({});
   await vault.writeLightAnchors({}).catch((error) => log.warn('kept anchors not dropped', error?.code ?? error?.name));
 }
 
 // The hooks of every walk. Each verified step is kept; when the light client finds the anchors kept from an earlier
 // session to be of another lineage (the first step above one refused by two nodes for what ties it to that anchor:
 // QcLightClient's onLineageReset), it drops them and walks from the pin at once, and the copy kept in the vault goes with
-// them (owner, 06.10: unverifiable caches never hang the wallet).
+// them (owner, 06.10: unverifiable caches never hang the wallet); a capsule it finds of another lineage than what the
+// walk verified goes the same way, from the vault too.
 const walkHooks = () => ({
   onProgress: keepWalkProgress,
   onLineageReset: () => {
     log.warn('kept anchors of another lineage dropped');
-    persistedIndex = 0;
+    persistedKey = null;
     keepWalkProgress();
+  },
+  onCapsuleDropped: () => {
+    log.warn('capsule of another lineage dropped');
+    forgetKeptCapsule();
   },
 });
 
@@ -553,6 +655,70 @@ const walkHooks = () => ({
 
 // The certified head as the pinned nodes last reported it ({index, at}): proofPasses pins a verified index by it.
 let headHintSeen = null;
+// Until when no node is asked for a capsule (refreshCapsule): the last refresh found none with one.
+let capsuleQuietUntil = 0;
+
+// What a worker woken from sleep takes over from the one before it, in chrome.storage.session (STORAGE_KEYS.LIGHT_HINTS):
+// the certified head last seen (headHintSeen), so its first proof read asks for the macroblock it holds at once, and
+// capsuleQuietUntil, so it does not probe nodes that had no capsule again. Hints only: a proof stands only by the
+// certified head read with it, and a quiet probe costs a longer walk at most. Read once per worker (loadAnchors).
+let hintsRead = null;
+function lightHintsRead() {
+  hintsRead ??= (async () => {
+    try {
+      const stored = (await globalThis.chrome?.storage?.session?.get(STORAGE_KEYS.LIGHT_HINTS))?.[STORAGE_KEYS.LIGHT_HINTS];
+      if (!isObject(stored)) return;
+      const seen = stored.headSeen;
+      if (headHintSeen === null && isObject(seen) && Number.isSafeInteger(seen.index) && seen.index >= 0
+          && Number.isSafeInteger(seen.at) && seen.at <= Date.now()) {
+        headHintSeen = { index: seen.index, at: seen.at };
+      }
+      if (Number.isSafeInteger(stored.capsuleQuietUntil)) {
+        capsuleQuietUntil = Math.max(capsuleQuietUntil, Math.min(stored.capsuleQuietUntil, Date.now() + CAPSULE_QUIET_MS));
+      }
+    } catch {
+      // none kept, or no session storage here
+    }
+  })();
+  return hintsRead;
+}
+
+let hintsWritten = { index: null, at: 0 };
+function keepLightHints(now = false) {
+  const index = headHintSeen?.index ?? null;
+  if (!now && index === hintsWritten.index && Date.now() - hintsWritten.at < LIGHT_HINTS_WRITE_MS) return;
+  hintsWritten = { index, at: Date.now() };
+  try {
+    Promise.resolve(globalThis.chrome?.storage?.session?.set({
+      [STORAGE_KEYS.LIGHT_HINTS]: { headSeen: headHintSeen, capsuleQuietUntil },
+    })).catch(() => {});
+  } catch {
+    // no session storage here
+  }
+}
+
+/**
+ * How many walk steps still stand between what this wallet verified and a checkpoint recent enough for a proof (within
+ * PROOF_MAX_LAG_MACROBLOCKS of the certified head seen last: core.stepsToVerify) when that is more than LONG_WALK_STEPS;
+ * else null (no head seen, a short walk, or none possible). While it is not null a balance not certified yet shows this
+ * progress (wallet-galc plan, Part 3 item 6; the app's walkSteps).
+ * @returns {number|null}
+ */
+export function walkSteps() {
+  if (headHintSeen === null) return null;
+  const head = Math.max(headHintSeen.index, core.highestVerifiedIndex());
+  let steps = Infinity;
+  for (let index = head; index >= Math.max(1, head - PROOF_MAX_LAG_MACROBLOCKS); index--) {
+    steps = Math.min(steps, core.stepsToVerify(index));
+  }
+  return Number.isFinite(steps) && steps > LONG_WALK_STEPS ? steps : null;
+}
+
+// What a balance not certified adds while a long walk is why: {walkSteps}, else nothing.
+const walkNote = () => {
+  const steps = walkSteps();
+  return steps === null ? {} : { walkSteps: steps };
+};
 
 /**
  * The certified head a proof's freshness is judged by: the higher of the newest macroblock this wallet verified and the
@@ -564,6 +730,7 @@ async function certifiedHeadNow() {
   const hint = await core.certifiedHeadHint(() => QNET.NODES).catch(() => null);
   if (!Number.isSafeInteger(hint)) return null;
   headHintSeen = { index: hint, at: Date.now() };
+  keepLightHints();
   return Math.max(core.highestVerifiedIndex(), hint);
 }
 
@@ -581,13 +748,19 @@ export function certifiedIndexStands(index, head) {
 }
 
 // The committee-certified state root of macroblock `index` when the index stands (certifiedIndexStands): the light client
-// walks up to that index only (core.certifiedStateRootAt), within QC_VERIFY_BUDGET_MS. {ok: true, stateRoot} or {ok: false}.
+// walks up to that index only (core.certifiedStateRootAt), from the genesis capsule when that walk is long
+// (refreshCapsule), within QC_VERIFY_BUDGET_MS. {ok: true, stateRoot} or {ok: false}, with `walking` when the budget ran
+// out while the walk goes on.
 async function certifiedRootFresh(index) {
   await loadAnchors();
   const head = await certifiedHeadNow();
   if (!certifiedIndexStands(index, head) || index < core.trustFloorIndex()) return { ok: false };
-  const walk = core.certifiedStateRootAt(index, () => shuffled(QNET.NODES), walkHooks()).catch(() => ({ ok: false }));
+  const walk = (async () => {
+    if (core.stepsToVerify(index) > CAPSULE_WALK_STEPS) await refreshCapsule(head);
+    return core.certifiedStateRootAt(index, () => shuffled(QNET.NODES), walkHooks());
+  })().catch(() => ({ ok: false }));
   const got = await withinBudget(walk, QC_VERIFY_BUDGET_MS);
+  if (got === false) return { ok: false, walking: true };
   if (!got?.ok) return { ok: false };
   await persistAnchors();
   return { ok: true, stateRoot: got.stateRoot };
@@ -600,7 +773,10 @@ async function legacyIndexFresh(stateRoot, blockHeight) {
   await loadAnchors();
   const head = await certifiedHeadNow();
   if (head === null || Math.floor(blockHeight / MACROBLOCK_INTERVAL) > head + PROOF_MAX_LAG_MACROBLOCKS) return null;
-  const walk = core.certifiedStateRootIndex(stateRoot, blockHeight, () => shuffled(QNET.NODES), walkHooks()).catch(() => null);
+  const walk = (async () => {
+    if (core.stepsToVerify(Math.floor(blockHeight / MACROBLOCK_INTERVAL)) > CAPSULE_WALK_STEPS) await refreshCapsule(head);
+    return core.certifiedStateRootIndex(stateRoot, blockHeight, () => shuffled(QNET.NODES), walkHooks());
+  })().catch(() => null);
   const index = await withinBudget(walk, QC_VERIFY_BUDGET_MS);
   if (!Number.isSafeInteger(index)) return null;
   await persistAnchors();
@@ -628,11 +804,16 @@ function noteOwnSends(address, state) {
 function proofPasses(address, index = null) {
   if (Number.isSafeInteger(index)) return [String(index)];
   const now = Date.now();
-  if (headHintSeen === null || now - headHintSeen.at >= HEAD_SEEN_MS) return ['latest'];
   if (now - (ownSendAt.get(address) ?? 0) < OWN_SEND_LATEST_MS) return ['latest'];
   const verified = core.highestVerifiedIndex();
+  if (verified < core.trustFloorIndex()) return ['latest'];
+  if (headHintSeen === null || now - headHintSeen.at >= HEAD_SEEN_MS) {
+    const at = Number(core.verifiedCheckpoint(verified)?.timestamp);
+    const ms = at < 1e12 ? at * 1000 : at;
+    return Number.isSafeInteger(ms) && ms > 0 && now - ms < RECENT_VERIFIED_MS ? [String(verified), 'latest'] : ['latest'];
+  }
   const head = Math.max(verified, headHintSeen.index);
-  return verified >= core.trustFloorIndex() && verified >= head - PROOF_MAX_LAG_MACROBLOCKS ? [String(verified), 'latest'] : ['latest'];
+  return verified >= head - PROOF_MAX_LAG_MACROBLOCKS ? [String(verified), 'latest'] : ['latest'];
 }
 
 // The pinned nodes a proof is asked of, in order: those neither waiting out a Retry-After nor marked as answering with
@@ -653,7 +834,9 @@ function proofOrder() {
  * `passes`; a later pass only when a node answered the earlier one (a pinned macroblock no node holds any more is
  * followed by 'latest'). judge(reply) reads one 200 answer: {verified} ends the read, {figure} keeps the first figure whose
  * proof folds under the root its node named. Any answer without a verifiable proof (an error, a rate limit, a body of
- * another shape, a root not certified) is no answer: the next node is asked.
+ * another shape, a root not certified) is no answer: the next node is asked; but a figure whose certificate waits only
+ * for a long walk ({walking}, walkSteps) ends the read: another node's proof waits for the same walk, so one read waits
+ * one budget, never one per node.
  * @returns {Promise<{verified: object|null, figure: object|null, answered: boolean}>} answered: a node answered (a 5xx or
  *   429 is no answer)
  */
@@ -679,6 +862,7 @@ async function proofAnswers(path, passes, judge) {
       const got = await judge(reply).catch(() => ({}));
       if (got.verified) return { verified: got.verified, figure: null, answered };
       if (got.figure && figure === null) figure = got.figure;
+      if (got.walking && walkSteps() !== null) return { verified: null, figure, answered };
     }
     if (!reached) break;
   }
@@ -727,7 +911,8 @@ function legacyAccountFields(body, address) {
  * node's live root, which counts only when that root is a recent certified one (legacyIndexFresh), and marks the node old
  * when its shape says so (core.isLegacyProofBody). onFigure(figure): a figure whose proof folds under the root its node
  * named, before the walk decides.
- * @returns {Promise<{verified?: object, figure?: object|null}>} a figure: {balanceNano, nonce, index, blockHeight, exists}
+ * @returns {Promise<{verified?: object, figure?: object|null}>} a figure: {balanceNano, nonce, index, blockHeight, exists,
+ *   isContract} (isContract: the leaf's is_contract; null from an older node's body, which does not carry it)
  */
 async function judgeAccount(address, reply, onFigure) {
   const body = strictBody(reply.text);
@@ -737,39 +922,56 @@ async function judgeAccount(address, reply, onFigure) {
     if (!read.ok) return {};
     const figure = {
       balanceNano: read.account.balance, nonce: read.account.nonce, index: read.index,
-      blockHeight: read.index * MACROBLOCK_INTERVAL, exists: read.account.exists,
+      blockHeight: read.index * MACROBLOCK_INTERVAL, exists: read.account.exists, isContract: read.account.is_contract === true,
     };
     const folded = typeof body.state_root === 'string' && read.fold(body.state_root);
     if (folded) onFigure?.(figure);
     const root = await certifiedRootFresh(read.index);
     if (root.ok && read.fold(root.stateRoot)) return { verified: figure };
-    return { figure: folded ? figure : null };
+    return { figure: folded ? figure : null, ...(root.walking ? { walking: true } : {}) };
   }
   if (core.isLegacyProofBody(body, 'account')) core.markNodeOld(reply.node);
   const fields = legacyAccountFields(body, address);
   if (fields === null || !core.verifyAccountProof(fields, body.merkle_proof, body.state_root)) return {};
-  const figure = { balanceNano: fields.balance, nonce: fields.nonce, index: null, blockHeight: body.block_height, exists: true };
+  const figure = {
+    balanceNano: fields.balance, nonce: fields.nonce, index: null, blockHeight: body.block_height, exists: true, isContract: null,
+  };
   onFigure?.(figure);
   const index = await legacyIndexFresh(body.state_root, body.block_height);
   if (index === null) return { figure };
   return { verified: { ...figure, index, blockHeight: index * MACROBLOCK_INTERVAL } };
 }
 
-// Verified proofs a send may use again (SEND_PROOF_MAX_AGE_MS): address -> {figure, at}.
+// Verified proofs a send may stand on, by address: {balanceNano, nonce, index}, the newest index kept. In worker memory and
+// in the session's storage (session.keepSendProof), so a worker woken from sleep sends without reading again; sendBase
+// judges one by its index against the certified head, never by its age.
 const sendProofs = new Map();
-const keepSendProof = (address, figure) => {
+function keepSendProof(address, figure) {
+  if (!Number.isSafeInteger(figure?.index)) return;
+  const kept = { balanceNano: figure.balanceNano, nonce: figure.nonce, index: figure.index };
+  const before = sendProofs.get(address);
+  if (before !== undefined && before.index > kept.index) return;
   sendProofs.delete(address);
-  sendProofs.set(address, { figure, at: Date.now() });
-  while (sendProofs.size > 8) sendProofs.delete(sendProofs.keys().next().value);
-};
-const keptSendProof = (address) => {
-  const kept = sendProofs.get(address);
-  return kept !== undefined && Date.now() - kept.at <= SEND_PROOF_MAX_AGE_MS ? kept.figure : null;
-};
+  sendProofs.set(address, kept);
+  while (sendProofs.size > SEND_PROOFS_MAX) sendProofs.delete(sendProofs.keys().next().value);
+  session.keepSendProof(address, kept).catch((error) => log.warn('send proof not kept', error?.code ?? error?.name));
+}
+
+// The proof kept for `address` (this worker's, else the session's), or null.
+async function keptSendProof(address) {
+  const kept = sendProofs.get(address) ?? await session.keptSendProof(address).catch(() => null);
+  if (kept === null || kept === undefined) return null;
+  if (!sendProofs.has(address)) sendProofs.set(address, kept);
+  return { ...kept };
+}
 
 // The account proof of `address` (proofPasses, judgeAccount); a verified one is kept for the next send check, and its nonce
 // as the highest certified one seen.
 async function accountProof(address, { index = null, onFigure = null } = {}) {
+  // the macroblocks kept from before and the head last seen first (a woken worker), so the proof asks for the newest
+  // verified one while it stands; the certified head it is judged by is read while the proof is fetched
+  await loadAnchors();
+  certifiedHeadNow().catch(() => null);
   const got = await proofAnswers(`/api/v1/account/${address}/balance/proof`, proofPasses(address, index),
     (reply) => judgeAccount(address, reply, onFigure));
   if (got.verified) {
@@ -779,6 +981,7 @@ async function accountProof(address, { index = null, onFigure = null } = {}) {
   return got;
 }
 
+// A figure not certified yet carries walkSteps while a long walk is why (walkNote).
 const accountView = (figure, verified) => ({
   balanceNano: figure.balanceNano,
   nonce: figure.nonce,
@@ -786,6 +989,7 @@ const accountView = (figure, verified) => ({
   verification: verified ? 'proof' : 'none',
   blockHeight: figure.blockHeight ?? null,
   index: figure.index ?? null,
+  ...(verified ? {} : walkNote()),
 });
 
 /**
@@ -799,7 +1003,7 @@ const accountView = (figure, verified) => ({
  * @returns {Promise<{balanceNano: string, nonce: string, verified: boolean, verification: 'proof'|'none',
  *   blockHeight: number|null, index: number|null}>}
  * @throws {WalletError} NETWORK when no node answered, BALANCE_UNCONFIRMED when answers came but none is certified and
- *   recent (and no figure other than a 0 can be shown)
+ *   recent (and no figure other than a 0 can be shown), with walkSteps while a long walk is why
  */
 export async function readAccount(address, { display = false } = {}) {
   if (!core.isValidQnetAddress(address)) throw new WalletError('INVALID_ADDRESS');
@@ -818,7 +1022,7 @@ export async function readAccount(address, { display = false } = {}) {
   if (got === false) return accountView(early, false);
   if (got.verified) return accountView(got.verified, true);
   if (got.figure && got.figure.balanceNano !== '0') return accountView(got.figure, false);
-  throw new WalletError(got.answered ? 'BALANCE_UNCONFIRMED' : 'NETWORK');
+  throw new WalletError(got.answered ? 'BALANCE_UNCONFIRMED' : 'NETWORK', got.answered ? walkNote() : {});
 }
 
 // ---------------------------------------------------------------- the chain's nonce
@@ -1128,6 +1332,7 @@ export async function getBalance() {
     verified: account.verified,
     verification: account.verification,
     blockHeight: account.blockHeight,
+    ...(Number.isSafeInteger(account.walkSteps) ? { walkSteps: account.walkSteps } : {}),
   };
 }
 
@@ -1185,19 +1390,28 @@ let headSeen = null;
 let chainChecked = 0;
 
 /**
- * Forgets what the wallet kept of a chain the pinned nodes no longer serve (followChain): the verified anchors, its
- * pending transactions and their spend records (signed on the old chain; none of them can be decided on this one), the
- * cached balances, token list and history, the proofs kept for a send, and the head it saw, which becomes `head`.
+ * Forgets what the wallet kept of a chain the pinned nodes no longer serve (followChain): the verified anchors and the
+ * genesis capsule, its pending transactions and their spend records (signed on the old chain; none of them can be decided
+ * on this one), the cached balances, token list and history, the proofs kept for a send, the recipient kinds and token
+ * row verdicts, and the head it saw, which becomes `head`.
  * @param {number} head
  * @returns {Promise<void>}
  */
 async function forgetChain(head) {
   log.warn('the network head went back: another chain, what was kept of the old one is dropped');
   await dropAnchors();
+  core.clearCapsule();
+  capsuleQuietUntil = 0;
+  keepLightHints(true);
+  await forgetKeptCapsule();
   await vault.updateState((state) => ({ ...state, pendingTransfers: [], spends: [] }))
     .catch((error) => log.warn('pending transactions of the old chain not dropped', error?.code ?? error?.name));
   chainNonceSeen = null;
   sendProofs.clear();
+  await session.forgetSendProofs().catch((error) => log.warn('send proofs not dropped', error?.code ?? error?.name));
+  recipientKinds.clear();
+  recipientPages.clear();
+  rowVerdicts.clear();
   tokenList = null;
   contractCache.clear();
   await session.forgetViews(['qnetBalance', 'qnetTokens', 'qnetHistory']);
@@ -1222,15 +1436,21 @@ export async function followChain() {
   chainChecked = Date.now();
   let head = await networkHeadIndex();
   if (head === null) return 'unknown';
+  let renamed = false;
   if (headSeen === null) {
     const cache = await vault.readChainCache().catch(() => ({}));
     headSeen = Number.isSafeInteger(cache?.headIndex) && cache.headIndex >= 0 ? cache.headIndex : 0;
-    // what was kept under another build's chain (its pinned genesis identities, core.chainIdentity) is another chain's
-    if (typeof cache?.chain === 'string' && cache.chain !== core.chainIdentity()) headSeen = Number.MAX_SAFE_INTEGER;
+    // what was kept under another build's chain (its network identity and pinned genesis identities, core.chainIdentity)
+    // is another chain's; the identity of a build before it carried the network identity, over the same genesis
+    // identities, is this chain's kept by an earlier build: its head stands, and the identity is written again
+    renamed = cache?.chain === legacyChainIdentity();
+    if (typeof cache?.chain === 'string' && cache.chain !== core.chainIdentity() && !renamed) headSeen = Number.MAX_SAFE_INTEGER;
   }
   await loadAnchors();
-  const anchorsAbove = (index) => core.highestVerifiedIndex() > pinIndex() && core.highestVerifiedIndex() >= index + CHAIN_REWIND_MACROBLOCKS;
-  if (headSeen >= head + CHAIN_REWIND_MACROBLOCKS || anchorsAbove(head)) {
+  const above = (index, at) => index > pinIndex() && index >= at + CHAIN_REWIND_MACROBLOCKS;
+  const anchorsAbove = (at) => above(ownTopIndex(), at);
+  const capsuleAbove = (at) => above(core.heldCapsuleIndex(), at);
+  if (headSeen >= head + CHAIN_REWIND_MACROBLOCKS || anchorsAbove(head) || capsuleAbove(head)) {
     head = await highestNetworkHead();
     if (head === null) return 'unknown';
   }
@@ -1238,16 +1458,38 @@ export async function followChain() {
     await forgetChain(head);
     return 'changed';
   }
-  if (headSeen === 0 || head >= headSeen + CHAIN_REWIND_MACROBLOCKS) {
-    headSeen = head;
-    await vault.updateChainCache((cache) => ({ ...cache, chain: core.chainIdentity(), headIndex: head }))
+  if (headSeen === 0 || head >= headSeen + CHAIN_REWIND_MACROBLOCKS || renamed) {
+    headSeen = Math.max(headSeen, head);
+    const kept = headSeen;
+    await vault.updateChainCache((cache) => ({ ...cache, chain: core.chainIdentity(), headIndex: kept }))
       .catch((error) => log.warn('chain head not kept', error?.code ?? error?.name));
   }
   if (anchorsAbove(head)) {
     log.warn('kept anchors above the network head: dropped');
     await dropAnchors();
   }
+  if (capsuleAbove(head)) {
+    log.warn('capsule above the network head: dropped');
+    core.clearCapsule();
+    await forgetKeptCapsule();
+  }
   return 'same';
+}
+
+// The highest macroblock this wallet verified itself (in this session or kept from an earlier one), or 0: the capsule's K
+// and the pin left out.
+const ownTopIndex = () => Math.max(0, ...Object.keys(core.exportVerifiedAnchors()).map(Number));
+
+// The chain identity a build before NETWORK_ID kept its data under (the pinned genesis identities alone, the light
+// client's former chainIdentity): a cache of it is this build's chain kept by an earlier build of the same genesis.
+let legacyIdentity = null;
+function legacyChainIdentity() {
+  if (legacyIdentity === null) {
+    const { GENESIS_NODE_IDS, GENESIS_CONSENSUS_PKS } = core.genesisConsensus;
+    const parts = [...GENESIS_NODE_IDS].sort().map((id) => `${id}:${GENESIS_CONSENSUS_PKS[id]}`);
+    legacyIdentity = core.sha3_256Hex(new TextEncoder().encode(parts.join('|'))).slice(0, 32);
+  }
+  return legacyIdentity;
 }
 
 // The highest macroblock any pinned node reports (each asked once, within HEAD_TIMEOUT_MS, all awaited), or null when
@@ -1287,28 +1529,31 @@ function reservedNano(transfers, except = null) {
 /**
  * The certified base a send is decided by (the owner's rule: a balance the committee certified, never one node's word,
  * never what nodes agree on, never the figure on screen), and the account nonce this wallet's own transactions are counted
- * up to (accountNonceOf). A proof verified in the last SEND_PROOF_MAX_AGE_MS is used again when its nonce is at least the
- * nodes' nonce now; otherwise one verified read is made (the walk waits QC_VERIFY_BUDGET_MS at most), and the kept proof
- * stands in when none verifies.
+ * up to (accountNonceOf). A kept QNC proof (keepSendProof: the follow tick, the balance read, the Send tab's warm read)
+ * stands while its macroblock stands by the certified head (certifiedIndexStands) and its nonce is at least the nodes'
+ * nonce now; otherwise one verified read is made (the walk waits QC_VERIFY_BUDGET_MS at most), and a kept proof that still
+ * stands by its index stands in when none verifies. A token balance is always read fresh at this base's macroblock
+ * (tokenSide): a transferFrom lowers a holder's balance without the holder's nonce.
  * @param {string} address
  * @returns {Promise<{certified: {balanceNano: string, nonce: string, index: number}, accountNonce: bigint, pkBound: boolean}>}
  * @throws {WalletError} NETWORK when no node answered, BALANCE_UNCONFIRMED when none certified a recent state
  */
 async function sendBase(address) {
   const agreedRead = agreedAccountOf(address);
-  const kept = keptSendProof(address);
+  const [kept, head] = await Promise.all([keptSendProof(address), certifiedHeadNow()]);
+  const standing = kept !== null && certifiedIndexStands(kept.index, head) ? kept : null;
   let agreed = null;
   let certified = null;
-  if (kept !== null) {
+  if (standing !== null) {
     agreed = await agreedRead;
-    if (agreed !== null && BigInt(kept.nonce) >= BigInt(agreed.nonce)) certified = kept;
+    if (agreed !== null && BigInt(standing.nonce) >= BigInt(agreed.nonce)) certified = standing;
   }
   if (certified === null) {
     const [got, nodes] = await Promise.all([accountProof(address), agreedRead]);
     agreed = nodes;
     if (got.verified) certified = got.verified;
-    else if (kept !== null) certified = kept;
-    else throw new WalletError(got.answered ? 'BALANCE_UNCONFIRMED' : 'NETWORK');
+    else if (standing !== null) certified = standing;
+    else throw new WalletError(got.answered ? 'BALANCE_UNCONFIRMED' : 'NETWORK', got.answered ? walkNote() : {});
   }
   noteChainNonce(address, certified.nonce);
   return { certified, accountNonce: accountNonceOf(address, certified.nonce, agreed), pkBound: agreed?.pkBound === true };
@@ -1512,6 +1757,90 @@ async function nodeConfirmedRows(address) {
   return new Set([...counts].filter(([, count]) => count >= MIN_NODE_AGREEMENT).map(([key]) => key));
 }
 
+// A token row of the archive is in a block only by its own logs proof (GET /api/v1/logs/proof): the leaf the node proves
+// must be the one this row's own fields make (core.transferLogLeaf: transaction, log index, contract and the event), it
+// folds to the block's sub-root and that to the window's logs_root, and that root is the one the committee certified for
+// the macroblock closing the window (core.verifyMacroblockLogsRoot, the app's verifyTokenTransferInclusion). The event is
+// written only when the transfer applied. A row not proven so stays unverified, whatever the nodes list. Verdicts are
+// kept by row: 'verified' and 'rejected' (the node's proof is another row's or folds to another root) for good, 'pending'
+// (no proof now, a window not certified yet, or a walk to its macroblock longer than ROW_PROOF_WALK_STEPS) is tried again
+// after ROW_PROOF_RETRY_MS. One history read checks at most ROW_PROOF_CHECKS rows and waits ROW_PROOF_WAIT_MS for them;
+// what is still running is found by the next read.
+const ROW_PROOF_MAX_BYTES = 64 * 1024;
+const ROW_PROOF_CHECKS = 8;
+const ROW_PROOF_WALK_STEPS = 4;
+const ROW_PROOF_WAIT_MS = 1500;
+const ROW_PROOF_RETRY_MS = 60 * 1000;
+const ROW_VERDICTS_MAX = 256;
+const rowVerdicts = new Map(); // `${hash}:${log index}` -> {verdict, at, running}
+
+// The decoded transfer of an archive token row, as the node's event encodes it, or null.
+function tokenTransferOf(row) {
+  const logIndex = safeIntOf(row.idx);
+  if (logIndex === null || logIndex > 0xffffffff || typeof row.kind !== 'string' || typeof row.std !== 'string') return null;
+  return {
+    tx_hash: row.hash, log_index: logIndex, contract: row.contract, from: row.from, to: row.to, amount: String(row.amount),
+    kind: row.kind, std: row.std, token_id: row.token_id ?? null,
+  };
+}
+
+// One row's verdict from its logs proof: 'verified', 'rejected' or 'pending'.
+async function tokenRowVerdict(transfer, block) {
+  const leaf = core.transferLogLeaf(transfer);
+  if (typeof leaf !== 'string') return 'rejected';
+  // a row whose macroblock this wallet cannot reach in a few steps is not fetched for
+  const covering = Number.isSafeInteger(block) && block > 0 ? Math.ceil(block / MACROBLOCK_INTERVAL) : null;
+  if (covering !== null && core.stepsToVerify(covering) > ROW_PROOF_WALK_STEPS) return 'pending';
+  let reply;
+  try {
+    reply = await nodeRequest(`/api/v1/logs/proof?tx_hash=${encodeURIComponent(transfer.tx_hash)}&log_index=${transfer.log_index}`,
+      { maxBytes: ROW_PROOF_MAX_BYTES });
+  } catch {
+    return 'pending';
+  }
+  const d = reply.status === 200 ? parseOrNull(reply.text) : null;
+  const hex = (v) => typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v);
+  if (!isObject(d) || d.error !== undefined || !hex(d.leaf) || !Array.isArray(d.proof) || !hex(d.block_root)
+    || !Array.isArray(d.window_proof) || !hex(d.logs_root)) return 'pending';
+  if (d.leaf.toLowerCase() !== leaf) return 'rejected';
+  if (!core.verifyLogInclusion(d.leaf, d.proof, d.block_root) || !core.verifyLogWindowInclusion(d.block_root, d.window_proof, d.logs_root)) {
+    return 'rejected';
+  }
+  const windowEnd = safeIntOf(d.window_end);
+  if (windowEnd === null || windowEnd % MACROBLOCK_INTERVAL !== 0) return 'pending';
+  if (core.stepsToVerify(windowEnd / MACROBLOCK_INTERVAL) > ROW_PROOF_WALK_STEPS) return 'pending';
+  const anchored = await core.verifyMacroblockLogsRoot(d.logs_root.toLowerCase(), windowEnd, () => shuffled(QNET.NODES), walkHooks());
+  if (anchored === true) return 'verified';
+  return anchored === 'mismatch' ? 'rejected' : 'pending';
+}
+
+// The token rows of `entries` ({row, item}) whose logs proof verifies (tokenRowVerdict), as their items.
+async function provenTokenRows(entries) {
+  const now = Date.now();
+  const keyed = entries.map((entry) => ({ ...entry, transfer: tokenTransferOf(entry.row) }))
+    .filter(({ transfer }) => transfer !== null)
+    .map((entry) => ({ ...entry, key: `${entry.transfer.tx_hash}:${entry.transfer.log_index}` }));
+  const due = keyed.filter(({ key }) => {
+    const known = rowVerdicts.get(key);
+    return known === undefined || (known.verdict === 'pending' && !known.running && now - known.at >= ROW_PROOF_RETRY_MS);
+  }).slice(0, ROW_PROOF_CHECKS);
+  const checks = due.map(({ key, transfer, item }) => {
+    const entry = { verdict: 'pending', at: now, running: true };
+    rowVerdicts.delete(key);
+    rowVerdicts.set(key, entry);
+    return tokenRowVerdict(transfer, item.block).catch(() => 'pending').then((verdict) => {
+      Object.assign(entry, { verdict, at: Date.now(), running: false });
+      if (verdict === 'rejected') log.warn('token row proof refused');
+    });
+  });
+  while (rowVerdicts.size > ROW_VERDICTS_MAX) rowVerdicts.delete(rowVerdicts.keys().next().value);
+  if (checks.length > 0) {
+    await withinBudget(Promise.all(checks), ROW_PROOF_WAIT_MS);
+    await persistAnchors();
+  }
+  return new Set(keyed.filter(({ key }) => rowVerdicts.get(key)?.verdict === 'verified').map(({ item }) => item));
+}
+
 // A superseded transfer (its replacement is being submitted) may still apply: it reads as pending or stale. A dropped one
 // (isDropped, against the verified nonce last read) reads as dropped.
 function pendingStatus(p, address, now) {
@@ -1564,13 +1893,15 @@ async function historyOf(qnetAddress, params, confirm) {
   ]);
   const body = parseOrNull(text);
   if (!isObject(body) || body.success !== true || !Array.isArray(body.items)) throw new WalletError('NETWORK');
-  const listed = (item) => confirmed !== null && confirmed.has(identityOf(item));
+  const mapped = body.items.map((row) => ({ row, item: historyItem(row, qnetAddress) })).filter(({ item }) => item !== null);
+  // a token row is in a block only by its own logs proof (provenTokenRows), never by the nodes' listing
+  const proven = confirm ? await provenTokenRows(mapped.filter(({ item }) => item.kind === 'token')) : new Set();
+  const listed = (item) => (item.kind === 'token' ? proven.has(item) : confirmed !== null && confirmed.has(identityOf(item)));
   // the light node's registration this wallet submitted names its node (the archive's row names none)
   const own = state.registration;
   const named = (item) => (item.kind === 'node_registration' && typeof own?.txHash === 'string' && own.txHash === item.hash
     ? { ...item, nodeId: own.nodeId } : item);
-  const items = body.items.map((row) => historyItem(row, qnetAddress)).filter(Boolean)
-    .map((item) => named(listed(item) ? { ...item, status: 'included' } : item));
+  const items = mapped.map(({ item }) => named(listed(item) ? { ...item, status: 'included' } : item));
   const next = typeof body.next_cursor === 'string' && CURSOR_RE.test(body.next_cursor) ? body.next_cursor : null;
   const now = Date.now();
   const pending = [...state.pendingTransfers].reverse().map((p) => pendingItem(p, qnetAddress, now));
@@ -1592,6 +1923,27 @@ async function historyOf(qnetAddress, params, confirm) {
 export async function getHistory(params = {}) {
   const { qnetAddress } = await session.requireUnlocked();
   return historyOf(qnetAddress, params ?? {}, true);
+}
+
+// The archive page the recipient check reads (recipientCheck), by address: one read shared by the reads that overlap, and
+// a page read in the last RECIPIENT_PAGE_MS used again, so the Send tab can read it while the address is typed
+// (sendWarm) and the review finds it read. It only ever adds warnings.
+const RECIPIENT_PAGE_MS = 30 * 1000;
+const recipientPages = new Map();
+function recipientPage(address) {
+  const kept = recipientPages.get(address);
+  if (kept !== undefined && (kept.at === null || Date.now() - kept.at < RECIPIENT_PAGE_MS)) return kept.read;
+  const entry = { at: null, read: null };
+  entry.read = historyOf(address, { limit: LIMITS.HISTORY_PAGE_MAX }, false).then(({ items }) => {
+    entry.at = Date.now();
+    return items;
+  }, (error) => {
+    if (recipientPages.get(address) === entry) recipientPages.delete(address);
+    throw error;
+  });
+  recipientPages.set(address, entry);
+  while (recipientPages.size > 2) recipientPages.delete(recipientPages.keys().next().value);
+  return entry.read;
 }
 
 // Shares the first and last four characters with a different address: what a person compares, and
@@ -1631,7 +1983,7 @@ export async function recipientCheck(to, amountNano = null) {
   let items = null;
   try {
     // the archive page only adds warnings here, so its rows are not checked against the nodes
-    ({ items } = await historyOf(qnetAddress, { limit: LIMITS.HISTORY_PAGE_MAX }, false));
+    items = await recipientPage(qnetAddress);
   } catch (error) {
     log.warn('history unavailable for the recipient check', error?.code ?? error?.name);
   }
@@ -1666,6 +2018,15 @@ export async function recipientCheck(to, amountNano = null) {
  */
 export function transferFeeNano() {
   return String(core.fees.TRANSFER_FEE_NANO);
+}
+
+// A send's certified base (transferSnapshot) and its recipient check, read together: the recipient's leaf comes from the
+// same certified state, so a base that cannot be had is the error said first.
+async function baseWithRecipient(snapshotRead, recipientRead) {
+  const [base, recipient] = await Promise.allSettled([snapshotRead, recipientRead]);
+  if (base.status === 'rejected') throw base.reason;
+  if (recipient.status === 'rejected') throw recipient.reason;
+  return base.value;
 }
 
 function assertTransfer(to, amountNano) {
@@ -1732,7 +2093,7 @@ export async function prepareTransfer(transfer) {
   assertTransfer(to, amountNano);
   if (replaceNonce !== null && u64Of(replaceNonce) === null) throw new WalletError('INVALID_PARAMS');
   const { qnetAddress } = await session.requireUnlocked();
-  const [snapshot] = await Promise.all([transferSnapshot(qnetAddress, replaceNonce), assertPayableRecipient(to, qnetAddress)]);
+  const snapshot = await baseWithRecipient(transferSnapshot(qnetAddress, replaceNonce), assertPayableRecipient(to, qnetAddress));
   return previewOf(qnetAddress, to, amountNano, snapshot);
 }
 
@@ -1814,7 +2175,7 @@ export async function sendTransfer(transfer) {
   return serialized(async () => {
     const { qnetAddress: from } = await session.requireUnlocked();
     if (expectedFeeNano !== transferFeeNano()) throw new WalletError('FEE_CHANGED');
-    const [snapshot] = await Promise.all([transferSnapshot(from, replaceNonce), assertPayableRecipient(to, from)]);
+    const snapshot = await baseWithRecipient(transferSnapshot(from, replaceNonce), assertPayableRecipient(to, from));
     const preview = previewOf(from, to, amountNano, snapshot);
     checkNonce(snapshot, expectedNonce, oneInFlight);
     checkRoom(snapshot);
@@ -1875,6 +2236,8 @@ async function storeAndSubmit(from, snapshot, record, withRecord) {
   let superseded = [];
   let refusedBefore = [];
   ownSendAt.set(from, record.createdAt);
+  // the next recipient check reads the archive again: this send may be on its page soon
+  recipientPages.delete(from);
   await vault.updateState((state) => {
     const sentAt = (p) => p.outcome === 'pending' && p.nonce === record.nonce;
     const refusedAt = (p) => p.outcome === 'refused' && p.nonce === record.nonce;
@@ -2068,27 +2431,49 @@ export async function readContract(address) {
   return { ...answer };
 }
 
+// What recipients are by their certified account leaf (recipientKind), by address: {index, isContract}.
+const RECIPIENT_KINDS_MAX = 64;
+const recipientKinds = new Map();
+
 /**
- * Refuses a recipient that is a contract account, a built-in token or another contract, as two pinned nodes agree
- * (readContract). A contract account has no key and no contract can send QNC or a built-in token on, so whatever a
+ * Whether `address` is a contract account, from its certified account leaf (is_contract, which the leaf hash commits to):
+ * its account proof folded to the state root of a recent macroblock whose committee certificate this wallet verified
+ * (judgeAccount), asked at this wallet's own verified macroblock first, so the walk is the one the send's own proof takes.
+ * An account proven absent is no contract. A leaf read stands while its macroblock stands by the certified head
+ * (certifiedIndexStands); a contract stays one. Never two nodes' word.
+ * @param {string} address
+ * @returns {Promise<boolean>}
+ * @throws {WalletError} RECIPIENT_UNCHECKED when no recent certified leaf can be had
+ */
+async function recipientKind(address) {
+  const kept = recipientKinds.get(address);
+  if (kept?.isContract === true) return true;
+  if (kept !== undefined && certifiedIndexStands(kept.index, await certifiedHeadNow())) return false;
+  const got = await proofAnswers(`/api/v1/account/${address}/balance/proof`, proofPasses(address),
+    (reply) => judgeAccount(address, reply, null));
+  const figure = got.verified;
+  if (!figure || typeof figure.isContract !== 'boolean' || !Number.isSafeInteger(figure.index)) throw new WalletError('RECIPIENT_UNCHECKED');
+  recipientKinds.delete(address);
+  recipientKinds.set(address, { index: figure.index, isContract: figure.isContract });
+  while (recipientKinds.size > RECIPIENT_KINDS_MAX) recipientKinds.delete(recipientKinds.keys().next().value);
+  return figure.isContract;
+}
+
+/**
+ * Refuses a recipient that is a contract account (a built-in token or another contract), by its certified account leaf
+ * (recipientKind). A contract account has no key and no contract can send QNC or a built-in token on, so whatever a
  * transfer or a token transfer credits to one stays there for good, and the node's door takes such a transfer today
- * (DEVP-R1-01: the SDK's recipient rule, with no override here). A recipient no two nodes agree on is not signed for.
- * `from`, the wallet's own address, is no contract and is not read.
+ * (DEVP-R1-01: the SDK's recipient rule, with no override here). A recipient whose leaf no recent certified state gives
+ * is not signed for. `from`, the wallet's own address, is no contract and is not read.
  * @param {string} to EON
  * @param {string|null} [from]
  * @returns {Promise<void>}
  * @throws {WalletError} RECIPIENT_IS_CONTRACT, RECIPIENT_UNCHECKED, INVALID_ADDRESS
  */
 export async function assertPayableRecipient(to, from = null) {
+  if (!core.isValidQnetAddress(to)) throw new WalletError('INVALID_ADDRESS');
   if (to === from) return;
-  let target;
-  try {
-    target = await readContract(to);
-  } catch (error) {
-    if (error instanceof WalletError && error.code === 'NETWORK') throw new WalletError('RECIPIENT_UNCHECKED');
-    throw error;
-  }
-  if (target.kind !== 'none') throw new WalletError('RECIPIENT_IS_CONTRACT');
+  if (await recipientKind(to)) throw new WalletError('RECIPIENT_IS_CONTRACT');
 }
 
 /**
@@ -2424,7 +2809,7 @@ const recipientOfCall = (request, from) => (request.kind === 'tokenTransfer' ? a
 export async function prepareCall(request) {
   assertCall(request);
   const { qnetAddress: from } = await session.requireUnlocked();
-  const [snapshot] = await Promise.all([transferSnapshot(from), recipientOfCall(request, from)]);
+  const snapshot = await baseWithRecipient(transferSnapshot(from), recipientOfCall(request, from));
   const tx = buildCall(request, from, snapshot.nextNonce);
   const token = request.kind === 'tokenTransfer' ? await tokenSide(request, from, snapshot) : null;
   return callPreviewOf(from, tx, snapshot, token);
@@ -2463,7 +2848,7 @@ export async function sendCall(call) {
   assertCall(request);
   return serialized(async () => {
     const { qnetAddress: from } = await session.requireUnlocked();
-    const [snapshot] = await Promise.all([transferSnapshot(from), recipientOfCall(request, from)]);
+    const snapshot = await baseWithRecipient(transferSnapshot(from), recipientOfCall(request, from));
     const tx = buildCall(request, from, snapshot.nextNonce);
     if (tx.maxFeeNano !== expectedFeeNano) throw new WalletError('FEE_CHANGED');
     checkNonce(snapshot, expectedNonce, oneInFlight);
@@ -2728,4 +3113,132 @@ export async function resubmitPending() {
     const count = (verdict) => [...verdicts.values()].filter((v) => v === verdict).length;
     return { resubmitted: results.size, confirmed: count('confirmed'), replaced: count('replaced'), passed: count('passed') };
   });
+}
+
+// ---------------------------------------------------------------- follow and the Send tab's reads ahead
+
+// The macroblock a follow tick walks to: the certified head, or the one before it when that is closer to what this wallet
+// verified, so once caught up one parity is followed (one step per two macroblocks; a proof stands within
+// PROOF_MAX_LAG_MACROBLOCKS of the head).
+const followTarget = (head) => (core.stepsToVerify(head - 1) < core.stepsToVerify(head) ? head - 1 : head);
+
+let following = null;
+
+/**
+ * One tick of the follow (the FOLLOW_ALARM, every FOLLOW_ALARM_MINUTES while the session is unlocked): the certified head,
+ * the genesis capsule when the walk to it is long (refreshCapsule), then one walk call of at most FOLLOW_STEPS_PER_TICK
+ * steps toward it (followTarget; both newest macroblocks for OWN_SEND_LATEST_MS after this wallet's own transaction, so
+ * that send shows once certified), the anchors kept, and the wallet's own QNC proof read at what is now verified when it
+ * is newer than the kept one: the next send stands on it at once (sendBase). Ticks never overlap; a locked session ends
+ * one at once.
+ * @returns {Promise<{ok: true, head: number, verified: boolean, proof: boolean}|{ok: false, reason: 'locked'|'no_head'}>}
+ */
+export function followTick() {
+  following ??= followOnce().finally(() => {
+    following = null;
+  });
+  return following;
+}
+
+async function followOnce() {
+  let address;
+  try {
+    ({ qnetAddress: address } = await session.requireUnlocked());
+  } catch {
+    return { ok: false, reason: 'locked' };
+  }
+  await loadAnchors();
+  const head = await certifiedHeadNow();
+  if (head === null) return { ok: false, reason: 'no_head' };
+  const state = await vault.readState().catch(() => null);
+  if (state !== null) noteOwnSends(address, state);
+  const both = Date.now() - (ownSendAt.get(address) ?? 0) < OWN_SEND_LATEST_MS;
+  const floor = core.trustFloorIndex();
+  const targets = (both ? [head, head - 1] : [followTarget(head)]).filter((index) => index >= floor);
+  if (targets.some((index) => core.stepsToVerify(index) > CAPSULE_WALK_STEPS)) await refreshCapsule(head);
+  for (const index of targets) {
+    if (core.stepsToVerify(index) === 0) continue;
+    await core.certifiedStateRootAt(index, () => shuffled(QNET.NODES), { ...walkHooks(), maxSteps: FOLLOW_STEPS_PER_TICK })
+      .catch(() => null);
+  }
+  await persistAnchors();
+  const verified = targets.filter((index) => core.stepsToVerify(index) === 0);
+  const newest = verified.length > 0 ? Math.max(...verified) : null;
+  const kept = await keptSendProof(address);
+  let proof = false;
+  if (newest !== null && (kept === null || kept.index < newest)) {
+    const got = await accountProof(address).catch(() => null);
+    proof = Boolean(got?.verified);
+  }
+  return { ok: true, head, verified: verified.length === targets.length && targets.length > 0, proof };
+}
+
+/**
+ * Starts the follow alarm (FOLLOW_ALARM, every FOLLOW_ALARM_MINUTES) when it is not running: sw.js on every unlock. It
+ * runs while the session is unlocked, and only then.
+ * @returns {Promise<void>}
+ */
+export async function startFollow() {
+  const alarms = globalThis.chrome?.alarms;
+  if (!alarms) return;
+  try {
+    if (!(await alarms.get(FOLLOW_ALARM))) await alarms.create(FOLLOW_ALARM, { periodInMinutes: FOLLOW_ALARM_MINUTES });
+  } catch (error) {
+    log.warn('follow alarm', error?.name);
+  }
+}
+
+/**
+ * Stops the follow alarm: sw.js on every lock.
+ * @returns {Promise<void>}
+ */
+export async function stopFollow() {
+  const alarms = globalThis.chrome?.alarms;
+  if (!alarms) return;
+  try {
+    await alarms.clear(FOLLOW_ALARM);
+  } catch (error) {
+    log.warn('follow alarm', error?.name);
+  }
+}
+
+/**
+ * sw.js alarm listener: the FOLLOW_ALARM runs a follow tick (followTick), and stops itself when it finds the session
+ * locked; any other alarm is not this module's.
+ * @param {{name: string}} alarm
+ * @returns {Promise<void>}
+ */
+export async function onAlarm(alarm) {
+  if (alarm?.name !== FOLLOW_ALARM) return;
+  const tick = await followTick();
+  if (!tick.ok && tick.reason === 'locked') await stopFollow();
+}
+
+let warmingOwn = null;
+
+/**
+ * Handler of `qnet.sendWarm` (the popup's Send tab): starts, without waiting for them, the reads a QNC review makes, so the
+ * review finds them done. When the tab opens: the wallet's own certified balance (a verified QNC proof, kept for the send:
+ * keepSendProof) unless a kept one stands by the certified head. With `to`, once an address is typed: that recipient's
+ * certified account leaf (recipientKind) and the archive page the recipient check reads (recipientPage). A read that fails
+ * here is made again by the review.
+ * @param {{to?: string}} [params]
+ * @returns {Promise<{started: true}>}
+ * @throws {WalletError} LOCKED, INVALID_ADDRESS
+ */
+export async function sendWarm(params = {}) {
+  const { qnetAddress } = await session.requireUnlocked();
+  const to = params?.to ?? null;
+  if (to !== null && !core.isValidQnetAddress(to)) throw new WalletError('INVALID_ADDRESS');
+  warmingOwn ??= (async () => {
+    const [kept, head] = await Promise.all([keptSendProof(qnetAddress), certifiedHeadNow()]);
+    if (kept === null || !certifiedIndexStands(kept.index, head)) await accountProof(qnetAddress);
+  })().catch((error) => log.debug('send read ahead', error?.code ?? error?.name)).finally(() => {
+    warmingOwn = null;
+  });
+  if (to !== null && to !== qnetAddress) {
+    recipientKind(to).catch((error) => log.debug('recipient read ahead', error?.code ?? error?.name));
+    recipientPage(qnetAddress).catch((error) => log.debug('recipient page read ahead', error?.code ?? error?.name));
+  }
+  return { started: true };
 }

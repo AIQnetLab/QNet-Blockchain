@@ -93,7 +93,7 @@ export function closeSiteSession(s: SiteSession): void {
   s.closed = true;
 }
 
-// The AAD of an answer: the session id, the intent and, for `link` and `claim`, the request's hash.
+// The AAD of an answer: the session id, the intent and, for an intent with a request, the request's hash.
 export function answerAad(id: string, intent: LinkIntent, reqHash: string | null): string {
   return `${AAD_PREFIX}${id}|${intent}${reqHash ? `|${reqHash}` : ''}`;
 }

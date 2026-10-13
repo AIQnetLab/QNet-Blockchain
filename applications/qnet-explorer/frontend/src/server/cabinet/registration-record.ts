@@ -2,8 +2,9 @@
 // from the explorer's archive of the chain (the NodeRegistration transaction's burn, burner and amount, which the indexer
 // keeps; src/indexer/transform.ts), and whose burn it is (`burnBy`). The chain holds them publicly; the nodes' public
 // status does not carry them, and the nodes prune old blocks. My node's Node details derive the node's one activation
-// code from them. A light node's registration is sent from its wallet, a super node's from the node's own id
-// (super_node_ and 16 hex of the wallet). A registration archived before the indexer kept these facts has none: the
+// code from them. A light and a super node's registration alike is sent from the wallet (development/qnet-integration/
+// src/node/registration.rs: the transaction's `from`); the row names the node by its kept `node_id` (super_node_ and 16
+// hex of the wallet for a super node). A registration archived before the indexer kept these facts has none: the
 // answer then says only that the archive holds none.
 //
 // Whose burn a light registration's is: the wallet's row in the activation registry that holds this burn names it (a
@@ -35,8 +36,7 @@ export const BURN_BY_CHECKS_PER_MINUTE = 30;
 
 export type RecordView = ArchivedRecord;
 
-// The archive's rows of the registrations sent from an address (a wallet, or a super node's id), newest first: the block
-// and the kept facts.
+// The archive's rows of the registrations sent from a wallet, newest first: the block and the kept facts.
 export type RecordLookup = (from: string) => Promise<{ block: unknown; data: unknown }[]>;
 
 // The archive's registration of a wallet, before whose burn it is.
@@ -135,7 +135,7 @@ export function createRecordReader(options: RecordReaderOptions): RecordReader {
       const view = await cache(`${nodeType}:${wallet}`, async (): Promise<RecordView | null> => {
         let row: ArchiveRow;
         try {
-          row = recordFrom(wallet, await options.lookup(nodeType === 'super' ? superNodeId(wallet) : wallet), nodeType);
+          row = recordFrom(wallet, await options.lookup(wallet), nodeType);
         } catch {
           return null;
         }
@@ -148,8 +148,9 @@ export function createRecordReader(options: RecordReaderOptions): RecordReader {
 }
 
 // The explorer database's rows (the indexer's `transactions` table; the index on from_address, block serves it).
+// Ordered by the column, not the text it is read as (a bare `block` in ORDER BY names the output column).
 export const RECORD_SQL = `SELECT block::text AS block, tx_type_data AS data FROM transactions
- WHERE from_address = $1 AND tx_type = 'NodeRegistration' ORDER BY block DESC, tx_index DESC LIMIT ${ROWS}`;
+ WHERE from_address = $1 AND tx_type = 'NodeRegistration' ORDER BY transactions.block DESC, tx_index DESC LIMIT ${ROWS}`;
 
 const GLOBAL_KEY = Symbol.for('qnet.cabinetRecordReader');
 

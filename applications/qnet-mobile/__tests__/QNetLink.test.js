@@ -1,8 +1,9 @@
 // QNet Link v1 revision 2 on the device (docs/protocols/qnet-link-v1.md section 14): the strict link parser, the request
 // and its hash, the X25519 / HKDF / AES-GCM answer and the check number against the vectors the site and the extension
-// share (docs/protocols/light-node.vectors.json, key `link`), the answer schema, the relay client that refuses any
-// session that does not match its link and request, what each intent offers and answers, and the platform wiring that
-// lets only a verified link in. An `activate` link is not a link to this app.
+// share (docs/protocols/light-node.vectors.json, key `link`; the `claim` exchanges, whose request names the node, from
+// docs/protocols/node-claim.vectors.json), the answer schema, the relay client that refuses any session that does not
+// match its link and request, what each intent offers and answers, and the platform wiring that lets only a verified link
+// in. An `activate` link is not a link to this app.
 const fs = require('fs');
 const path = require('path');
 const { x25519 } = require('@noble/curves/ed25519');
@@ -12,6 +13,7 @@ const {
   groupCheckNumber, requestText, reqHashOf, walletHashOf, buildPlaintext, plaintextProblem, openSession, deliverAnswer,
   markHandled, wasHandled, LinkRefusal, prepareOffer, performIntent,
 } = require('../src/services/QNetLink');
+const { superNodeId } = require('../src/crypto/NodePreimages');
 
 const ROOT = path.join(__dirname, '..');
 const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
@@ -20,6 +22,11 @@ const V = LN.link;
 const C0 = LN.constants.link;
 // Revision 1's file keeps what revision 2 did not repeat: its activate links and the low-order points.
 const R1 = JSON.parse(fs.readFileSync(path.join(ROOT, '../../docs/protocols/qnet-link-v1.vectors.json'), 'utf8'));
+// A `claim` request names the node, the wallet's light or super node (12.10): its exchanges are node-claim.vectors.json's.
+// The claim cases of light-node.vectors.json keep the earlier request, which named no node: the app refuses it.
+const NC = JSON.parse(fs.readFileSync(path.join(ROOT, '../../docs/protocols/node-claim.vectors.json'), 'utf8'));
+const LEGACY_CLAIM = V.cases.filter((c) => c.intent === 'claim');
+const CASES = [...V.cases.filter((c) => c.intent !== 'claim'), ...NC.cases];
 const hex = (h) => Uint8Array.from(Buffer.from(h, 'hex'));
 const linkOf = (c) => parseLink(c.link);
 const viewOf = (c) => ({ intent: c.intent, request: c.request });
@@ -30,7 +37,7 @@ const answerOf = (c) => {
   delete answer.intent;
   return answer;
 };
-const byName = (n) => V.cases.find((c) => c.name === n);
+const byName = (n) => CASES.find((c) => c.name === n);
 
 describe('the constants', () => {
   it('are the protocol\'s', () => {
@@ -48,18 +55,19 @@ describe('the constants', () => {
       expect(LINK.INTENT_ERRORS[intent]).toEqual(C0.errors[intent]);
     }
     expect(Object.keys(LINK.STATUSES)).toEqual(C0.intents);
-    expect(LINK.REQUEST_KEYS).toEqual(C0.requestKeys);
+    expect(LINK.REQUEST_KEYS).toEqual({ ...C0.requestKeys, claim: NC.constants.requestKeys });
     expect([...LINK.ERRORS].sort()).toEqual([...new Set(Object.values(C0.errors).flat())].sort());
     expect([LINK.CONSENT_PAST_S, LINK.CONSENT_FUTURE_S]).toEqual([C0.consentWindow.pastSeconds, C0.consentWindow.futureSeconds]);
     expect([LINK.RESERVE_PAST_S, LINK.RESERVE_FUTURE_S]).toEqual([C0.reserveWindow.pastSeconds, C0.reserveWindow.futureSeconds]);
     expect(String(LINK.CLAIM_MIN_NANO)).toBe(C0.claimMinNano);
+    expect(String(LINK.CLAIM_MIN_NANO)).toBe(NC.constants.claimMinNano);
     expect(LINK.RELAY).toBe('https://aiqnet.io');
   });
 });
 
 describe('the link', () => {
   it('parses every vector link to its session and request hash', () => {
-    for (const c of V.cases) {
+    for (const c of [...V.cases, ...NC.cases]) {
       const want = c.intent === 'connect'
         ? { id: c.sessionId, sitePub: c.sessionRequest.sitePub, intent: 'connect' }
         : { id: c.sessionId, sitePub: c.sessionRequest.sitePub, intent: c.intent, reqHash: c.reqHash };
@@ -107,10 +115,21 @@ describe('the link', () => {
 
 describe('the request', () => {
   it('rebuilds each request to its exact bytes and hash', () => {
-    for (const c of V.cases.filter((x) => x.intent !== 'connect')) {
+    for (const c of CASES.filter((x) => x.intent !== 'connect')) {
       expect([c.name, requestText(c.intent, c.request)]).toEqual([c.name, c.requestText]);
       expect([c.name, reqHashOf(c.requestText)]).toEqual([c.name, c.reqHash]);
     }
+  });
+
+  it('a claim names the wallet and its light or super node; the earlier request, which named no node, is refused', () => {
+    expect(LEGACY_CLAIM.length).toBe(6);
+    for (const c of LEGACY_CLAIM) expect([c.name, requestText('claim', c.request)]).toEqual([c.name, null]);
+    expect(NC.invalidSessionRequests.length).toBeGreaterThanOrEqual(8);
+    for (const { why, body } of NC.invalidSessionRequests) expect([why, requestText('claim', JSON.parse(body).request)]).toEqual([why, null]);
+    const r = { walletHash: W.walletHash, nodeId: superNodeId(W.address) };
+    expect(requestText('claim', r)).toBe(`{"walletHash":"${W.walletHash}","nodeId":"${r.nodeId}"}`);
+    // The protocol's order, whatever order the object has.
+    expect(requestText('claim', { nodeId: W.nodeId, walletHash: W.walletHash })).toBe(`{"walletHash":"${W.walletHash}","nodeId":"${W.nodeId}"}`);
   });
 
   it('refuses a request of another shape', () => {
@@ -129,7 +148,7 @@ describe('the request', () => {
 });
 
 describe('the answer crypto, against the shared vectors', () => {
-  it.each(V.cases.map((c) => [c.name, c]))('%s: the app key and IV of the vector give its exact body and check number', (name, c) => {
+  it.each(CASES.map((c) => [c.name, c]))('%s: the app key and IV of the vector give its exact body and check number', (name, c) => {
     const shared = x25519.getSharedSecret(hex(c.appPrivateKey), hex(c.sitePublicKey));
     expect(Buffer.from(shared).toString('hex')).toBe(c.sharedSecret);
     expect(Buffer.from(sessionKey(shared, c.sessionId)).toString('hex')).toBe(c.key);
@@ -154,7 +173,7 @@ describe('the answer crypto, against the shared vectors', () => {
 
 describe('the answer plaintext', () => {
   it('builds every answer of the vectors byte for byte', () => {
-    for (const c of V.cases) {
+    for (const c of CASES) {
       expect([c.name, buildPlaintext(viewOf(c), answerOf(c), windowOf(c.context))]).toEqual([c.name, c.plaintext]);
       expect([c.name, plaintextProblem(c.plaintext, viewOf(c), windowOf(c.context))]).toEqual([c.name, null]);
     }
@@ -162,11 +181,21 @@ describe('the answer plaintext', () => {
 
   it('refuses every invalid answer for the reason the vectors give (the consent signature is the app\'s own)', () => {
     expect(V.invalidPlaintexts.length).toBeGreaterThanOrEqual(25);
+    // The checks before the node's: the earlier claim request names no node, so a claim answer that gets past these is
+    // refused at the node check, whatever the vectors' reason after it.
+    const beforeNode = ['size', 'json', 'v', 'intent', 'status', 'keys', 'error', 'qnet', 'solana'];
     for (const p of V.invalidPlaintexts) {
-      const session = { intent: byName(p.session).intent, request: p.context.request };
+      const { intent } = V.cases.find((c) => c.name === p.session);
+      const session = { intent, request: p.context.request };
       const got = plaintextProblem(p.plaintext, session, windowOf(p.context));
       // The app does not verify the ML-DSA signature it made itself; the site does.
-      expect([p.session, p.reason, got]).toEqual([p.session, p.reason, p.reason === 'sig' ? null : p.reason]);
+      const want = intent === 'claim' && !beforeNode.includes(p.reason) ? 'nodeId' : (p.reason === 'sig' ? null : p.reason);
+      expect([p.session, p.reason, got]).toEqual([p.session, p.reason, want]);
+    }
+    expect(NC.invalidPlaintexts.length).toBeGreaterThanOrEqual(10);
+    for (const p of NC.invalidPlaintexts) {
+      expect([p.why, plaintextProblem(p.plaintext, { intent: 'claim', request: p.context.request }, windowOf(p.context))])
+        .toEqual([p.why, p.fail]);
     }
   });
 
@@ -206,7 +235,7 @@ beforeEach(async () => {
 
 describe('the relay session', () => {
   it('GETs exactly the session on aiqnet.io and accepts one that matches the link, its request included', async () => {
-    for (const c of V.cases) {
+    for (const c of CASES) {
       relay = () => reply(200, viewFor(c));
       calls.length = 0;
       const s = await openSession(linkOf(c));
@@ -236,8 +265,19 @@ describe('the relay session', () => {
     }
   });
 
+  it('refuses the session of an earlier claim request, which named no node, as one that does not match its link', async () => {
+    for (const c of LEGACY_CLAIM) {
+      relay = () => reply(200, viewFor(c));
+      await expect(openSession(linkOf(c))).rejects.toMatchObject({ reason: 'mismatch' });
+    }
+    // A request naming another node than the one the link's hash binds.
+    const c = byName('claim-super-ok');
+    relay = () => reply(200, viewFor(c, { request: { ...c.request, nodeId: W.nodeId } }));
+    await expect(openSession(linkOf(c))).rejects.toMatchObject({ reason: 'mismatch' });
+  });
+
   it('refuses an answered, expiring, unknown or unreachable session', async () => {
-    const c = byName('claim-ok');
+    const c = byName('claim-light-ok');
     for (const [make, reason] of [
       [() => reply(200, viewFor(c, { answered: true })), 'answered'],
       [() => reply(200, viewFor(c, { expiresIn: 29 })), 'expiring'],
@@ -267,7 +307,7 @@ describe('the answer delivery', () => {
   const live = (request = null) => ({ expiresAt: Date.now() + 600000, request });
 
   it('POSTs {appPub, iv, ct} sealed to the session and its request, which the site opens to the exact answer', async () => {
-    const c = byName('claim-rejected');
+    const c = byName('claim-super-rejected');
     relay = () => reply(201, { ok: true });
     expect(await deliverAnswer(linkOf(c), live(c.request), { status: 'rejected' })).toBe('delivered');
     const sent = JSON.parse(calls[0].body);
@@ -349,8 +389,11 @@ const session = (request) => ({ expiresAt: Date.now() + 500000, request });
 
 describe('what each intent offers before anything is signed', () => {
   const link = linkOf(byName('link-ok-check'));
-  const claim = linkOf(byName('claim-ok'));
+  const claim = linkOf(byName('claim-light-ok'));
   const burnTx = byName('link-ok-check').request.burnTx;
+  const S = superNodeId(W.address);
+  const lightClaim = session({ walletHash: W.walletHash, nodeId: W.nodeId });
+  const superClaim = session({ walletHash: W.walletHash, nodeId: S });
 
   it('connect offers the addresses, or NO_WALLET', async () => {
     const c = linkOf(byName('connect-ok'));
@@ -369,7 +412,7 @@ describe('what each intent offers before anything is signed', () => {
       .toMatchObject({ error: 'NETWORK' });
     expect(await prepareOffer(link, { wallet: WALLET, session: session({ burnTx: null, walletHash: null, check: false }), node: node({ status: async () => ({ onChain: false, features: [] }) }) }))
       .toMatchObject({ error: 'NO_NODE' });
-    expect(await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: null }), node: node({ status: async () => ({ onChain: false, features: [] }) }) }))
+    expect(await prepareOffer(claim, { wallet: WALLET, session: lightClaim, node: node({ status: async () => ({ onChain: false, features: [] }) }) }))
       .toMatchObject({ error: 'NO_NODE' });
     expect(await prepareOffer(link, { wallet: null, session: session({ burnTx, walletHash: null, check: false }), node: node() }))
       .toMatchObject({ error: 'NO_WALLET' });
@@ -464,14 +507,55 @@ describe('what each intent offers before anything is signed', () => {
   });
 
   it('claim: the amount from the app\'s own quorum, nothing to move below 1 QNC, and one move at a time', async () => {
-    expect(await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: null }), node: node() }))
-      .toEqual({ kind: 'claim', nodeId: W.nodeId, qnet: W.address, amountNano: 12500000000 });
-    expect(await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: null }), node: node({ balance: async () => 999999999 }) }))
-      .toEqual({ kind: 'claim_empty', nodeId: W.nodeId, qnet: W.address });
-    expect(await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: null }), node: node({ balance: async () => null }) }))
+    const n = node();
+    expect(await prepareOffer(claim, { wallet: WALLET, session: lightClaim, node: n }))
+      .toEqual({ kind: 'claim', nodeId: W.nodeId, nodeType: 'light', qnet: W.address, amountNano: 12500000000 });
+    expect(n.status).toHaveBeenCalledWith(W.nodeId);
+    expect(n.balance).toHaveBeenCalledWith(W.nodeId);
+    expect(await prepareOffer(claim, { wallet: WALLET, session: lightClaim, node: node({ balance: async () => 999999999 }) }))
+      .toEqual({ kind: 'claim_empty', nodeId: W.nodeId, nodeType: 'light', qnet: W.address });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: lightClaim, node: node({ balance: async () => null }) }))
       .toMatchObject({ error: 'NETWORK' });
-    expect(await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: null }), node: node({ claimBusy: () => true }) }))
+    expect(await prepareOffer(claim, { wallet: WALLET, session: lightClaim, node: node({ claimBusy: () => true }) }))
       .toMatchObject({ error: 'CLAIM_BUSY' });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: lightClaim, node: node({ status: async () => ({ onChain: null, features: [] }) }) }))
+      .toMatchObject({ error: 'NETWORK' });
+  });
+
+  it('claim: the wallet\'s super node, which two genesis nodes list alike, and its balance', async () => {
+    const n = node({ serverListed: jest.fn(async () => true) });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: superClaim, node: n }))
+      .toEqual({ kind: 'claim', nodeId: S, nodeType: 'super', qnet: W.address, amountNano: 12500000000 });
+    expect(n.serverListed).toHaveBeenCalledWith(S);
+    expect(n.status).not.toHaveBeenCalled();
+    expect(n.balance).toHaveBeenCalledWith(S);
+    expect(await prepareOffer(claim, { wallet: WALLET, session: superClaim, node: node({ serverListed: async () => true, balance: async () => 5 }) }))
+      .toEqual({ kind: 'claim_empty', nodeId: S, nodeType: 'super', qnet: W.address });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: superClaim, node: node({ serverListed: async () => false }) }))
+      .toEqual({ kind: 'unavailable', error: 'NO_NODE' });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: superClaim, node: node({ serverListed: async () => null }) }))
+      .toEqual({ kind: 'unavailable', error: 'NETWORK' });
+    // A node side that cannot read the super node's status reads nothing as listed.
+    expect(await prepareOffer(claim, { wallet: WALLET, session: superClaim, node: node() })).toEqual({ kind: 'unavailable', error: 'NETWORK' });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: superClaim, node: node({ serverListed: async () => true, claimBusy: () => true }) }))
+      .toEqual({ kind: 'unavailable', error: 'CLAIM_BUSY' });
+  });
+
+  it('claim: another wallet\'s super or light node, or a genesis node, is WALLET_MISMATCH before anything is read', async () => {
+    const other = LN.wallets[1];
+    for (const nodeId of [superNodeId(other.address), other.nodeId, 'genesis_node_001']) {
+      const n = node({ serverListed: jest.fn(async () => true) });
+      expect([nodeId, await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: W.walletHash, nodeId }), node: n })])
+        .toEqual([nodeId, { kind: 'unavailable', error: 'WALLET_MISMATCH' }]);
+      expect(n.status).not.toHaveBeenCalled();
+      expect(n.serverListed).not.toHaveBeenCalled();
+      expect(n.balance).not.toHaveBeenCalled();
+    }
+    // The other wallet's own request, its super node named: this wallet is not the one it names.
+    const n = node({ serverListed: jest.fn(async () => true) });
+    expect(await prepareOffer(claim, { wallet: WALLET, session: session({ walletHash: other.walletHash, nodeId: superNodeId(other.address) }), node: n }))
+      .toEqual({ kind: 'unavailable', error: 'WALLET_MISMATCH' });
+    expect(n.serverListed).not.toHaveBeenCalled();
   });
 });
 
@@ -498,7 +582,7 @@ describe('what a confirmed request answers', () => {
   });
 
   it('claim: the moved amount as a decimal string, empty, or the network\'s refusal', async () => {
-    const offer = { kind: 'claim', nodeId: W.nodeId, qnet: W.address, amountNano: 12500000000 };
+    const offer = { kind: 'claim', nodeId: W.nodeId, nodeType: 'light', qnet: W.address, amountNano: 12500000000 };
     const n = node();
     expect(await performIntent({ intent: 'claim' }, offer, { node: n }))
       .toEqual({ status: 'ok', qnet: W.address, nodeId: W.nodeId, amountNano: '12500000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null });
@@ -509,6 +593,20 @@ describe('what a confirmed request answers', () => {
       .toEqual({ status: 'error', error: 'CLAIM_REFUSED' });
     expect(await performIntent({ intent: 'claim' }, { ...offer, kind: 'claim_empty' }, { node: n }))
       .toEqual({ status: 'empty', qnet: W.address, nodeId: W.nodeId });
+  });
+
+  it('claim: a move of the super node\'s balance answers with the super node\'s id, which the answer check takes', async () => {
+    const S = superNodeId(W.address);
+    const offer = { kind: 'claim', nodeId: S, nodeType: 'super', qnet: W.address, amountNano: 48000000000 };
+    const n = node({ claim: jest.fn(async () => ({ status: 'ok', amountNano: '48000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null })) });
+    const a = await performIntent({ intent: 'claim' }, offer, { node: n });
+    expect(a).toEqual({ status: 'ok', qnet: W.address, nodeId: S, amountNano: '48000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null });
+    expect(n.claim).toHaveBeenCalledWith({ nodeId: S, qnet: W.address, amountNano: 48000000000 });
+    const view = { intent: 'claim', request: { walletHash: W.walletHash, nodeId: S } };
+    expect(plaintextProblem(buildPlaintext(view, a), view)).toBe(null);
+    // The same answer for a request that named the light node is not sent.
+    expect(() => buildPlaintext({ intent: 'claim', request: { walletHash: W.walletHash, nodeId: W.nodeId } }, a)).toThrow(/nodeId/);
+    expect(await performIntent({ intent: 'claim' }, { ...offer, kind: 'claim_empty' }, { node: n })).toEqual({ status: 'empty', qnet: W.address, nodeId: S });
   });
 });
 
@@ -862,7 +960,7 @@ describe('the unlink request', () => {
     const t = require('../src/i18n').makeT('en');
     const screen = read('src/screens/QNetLinkScreen.js');
     expect(screen).toMatch(/unlink: 'link_title_unlink',/);
-    expect(screen).toMatch(/\{Number\.isSafeInteger\(o\.since\) \? row\(t\('link_unlink_since'\), dayText\(o\.since\)\) : null\}/);
+    expect(screen).toMatch(/\{Number\.isSafeInteger\(o\.since\) \? <InfoRow label=\{t\('link_unlink_since'\)\} value=\{dayText\(o\.since\)\} ltr \/> : null\}/);
     expect(screen).toMatch(/t\(a\.unbound === true \? 'link_result_unlinked' : 'link_result_unlinked_unconfirmed'\)/);
     expect(t('link_title_unlink')).toBe("Unlink this wallet's node from this device");
     // The sheet names no website and no other place: it says what happens on this device.

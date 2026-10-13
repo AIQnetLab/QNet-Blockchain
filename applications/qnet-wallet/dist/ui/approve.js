@@ -8,8 +8,8 @@
 // locked the window asks to unlock first, then shows the request without asking again. An activation
 // (qnet_activateNode) is confirmed the same way (a burn also needs its acknowledgement ticked); the worker burns (or
 // reads the wallet's existing activation) and this window stays on the outcome until closed, showing a light node's
-// record on the QNet network while it is made. So do a move of the node balance (qnet_claimNodeBalance) and the unlink
-// of the light node's device (qnet_unlinkNodeDevice).
+// record on the QNet network while it is made. So do a move of the balance of the node the site names, the wallet's light
+// or super node (qnet_claimNodeBalance, decision 47), and the unlink of the light node's device (qnet_unlinkNodeDevice).
 import { DEFAULT_LANGUAGE, QNET, TIMINGS, languageForTag } from '../background/config.js';
 import {
   DECIMALS, call, clear, clearPageStorage, el, formatUnits, hardenSecretInput, loadLocale, log, onWalletEvent, refuseAutoFocus,
@@ -692,6 +692,8 @@ function activationSummary(details, mode) {
       // where the node runs: a Light node in QNet Wallet on a phone or tablet, a Super node on the user's own server
       el('p', { className: 'ap-muted', text: t(`activateAbout_${details.nodeType}`) }),
       row(t('activateBurnAmount'), t('amount1dev', [cost]), 'ap-strong'),
+      // no proof serves the price: it is what the pinned nodes all quote alike
+      el('p', { className: 'ap-muted', text: t('activatePriceReported') }),
       row(t('activateToken'), t('activateTokenValue', [details.cluster])),
       ...block(t('activateMint'), details.mint, 'ap-mono ap-address'),
       // words around the program id: the text's own direction, the id isolated by t()
@@ -901,8 +903,8 @@ function registrationLine(initial) {
 // ---------------------------------------------------------------- node balance (qnet_claimNodeBalance)
 
 /**
- * The move of the node balance by details.mode: 'claim' (the node and its balance two nodes agree on; an armed
- * confirm), 'empty' (below 1 QNC) and 'unavailable' (the reason), each with one button
+ * The move of the node balance by details.mode: 'claim' (the node the site named, light or super, and its balance two
+ * nodes agree on; an armed confirm), 'empty' (below 1 QNC) and 'unavailable' (the reason), each with one button
  * that tells the site, null (still reading).
  * @param {import('../background/provider.js').ApprovalView} next
  * @returns {void}
@@ -915,8 +917,9 @@ function renderClaim(next) {
       el('div', { className: 'ap-actions' }, rejectButton()));
     return;
   }
+  const superNode = details.nodeType === 'super';
   const rows = mode === 'unavailable' ? [] : [
-    row(t('nodeLight'), details.nodeId, 'ap-mono'),
+    row(t(superNode ? 'nodeSuper' : 'nodeLight'), details.nodeId, 'ap-mono'),
     row(t('apNodeBalance'), qnc(details.amountNano), 'ap-strong'),
   ];
   if (mode !== 'claim') {
@@ -936,7 +939,7 @@ function renderClaim(next) {
   const confirm = button(t('apConfirm_claimNodeBalance'), true);
   frame(next,
     el('section', { className: 'ap-card' },
-      el('p', { text: t('apClaimIntro') }),
+      el('p', { text: t(superNode ? 'apClaimIntroSuper' : 'apClaimIntro') }),
       ...rows),
     el('div', { className: 'ap-actions' }, rejectButton(), confirm));
   armConfirm(confirm, () => runClaim(next), () => true, TIMINGS.CONFIRM_ARM_VALUE_MS);

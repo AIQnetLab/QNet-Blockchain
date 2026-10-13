@@ -281,54 +281,52 @@ test('the Device tab: the Overview\'s miss, else an earlier one that carries the
 });
 
 test('each reason\'s line: what happened in that epoch, whether the wake reached the device when known, and what to do; never a time', () => {
-  const line = (over, platform = 'android', wake = null) => missText(site(over), platform, wake);
+  const line = (over, platform = 'android') => missText(site(over), platform);
   const background = TEXTS.miss_todo_background_android;
-  assert.equal(line({}), `Epoch 200 was not counted: the network sent the device a wake, and no answer came before that epoch's check closed. ${background}`);
+  assert.equal(line({}), `Epoch 200 was not counted: QNet Blockchain sent the device a wake, and no answer came before that epoch's check closed. ${background}`);
   assert.equal(line({ reason: 'answered_late' }), `Epoch 200 was not counted: the device answered after that epoch's check had closed. ${background}`);
   assert.equal(line({ reason: 'answered_late', delivered: true }, 'ios'),
     `Epoch 200 was not counted: the device answered after that epoch's check had closed. The wake reached the device. ${TEXTS.miss_todo_background_ios}`);
   assert.equal(line({ reason: 'answered_late' }, null), `${TEXTS.miss_late.replace('{epoch}', '200')} ${TEXTS.miss_todo_background}`);
-  assert.equal(line({ reason: 'answer_refused' }), `Epoch 200 was not counted: the device answered, but the network did not accept the answer. ${TEXTS.miss_todo_run_again}`);
+  assert.equal(line({ reason: 'answer_refused' }), `Epoch 200 was not counted: the device answered, but QNet Blockchain did not accept the answer. ${TEXTS.miss_todo_run_again}`);
   assert.equal(line({ reason: 'no_push_address' }), `${TEXTS.miss_no_push.replace('{epoch}', '200')} ${TEXTS.miss_todo_open_once}`);
-  // A device the network stopped waking after two epochs without an answer: open the app, or I'm back where it is.
+  // A device the network stopped waking after two epochs without an answer: open the app, which answers once it is open
+  // (owner, 11.10: no I'm back on the site).
   const inactive = { reason: 'not_woken_inactive' };
-  const stopped = 'Epoch 200 was not counted: the device had not answered in the two epochs before it, so the network stopped waking it.';
+  const stopped = 'Epoch 200 was not counted: the device had not answered in the two epochs before it, so QNet Blockchain stopped waking it.';
   assert.equal(line(inactive), `${stopped} Open QNet Wallet on that device.`);
-  assert.equal(line(inactive, 'android', 'here'), `${stopped} Open QNet Wallet on that device, or press I'm back.`);
-  assert.equal(line(inactive, 'android', 'overview'), `${stopped} Open QNet Wallet on that device, or press I'm back on the Overview.`);
   assert.doesNotMatch(TEXTS.miss_inactive, /several/);
-  assert.equal(missNotice(site(inactive), 'ios', 'here').todo, 'miss_todo_open_or_wake');
+  assert.equal(missNotice(site(inactive), 'ios').todo, 'miss_todo_open');
+  for (const key of ['miss_todo_open_or_wake', 'miss_todo_open_or_wake_overview']) assert.ok(!(key in TEXTS), key);
   // Large epochs grouped as the texts write numbers.
-  assert.match(missText(site({ epoch: 12_345 }), 'android', null), /^Epoch 12,345 was not counted/);
+  assert.match(missText(site({ epoch: 12_345 }), 'android'), /^Epoch 12,345 was not counted/);
   // No line carries a time of day or a delay, whatever the record.
   for (const reason of MISS_REASONS) {
     for (const delivered of [true, false, null]) {
-      assert.doesNotMatch(missText(site({ reason, delivered }), 'android', null), /\d{1,2}:\d{2}|\bmin\b|\bh\b|within a minute|after it was sent/, `${reason} ${delivered}`);
+      assert.doesNotMatch(missText(site({ reason, delivered }), 'android'), /\d{1,2}:\d{2}|\bmin\b|\bh\b|within a minute|after it was sent/, `${reason} ${delivered}`);
     }
   }
 });
 
 // Owner, 05.10: a miss the network caused never counts against the device. A wake the network did not get out
 // (`not_sent`: the provider refused it, the pacing shed it, no anchor, the owner was down) and a shard with no committed
-// check (`not_committed`) say so, and that nothing on the device needs changing, wherever I'm back is.
+// check (`not_committed`) say so, and that nothing on the device needs changing.
 test('the network\'s misses: what happened, and nothing to change on the device', () => {
   const network = TEXTS.miss_todo_network;
   assert.equal(network, 'That was the network\'s miss: nothing needs changing on that device or in QNet Wallet.');
   for (const platform of ['android', 'ios', null]) {
-    for (const wake of [null, 'here', 'overview']) {
-      assert.equal(missText(site({ reason: 'not_sent' }), platform, wake),
-        `Epoch 200 was not counted: the network did not get its wake out to the device in that epoch. ${network}`);
-      assert.equal(missText(site({ reason: 'not_committed' }), platform, wake),
-        `Epoch 200 was not counted: the network published no check of this node's group in that epoch, so no node of the group was counted in it. ${network}`);
-    }
+    assert.equal(missText(site({ reason: 'not_sent' }), platform),
+      `Epoch 200 was not counted: QNet Blockchain did not get its wake out to the device in that epoch. ${network}`);
+    assert.equal(missText(site({ reason: 'not_committed' }), platform),
+      `Epoch 200 was not counted: QNet Blockchain published no check of this node's group in that epoch, so no node of the group was counted in it. ${network}`);
   }
-  assert.deepEqual(missNotice(site({ reason: 'not_sent' }), 'ios', 'here'), { what: 'miss_not_sent', todo: 'miss_todo_network' });
-  assert.deepEqual(missNotice(site({ reason: 'not_committed' }), 'android', null), { what: 'miss_not_committed', todo: 'miss_todo_network' });
+  assert.deepEqual(missNotice(site({ reason: 'not_sent' }), 'ios'), { what: 'miss_not_sent', todo: 'miss_todo_network' });
+  assert.deepEqual(missNotice(site({ reason: 'not_committed' }), 'android'), { what: 'miss_not_committed', todo: 'miss_todo_network' });
   // A wake that never went out has no delivery to tell; a shard not checked may still tell that an answered wake came.
-  assert.equal(missText(site({ reason: 'not_sent', delivered: true }), 'android', null),
-    `Epoch 200 was not counted: the network did not get its wake out to the device in that epoch. ${network}`);
-  assert.equal(missText(site({ reason: 'not_committed', delivered: true }), 'android', null),
-    `Epoch 200 was not counted: the network published no check of this node's group in that epoch, so no node of the group was counted in it. The wake reached the device. ${network}`);
+  assert.equal(missText(site({ reason: 'not_sent', delivered: true }), 'android'),
+    `Epoch 200 was not counted: QNet Blockchain did not get its wake out to the device in that epoch. ${network}`);
+  assert.equal(missText(site({ reason: 'not_committed', delivered: true }), 'android'),
+    `Epoch 200 was not counted: QNet Blockchain published no check of this node's group in that epoch, so no node of the group was counted in it. The wake reached the device. ${network}`);
   // Read from the node as any other reason, and on the Overview beside an Offline state like any other miss.
   for (const reason of ['not_sent', 'not_committed']) {
     assert.deepEqual(parseNodeMiss(miss({ reason })), site({ reason }), reason);
@@ -345,41 +343,40 @@ test('the network\'s misses: what happened, and nothing to change on the device'
 // advice. What QNet Wallet did with the wake (swiped away, not opened since a restart) is no longer public, so the hint
 // for a wake with no answer is the same for every account.
 test('the device\'s account: whether the wake reached the device, or that it never arrived, with the generic advice for a wake with no answer', () => {
-  const head = 'Epoch 200 was not counted: the network sent the device a wake, and no answer came before that epoch\'s check closed.';
+  const head = 'Epoch 200 was not counted: QNet Blockchain sent the device a wake, and no answer came before that epoch\'s check closed.';
   const background = TEXTS.miss_todo_background_android;
-  assert.equal(missText(told(), 'android', null), `${head} The wake reached the device. ${background}`);
-  assert.equal(missText(told(), 'ios', null), `${head} The wake reached the device. ${TEXTS.miss_todo_background_ios}`);
-  assert.equal(missText(site({ delivered: false }), 'android', null), `${head} The wake did not reach the device. ${background}`);
-  assert.equal(missText(site(), 'android', null), `${head} ${background}`);
-  for (const delivered of [true, false, null]) assert.equal(missNotice(site({ delivered }), 'android', null).todo, 'miss_todo_background_android', String(delivered));
+  assert.equal(missText(told(), 'android'), `${head} The wake reached the device. ${background}`);
+  assert.equal(missText(told(), 'ios'), `${head} The wake reached the device. ${TEXTS.miss_todo_background_ios}`);
+  assert.equal(missText(site({ delivered: false }), 'android'), `${head} The wake did not reach the device. ${background}`);
+  assert.equal(missText(site(), 'android'), `${head} ${background}`);
+  for (const delivered of [true, false, null]) assert.equal(missNotice(site({ delivered }), 'android').todo, 'miss_todo_background_android', String(delivered));
   // A miss read from a node of an earlier version gives the same line, whatever outcome it carried.
   for (const outcome of ['swiped', 'not_opened_since_boot', 'no_key', 'answer_failed']) {
-    assert.equal(missText(parseNodeMiss(oldMiss({ app_outcome: outcome, delivered_at: REACHED })), 'android', null), `${head} The wake reached the device. ${background}`, outcome);
+    assert.equal(missText(parseNodeMiss(oldMiss({ app_outcome: outcome, delivered_at: REACHED })), 'android'), `${head} The wake reached the device. ${background}`, outcome);
   }
   // A wake that never reached the device: the push service or the device held it.
-  assert.equal(missText(site({ reason: 'not_delivered', delivered: false }), 'android', null),
-    `Epoch 200 was not counted: the wake the network sent never reached the device. The push service or the device held it. ${background}`);
-  assert.equal(missText(site({ reason: 'not_delivered', delivered: false }), 'ios', null),
-    `Epoch 200 was not counted: the wake the network sent never reached the device. The push service or the device held it. ${TEXTS.miss_todo_background_ios}`);
+  assert.equal(missText(site({ reason: 'not_delivered', delivered: false }), 'android'),
+    `Epoch 200 was not counted: the wake QNet Blockchain sent never reached the device. The push service or the device held it. ${background}`);
+  assert.equal(missText(site({ reason: 'not_delivered', delivered: false }), 'ios'),
+    `Epoch 200 was not counted: the wake QNet Blockchain sent never reached the device. The push service or the device held it. ${TEXTS.miss_todo_background_ios}`);
 });
 
 // One line with the device rows: on the Device tab for an Online or Offline device (its own miss: the Overview's, else
-// one the device told about), on the Overview beside the Offline state where I'm back follows. No row names the time of
-// an answer. A typed address (view only) shows the platform, the state and the epochs only. I'm back itself stays on the
-// Overview only.
-test('the pages: the miss line in the device rows, no answer time, a typed address shown by its platform, state and epochs only', () => {
+// one the device told about), on the Overview beside the Offline state where running the node on the phone again
+// follows. No row names the time of an answer. An address only viewed shows the state and the epochs only.
+test('the pages: the miss line in the device rows, no answer time, an address only viewed shown by its state and epochs only', () => {
   const rows = code('components/cabinet/NodeStatus.tsx');
-  assert.match(rows, /const miss = full \? deviceMiss\(status\) : shownMiss\(status\);\s*if \(!miss\) return null;\s*return <p>\{missText\(miss, status\.device\?\.platform \?\? null, wake\)\}<\/p>;/);
+  assert.match(rows, /const miss = full \? deviceMiss\(status\) : shownMiss\(status\);\s*if \(!miss\) return null;\s*return <p>\{missText\(miss, status\.device\?\.platform \?\? null\)\}<\/p>;/);
   assert.match(rows, /const missed = !viewOnly && \(state === 'offline' \|\| \(full && state === 'online'\)\);/);
-  assert.match(rows, /const named = device && viewOnly \? \{ platform: device\.platform, model: null \} : device;/);
+  assert.match(rows, /const named = viewOnly \? null : device;/);
   assert.match(rows, /\{full && named && deviceName\(named\) && <p>\{deviceName\(named\)\}<\/p>\}/);
   assert.match(rows, /\{full && !viewOnly && device\?\.linkedSince != null && /);
-  assert.match(rows, /const wake: WakePlace = state === 'offline' && canWake\(status\) \? \(full \? 'overview' : 'here'\) : null;/);
-  assert.match(rows, /\{missed && <MissLine status=\{status\} wake=\{wake\} full=\{full\} \/>\}\s*<\/>/);
+  assert.doesNotMatch(rows, /WakePlace|canWake/);
+  assert.match(rows, /\{missed && <MissLine status=\{status\} full=\{full\} \/>\}\s*<\/>/);
   assert.doesNotMatch(rows, /lastAnswer\b|answerText|Date\.now\(\)\)\}<\/p>/);
   assert.equal(rows.match(/<MissLine /g)?.length, 1);
   assert.doesNotMatch(rows, /WakePanel/);
-  assert.match(code('components/cabinet/NodeHome.tsx'), /<DeviceRows status=\{status\} viewOnly=\{viewOnly\} \/>\s*\{wake && <WakePanel /);
+  assert.match(code('components/cabinet/NodeHome.tsx'), /<DeviceRows status=\{status\} viewOnly=\{viewOnly\} \/>\s*\{\}\s*\{state === 'offline' && !viewOnly && <LinkDevice onLinked=\{reread\} relink \/>\}/);
   assert.match(code('components/cabinet/NodeDevices.tsx'), /<DeviceRows status=\{status\} full viewOnly=\{viewOnly\} \/>/);
   assert.match(code('server/cabinet/node-proxy.ts'), /kind !== 'read' \|\| unasked\.length === 0 \|\| !\(asksOtherOwners\(view\) \|\| offline\)\) return view;/);
   // The site keeps none of the precise fields anywhere: not in the route's parser, not in its cache.
@@ -390,7 +387,7 @@ test('the pages: the miss line in the device rows, no answer time, a typed addre
 
 test('the texts: self-service, no contact to write to, no other names, no word for earnings, no time', () => {
   const keys = Object.keys(TEXTS).filter((k) => /^(miss|delivery)_/.test(k));
-  assert.equal(keys.length, 19);
+  assert.equal(keys.length, 17);
   for (const key of keys) {
     assert.doesNotMatch(TEXTS[key], /support|write to|contact|e-?mail|reward|\bearn|mining|\bburn|price|activat/i, key);
     assert.doesNotMatch(TEXTS[key], /Google|Apple|Firebase|Samsung|Xiaomi|Huawei/, key);

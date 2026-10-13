@@ -1744,10 +1744,18 @@ impl SimplifiedP2P {
                                 version, network_id, mb_index, mb_hash, committee_digest_anchor,
                                 committee_digest_pred, minted_at_height, genesis_id, sig,
                             ) {
-                                crate::galc::adopt_verified(&cap);
+                                crate::galc::adopt_assembled(&cap);
                             }
                         }
                     });
+                } else if version == crate::galc::GALC_V2_VERSION {
+                    // The wallet capsule's partial, sent only between genesis nodes and taken only from the
+                    // signer's own address. The receiver checks the signature against its own K and K-1; a
+                    // binary without v2 drops version 2 above.
+                    crate::galc::receive_partial_v2(crate::galc::V2Partial {
+                        network_id, mb_index, mb_hash, committee_digest_anchor, committee_digest_pred,
+                        minted_at_height, genesis_id, sig,
+                    }, from_peer);
                 }
             }
 
@@ -2923,5 +2931,23 @@ impl SimplifiedP2P {
                 }
             }
         }
+    }
+
+    /// Send `message` to each connected genesis peer (by its id or its genesis address), never to a super:
+    /// the GALC v2 partial. Returns how many sends the transport took.
+    pub async fn send_to_genesis_peers(&self, message: &NetworkMessage) -> usize {
+        let targets: Vec<String> = self.connected_peers_lockfree.iter()
+            .filter(|e| {
+                let p = e.value();
+                crate::genesis_constants::is_legacy_genesis_node(&p.id)
+                    || crate::genesis_constants::get_genesis_id_by_ip(p.addr.split(':').next().unwrap_or("")).is_some()
+            })
+            .map(|e| e.value().addr.clone())
+            .collect();
+        let mut sent = 0;
+        for addr in targets {
+            if self.send_message_quic(&addr, message).await.is_ok() { sent += 1; }
+        }
+        sent
     }
 }

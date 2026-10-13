@@ -34,7 +34,7 @@ const MB_MAX_DIGITS: usize = 20;
 const CACHE_EXPLICIT: &str = "public, max-age=300, immutable";
 const CACHE_LATEST: &str = "public, max-age=10";
 const CACHE_STATE: &str = "public, max-age=5";
-const CACHE_NONE: &str = "no-store";
+pub(crate) const CACHE_NONE: &str = "no-store";
 const KIND_ACCOUNT: u8 = 0;
 const KIND_TOKEN: u8 = 1;
 
@@ -115,7 +115,7 @@ fn admit_source(remote: Option<SocketAddr>, bucket: &str, views: &ProofViews) ->
 
 // ─── Replies ────────────────────────────────────────────────────────────────────────────────────
 
-fn json_response(status: StatusCode, body: String, cache: &'static str, retry_after: Option<u64>) -> warp::reply::Response {
+pub(crate) fn json_response(status: StatusCode, body: String, cache: &'static str, retry_after: Option<u64>) -> warp::reply::Response {
     let mut r = warp::reply::Response::new(warp::hyper::Body::from(body));
     *r.status_mut() = status;
     let h = r.headers_mut();
@@ -128,7 +128,7 @@ fn json_response(status: StatusCode, body: String, cache: &'static str, retry_af
 }
 
 /// Every error of the new form: typed, `proof_format` 2, never stored by a cache.
-fn error_response(status: StatusCode, error: &str, mut fields: serde_json::Map<String, Value>, retry_after: Option<u64>) -> warp::reply::Response {
+pub(crate) fn error_response(status: StatusCode, error: &str, mut fields: serde_json::Map<String, Value>, retry_after: Option<u64>) -> warp::reply::Response {
     fields.insert("proof_format".into(), json!(PROOF_FORMAT));
     fields.insert("error".into(), json!(error));
     if let Some(secs) = retry_after {
@@ -137,15 +137,15 @@ fn error_response(status: StatusCode, error: &str, mut fields: serde_json::Map<S
     json_response(status, Value::Object(fields).to_string(), CACHE_NONE, retry_after)
 }
 
-fn fields(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+pub(crate) fn fields(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
-fn bad_parameter(parameter: &str) -> warp::reply::Response {
+pub(crate) fn bad_parameter(parameter: &str) -> warp::reply::Response {
     error_response(StatusCode::BAD_REQUEST, "bad_parameter", fields(&[("parameter", json!(parameter))]), None)
 }
 
-fn rate_limited(retry_after: u64) -> warp::reply::Response {
+pub(crate) fn rate_limited(retry_after: u64) -> warp::reply::Response {
     error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited", serde_json::Map::new(), Some(retry_after.max(1)))
 }
 

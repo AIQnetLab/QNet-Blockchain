@@ -202,6 +202,7 @@ const isOptU64 = (v: unknown): boolean => v === undefined || v === null || isU64
 const isOptString = (v: unknown): boolean => v === undefined || v === null || typeof v === 'string';
 const isStringList = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string');
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isHex32 = (v: unknown): boolean => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v);
 
 /** Why a served registry entry cannot be hashed, or null. */
 export function registryEntryProblem(e: unknown): string | null {
@@ -223,16 +224,21 @@ export function proofShapeProblem(proof: unknown): string | null {
   for (const k of ['index', 'window_head_height', 'total_supply', 'timestamp']) if (!isOptU64(cp[k])) return k;
   if (cp.parent_qc !== undefined && cp.parent_qc !== null) {
     const p = cp.parent_qc;
-    if (!isObject(p) || typeof p.checkpoint_hash !== 'string' || !isOptU64(p.index)) return 'parent_qc';
+    if (!isObject(p) || !isHex32(p.checkpoint_hash) || !isOptU64(p.index)) return 'parent_qc';
   }
-  if (!(cp.window_mb_hashes === undefined || cp.window_mb_hashes === null || isStringList(cp.window_mb_hashes))) return 'window_mb_hashes';
-  for (const k of ['state_root', 'beacon', 'epoch_commitment', 'reward_root', 'registry_root', 'logs_root', 'dilithium_pk_root',
-    'reward_epoch_root', 'proposer']) {
-    if (!isOptString(cp[k])) return k;
+  if (!(cp.window_mb_hashes === undefined || cp.window_mb_hashes === null
+    || (Array.isArray(cp.window_mb_hashes) && cp.window_mb_hashes.every(isHex32)))) return 'window_mb_hashes';
+  // Every hash is lowercase hex of 32 bytes, as nodes serve it: the checkpoint hash decodes hex loosely (any case, a
+  // trailing non-hex tail ignored), so another spelling would verify and then be kept, and compared, as served.
+  for (const k of ['state_root', 'beacon', 'epoch_commitment', 'reward_root', 'registry_root']) if (!isHex32(cp[k])) return k;
+  for (const k of ['logs_root', 'dilithium_pk_root', 'reward_epoch_root']) {
+    if (!(cp[k] === undefined || cp[k] === null || isHex32(cp[k]))) return k;
   }
+  if (!isOptString(cp.proposer)) return 'proposer';
   const ra = cp.recovery_anchor;
-  if (!(ra === undefined || ra === null || (Array.isArray(ra) && ra.length === 2 && isU64(ra[0]) && typeof ra[1] === 'string'))) return 'recovery_anchor';
-  if (!isOptString(proof.eligible_raw)) return 'eligible_raw';
+  if (!(ra === undefined || ra === null || (Array.isArray(ra) && ra.length === 2 && isU64(ra[0]) && isHex32(ra[1])))) return 'recovery_anchor';
+  if (!(proof.eligible_raw === undefined || proof.eligible_raw === null
+    || (typeof proof.eligible_raw === 'string' && /^(?:[0-9a-f]{2})*$/.test(proof.eligible_raw)))) return 'eligible_raw';
   if (!(proof.banned === undefined || proof.banned === null || isStringList(proof.banned))) return 'banned';
   const pks = proof.committee_pubkeys;
   if (!(pks === undefined || pks === null || (isObject(pks) && Object.values(pks).every((v) => typeof v === 'string')))) return 'committee_pubkeys';

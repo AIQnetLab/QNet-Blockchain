@@ -208,6 +208,7 @@ pub struct SimpleMempool {
     /// verified before it is pooled and its ban is write-once, so a second adds nothing, while each copy is
     /// fee-free at top priority: keyed by hash only, distinct-hash copies of one proof filled the pool and
     /// pushed paying TXs out. Offender -> hash; cleared with the commitment indices on every removal path.
+    /// A merkle reward claim takes the same kind of slot under `claim:<wallet>` (single_slot_key).
     evidence_index: Arc<DashMap<String, String>>,
     /// Reverse of `evidence_index`: hash -> offender.
     evidence_reverse: Arc<DashMap<String, String>>,
@@ -328,6 +329,24 @@ impl SimpleMempool {
     /// verifies a proof costs.
     pub fn has_pending_evidence_against(&self, offender: &str) -> bool {
         self.evidence_index.contains_key(offender)
+    }
+
+    /// The one-per-key slot a TX holds while pooled: a slashing proof's offender, or `claim:<wallet>` for a merkle
+    /// reward claim. Every claim a wallet signs starts at its watermark, so a second one pending beside the first
+    /// credits only what the first leaves, most often nothing, and then reads as confirmed; the first is kept.
+    fn single_slot_key(tx: &Transaction) -> Option<String> {
+        if let Some(o) = tx.slashed_offender() {
+            return Some(o.to_string());
+        }
+        if tx.is_merkle_reward_claim() {
+            return tx.to.as_ref().map(|w| format!("claim:{}", w));
+        }
+        None
+    }
+
+    /// The hash of the merkle reward claim pending for `wallet`, if one is. O(1), for the doors.
+    pub fn pending_claim_hash(&self, wallet: &str) -> Option<String> {
+        self.evidence_index.get(&format!("claim:{}", wallet)).map(|e| e.value().clone())
     }
 
     /// Claims `offender`'s single evidence slot for `hash`; false when a proof already holds it.
@@ -742,8 +761,9 @@ impl SimpleMempool {
             return false;
         }
 
-        // One pending proof per offender, checked before a full pool can make room for a second.
-        let offender = parsed_tx.slashed_offender();
+        // One pending proof per offender (one claim per wallet), checked before a full pool can make room for a second.
+        let slot = Self::single_slot_key(&parsed_tx);
+        let offender = slot.as_deref();
         if offender.map_or(false, |o| self.has_pending_evidence_against(o)) {
             return false;
         }
@@ -984,8 +1004,9 @@ impl SimpleMempool {
             return false;
         }
 
-        // One pending proof per offender, checked before a full pool can make room for a second.
-        let offender = parsed_tx.slashed_offender();
+        // One pending proof per offender (one claim per wallet), checked before a full pool can make room for a second.
+        let slot = Self::single_slot_key(&parsed_tx);
+        let offender = slot.as_deref();
         if offender.map_or(false, |o| self.has_pending_evidence_against(o)) {
             return false;
         }
@@ -2103,6 +2124,40 @@ mod hygiene_tests {
         pool.remove_transaction(&h2);
         assert!(!pool.has_pending_evidence_against("super_eqv"));
         assert!(pool.holder_census().iter().any(|(n, v)| *n == "mp_evidence" && *v == 0));
+    }
+
+    /// A merkle reward claim crediting `wallet`; `ts` varies its hash the way a re-signed copy does.
+    fn claim_tx(wallet: &str, ts: u64) -> (Transaction, String) {
+        let tx = Transaction::new("system_rewards_pool".to_string(), Some(wallet.to_string()), 5, 0, 0, 0, ts, None,
+            qnet_state::TransactionType::RewardDistribution,
+            Some(r#"{"claims":[{"epoch":160,"amount":5,"proof":[]}]}"#.to_string()));
+        let hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        (tx, hash)
+    }
+
+    // Two signed copies of one wallet's claim (a double-tapped Claim, or a retry on another node) both entered the
+    // pool and both landed; the second credited nothing and read as confirmed. One pending claim per wallet now,
+    // on both admission paths; another wallet is not affected and the slot frees when the claim leaves.
+    #[test]
+    fn one_pending_claim_per_wallet() {
+        let pool = test_pool();
+        let (c1, h1) = claim_tx("eon_wallet_a", 1_700_000_001);
+        let (c2, h2) = claim_tx("eon_wallet_a", 1_700_000_002);
+        let (c3, h3) = claim_tx("eon_wallet_a", 1_700_000_003);
+        let (other, ho) = claim_tx("eon_wallet_b", 1_700_000_001);
+        assert!(c1.is_merkle_reward_claim() && h1 != h2 && h2 != h3);
+        assert!(pool.add_binary_transaction(bincode::serialize(&c1).unwrap(), h1.clone(), 0));
+        assert_eq!(pool.pending_claim_hash("eon_wallet_a").as_deref(), Some(h1.as_str()));
+        assert!(!pool.add_binary_transaction(bincode::serialize(&c2).unwrap(), h2.clone(), 0), "binary path");
+        assert!(!pool.add_raw_transaction(serde_json::to_string(&c3).unwrap(), h3.clone(), 0), "json path");
+        assert!(pool.add_binary_transaction(bincode::serialize(&other).unwrap(), ho.clone(), 0), "another wallet");
+        assert_eq!(pool.size(), 2);
+
+        pool.batch_remove_transactions(&[h1]);
+        assert!(pool.pending_claim_hash("eon_wallet_a").is_none(), "the slot frees when the claim leaves");
+        assert!(pool.add_binary_transaction(bincode::serialize(&c2).unwrap(), h2.clone(), 0));
+        assert_eq!(pool.pending_claim_hash("eon_wallet_a").as_deref(), Some(h2.as_str()));
+        assert!(!pool.has_pending_evidence_against("eon_wallet_a"), "a claim slot is not an evidence slot");
     }
 
     /// A heartbeat for `super_hb`; `nonce` sits outside its signed message, so a relay varies it freely.

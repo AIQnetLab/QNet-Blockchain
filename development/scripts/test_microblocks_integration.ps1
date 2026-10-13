@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # Integration test for QNet microblocks
 
-Write-Host "=== QNet Microblocks Integration Test ===" -ForegroundColor Cyan
+Write-Host "=== QNet Blockchain Microblocks Integration Test ===" -ForegroundColor Cyan
 Write-Host "Testing micro/macro block architecture" -ForegroundColor Yellow
 Write-Host ""
 

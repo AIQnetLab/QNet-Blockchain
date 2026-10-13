@@ -1,6 +1,6 @@
-// How it works in short, beside the connect screen: the three ways in three or four big steps each (a light node from a
+// How it works in short, beside the connect screen: the three ways in three to five big steps each (a light node from a
 // phone, only while the site pays from a phone; a light node from a computer; a super node, only with the QNet
-// extension), and the full guide (in the header's Docs menu too).
+// extension, which QNet Wallet with the same wallet then shows), and the full guide (in the header's Docs menu too).
 
 import Link from 'next/link';
 import { t, type MessageKey } from '@/lib/texts';

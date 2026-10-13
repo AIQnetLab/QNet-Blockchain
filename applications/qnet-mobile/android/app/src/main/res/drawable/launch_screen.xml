@@ -1,12 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Dark background -->
     <item android:drawable="@color/splash_background_color" />
-    
-    <!-- QNet app icon in center - same as launcher icon -->
+
+    <!-- The app mark without the icon's square, at the size of the iOS launch screen image (192) -->
     <item
-        android:width="120dp"
-        android:height="120dp"
-        android:drawable="@mipmap/ic_launcher"
+        android:width="192dp"
+        android:height="192dp"
+        android:drawable="@mipmap/splash_logo"
         android:gravity="center" />
 </layer-list>

@@ -1,8 +1,8 @@
 /**
- * The device's model every binding names (owner, 06.10: the site's Device tab and the Node tab show the linked device
- * itself, not only its platform): a short marketing name built on the device from what the system gives without any
- * permission, never an identifier, sent beside the platform with Use this device, the QNet Link sheet's binding and every
- * re-send; and the model the network names shown on the Node tab. Device names here are made up.
+ * The device's model every binding names (owner, 06.10: the site's Device tab shows the linked device itself, not only
+ * its platform): a short marketing name built on the device from what the system gives without any permission, never an
+ * identifier, sent beside the platform with Use this device, the QNet Link sheet's binding and every re-send. The Node tab
+ * names no model (owner, 11.10: the site shows it). Device names here are made up.
  */
 jest.mock('../src/crypto/DilithiumCrypto', () => ({
   isDilithiumAvailable: () => true,
@@ -38,7 +38,7 @@ const DeviceKey = require('../src/services/NodeDeviceKey');
 const M = require('../src/services/DeviceModel');
 const Push = require('../src/services/PushService');
 const { LINK_PENDING_KEY, readNodeStatus } = require('../src/services/LightNode');
-const { default: NodeTab, linkedModel } = require('../src/screens/NodeTab');
+const { default: NodeTab } = require('../src/screens/NodeTab');
 const { makeT } = require('../src/i18n');
 const V = require('../../../docs/protocols/light-node.vectors.json');
 
@@ -257,17 +257,13 @@ describe('the model the network names', () => {
     }
   });
 
-  it('the Node tab names the linked device by its model, this one or another; never its platform', () => {
+  it('the Node tab names no device model and no platform, for this device or another (owner, 11.10)', () => {
     const status = (device, over = {}) => ({
       reachable: true, onChain: true, registrationPending: false, deviceBound: true, deviceBoundAgreed: true, answered: null,
       needsReactivation: false, counted: null, device, deviceTags: [], features: [], signed: null, keyOurs: null,
       bindingSeqAgreed: null, ...over,
     });
     const dev = { platform: 'android', model: 'Acme Phone 7', linkedSince: 1790035200, lastAnswerEpoch: 7, state: 'online' };
-    expect(linkedModel(status(dev))).toBe('Acme Phone 7');
-    expect(linkedModel(status({ ...dev, model: null }))).toBe(null);
-    expect(linkedModel(status({ ...dev, state: 'unlinked' }))).toBe(null);
-    expect(linkedModel(null)).toBe(null);
     const render = (light) => {
       let tree;
       act(() => {
@@ -276,19 +272,16 @@ describe('the model the network names', () => {
       });
       return tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
     };
-    const elsewhere = render({ status: status(dev) });
-    expect(elsewhere).toContain(t('node_other_device'));
-    expect(elsewhere).toContain(`${t('node_device')}\nAcme Phone 7`);
     const here = render({ status: status(dev, { bindingSeqAgreed: SEQ }), local: { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: true } });
-    expect(here).toContain(`${t('node_device')}\nAcme Phone 7`);
-    expect(here).not.toMatch(/Android/);
-    expect(render({ status: status({ ...dev, model: null }) })).not.toContain(t('node_device'));
-    expect(render({ status: status(null, { deviceBound: false, deviceBoundAgreed: false }) })).not.toContain(t('node_device'));
+    expect(here).toContain(t('node_badge_online'));
+    expect(here).not.toMatch(/Acme Phone 7|Android|Device/);
+    // Bound to another device: not shown at all (owner, 11.10), so neither is its model.
+    expect(render({ status: status(dev) })).not.toMatch(/Acme Phone 7|Android/);
   });
 
-  it('the label is in every language of the app', () => {
+  it('no language of the app keeps the label of the row that went', () => {
     for (const loc of ['ar', 'de', 'en', 'es', 'fr', 'it', 'ja', 'ko', 'pt', 'ru', 'zh-CN']) {
-      expect([loc, /^ {2}node_device: ['"][^'"]+['"],$/m.test(read(`src/i18n/locales/${loc}.js`))]).toEqual([loc, true]);
+      expect([loc, /^ {2}node_device:/m.test(read(`src/i18n/locales/${loc}.js`))]).toEqual([loc, false]);
     }
   });
 });

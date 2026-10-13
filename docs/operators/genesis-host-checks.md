@@ -1,7 +1,7 @@
 # Genesis host checks before a roll
 
 Checks for the five genesis hosts (001 to 005) and the super-node host 006, to run before the roll that carries
-the light-node binding, push, unbind and "I'm back" routes. Every command in sections 1 to 3 only reads. Where
+the light-node binding, push, unbind and wake routes. Every command in sections 1 to 3 only reads. Where
 a check fails, the change to make is written out and left to the operator; section 4 prints a number and
 changes nothing either.
 

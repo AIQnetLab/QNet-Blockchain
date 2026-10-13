@@ -1,13 +1,15 @@
 // QNet Link v1, the site's side: revision 2 against the shared vectors (docs/protocols/light-node.vectors.json,
 // the file the app's and the extension's tests read) and an independent node:crypto implementation of the app's
-// side; the extension's qnet_activateNode answers against qnet-link-v1.vectors.json. Run: npm run test:wallet
+// side; the extension's qnet_activateNode answers against qnet-link-v1.vectors.json. The `claim` request names the node
+// (docs/protocols/node-claim.vectors.json): its cases join the site's, and the earlier `claim` request of
+// light-node.vectors.json, which named no node, is refused. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { blake3 } from '@noble/hashes/blake3';
-import { LIGHT, LINK, LINK_CONSTANTS as K, VECTORS, appSeal, bodyOf, x25519Pkcs8 } from './link-helpers.mjs';
+import { CLAIM, LIGHT, LINK, LINK_CONSTANTS as K, VECTORS, appSeal, bodyOf, x25519Pkcs8 } from './link-helpers.mjs';
 import {
   AAD_PREFIX,
   ANDROID_PACKAGE,
@@ -89,6 +91,12 @@ const consents = LINK.cases.filter((c) => c.intent === 'link' && JSON.parse(c.pl
 });
 const vectorVerify = (pk, message, sig) => consents.some((k) => same(k.pk, pk) && same(k.message, message) && same(k.sig, sig));
 
+// The site's cases: the light node vectors' but their earlier `claim` request, which named no node, and the `claim`
+// request that names the light or super node.
+const EARLIER_CLAIMS = LINK.cases.filter((c) => c.intent === 'claim');
+const CASES = [...LINK.cases.filter((c) => c.intent !== 'claim'), ...CLAIM.cases];
+const ofSite = (n) => !EARLIER_CLAIMS.some((c) => c.name === n.session);
+
 test('constants are the vectors\' constants', () => {
   assert.equal(LINK_PREFIX, K.prefix);
   assert.equal(LINK_RE.source, K.pattern);
@@ -110,6 +118,10 @@ test('constants are the vectors\' constants', () => {
   assert.equal(RESERVE_ANSWER_FUTURE_S, K.reserveWindow.futureSeconds);
   assert.deepEqual([...INTENTS], ['connect', 'link', 'claim', 'reserve', 'unlink']);
   assert.equal(CLAIM_MIN_NANO, BigInt(K.claimMinNano));
+  assert.equal(CLAIM_MIN_NANO, BigInt(CLAIM.constants.claimMinNano));
+  assert.deepEqual(CLAIM.constants.requestKeys, ['walletHash', 'nodeId']);
+  assert.equal(EARLIER_CLAIMS.length, 6);
+  assert.equal(CLAIM.constants.chainTag, LIGHT.constants.chainTag);
   assert.equal(CHAIN_TAG, LIGHT.constants.chainTag);
   assert.equal(POLL_INTERVAL_MS, 2000);
   // The link has its own host; the site and the relay do not move.
@@ -136,7 +148,7 @@ test('android: the site button\'s intent: URL, whose data is the link itself', (
   assert.equal(androidIntentUrl(a.link, a.browserFallbackUrl), a.intentUrl);
   assert.deepEqual(parseUri(a.intentUrl), { data: a.link, package: a.package, fallback: a.browserFallbackUrl });
   assert.equal(parseLink(a.intentUrl), null, 'an intent: URL is not a link');
-  for (const c of LINK.cases) assert.equal(parseUri(androidIntentUrl(c.link, WALLET_PAGE)).data, c.link, c.name);
+  for (const c of [...LINK.cases, ...CLAIM.cases]) assert.equal(parseUri(androidIntentUrl(c.link, WALLET_PAGE)).data, c.link, c.name);
   for (const n of LINK.invalidLinks) assert.equal(androidIntentUrl(n.link, WALLET_PAGE), null, n.reason);
   const link = LINK.cases[0].link;
   assert.equal(androidIntentUrl(link, 'http://aiqnet.io/wallet'), null);
@@ -184,7 +196,7 @@ test('base64url: canonical only', () => {
 });
 
 test('link: build and parse every case, refuse every invalid link, activate among them', () => {
-  for (const c of LINK.cases) {
+  for (const c of [...LINK.cases, ...CLAIM.cases]) {
     const parsed = parseLink(c.link);
     assert.deepEqual(parsed, { id: c.sessionId, sitePub: b64u(c.sitePublicKey), intent: c.intent, ...(c.reqHash ? { reqHash: c.reqHash } : {}) }, c.name);
     assert.equal(buildLink(parsed), c.link, c.name);
@@ -197,7 +209,7 @@ test('link: build and parse every case, refuse every invalid link, activate amon
 });
 
 test('requests: exact keys and forms, the request bytes and their hash', () => {
-  for (const c of LINK.cases.filter((x) => x.request)) {
+  for (const c of CASES.filter((x) => x.request)) {
     assert.deepEqual(checkRequest(c.intent, c.request), c.request, c.name);
     assert.equal(requestText(c.intent, c.request), c.requestText, c.name);
     assert.equal(requestHash(c.requestText), c.reqHash, c.name);
@@ -208,6 +220,15 @@ test('requests: exact keys and forms, the request bytes and their hash', () => {
     { ...link, walletHash: '74940B0126365748' }, { ...link, walletHash: '4940b0126365748' }, null, [link],
   ]) assert.equal(checkRequest('link', bad), null, JSON.stringify(bad));
   assert.equal(checkRequest('claim', link), null);
+  // A `claim` request names the wallet and its light or super node (owner, 12.10); the earlier one named no node.
+  for (const c of EARLIER_CLAIMS) assert.equal(checkRequest('claim', c.request), null, c.name);
+  for (const n of CLAIM.invalidSessionRequests) assert.equal(checkRequest('claim', JSON.parse(n.body).request), null, n.why);
+  for (const w of CLAIM.wallets) {
+    for (const nodeId of [w.lightNodeId, w.superNodeId]) {
+      assert.deepEqual(checkRequest('claim', { nodeId, walletHash: w.walletHash }), { walletHash: w.walletHash, nodeId });
+      assert.equal(requestText('claim', { nodeId, walletHash: w.walletHash }), JSON.stringify({ walletHash: w.walletHash, nodeId }));
+    }
+  }
   assert.equal(checkRequest('connect', {}), null);
   // Key order in the input does not matter; the bytes are always in the protocol's order.
   const reordered = { check: false, walletHash: null, burnTx: null };
@@ -230,10 +251,13 @@ test('identity: wallet hash, node id, proof, consent message and EON address, as
 });
 
 test('relay bodies: every case passes with its request and hash, every invalid body fails', () => {
-  for (const c of LINK.cases) {
+  for (const c of CASES) {
     assert.deepEqual(validateSessionRequest(JSON.stringify(c.sessionRequest)), c.sessionView, c.name);
     assert.deepEqual(validateResponseRequest(JSON.stringify(c.responseRequest), c.intent), c.responseRequest, c.name);
   }
+  // The earlier `claim` request named no node: its session is refused, whatever the answer would be.
+  for (const c of EARLIER_CLAIMS) assert.equal(validateSessionRequest(JSON.stringify(c.sessionRequest)), null, c.name);
+  for (const n of CLAIM.invalidSessionRequests) assert.equal(validateSessionRequest(n.body), null, n.why);
   for (const n of LINK.invalidSessionRequests) assert.equal(validateSessionRequest(n.body), null, n.reason);
   for (const n of LINK.invalidResponseRequests) assert.equal(validateResponseRequest(n.body, n.intent), null, n.reason);
   // A `link` answer is too big for a `connect` or `claim` session.
@@ -246,23 +270,53 @@ test('relay bodies: every case passes with its request and hash, every invalid b
 });
 
 test('answers: every case is accepted in its context, every invalid plaintext fails at its check', () => {
-  for (const c of LINK.cases) {
+  for (const c of CASES) {
     const checked = validateAnswer(c.plaintext, { intent: c.intent, ...contextOf(c.context, vectorVerify) });
     assert.deepEqual(checked, { ok: true, answer: JSON.parse(c.plaintext) }, c.name);
   }
-  for (const n of LINK.invalidPlaintexts) {
+  for (const n of LINK.invalidPlaintexts.filter(ofSite)) {
     const intent = LINK.cases.find((c) => c.name === n.session).intent;
     const checked = validateAnswer(n.plaintext, { intent, ...contextOf(n.context, vectorVerify) });
     assert.deepEqual(checked, { ok: false, reason: n.reason }, `${n.session} ${n.reason}: ${n.plaintext.slice(0, 80)}`);
   }
-  assert.ok(LINK.invalidPlaintexts.length >= 30);
+  assert.ok(LINK.invalidPlaintexts.filter(ofSite).length >= 30);
+  for (const n of CLAIM.invalidPlaintexts) {
+    const checked = validateAnswer(n.plaintext, { intent: 'claim', ...contextOf(n.context, vectorVerify) });
+    assert.deepEqual(checked, { ok: false, reason: n.fail }, `${n.case} ${n.why}`);
+  }
+  // An answer of the earlier request, which named no node, moves nothing on the page: no node to read it for.
+  for (const c of EARLIER_CLAIMS.filter((x) => ['ok', 'empty'].includes(JSON.parse(x.plaintext).status))) {
+    assert.deepEqual(validateAnswer(c.plaintext, { intent: 'claim', ...contextOf(c.context, vectorVerify) }), { ok: false, reason: 'nodeId' }, c.name);
+  }
+  for (const n of LINK.invalidPlaintexts.filter((x) => !ofSite(x))) {
+    assert.equal(validateAnswer(n.plaintext, { intent: 'claim', ...contextOf(n.context, vectorVerify) }).ok, false, `${n.session} ${n.reason}`);
+  }
+});
+
+// Owner, 12.10: the answer names the node the request named, the light or the super node of its wallet.
+test('answers: a claim answer names the requested node of its own wallet', () => {
+  const [kat, other] = CLAIM.wallets;
+  const c = CLAIM.cases.find((x) => x.name === 'claim-super-ok');
+  const answer = JSON.parse(c.plaintext);
+  const check = (over, request = c.context.request) => validateAnswer(JSON.stringify({ ...answer, ...over }),
+    { intent: 'claim', ...contextOf({ ...c.context, request }, vectorVerify) });
+  assert.equal(check({}).ok, true);
+  assert.deepEqual(check({ nodeId: kat.lightNodeId }), { ok: false, reason: 'nodeId' });
+  assert.deepEqual(check({ nodeId: other.superNodeId }), { ok: false, reason: 'nodeId' });
+  // a request that names another wallet's node is never read as this wallet's
+  assert.deepEqual(check({}, { walletHash: kat.walletHash, nodeId: other.superNodeId }), { ok: false, reason: 'nodeId' });
+  assert.deepEqual(check({ nodeId: other.superNodeId }, { walletHash: kat.walletHash, nodeId: other.superNodeId }), { ok: false, reason: 'nodeId' });
+  // the light node's move reads the same way
+  assert.equal(check({ nodeId: kat.lightNodeId }, { walletHash: kat.walletHash, nodeId: kat.lightNodeId }).ok, true);
+  // no request, no node: nothing is read
+  assert.deepEqual(check({}, null), { ok: false, reason: 'nodeId' });
 });
 
 // SITE-R2-03, owner decision 27.09 (EXT-R1-03 option (a)): a claim whose quote stopped at an epoch may move less than
 // 1 QNC, so a balance spread over many small epochs can always be moved; a full claim still moves at least 1 QNC, and
 // no claim moves nothing.
 test('answers: a capped claim below 1 QNC is read; a full one below 1 QNC and a zero one are not', () => {
-  const c = LINK.cases.find((x) => x.name === 'claim-ok-partial');
+  const c = CLAIM.cases.find((x) => x.name === 'claim-super-ok-partial');
   const answer = JSON.parse(c.plaintext);
   assert.equal(answer.stoppedAtEpoch, '155');
   const check = (over) => validateAnswer(JSON.stringify({ ...answer, ...over }), { intent: 'claim', ...contextOf(c.context, vectorVerify) });
@@ -382,7 +436,7 @@ test('signatures must decode to 64 bytes', () => {
 });
 
 test('crypto: the site key, the link, the decryption and the check number of every case, with either kind of key', async () => {
-  for (const c of LINK.cases) {
+  for (const c of CASES) {
     for (const s of [bytesSession(c), await webCryptoSession(c)]) {
       assert.equal(s.sitePub, b64u(c.sitePublicKey), c.name);
       assert.equal(s.link, c.link, c.name);
@@ -415,7 +469,7 @@ test('crypto: a fresh session round-trips with the app side done by node:crypto,
   const requests = [
     ['connect', null],
     ['link', { burnTx: null, walletHash: '74940b0126365748', check: true }],
-    ['claim', { walletHash: null }],
+    ['claim', { walletHash: '74940b0126365748', nodeId: 'super_node_f3e187d8752f4514' }],
   ];
   for (const [intent, request] of requests) {
     for (const subtle of [crypto.subtle, undefined]) {
@@ -447,6 +501,10 @@ test('crypto: fresh sessions draw fresh ids and non-extractable keys; a request 
   await assert.rejects(newSiteSession('connect', { walletHash: null }), /request/);
   await assert.rejects(newSiteSession('link', null), /request/);
   await assert.rejects(newSiteSession('link', { walletHash: null }), /request/);
+  // A `claim` request names the wallet and its node (owner, 12.10).
+  await assert.rejects(newSiteSession('claim', { walletHash: null }), /request/);
+  await assert.rejects(newSiteSession('claim', { walletHash: '74940b0126365748' }), /request/);
+  await assert.rejects(newSiteSession('claim', { walletHash: '74940b0126365748', nodeId: 'genesis_node_001' }), /request/);
 });
 
 function mockProvider(handler) {

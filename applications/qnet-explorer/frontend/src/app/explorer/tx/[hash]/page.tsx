@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import ExplorerLink from '@/components/ExplorerLink';
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { setCache } from '@/lib/explorer-cache';
 import { formatTokenAmount } from '@/lib/token-format';
@@ -173,7 +173,7 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
   const addrLink = (addr: string) => {
     const isValid = addr && addr.length > 10 && addr.includes('eon');
     return isValid ? (
-      <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">{truncate(addr, 12, 8)}</ExplorerLink>
+      <Link href={`/explorer/address/${addr}`} className="address-link">{truncate(addr, 12, 8)}</Link>
     ) : (
       <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
     );
@@ -192,10 +192,10 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
         <div className="detail-row">
           <span className="detail-label">Amount</span>
           <span className="detail-value">
-            <ExplorerLink href={`/explorer/token/${call.contract}`} className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Link href={`/explorer/token/${call.contract}`} className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <TokenIcon logo={logo} symbol={symbol} address={call.contract} size={16} />
               <span>{amount}{symbol ? ` ${symbol}` : ''}</span>
-            </ExplorerLink>
+            </Link>
           </span>
         </div>
         <div className="detail-row">
@@ -205,9 +205,9 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
         <div className="detail-row">
           <span className="detail-label">Token</span>
           <span className="detail-value">
-            <ExplorerLink href={`/explorer/token/${call.contract}`} className="address-link">
+            <Link href={`/explorer/token/${call.contract}`} className="address-link">
               {symbol || truncate(call.contract, 12, 8)}
-            </ExplorerLink>
+            </Link>
             <CopyBtn text={call.contract} />
           </span>
         </div>
@@ -312,18 +312,18 @@ export default function TransactionPage() {
           <div className="detail-row">
             <span className="detail-label">Block</span>
             <span className="detail-value">
-              <ExplorerLink href={`/explorer/block/${tx.block}`} className="address-link">
+              <Link href={`/explorer/block/${tx.block}`} className="address-link">
                 {tx.block}
-              </ExplorerLink>
+              </Link>
             </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">From</span>
             <span className="detail-value">
               {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
-                <ExplorerLink href={`/explorer/address/${tx.from}`} className="address-link">
+                <Link href={`/explorer/address/${tx.from}`} className="address-link">
                   {truncate(tx.from, 12, 8)}
-                </ExplorerLink>
+                </Link>
               ) : (
                 <span className="address-link">{txPartyLabel(tx.from || 'N/A', full)}</span>
               )}
@@ -334,9 +334,9 @@ export default function TransactionPage() {
             <span className="detail-label">To</span>
             <span className="detail-value">
               {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
-                <ExplorerLink href={`/explorer/address/${tx.to}`} className="address-link">
+                <Link href={`/explorer/address/${tx.to}`} className="address-link">
                   {truncate(tx.to, 12, 8)}
-                </ExplorerLink>
+                </Link>
               ) : (
                 <span className="address-link">{txPartyLabel(tx.to || 'N/A', full)}</span>
               )}
@@ -347,10 +347,10 @@ export default function TransactionPage() {
             <span className="detail-label">Amount</span>
             <span className="detail-value" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               {(tx.amount || '0').includes('QNC') ? (
-                <ExplorerLink href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                   <TokenIcon native size={16} />
                   <span>{tx.amount || '0'}</span>
-                </ExplorerLink>
+                </Link>
               ) : (
                 <span>{tx.amount || '0'}</span>
               )}
@@ -391,7 +391,7 @@ export default function TransactionPage() {
                   <div className="detail-row" key={i}>
                     <span className="detail-label">#{i + 1}</span>
                     <span className="detail-value">
-                      <ExplorerLink href={`/explorer/address/${r.to}`} className="addr">{r.to}</ExplorerLink>
+                      <Link href={`/explorer/address/${r.to}`} className="addr">{r.to}</Link>
                       {' — '}{(Number(r.amount) / 1e9).toFixed(9)} QNC
                     </span>
                   </div>

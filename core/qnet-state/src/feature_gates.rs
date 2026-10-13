@@ -170,6 +170,40 @@ pub const WALLET_ONE_NODE_GATE_HEIGHT: u64 = 3_657_600;
 /// never changes (scripts/deploy-genesis.sh refuses to move a crossed gate).
 pub const FAILOVER_TENURE_BOUND_GATE_HEIGHT: u64 = 3_657_600;
 
+/// From this height the eligible-producer snapshot admits only the compiled `EMERGENCY_COMMITTEE_ALLOWLIST`
+/// (genesis_node_001..005 and the sixth node). The rule applies where that stored, certified set is built
+/// (both arms of the snapshot builder and its genesis floor), at the snapshot's own boundary. Committees,
+/// producer rosters and light clients all derive from the stored set unchanged, so they agree on one
+/// committee per window. An emergency rule after the 10.10 halt, until admission and retention rest on a
+/// voting record.
+///
+/// The boundary of macroblock 38949, the first one no node had sealed when the chain halted (sealed 38948,
+/// tip 3508200). It sits below the tip on purpose. By the old rule, heartbeats already in blocks 3505902 and
+/// 3506098 put two outside members that missed most of their slots back into snapshots 38955-38975 and
+/// 38957-38975, so windows 38957-38977 need 7 of 9 or 10 votes, which the six alone never reach. Under this rule:
+///   - window 38951 onward has the six, quorum 5;
+///   - windows 38949-38950 keep the eight sealed in macroblocks 38947-38948, quorum 6.
+/// Nothing certified changes: no snapshot at or above this boundary exists on any node. The two rules build
+/// different content at head 3505410, so they never certify it together. Six of those eight must run this
+/// binary before that head can seal: all six of ours while the two outside members stay silent. The roll uses
+/// SKIP_GATE_CHECK=1 and QNET_RECOVERY_HALTED=1, after checking by hand that every node still stops at sealed
+/// 38948.
+/// Registration follows the committee: the burn attestation quorum, the attestor check, the arm quorum and the
+/// registration door's committee lane all resolve committee_for_height. So from window 38951 only the six
+/// attest, 5 of 6. The registry does not consult this rule; from SUPER_REWARD_ADMISSION_GATE_HEIGHT the super
+/// reward roster does (super_reward_admission). Once any node has crossed this height, it never changes.
+pub const EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT: u64 = 3_505_410;
+
+/// From the epoch whose first block is this height a super earns an epoch's operator share only when it is in that
+/// epoch's consensus-admitted set (`super_reward_admission`): today EMERGENCY_COMMITTEE_ALLOWLIST, later earned
+/// membership. Asked at the epoch's first block by the settle writer of super_elig_{N}, so producer, replicas and
+/// snapshot joiners file one set; the claim path never asks it, so earned rewards stay claimable. Below it every
+/// qualifying super earns and stored rows replay unchanged. A consensus rule (the set feeds reward_root): every node
+/// must run the binary before this epoch settles. Epoch 258: the release that ships it rolls after the three gates
+/// above (epoch 254) are crossed, and this boundary is the first one far enough above that roll. Once any node has
+/// crossed it, the height never changes.
+pub const SUPER_REWARD_ADMISSION_GATE_HEIGHT: u64 = 3_715_200;
+
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
 const fn qnet_state_gas_metering_height() -> u64 { crate::transaction::GAS_METERING_ACTIVATION_HEIGHT }
@@ -196,6 +230,8 @@ pub mod id {
     pub const TX_TARGET_BOUND: &str = "tx_target_bound";
     pub const WALLET_ONE_NODE: &str = "wallet_one_node";
     pub const FAILOVER_TENURE_BOUND: &str = "failover_tenure_bound";
+    pub const EMERGENCY_COMMITTEE_ALLOWLIST: &str = "emergency_committee_allowlist";
+    pub const SUPER_REWARD_ADMISSION: &str = "super_reward_admission";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -223,6 +259,8 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::TX_TARGET_BOUND, TX_TARGET_BOUND_GATE_HEIGHT),
     (id::WALLET_ONE_NODE, WALLET_ONE_NODE_GATE_HEIGHT),
     (id::FAILOVER_TENURE_BOUND, FAILOVER_TENURE_BOUND_GATE_HEIGHT),
+    (id::EMERGENCY_COMMITTEE_ALLOWLIST, EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT),
+    (id::SUPER_REWARD_ADMISSION, SUPER_REWARD_ADMISSION_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -289,6 +327,7 @@ mod tests {
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
             LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR, CONTRACT_GAS_SIGNED,
             MICROBLOCK_SIG_RAW, TX_TARGET_BOUND, WALLET_ONE_NODE, FAILOVER_TENURE_BOUND,
+            EMERGENCY_COMMITTEE_ALLOWLIST, SUPER_REWARD_ADMISSION,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),
@@ -364,6 +403,39 @@ mod tests {
         assert!(super::is_active(super::id::FAILOVER_TENURE_BOUND, u64::MAX));
     }
 
+    /// The one gate that is deliberately not an epoch boundary. It is the boundary of macroblock 38949, the first
+    /// snapshot no node had sealed at the 10.10 halt, so every snapshot already sealed (38948 and below) keeps the
+    /// set it was built with. The rule reads it only at snapshot boundaries, so a window boundary suffices. The
+    /// roll script reads gate heights as plain integers and compares them in shell arithmetic, so the value must
+    /// stay one.
+    #[test]
+    fn emergency_committee_allowlist_starts_at_the_first_unsealed_snapshot() {
+        let h = super::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT;
+        assert_eq!(h % 90, 0, "a snapshot boundary");
+        assert_eq!(h / 90, 38_949, "the first macroblock no node sealed before the 10.10 halt");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(h < i64::MAX as u64, "shell arithmetic in the roll script holds it");
+        assert!(!super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, h - 1), "old rule below");
+        assert!(super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, h), "allowlist from the gate");
+        assert!(super::is_active(super::id::EMERGENCY_COMMITTEE_ALLOWLIST, u64::MAX));
+    }
+
+    /// The reward admission rule is asked at an epoch's first block, so only an epoch boundary keeps every epoch on one
+    /// rule. It sits above the allowlist gate, so the allowlist is active at every gated epoch start.
+    #[test]
+    fn super_reward_admission_is_epoch_aligned_above_the_allowlist() {
+        let h = super::SUPER_REWARD_ADMISSION_GATE_HEIGHT;
+        assert_eq!(h % 14_400, 0, "an epoch boundary");
+        assert_eq!(h / 14_400, 258, "epoch 258");
+        assert!(h > super::TX_TARGET_BOUND_GATE_HEIGHT, "above the gates the release rolls after");
+        assert!(h > super::EMERGENCY_COMMITTEE_ALLOWLIST_GATE_HEIGHT, "the allowlist governs every gated epoch");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(h < i64::MAX as u64, "shell arithmetic in the roll script holds it");
+        assert!(!super::is_active(super::id::SUPER_REWARD_ADMISSION, h - 1), "old rule below");
+        assert!(super::is_active(super::id::SUPER_REWARD_ADMISSION, h), "admitted set from the gate");
+        assert!(super::is_active(super::id::SUPER_REWARD_ADMISSION, u64::MAX));
+    }
+
     /// NodeActivation, the other way a wallet gained a super identity, is refused from tx_target_bound. Were
     /// the one-node rule earlier, a wallet with a light node could still become a super node through it.
     #[test]
@@ -396,11 +468,12 @@ mod tests {
 
     /// SIGBIND-R1-03: the roll script accepted any moved gate whose new height was ahead of the tip, so a gate
     /// the fleet had crossed could be moved up and every block between replayed under the other rule. A gate
-    /// whose old height is within the margin of the tip is refused as frozen, before the ahead-of-tip check.
+    /// whose old height is within the margin of the tip (FINISH_MARGIN in a mixed fleet) is refused as frozen,
+    /// before the ahead-of-tip check.
     #[test]
     fn the_roll_script_freezes_a_crossed_gate() {
         let script = include_str!("../../../scripts/deploy-genesis.sh");
-        let frozen = script.find(r#"[ "$ov" -le $((tip + GATE_MARGIN)) ]"#).expect("the frozen-gate test");
+        let frozen = script.find(r#"[ "$ov" -le $((tip + crossed)) ]"#).expect("the frozen-gate test");
         let refusal = script.find("gate already crossed").expect("its refusal");
         let ahead = script.find(r#"if [ "$nv" -gt $((tip + GATE_MARGIN)) ]; then"#).expect("the ahead-of-tip check");
         assert!(frozen < refusal && refusal < ahead, "the frozen check runs first");

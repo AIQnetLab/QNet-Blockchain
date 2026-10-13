@@ -374,45 +374,10 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     marginBottom: 15,
   },
-  settingItem: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    padding: 15,
-    marginBottom: 10,
-  },
-  settingInfo: {
-    flex: 1,
-  },
-  settingTitle: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
-    marginBottom: 4,
-  },
+  // A line of Settings that is not a setting's row (components/InfoRow SettingRow): a warning, no sites yet.
   settingSubtitle: {
     color: '#888',
     fontSize: 13,
-  },
-  // A long value wraps inside its box instead of squeezing the title beside it.
-  settingDropdown: {
-    flexShrink: 1,
-    maxWidth: '50%',
-    marginStart: 10,
-    backgroundColor: '#1a1a2e',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: '#00d4ff',
-  },
-  settingValue: {
-    color: '#00d4ff',
-    fontSize: 14,
-    fontWeight: '600',
-    textAlign: 'center',
   },
   modalOverlay: {
     position: 'absolute',
@@ -713,12 +678,22 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textAlign: 'center',
   },
-  // The quiet line under Send and Receive while the figures are being updated, or when they could not be.
+  // The quiet line under Send and Receive when the figures could not be updated for a while, or the network stopped.
   balanceStatusLine: {
     color: '#8a8fa3',
     fontSize: 12,
     textAlign: 'center',
     marginTop: 8,
+  },
+  // A move of a node balance in transit, on its own line under the QNC row (services/ClaimTransit).
+  // At the row's end, where the QNC figure is, on either side of a right-to-left screen.
+  transitLine: {
+    alignSelf: 'flex-end',
+    color: '#ffaa00',
+    fontSize: 13,
+    marginTop: -4,
+    marginBottom: 8,
+    paddingHorizontal: 15,
   },
   // The QNet Send screen's token switch: one row of chips, scrolled sideways when they do not fit.
   sendTokenScroll: {
@@ -816,8 +791,7 @@ const styles = StyleSheet.create({
   tokenList: {
     marginBottom: 20,
   },
-  // Token rows (and tokenItemClickable) wrap: a balance that does not fit beside the name
-  // takes its own right-aligned line instead of running past the card.
+  // The unsettled transactions' rows wrap: "Stop sending" takes its own line when it does not fit.
   tokenItem: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -888,11 +862,18 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 12,
   },
+  // A balance beside its token in up to two fifths of the row, shrinking to fit; one that would not fit there even at
+  // half its size goes under the token, whole (screens/WalletScreen TokenBalance).
   tokenBalance: {
     alignItems: 'flex-end',
-    flexShrink: 1,
-    maxWidth: '100%',
+    flexShrink: 0,
+    maxWidth: '40%',
     marginStart: 'auto',
+  },
+  tokenBalanceUnder: {
+    width: '100%',
+    alignItems: 'flex-end',
+    marginTop: 8,
   },
   tokenAmount: {
     color: '#ffffff',
@@ -905,9 +886,9 @@ const styles = StyleSheet.create({
     fontSize: 12,
     textAlign: 'right',
   },
+  // A token on Assets: its icon and name, and its balance on the same line (tokenBalance), or under them (tokenItemWrap).
   tokenItemClickable: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     backgroundColor: '#16213e',
@@ -916,6 +897,9 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  tokenItemWrap: {
+    flexWrap: 'wrap',
   },
   tokenSendHint: {
     color: '#00d4ff',
@@ -1086,23 +1070,15 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   // Send Modal Styles
+  // The Send forms' balance: its row (components/InfoRow) in a tinted box, a token's contract under it.
   sendBalanceInfo: {
     backgroundColor: 'rgba(0, 212, 255, 0.1)',
     borderRadius: 8,
-    padding: 12,
+    paddingHorizontal: 12,
     marginBottom: 16,
-    alignItems: 'center',
   },
-  sendBalanceLabel: {
-    color: '#888',
-    fontSize: 12,
-    marginBottom: 4,
-  },
-  sendBalanceAmount: {
-    writingDirection: 'ltr',
-    color: '#00d4ff',
-    fontSize: 20,
-    fontWeight: '700',
+  sendBalanceNotes: {
+    paddingBottom: 10,
   },
   percentageButtons: {
     flexDirection: 'row',
@@ -1124,55 +1100,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
-  sendFeeContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 12,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+  // The Send forms' fee and total rows (components/InfoRow).
+  sendFigures: {
     marginTop: 8,
     marginBottom: 16,
-  },
-  sendFeeLabel: {
-    color: '#888',
-    fontSize: 14,
-    flexShrink: 1,
-    marginEnd: 12,
-  },
-  sendFeeValue: {
-    color: '#ffaa00',
-    fontSize: 14,
-    fontWeight: '600',
-    marginStart: 'auto',
-    writingDirection: 'ltr',
-  },
-  sendTotalContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-    borderRadius: 8,
-    marginBottom: 16,
-  },
-  sendTotalLabel: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-    marginEnd: 12,
-  },
-  sendTotalValue: {
-    color: '#00d4ff',
-    fontSize: 16,
-    fontWeight: '700',
-    flexShrink: 1,
-    maxWidth: '100%',
-    textAlign: 'right',
-    marginStart: 'auto',
   },
   // Send Screen Styles (inline, not modal)
   sendScreenContainer: {
@@ -1300,29 +1231,20 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginBottom: 8,
   },
+  // The recipient's field (components/InfoRow) across the card's width.
   txResultTo: {
-    textAlign: 'center',
-    color: '#888',
-    fontSize: 14,
-    marginBottom: 24,
+    alignSelf: 'stretch',
+    marginBottom: 16,
   },
+  // The hash's field (components/InfoRow, its own padding above and below) and the hint, in a tinted box.
   txHashContainer: {
     backgroundColor: 'rgba(0, 212, 255, 0.1)',
     borderRadius: 12,
-    padding: 16,
+    paddingHorizontal: 16,
+    paddingTop: 6,
+    paddingBottom: 14,
     width: '100%',
     marginBottom: 24,
-  },
-  txHashLabel: {
-    color: '#888',
-    fontSize: 12,
-    marginBottom: 8,
-  },
-  txHashValue: {
-    writingDirection: 'ltr',
-    color: '#00d4ff',
-    fontSize: 14,
-    fontFamily: 'monospace',
   },
   txHashHint: {
     color: '#666',
@@ -1372,17 +1294,23 @@ const styles = StyleSheet.create({
     marginVertical: 1,
   },
   historyBadge_pending: { backgroundColor: 'rgba(255, 170, 0, 0.15)' },
+  historyBadge_moving: { backgroundColor: 'rgba(255, 170, 0, 0.15)' },
   historyBadge_confirmed: { backgroundColor: 'rgba(0, 255, 136, 0.12)' },
   historyBadge_failed: { backgroundColor: 'rgba(255, 68, 68, 0.15)' },
   historyBadge_dropped: { backgroundColor: 'rgba(138, 143, 163, 0.15)' },
+  historyBadge_unverified: { backgroundColor: 'rgba(138, 143, 163, 0.15)' },
+  historyBadge_included: { backgroundColor: 'rgba(0, 212, 255, 0.12)' },
   historyBadgeText: {
     fontSize: 11,
     fontWeight: '600',
   },
   historyBadgeText_pending: { color: '#ffaa00' },
+  historyBadgeText_moving: { color: '#ffaa00' },
   historyBadgeText_confirmed: { color: '#00ff88' },
   historyBadgeText_failed: { color: '#ff4444' },
   historyBadgeText_dropped: { color: '#8a8fa3' },
+  historyBadgeText_unverified: { color: '#8a8fa3' },
+  historyBadgeText_included: { color: '#00d4ff' },
   // History (screens/HistoryTab): a header per day, then one compact row per transaction, the amount never cut.
   histDay: {
     color: '#7d8299',
@@ -1496,8 +1424,11 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   histStatus_pending: { color: '#ffaa00' },
+  histStatus_moving: { color: '#ffaa00' },
   histStatus_failed: { color: '#ff4444' },
   histStatus_dropped: { color: '#8a8fa3' },
+  histStatus_unverified: { color: '#8a8fa3' },
+  histStatus_included: { color: '#00d4ff' },
   // The detail screen of one transaction.
   txDetailHeader: {
     flexDirection: 'row',
@@ -1543,26 +1474,6 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     marginEnd: 0,
   },
-  txDetailField: {
-    borderTopWidth: 1,
-    borderTopColor: '#1f2a4d',
-    paddingVertical: 10,
-  },
-  txDetailLabel: {
-    color: '#7d8299',
-    fontSize: 12,
-    marginBottom: 3,
-  },
-  txDetailValue: {
-    color: '#ffffff',
-    fontSize: 14,
-  },
-  txDetailMono: {
-    fontFamily: 'monospace',
-    fontSize: 13,
-    writingDirection: 'ltr',
-    textAlign: 'left',
-  },
   txDetailWarning: {
     color: '#ff5555',
     fontSize: 12,
@@ -1603,7 +1514,7 @@ const styles = StyleSheet.create({
   nodeMonitoringCard: {
     backgroundColor: '#16213e',
     borderRadius: 15,
-    padding: 20,
+    padding: 16,
     marginBottom: 20,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.2)',
@@ -1611,8 +1522,12 @@ const styles = StyleSheet.create({
   nodeMonitoringHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    marginBottom: 20,
+    alignItems: 'center',
+  },
+  // The node id beside the status badge (screens/NodeTab NodeId).
+  nodeIdBox: {
+    flex: 1,
+    marginEnd: 12,
   },
   nodeMonitoringTitle: {
     flexShrink: 1,
@@ -1663,16 +1578,6 @@ const styles = StyleSheet.create({
   nodeMonitoringInfo: {
     marginBottom: 12,
   },
-  nodeMonitoringLabel: {
-    fontSize: 12,
-    color: '#888888',
-    marginBottom: 4,
-  },
-  nodeMonitoringValue: {
-    fontSize: 14,
-    color: '#00d4ff',
-    fontWeight: '500',
-  },
   serverActivationNotice: {
     backgroundColor: 'rgba(255, 170, 0, 0.1)',
     borderRadius: 10,
@@ -1698,10 +1603,11 @@ const styles = StyleSheet.create({
     color: '#888888',
     textAlign: 'center',
   },
+  // A Node tab card of label and value rows (components/InfoRow), padded as the History detail card is.
   rewardsCard: {
     backgroundColor: '#16213e',
     borderRadius: 15,
-    padding: 20,
+    padding: 16,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.2)',
   },
@@ -1709,38 +1615,7 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '600',
     color: '#ffffff',
-    marginBottom: 20,
-  },
-  // A label and its value share one line: a long label wraps within 60% of it and the value takes the rest.
-  // An amount shrinks to fit (numberOfLines={1} + adjustsFontSizeToFit); a status or a countdown wraps.
-  rewardItem: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-    paddingBottom: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255, 255, 255, 0.05)',
-  },
-  // A row whose value goes under its label when the two do not fit side by side (a long word in some language).
-  rewardItemWrap: {
-    flexWrap: 'wrap',
-  },
-  rewardLabel: {
-    fontSize: 14,
-    color: '#888888',
-    flexShrink: 0,
-    maxWidth: '60%',
-    marginEnd: 12,
-  },
-  rewardValue: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#00d4ff',
-    flexShrink: 1,
-    maxWidth: '100%',
-    textAlign: 'right',
-    marginStart: 'auto',
+    marginBottom: 6,
   },
   // Plain note under a reward row (pending rewards stay out of the balance until claimed).
   rewardHint: {
