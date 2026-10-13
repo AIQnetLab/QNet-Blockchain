@@ -71,7 +71,7 @@ export const TEXTS = {
   progress_now: 'now',
 
   // Overview
-  overview_title: 'Your node',
+  overview_title: 'Light node',
   epoch_note: 'QNet Blockchain checks each node once per epoch, a period of about 4 hours.',
 
   // The next step after an activation: the node recorded on the QNet network, the phone linked, the node running
@@ -97,7 +97,7 @@ export const TEXTS = {
   next_link_3_qr: 'Link the phone: press "Link a device" and confirm in QNet Wallet (on a computer, scan the QR code with the phone\'s camera, or open this page in the phone\'s own browser and press it there).',
   next_link_3_app: 'Linking the phone from this page opens soon. Until then the node stays recorded for this wallet, and nothing is lost.',
   next_link_done: 'Once the phone answers QNet Blockchain, this page shows the node as running.',
-  next_running: 'Your node runs while QNet Wallet runs on that device: open, in the background or behind the lock screen, and online.',
+  next_running: 'The node runs while QNet Wallet runs on that device: open, in the background or behind the lock screen, and online.',
   next_offline: 'The linked device has not answered QNet Blockchain lately. Open QNet Wallet on it: the app answers by itself once it is open. If that phone no longer holds the node, run the node on it again from the Overview.',
   next_device_pending: 'A new device is linked. Waiting for its first answer; this page moves on by itself.',
   next_super: 'This wallet\'s activation is for a super node, which runs on a server. Its code and the server\'s settings are on the Overview.',
@@ -137,7 +137,7 @@ export const TEXTS = {
   super_step_errors: 'If the log shows mnemonic_mismatch, the phrase in the file is not this wallet\'s: check its spelling. burn_not_found_on_solana: the burn or its amount in the settings is not this activation\'s (the node keeps running, unregistered). missing_burn_env_vars: a burn setting is missing. Insufficient RAM: the server has less than 4,000 MB of memory. After a fix, run the update step\'s commands, then the address and start steps again.',
   super_step_update: 'When a new release of the node software is out, download it and start the node again with the same settings: run these, then the address and start steps again. The chain data in /opt/qnet/data stays, and a restart counts as downtime:',
   super_step_joined: 'Catching up takes from minutes to hours; the node then registers itself, and the Overview shows it once its registration is on QNet Blockchain. An epoch, about 4 hours, counts when the server sends at least 9 of its 10 heartbeats, one about every 24 minutes, so downtime of more than about 24 minutes in an epoch, a restart included, can lose that epoch.',
-  super_title: 'Your super node',
+  super_title: 'Super node',
   super_id: 'Super node ID',
   super_last_seen: 'Last seen: {time}',
   super_last_seen_unknown: 'Last seen: not known yet',
