@@ -363,13 +363,12 @@ test('the device\'s account: whether the wake reached the device, or that it nev
 
 // One line with the device rows: on the Device tab for an Online or Offline device (its own miss: the Overview's, else
 // one the device told about), on the Overview beside the Offline state where running the node on the phone again
-// follows. No row names the time of an answer. A typed address (view only) shows the platform, the state and the epochs
-// only.
-test('the pages: the miss line in the device rows, no answer time, a typed address shown by its platform, state and epochs only', () => {
+// follows. No row names the time of an answer. An address only viewed shows the state and the epochs only.
+test('the pages: the miss line in the device rows, no answer time, an address only viewed shown by its state and epochs only', () => {
   const rows = code('components/cabinet/NodeStatus.tsx');
   assert.match(rows, /const miss = full \? deviceMiss\(status\) : shownMiss\(status\);\s*if \(!miss\) return null;\s*return <p>\{missText\(miss, status\.device\?\.platform \?\? null\)\}<\/p>;/);
   assert.match(rows, /const missed = !viewOnly && \(state === 'offline' \|\| \(full && state === 'online'\)\);/);
-  assert.match(rows, /const named = device && viewOnly \? \{ platform: device\.platform, model: null \} : device;/);
+  assert.match(rows, /const named = viewOnly \? null : device;/);
   assert.match(rows, /\{full && named && deviceName\(named\) && <p>\{deviceName\(named\)\}<\/p>\}/);
   assert.match(rows, /\{full && !viewOnly && device\?\.linkedSince != null && /);
   assert.doesNotMatch(rows, /WakePlace|canWake/);

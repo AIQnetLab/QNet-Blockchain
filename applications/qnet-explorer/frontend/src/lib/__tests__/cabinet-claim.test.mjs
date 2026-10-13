@@ -130,7 +130,9 @@ test('the Overview offers Move to wallet for a light and a super node, naming th
   const sup = home.slice(home.indexOf('function SuperOverview('), home.indexOf('function Overview('));
   for (const part of [light, sup]) {
     assert.match(part, /<Move\s+qnet=\{choice\.qnet\}\s+nodeId=\{nodeId\}\s+movable=\{movable\}/);
-    assert.match(part, /\{movable && viewOnly && <ConnectFirst \/>\}/);
+    // An address only viewed is offered no move, nor a way to it (CabinetFrame's viewing line has Stop viewing).
+    assert.match(part, /\{\(movable \|\| moved\) && !viewOnly && choice && \(/);
+    assert.doesNotMatch(part, /ConnectFirst/);
     assert.match(part, /<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/);
   }
   assert.match(sup, /const movable = isClaimNodeId\(nodeId\) && canMove\(status\.balanceNano\);/);

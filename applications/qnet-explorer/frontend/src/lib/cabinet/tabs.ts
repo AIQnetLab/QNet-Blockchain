@@ -51,9 +51,10 @@ export function tabRoute(tab: unknown): string | null {
 }
 
 // Activate is offered only while the wallet has no node, no burn and nothing on its way from any source (the state
-// `none`, wallet-activation.ts), while an activation of this browser for this wallet is unfinished, and on its own page.
-export function visibleTabs(state: ViewState | null, openActivation: boolean, current: Tab): Tab[] {
-  return TABS.filter((tab) => tab !== 'activate' || state === 'none' || openActivation || current === 'activate');
+// `none`, wallet-activation.ts), while an activation of this browser for this wallet is unfinished, and on its own page;
+// never for an address only viewed (`viewOnly`), unless that page is open.
+export function visibleTabs(state: ViewState | null, openActivation: boolean, current: Tab, viewOnly = false): Tab[] {
+  return TABS.filter((tab) => tab !== 'activate' || current === 'activate' || (!viewOnly && (state === 'none' || openActivation)));
 }
 
 // Connect, Activate, then for a light node Link a device and Running, for a super node Run the server and Running.

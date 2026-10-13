@@ -6,8 +6,9 @@
 // the node balance that can hold the page's epochs (RewardDistribution rows from system_rewards_pool to the wallet from
 // the end of the page's oldest epoch on, whose payload lists the epochs and amounts each moved) and the times of the
 // blocks the page's epochs began and ended with. Three indexed reads per page, the registrations kept once found; every
-// row is public on the chain. The nodes' own per-epoch history stays the source of what was counted. Also a super
-// node's newest heartbeat, when it was last seen.
+// row is public on the chain. The nodes' own per-epoch history stays the source of what was counted. For the first page
+// also every move of the wallet, for what they took to it in all (movedTotal). Also a super node's newest heartbeat,
+// when it was last seen.
 
 import { epochOfKey } from '../../lib/cabinet/epochs.ts';
 import { isSuperNodeId, lightNodeId, superNodeId } from '../../lib/qnet-link.ts';
@@ -30,6 +31,13 @@ export const CLAIMS_SQL = `SELECT hash, block::text AS block, data FROM transact
  WHERE to_address = $1 AND tx_type = 'RewardDistribution' AND from_address = 'system_rewards_pool' AND transactions.block >= $2
  ORDER BY transactions.block ASC, tx_index ASC LIMIT ${CLAIM_ROWS}`;
 export const TIMES_SQL = 'SELECT height::text AS height, timestamp::text AS ts FROM blocks WHERE height = ANY($1::bigint[])';
+// Every move of the wallet, in chain order: its amount (the payload's own total, which the chain binds) and its payload
+// without the proofs, which only the epochs and amounts are read from (movedEpochs). A wallet with more moves than this
+// gets no total.
+export const MOVE_ROWS = 5_000;
+export const MOVES_SQL = `SELECT amount::text AS amount, regexp_replace(COALESCE(data, ''), '"proof"\\s*:\\s*\\[[^{}]*\\]', '', 'g') AS data FROM transactions
+ WHERE to_address = $1 AND tx_type = 'RewardDistribution' AND from_address = 'system_rewards_pool'
+ ORDER BY transactions.block ASC, tx_index ASC LIMIT ${MOVE_ROWS + 1}`;
 // A super node's newest heartbeat, sent from the node's id, with its block's time: when the node was last seen by the
 // chain. None while the archive is behind (it wrote nothing for 120 s, the health route's rule): its newest heartbeat
 // would read as a stale last-seen time beside the network's own Online.
@@ -48,10 +56,14 @@ export interface ArchiveFacts {
   claims: Map<number, { tx: string; amountNano: string | null }>;
   // Block height -> its time (ms).
   times: Map<number, number>;
+  // What the wallet's moves took to it in all, and the watermark of moved epochs they leave (movedTotal); null when not
+  // asked for or not readable.
+  moved: MovedTotal | null;
 }
 
-// The archive's facts for a wallet's node, given the epoch keys of the page the network reported for it.
-export type EpochArchive = (wallet: string, nodeId: string, keys: number[]) => Promise<ArchiveFacts>;
+// The archive's facts for a wallet's node, given the epoch keys of the page the network reported for it; `withMoves`
+// (the first page) also reads every move of the wallet.
+export type EpochArchive = (wallet: string, nodeId: string, keys: number[], withMoves?: boolean) => Promise<ArchiveFacts>;
 
 type Row = Record<string, unknown>;
 export type ArchiveQuery = (text: string, params: unknown[]) => Promise<{ rows: Row[] }>;
@@ -121,6 +133,38 @@ export function claimsFrom(rows: Row[]): Map<number, { tx: string; amountNano: s
   return out;
 }
 
+export interface MovedTotal {
+  // Decimal nano QNC.
+  nano: string;
+  // The highest epoch key the moves credited (0 for none): the network's own `last_claimed_epoch` once the archive holds
+  // every move the network applied.
+  watermark: number;
+}
+
+// What the wallet's moves (MOVES_SQL rows, in chain order) credited, replayed by the chain's own rule (state.rs
+// claim_reward, epochs in key order): each listed epoch above the wallet's watermark is credited and raises it, one at
+// or below it credits nothing, so a move sent twice counts once. Null when a move cannot be read whole (no epoch, a key
+// that is no epoch key, an entry without its amount, listed amounts that are not the move's own total, as in a payload
+// the archive cut short) and for more rows than MOVE_ROWS: no total rather than a wrong one.
+export function movedTotal(rows: Row[]): MovedTotal | null {
+  if (rows.length > MOVE_ROWS) return null;
+  let total = 0n;
+  let watermark = 0;
+  for (const row of rows) {
+    if (typeof row.amount !== 'string' || !/^\d{1,20}$/.test(row.amount)) return null;
+    const entries = movedEpochs(row.data).sort((a, b) => a.key - b.key);
+    if (entries.length === 0 || entries.some((e) => !epochOfKey(e.key) || e.amountNano === null)) return null;
+    const amounts = entries.map((e) => BigInt(e.amountNano as string));
+    if (amounts.reduce((sum, a) => sum + a, 0n) !== BigInt(row.amount)) return null;
+    entries.forEach((e, i) => {
+      if (e.key <= watermark) return;
+      total += amounts[i];
+      watermark = e.key;
+    });
+  }
+  return { nano: total.toString(), watermark };
+}
+
 export function timesFrom(rows: Row[]): Map<number, number> {
   const out = new Map<number, number>();
   for (const row of rows) {
@@ -142,21 +186,23 @@ export function createLastHeartbeat(query: ArchiveQuery): (nodeId: string) => Pr
 }
 
 // The page's reads: the wallet's registrations (kept once found), and, for the page's epochs, the moves from the end of
-// its oldest epoch on and the times of its epochs' first blocks and their successors.
+// its oldest epoch on and the times of its epochs' first blocks and their successors; `withMoves`, every move of the
+// wallet too, whose read failing leaves the rest of the facts.
 export function createEpochArchive(query: ArchiveQuery, now: () => number = Date.now): EpochArchive {
   const registrations = memo<Registrations>((r) => (r.superAt !== null ? REGISTRATION_CACHE_MS : REGISTRATION_RECHECK_MS), now);
-  return async (wallet, nodeId, keys) => {
+  return async (wallet, nodeId, keys, withMoves = false) => {
     const spans = keys.map(epochOfKey).filter((s) => s !== null);
     const oldest = spans.length > 0 ? Math.min(...spans.map((s) => s.end)) : null;
     const heights = [...new Set(spans.flatMap((s) => [s.start, s.end]))];
-    const [registered, moves, times] = await Promise.all([
+    const [registered, moves, times, all] = await Promise.all([
       registrations(`${wallet}:${nodeId}`, async () => walletRegistrations(wallet, nodeId, (await query(REGISTRATION_SQL, [wallet])).rows), (r) => r.first !== null),
       oldest === null ? null : query(CLAIMS_SQL, [wallet, oldest]),
       heights.length === 0 ? null : query(TIMES_SQL, [heights]),
+      withMoves ? query(MOVES_SQL, [wallet]).catch(() => null) : null,
     ]);
     return {
       registeredHeight: registered.first, superHeight: registered.superAt,
-      claims: moves ? claimsFrom(moves.rows) : new Map(), times: times ? timesFrom(times.rows) : new Map(),
+      claims: moves ? claimsFrom(moves.rows) : new Map(), times: times ? timesFrom(times.rows) : new Map(), moved: all ? movedTotal(all.rows) : null,
     };
   };
 }

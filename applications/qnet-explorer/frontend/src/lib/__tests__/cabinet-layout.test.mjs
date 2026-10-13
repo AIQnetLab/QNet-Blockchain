@@ -99,8 +99,11 @@ test('the sections shown, the way to a running node and the landing section foll
   assert.deepEqual(visibleTabs('node', true, 'device'), [...TABS]);
   assert.deepEqual(visibleTabs('burned', false, 'activate'), [...TABS]);
   const frame = code('components/cabinet/CabinetFrame.tsx');
-  assert.match(frame, /visibleTabs\(view\.state, openActivation, tab\)/);
-  assert.match(frame, /const openActivation = \(records \?\? \[\]\)\.some\(\(r\) => isUnfinished\(r\) && \(pinnedWallet\(r\) === null \|\| pinnedWallet\(r\) === choice\?\.qnet\)\);/);
+  assert.match(frame, /visibleTabs\(view\.state, openActivation, tab, viewOnly\)/);
+  assert.match(frame, /const openActivation = \(records \?\? \[\]\)\.some\(\(r\) => isUnfinished\(r\) && \(pinnedWallet\(r\) === null \|\| pinnedWallet\(r\) === choice\.qnet\)\);/);
+  // An address only viewed is offered no Activate section, unless its page is open.
+  assert.deepEqual(visibleTabs('none', true, 'overview', true), withoutActivate);
+  assert.deepEqual(visibleTabs('none', false, 'activate', true), [...TABS]);
   assert.deepEqual([...JOURNEY], ['connect', 'activate', 'link', 'running']);
   assert.deepEqual(journey(false, null), { done: 0, current: 0, nodeType: null });
   assert.deepEqual(journey(true, null), { done: 1, current: null, nodeType: null });
@@ -119,7 +122,7 @@ test('the sections shown, the way to a running node and the landing section foll
 
 test('before a wallet: one connect screen with the three ways and How it works in short', () => {
   const frame = code('components/cabinet/CabinetFrame.tsx');
-  assert.match(frame, /if \(ready && choice\) body = <Dashboard tab=\{tab\}>\{children\}<\/Dashboard>;\s*else if \(ready && open\) body = children;\s*else if \(ready && open === false\) body = <ConnectScreen \/>;/);
+  assert.match(frame, /if \(ready && choice\) body = <Dashboard choice=\{choice\} tab=\{tab\}>\{children\}<\/Dashboard>;\s*else if \(ready && open\) body = children;\s*else if \(ready && open === false\) body = <ConnectScreen \/>;/);
   // Activate shows an unfinished activation of this browser without a wallet.
   assert.match(code('components/cabinet/NodeActivate.tsx'), /<CabinetFrame tab="activate" open=\{record === undefined \? null : record !== null && isUnfinished\(record\)\}>/);
   // How it works is readable without a wallet: a page of its own (the test above).
@@ -134,7 +137,8 @@ test('before a wallet: one connect screen with the three ways and How it works i
   assert.match(choice, /if \(device\.phone\) void button\.start\('connect'\);\s*else void qr\.start\('connect'\);/);
   assert.match(choice, /\{t\(device\.phone \? 'connect_app_here' : 'connect_app_qr'\)\}/);
   assert.match(choice, /const install = !extension && !device\.phone \? installTarget\(window\.navigator\) : null;/);
-  assert.match(choice, /choose\(\{ qnet: value, source: 'entered' \}\);/);
+  assert.match(choice, /viewAddress\(value\);/);
+  assert.doesNotMatch(choice, /source: 'entered'/);
   // One filled button: the extension's when it is there, else QNet Wallet's.
   assert.match(choice, /className=\{buttonClass\(!extension\)\} onClick=\{ask\}/);
   assert.match(choice, /className=\{buttonClass\(true\)\} onClick=\{askExtension\}/);
@@ -145,14 +149,17 @@ test('before a wallet: one connect screen with the three ways and How it works i
 
 test('the dashboard: the whole address copied by a tap, how it was connected, Disconnect, the way, the sections', () => {
   const frame = code('components/cabinet/CabinetFrame.tsx');
-  assert.doesNotMatch(frame, /shortAddress/);
+  // The whole address, never shortened; only the line of an address viewed names it short, beside the whole one.
+  assert.equal(frame.match(/shortAddress\(/g)?.length, 1);
   assert.match(frame, /<button type="button" className="cabinet-address" onClick=\{\(\) => void copyAddress\(\)\} title=\{t\('wallet_copy_label'\)\}>\s*\{choice\.qnet\}\s*<\/button>/);
-  assert.match(frame, /await navigator\.clipboard\.writeText\(choice\.qnet\);/);
+  assert.match(frame, /await navigator\.clipboard\.writeText\(address\);/);
   assert.match(frame, /\{t\(SOURCE_TEXT\[choice\.source\]\)\}/);
-  for (const key of ['wallet_source_extension', 'wallet_source_app', 'wallet_source_app_qr', 'wallet_source_entered']) assert.ok(frame.includes(`'${key}'`), key);
+  for (const key of ['wallet_source_extension', 'wallet_source_app', 'wallet_source_app_qr']) assert.ok(frame.includes(`'${key}'`), key);
+  // A typed address is no way of connecting.
+  assert.equal('wallet_source_entered' in TEXTS, false);
   // Disconnect forgets the wallet; the extension's own connection ends with it when it is that wallet.
   assert.match(frame, /if \(choice\.source === 'extension' && accounts\?\.qnet === choice\.qnet\) void disconnect\(\);\s*forget\(\);/);
-  assert.match(frame, /<CabinetProgress connected view=\{view\} \/>\s*<WalletCard \/>\s*<nav className="cabinet-nav"/);
+  assert.match(frame, /\{viewOnly \? <ViewingCard qnet=\{choice\.qnet\} \/> : \(\s*<>\s*<CabinetProgress connected view=\{view\} \/>\s*<WalletCard choice=\{choice\} \/>\s*<\/>\s*\)\}\s*<nav className="cabinet-nav"/);
   assert.match(frame, /aria-current=\{key === tab \? 'page' : undefined\}/);
   // The address wraps and is never cut.
   assert.match(CSS, /\.cabinet-address \{[^}]*word-break: break-all;[^}]*\}/);
@@ -161,19 +168,26 @@ test('the dashboard: the whole address copied by a tap, how it was connected, Di
   assert.match(code('components/cabinet/CabinetProgress.tsx'), /aria-current=\{at === 'now' \? 'step' : undefined\}/);
 });
 
-// A typed address only views: every action the wallet itself confirms asks to connect it first.
-test('a typed address views: the actions the wallet confirms ask to connect first', () => {
-  assert.match(code('components/cabinet/CabinetProvider.tsx'), /viewOnly: current\?\.source === 'entered',/);
-  assert.match(code('components/cabinet/NodeDevices.tsx'), /\{viewOnly \? <div className="activate-card"><ConnectFirst \/><\/div> : \(\s*<>\s*<UnlinkDevice status=\{status\} onUnlinked=\{reread\} \/>\s*<LinkDevice onLinked=\{reread\} move \/>\s*<\/>\s*\)\}/);
-  assert.match(code('components/cabinet/NodeActivate.tsx'), /\} else if \(!record && viewOnly\) \{\s*body = <div className="activate-card"><ConnectFirst \/><\/div>;\s*\} else if \(!record && !offer\) \{/);
+// Owner, 13.10: View by address is no connection. The page says the address is viewed read only, with Stop viewing; no
+// action the wallet itself confirms (activate, link, unlink, move) is offered, nor a button to it in its place.
+test('an address only viewed: read only, with Stop viewing, and no action that needs the wallet', () => {
+  assert.match(code('components/cabinet/CabinetProvider.tsx'), /const \{ taken, connected, current, viewOnly \} = useMemo\(\s*\(\) => shownWallet\(/);
+  assert.match(code('lib/cabinet/wallet-choice.ts'), /const viewOnly = connected === null && viewing !== null;/);
+  assert.equal(existsSync(new URL('components/cabinet/ConnectFirst.tsx', SRC)), false);
+  for (const file of ['NodeHome', 'NodeDevices', 'NextSteps', 'NodeActivate', 'CabinetFrame', 'NodeHistory']) {
+    assert.doesNotMatch(code(`components/cabinet/${file}.tsx`), /ConnectFirst|leaveView/, file);
+  }
+  assert.match(code('components/cabinet/NodeDevices.tsx'), /\{!viewOnly && \(\s*<>\s*<UnlinkDevice status=\{status\} onUnlinked=\{reread\} \/>\s*<LinkDevice onLinked=\{reread\} move \/>\s*<\/>\s*\)\}/);
+  assert.match(code('components/cabinet/NodeActivate.tsx'), /\} else if \(!record && viewOnly\) \{\s*body = <div className="activate-card"><p>\{t\('connect_first'\)\}<\/p><\/div>;\s*\} else if \(!record && !offer\) \{/);
+  assert.match(code('components/cabinet/NodeActivate.tsx'), /<div className="activate-card"><p>\{t\(viewOnly \? 'connect_first' : 'act_no_wallet'\)\}<\/p><\/div>/);
   const home = code('components/cabinet/NodeHome.tsx');
   // No node: the one card every section shows (NextSteps.tsx), with the wallet's state; on the Overview with the code
   // and its next step when a burn is known.
   assert.match(home, /if \(view\.state !== 'node'\) return <NoNode pending=\{view\.state === 'recording'\} overview \/>;/);
   assert.match(home, /if \(state === 'none' \|\| state === 'pending'\) \{\s*return \(\s*<>\s*<NoNode pending=\{state === 'pending'\} overview \/>/);
   const steps = code('components/cabinet/NextSteps.tsx');
-  // With nothing anywhere: both node types (R2), or Connect your wallet for an address only viewed.
-  assert.match(steps, /\{viewOnly \? <ConnectFirst \/> : \(\s*<div className="cabinet-actions">\s*<Link href=\{`\$\{TAB_HREF\.activate\}\?type=light`\} className="qnet-button activate-primary">\{t\('action_activate_light'\)\}<\/Link>\s*<Link href=\{`\$\{TAB_HREF\.activate\}\?type=super`\} className="qnet-button secondary">\{t\('action_activate_super'\)\}<\/Link>/);
+  // With nothing anywhere: both node types (R2), none for an address only viewed.
+  assert.match(steps, /\{!viewOnly && \(\s*<div className="cabinet-actions">\s*<Link href=\{`\$\{TAB_HREF\.activate\}\?type=light`\} className="qnet-button activate-primary">\{t\('action_activate_light'\)\}<\/Link>\s*<Link href=\{`\$\{TAB_HREF\.activate\}\?type=super`\} className="qnet-button secondary">\{t\('action_activate_super'\)\}<\/Link>/);
   assert.equal(TEXTS.action_activate_light, 'Activate a light node');
   assert.equal(TEXTS.action_activate_super, 'Activate a super node');
   for (const file of ['components/cabinet/NodeDevices.tsx', 'components/cabinet/NodeHistory.tsx']) {
@@ -183,12 +197,22 @@ test('a typed address views: the actions the wallet confirms ask to connect firs
   assert.match(code('components/cabinet/NodeDevices.tsx'), /if \(s === 'none' \|\| s === 'pending'\) return <NoNode pending=\{s === 'pending'\} \/>;/);
   // Link your phone: the numbered steps, then Link a device in place while the site sends link requests.
   assert.match(home, /\{state === 'no_device' && <LinkPhone onLinked=\{reread\} \/>\}/);
-  assert.match(steps, /\{onLinked && phoneFlows && \(viewOnly \? <div className="activate-card"><ConnectFirst \/><\/div> : <LinkDevice onLinked=\{onLinked\} \/>\)\}/);
-  // The node balance of either type moves from here too (owner, 12.10): a typed address is asked to connect first.
-  assert.equal(home.match(/\{movable && viewOnly && <ConnectFirst \/>\}/g)?.length, 2);
+  assert.match(steps, /\{onLinked && phoneFlows && !viewOnly && <LinkDevice onLinked=\{onLinked\} \/>\}/);
+  // The way back into an activation of this browser, and asking the extension to record again: not for a view.
+  assert.match(steps, /\{!viewOnly && <Link href=\{TAB_HREF\.activate\} className="qnet-button activate-primary">\{t\('code_continue'\)\}<\/Link>\}/);
+  assert.match(steps, /\{late && askAgain && extension && !viewOnly && \(/);
+  assert.match(code('components/cabinet/NodeDetails.tsx'), /\{facts\?\.open && !viewOnly && <Link href=\{TAB_HREF\.activate\}/);
+  // The node balance of either type moves from here too (owner, 12.10), never for an address only viewed.
   assert.equal(home.match(/\{\(movable \|\| moved\) && !viewOnly && choice && \(/g)?.length, 2);
-  // Connecting leaves the typed address (no Disconnect); the connect screen, or the extension's wallet, follows.
-  assert.match(code('components/cabinet/ConnectFirst.tsx'), /<button type="button" className="qnet-button activate-primary" onClick=\{leaveView\}>\{t\('connect_first_button'\)\}<\/button>/);
+  // Each action keeps itself from a view as well.
+  for (const file of ['LinkDevice', 'UnlinkDevice']) assert.match(code(`components/cabinet/${file}.tsx`), /if \(viewOnly\) return null;/, file);
+  assert.match(code('components/cabinet/NodeClaim.tsx'), /if \(viewOnly\) return null;\s*return \(/);
+  // The page's line: viewed, read only, and Stop viewing (back to the connect screen, no Disconnect).
+  const frame = code('components/cabinet/CabinetFrame.tsx');
+  assert.match(frame, /<p className="cabinet-kicker" role="status">\{t\('view_line', \{ wallet: shortAddress\(qnet\) \}\)\}<\/p>/);
+  assert.equal(TEXTS.view_line, 'Viewing {wallet} — read only');
+  assert.equal(TEXTS.view_stop, 'Stop viewing');
+  assert.match(TEXTS.view_note, /^Only what QNet Blockchain shows publicly for this address\. Nothing here acts for it/);
 });
 
 test('the Overview offers the one next step in place: activate, link a device, or run the node on the phone again', () => {
@@ -251,11 +275,11 @@ test('one connect logic: the header connects the extension or leads to My node, 
   // The header reads the one remembered wallet and Disconnect mark, through My node's provider, and hears their changes.
   const provider = code('components/cabinet/CabinetProvider.tsx');
   assert.match(provider, /export function useHeldWallet\(\): string \| null \{/);
-  assert.match(provider, /const read = \(\) => \{\s*const storage = localStore\(\);\s*setKept\(heldHere \?\? \{ choice: loadChoice\(storage\), disconnected: loadDisconnected\(storage\) \}\);\s*\};/);
+  assert.match(provider, /const read = \(\) => setKept\(heldHere \?\? storedHeld\(\)\);/);
   // Choosing, Disconnect, the header's wallet and the extension's wallet taken up all write through one step that tells
   // the page; My node's pages hear it too.
   assert.equal(provider.match(/window\.dispatchEvent\(new Event\(HELD_EVENT\)\);/g)?.length, 1);
-  assert.match(provider, /export function chooseWallet\(next: WalletChoice\): void \{\s*hold\(next, next\.source !== 'entered' \? false : undefined\);\s*\}/);
+  assert.match(provider, /export function chooseWallet\(next: WalletChoice\): void \{\s*hold\(\{ choice: next, disconnected: false \}\);\s*\}/);
   assert.match(provider, /window\.addEventListener\(HELD_EVENT, onHeld\);/);
   const screen = code('components/cabinet/ConnectScreen.tsx');
   assert.match(screen, /if \(!shown \|\| window\.location\.hash !== `#\$\{CONNECT_ID\}`\) return;\s*if \(card\.current\) showConnectCard\(card\.current, false\);/);

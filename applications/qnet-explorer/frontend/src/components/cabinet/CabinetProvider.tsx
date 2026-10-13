@@ -12,14 +12,17 @@
 // state, and none offers a burn unless it is `none`.
 // The site's header shows the same wallet on every page (useHeldWallet) and keeps a wallet it connected with the same
 // step (chooseWallet); a change made in another tab reaches this one through the storage event.
+// View by address is no connection: the typed address is kept for this tab apart from the wallet (wallet-choice.ts
+// VIEW_KEY), shown read only (viewOnly), never in the header, and no extension's wallet is taken up while it is shown;
+// a wallet connected with a tap ends it.
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useWallet } from '@/contexts/AppContext';
 import { useNodeStatus, useSuperStatus, useWalletNode } from '@/hooks/useNodeStatus';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
 import {
-  DISCONNECTED_KEY, WALLET_KEY, awaitsExtension, choiceView, clearChoice, extensionReconnect, loadChoice, loadDisconnected, saveChoice, saveDisconnected,
-  type WalletChoice,
+  DISCONNECTED_KEY, WALLET_KEY, awaitsExtension, choiceView, clearChoice, loadChoice, loadDisconnected, loadViewing, saveChoice, saveDisconnected,
+  saveViewing, shownWallet, type WalletChoice,
 } from '@/lib/cabinet/wallet-choice';
 import { ACTIVATIONS_KEY, keepAnswer, loadKept, type KeptActivation, type KeptActivations } from '@/lib/cabinet/kept-activation';
 import { SCAN_CACHE_MS, parseActivationRecord, type ActivationRecordView, type ScanView } from '@/lib/cabinet/burn-record';
@@ -30,10 +33,11 @@ interface CabinetValue {
   // False until the remembered choice was read and, while the extension's first answer may still set the wallet, until
   // that answer came (awaitsExtension).
   ready: boolean;
+  // The wallet the pages show: the connected one, or while viewing the typed address (source `entered`).
   choice: WalletChoice | null;
   nodeId: string | null;
   walletHash: string | null;
-  // An address typed on the page: shown, never acted for.
+  // View by address: no wallet is connected; the typed address is shown read only, never acted for.
   viewOnly: boolean;
   // The site's CABINET_PHONE_FLOWS: `link`, `reserve`, `unlink` and `claim` requests to QNet Wallet are offered.
   phoneFlows: boolean;
@@ -50,8 +54,9 @@ interface CabinetValue {
   choose: (choice: WalletChoice) => void;
   // Disconnect: the wallet goes, and the extension's wallet is not taken up by itself until a tap connects one.
   forget: () => void;
-  // Leaves a typed address for the connect screen (ConnectFirst); not a Disconnect, so it leaves no mark.
-  leaveView: () => void;
+  // View by address, and its end (back to the connect screen; not a Disconnect, so it leaves no mark).
+  viewAddress: (qnet: string) => void;
+  stopViewing: () => void;
   // Keeps a checked activation answer of the extension for the wallet it names.
   keepActivation: (answer: ActivationAnswer) => void;
 }
@@ -86,25 +91,49 @@ function localStore(): Storage | null {
   }
 }
 
-type Held = { choice: WalletChoice | null; disconnected: boolean };
+function tabStore(): Storage | null {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+// The remembered wallet, the Disconnect mark, and the address this tab views (none while a wallet is connected).
+type Held = { choice: WalletChoice | null; disconnected: boolean; viewing: string | null };
 
 // What this tab kept last: the page reads it before the store, which may be blocked.
 let heldHere: Held | null = null;
 
-// The one step that changes the remembered wallet: the Disconnect mark first when it changes, then the wallet, then
-// the page is told (My node's pages and the header read both).
-function hold(next: WalletChoice | null, disconnected?: boolean): void {
+function storedHeld(): Held {
   const storage = localStore();
-  if (disconnected !== undefined) saveDisconnected(storage, disconnected);
-  if (next) saveChoice(storage, next);
-  else clearChoice(storage);
-  heldHere = { choice: next, disconnected: disconnected ?? heldHere?.disconnected ?? loadDisconnected(storage) };
+  const choice = loadChoice(storage);
+  return { choice, disconnected: loadDisconnected(storage), viewing: choice ? null : loadViewing(tabStore()) };
+}
+
+// The one step that changes what the cabinet holds: the Disconnect mark first when it changes, then the wallet (a
+// connected one ends the view), then the view, then the page is told (My node's pages and the header read them). What
+// `change` leaves out stays.
+function hold(change: Partial<Held>): void {
+  const storage = localStore();
+  const next: Held = { ...(heldHere ?? storedHeld()), ...change };
+  if (change.choice) next.viewing = null;
+  if (change.disconnected !== undefined) saveDisconnected(storage, change.disconnected);
+  if (change.choice) saveChoice(storage, change.choice);
+  else if (change.choice === null) clearChoice(storage);
+  if (change.choice || change.viewing !== undefined) saveViewing(tabStore(), next.viewing);
+  heldHere = next;
   window.dispatchEvent(new Event(HELD_EVENT));
 }
 
-// A wallet connected with a tap, here or in the header: it lifts a Disconnect; an address typed only to look does not.
+// A wallet connected with a tap, here or in the header: it lifts a Disconnect and ends a view.
 export function chooseWallet(next: WalletChoice): void {
-  hold(next, next.source !== 'entered' ? false : undefined);
+  hold({ choice: next, disconnected: false });
+}
+
+// The header's Connect wallet while this tab views an address: the view, which hides the connect card, ends.
+export function endView(): void {
+  if ((heldHere ?? storedHeld()).viewing) hold({ viewing: null });
 }
 
 // The server's record of `wallet`, read on load, on return, after a step and on a timer, with the search of the wallet's
@@ -204,6 +233,7 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
   const [loaded, setLoaded] = useState(false);
   const [choice, setChoice] = useState<WalletChoice | null>(null);
   const [disconnected, setDisconnected] = useState(false);
+  const [viewing, setViewing] = useState<string | null>(null);
   const [activations, setActivations] = useState<KeptActivations>({});
   const [pulse, setPulse] = useState(0);
   const { providerStatus, providerChannel, accounts, accountsKnown } = useWallet();
@@ -211,24 +241,32 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
 
   useEffect(() => {
     const storage = localStore();
-    setChoice(loadChoice(storage));
-    setDisconnected(loadDisconnected(storage));
+    const stored = storedHeld();
+    // A view kept from before a wallet was connected (in another tab) is over.
+    if (stored.choice) saveViewing(tabStore(), null);
+    setChoice(stored.choice);
+    setDisconnected(stored.disconnected);
+    setViewing(stored.viewing);
     setLoaded(true);
     setActivations(loadKept(storage));
-    // Every change of the remembered wallet in this tab, the header's included.
+    // Every change of the remembered wallet or the view in this tab, the header's included.
     const onHeld = () => {
       if (!heldHere) return;
       setChoice(heldHere.choice);
       setDisconnected(heldHere.disconnected);
+      setViewing(heldHere.viewing);
     };
-    // A Disconnect, another wallet or another kept answer in another tab (SITE-F11): this tab's memory of it is over.
+    // A Disconnect, another wallet or another kept answer in another tab (SITE-F11): this tab's memory of it is over; a
+    // wallet connected there ends this tab's view too.
     const onStorage = (event: StorageEvent) => {
       if (event.key !== null && event.key !== WALLET_KEY && event.key !== DISCONNECTED_KEY && event.key !== ACTIVATIONS_KEY) return;
       heldHere = null;
-      const s = localStore();
-      setChoice(loadChoice(s));
-      setDisconnected(loadDisconnected(s));
-      setActivations(loadKept(s));
+      const now = storedHeld();
+      if (now.choice) saveViewing(tabStore(), null);
+      setChoice(now.choice);
+      setDisconnected(now.disconnected);
+      setViewing(now.viewing);
+      setActivations(loadKept(localStore()));
     };
     window.addEventListener(HELD_EVENT, onHeld);
     window.addEventListener('storage', onStorage);
@@ -243,13 +281,15 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
     };
   }, []);
 
-  const keep = useCallback((next: WalletChoice | null) => hold(next), []);
+  const keep = useCallback((next: WalletChoice) => hold({ choice: next }), []);
 
   const choose = useCallback((next: WalletChoice) => chooseWallet(next), []);
 
-  const forget = useCallback(() => hold(null, true), []);
+  const forget = useCallback(() => hold({ choice: null, disconnected: true }), []);
 
-  const leaveView = useCallback(() => keep(null), [keep]);
+  const viewAddress = useCallback((qnet: string) => hold({ viewing: qnet }), []);
+
+  const stopViewing = useCallback(() => hold({ viewing: null }), []);
 
   const keepActivation = useCallback((answer: ActivationAnswer) => {
     setActivations((current) => keepAnswer(localStore(), current, answer, Date.now()));
@@ -257,28 +297,31 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
 
   const refreshActivation = useCallback(() => setPulse((n) => n + 1), []);
 
-  // The extension's wallet as the cabinet takes it up: shown in this render, then kept.
-  const taken = loaded ? extensionReconnect(choice, channel, accounts, disconnected) : null;
+  // The extension's wallet as the cabinet takes it up (once the Disconnect mark is read, never while an address is
+  // viewed): shown in this render, then kept. One object per change, so the pages re-render only on one.
+  const { taken, connected, current, viewOnly } = useMemo(
+    () => shownWallet(choice, viewing, loaded ? channel : null, accounts, disconnected),
+    [choice, viewing, loaded, channel, accounts, disconnected],
+  );
   useEffect(() => {
     if (taken) keep(taken);
   }, [taken, keep]);
-  const current = taken ?? choice;
 
   // Nothing rather than the connect screen or the extension's earlier wallet for a moment.
-  const ready = loaded && !awaitsExtension(choice, channel, accountsKnown, disconnected);
+  const ready = loaded && (viewOnly || !awaitsExtension(choice, channel, accountsKnown, disconnected));
 
-  // Every source of the wallet's activation.
+  // Every source of the wallet's activation; a viewed address's light status is read without the device's details.
   const wallet = current?.qnet ?? null;
   const cv = current ? choiceView(current) : null;
   const network = useWalletNode(wallet);
-  const light = useNodeStatus(cv?.nodeId ?? null);
+  const light = useNodeStatus(cv?.nodeId ?? null, viewOnly);
   const listedSuper = network.state.phase === 'ok' && network.state.value.state === 'registered' && network.state.value.nodeType === 'super'
     ? network.state.value.nodeId : null;
   const superId = wallet ? listedSuper ?? superNodeId(wallet) : null;
   const superRead = useSuperStatus(superId);
   const server = useServerRecord(wallet, current?.solana ?? null, pulse);
   const busyRecord = server.read.phase === 'ok' && ['reserved', 'sending'].includes(server.read.value.state);
-  const applies = channel === 'extension' && current !== null && (current.source === 'extension' || accounts?.qnet === current.qnet);
+  const applies = channel === 'extension' && connected !== null && (connected.source === 'extension' || accounts?.qnet === connected.qnet);
   const asked = useExtensionActivation(applies, wallet, pulse, busyRecord);
   // A wallet chosen from the extension while no extension answers here: its source is not known (nothing is offered);
   // while the page still looks for the extension, it is loading.
@@ -286,7 +329,7 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
   const extension: ExtensionRead = !extensionGone ? asked
     : providerStatus === 'detecting' ? { phase: 'loading' } : { phase: 'failed', failure: 'disconnected' };
   const records = usePaymentRecords(pulse);
-  const kept = current ? activations[current.qnet] ?? null : null;
+  const kept = connected ? activations[connected.qnet] ?? null : null;
 
   // A step asks every read again, the shared network reads included.
   const { refresh: refreshNetwork } = network;
@@ -331,10 +374,11 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
   }, [watch, step, watchSuper, refreshNetwork, refreshLight, refreshSuper]);
 
   const value = useMemo<CabinetValue>(() => ({
-    ready, choice: current, nodeId: cv?.nodeId ?? null, walletHash: cv?.walletHash ?? null, viewOnly: current?.source === 'entered', phoneFlows,
-    activation: kept, view, record: server.read.phase === 'ok' ? server.read.value : null, superId, refreshActivation, choose, forget, leaveView,
-    keepActivation,
-  }), [ready, current, cv?.nodeId, cv?.walletHash, phoneFlows, kept, view, server.read, superId, refreshActivation, choose, forget, leaveView, keepActivation]);
+    ready, choice: current, nodeId: cv?.nodeId ?? null, walletHash: cv?.walletHash ?? null, viewOnly, phoneFlows,
+    activation: kept, view, record: server.read.phase === 'ok' ? server.read.value : null, superId, refreshActivation, choose, forget, viewAddress,
+    stopViewing, keepActivation,
+  }), [ready, current, cv?.nodeId, cv?.walletHash, viewOnly, phoneFlows, kept, view, server.read, superId, refreshActivation, choose, forget, viewAddress,
+    stopViewing, keepActivation]);
 
   return <CabinetContext.Provider value={value}>{children}</CabinetContext.Provider>;
 }
@@ -345,16 +389,14 @@ export function useCabinet(): CabinetValue {
   return value;
 }
 
-// The address of the wallet My node shows, for the site's header on every page: the one it remembers, or the
-// extension's it takes up (extensionReconnect); null before it is read.
+// The address of the connected wallet, for the site's header on every page: the one My node remembers, or the
+// extension's it takes up (extensionReconnect, not while this tab views an address); never a viewed address; null
+// before it is read.
 export function useHeldWallet(): string | null {
   const { providerStatus, providerChannel, accounts } = useWallet();
   const [kept, setKept] = useState<Held | null>(null);
   useEffect(() => {
-    const read = () => {
-      const storage = localStore();
-      setKept(heldHere ?? { choice: loadChoice(storage), disconnected: loadDisconnected(storage) });
-    };
+    const read = () => setKept(heldHere ?? storedHeld());
     // Another tab changed the store: this tab's memory of it is over.
     const onStorage = () => {
       heldHere = null;
@@ -370,5 +412,5 @@ export function useHeldWallet(): string | null {
   }, []);
   if (!kept) return null;
   const channel = providerStatus === 'available' ? providerChannel : null;
-  return (extensionReconnect(kept.choice, channel, accounts, kept.disconnected) ?? kept.choice)?.qnet ?? null;
+  return shownWallet(kept.choice, kept.viewing, channel, accounts, kept.disconnected).connected?.qnet ?? null;
 }

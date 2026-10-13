@@ -26,7 +26,7 @@ function answerKey(answer: LinkAnswer): MessageKey {
 }
 
 export default function LinkDevice({ onLinked, move = false, relink = false }: { onLinked: () => void; move?: boolean; relink?: boolean }) {
-  const { choice, walletHash, phoneFlows } = useCabinet();
+  const { choice, walletHash, viewOnly, phoneFlows } = useCabinet();
   const device = useDeviceKind();
   // The button on this device, and a request shown as a QR code: two sessions, never one.
   const button = useLinkSession({ slot: 'devices' });
@@ -40,6 +40,8 @@ export default function LinkDevice({ onLinked, move = false, relink = false }: {
     if (linked) onLinkedRef.current();
   }, [linked]);
 
+  // An address only viewed is never offered a link.
+  if (viewOnly) return null;
   // Until the site sends link requests, the way is the app's own Node tab: said in the card's own words, not as a note.
   if (!phoneFlows && relink) return <p className="activate-note">{t('relink_closed')}</p>;
   if (!phoneFlows) {

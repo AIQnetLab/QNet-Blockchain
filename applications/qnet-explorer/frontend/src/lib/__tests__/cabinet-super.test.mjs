@@ -206,6 +206,6 @@ test('the status rows: waiting for network admission instead of Offline, the pac
   // wallet's own super node (owner, 12.10).
   const home = code('components/cabinet/NodeHome.tsx');
   const overview = home.slice(home.indexOf('function SuperOverview('), home.indexOf('function Overview('));
-  assert.match(overview, /<BalanceRow status=\{status\} \/>\s*<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/);
+  assert.match(overview, /<BalanceRow status=\{status\} \/>\s*<Earned nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\} \/>\s*<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/);
   assert.match(overview, /<Move\s+qnet=\{choice\.qnet\}\s+nodeId=\{nodeId\}/);
 });

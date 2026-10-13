@@ -11,8 +11,9 @@
 // height and the server's), its balance, its
 // details with the server's steps and its latest epochs. A balance of either type is moved into the wallet from here
 // with Move to wallet (NodeClaim.tsx: the extension's window on this computer, or QNet Wallet; owner, 12.10), as from
-// QNet Wallet's Node tab; every epoch on History (owner, 11.10: no count over a window of recent epochs, the epochs
-// themselves). A wallet with both shows both.
+// QNet Wallet's Node tab, and comes with the total earned, moved plus the node balance (NodeHistory.tsx Earned; owner,
+// 13.10); every epoch on History (owner, 11.10: no count over a window of recent epochs, the epochs themselves). A
+// wallet with both shows both. An address only viewed gets the public facts alone: no action, no device details.
 // All of it follows the wallet, not the way it was connected: the network, the explorer's archive and the site's record
 // for every wallet (src/lib/cabinet/wallet-activation.ts). A bare /node opens Activate only for a connected wallet with
 // nothing anywhere (src/lib/cabinet/tabs.ts landingTab); ?tab=overview stays.
@@ -27,12 +28,11 @@ import { TAB_HREF, landingTab } from '@/lib/cabinet/tabs';
 import { lightSectionState } from '@/lib/cabinet/wallet-activation';
 import CabinetFrame from './CabinetFrame';
 import { useCabinet } from './CabinetProvider';
-import ConnectFirst from './ConnectFirst';
 import LinkDevice from './LinkDevice';
 import { LinkPhone, NoNode } from './NextSteps';
 import { Move } from './NodeClaim';
 import NodeDetails, { lightStatusText, useWalletActivation, type WalletActivation } from './NodeDetails';
-import { Epochs } from './NodeHistory';
+import { Earned, Epochs } from './NodeHistory';
 import { BalanceRow, DeviceRows, StatusGate, SuperRows } from './NodeStatus';
 
 function Summary({ nodeId, status, refresh, known }: { nodeId: string; status: NodeStatusView; refresh: () => void; known: WalletActivation }) {
@@ -72,8 +72,8 @@ function Summary({ nodeId, status, refresh, known }: { nodeId: string; status: N
       <div className="activate-card">
         <h3 className="activate-step">{t('balance_title')}</h3>
         <BalanceRow status={status} />
+        <Earned nodeId={nodeId} balanceNano={status.balanceNano} />
         <p className="activate-note">{t('balance_lead')}</p>
-        {movable && viewOnly && <ConnectFirst />}
         {(movable || moved) && !viewOnly && choice && (
           <Move
             qnet={choice.qnet}
@@ -96,7 +96,8 @@ function Summary({ nodeId, status, refresh, known }: { nodeId: string; status: N
 }
 
 function LightOverview({ nodeId }: { nodeId: string }) {
-  const { state, retry, refresh } = useNodeStatus(nodeId);
+  const { viewOnly } = useCabinet();
+  const { state, retry, refresh } = useNodeStatus(nodeId, viewOnly);
   const known = useWalletActivation('light');
   return <StatusGate state={state} retry={retry}>{(status) => <Summary nodeId={nodeId} status={status} refresh={refresh} known={known} />}</StatusGate>;
 }
@@ -130,8 +131,8 @@ function SuperOverview({ nodeId }: { nodeId: string }) {
       <div className="activate-card">
         <h3 className="activate-step">{t('balance_title')}</h3>
         <BalanceRow status={status} />
+        <Earned nodeId={nodeId} balanceNano={status.balanceNano} />
         <p className="activate-note">{t('balance_lead')}</p>
-        {movable && viewOnly && <ConnectFirst />}
         {(movable || moved) && !viewOnly && choice && (
           <Move
             qnet={choice.qnet}

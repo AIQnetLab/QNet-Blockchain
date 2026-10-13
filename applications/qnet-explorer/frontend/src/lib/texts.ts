@@ -51,10 +51,14 @@ export const TEXTS = {
   wallet_source_extension: 'Connected with the QNet Wallet extension.',
   wallet_source_app: 'Connected with QNet Wallet on this device.',
   wallet_source_app_qr: 'Connected with QNet Wallet by QR code.',
-  wallet_source_entered: 'View only: you typed this address.',
   wallet_disconnect: 'Disconnect',
   connect_first: 'You are only viewing this address. To make changes, connect the wallet itself.',
   connect_first_button: 'Connect your wallet',
+
+  // An address typed only to look (View by address): no wallet is connected
+  view_line: 'Viewing {wallet} — read only',
+  view_note: 'Only what QNet Blockchain shows publicly for this address. Nothing here acts for it, and the device that runs its node stays private. To activate, link a device or move the node balance, stop viewing and connect the wallet itself.',
+  view_stop: 'Stop viewing',
 
   // Where the wallet is on the way to a running node
   progress_label: 'Your progress',
@@ -272,6 +276,12 @@ export const TEXTS = {
   // Node balance, of a light or a super node, and Move to wallet (owner, 12.10: through this site too)
   balance_title: 'Node balance',
   balance_lead: 'Each counted epoch adds QNC to the node balance, which QNet Blockchain keeps for this wallet. From 1 QNC, move it into the wallet: the wallet signs the move, and this page only asks.',
+  // Owner, 13.10: the whole sum, moved to the wallet plus the node balance, from the explorer archive's moves.
+  earned_total: 'Total earned: {amount} QNC',
+  earned_split: 'Moved to the wallet: {moved} QNC · in the node balance: {balance} QNC',
+  earned_reading: 'Total earned: reading the latest moves again…',
+  earned_unknown: 'Total earned: could not be read.',
+  earned_unknown_split: 'Moved to the wallet: could not be read · in the node balance: {balance} QNC',
   claim_with_extension: 'Move to wallet with the extension',
   claim_extension_note: 'The extension shows the amount before it moves anything.',
   claim_with_app: 'Move with QNet Wallet',

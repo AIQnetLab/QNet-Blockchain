@@ -37,7 +37,7 @@ function Report({ answer, via }: { answer: LinkAnswer; via: ClaimVia }) {
 // The ways to move the balance of `nodeId`, the wallet's light or super node; kept mounted when the balance falls below
 // 1 QNC, so a report stays on screen.
 export function Move({ qnet, nodeId, movable, onAnswer }: { qnet: string; nodeId: string; movable: boolean; onAnswer: () => void }) {
-  const { choice, phoneFlows } = useCabinet();
+  const { choice, viewOnly, phoneFlows } = useCabinet();
   const { providerStatus, providerChannel, accounts, claimNodeBalance } = useWallet();
   const device = useDeviceKind();
   // One session per node: a wallet with both node types shows two balances.
@@ -74,6 +74,8 @@ export function Move({ qnet, nodeId, movable, onAnswer }: { qnet: string; nodeId
     void qr.start('claim', request);
   };
 
+  // An address only viewed is never offered a move.
+  if (viewOnly) return null;
   return (
     <>
       {extension && (

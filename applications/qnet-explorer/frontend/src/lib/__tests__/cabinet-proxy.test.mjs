@@ -445,17 +445,20 @@ test('the history: a page of the epochs a node settled, a second node for the on
     ],
     // The node has more, and the page did not reach the registration's epoch.
     more: true,
+    // The first node gave no balance before its page (cabinet-earned.test.mjs has the total).
+    earned: null,
   });
   assert.deepEqual(parseHistoryView(body), body);
   assert.equal(JSON.stringify(body).includes('eon'), false, 'the wallet the node names is not passed on');
-  // Two nodes, one page of 30 epochs each; the archive for the wallet the nodes name, which is the node's.
-  assert.deepEqual(calls.map((c) => c.path), [`/api/v1/rewards/history/${NODE}?limit=30`, `/api/v1/rewards/history/${NODE}?limit=30`]);
+  // Two nodes, one page of 30 epochs each, the first one's node balance read just before its page; the archive for the
+  // wallet the nodes name, which is the node's.
+  assert.deepEqual(calls.map((c) => c.path), [`/api/v1/rewards/pending/${NODE}`, `/api/v1/rewards/history/${NODE}?limit=30`, `/api/v1/rewards/history/${NODE}?limit=30`]);
   assert.deepEqual(asked, [{ wallet: WALLET, nodeId: NODE, keys: first.history.filter((r) => r.status !== 'a_status_to_come').map((r) => r.epoch) }]);
   await p.history(get(`${BASE}/history`), NODE, archive);
-  assert.equal(calls.length, 2, 'cached');
+  assert.equal(calls.length, 3, 'cached');
   advance(HISTORY_CACHE_MS);
   await p.history(get(`${BASE}/history`), NODE, archive);
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 6);
   assert.equal((await proxy({}).p.history(get(`${BASE}/history`), NODE)).status, 503);
 });
 
@@ -476,8 +479,10 @@ test('the history without the archive: undated, nothing left out; one node when 
     archived: false,
     rows: [{ epoch: 10, result: 'missed', amountQnc: null, startedAt: null, endedAt: null, claimTx: null }, { epoch: 9, result: 'moved', amountQnc: 1, startedAt: null, endedAt: null, claimTx: null }],
     more: true,
+    earned: null,
   });
-  assert.equal(calls.length, 1);
+  // The node balance asked before the page (none here), and the page.
+  assert.equal(calls.length, 2);
   assert.equal(archived, 1);
   // A node that names a wallet the id does not derive from (a genesis node's): the archive is asked for that wallet, and
   // older pages are offered.
@@ -671,6 +676,7 @@ test('the archive: the wallet\'s first registration and its super node\'s, kept 
   assert.deepEqual(queries.map((q) => q.params), [[WALLET], [WALLET, endOf(2)], [[startOf(3), endOf(3), startOf(2)]]]);
   assert.deepEqual(facts, {
     registeredHeight: 1000, superHeight: null, claims: new Map([[key(2), { tx: TX('3'), amountNano: '7' }]]), times: new Map([[endOf(2), 1_790_000_000_000]]),
+    moved: null,
   });
   // Registrations found without the super node's are read again after REGISTRATION_RECHECK_MS (the wallet may still
   // register one); nothing to date or move: no other read.
@@ -723,7 +729,7 @@ test('the parsers take only the fields they know, in their forms', () => {
   assert.equal(parseStatusView({ ...view, extra: 1 }), null);
   assert.equal(parseStatusView({ ...view, balanceNano: 1 }), null);
   assert.equal(parseStatusView({ ...view, balanceNano: '01' }), null);
-  const epochs = { registeredEpoch: 3, archived: true, rows: [{ epoch: 4, result: 'missed', amountQnc: null, startedAt: 0, endedAt: 1, claimTx: null }], more: false };
+  const epochs = { registeredEpoch: 3, archived: true, rows: [{ epoch: 4, result: 'missed', amountQnc: null, startedAt: 0, endedAt: 1, claimTx: null }], more: false, earned: null };
   assert.deepEqual(parseHistoryView(epochs), epochs);
   const full = { ...epochs, rows: Array.from({ length: HISTORY_PAGE_ROWS + 1 }, (_, i) => ({ ...epochs.rows[0], epoch: i })) };
   assert.deepEqual(parseHistoryView(full), full);
@@ -737,6 +743,12 @@ test('the parsers take only the fields they know, in their forms', () => {
     { ...epochs, rows: [{ epoch: 4, result: 'missed', amountQnc: null, endedAt: 1, claimTx: null }] },
     { ...epochs, more: 'yes' },
     { registeredEpoch: 3, archived: true, rows: [] },
+    { registeredEpoch: 3, archived: true, rows: [], more: false },
+    { ...epochs, earned: undefined },
+    { ...epochs, earned: { movedNano: '1' } },
+    { ...epochs, earned: { movedNano: 1, balanceNano: '2' } },
+    { ...epochs, earned: { movedNano: '01', balanceNano: '2' } },
+    { ...epochs, earned: { movedNano: '1', balanceNano: '2', totalNano: '3' } },
     { ...epochs, earlier: [] },
     { ...full, rows: [...full.rows, { ...epochs.rows[0], epoch: 99 }] },
     { ...epochs, rows: [{ ...epochs.rows[0], amountQnc: -1 }] },

@@ -2,8 +2,8 @@
 
 // /node/device, the Device tab: the device that runs the light node, from the public status's `device` (its state:
 // Online, Offline, or a new device waiting for its first answer; its model and platform as it said when it linked, the
-// UTC day it linked, whether it answered this epoch and the epoch of its last answer; for a typed address its platform,
-// state and epochs only). With a device linked, "Unlink the device" (UnlinkDevice.tsx:
+// UTC day it linked, whether it answered this epoch and the epoch of its last answer; for an address only viewed its
+// state and epochs only, read without the device's details). With a device linked, "Unlink the device" (UnlinkDevice.tsx:
 // the wallet signs it, the QNet extension that holds it or QNet Wallet on any device; the device's own form while the
 // network does not take the wallet's) and "Move the node to another device", the same request that runs the node on
 // a phone again. With none, Link a device in numbered steps (NextSteps.tsx LinkPhone). A super node runs on its server:
@@ -16,7 +16,6 @@ import { STATUS_KEPT_MS, isLinkedState } from '@/lib/cabinet/node-view';
 import { lightSectionState } from '@/lib/cabinet/wallet-activation';
 import CabinetFrame from './CabinetFrame';
 import { useCabinet } from './CabinetProvider';
-import ConnectFirst from './ConnectFirst';
 import LinkDevice from './LinkDevice';
 import { LinkPhone, NoNode } from './NextSteps';
 import { DeviceRows, StatusGate, SuperRows } from './NodeStatus';
@@ -24,7 +23,7 @@ import UnlinkDevice from './UnlinkDevice';
 
 function Devices({ nodeId }: { nodeId: string }) {
   const { viewOnly, view } = useCabinet();
-  const { state, retry, refresh } = useNodeStatus(nodeId);
+  const { state, retry, refresh } = useNodeStatus(nodeId, viewOnly);
   return (
     <StatusGate state={state} retry={retry}>
       {(status) => {
@@ -42,7 +41,8 @@ function Devices({ nodeId }: { nodeId: string }) {
               <DeviceRows status={status} full viewOnly={viewOnly} />
               <p className="activate-note">{t('devices_lead')}</p>
             </div>
-            {viewOnly ? <div className="activate-card"><ConnectFirst /></div> : (
+            {/* An address only viewed: nothing that needs the wallet. */}
+            {!viewOnly && (
               <>
                 <UnlinkDevice status={status} onUnlinked={reread} />
                 <LinkDevice onLinked={reread} move />

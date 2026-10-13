@@ -52,8 +52,9 @@ function MissLine({ status, full }: { status: NodeStatusView; full: boolean }) {
 // (node-view.ts deviceName), the day it linked and the epoch of its last answer, from the public status's `device`
 // (none from a node of an earlier version: then the last counted epoch). Last, the latest epoch not counted: on the
 // Device tab for an Online or Offline device (also once counted again, when the device told what happened to the
-// wake), on the Overview beside the Offline state, where running the node on the phone again follows. `viewOnly` (a
-// typed address): the platform, the state and the epochs only, no model, no day it linked and no miss.
+// wake), on the Overview beside the Offline state, where running the node on the phone again follows. `viewOnly` (an
+// address only viewed, whose status comes without them, node-view.ts publicStatus): the network's facts only, the state
+// and the epochs; no platform, no model, no day it linked and no miss, which are the owner's device details.
 // Shown for a node on the network only, also one listed while its status still catches up.
 export function DeviceRows({ status, full = false, viewOnly = false }: { status: NodeStatusView; full?: boolean; viewOnly?: boolean }) {
   const state = nodeState(status);
@@ -62,7 +63,7 @@ export function DeviceRows({ status, full = false, viewOnly = false }: { status:
   const device = status.device ?? null;
   const last = device ? device.lastAnswerEpoch : status.counted.lastCountedEpoch;
   const missed = !viewOnly && (state === 'offline' || (full && state === 'online'));
-  const named = device && viewOnly ? { platform: device.platform, model: null } : device;
+  const named = viewOnly ? null : device;
   return (
     <>
       <p className="cabinet-badge-row">

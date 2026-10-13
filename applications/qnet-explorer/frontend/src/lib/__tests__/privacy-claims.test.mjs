@@ -61,6 +61,10 @@ test('what the site stores in the browser: the address view, the node pages\' wa
   const provider = readFileSync(new URL('components/cabinet/CabinetProvider.tsx', SRC), 'utf8');
   assert.deepEqual(provider.match(/localStorage\.?\w*/g), ['localStorage']);
   assert.match(readFileSync(new URL('lib/cabinet/wallet-choice.ts', SRC), 'utf8'), /export const WALLET_KEY = 'qnet\.cabinet\.wallet';/);
+  // View by address: one key in this tab's session storage, apart from the wallet, until Stop viewing or a connect.
+  assert.match(policy, /When you view an address on the node pages \(View by address\), the page keeps that address in this tab's session storage until you press Stop viewing there or connect a wallet: it is no connected wallet, and its node is read without the details of the device that runs it\./);
+  assert.deepEqual(provider.match(/sessionStorage\.?\w*/g), ['sessionStorage']);
+  assert.match(readFileSync(new URL('lib/cabinet/wallet-choice.ts', SRC), 'utf8'), /export const VIEW_KEY = 'qnet\.cabinet\.view';/);
   // The extension's activation, kept per wallet with its public fields only, at most five wallets.
   const kept = read(SRC, 'lib/cabinet/kept-activation.ts');
   assert.match(kept, /export const ACTIVATIONS_KEY = 'qnet\.cabinet\.activations';/);

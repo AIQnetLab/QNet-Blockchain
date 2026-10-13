@@ -50,7 +50,6 @@ import { installTarget, shortAddress } from '@/lib/qnet-provider';
 import { AnswerCheck, Funding, Leftovers, LeftoversNow, Receipt, Registered } from './ActivateSteps';
 import CabinetFrame from './CabinetFrame';
 import { useCabinet } from './CabinetProvider';
-import ConnectFirst from './ConnectFirst';
 import ExtensionActivate, { requestedType } from './ExtensionActivate';
 import LinkWaiting from './LinkWaiting';
 import { NoNode, NodeNext } from './NextSteps';
@@ -130,7 +129,7 @@ export default function NodeActivate() {
   const { ready, choice, choose, viewOnly, view, refreshActivation, nodeId, phoneFlows } = useCabinet();
   // The wallet's light node status the cabinet reads anyway: a network that does not list the v2 owner bind on both
   // settling nodes takes no payment burn yet. Read again before an address is made and before a burn is signed.
-  const lightStatus = useNodeStatus(nodeId);
+  const lightStatus = useNodeStatus(nodeId, viewOnly);
   const paymentClosed = lightStatus.state.phase === 'ok' && !lightStatus.state.value.features.includes(OWNER_BIND_V2_FEATURE);
   const { providerStatus, providerChannel, accounts } = useWallet();
   const extension = providerStatus === 'available' && providerChannel === 'extension';
@@ -545,8 +544,8 @@ export default function NodeActivate() {
   if (!ready || record === undefined || supported === null) {
     body = null;
   } else if (!record && viewOnly) {
-    // A typed address is only viewed: the wallet itself connects before an activation for it starts.
-    body = <div className="activate-card"><ConnectFirst /></div>;
+    // An address only viewed: the wallet itself connects before an activation for it starts.
+    body = <div className="activate-card"><p>{t('connect_first')}</p></div>;
   } else if (!record && !offer) {
     // The wallet has a node, a burn, something on its way, or a source that did not answer: its state and next step;
     // nothing new starts here. The extension's answer given on this page stays in view instead of the state card.
@@ -669,7 +668,7 @@ export default function NodeActivate() {
             <button type="button" className="qnet-button activate-primary" onClick={() => void burn()} disabled={working || paymentClosed}>{t('act_burn')}</button>
           </div>
         ) : choice === null || viewOnly ? (
-          <div className="activate-card"><p>{t('act_no_wallet')}</p>{viewOnly && <ConnectFirst />}</div>
+          <div className="activate-card"><p>{t(viewOnly ? 'connect_first' : 'act_no_wallet')}</p></div>
         ) : view.state === 'node' ? (
           <div className="activate-card"><p>{t('act_wallet_has_node')}</p></div>
         ) : <NoNode pending={view.state === 'recording'} />)}

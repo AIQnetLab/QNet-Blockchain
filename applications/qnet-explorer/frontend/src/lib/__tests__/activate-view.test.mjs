@@ -120,7 +120,7 @@ test('the extension\'s activation on /node/activate: one call, the hold kept for
   // node id its log will name.
   assert.match(view, /\) : answer\.nodeType === 'super' && answer\.code \? \(\s*<SuperNext code=\{answer\.code\} burnTx=\{burnTx\} burnAmount=\{burnAmount\} nodeId=\{answer\.qnet \? superNodeId\(answer\.qnet\) : null\} \/>/);
   const light = page.slice(page.indexOf('function LightNext('), page.indexOf('function AnswerView('));
-  assert.match(light, /const \{ state \} = useNodeStatus\(lightNodeId\(qnet\)\);/);
+  assert.match(light, /const \{ state \} = useNodeStatus\(lightNodeId\(qnet\), viewOnly\);/);
   // Or as soon as the network lists it for the cabinet's wallet (owner, 30.09: the page moves on by itself).
   assert.match(light, /const listed = choice\?\.qnet === qnet && view\.nodes\.includes\('light'\);/);
   assert.match(light, /const registered = listed \|\| \(state\.phase === 'ok' && nodeState\(state\.value\) !== 'none' && nodeState\(state\.value\) !== 'pending'\);/);
@@ -187,8 +187,9 @@ test('the record on the network: its progress, and Record on the network after a
   // "Nothing is burned again" only for a final burn; a registration the extension did not make is not asked of it.
   assert.match(steps, /\{t\(burnFinal \? 'next_record_again_lead' : 'next_record_again_lead_pending'\)\}/);
   assert.doesNotMatch(TEXTS.next_record_again_lead_pending, /nothing is burned/);
-  // Only where the extension is: a browser without it waits for the network (owner, 06.10).
-  assert.match(steps, /\{late && askAgain && extension && \(/);
+  // Only where the extension is: a browser without it waits for the network (owner, 06.10); never for an address only
+  // viewed.
+  assert.match(steps, /\{late && askAgain && extension && !viewOnly && \(/);
   // Asked of the extension again only for a burn of the extension.
   assert.match(steps, /<Recording qnet=\{choice\.qnet\} since=\{null\} pending askAgain=\{view\.burn\?\.way === 'extension'\} \/>/);
   // The steps to the phone: the Wallet page, the same recovery phrase, then Link a device (a phone that is not linked
@@ -257,7 +258,7 @@ test('Move to wallet on the Overview: the extension for its own wallet, QNet Wal
   assert.match(home, /const movable = isClaimNodeId\(nodeId\) && canMove\(status\.balanceNano\);/);
   assert.equal(home.match(/<Move\s+qnet=\{choice\.qnet\}\s+nodeId=\{nodeId\}\s+movable=\{movable\}/g)?.length, 2);
   assert.match(home, /window\.setTimeout\(refresh, STATUS_KEPT_MS \+ 1_000\);/);
-  assert.equal(home.match(/<h3 className="activate-step">\{t\('balance_title'\)\}<\/h3>\s*<BalanceRow status=\{status\} \/>\s*<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/g)?.length, 2);
+  assert.equal(home.match(/<h3 className="activate-step">\{t\('balance_title'\)\}<\/h3>\s*<BalanceRow status=\{status\} \/>\s*<Earned nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\} \/>\s*<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/g)?.length, 2);
   assert.doesNotMatch(home, /balance_move/);
   // The context's call checks the result for the wallet the page shows and the node it names.
   const context = code('contexts/AppContext.tsx');

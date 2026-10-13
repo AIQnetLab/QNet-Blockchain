@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  joinPages, parseHistoryView, parseStatusView, parseSuperStatus, type HistoryRow, type HistoryView, type NodeStatusView, type SuperStatusView,
+  joinPages, parseHistoryView, parseStatusView, parseSuperStatus, statusPath, type HistoryRow, type HistoryView, type NodeStatusView, type SuperStatusView,
 } from '@/lib/cabinet/node-view';
 import { parseWalletNode, type WalletNodeView } from '@/lib/cabinet/wallet-activation';
 
@@ -120,8 +120,10 @@ export function useSharedRead<T>(url: string | null, parse: (body: unknown) => T
 
 const nodeUrl = (nodeId: string | null, path = '') => (nodeId ? `/api/cabinet/node/${encodeURIComponent(nodeId)}${path}` : null);
 
-export function useNodeStatus(nodeId: string | null) {
-  return useSharedRead<NodeStatusView>(nodeUrl(nodeId), parseStatusView, true);
+// `view`: an address only viewed, whose status comes without the device's details (node-view.ts publicStatus); its
+// own shared read, so a connected wallet's details never reach a view.
+export function useNodeStatus(nodeId: string | null, view: boolean) {
+  return useSharedRead<NodeStatusView>(nodeId ? statusPath(nodeId, view) : null, parseStatusView, true);
 }
 
 // A light or a super node's newest epochs, the first page.

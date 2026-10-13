@@ -5,7 +5,9 @@
 // node balance, and the node's epochs one by one, a page at a time (the nodes' reward history, with the explorer's archive
 // for the dates, the moves to the wallet and the registration: epoch-archive.ts), and a super node's status (online, last seen, its heartbeats, its
 // standing and balance, its pace this epoch, the heights, and its admission as the node names it, else whether the
-// network's eligible set lists it: eligible-set.ts) from the nodes' server status. Each route takes only a node id, answers exact shapes
+// network's eligible set lists it: eligible-set.ts) from the nodes' server status. The history's first page also carries
+// what the wallet earned (earnedOf); the status read for an address only viewed (`?view=1`) leaves the device's own
+// details out (node-view.ts publicStatus). Each route takes only a node id, answers exact shapes
 // (src/lib/cabinet/node-view.ts), caches per node for about the page's poll interval ("not registered" a little longer),
 // shares one upstream round between concurrent readers of a node, meters every client (limits.ts) and, apart, each
 // client's reads that miss the cache and go upstream, and asks each genesis node at most a set number of reads a second,
@@ -19,8 +21,9 @@ import { isEonAddress } from '../../lib/qnet-provider.ts';
 import { epochOfHeight, epochOfKey } from '../../lib/cabinet/epochs.ts';
 import { asksOtherOwners, latestMiss, parseNodeMiss, type LastMiss } from '../../lib/cabinet/last-miss.ts';
 import {
-  DEVICE_PLATFORMS, DEVICE_STATES, HISTORY_PAGE_MAX, HISTORY_PAGE_ROWS, STATUS_KEPT_MS, isDeviceModel, isFeatureList, isSuperAdmission, type DevicePlatform, type DeviceState,
-  type DeviceView, type HistoryResult, type HistoryRow, type HistoryView, type NodeStatusView, type SuperAdmission, type SuperStatusView,
+  DEVICE_PLATFORMS, DEVICE_STATES, HISTORY_KEPT_MS, HISTORY_PAGE_MAX, HISTORY_PAGE_ROWS, STATUS_KEPT_MS, isDeviceModel, isFeatureList, isSuperAdmission, publicStatus,
+  type DevicePlatform, type DeviceState, type DeviceView, type HistoryEarned, type HistoryResult, type HistoryRow, type HistoryView, type NodeStatusView,
+  type SuperAdmission, type SuperStatusView,
 } from '../../lib/cabinet/node-view.ts';
 import type { ArchiveFacts, EpochArchive } from './epoch-archive.ts';
 import { memo } from './cache.ts';
@@ -38,7 +41,7 @@ export const NONE_CACHE_MS = 30_000;
 export const RESERVE_CACHE_MS = 5_000;
 // Every page of a node's epochs is kept about as long as a status: an older page changes too, when an epoch settles and
 // when the wallet moves its balance (each move takes every settled epoch, however old).
-export const HISTORY_CACHE_MS = 30_000;
+export const HISTORY_CACHE_MS = HISTORY_KEPT_MS;
 const NODE_TIMEOUT_MS = 4_000;
 const NODE_BODY_MAX_BYTES = 64 * 1024;
 export const ELIGIBLE_WAIT_MS = 3_000;
@@ -197,6 +200,17 @@ export function parsePending(body: unknown): string | null {
   return String(body.pending_rewards_nano);
 }
 
+// The same answer with `first_unclaimed_epoch`, the lowest epoch key above the wallet's watermark of moved epochs that
+// pays it (null for none): what ties the balance to the moves a history read just after it names (historyView). Null
+// for an answer without the field.
+export function parsePendingAt(body: unknown): { nano: string; firstUnclaimed: number | null } | null {
+  const nano = parsePending(body);
+  if (nano === null || !isObject(body) || !Object.prototype.hasOwnProperty.call(body, 'first_unclaimed_epoch')) return null;
+  const first = body.first_unclaimed_epoch;
+  if (first !== null && !isCount(first)) return null;
+  return { nano, firstUnclaimed: first };
+}
+
 // A node's verdict on one epoch (rewards_api.rs reward_history_status): paid and not moved yet, paid and moved, not
 // counted, the node's group not checked that epoch, a super node outside that epoch's admitted set (its zero is the
 // network's admission, not missed heartbeats), or not servable by this node.
@@ -210,6 +224,8 @@ export interface NodeHistory {
   rows: { key: number; status: NodeStatus; amountQnc: number }[];
   // The node has older epochs past this page (its `pagination.has_more`).
   more: boolean;
+  // The wallet's watermark of moved epochs (`last_claimed_epoch`, an epoch key; 0 before any move), when the node sends it.
+  lastClaimed?: number | null;
 }
 
 // GET /api/v1/rewards/history/{id}: every epoch the network settled, newest first, with the node's verdict; a status
@@ -223,14 +239,15 @@ export function parseHistory(body: unknown): NodeHistory | null {
     if ((NODE_STATUSES as readonly string[]).includes(r.status)) rows.push({ key: r.epoch, status: r.status as NodeStatus, amountQnc: r.amount_qnc });
   }
   const more = isObject(body.pagination) && body.pagination.has_more === true;
-  return { wallet: isEonAddress(body.wallet) ? body.wallet : null, rows, more };
+  return { wallet: isEonAddress(body.wallet) ? body.wallet : null, rows, more, lastClaimed: isCount(body.last_claimed_epoch) ? body.last_claimed_epoch : null };
 }
 
-// A second node's answer fills the epochs the first could not serve; an answer for another wallet adds nothing.
+// A second node's answer fills the epochs the first could not serve; an answer for another wallet adds nothing. The
+// watermark stays the first's, which the balance read before it goes with.
 export function mergeHistory(a: NodeHistory, b: NodeHistory): NodeHistory {
   if (a.wallet !== b.wallet) return a;
   const served = new Map(b.rows.filter((r) => r.status !== 'unavailable').map((r) => [r.key, r]));
-  return { wallet: a.wallet, rows: a.rows.map((r) => (r.status === 'unavailable' ? served.get(r.key) ?? r : r)), more: a.more };
+  return { ...a, rows: a.rows.map((r) => (r.status === 'unavailable' ? served.get(r.key) ?? r : r)) };
 }
 
 const RESULTS: Record<NodeStatus, HistoryResult> = {
@@ -249,8 +266,9 @@ const RESULTS: Record<NodeStatus, HistoryResult> = {
 // not counted, even when the light node's group was not checked; one the nodes report as not admitted stays so, never
 // not counted. Older epochs follow while the node has more, names a
 // wallet (a made-up id names none) and the page did not reach the registration. Without the archive (`facts` null)
-// nothing is dated and no epoch is left out.
-export function historyView(node: NodeHistory, facts: ArchiveFacts | null): HistoryView {
+// nothing is dated and no epoch is left out. `balance`: the first page's node balance, read from the node that gave the
+// page just before it (earnedOf).
+export function historyView(node: NodeHistory, facts: ArchiveFacts | null, balance: PendingAt | null = null): HistoryView {
   const registeredEpoch = facts && facts.registeredHeight !== null ? epochOfHeight(facts.registeredHeight) : null;
   const superEpoch = facts && facts.superHeight !== null ? epochOfHeight(facts.superHeight) : null;
   const rows: HistoryRow[] = [];
@@ -281,7 +299,28 @@ export function historyView(node: NodeHistory, facts: ArchiveFacts | null): Hist
   }
   rows.sort((a, b) => b.epoch - a.epoch);
   const more = node.more && node.wallet !== null && oldest !== null && (registeredEpoch === null || oldest > registeredEpoch);
-  return { registeredEpoch, archived: facts !== null, rows: rows.slice(0, HISTORY_PAGE_ROWS + 1), more };
+  return { registeredEpoch, archived: facts !== null, rows: rows.slice(0, HISTORY_PAGE_ROWS + 1), more, earned: earnedOf(node, facts, balance) };
+}
+
+export type PendingAt = NonNullable<ReturnType<typeof parsePendingAt>>;
+
+// The wallet's earnings at one moment, or null. The balance goes with the page's watermark only while no move landed
+// between the two reads (its first unpaid epoch is still above the watermark), and the archive's moves count only when
+// they replay to that same watermark (epoch-archive.ts movedTotal): an archive behind the move, or a node behind the
+// archive, gives no total rather than one from two moments.
+export function earnedOf(node: NodeHistory, facts: ArchiveFacts | null, balance: PendingAt | null): HistoryEarned | null {
+  const watermark = node.lastClaimed ?? null;
+  const moved = facts?.moved ?? null;
+  if (balance === null || watermark === null || moved === null || moved.watermark !== watermark) return null;
+  if (balance.firstUnclaimed !== null && balance.firstUnclaimed <= watermark) return null;
+  return { movedNano: moved.nano, balanceNano: balance.nano };
+}
+
+// `?view=1` of the status route, the read of an address only viewed (node-view.ts publicStatus): true; absent: false;
+// anything else is null.
+export function viewRead(request: Request): boolean | null {
+  const raw = new URL(request.url).searchParams.get('view');
+  return raw === null ? false : raw === '1' ? true : null;
 }
 
 // `?page=N` of the history route: absent is the first page; anything but a whole number up to HISTORY_PAGE_MAX is null.
@@ -521,28 +560,34 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
   }
 
   // One node's history of the page, and a second node's for the epochs the first could not serve; then the archive's
-  // facts for the wallet the nodes name (none for a made-up id).
+  // facts for the wallet the nodes name (none for a made-up id). For the first page with the archive, the node balance
+  // too, from the node that gives the page, read just before it, and the archive's moves (the wallet's total earned).
   async function loadHistory(nodeId: string, page: number, archive: EpochArchive | undefined): Promise<HistoryView | null> {
     const order = shuffled();
     const kind = pageKind(nodeId);
+    const earning = page === 0 && archive !== undefined;
     let got: NodeHistory | null = null;
+    let balance: PendingAt | null = null;
     let answered = 0;
     while (order.length > 0 && answered < 2 && (got === null || got.rows.some((r) => r.status === 'unavailable'))) {
-      const value = parseHistory(await read(`${order.shift() as string}${historyPath(nodeId, page)}`, kind));
+      const base = order.shift() as string;
+      const before = earning && got === null ? parsePendingAt(await read(`${base}/api/v1/rewards/pending/${encodeURIComponent(nodeId)}`, kind)) : null;
+      const value = parseHistory(await read(`${base}${historyPath(nodeId, page)}`, kind));
       if (value === null) continue;
       answered += 1;
+      if (got === null) balance = before;
       got = got === null ? value : mergeHistory(got, value);
     }
     if (got === null) return null;
     let facts: ArchiveFacts | null = null;
     if (archive && got.wallet) {
       try {
-        facts = await archive(got.wallet, nodeId, got.rows.map((r) => r.key));
+        facts = await archive(got.wallet, nodeId, got.rows.map((r) => r.key), earning);
       } catch {
         facts = null;
       }
     }
-    return historyView(got, facts);
+    return historyView(got, facts, balance);
   }
 
   // A super node's status: one node that lists it registered answers "yes" (the details are its own, its admission among
@@ -611,15 +656,17 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
       return view ? cabinetJson(200, view) : cabinetJson(503, { error: 'unavailable' });
     },
 
-    // GET /api/cabinet/node/:id
+    // GET /api/cabinet/node/:id[?view=1]
     async status(request, nodeId) {
       const refused = gate(request, 'node');
       if (refused) return refused;
-      if (!isLightNodeId(nodeId)) return cabinetJson(400, { error: 'invalid_request' });
+      const viewed = viewRead(request);
+      if (!isLightNodeId(nodeId) || viewed === null) return cabinetJson(400, { error: 'invalid_request' });
       const limited = spent(request, statusCache.has(nodeId));
       if (limited) return limited;
       const view = await statusCache(nodeId, () => loadStatus(nodeId), (v) => v !== null);
-      return view ? cabinetJson(200, view) : cabinetJson(503, { error: 'unavailable' });
+      if (!view) return cabinetJson(503, { error: 'unavailable' });
+      return cabinetJson(200, viewed ? publicStatus(view) : view);
     },
 
     // GET /api/cabinet/node/:id/history[?page=N]

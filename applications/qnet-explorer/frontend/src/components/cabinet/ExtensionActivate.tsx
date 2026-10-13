@@ -79,8 +79,8 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 // for the cabinet's wallet (wallet-activation.ts); until then its record on the network, then, by itself, Link your
 // phone. `since`: when the page got the answer.
 function LightNext({ qnet, since, burnFinal }: { qnet: string; since: number; burnFinal: boolean }) {
-  const { ready, choice, choose, view } = useCabinet();
-  const { state } = useNodeStatus(lightNodeId(qnet));
+  const { ready, choice, choose, viewOnly, view } = useCabinet();
+  const { state } = useNodeStatus(lightNodeId(qnet), viewOnly);
   // The extension's wallet becomes the cabinet's wallet when none was chosen.
   useEffect(() => {
     if (ready && !choice) choose({ qnet, source: 'extension' });

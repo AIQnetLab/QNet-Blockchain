@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  DISCONNECTED_KEY, WALLET_KEY, awaitsExtension, extensionReconnect, loadChoice, loadDisconnected, saveChoice, saveDisconnected,
+  DISCONNECTED_KEY, WALLET_KEY, awaitsExtension, extensionReconnect, loadChoice, loadDisconnected, saveChoice, saveDisconnected, shownWallet,
 } from '../cabinet/wallet-choice.ts';
 import { isEonAddress, readAccounts } from '../qnet-provider.ts';
 
@@ -153,32 +153,34 @@ test('a Disconnect is kept in this browser until a tap connects, and blocked sto
   assert.deepEqual(loadChoice(s), { qnet: OTHER, source: 'app', solana: SOL2 });
 });
 
-test('the cabinet: Disconnect sets the mark, a tap lifts it, a typed address and the reconnect never touch it', () => {
+test('the cabinet: Disconnect sets the mark, a tap lifts it, a view and the reconnect never touch it', () => {
   const cabinet = code('components/cabinet/CabinetProvider.tsx');
   assert.match(cabinet, /const channel = providerStatus === 'available' \? providerChannel : null;/);
-  assert.match(cabinet, /setChoice\(loadChoice\(storage\)\);\s*setDisconnected\(loadDisconnected\(storage\)\);\s*setLoaded\(true\);/);
-  // One step writes the mark before the wallet and then tells the page (the header and My node's pages read both): a
-  // tap lifts the mark, Disconnect sets it, a typed address and the reconnect leave it.
-  assert.match(cabinet, /function hold\(next: WalletChoice \| null, disconnected\?: boolean\): void \{\s*const storage = localStore\(\);\s*if \(disconnected !== undefined\) saveDisconnected\(storage, disconnected\);\s*if \(next\) saveChoice\(storage, next\);\s*else clearChoice\(storage\);/);
-  assert.match(cabinet, /export function chooseWallet\(next: WalletChoice\): void \{\s*hold\(next, next\.source !== 'entered' \? false : undefined\);\s*\}/);
+  assert.match(cabinet, /setChoice\(stored\.choice\);\s*setDisconnected\(stored\.disconnected\);\s*setViewing\(stored\.viewing\);\s*setLoaded\(true\);/);
+  // One step writes the mark before the wallet, then the view, and then tells the page (the header and My node's pages
+  // read them): a tap lifts the mark and ends a view, Disconnect sets it, a view and the reconnect leave it.
+  assert.match(cabinet, /function hold\(change: Partial<Held>\): void \{\s*const storage = localStore\(\);\s*const next: Held = \{ \.\.\.\(heldHere \?\? storedHeld\(\)\), \.\.\.change \};\s*if \(change\.choice\) next\.viewing = null;\s*if \(change\.disconnected !== undefined\) saveDisconnected\(storage, change\.disconnected\);\s*if \(change\.choice\) saveChoice\(storage, change\.choice\);\s*else if \(change\.choice === null\) clearChoice\(storage\);\s*if \(change\.choice \|\| change\.viewing !== undefined\) saveViewing\(tabStore\(\), next\.viewing\);/);
+  assert.match(cabinet, /export function chooseWallet\(next: WalletChoice\): void \{\s*hold\(\{ choice: next, disconnected: false \}\);\s*\}/);
   assert.match(cabinet, /const choose = useCallback\(\(next: WalletChoice\) => chooseWallet\(next\), \[\]\);/);
-  assert.match(cabinet, /const forget = useCallback\(\(\) => hold\(null, true\), \[\]\);/);
-  assert.match(cabinet, /const keep = useCallback\(\(next: WalletChoice \| null\) => hold\(next\), \[\]\);/);
-  assert.match(cabinet, /const leaveView = useCallback\(\(\) => keep\(null\), \[keep\]\);/);
+  assert.match(cabinet, /const forget = useCallback\(\(\) => hold\(\{ choice: null, disconnected: true \}\), \[\]\);/);
+  assert.match(cabinet, /const keep = useCallback\(\(next: WalletChoice\) => hold\(\{ choice: next \}\), \[\]\);/);
+  assert.match(cabinet, /const viewAddress = useCallback\(\(qnet: string\) => hold\(\{ viewing: qnet \}\), \[\]\);/);
+  assert.match(cabinet, /const stopViewing = useCallback\(\(\) => hold\(\{ viewing: null \}\), \[\]\);/);
   assert.equal(cabinet.match(/saveDisconnected\(/g)?.length, 1);
   // Every change, the header's included, reaches the provider's state.
-  assert.match(cabinet, /const onHeld = \(\) => \{\s*if \(!heldHere\) return;\s*setChoice\(heldHere\.choice\);\s*setDisconnected\(heldHere\.disconnected\);\s*\};/);
+  assert.match(cabinet, /const onHeld = \(\) => \{\s*if \(!heldHere\) return;\s*setChoice\(heldHere\.choice\);\s*setDisconnected\(heldHere\.disconnected\);\s*setViewing\(heldHere\.viewing\);\s*\};/);
   // The reconnect writes through `keep`, never `choose`, so it does not count as a tap; the pages see its wallet in the
-  // same render (no earlier wallet for a moment).
-  assert.match(cabinet, /const taken = loaded \? extensionReconnect\(choice, channel, accounts, disconnected\) : null;\s*useEffect\(\(\) => \{\s*if \(taken\) keep\(taken\);\s*\}, \[taken, keep\]\);\s*const current = taken \?\? choice;/);
-  assert.match(cabinet, /ready, choice: current, nodeId: cv\?\.nodeId \?\? null, walletHash: cv\?\.walletHash \?\? null, viewOnly: current\?\.source === 'entered'/);
+  // same render (no earlier wallet for a moment). None while an address is viewed.
+  assert.match(cabinet, /const \{ taken, connected, current, viewOnly \} = useMemo\(\s*\(\) => shownWallet\(choice, viewing, loaded \? channel : null, accounts, disconnected\),\s*\[choice, viewing, loaded, channel, accounts, disconnected\],\s*\);\s*useEffect\(\(\) => \{\s*if \(taken\) keep\(taken\);\s*\}, \[taken, keep\]\);/);
+  assert.match(cabinet, /ready, choice: current, nodeId: cv\?\.nodeId \?\? null, walletHash: cv\?\.walletHash \?\? null, viewOnly, phoneFlows,/);
   // A Disconnect or another wallet in another tab reaches this tab's pages too (SITE-F11).
   assert.match(cabinet, /if \(event\.key !== null && event\.key !== WALLET_KEY && event\.key !== DISCONNECTED_KEY && event\.key !== ACTIVATIONS_KEY\) return;\s*heldHere = null;/);
   assert.match(cabinet, /window\.addEventListener\('storage', onStorage\);/);
-  // No connect screen or earlier wallet for a moment while the extension answers.
-  assert.match(cabinet, /const ready = loaded && !awaitsExtension\(choice, channel, accountsKnown, disconnected\);/);
-  // The provider and the header decide with the one rule.
-  assert.equal(cabinet.match(/extensionReconnect\(/g)?.length, 2);
+  // No connect screen or earlier wallet for a moment while the extension answers (a view waits for nothing).
+  assert.match(cabinet, /const ready = loaded && \(viewOnly \|\| !awaitsExtension\(choice, channel, accountsKnown, disconnected\)\);/);
+  // The provider and the header decide with the one rule (wallet-choice.ts shownWallet).
+  assert.equal(cabinet.match(/shownWallet\(/g)?.length, 2);
+  assert.doesNotMatch(cabinet, /extensionReconnect\(/);
   // Every change of the remembered wallet goes through `keep`, which tells the header.
   assert.equal(cabinet.match(/window\.dispatchEvent\(new Event\(HELD_EVENT\)\);/g)?.length, 1);
   assert.equal(cabinet.match(/saveChoice\(/g)?.length, 1);
@@ -186,20 +188,22 @@ test('the cabinet: Disconnect sets the mark, a tap lifts it, a typed address and
   const frame = code('components/cabinet/CabinetFrame.tsx');
   assert.match(frame, /if \(choice\.source === 'extension' && accounts\?\.qnet === choice\.qnet\) void disconnect\(\);\s*forget\(\);/);
   assert.equal(frame.match(/forget\(\)/g)?.length, 1);
-  // "Connect your wallet" on a typed address is no Disconnect: it leaves the view without a mark.
-  const first = code('components/cabinet/ConnectFirst.tsx');
-  assert.match(first, /const \{ leaveView \} = useCabinet\(\);/);
-  assert.doesNotMatch(first, /forget/);
+  // Stop viewing is no Disconnect: it ends the view without a mark.
+  assert.match(frame, /const \{ stopViewing \} = useCabinet\(\);/);
+  assert.match(frame, /<button type="button" className="qnet-button secondary" onClick=\{stopViewing\}>\{t\('view_stop'\)\}<\/button>/);
 });
 
 test('the header shows the wallet My node shows: the remembered one, or the extension\'s it takes up', () => {
   const cabinet = code('components/cabinet/CabinetProvider.tsx');
-  assert.match(cabinet, /setKept\(heldHere \?\? \{ choice: loadChoice\(storage\), disconnected: loadDisconnected\(storage\) \}\);/);
+  assert.match(cabinet, /const read = \(\) => setKept\(heldHere \?\? storedHeld\(\)\);/);
+  assert.match(cabinet, /return \{ choice, disconnected: loadDisconnected\(storage\), viewing: choice \? null : loadViewing\(tabStore\(\)\) \};/);
   // Another tab's change of the store ends this tab's memory of it.
   assert.match(cabinet, /const onStorage = \(\) => \{\s*heldHere = null;\s*read\(\);\s*\};/);
-  assert.match(cabinet, /return \(extensionReconnect\(kept\.choice, channel, accounts, kept\.disconnected\) \?\? kept\.choice\)\?\.qnet \?\? null;/);
+  // A viewed address is never the header's wallet, nor is the extension's taken up while one is viewed.
+  assert.match(cabinet, /return shownWallet\(kept\.choice, kept\.viewing, channel, accounts, kept\.disconnected\)\.connected\?\.qnet \?\? null;/);
   // The same steps on plain inputs.
-  const held = (choice, channel, accounts, disconnected) => (extensionReconnect(choice, channel, accounts, disconnected) ?? choice)?.qnet ?? null;
+  const held = (choice, channel, accounts, disconnected, viewing = null) => shownWallet(choice, viewing, channel, accounts, disconnected).connected?.qnet ?? null;
+  assert.equal(held(null, 'extension', { qnet: EON, solana: SOL }, false, OTHER), null, 'viewing: no wallet in the header');
   const accounts = { qnet: EON, solana: SOL };
   assert.equal(held(null, 'extension', accounts, false), EON);
   assert.equal(held(null, 'extension', accounts, true), null, 'after a Disconnect');

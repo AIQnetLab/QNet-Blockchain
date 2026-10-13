@@ -326,7 +326,10 @@ export default function PrivacyPage() {
               connected wallet&apos;s Solana address in this tab&apos;s session storage until the faucet page reads it
               once to fill in its field, and removes it then; nothing is sent until you press the faucet&apos;s button. With
               it the page keeps the faucet pass the server gave for the wallet of the activation, the same way, until the
-              faucet page reads it once and sends it with your claim.
+              faucet page reads it once and sends it with your claim. When you view an address on the node pages (View
+              by address), the page keeps that address in this tab&apos;s session storage until you press Stop viewing
+              there or connect a wallet: it is no connected wallet, and its node is read without the details of the
+              device that runs it.
               The browser keeps those keys for this site only
               and never hands them out. A request expires after ten minutes; the page deletes what is left of an expired
               one when it next opens. The Support page&apos;s device-check form sends nothing to the server: it opens your

@@ -92,11 +92,11 @@ export interface WalletActivation {
 // What the page knows of the chosen wallet's activation of `nodeType`, whichever way the wallet was connected: the
 // network's record, then every other source (the cabinet's view of the wallet), then an activation of this browser.
 export function useWalletActivation(nodeType: NodeType = 'light'): WalletActivation {
-  const { choice, nodeId, superId, activation, view } = useCabinet();
+  const { choice, viewOnly, nodeId, superId, activation, view } = useCabinet();
   const stored = usePaymentRecords();
   const records = stored ?? [];
   const wallet = choice?.qnet ?? null;
-  const light = useNodeStatus(nodeType === 'light' ? nodeId : null).state;
+  const light = useNodeStatus(nodeType === 'light' ? nodeId : null, viewOnly).state;
   const superRead = useSuperStatus(nodeType === 'super' ? superId : null).state;
   const read = nodeType === 'super' ? superRead : light;
   const registered = read.phase === 'ok' ? read.value.registered : read.phase === 'unavailable' ? null : undefined;
@@ -133,6 +133,7 @@ function CodeValue({ facts }: { facts: ActivationFacts }) {
 // The details card of the wallet's node of `nodeType`, and a super node's server settings. `statusText`: how the node
 // stands on the network; `nodeId`: the node's id.
 export default function NodeDetails({ nodeType = 'light', nodeId, statusText, known }: { nodeType?: NodeType; nodeId: string; statusText: string; known: WalletActivation }) {
+  const { viewOnly } = useCabinet();
   const { facts, registration } = known;
   const light = nodeType === 'light';
   return (
@@ -165,7 +166,7 @@ export default function NodeDetails({ nodeType = 'light', nodeId, statusText, kn
         )}
         {/* A light node's code is only a receipt; a super node's server needs it (audit M23). */}
         {facts?.code && <p className="activate-note">{t(light ? 'details_note' : 'details_note_super')}</p>}
-        {facts?.open && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
+        {facts?.open && !viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
       </div>
       {!light && facts?.code && <div className="activate-card"><SuperNext code={facts.code} burnTx={facts.burnTx} burnAmount={facts.amount} nodeId={nodeId} /></div>}
     </>

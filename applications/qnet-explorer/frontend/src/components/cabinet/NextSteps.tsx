@@ -34,7 +34,6 @@ import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
 import { useCabinet } from './CabinetProvider';
-import ConnectFirst from './ConnectFirst';
 import CopyButton from './CopyButton';
 import LinkDevice from './LinkDevice';
 import LinkWaiting from './LinkWaiting';
@@ -71,7 +70,7 @@ function Step({ at, children }: { at: 'done' | 'now' | 'ahead'; children: ReactN
 export function Recording({ qnet, since, burnFinal = true, pending = false, askAgain = true }: {
   qnet: string; since: number | null; burnFinal?: boolean; pending?: boolean; askAgain?: boolean;
 }) {
-  const { choice, view, keepActivation, refreshActivation } = useCabinet();
+  const { choice, viewOnly, view, keepActivation, refreshActivation } = useCabinet();
   const { providerStatus, providerChannel, accounts, activateNode } = useWallet();
   const [shown] = useState(() => Date.now());
   const [now, setNow] = useState(() => Date.now());
@@ -118,7 +117,7 @@ export function Recording({ qnet, since, burnFinal = true, pending = false, askA
       {view.networkDown && choice?.qnet === qnet && <p className="activate-note" role="status">{t('next_network_down')}</p>}
       {/* Asking again is the extension's own way: a browser without it waits for the network, and a burn that does not
           end up registered comes back with Continue in QNet Wallet. */}
-      {late && askAgain && extension && (
+      {late && askAgain && extension && !viewOnly && (
         <div className="cabinet-choice">
           {holds ? (
             <>
@@ -184,7 +183,7 @@ export function LinkPhone({ onLinked }: { onLinked?: () => void }) {
         {!onLinked && phoneFlows && !viewOnly && <Link href={TAB_HREF.device} className="qnet-button activate-primary">{t('action_link_device')}</Link>}
         <p className="activate-note">{t('next_link_done')}</p>
       </div>
-      {onLinked && phoneFlows && (viewOnly ? <div className="activate-card"><ConnectFirst /></div> : <LinkDevice onLinked={onLinked} />)}
+      {onLinked && phoneFlows && !viewOnly && <LinkDevice onLinked={onLinked} />}
     </>
   );
 }
@@ -413,7 +412,7 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
     void post(consent);
   }, [answer, usable, qnet, burn.burnTx, burn.burnAmount, burner, post]);
 
-  if (viewOnly) return <div className="activate-card"><p>{t('burned_payment_lead')}</p><ConnectFirst /></div>;
+  if (viewOnly) return <div className="activate-card"><p>{t('burned_payment_lead')}</p></div>;
   if (outcome && (outcome.result === 'admitted' || outcome.result === 'registered')) {
     return <Recording qnet={qnet} since={null} pending={outcome.result === 'registered'} askAgain={false} />;
   }
@@ -455,7 +454,7 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
 // is registered with QNet Wallet from this browser, whatever it is; only a burn the extension here just made and
 // records itself waits for it.
 function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
-  const { activation, choice, view } = useCabinet();
+  const { activation, choice, viewOnly, view } = useCabinet();
   const { providerStatus, providerChannel, accounts } = useWallet();
   const records = usePaymentRecords();
   const here = (records ?? []).some((r) => isUnfinished(r) && r.burn?.tx === burn.burnTx && r.stage !== 'closing');
@@ -478,7 +477,7 @@ function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
       ) : next.step === 'resume' ? (
         <div className="activate-card">
           <p>{t('next_resume')}</p>
-          <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>
+          {!viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
         </div>
       ) : next.step === 'finish' ? (
         <FinishLight qnet={qnet} burn={burn} burner={next.burner} />
@@ -526,7 +525,7 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
       return card(view.here ? (
         <>
           <p>{t('state_reserved_here')}</p>
-          <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>
+          {!viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
         </>
       ) : <p>{t('state_reserved', { time: shownTime(view.until) })}</p>);
     case 'sending':
@@ -554,7 +553,8 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
       return card(
         <>
           <p>{t('no_node')}</p>
-          {viewOnly ? <ConnectFirst /> : (
+          {/* An address only viewed is offered no activation: only the wallet itself starts one. */}
+          {!viewOnly && (
             <div className="cabinet-actions">
               <Link href={`${TAB_HREF.activate}?type=light`} className="qnet-button activate-primary">{t('action_activate_light')}</Link>
               <Link href={`${TAB_HREF.activate}?type=super`} className="qnet-button secondary">{t('action_activate_super')}</Link>

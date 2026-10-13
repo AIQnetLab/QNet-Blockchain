@@ -19,6 +19,7 @@ import { formatCheckNumber } from '@/lib/qnet-link';
 import { shortAddress } from '@/lib/qnet-provider';
 import { rich } from '@/lib/rich';
 import { decodeKey } from '@/lib/solana-message';
+import { useCabinet } from './CabinetProvider';
 import CopyButton from './CopyButton';
 import { QrCode } from './LinkWaiting';
 import { DeviceRows, StatusGate } from './NodeStatus';
@@ -304,7 +305,8 @@ export function Leftovers({
 
 // The registered node, as the nodes report it now. One wallet, one node: nothing else to activate for it (SITE-F12).
 export function Registered({ nodeId }: { nodeId: string }) {
-  const { state, retry } = useNodeStatus(nodeId);
+  const { viewOnly } = useCabinet();
+  const { state, retry } = useNodeStatus(nodeId, viewOnly);
   return (
     <div className="activate-card">
       <p className="activate-result">{t('act_done')}</p>

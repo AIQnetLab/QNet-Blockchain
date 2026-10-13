@@ -72,6 +72,14 @@ export interface HistoryRow {
   claimTx: string | null;
 }
 
+// What the wallet's node earned, as of one moment (node-proxy.ts historyView): the QNC every move took to the wallet
+// (decimal nano, from the explorer archive's moves, which replay to the network's own watermark of moved epochs) and
+// the node balance the node that gave the page reported just before it.
+export interface HistoryEarned {
+  movedNano: string;
+  balanceNano: string;
+}
+
 // One page of the node's epochs (GET /api/cabinet/node/:id/history?page=N), newest first.
 export interface HistoryView {
   // The epoch of the wallet's first node registration, where its epochs start, from the explorer's archive; null when
@@ -82,12 +90,16 @@ export interface HistoryView {
   rows: HistoryRow[];
   // Older epochs of the node follow on the next page.
   more: boolean;
+  // The first page's: null on a later page, and when the archive or the nodes could not answer it for one moment.
+  earned: HistoryEarned | null;
 }
 
 // The epochs of a page; a page after the first repeats the epoch before it (node-proxy.ts historyPath), so a page read
 // a moment apart from the one before skips none.
 export const HISTORY_PAGE_ROWS = 30;
 export const HISTORY_PAGE_MAX = 1_000;
+// How long the site keeps a page of a node's epochs (node-proxy.ts HISTORY_CACHE_MS).
+export const HISTORY_KEPT_MS = 30_000;
 // The epochs a node keeps the details of to serve their results (development/qnet-integration/src/node/rewards.rs
 // SHARD_CACHE_RETAIN_EPOCHS): 256, about six weeks.
 export const EPOCHS_KEPT = 256;
@@ -122,6 +134,18 @@ export function isDeviceView(v: unknown): v is DeviceView | null {
   if (v.lastAnswerEpoch !== null && !isCount(v.lastAnswerEpoch)) return false;
   if (!isLastMiss(v.lastMiss)) return false;
   return (DEVICE_STATES as readonly unknown[]).includes(v.state);
+}
+
+// The status route, and its read for an address only viewed (`view`): GET /api/cabinet/node/:id?view=1 answers the same
+// status with the device's details that are not the network's left out (publicStatus).
+export function statusPath(nodeId: string, view: boolean): string {
+  return `/api/cabinet/node/${encodeURIComponent(nodeId)}${view ? '?view=1' : ''}`;
+}
+
+// A status for a viewed address: the device's state and the epoch of its last answer are the network's; its platform,
+// its model, the day it linked and its account of a missed epoch are the owner's device details, so none is passed on.
+export function publicStatus(s: NodeStatusView): NodeStatusView {
+  return s.device ? { ...s, device: { ...s.device, platform: null, model: null, linkedSince: null, lastMiss: null } } : s;
 }
 
 // GET /api/cabinet/node/:id, exactly.
@@ -224,13 +248,34 @@ function isHistoryRow(r: unknown): boolean {
   return r.claimTx === null || (typeof r.claimTx === 'string' && TX_RE.test(r.claimTx));
 }
 
+const isNano = (v: unknown): v is string => typeof v === 'string' && NANO_RE.test(v);
+const isEarned = (v: unknown): boolean => v === null || (isObject(v) && hasKeys(v, ['movedNano', 'balanceNano']) && isNano(v.movedNano) && isNano(v.balanceNano));
+
 // GET /api/cabinet/node/:id/history[?page=N], exactly.
 export function parseHistoryView(body: unknown): HistoryView | null {
-  if (!isObject(body) || !hasKeys(body, ['registeredEpoch', 'archived', 'rows', 'more'])) return null;
+  if (!isObject(body) || !hasKeys(body, ['registeredEpoch', 'archived', 'rows', 'more', 'earned'])) return null;
   if (body.registeredEpoch !== null && !isCount(body.registeredEpoch)) return null;
   if (typeof body.archived !== 'boolean' || typeof body.more !== 'boolean') return null;
   if (!Array.isArray(body.rows) || body.rows.length > HISTORY_PAGE_ROWS + 1 || !body.rows.every(isHistoryRow)) return null;
+  if (!isEarned(body.earned)) return null;
   return body as unknown as HistoryView;
+}
+
+// "Total earned" (owner, 13.10): the moves plus the node balance, both of the history's one moment, so a move between
+// two reads never counts twice or not at all. Shown while that balance is the one the page shows (`shown`, the status
+// read's); while they differ (a move, or an epoch settled, between the two reads) the history is read again
+// (`reading`), and once the page gave up on that (`gaveUp`) or without the history's answer it is unknown, with the
+// balance the page shows: never a total from two moments.
+export type EarnedView =
+  | { kind: 'total'; totalNano: string; movedNano: string; balanceNano: string }
+  | { kind: 'reading' }
+  | { kind: 'unknown'; balanceNano: string | null };
+
+export function earnedView(earned: HistoryEarned | null, shown: string | null, gaveUp = false): EarnedView {
+  if (earned === null) return { kind: 'unknown', balanceNano: shown };
+  if (shown !== null && shown !== earned.balanceNano) return gaveUp ? { kind: 'unknown', balanceNano: shown } : { kind: 'reading' };
+  const { movedNano, balanceNano } = earned;
+  return { kind: 'total', totalNano: (BigInt(movedNano) + BigInt(balanceNano)).toString(), movedNano, balanceNano };
 }
 
 // The pages read so far as one list, newest first, each epoch once (a page repeats the epoch before it, and one read

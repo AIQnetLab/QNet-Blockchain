@@ -154,8 +154,14 @@ test('the extension\'s buttons, tabs and fields are named as the extension names
   assert.equal(norm(TEXTS.act_code), norm(EXT.codeLabel), 'act_code');
 });
 
+// Owner, 13.10: the one exception is the node's "Total earned", the sum moved to the wallet plus the node balance
+// (NodeHistory.tsx Earned); its texts say that phrase and no other word of the kind.
 test('no text speaks of earnings: the node balance is what it is', () => {
-  for (const [key, text] of Object.entries(TEXTS)) assert.doesNotMatch(text, /reward|\bmining\b|\bearn|\bincome\b|\bprofit/i, key);
+  for (const [key, text] of Object.entries(TEXTS)) {
+    const said = key.startsWith('earned_') ? text.replace(/^Total earned: /, '') : text;
+    assert.doesNotMatch(said, /reward|\bmining\b|\bearn|\bincome\b|\bprofit/i, key);
+  }
+  assert.deepEqual(Object.keys(TEXTS).filter((k) => /\bearn/i.test(TEXTS[k])), ['earned_total', 'earned_reading', 'earned_unknown']);
 });
 
 // The page as the QNet app's view renders it: every `{full && …}` block (shown only outside that view) removed.

@@ -6,13 +6,16 @@
 // wallet (src/server/cabinet/node-proxy.ts history, with the explorer's archive), a page at a time with Show more. A
 // light and a super node alike; a wallet with both has one list, since the network keeps the epochs per wallet. A
 // wallet without a node gets the state its sources agree on, with the way on. The Overview shows the newest rows of the
-// same table (Epochs).
+// same table (Epochs). Above them, here and with the Overview's node balance, the total earned (Earned).
 
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { number, t, type MessageKey } from '@/lib/texts';
 import { TAB_HREF } from '@/lib/cabinet/tabs';
 import { useEpochList, useNodeHistory, type EpochList } from '@/hooks/useNodeStatus';
-import { EPOCHS_KEPT, type HistoryResult, type HistoryRow, type HistoryView } from '@/lib/cabinet/node-view';
+import {
+  EPOCHS_KEPT, HISTORY_KEPT_MS, earnedView, formatQnc, type HistoryResult, type HistoryRow, type HistoryView,
+} from '@/lib/cabinet/node-view';
 import CabinetFrame from './CabinetFrame';
 import { useCabinet } from './CabinetProvider';
 import { NoNode } from './NextSteps';
@@ -125,11 +128,56 @@ export function Epochs({ nodeId, show }: { nodeId: string; show: 'all' | 'recent
   return <AllEpochs nodeId={nodeId} first={view} />;
 }
 
+// While the history's balance is not the one the page shows, the history is read again this many times: at once, then
+// once the site's copy of it is over.
+export const EARNED_RETRIES = 3;
+
+// "Total earned: X QNC" with its split, moved to the wallet and in the node balance (node-view.ts earnedView), from the
+// history's first page; `balanceNano`, the node balance the page shows (null where it shows none: History, whose split
+// names the history's own). Public chain data, the same for a connected wallet and an address only viewed. Nothing while
+// the history is read the first time.
+export function Earned({ nodeId, balanceNano }: { nodeId: string; balanceNano: string | null }) {
+  const { state, refresh } = useNodeHistory(nodeId);
+  const [tries, setTries] = useState(0);
+  const earned = state.phase === 'ok' ? state.value.earned : null;
+  const differs = earned !== null && balanceNano !== null && earned.balanceNano !== balanceNano;
+  useEffect(() => {
+    if (!differs) {
+      setTries(0);
+      return;
+    }
+    if (tries >= EARNED_RETRIES) return;
+    const timer = window.setTimeout(() => {
+      setTries((n) => n + 1);
+      refresh();
+    }, tries === 0 ? 0 : HISTORY_KEPT_MS + 1_000);
+    return () => window.clearTimeout(timer);
+  }, [differs, tries, refresh]);
+  if (state.phase === 'loading') return null;
+  const shown = earnedView(earned, balanceNano, tries >= EARNED_RETRIES);
+  if (shown.kind === 'reading') return <p className="activate-status" aria-live="polite">{t('earned_reading')}</p>;
+  if (shown.kind === 'unknown') {
+    return (
+      <>
+        <p>{t('earned_unknown')}</p>
+        {shown.balanceNano !== null && <p className="activate-note">{t('earned_unknown_split', { balance: formatQnc(shown.balanceNano) })}</p>}
+      </>
+    );
+  }
+  return (
+    <>
+      <p>{t('earned_total', { amount: formatQnc(shown.totalNano) })}</p>
+      <p className="activate-note">{t('earned_split', { moved: formatQnc(shown.movedNano), balance: formatQnc(shown.balanceNano) })}</p>
+    </>
+  );
+}
+
 function EpochCard({ nodeId }: { nodeId: string }) {
   return (
     <div className="activate-card">
       <h3 className="activate-step">{t('history_epochs')}</h3>
       <p className="activate-note">{t('epoch_note')}</p>
+      <Earned nodeId={nodeId} balanceNano={null} />
       <Epochs nodeId={nodeId} show="all" />
     </div>
   );
