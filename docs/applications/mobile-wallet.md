@@ -1807,7 +1807,7 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.0 (21) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.0 (22) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds enable R8 minification and resource shrinking.
   iOS: bundle id `com.qnetmobile`, iPhone and iPad (`TARGETED_DEVICE_FAMILY = "1,2"`), not offered on Mac or
   Vision Pro; deployment target 15.6 for the app target.
