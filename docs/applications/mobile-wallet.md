@@ -535,7 +535,10 @@ no proof badge; only the checks above make a value count as proven where the app
   as soon as its own source answers: SOL and 1DEV from Solana, QNC as soon as its answer is read and its Merkle proof
   folded (not verified yet: it cannot lower the figure shown), then again once the lineage walk decided; an answer whose
   proof did not fold is never shown. Nothing kept or early is ever marked or used as verified: sends read their own
-  balance and nonce. A move of a node balance in transit is not shown on Assets: History says Moving and the Node tab
+  balance and nonce. The QNC figure at a genesis node's live tip (the proof route without `mb`: its live state, a proof
+  under that state's root) shows as soon as its proof folds, so money that came in shows within seconds
+  (`WalletManager.liveQncFigure`); a certified figure of an older state does not go over it, one that reaches its
+  height confirms it. A move of a node balance in transit is not shown on Assets: History says Moving and the Node tab
   "Moving X" ([Moving the node balance](#moving-the-node-balance)). A refresh that changes nothing renders
   nothing new: a merge that changes no figure keeps the object on screen (`src/utils/balanceMerge.js`), as do the token
   list, the kept transactions and the time of the QNC read.
@@ -1839,7 +1842,7 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.1 (27) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.1 (28) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds enable R8 minification and resource shrinking.
   iOS: bundle id `com.qnetmobile`, iPhone and iPad (`TARGETED_DEVICE_FAMILY = "1,2"`), not offered on Mac or
   Vision Pro; deployment target 15.6 for the app target.

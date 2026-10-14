@@ -4367,9 +4367,25 @@ const WalletScreen = () => {
 
       // v3.27: TRUSTLESS - Get balance WITH Merkle proof verification
       let figureAt = 0; // when the QNC answer was read: its figure lands first, its proof decides later
+      // A genesis node's live tip, shown as soon as it comes (money that came in shows within seconds, as a wallet that
+      // shows its node's answer does); the certified read below confirms it, and an older figure never goes over it.
+      let live = null;
+      const liveRead = qnetAddr ? Promise.resolve().then(() => walletManager.liveQncFigure(qnetAddr)).then((f) => {
+        if (!f || gone() || !owner || !Number.isFinite(f.balance)) return;
+        live = f;
+        const { q, optimistic } = held(f.balance, false);
+        figureAt = Date.now();
+        setTokenBalances((prev) => mergeTokenBalances(prev, {
+          owner, qnc: q, verified: false, optimistic, qncLce: optimistic ? undefined : f.figureClaimedEpoch,
+        }));
+        noteFreshFigure(owner, 'qnc', figureAt);
+        figureLanded();
+      }, () => {}) : null;
+      const olderThanLive = (h) => !!live && !(Number(h) >= live.blockHeight);
+
       const qncResult = await walletManager.getQNCBalanceWithProof(qnetAddr, true, {
         onFigure: (f) => {
-          if (gone() || !owner || !Number.isFinite(f.balance)) return;
+          if (gone() || !owner || !Number.isFinite(f.balance) || olderThanLive(f.blockHeight)) return;
           const { q, optimistic } = held(f.balance, false);
           figureAt = Date.now();
           // The figure's own watermark goes on screen with it: Assets' in-transit line leaves out what this figure holds
@@ -4391,20 +4407,26 @@ const WalletScreen = () => {
         walletManager.sendDuePending(qnetAddr).catch(() => {}).finally(() => { refreshKept(qnetAddr); });
       }
 
+      await liveRead;
+      if (gone()) return;
       const qncOk = !!qncResult?.ok;
       const isBalanceVerified = qncResult?.verified || false;
+      // A certified figure of a state older than the live one on screen confirms the walk, not the figure: the live one
+      // stays until a certified state reaches its height.
+      const liveNewer = qncOk && olderThanLive(qncResult.blockHeight);
+      const shownVerified = isBalanceVerified && !liveNewer;
 
       // Resolve the QNC value to apply OUTSIDE the state updater (it mutates refs). The optimistic-send
       // guard holds the expected (lower) balance until the queried node has caught up to our TX.
       let qncToApply = null; // null ⇒ QNC fetch failed: keep last-known, never flash 0
       let optimistic = false;
-      if (qncOk) ({ q: qncToApply, optimistic } = held(qncResult.balance, true));
+      if (qncOk) ({ q: qncToApply, optimistic } = held(liveNewer ? live.balance : qncResult.balance, true));
       // One unproven answer lower than the figure shown may be a lagging node, so it does not lower it by itself;
       // two genesis nodes agreeing on the lower figure do (MOBNET-R3-04): a spend made from the browser, the extension
       // or by anyone holding the phrase then shows here instead of the old, higher balance.
       let agreed = false;
       const shown = shownBalancesRef.current;
-      if (qncOk && !isBalanceVerified && !optimistic && qnetAddr && shown && shown.owner === qnetAddr
+      if (qncOk && !shownVerified && !optimistic && qnetAddr && shown && shown.owner === qnetAddr
           && qncToApply < (shown.qnc || 0)) {
         const agreedQnc = await walletManager.agreedGenesisBalance(qnetAddr).catch(() => null);
         if (gone()) return;
@@ -4412,13 +4434,13 @@ const WalletScreen = () => {
       }
       // "Verified by proof" only for the figure a proof covered: never while the optimistic hold after a send
       // shows the expected balance instead (MOBNET-R2-07).
-      setBalanceVerified && setBalanceVerified(qncOk && isBalanceVerified && !optimistic);
+      setBalanceVerified && setBalanceVerified(qncOk && shownVerified && !optimistic);
 
       // Merge: overwrite a figure ONLY when its fetch succeeded (null/failed ⇒ keep last-known) — and
       // "last-known" is only ever this same address's; another wallet's balances start from zero.
       setTokenBalances(prev => mergeTokenBalances(prev, {
-        owner, qnc: qncToApply, verified: isBalanceVerified, optimistic, agreed,
-        qncLce: optimistic ? undefined : (agreed ? null : (qncOk ? qncResult.figureClaimedEpoch : undefined)),
+        owner, qnc: qncToApply, verified: shownVerified, optimistic, agreed,
+        qncLce: optimistic ? undefined : (agreed ? null : (qncOk ? (liveNewer ? live.figureClaimedEpoch : qncResult.figureClaimedEpoch) : undefined)),
       }));
       if (owner && qncOk) noteFreshFigure(owner, 'qnc', figureAt || Date.now());
       // No figure: one more failure in a row; the line comes only once they last (noteQncFailure).

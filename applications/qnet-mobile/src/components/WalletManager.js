@@ -6429,6 +6429,22 @@ export class WalletManager {
       return { figure: folded ? figure : null, error: 'unconfirmed' };
     }
     if (isLegacyProofBody(data, 'account')) markNodeOld(res.base);
+    const got = await this._liveAccountFigure(address, data, verify);
+    if (got.error) return { error: got.error };
+    const { figure } = got;
+    if (!verify) return { figure };
+    early(figure, got.folded);
+    if (!got.folded) return { error: 'bad proof' };
+    // The older body is of the node's live state: its watermark counts only once that root is a certified one.
+    if (await this._certifiedFresh(data.state_root, data.block_height)) {
+      return { verified: { ok: true, verified: true, ...figure, lastClaimedEpoch: figure.figureClaimedEpoch, proof: data.merkle_proof } };
+    }
+    return { figure, error: 'unconfirmed' };
+  }
+
+  // An account answer in the body of the node's live state (no proof_format): { figure, folded (its proof folds to the
+  // root the node served; checked only with `fold`) } or { error }.
+  async _liveAccountFigure(address, data, fold = true) {
     const balanceNanoStr = u64Text(data.balance);
     const nonceStr = u64Text(data.nonce);
     if (balanceNanoStr === null || nonceStr === null) return { error: 'bad proof' };
@@ -6448,19 +6464,40 @@ export class WalletManager {
     const figure = {
       balance: Number(balanceNanoStr) / 1e9, balanceNano: balanceNanoStr, nonce: nonceStr,
       blockHeight: data.block_height, stateRoot: data.state_root, index: null,
-      // The leaf's watermark the proof folded with, carried as the certified body's is (Assets' in-transit line).
+      // The leaf's watermark the proof folded with, carried as the certified body's is.
       figureClaimedEpoch: epochNumber(lceStr),
     };
-    if (!verify) return { figure };
-    const proofValid = Array.isArray(data.merkle_proof) && data.merkle_proof.length > 0
+    const folded = fold && Array.isArray(data.merkle_proof) && data.merkle_proof.length > 0
       && await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, lceStr, isNode, extra);
-    early(figure, proofValid);
-    if (!proofValid) return { error: 'bad proof' };
-    // The older body is of the node's live state: its watermark counts only once that root is a certified one.
-    if (await this._certifiedFresh(data.state_root, data.block_height)) {
-      return { verified: { ok: true, verified: true, ...figure, lastClaimedEpoch: figure.figureClaimedEpoch, proof: data.merkle_proof } };
+    return { figure, folded: !!folded };
+  }
+
+  /**
+   * The open wallet's QNC figure at a genesis node's live tip (the proof route without `mb`: the node's live state and a
+   * proof of the account under that state's root), for the screen only, as a wallet that shows its node's answer does:
+   * money that came in shows within seconds instead of after the next certified checkpoint. { balance, balanceNano,
+   * nonce, blockHeight, figureClaimedEpoch } once its proof folds to the root the node served, else null. Never a send's
+   * base (certifiedQncForSend) and never verified: the certified read confirms it.
+   */
+  async liveQncFigure(address) {
+    if (!address || typeof address !== 'string') return null;
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/account/${address}/balance/proof`, {
+        timeoutMs: 5000, hedgeMs: 800, raw: true, nodes: this.getTrustedNodes(3), maxBytes: WalletManager.PROOF_ANSWER_MAX_BYTES,
+      });
+    } catch (_) {
+      return null;
     }
-    return { figure, error: 'unconfirmed' };
+    if (!res || !res.ok || !res.data) return null;
+    let data;
+    try { data = parseStrictJson(res.data); } catch (_) { return null; }
+    if (!data || typeof data !== 'object' || Array.isArray(data) || data.proof_format !== undefined) return null;
+    if (!Number.isSafeInteger(data.block_height) || data.block_height < 0) return null;
+    const got = await this._liveAccountFigure(address, data);
+    if (!got.folded) return null;
+    const f = got.figure;
+    return { balance: f.balance, balanceNano: f.balanceNano, nonce: f.nonce, blockHeight: f.blockHeight, figureClaimedEpoch: f.figureClaimedEpoch };
   }
 
   // V2: TRUSTLESS QRC-20 balance — exactly the getQNCBalanceWithProof trust model, one level deeper.

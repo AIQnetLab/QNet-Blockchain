@@ -59,6 +59,7 @@ jest.mock('../src/components/WalletManager', () => {
       if (opts && opts.onFigure && r && r.ok) opts.onFigure({ balance: r.balance, balanceNano: r.balanceNano, nonce: r.nonce, blockHeight: 9090, folded: true });
       return r;
     }
+    liveQncFigure() { return Promise.resolve(mockState.live || null); }
     // The send's checks, each counted and answered when the test says.
     certifiedQncForSend() { return mockState.check('balance', { ok: true, verified: true, balanceNano: '20000000000', nonce: '3' }); }
     payableRecipientProblem() { return mockState.check('recipient', null); }
@@ -197,6 +198,7 @@ beforeEach(async () => {
   await AsyncStorage.clear();
   commits = 0;
   Object.assign(mockState, {
+    live: null,
     calls: [],
     held: { balance: [], recipient: [], kept: [] },
     gated: false,
@@ -300,6 +302,21 @@ describe('the Send button', () => {
     // All three were waiting at once, so the wait is one check's, whatever the machine's speed adds to it.
     expect(most).toBe(3);
     expect([...mockState.calls].sort()).toEqual(['balance', 'kept', 'recipient']);
+  });
+});
+
+describe('the QNC figure at the live tip (owner, 14.10)', () => {
+  it('shows the live figure of a genesis node; a certified one of an older state does not go over it, a newer one does', async () => {
+    mockState.live = { balance: 25, balanceNano: '25000000000', nonce: '3', blockHeight: 9150, figureClaimedEpoch: 0 };
+    let tree = await unlocked();
+    await flush(6);
+    expect(texts(tree).split(String.fromCharCode(10))).toContain('25');
+    await act(async () => { mounted.pop().unmount(); });
+    mockState.live = { balance: 25, balanceNano: '25000000000', nonce: '3', blockHeight: 9000, figureClaimedEpoch: 0 };
+    tree = await unlocked();
+    await flush(6);
+    expect(texts(tree).split(String.fromCharCode(10))).toContain('20');
+    expect(texts(tree).split(String.fromCharCode(10))).not.toContain('25');
   });
 });
 
