@@ -22,7 +22,7 @@ npm run build            # dist/lib/qnet-core.js
 npm test                 # offline tests: bundle, modules, pages, the whole extension, the package
 npm run test:live        # read-only checks against Solana devnet and the QNet Blockchain nodes
 npm run build:dev        # dist-dev/: dist plus localhost content-script matches (git-ignored); again after every dist change, npm test refuses a stale one
-npm run package          # qnet-wallet-3.1.3.zip: the store package (git-ignored)
+npm run package          # qnet-wallet-3.1.4.zip: the store package (git-ignored)
 npm run check:overflow   # headless Chrome: every screen in every language, nothing overflows
 ```
 

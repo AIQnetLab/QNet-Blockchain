@@ -940,6 +940,9 @@ export async function resolvePubkeys(committee, anchorRoot, anchorHeight, served
 // that node, never an allocation the phone must survive. The bounds leave room for a committee's QC (a quorum of
 // 3309-byte signatures, hex) and the eligible set of a large network.
 export const PROOF_MAX_BYTES = 8 * 1024 * 1024;
+// A proof or a capsule is tens of kilobytes over TLS to a node that may be continents away: a phone on a slow or lossy
+// link must not give up on it at the 10 s the small reads use, or the walk never moves and the capsule never comes.
+export const LARGE_READ_TIMEOUT_MS = 25_000;
 export const REGISTRY_MAX_BYTES = 16 * 1024 * 1024;
 
 function fetchJson(url, maxBytes, timeoutMs = 10000) {
@@ -1116,7 +1119,7 @@ async function verifyStep(j, nodesProvider, hooks, tally = null, ahead = null, t
       first = null;
       // Fetched ahead under its share of the walk's byte budget and larger than that: asked again now with the full
       // bound, never charged for it.
-      if (capped && got.error && got.error.code === 'RESPONSE_TOO_LARGE') got = await nodeGet(base, proofPath(j), PROOF_MAX_BYTES);
+      if (capped && got.error && got.error.code === 'RESPONSE_TOO_LARGE') got = await nodeGet(base, proofPath(j), PROOF_MAX_BYTES, LARGE_READ_TIMEOUT_MS);
     } else {
       const now = Date.now();
       const open = nodes.filter((u) => !tried.has(u) && !recentFailure(j, u));
@@ -1131,7 +1134,7 @@ async function verifyStep(j, nodesProvider, hooks, tally = null, ahead = null, t
         await sleep(wait);
         continue;
       }
-      got = await nodeGet(base, proofPath(j), PROOF_MAX_BYTES);
+      got = await nodeGet(base, proofPath(j), PROOF_MAX_BYTES, LARGE_READ_TIMEOUT_MS);
     }
     tried.add(base);
     if (got.limited) {
@@ -1196,7 +1199,7 @@ function fetchAhead(j, nodesProvider, share = PROOF_MAX_BYTES) {
   const base = nodesFrom(nodesProvider).find((u) => !recentFailure(j, u) && readWait(u, now) === 0);
   if (!base) return null;
   const entry = { base, share, bytes: null, answer: null };
-  entry.answer = nodeGet(base, proofPath(j), share).then((got) => {
+  entry.answer = nodeGet(base, proofPath(j), share, LARGE_READ_TIMEOUT_MS).then((got) => {
     if (got && got.body) entry.bytes = proofBytes(got.body);
     return got;
   });
@@ -1659,6 +1662,7 @@ export const OWN_ROOT_WALK_STEPS = 16;
 // Distinct nodes whose proofs of K, and of K-1, must hash to the capsule's checkpoint hashes; as many whose proofs hash
 // to other checkpoints drop it (no node is blamed).
 export const CAPSULE_ROOT_NODES = 2;
+const CAPSULE_ASK_NODES = 3;
 
 // The held capsule: { index: K, cpA, wire, roots: { [j]: proof parts }, entries: { [j]: verified entry } } for j = K, K-1.
 // Not in the LRU, not dropped by the lineage reset of kept anchors; replaced only by a higher K; cleared by clearCapsule.
@@ -1887,9 +1891,11 @@ async function refreshCapsuleNow(nodesProvider, { headHint, proofNodes = null, f
   if (held > 0 && head < held + GALC_V2_MINT_INTERVAL) return { ok: false, reason: 'current' };
   if (!force && !capsuleWanted(head)) return { ok: false, reason: 'not_needed' };
   const now = Date.now();
-  const ask = nodesFrom(nodesProvider).filter((u) => !capsuleMissed(u, now) && readWait(u, now) === 0).slice(0, CAPSULE_ROOT_NODES);
+  // Only a node's own rate limit keeps it out, never this device's read budget: a walk that spent it must not shut out
+  // the one read that ends the walk. Three nodes at once, so one slow or missing answer still leaves two.
+  const ask = nodesFrom(nodesProvider).filter((u) => !capsuleMissed(u, now) && !((_nodeBackoff.get(u) || 0) > now)).slice(0, CAPSULE_ASK_NODES);
   if (ask.length === 0) return { ok: false, reason: 'no_capsule' };
-  const answers = await Promise.all(ask.map((base) => nodeGet(base, CAPSULE_PATH, CAPSULE_MAX_BYTES).then((got) => ({ base, got }))));
+  const answers = await Promise.all(ask.map((base) => nodeGet(base, CAPSULE_PATH, CAPSULE_MAX_BYTES, LARGE_READ_TIMEOUT_MS).then((got) => ({ base, got }))));
   let reason = 'no_capsule';
   const offers = [];
   for (const { base, got } of answers) {
@@ -1967,6 +1973,13 @@ export function refreshCapsule(nodesProvider, opts = {}) {
 }
 
 /** The K of the held capsule, or 0. */
+/** Each node's read state for the diagnostics: its own backoff, this device's budget wait, a capsule miss (ms left). */
+export function nodeReadStates(bases) {
+  const now = Date.now();
+  return bases.map((b) => ({ base: b, backoff: Math.max(0, (_nodeBackoff.get(b) || 0) - now), wait: readWait(b, now),
+    capsuleMiss: Math.max(0, (_capsuleMiss.get(b) || 0) - now) }));
+}
+
 export function heldCapsuleIndex() {
   return _capsule ? _capsule.index : 0;
 }

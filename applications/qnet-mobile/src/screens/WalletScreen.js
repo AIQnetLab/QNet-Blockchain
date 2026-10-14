@@ -162,7 +162,7 @@ const NOTHING_SENT_CODES = ['PENDING_SETTLED', 'PENDING_CHANGED', 'PENDING_CHOIC
 // A full screen keeps clear of the status bar, the notch and the side insets from the safe area on every device (a
 // tablet's status bar, Slide Over and Split View differ from a phone's); the bottom bar keeps clear of the bottom itself.
 // The longest a pull-to-refresh spinner turns (pullRefresh); the read it started may finish later.
-const REFRESH_SPIN_MS = 15_000;
+const REFRESH_SPIN_MS = 3_000;
 const SCREEN_EDGES = ['top', 'left', 'right'];
 // The open wallet's screen: its header takes the top inset itself, so its colour fills the status bar's area too.
 const MAIN_EDGES = ['left', 'right'];

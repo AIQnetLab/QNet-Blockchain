@@ -1,4 +1,4 @@
-# QNet Wallet extension 3.1.3: contracts
+# QNet Wallet extension 3.1.4: contracts
 
 This file is the single agreement between the modules of the rebuilt extension. The rebuild spec and the
 three audit reports (ext-secrets, ext-surface, ext-crypto) are normative; this file turns them into

@@ -24,7 +24,7 @@ import {
   highestVerifiedIndex, exportVerifiedAnchors, importVerifiedAnchors, chainIdentity, isRateLimitBody,
   certifiedStateRootAt, certifiedHeadHint, markNodeOld, nodeMarkedOld, trustFloorIndex, verifiedCheckpointTime,
   stepsToVerify, refreshCapsule, followStep, exportCapsule, importCapsule, clearCapsule, heldCapsuleIndex,
-  OWN_ROOT_WALK_STEPS, verifyCapsuleSignatures,
+  OWN_ROOT_WALK_STEPS, verifyCapsuleSignatures, nodeReadStates,
 } from '../crypto/QcLightClient';
 import { NETWORK_ID } from '../config/genesisConsensus';
 import { boundedGetJson } from '../utils/boundedFetch';
@@ -2962,9 +2962,13 @@ export class WalletManager {
       'walk: ' + (w.ok === undefined ? 'never' : w.ok ? 'ok' : (w.why || 'failed')) + (w.index ? ' to ' + w.index : '') + ' (' + age(w.at) + ')',
       'verified up to: ' + highestVerifiedIndex(), 'steps left: ' + (this.walkSteps() ?? 'none')];
     // The same read and the same signature check the walk uses, done now: which of the two fails on this device.
+    for (const n of nodeReadStates(GENESIS_NODES)) {
+      lines.push(n.base.replace('https://', '') + ': backoff ' + Math.round(n.backoff / 1000) + 's, budget ' + Math.round(n.wait / 1000) + 's, miss ' + Math.round(n.capsuleMiss / 1000) + 's');
+    }
     try {
-      const cap = await boundedGetJson(GENESIS_NODES[0] + '/api/v1/galc/capsule', { timeoutMs: 15000, maxBytes: 64 * 1024 });
-      lines.push('capsule read: ok K=' + (cap && cap.mb_index));
+      const t0 = Date.now();
+      const cap = await boundedGetJson(GENESIS_NODES[0] + '/api/v1/galc/capsule', { timeoutMs: 30000, maxBytes: 64 * 1024 });
+      lines.push('capsule read: ok K=' + (cap && cap.mb_index) + ' in ' + (Date.now() - t0) + ' ms');
       const sig = await verifyCapsuleSignatures(cap);
       lines.push('capsule signatures on this device: ' + sig.valid.length + ' valid');
     } catch (e) {
@@ -2973,9 +2977,10 @@ export class WalletManager {
     return lines.join(String.fromCharCode(10));
   }
 
-  // A walk to `index` of more than OWN_ROOT_WALK_STEPS steps first asks for a capsule (at most CAPSULE_WAIT_MS): one
+  // A walk to `index` of more than OWN_ROOT_WALK_STEPS steps first asks for a capsule (at most CAPSULE_WAIT_MS, as long
+  // as its reads may take: a walk started early spends the read budget and the capsule then never comes): one
   // rooted meanwhile makes it a few steps. Without one the walk goes on from the anchors or the pin, exactly as before.
-  static CAPSULE_WAIT_MS = 8000;
+  static CAPSULE_WAIT_MS = 30_000;
 
   async _capsuleFirst(index, head) {
     if (!Number.isSafeInteger(head) || !(stepsToVerify(index) > OWN_ROOT_WALK_STEPS)) return;

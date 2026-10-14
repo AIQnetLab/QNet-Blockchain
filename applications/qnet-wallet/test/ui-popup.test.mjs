@@ -2081,7 +2081,7 @@ describe('popup: settings', () => {
     await page.click('[data-action="revoke"]');
     assert.deepEqual(page.callsOf('sites.revoke').map((entry) => entry.params), [{ origin: 'https://aiqnet.io' }]);
     assert.equal(page.$$('[data-action="revoke"]').length, 1);
-    assert.match(page.text(), /Version3\.1\.3/);
+    assert.match(page.text(), /Version3\.1\.4/);
   });
 
   it('checks a new password locally, then changes it with the current one', async () => {

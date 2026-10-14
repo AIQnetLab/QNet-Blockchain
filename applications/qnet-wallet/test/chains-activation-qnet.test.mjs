@@ -2356,7 +2356,7 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
       const { toUiError } = await import('../dist/background/errors.js');
       assert.deepEqual(toUiError(new WalletError('BALANCE_UNCONFIRMED', { walkSteps: 7 })),
         { code: 'BALANCE_UNCONFIRMED', message: 'The balance is not confirmed yet', walkSteps: 7 });
-      assert.equal(capsuleAsks, 2, 'the first worker asked two nodes; the next ones asked nobody');
+      assert.equal(capsuleAsks, 3, 'the first worker asked three nodes; the next ones asked nobody');
       assert.ok(store.qnet_light_hints_v1.capsuleQuietUntil > Date.now());
     } finally {
       delete globalThis.chrome;

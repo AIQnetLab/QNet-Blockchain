@@ -6,7 +6,7 @@
 /** true only in dist-dev/, where scripts/build-dev.mjs rewrites this line; gates the logger. */
 export const DEV_BUILD = false;
 
-export const WALLET_VERSION = '3.1.3';
+export const WALLET_VERSION = '3.1.4';
 export const RELEASE_CHANNEL = 'testnet';
 
 export const QNET = Object.freeze({

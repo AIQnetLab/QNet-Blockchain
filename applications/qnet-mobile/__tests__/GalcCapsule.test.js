@@ -233,7 +233,7 @@ describe('on a chain whose nodes serve no capsule (404, 405)', () => {
   it('each node is asked once per TTL, and the walk goes on from the pin exactly as before', async () => {
     serve({ capsule: { [N[4]]: 404 } });
     await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'no_capsule' });
-    expect(capsuleAsks()).toEqual([N[0], N[1]]);
+    expect(capsuleAsks()).toEqual([N[0], N[1], N[2]]);
     await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'no_capsule' });
     await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'no_capsule' });
     await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'no_capsule' });
@@ -242,13 +242,13 @@ describe('on a chain whose nodes serve no capsule (404, 405)', () => {
     // The walk: from the root, as a client that never asked.
     await expect(lc.verifyMacroblockStateRoot(stateRootOf(50), 50 * 90, nodes)).resolves.toBe(true);
     expect(indicesAsked()).toEqual(Array.from({ length: 25 }, (_, i) => 2 + 2 * i));
-    // After the TTL the first two are asked again.
+    // After the TTL the first three are asked again.
     const now = Date.now();
     const clock = jest.spyOn(Date, 'now').mockReturnValue(now + lc.CAPSULE_MISS_TTL_MS + 1);
     try {
       calls.length = 0;
       await lc.refreshCapsule(nodes, { force: true });
-      expect(capsuleAsks()).toEqual([N[0], N[1]]);
+      expect(capsuleAsks()).toEqual([N[0], N[1], N[2]]);
     } finally {
       clock.mockRestore();
     }
@@ -293,7 +293,7 @@ describe('a capsule on the synthetic chain', () => {
     const second = await lc.followStep(nodes, { maxSteps: lc.WALK_STEPS_PER_CALL, both: true });
     expect(second).toMatchObject({ ok: true, verified: true, stepsLeft: 0, capsule: null });
     expect(second.targets.map((t) => t.index)).toEqual([HEAD, HEAD - 1]);
-    expect(capsuleAsks()).toEqual([N[0], N[1]]);
+    expect(capsuleAsks()).toEqual([N[0], N[1], N[2]]);
   });
 
   it('three valid signatures of four entries are refused; the node waits out the TTL; no proof is fetched', async () => {
@@ -304,7 +304,7 @@ describe('a capsule on the synthetic chain', () => {
     expect(proofsAsked()).toEqual([]);
     expect(lc.heldCapsuleIndex()).toBe(0);
     await lc.refreshCapsule(nodes);
-    expect(capsuleAsks()).toEqual([N[0], N[1], N[2], N[3]]);
+    expect(capsuleAsks()).toEqual(N);
   });
 
   it.each([
