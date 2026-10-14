@@ -6,6 +6,7 @@
 import './src/polyfills/crypto-install';
 import 'react-native-get-random-values';
 import { Buffer } from 'buffer';
+import './src/polyfills/buffer-subarray';
 global.Buffer = Buffer;
 
 if (typeof global.process === 'undefined') {

@@ -177,8 +177,11 @@ K-1 are built as for any walk step: `stateRoot`, `logsRoot`, `checkpointHash`, t
 - It is replaced only by a capsule with a higher K.
 - A capsule naming a checkpoint other than one the device verified (or kept with its roots) for K or K-1 is refused; a
   held one is dropped when a walk later verifies another checkpoint at K or K-1, or when two nodes refuse the first step
-  above its root for what ties that step to the root (its committee's signatures, its keys, its registry). Dropping
-  costs a longer walk, never trust, and the same capsule is not taken again for 10 minutes.
+  above its root for what ties that step to the root (its committee's signatures, its keys, its registry) and a walk
+  rooted lower then verifies a step; a device that verifies no step at all keeps it (the fault is the device's or the
+  network's, not the capsule's). Anchors kept from an earlier session are checked the same way. Dropping costs a longer
+  walk, never trust, and the same capsule is not taken again, nor asked for, until a newer one can exist (10 minutes at
+  most); no node is charged for serving it.
 - A rewind of the chain (the pinned nodes serve another chain) clears it (`clearCapsule`).
 - K and K-1 answer state and log queries at their own index. The trust floor stays at the pin + 1, so log proofs
   between the pin and K keep verifying by the walk from the pin.
@@ -193,11 +196,12 @@ to the head takes at most ⌈10 / 2⌉ + 1 = 6 steps per parity.
 
 ### 7.6 Fetching
 
-- Two nodes are asked at once (the genesis names); the highest K that passes sections 7.1 to 7.3 is taken: an offer
+- Three nodes are asked at once (the genesis names); the highest K that passes sections 7.1 to 7.3 is taken: an offer
   whose roots cannot be confirmed now leaves the next one.
-- A node answering 404 or 405, an oversized or refused capsule, or none newer than the held one is not asked again for
-  10 minutes (`CAPSULE_MISS_TTL_MS`): probing costs at most one request per node per 10 minutes. A node that did not
-  answer (timeout, server error) waits 60 seconds. A rate-limit answer only pauses that node.
+- A node answering 404 or 405, an oversized or unusable capsule, or none newer than the held one is not asked again for
+  10 minutes (`CAPSULE_MISS_TTL_MS`) or until the next mint period starts, whichever comes first: probing costs at most
+  one request per node per 10 minutes, and a capsule minted meanwhile is never shut out. A node that did not answer
+  (timeout, server error) waits 60 seconds. A rate-limit answer only pauses that node.
 - No request is made while no newer capsule can exist (certified head below the held K + 10), or while the walk from
   the device's own anchors to the head is 16 steps or shorter on both parities.
 - With no capsule every walk, proof and badge is exactly what it is without capsules.

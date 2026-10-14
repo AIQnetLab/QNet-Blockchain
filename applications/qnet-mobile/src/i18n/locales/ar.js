@@ -749,7 +749,6 @@ export default {
   balance_unavailable: "لم يُحدَّث. اسحب للأسفل لإعادة المحاولة.",
   balance_network_paused: 'لم تؤكد QNet Blockchain أي جديد منذ {time}. الأرصدة كما كانت حينها.',
   balance_network_paused_untimed: 'لم تؤكد QNet Blockchain أي جديد منذ فترة. الأرصدة كما كانت في آخر حالة مؤكدة.',
-  transit_line: 'قيد النقل: {amount} QNC',
   hist_status_dropped: "غير موجودة",
   hist_status_moving: 'قيد النقل',
   hist_status_unverified: "غير موثّقة",

@@ -168,7 +168,7 @@ describe('the balance a send is decided by', () => {
   });
 
   it('a walk that never ends does not hold the send check past its deadline', async () => {
-    expect(WalletManager.SEND_CHECK_DEADLINE_MS).toBe(6000);
+    expect(WalletManager.SEND_CHECK_DEADLINE_MS).toBe(20_000);
     global.fetch = jest.fn(async (url) => (url.includes('/balance/proof')
       ? reply(200, `{"balance":5000000000,"nonce":3,"merkle_proof":[{"sibling":"00","is_right":true}],"state_root":"${ROOT}","block_height":9000}`)
       : reply(200, { nonce: 3, height: 9000 })));
@@ -192,6 +192,31 @@ describe('the balance a send is decided by', () => {
       WalletManager.sendProofs.clear();
       global.fetch = jest.fn(async (url, opts) => (url.includes('/balance/proof') ? hanging(opts) : reply(200, { nonce: 3 })));
       await expect(wm.certifiedQncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: false, error: 'unanswered' });
+    } finally {
+      WalletManager.SEND_CHECK_DEADLINE_MS = saved;
+    }
+  });
+
+  it('a check that joins a read already running waits its own full deadline (the tap after the Send screen opened)', async () => {
+    const wm = new WalletManager();
+    const saved = WalletManager.SEND_CHECK_DEADLINE_MS;
+    WalletManager.SEND_CHECK_DEADLINE_MS = 400;
+    try {
+      let reads = 0;
+      const fresh = (progress) => {
+        reads += 1;
+        progress.answered = true;
+        return new Promise((resolve) => { setTimeout(() => resolve({ figure: { balanceNano: '5' }, nonce: 1 }), 600); });
+      };
+      const opened = wm._sendBase('qnc|x', () => null, fresh, null);
+      await new Promise((resolve) => { setTimeout(resolve, 300); });
+      const tapped = wm._sendBase('qnc|x', () => null, fresh, null);
+      await expect(opened).resolves.toEqual({ error: 'unconfirmed' });
+      await expect(tapped).resolves.toMatchObject({ figure: { balanceNano: '5' } });
+      expect(reads).toBe(1);
+      // A check after the first read's window starts its own read.
+      await wm._sendBase('qnc|x', () => null, fresh, null);
+      expect(reads).toBe(2);
     } finally {
       WalletManager.SEND_CHECK_DEADLINE_MS = saved;
     }

@@ -326,7 +326,8 @@ describe('a capsule on the synthetic chain', () => {
     await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'conflict' });
     expect(lc.heldCapsuleIndex()).toBe(0);
     calls.length = 0;
-    await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'conflict' });
+    // Refused here now: nothing is fetched for it, and the nodes that serve it are not charged.
+    await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'refused' });
     expect(proofsAsked()).toEqual([]);
   });
 
@@ -481,6 +482,123 @@ describe('a capsule on the synthetic chain', () => {
     expect(lc.heldCapsuleIndex()).toBe(0);
     const asked = indicesAsked();
     expect(asked.slice(0, asked.indexOf(1)).every((j) => j > KC)).toBe(true); // first above the capsule, then from the root
+  });
+});
+
+// Buffer#subarray as Hermes gives it (the phones' engine): a plain Uint8Array over the same bytes. Returns the undo.
+function hermesSubarray() {
+  const own = Object.getOwnPropertyDescriptor(Buffer.prototype, 'subarray');
+  Buffer.prototype.subarray = function subarray(start, end) {
+    return Uint8Array.prototype.subarray.call(new Uint8Array(this.buffer, this.byteOffset, this.length), start, end);
+  };
+  return () => {
+    if (own) Object.defineProperty(Buffer.prototype, 'subarray', own);
+    else delete Buffer.prototype.subarray;
+  };
+}
+
+describe('on an engine whose Buffer#subarray is a plain Uint8Array (Hermes, 14.10)', () => {
+  let undo;
+  beforeEach(() => { undo = hermesSubarray(); });
+  afterEach(() => undo());
+
+  it('a capsule roots, and the walks from it and from the pin verify', async () => {
+    const capsule = capsuleAt();
+    serve({ capsule: () => capsule });
+    await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: true, index: KC });
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(HEAD), HEAD * 90, nodes)).resolves.toBe(true);
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(HEAD - 1), (HEAD - 1) * 90, nodes)).resolves.toBe(true);
+    reset();
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(12), 12 * 90, nodes)).resolves.toBe(true);
+  });
+});
+
+describe('a device whose walk steps all fail', () => {
+  // The votes of every walk step are refused on this device alone; the capsule's genesis signatures still verify.
+  const refuseVotes = () => verifyDilithium.mockImplementation(async (m, sig, pk) => (m.startsWith('QNET_BFT2_VOTE:') ? false : verify(m, sig, pk)));
+  afterEach(() => verifyDilithium.mockImplementation(verify));
+
+  it('keeps the capsule it rooted (nothing is deleted), charges no node, and asks for none while none newer can exist', async () => {
+    const capsule = capsuleAt();
+    const head = KC + 5;
+    serve({ capsule: () => capsule, head });
+    await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: true, index: KC });
+    refuseVotes();
+    const hooks = { onCapsuleDropped: jest.fn(), onLineageReset: jest.fn() };
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, hooks)).resolves.toBe(false);
+    expect(hooks.onCapsuleDropped).not.toHaveBeenCalled();
+    expect(hooks.onLineageReset).not.toHaveBeenCalled();
+    expect(lc.heldCapsuleIndex()).toBe(KC);
+    expect(lc.capsuleRefusal()).toBeNull();
+    expect(lc.lastStepFailure().nodes.map((n) => n.reason)).toEqual(expect.arrayContaining(['qc_invalid']));
+    // Its first step above the capsule stays failed for the TTL: a second check fetches nothing for it.
+    calls.length = 0;
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, hooks)).resolves.toBe(false);
+    expect(indicesAsked()).not.toContain(KC + 1);
+    for (let i = 0; i < 6; i++) await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'current' });
+    expect(capsuleAsks()).toEqual([]);
+    expect(lc.nodeReadStates(N).map((n) => n.capsuleMiss)).toEqual([0, 0, 0, 0, 0]);
+    // Once the device verifies again, the kept capsule roots the walk at once.
+    verifyDilithium.mockImplementation(verify);
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 61_000);
+    try {
+      calls.length = 0;
+      await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, hooks)).resolves.toBe(true);
+      expect(indicesAsked()).toEqual([41, 43, 45]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
+
+describe('a capsule refused here', () => {
+  it('is not asked for again until a newer one can exist, no node is charged for it, and the next one is taken', async () => {
+    const foreignIds = ['other_node_a', 'other_node_b'];
+    const foreign = (j) => {
+      const p = proofFor(j);
+      const raw = eligibleRawHex(foreignIds);
+      const cp = { ...p.checkpoint, epoch_commitment: lc.epochCommitment(Buffer.from(raw, 'hex'), foreignIds, []) };
+      return { ...p, checkpoint: cp, eligible_raw: raw, committee: foreignIds };
+    };
+    const f = capsuleAt(KC, { over: { cp_hash_pred: lc.checkpointHash(foreign(KC - 1).checkpoint) } });
+    const head = KC + 5;
+    serve({ capsule: () => f, head });
+    await expect(lc.importCapsule({ capsule: f, roots: { [KC]: partsOf(proofFor(KC)), [KC - 1]: partsOf(foreign(KC - 1)) } }))
+      .resolves.toEqual({ ok: true, index: KC });
+    const dropped = jest.fn();
+    // The walk from the pin verifies: the refusal above the capsule was about the capsule, which goes.
+    await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, { onCapsuleDropped: dropped })).resolves.toBe(true);
+    expect(dropped).toHaveBeenCalledTimes(1);
+    expect(lc.heldCapsuleIndex()).toBe(0);
+    expect(lc.capsuleRefusal()).toMatchObject({ index: KC });
+    calls.length = 0;
+    for (let i = 0; i < 6; i++) {
+      await expect(lc.refreshCapsule(nodes, { headHint: head, force: true })).resolves.toEqual({ ok: false, reason: 'refused' });
+    }
+    expect(capsuleAsks()).toEqual([]);
+    expect(lc.nodeReadStates(N).map((n) => n.capsuleMiss)).toEqual([0, 0, 0, 0, 0]);
+    // A newer capsule can exist: every node is asked again, and it is taken.
+    const next = capsuleAt(KC + 10);
+    serve({ capsule: () => next, head: KC + 10 });
+    await expect(lc.refreshCapsule(nodes, { headHint: KC + 10, force: true })).resolves.toEqual({ ok: true, index: KC + 10 });
+    expect(capsuleAsks()).toEqual([N[0], N[1], N[2]]);
+  });
+});
+
+describe('a capsule miss', () => {
+  it('lasts until a newer capsule can exist, not the whole TTL', async () => {
+    const good = capsuleAt();
+    const forged = { ...good, sigs: [...good.sigs.slice(0, 3), [GENESIS_IDS[3], good.sigs[0][1].replace(GENESIS_IDS[0], GENESIS_IDS[3])]] };
+    serve({ capsule: { [N[0]]: forged }, head: KC + 5 });
+    await expect(lc.refreshCapsule(nodes, { headHint: KC + 5, force: true })).resolves.toEqual({ ok: false, reason: 'invalid' });
+    expect(capsuleAsks()).toEqual([N[0], N[1], N[2]]);
+    calls.length = 0;
+    await expect(lc.refreshCapsule(nodes, { headHint: KC + 9, force: true })).resolves.toEqual({ ok: false, reason: 'no_capsule' });
+    expect(capsuleAsks()).toEqual([N[3], N[4]]);
+    const next = capsuleAt(KC + 10);
+    serve({ capsule: { [N[0]]: next, [N[1]]: next }, head: KC + 10 });
+    await expect(lc.refreshCapsule(nodes, { headHint: KC + 10, force: true })).resolves.toEqual({ ok: true, index: KC + 10 });
+    expect(capsuleAsks()[0]).toBe(N[0]);
   });
 });
 

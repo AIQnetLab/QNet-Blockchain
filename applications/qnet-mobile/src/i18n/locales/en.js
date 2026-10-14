@@ -751,7 +751,6 @@ QNet Wallet is published by Orrery Group LLC. The full Terms of Use and the Priv
   balance_unavailable: "Not updated. Pull down to try again.",
   balance_network_paused: 'QNet Blockchain has confirmed nothing new since {time}. Balances are as of then.',
   balance_network_paused_untimed: 'QNet Blockchain has confirmed nothing new for some time. Balances are as of its last confirmed state.',
-  transit_line: '+{amount} QNC in transit',
   hist_status_dropped: "Not found",
   hist_status_moving: 'Moving',
   // History's receive labels, the progress of a long lineage walk, a super node's admission.

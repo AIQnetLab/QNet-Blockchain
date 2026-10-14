@@ -749,7 +749,6 @@ QNet Wallet wird von der Orrery Group LLC herausgegeben. Die vollständigen Nutz
   balance_unavailable: "Nicht aktualisiert. Zum erneuten Versuch nach unten ziehen.",
   balance_network_paused: 'QNet Blockchain hat seit {time} nichts Neues bestätigt. Die Guthaben sind auf diesem Stand.',
   balance_network_paused_untimed: 'QNet Blockchain bestätigt seit einiger Zeit nichts Neues. Die Guthaben entsprechen dem zuletzt bestätigten Stand.',
-  transit_line: '+{amount} QNC unterwegs',
   hist_status_dropped: "Nicht gefunden",
   hist_status_moving: 'Unterwegs',
   hist_status_unverified: "Nicht geprüft",

@@ -700,10 +700,10 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
 
   // Owner, 11.10: the line never flashes. None while a read runs or after one read that failed; not updated (with the kept
   // figures, or with none) once reads failed twice over two minutes; the network stopped, whatever the reads give (with
-  // the time of its last certified state once verified, without one before). And a move of a node balance in transit on
-  // its own line under QNC (services/ClaimTransit). Every line in every table: right to left in Arabic, and at the large
+  // the time of its last certified state once verified, without one before). A move of a node balance in transit shows
+  // no line there. Every line in every table: right to left in Arabic, and at the large
   // system text size in every real language (check); the cases that show no line, in the longest table only.
-  it('the line about the figures on Assets, and a move in transit under QNC', async () => {
+  it('the line about the figures on Assets, and none for a move in transit', async () => {
     const issues = [];
     const realNow = Date.now.bind(Date);
     let offset = 0;
@@ -739,13 +739,11 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     } finally {
       nowSpy.mockRestore();
     }
-    // A move in transit: its own line under the QNC row, the amount never in the QNC figure.
+    // A move in transit: no line on Assets (owner, 14.10: History says Moving), the amount never in the QNC figure.
     Object.assign(mockState, { qncRead: 'hang', snapshot: null, pause: null, walk: null });
     await keepMoveInTransit();
     const tree = await unlocked();
-    const transit = tree.root.findAll((n) => n.props.testID === 'qnc-transit' && n.type === Text);
-    expect(transit).toHaveLength(1);
-    expect(plain([].concat(transit[0].props.children).join(''))).toContain('1234567.89123');
+    expect(tree.root.findAll((n) => n.props.testID === 'qnc-transit' && n.type === Text)).toHaveLength(0);
     issues.push(...check(tree, 'assets: a move in transit'));
     expect(issues).toEqual([]);
   });

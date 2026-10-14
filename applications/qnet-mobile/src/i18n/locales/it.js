@@ -749,7 +749,6 @@ QNet Wallet è pubblicato da Orrery Group LLC. I Termini d'uso completi e l'Info
   balance_unavailable: "Non aggiornato. Trascina verso il basso per riprovare.",
   balance_network_paused: 'QNet Blockchain non ha confermato nulla di nuovo da {time}. I saldi sono di quel momento.',
   balance_network_paused_untimed: "QNet Blockchain non conferma nulla di nuovo da un po'. I saldi sono quelli dell'ultimo stato confermato.",
-  transit_line: '+{amount} QNC in arrivo',
   hist_status_dropped: "Non trovata",
   hist_status_moving: 'In arrivo',
   hist_status_unverified: "Non verificata",

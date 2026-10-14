@@ -749,7 +749,6 @@ QNet Wallet 由 Orrery Group LLC 发布。完整的使用条款和隐私政策�
   balance_unavailable: "未更新。下拉以重试。",
   balance_network_paused: 'QNet Blockchain 自 {time} 起未确认任何新内容。余额为当时的数据。',
   balance_network_paused_untimed: 'QNet Blockchain 已有一段时间未确认任何新内容。余额为最后一次确认时的数据。',
-  transit_line: '+{amount} QNC 转入中',
   hist_status_dropped: "未找到",
   hist_status_moving: '转入中',
   hist_status_unverified: "未验证",

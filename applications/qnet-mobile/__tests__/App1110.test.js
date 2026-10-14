@@ -257,7 +257,7 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
   // Before, nothing was held: the node balance kept its old figure (read once, the largest of three answers, then locked
   // for the epoch) with Move on, and Assets showed nothing of the move until a certified read: the amount was in two
   // places or in none. This test fails on that behaviour at its first look at Assets.
-  it('is "+X in transit" under QNC and "Moving X" on the Node tab until a certified read shows it, then the node balance of the nodes that applied it', async () => {
+  it('is "Moving X" on the Node tab until a certified read shows it, never a line under QNC, then the node balance of the nodes that applied it', async () => {
     const tree = await unlocked();
     expect(qncFigure(tree)).toBe('1');
     expect(transitLine(tree)).toBe(null);
@@ -266,12 +266,12 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
     expect(texts(tree)).toContain(t('node_moving', { amount: '4 QNC' }));
     expect(moveButton(tree).props.disabled).toBe(true);
     expect(texts(tree)).toContain(`${t('node_balance')}\n0 QNC`);
-    // Assets: the amount on its own line, not in the QNC figure, while reads still show the old watermark.
+    // Assets: the QNC figure alone, never the amount in transit (owner, 14.10: History says Moving).
     await tab(tree, 'assets');
-    expect(transitLine(tree)).toBe(t('transit_line', { amount: '4' }));
+    expect(transitLine(tree)).toBe(null);
     expect(qncFigure(tree)).toBe('1');
     await pull(tree);
-    expect(transitLine(tree)).toBe(t('transit_line', { amount: '4' }));
+    expect(transitLine(tree)).toBe(null);
     // The certified read with the watermark at the batch's last epoch holds the amount: the line goes in the same update.
     // One genesis node still lags behind the move (the old 4 QNC unclaimed): its answer no longer counts; the others
     // applied the whole move and answer as the node does (nothing left: 0, no first unclaimed epoch).
@@ -355,7 +355,8 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
     await moved(tree);
     await act(async () => { mounted.pop().unmount(); });
     tree = await unlocked();
-    expect(transitLine(tree)).toBe(t('transit_line', { amount: '4' }));
+    await tab(tree, 'node');
+    expect(texts(tree)).toContain(t('node_moving', { amount: '4 QNC' }));
   });
 
   // Before, 35 minutes on, the wallet asked three genesis nodes' live state and said the move did not go through when
@@ -371,7 +372,7 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
       const asked = mockState.pendingCalls;
       await tab(tree, 'assets');
       await pull(tree);
-      expect(transitLine(tree)).toBe(t('transit_line', { amount: '4' }));
+      expect(transitLine(tree)).toBe(null);
       expect(qncFigure(tree)).toBe('1');
       await tab(tree, 'node');
       await transitTick();

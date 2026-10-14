@@ -267,8 +267,18 @@ describe('the Send button', () => {
     expect(byTestId(tree, 'send-busy')).toEqual([]);
   });
 
+  it('opening the Send screen starts the balance check, so the tap takes it at once', async () => {
+    const tree = await unlocked();
+    mockState.calls = [];
+    const send = tree.root.findAll((n) => n.props.testID === 'assets-send' && typeof n.props.onPress === 'function')[0];
+    await act(async () => { send.props.onPress(); });
+    await flush(2);
+    expect(mockState.calls).toEqual(['balance']);
+  });
+
   it('the wait before the review is the slowest check, not the sum of them', async () => {
     const tree = await sendForm();
+    mockState.calls = [];
     const DELAY = 600;
     let inFlight = 0;
     let most = 0;

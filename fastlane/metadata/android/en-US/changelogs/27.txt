@@ -1,0 +1,4 @@
+• Balances and sends are now confirmed on the phone itself: a fault of the phone's script engine kept every block check from passing
+• A send right after opening the app waits for the confirmation instead of stopping
+• Pull to refresh ends as soon as the new balance is on screen
+• A move from the node shows as Moving in History, not under the balance

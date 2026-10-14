@@ -749,7 +749,6 @@ QNet Wallet は Orrery Group LLC が公開しています。利用規約の全�
   balance_unavailable: "未更新。下に引いて再試行してください。",
   balance_network_paused: 'QNet Blockchain は {time} 以降、新たな確認を行っていません。残高はその時点のものです。',
   balance_network_paused_untimed: 'QNet Blockchain はしばらく新たな確認を行っていません。残高は最後に確認された時点のものです。',
-  transit_line: '+{amount} QNC 移動中',
   hist_status_dropped: "見つかりません",
   hist_status_moving: '移動中',
   hist_status_unverified: "未検証",

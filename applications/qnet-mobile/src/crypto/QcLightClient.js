@@ -131,14 +131,14 @@ function certifiedEntry(j) {
 }
 
 // The highest index below `idx` on idx's parity chain that this device's own data roots a walk at (a macroblock verified
-// now or in an earlier session, or the pin), or -1.
-function ownWalkRoot(idx) {
+// now or in an earlier session, or the pin), or -1. `resume` false: not the anchors kept from an earlier session.
+function ownWalkRoot(idx, resume = true) {
   let best = -1;
   const consider = (j) => {
     if (j < idx && j > best && (idx - j) % 2 === 0 && anchorFor(j)) best = j;
   };
   for (const j of _verifiedCache.keys()) consider(j);
-  for (const j of _resumeAnchors.keys()) consider(j);
+  if (resume) for (const j of _resumeAnchors.keys()) consider(j);
   const k = WS_CHECKPOINT.index || 0;
   if (k > 0) { consider(k); consider(k - 1); }
   return best;
@@ -154,10 +154,11 @@ function capsuleWalkRoot(idx) {
 const stepsFrom = (root, idx) => (root < 0 ? Infinity : (idx - root) / 2);
 
 // The highest index below `idx` on idx's parity chain that a walk to idx starts from, or -1. The capsule's root only when
-// it is higher than this device's own and the walk from its own takes more than OWN_ROOT_WALK_STEPS steps.
-function walkRoot(idx) {
-  const own = ownWalkRoot(idx);
-  const held = capsuleWalkRoot(idx);
+// it is higher than this device's own and the walk from its own takes more than OWN_ROOT_WALK_STEPS steps. `without`:
+// { resume, capsule } a walk leaves out while it checks them (walkTo).
+function walkRoot(idx, without = null) {
+  const own = ownWalkRoot(idx, !(without && without.resume));
+  const held = without && without.capsule ? -1 : capsuleWalkRoot(idx);
   return held > own && stepsFrom(own, idx) > OWN_ROOT_WALK_STEPS ? held : own;
 }
 
@@ -744,7 +745,9 @@ export function decodeEligibleNodeIds(eligibleRawBytes) {
     if (off + 8 > buf.length) return [];
     const slen = Number(buf.readBigUInt64LE(off)); off += 8;
     if (off + slen + 4 > buf.length) return [];
-    ids.push(buf.subarray(off, off + slen).toString('utf8')); off += slen + 4; // +4 = u32 reputation
+    // Decoded in place, never through subarray: on Hermes a Buffer's subarray is a plain Uint8Array, whose toString
+    // lists the bytes ("103,101,...") instead of the id, and no committee key would bind (the phone verified no step).
+    ids.push(buf.toString('utf8', off, off + slen)); off += slen + 4; // +4 = u32 reputation
   }
   return ids;
 }
@@ -1297,86 +1300,114 @@ async function walkTo(idx, nodesProvider, hooks) {
   const budget = hooks && Number.isSafeInteger(hooks.maxSteps) && hooks.maxSteps >= 1
     ? Math.min(hooks.maxSteps, WALK_STEPS_PER_CALL) : WALK_STEPS_PER_CALL;
   let largestSeen = 0;
-  // Three passes at most: a later one only after the one before found its root (anchors kept from an earlier session,
-  // or the capsule's root) to be of another lineage and rooted the walk lower instead (see below).
-  for (let pass = 0; pass < 3; pass++) {
-    const root = walkRoot(idx);
-    const resumed = root >= 0 && _resumeAnchors.has(root) && !_verifiedCache.has(root);
-    const capsuleRooted = root >= 0 && !resumed && !_verifiedCache.has(root) && capsuleEntry(root) !== undefined;
-    const start = root >= 0
-      ? root + 2
-      : k > 0
-        ? (((idx - (k + 1)) % 2 === 0) ? k + 1 : k + 2)
-        : ((idx % 2 === 0) ? 2 : 1);
-    let reset = false;
-    const ahead = new Map(); // step -> its proof fetched ahead (fetchAhead)
-    // The committee size the walk expects: its anchor's eligible set, the genesis set below it.
-    const rootAnchor = root >= 0 ? anchorFor(root) : null;
-    const members = rootAnchor && Array.isArray(rootAnchor.eligibleIds) ? rootAnchor.eligibleIds.length : GENESIS_NODE_IDS.length;
-    const held = () => {
-      let sum = 0;
-      for (const e of ahead.values()) {
-        if (!e) continue;
-        if (e.bytes !== null && e.bytes > largestSeen) largestSeen = e.bytes;
-        sum += e.bytes !== null ? e.bytes : e.share;
-      }
-      return sum;
-    };
-    for (let j = start; j <= idx; j += 2) {
-      if (_verifiedCache.has(j)) continue;
-      // The budget of this call is spent: what was verified is kept (hooks.onProgress), the next call goes on.
-      if (steps >= budget) {
-        console.warn('[WARN][LIGHT] walk_budget_spent j=' + j + ' target=' + idx);
+  // Roots whose first step several nodes refused for what ties it to them (see below), each with the failures that
+  // refusal left: { kind: 'resume' | 'capsule', k, failures }. Left out of the next passes, and dropped only once a step
+  // of a pass rooted lower verifies; otherwise kept, with their failures back.
+  const suspects = [];
+  const without = { resume: false, capsule: false };
+  try {
+    // Three passes at most: a later one only after the one before found its root (anchors kept from an earlier session,
+    // or the capsule's root) refused and rooted the walk lower instead (see below).
+    for (let pass = 0; pass < 3; pass++) {
+      const root = walkRoot(idx, without);
+      const resumed = root >= 0 && !without.resume && _resumeAnchors.has(root) && !_verifiedCache.has(root);
+      const capsuleRooted = root >= 0 && !without.capsule && !resumed && !_verifiedCache.has(root) && capsuleEntry(root) !== undefined;
+      const start = root >= 0
+        ? root + 2
+        : k > 0
+          ? (((idx - (k + 1)) % 2 === 0) ? k + 1 : k + 2)
+          : ((idx % 2 === 0) ? 2 : 1);
+      let reset = false;
+      const ahead = new Map(); // step -> its proof fetched ahead (fetchAhead)
+      // The committee size the walk expects: its anchor's eligible set, the genesis set below it.
+      const rootAnchor = root >= 0 ? anchorFor(root) : null;
+      const members = rootAnchor && Array.isArray(rootAnchor.eligibleIds) ? rootAnchor.eligibleIds.length : GENESIS_NODE_IDS.length;
+      const held = () => {
+        let sum = 0;
+        for (const e of ahead.values()) {
+          if (!e) continue;
+          if (e.bytes !== null && e.bytes > largestSeen) largestSeen = e.bytes;
+          sum += e.bytes !== null ? e.bytes : e.share;
+        }
+        return sum;
+      };
+      for (let j = start; j <= idx; j += 2) {
+        if (_verifiedCache.has(j)) continue;
+        // The budget of this call is spent: what was verified is kept (hooks.onProgress), the next call goes on.
+        if (steps >= budget) {
+          console.warn('[WARN][LIGHT] walk_budget_spent j=' + j + ' target=' + idx);
+          return null;
+        }
+        // This step and the next ones, up to `depth`, never past this call's budget nor the walk's byte bound, are
+        // fetched now; the step itself always is.
+        for (let s = j, n = 0, used = steps; s <= idx && n < depth && used < budget; s += 2) {
+          if (_verifiedCache.has(s)) continue;
+          if (!ahead.has(s)) {
+            const inFlight = held();
+            const share = prefetchShareBytes(members, largestSeen);
+            if (s !== j && inFlight + share > byteBudget) break;
+            ahead.set(s, fetchAhead(s, nodesProvider, share));
+          }
+          n += 1;
+          used += 1;
+        }
+        steps += 1;
+        const first = ahead.get(j) || null;
+        ahead.delete(j);
+        // A step no node could serve stops the walk (j+2's committee is derived from j); each node that failed
+        // it is not asked again for it until its TTL lapses, so a hopeless step costs no fetches and no
+        // ML-DSA opens on every balance check. A target not certified yet stops it with no node charged.
+        const tally = { refused: 0 };
+        const outcome = await verifyStep(j, nodesProvider, hooks, tally, first, j === idx);
+        if (first && first.bytes !== null && first.bytes > largestSeen) largestSeen = first.bytes;
+        if (outcome === STEP.VERIFIED) {
+          // A step of a pass rooted below the suspects verified: this device verifies steps, so the refusals above them
+          // were about them. They go (the stored copies with them: hooks.onLineageReset, hooks.onCapsuleDropped).
+          for (const sus of suspects.splice(0)) {
+            if (sus.kind === 'resume') {
+              _resumeAnchors.clear();
+              notify(hooks && hooks.onLineageReset);
+            } else if (_capsule && _capsule.index === sus.k) {
+              dropCapsule();
+              notify(hooks && hooks.onCapsuleDropped);
+            }
+          }
+          continue;
+        }
+        // The first step above an anchor kept from an earlier session, refused by several nodes for what ties it to that
+        // anchor (its committee's signatures, its keys, its registry): the anchor may not be this chain's lineage (a chain
+        // that started again), and the walk would never get past it. A capsule whose root is refused the same way is
+        // checked the same way. The walk roots lower at once, leaving that root out; the root goes only when a step of
+        // that lower walk verifies (above): a device that verifies no step at all (its own fault, or nodes down) keeps
+        // what it holds, never deletes the only progress it has. The pin and macroblocks verified in this session are
+        // never dropped, so at worst this costs a longer walk, never trust.
+        if ((resumed || capsuleRooted) && j === start && tally.refused >= LINEAGE_REFUSALS) {
+          const failures = [..._failedCache].filter(([key]) => key.startsWith(j + '|'));
+          for (const [key] of failures) _failedCache.delete(key);
+          if (resumed) {
+            console.warn('[WARN][LINEAGE] resume_anchor_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
+            suspects.push({ kind: 'resume', k: root, failures });
+            without.resume = true;
+          } else {
+            console.warn('[WARN][GALC] capsule_root_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
+            suspects.push({ kind: 'capsule', k: _capsule ? _capsule.index : -1, failures });
+            without.capsule = true;
+          }
+          reset = true;
+          break;
+        }
         return null;
       }
-      // This step and the next ones, up to `depth`, never past this call's budget nor the walk's byte bound, are
-      // fetched now; the step itself always is.
-      for (let s = j, n = 0, used = steps; s <= idx && n < depth && used < budget; s += 2) {
-        if (_verifiedCache.has(s)) continue;
-        if (!ahead.has(s)) {
-          const inFlight = held();
-          const share = prefetchShareBytes(members, largestSeen);
-          if (s !== j && inFlight + share > byteBudget) break;
-          ahead.set(s, fetchAhead(s, nodesProvider, share));
-        }
-        n += 1;
-        used += 1;
-      }
-      steps += 1;
-      const first = ahead.get(j) || null;
-      ahead.delete(j);
-      // A step no node could serve stops the walk (j+2's committee is derived from j); each node that failed
-      // it is not asked again for it until its TTL lapses, so a hopeless step costs no fetches and no
-      // ML-DSA opens on every balance check. A target not certified yet stops it with no node charged.
-      const tally = { refused: 0 };
-      const outcome = await verifyStep(j, nodesProvider, hooks, tally, first, j === idx);
-      if (first && first.bytes !== null && first.bytes > largestSeen) largestSeen = first.bytes;
-      if (outcome === STEP.VERIFIED) continue;
-      // The first step above an anchor kept from an earlier session, refused by several nodes for what ties it to that
-      // anchor (its committee's signatures, its keys, its registry): the anchor is not this chain's lineage (a chain
-      // that started again), and the walk would never get past it. The kept anchors go, the failures they caused are
-      // forgotten, and the walk roots at the pin (or a lower anchor) at once. The pin and macroblocks verified in this
-      // session are never dropped, so at worst this costs a longer walk, never trust. A capsule whose root is refused
-      // the same way goes the same way (hooks.onCapsuleDropped); the kept anchors stay.
-      if ((resumed || capsuleRooted) && j === start && tally.refused >= LINEAGE_REFUSALS) {
-        if (resumed) {
-          console.warn('[WARN][LINEAGE] resume_anchor_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
-          _resumeAnchors.clear();
-          notify(hooks && hooks.onLineageReset);
-        } else {
-          console.warn('[WARN][GALC] capsule_root_refused root=' + root + ' j=' + j + ' refused=' + tally.refused);
-          dropCapsule();
-          notify(hooks && hooks.onCapsuleDropped);
-        }
-        for (const key of [..._failedCache.keys()]) if (key.startsWith(j + '|')) _failedCache.delete(key);
-        reset = true;
-        break;
-      }
-      return null;
+      if (!reset) return _verifiedCache.get(idx) || null;
     }
-    if (!reset) return _verifiedCache.get(idx) || null;
+    return null;
+  } finally {
+    // Suspects no lower step confirmed stay held; their step stays failed for its TTL (no refetch), unless a lower pass
+    // reached it and failed it itself.
+    for (const sus of suspects) {
+      for (const [key, f] of sus.failures) if (!_failedCache.has(key)) _failedCache.set(key, f);
+    }
   }
-  return null;
 }
 
 // ── public entrypoint ───────────────────────────────────────────────────────
@@ -1654,7 +1685,9 @@ export const CAPSULE_MAX_BYTES = 64 * 1024;
 // A kept capsule record (exportCapsule): the capsule and the parts of the proofs of K and K-1 that bind it.
 const CAPSULE_RECORD_MAX_BYTES = 1024 * 1024;
 // A node that answered no capsule (404, 405), an unusable one or one not newer than the held one, is not asked again for
-// this long: probing costs at most one request per node per TTL. A node that did not answer at all waits FAIL_TTL_MS.
+// this long, or until the next mint period starts (a newer capsule can exist only from then on), whichever comes first:
+// probing costs at most one request per node per TTL or mint interval, and a capsule minted meanwhile is never shut out.
+// A node that did not answer at all waits FAIL_TTL_MS.
 export const CAPSULE_MISS_TTL_MS = 10 * 60_000;
 // A walk from this device's own anchor of at most this many steps (about 16 s at today's speed) is taken even when the
 // capsule roots higher: the capsule shortens long walks, it never stands in for a lineage the device can still follow.
@@ -1668,7 +1701,7 @@ const CAPSULE_ASK_NODES = 3;
 // Not in the LRU, not dropped by the lineage reset of kept anchors; replaced only by a higher K; cleared by clearCapsule.
 let _capsule = null;
 let _capsuleRefused = null; // { index, cpA, at }: a capsule dropped for a conflict, not taken again within the TTL
-const _capsuleMiss = new Map(); // base -> until when it is not asked for a capsule
+const _capsuleMiss = new Map(); // base -> { until, period }: until when, and in which mint period, it is not asked
 let _capsuleRefresh = null;
 
 // The entry of a root of the held capsule, or undefined.
@@ -1692,8 +1725,9 @@ function capsuleConflicts(j, cpHash) {
   return true;
 }
 
-const capsuleRefusedNow = (c) => !!_capsuleRefused && _capsuleRefused.index === c.mb_index
-  && _capsuleRefused.cpA === c.cp_hash_anchor && Date.now() - _capsuleRefused.at < CAPSULE_MISS_TTL_MS;
+// Whether capsule `c` (null: any) was refused here within the TTL.
+const capsuleRefusedNow = (c) => !!_capsuleRefused && Date.now() - _capsuleRefused.at < CAPSULE_MISS_TTL_MS
+  && (c === null || (_capsuleRefused.index === c.mb_index && _capsuleRefused.cpA === c.cp_hash_anchor));
 
 /** The text the genesis keys sign for a capsule (docs/protocols/galc-capsule-v2.md section 3). */
 export function capsulePreimage(c) {
@@ -1865,14 +1899,18 @@ async function rootCapsule(c, nodes) {
   return { ok: true };
 }
 
-function missCapsule(base, ms = CAPSULE_MISS_TTL_MS) {
-  _capsuleMiss.set(base, Date.now() + ms);
+// The mint period a certified head is in (a capsule is minted every GALC_V2_MINT_INTERVAL macroblocks), or null.
+const mintPeriod = (head) => (Number.isSafeInteger(head) ? Math.floor(head / GALC_V2_MINT_INTERVAL) : null);
+
+function missCapsule(base, ms, head) {
+  _capsuleMiss.set(base, { until: Date.now() + ms, period: mintPeriod(head) });
 }
 
-function capsuleMissed(base, now) {
-  const until = _capsuleMiss.get(base);
-  if (until === undefined) return false;
-  if (until <= now) { _capsuleMiss.delete(base); return false; }
+function capsuleMissed(base, now, head) {
+  const m = _capsuleMiss.get(base);
+  if (m === undefined) return false;
+  const p = mintPeriod(head);
+  if (m.until <= now || (p !== null && m.period !== null && p > m.period)) { _capsuleMiss.delete(base); return false; }
   return true;
 }
 
@@ -1890,10 +1928,15 @@ async function refreshCapsuleNow(nodesProvider, { headHint, proofNodes = null, f
   const held = _capsule ? _capsule.index : 0;
   if (held > 0 && head < held + GALC_V2_MINT_INTERVAL) return { ok: false, reason: 'current' };
   if (!force && !capsuleWanted(head)) return { ok: false, reason: 'not_needed' };
+  // The capsule this device refused is the newest that can exist yet: nobody is asked, and no node is charged for
+  // serving what every node serves.
+  if (capsuleRefusedNow(null) && held < _capsuleRefused.index && head < _capsuleRefused.index + GALC_V2_MINT_INTERVAL) {
+    return { ok: false, reason: 'refused' };
+  }
   const now = Date.now();
   // Only a node's own rate limit keeps it out, never this device's read budget: a walk that spent it must not shut out
   // the one read that ends the walk. Three nodes at once, so one slow or missing answer still leaves two.
-  const ask = nodesFrom(nodesProvider).filter((u) => !capsuleMissed(u, now) && !((_nodeBackoff.get(u) || 0) > now)).slice(0, CAPSULE_ASK_NODES);
+  const ask = nodesFrom(nodesProvider).filter((u) => !capsuleMissed(u, now, head) && !((_nodeBackoff.get(u) || 0) > now)).slice(0, CAPSULE_ASK_NODES);
   if (ask.length === 0) return { ok: false, reason: 'no_capsule' };
   const answers = await Promise.all(ask.map((base) => nodeGet(base, CAPSULE_PATH, CAPSULE_MAX_BYTES, LARGE_READ_TIMEOUT_MS).then((got) => ({ base, got }))));
   let reason = 'no_capsule';
@@ -1901,13 +1944,13 @@ async function refreshCapsuleNow(nodesProvider, { headHint, proofNodes = null, f
   for (const { base, got } of answers) {
     if (got.limited) continue;
     if (got.error) {
-      missCapsule(base, capsuleErrorWait(got.error));
+      missCapsule(base, capsuleErrorWait(got.error), head);
       continue;
     }
     const problem = capsuleProblem(got.body, head);
     if (problem) {
       console.warn('[WARN][GALC] capsule_refused base=' + base + ' reason=' + problem);
-      missCapsule(base);
+      missCapsule(base, CAPSULE_MISS_TTL_MS, head);
       reason = 'invalid';
       continue;
     }
@@ -1919,20 +1962,20 @@ async function refreshCapsuleNow(nodesProvider, { headHint, proofNodes = null, f
   let failed = null;
   for (const { base, c } of offers) {
     if (c.mb_index <= (_capsule ? _capsule.index : held)) {
-      missCapsule(base);
+      missCapsule(base, CAPSULE_MISS_TTL_MS, head);
       if (reason === 'no_capsule') reason = 'stale';
       continue;
     }
     const id = c.mb_index + ':' + c.cp_hash_anchor + ':' + c.cp_hash_pred;
     if (seen.has(id)) continue;
     seen.add(id);
+    // Refused here: a fault of this capsule, never of the node that serves it.
     if (capsuleRefusedNow(c)) {
-      missCapsule(base);
-      reason = 'conflict';
+      reason = 'refused';
       continue;
     }
     if (!(await verifyCapsuleSignatures(c)).ok) {
-      missCapsule(base);
+      missCapsule(base, CAPSULE_MISS_TTL_MS, head);
       reason = 'invalid';
       continue;
     }
@@ -1940,7 +1983,7 @@ async function refreshCapsuleNow(nodesProvider, { headHint, proofNodes = null, f
     if (r.ok) return { ok: true, index: c.mb_index };
     if (r.reason === 'conflict' || r.reason === 'recovery_anchor') {
       _capsuleRefused = { index: c.mb_index, cpA: c.cp_hash_anchor, at: Date.now() };
-      missCapsule(base);
+      missCapsule(base, CAPSULE_MISS_TTL_MS, head);
     }
     if (failed === null) failed = r.reason === 'recovery_anchor' ? 'invalid' : r.reason;
   }
@@ -1977,7 +2020,34 @@ export function refreshCapsule(nodesProvider, opts = {}) {
 export function nodeReadStates(bases) {
   const now = Date.now();
   return bases.map((b) => ({ base: b, backoff: Math.max(0, (_nodeBackoff.get(b) || 0) - now), wait: readWait(b, now),
-    capsuleMiss: Math.max(0, (_capsuleMiss.get(b) || 0) - now) }));
+    capsuleMiss: Math.max(0, ((_capsuleMiss.get(b) || {}).until || 0) - now) }));
+}
+
+/** The capsule refused here within the TTL, for the diagnostics: { index, ageMs }, or null. */
+export function capsuleRefusal() {
+  return capsuleRefusedNow(null) ? { index: _capsuleRefused.index, ageMs: Date.now() - _capsuleRefused.at } : null;
+}
+
+/**
+ * The walk step that failed last, for the diagnostics: { j, nodes: [{ base, reason, ageMs }] } of its failures still
+ * within FAIL_TTL_MS, or null.
+ */
+export function lastStepFailure() {
+  const now = Date.now();
+  let last = null;
+  for (const [key, f] of _failedCache) {
+    if (now - f.at >= FAIL_TTL_MS) continue;
+    if (!last || f.at > last.at) last = { j: Number(key.slice(0, key.indexOf('|'))), at: f.at };
+  }
+  if (!last) return null;
+  const nodes = [];
+  for (const [key, f] of _failedCache) {
+    const sep = key.indexOf('|');
+    if (Number(key.slice(0, sep)) === last.j && now - f.at < FAIL_TTL_MS) {
+      nodes.push({ base: key.slice(sep + 1), reason: f.reason, ageMs: now - f.at });
+    }
+  }
+  return { j: last.j, nodes };
 }
 
 export function heldCapsuleIndex() {
@@ -2030,7 +2100,7 @@ export async function importCapsule(record) {
   }
 }
 
-/** Forgets the held capsule (the chain went back: another chain), and which nodes had none. */
+/** Forgets the held capsule (the chain went back: another chain), the one refused, and which nodes had none. */
 export function clearCapsule() {
   _capsule = null;
   _capsuleRefused = null;

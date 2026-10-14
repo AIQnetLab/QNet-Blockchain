@@ -103,7 +103,7 @@ import { createGrantStore } from '../browser/grants';
 import { describeOrigin, handedOverByBrowser } from '../browser/url';
 import { mergeTokenBalances, optimisticTokenRow } from '../utils/balanceMerge';
 import {
-  acceptedBalance, addMove, emptyTransit, readTransit, settleMoves, shownTransitNano, transitRecord, transitTotal,
+  acceptedBalance, addMove, emptyTransit, readTransit, settleMoves, transitRecord, transitTotal,
   withMoveStates, writeTransit,
 } from '../services/ClaimTransit';
 import { autoSendable, refusalHeals } from '../services/PendingTx';
@@ -1459,6 +1459,10 @@ const WalletScreen = () => {
     setTxResult(null);
     setShowScan(false);
     setShowSendScreen(true);
+    // The certified balance a QNet send is checked against is read from now on, while the form is filled: the tap then
+    // takes it at once, or joins the read already running (WalletManager.certifiedQncForSend).
+    const from = network === 'qnet' && wallet && (wallet.qnetAddress || wallet.address);
+    if (from) Promise.resolve().then(() => walletManager.certifiedQncForSend(from)).catch(() => {});
   };
 
   // What the Solana Send screen's scan read goes into its form: the recipient, and for a payment request its token and
@@ -4291,6 +4295,11 @@ const WalletScreen = () => {
   // One read at a time per wallet. A call while one started a moment ago for the same wallet (the unlock's and the Assets
   // tab's start together) shares it instead of asking every source again; a call while one has been running longer may
   // be for something that read predates (a feed event, a confirmed send), so one more read follows it.
+  // A pull to refresh on Assets ends when the read's QNC figure is on screen, as a wallet that shows its node's answer
+  // does; the proof check of that figure goes on in the background and a send still waits for it.
+  const figureWaitersRef = useRef([]);
+  const figureLanded = () => { figureWaitersRef.current.splice(0).forEach((resolve) => resolve()); };
+
   const loadBalance = (publicKey, target = null) => {
     const owner = (target && target.qnetAddress) || (wallet && wallet.qnetAddress) || null;
     const running = balanceRunRef.current;
@@ -4369,6 +4378,7 @@ const WalletScreen = () => {
             owner, qnc: q, verified: false, optimistic, qncLce: optimistic ? undefined : f.figureClaimedEpoch,
           }));
           noteFreshFigure(owner, 'qnc', figureAt);
+          figureLanded();
         },
       });
 
@@ -6631,7 +6641,10 @@ const WalletScreen = () => {
             refreshControl={
               <RefreshControl
                 refreshing={refreshing.assets}
-                onRefresh={() => pullRefresh('assets', () => loadBalance(wallet.publicKey))}
+                onRefresh={() => pullRefresh('assets', () => new Promise((resolve) => {
+                  figureWaitersRef.current.push(resolve);
+                  Promise.resolve(loadBalance(wallet.publicKey)).catch(() => {}).finally(resolve);
+                }))}
                 colors={['#00d4ff']}
                 tintColor="#00d4ff"
                 titleColor="#00d4ff"
@@ -6773,19 +6786,6 @@ const WalletScreen = () => {
                   <TokenBalance text={figure('qnc', fmtAmount(tokenBalances.qnc, 5))} />
                 </TouchableOpacity>
                 )}
-                {/* A move of a node balance in transit, on its own line and never inside the QNC figure, until a
-                    certified read shows it in the wallet; what the figure on screen holds already is left out of it
-                    (services/ClaimTransit shownTransitNano). */}
-                {(() => {
-                  const nano = transit.owner === wallet.qnetAddress && tokenBalances.owner === wallet.qnetAddress
-                    ? shownTransitNano(transit, tokenBalances.qncLce) : (transit.owner === wallet.qnetAddress ? transitTotal(transit) : 0);
-                  return nano > 0 ? (
-                    <Text style={styles.transitLine} testID="qnc-transit">
-                      {t('transit_line', { amount: maskAmt(fmtAmount(nano / 1e9, 5)) })}
-                    </Text>
-                  ) : null;
-                })()}
-
                 {/* QRC-20 holdings + custom tokens (deduped, hidden filtered via ⋮ manager); tap=Send, long-press=hide. */}
                 {qrcTokens.filter((tk) => isTokenShown(tk.contract)).map((tk) => {
                   const reserved = usesReservedName(tk.symbol, tk.name);
@@ -7332,7 +7332,7 @@ const WalletScreen = () => {
       {renderBrowserPane('main')}
       <View style={[styles.header, { paddingTop: 15 + insets.top }]} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
         {/* A long press shows the light client's state for a support screenshot; nothing else on screen. */}
-        <Text style={styles.title} onLongPress={() => { walletManager.lightClientDiagnostics().then((text) => showAlert('', text)).catch(() => {}); }}>{t('qnet_wallet')}</Text>
+        <Text style={styles.title} onLongPress={() => { walletManager.lightClientDiagnostics(wallet && wallet.qnetAddress).then((text) => showAlert('', text)).catch(() => {}); }}>{t('qnet_wallet')}</Text>
         {/* Overflow menu: token manager / hide balances (Settings is a tab of the bottom bar) */}
         <TouchableOpacity
           style={styles.headerMenuBtn}

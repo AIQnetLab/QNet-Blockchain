@@ -749,7 +749,6 @@ QNet Wallet은 Orrery Group LLC가 게시합니다. 전체 이용 약관과 개�
   balance_unavailable: "업데이트되지 않음. 아래로 당겨 다시 시도하세요.",
   balance_network_paused: 'QNet Blockchain이 {time} 이후 새로 확인한 것이 없습니다. 잔액은 그 시점 기준입니다.',
   balance_network_paused_untimed: 'QNet Blockchain이 한동안 새로 확인한 것이 없습니다. 잔액은 마지막으로 확인된 시점 기준입니다.',
-  transit_line: '+{amount} QNC 이동 중',
   hist_status_dropped: "찾을 수 없음",
   hist_status_moving: '이동 중',
   hist_status_unverified: "미검증",

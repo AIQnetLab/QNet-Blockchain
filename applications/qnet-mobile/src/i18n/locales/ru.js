@@ -749,7 +749,6 @@ QNet Wallet публикует Orrery Group LLC. Полные Условия и�
   balance_unavailable: "Не обновлено. Потяните вниз, чтобы повторить.",
   balance_network_paused: 'QNet Blockchain не подтверждает ничего нового с {time}. Балансы — на тот момент.',
   balance_network_paused_untimed: 'QNet Blockchain уже некоторое время ничего не подтверждает. Балансы — на момент последнего подтверждения.',
-  transit_line: '+{amount} QNC в пути',
   hist_status_dropped: "Не найдена",
   hist_status_moving: 'В пути',
   hist_status_unverified: "Не проверена",

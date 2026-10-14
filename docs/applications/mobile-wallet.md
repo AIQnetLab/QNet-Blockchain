@@ -535,8 +535,8 @@ no proof badge; only the checks above make a value count as proven where the app
   as soon as its own source answers: SOL and 1DEV from Solana, QNC as soon as its answer is read and its Merkle proof
   folded (not verified yet: it cannot lower the figure shown), then again once the lineage walk decided; an answer whose
   proof did not fold is never shown. Nothing kept or early is ever marked or used as verified: sends read their own
-  balance and nonce. A move of a node balance in transit shows on its own line under QNC, less what the figure on screen
-  holds of it already ([Moving the node balance](#moving-the-node-balance)). A refresh that changes nothing renders
+  balance and nonce. A move of a node balance in transit is not shown on Assets: History says Moving and the Node tab
+  "Moving X" ([Moving the node balance](#moving-the-node-balance)). A refresh that changes nothing renders
   nothing new: a merge that changes no figure keeps the object on screen (`src/utils/balanceMerge.js`), as do the token
   list, the kept transactions and the time of the QNC read.
 - **The transport.** Every connection is HTTPS; see *Platforms and build* below.
@@ -614,15 +614,17 @@ anchor and match their epoch commitments. K and K-1 then root walks as the pin d
 their own index; the trust floor stays at the pin. A walk uses the capsule's root only when it is higher than the
 device's own anchor and the walk from that anchor takes more than 16 steps (`OWN_ROOT_WALK_STEPS`).
 
-Two genesis names are asked at once, and only while that walk is long on either parity and a newer capsule can exist
-(no capsule held, or the certified head at least 10 above the held K). A node answering 404 or 405 (today's nodes answer
-405), an unusable capsule or none newer than the held one is not asked again for 10 minutes; one that did not answer,
-for 60 seconds. A balance read whose walk is longer than 16 steps waits up to 8 seconds for such a capsule first
-(`WalletManager._capsuleFirst`); without one everything is as before. One capsule is held, and only a higher K replaces
-it. It is dropped when a walk verifies another checkpoint at K or K-1, when two nodes refuse the first step above its
-root for what ties that step to it, or when the certified head the genesis nodes report is 10 or more macroblocks below
-K (a chain that went back: `WalletManager._forgetCapsuleAbove`, checked by the follow below); a capsule dropped for a
-conflict is not taken again for 10 minutes. The held capsule and the proof parts of K and K-1 that bind it are kept in
+Three genesis names are asked at once, and only while that walk is long on either parity and a newer capsule can
+exist (no capsule held, or the certified head at least 10 above the held K). A node answering 404 or 405, an unusable
+capsule or none newer than the held one is not asked again for 10 minutes or until the next mint period starts,
+whichever comes first; one that did not answer, for 60 seconds. A balance read whose walk is longer than 16 steps waits
+up to 30 seconds for such a capsule first (`WalletManager._capsuleFirst`); without one everything is as before. One
+capsule is held, and only a higher K replaces it. It is dropped when a walk verifies another checkpoint at K or K-1,
+when two nodes refuse the first step above its root for what ties that step to it and a walk rooted lower then verifies
+a step (a device that verifies no step keeps it), or when the certified head the genesis nodes report is 10 or more
+macroblocks below K (a chain that went back: `WalletManager._forgetCapsuleAbove`, checked by the follow below); a
+capsule dropped for a conflict is not taken again, nor asked for, until a newer one can exist (10 minutes at most), and
+no node is charged for serving it. The held capsule and the proof parts of K and K-1 that bind it are kept in
 plain storage (`qnet_galc_capsule`) with the build's `NETWORK_ID` and chain fingerprint; it is chain data, no wallet's,
 so a wallet switch keeps it. It needs no sealing: after a relaunch it is verified again, with no network, before it
 roots anything, and a record of another chain or one that no longer verifies is dropped.
@@ -747,7 +749,7 @@ the review the form reads, all at once, the QNC balance, a token send's token ba
 wallet's kept transactions. A recipient that is a contract (a built-in token, the token being sent included, or any
 other contract: none sends QNC or a token on) is refused with "This address is a contract, not an account. …", decided
 only by the `is_contract` field of its account leaf folded to a certified root, as the balance is
-(`WalletManager.certifiedRecipientKind`, `payableRecipientProblem`); with no certified answer within 6 seconds nothing
+(`WalletManager.certifiedRecipientKind`, `payableRecipientProblem`); with no certified answer within 20 seconds nothing
 is sent ("QNet Blockchain could not confirm that this address is an account and not a contract, so nothing was sent.
 Try again."). A contract answer is kept for the session and an account answer while its macroblock is within two of
 the certified head, so the same check just before signing is instant. A send is decided only by a balance the
@@ -755,7 +757,9 @@ committee certified (`WalletManager.certifiedQncForSend`, `checkedTokenBalance`)
 seconds before, or for QNC one of any age whose macroblock is still within two of the certified head (the foreground
 follow keeps one there: `_keptByIndex`; a token proof, and one naming no macroblock, count by their age only, since a
 token balance can drop without the holder's nonce), used at once while it is at least as new as the account nonce the
-chain confirms, else one verified read rooted at the checkpoints already certified on the device, within 6 seconds; never one node's answer, never what genesis nodes agree
+chain confirms, else one verified read within 20 seconds (as long as the first certification after a launch takes: the
+capsule, then the few steps from it; the extension's send check has the same 20 s), started when the Send screen
+opens, so the tap usually finds it done; never one node's answer, never what genesis nodes agree
 on, never the figure on screen. The certified state lags the chain by up to a few minutes, so right after the wallet's
 own send the next one's nonce is above the certified nonce: the decision stays on the certified figure less the amount
 and most fee (a token transfer: the tokens it moves) of each of this wallet's own transactions from the certified
@@ -911,9 +915,7 @@ the batch's first one, its last epoch, each epoch's amount, the transaction hash
 balance. The epochs come from the batch signed, never from the quoting node's own watermark, so no node can make the
 first certified read look like the move went through. While it is held:
 
-- Assets shows "+X QNC in transit" on a line of its own under QNC, never inside the QNC figure; what the figure on
-  screen holds of the move already, by that figure's own leaf watermark (a figure not verified yet may), is left out of
-  the line, so the amount is never shown twice;
+- Assets shows the QNC figure alone, never the amount in transit inside it or on a line under it;
 - the Node tab shows the rest of the node balance and, on its move button, off, "Moving X", on the card that shows the
   balance, whichever node id the move was made by;
 - the move's History row says "Moving";
@@ -1837,7 +1839,7 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.0 (26) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.1 (27) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds enable R8 minification and resource shrinking.
   iOS: bundle id `com.qnetmobile`, iPhone and iPad (`TARGETED_DEVICE_FAMILY = "1,2"`), not offered on Mac or
   Vision Pro; deployment target 15.6 for the app target.

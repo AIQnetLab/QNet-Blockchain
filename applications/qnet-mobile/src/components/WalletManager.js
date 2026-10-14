@@ -24,7 +24,7 @@ import {
   highestVerifiedIndex, exportVerifiedAnchors, importVerifiedAnchors, chainIdentity, isRateLimitBody,
   certifiedStateRootAt, certifiedHeadHint, markNodeOld, nodeMarkedOld, trustFloorIndex, verifiedCheckpointTime,
   stepsToVerify, refreshCapsule, followStep, exportCapsule, importCapsule, clearCapsule, heldCapsuleIndex,
-  OWN_ROOT_WALK_STEPS, verifyCapsuleSignatures, nodeReadStates,
+  OWN_ROOT_WALK_STEPS, verifyCapsuleSignatures, nodeReadStates, capsuleRefusal, lastStepFailure,
 } from '../crypto/QcLightClient';
 import { NETWORK_ID } from '../config/genesisConsensus';
 import { boundedGetJson } from '../utils/boundedFetch';
@@ -2951,9 +2951,10 @@ export class WalletManager {
 
   /**
    * The light client's state in one line for a support screenshot (long press on the title): the capsule held, the
-   * last capsule answer and the last walk to a certified root, with the steps a walk to the head still takes.
+   * last capsule answer and the last walk to a certified root, with the steps a walk to the head still takes, and the
+   * certified balance the next send of `address` would be checked against.
    */
-  async lightClientDiagnostics() {
+  async lightClientDiagnostics(address = null) {
     const c = this._lastCapsule || {};
     const w = this._lastWalk || {};
     const age = (at) => (at ? Math.round((Date.now() - at) / 1000) + 's ago' : 'never');
@@ -2961,6 +2962,14 @@ export class WalletManager {
       'capsule ask: ' + (c.reason || 'never') + (c.index ? ' K=' + c.index : '') + ' (' + age(c.at) + ')',
       'walk: ' + (w.ok === undefined ? 'never' : w.ok ? 'ok' : (w.why || 'failed')) + (w.index ? ' to ' + w.index : '') + ' (' + age(w.at) + ')',
       'verified up to: ' + highestVerifiedIndex(), 'steps left: ' + (this.walkSteps() ?? 'none')];
+    const kept = address ? WalletManager.sendProofs.get(`qnc|${address}`) : null;
+    lines.push('send check base: ' + (kept ? 'K=' + kept.index + ' (' + age(kept.at) + ')' : 'none yet'));
+    const refused = capsuleRefusal();
+    if (refused) lines.push('capsule refused: K=' + refused.index + ' (' + age(Date.now() - refused.ageMs) + ')');
+    const step = lastStepFailure();
+    if (step) {
+      lines.push('step ' + step.j + ' failed: ' + step.nodes.map((n) => n.base.replace('https://', '').split('.')[0] + ' ' + n.reason).join(', '));
+    }
     // The same read and the same signature check the walk uses, done now: which of the two fails on this device.
     for (const n of nodeReadStates(GENESIS_NODES)) {
       lines.push(n.base.replace('https://', '') + ': backoff ' + Math.round(n.backoff / 1000) + 's, budget ' + Math.round(n.wait / 1000) + 's, miss ' + Math.round(n.capsuleMiss / 1000) + 's');
@@ -4982,13 +4991,13 @@ export class WalletManager {
   // head and its nonce is not below the account nonce, however long ago it was read (the foreground follow keeps one at
   // the head: followTick). A token proof, and a proof that names no macroblock (a node from before certified proofs),
   // by its age only: a token balance can drop without the holder's nonce (another account's transferFrom). Otherwise
-  // one verified read, rooted at the checkpoints this device already certified, with SEND_CHECK_DEADLINE_MS for all of
-  // it (a long lineage walk is never waited for).
+  // one verified read with SEND_CHECK_DEADLINE_MS for all of it: as long as the first certification after a launch takes
+  // (the capsule, then the few steps from it; the extension's send check has the same 20 s), never a walk from the pin.
   static SEND_PROOF_MAX_AGE_MS = 30_000;
-  static SEND_CHECK_DEADLINE_MS = 6000;
+  static SEND_CHECK_DEADLINE_MS = 20_000;
   static SEND_PROOFS_MAX = 32;
   static sendProofs = new Map(); // 'qnc|address' | 'token|contract|holder' -> { figure, stateRoot, index, at }
-  static sendReads = new Map();  // the same keys -> the verified read in flight
+  static sendReads = new Map();  // the same keys -> { work, progress }: the verified read in flight
 
   static _keepSendProof(key, figure, stateRoot, index = null) {
     WalletManager.sendProofs.delete(key);
@@ -5048,25 +5057,34 @@ export class WalletManager {
   // `fresh(progress)`: one verified read as { figure, nonce, ... }, or null; `progress.answered` is set once a node
   // answered. A kept proof at least as new as `accountNonce` is used at once; otherwise a fresh one is read (a newer
   // certified state may already hold the spends the account nonce shows) and the kept one stands in when none comes in
-  // time. The base, or { error: 'unanswered' (no node answered) | 'unconfirmed' (answers came, none certified in time) }.
+  // time. One read for the callers that come while it is younger than SEND_CHECK_DEADLINE_MS (a later one starts its
+  // own: a read that never ends holds nobody after it), each waiting SEND_CHECK_DEADLINE_MS from its own call: the tap
+  // on Send joins the read the Send screen started when it opened and still waits its own full time.
+  // The base, or { error: 'unanswered' (no node answered) | 'unconfirmed' (answers came, none certified in time) }.
   async _sendBase(key, kept, fresh, accountNonce) {
     const k = kept();
     if (k && k.nonce !== null && accountNonce !== null && k.nonce >= accountNonce) return { ...k, cached: true };
     let read = WalletManager.sendReads.get(key);
     if (!read) {
       const progress = { answered: false };
-      const none = () => ({ error: progress.answered ? 'unconfirmed' : 'unanswered' });
-      let timer;
-      read = Promise.race([
-        Promise.resolve().then(() => fresh(progress)).then((r) => r || none(), none),
-        new Promise((resolve) => { timer = setTimeout(() => resolve(none()), WalletManager.SEND_CHECK_DEADLINE_MS); }),
-      ]).finally(() => {
-        clearTimeout(timer);
+      let expiry = null;
+      const drop = () => {
+        clearTimeout(expiry);
         if (WalletManager.sendReads.get(key) === read) WalletManager.sendReads.delete(key);
-      });
+      };
+      const work = Promise.resolve().then(() => fresh(progress)).catch(() => null).finally(drop);
+      read = { work, progress };
+      expiry = setTimeout(drop, WalletManager.SEND_CHECK_DEADLINE_MS);
+      if (expiry && typeof expiry.unref === 'function') expiry.unref();
       WalletManager.sendReads.set(key, read);
     }
-    const r = await read;
+    const { work, progress } = read;
+    const none = () => ({ error: progress.answered ? 'unconfirmed' : 'unanswered' });
+    let timer;
+    const r = await Promise.race([
+      work.then((v) => v || none()),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(none()), WalletManager.SEND_CHECK_DEADLINE_MS); }),
+    ]).finally(() => clearTimeout(timer));
     if (r && r.figure) return r;
     return k ? { ...k, cached: true } : r;
   }
