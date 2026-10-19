@@ -38,6 +38,10 @@ const MOBILE_MODULES = new Set([
   'utils/boundedFetch.js',
   // the strict reader of balance and token proof answers (a repeated key refuses one)
   'utils/strictJson.js',
+  // amounts as the language writes them, and the amount field's reading of a typed or pasted figure
+  'utils/amountFormat.js',
+  'utils/sendAmount.js',
+  'utils/textEdit.js',
 ].map((p) => path.join(MOBILE_SRC, p)));
 
 // Text the shipped bundle must never contain.

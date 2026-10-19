@@ -28,10 +28,10 @@ pub(super) struct LightNodeBindRequest {
     #[serde(default)] pub(super) device_token: Option<String>,
     #[serde(default)] pub(super) endpoint: Option<String>,
     /// The device's platform, "android" or "ios" (`light_binding::platform_hint`): unsigned, shown by the public
-    /// status only; anything else is no platform, and a bind is never refused for it.
+    /// status and spacing an iOS device's pushes; anything else is no platform, and a bind is never refused for it.
     #[serde(default)] pub(super) platform: Option<String>,
     /// The device's model, a short marketing name (`light_binding::model_hint`): unsigned and shown by the public
-    /// status only, like `platform`; anything else is no model, and a bind is never refused for it.
+    /// status only; anything else is no model, and a bind is never refused for it.
     #[serde(default)] pub(super) model: Option<String>,
     /// The wallet's registration consent, for a node the chain has not registered yet (U4).
     #[serde(default)] pub(super) consent: Option<BindConsent>,
@@ -1370,9 +1370,9 @@ mod tests {
         assert_eq!(apply_token_sync(&s, None, &l0, t), SyncOutcome::Stale("stale"));
     }
 
-    /// 04.10: the bind's platform hint (unsigned, display-only) is kept with the binding's push record, through a
-    /// pending binding's promotion and the token sync; anything else is no platform and never a refusal; an entry
-    /// an older binary stored in the pending store still reads.
+    /// The bind's platform hint (unsigned, shown by the status and spacing an iOS device's pushes) is kept with the
+    /// binding's push record, through a pending binding's promotion and the token sync; anything else is no platform
+    /// and never a refusal; an entry an older binary stored in the pending store still reads.
     #[test]
     fn the_binds_platform_hint_is_kept_with_its_binding_and_never_refuses() {
         let (s, _d) = storage();

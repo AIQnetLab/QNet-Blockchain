@@ -185,12 +185,13 @@ pub(super) struct FcmTokenSyncRequest {
     /// it accepted it under). Absent from a v2 record and from an older sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) writer:     Option<String>,
-    /// The bound device's platform hint a v2 record's bind named ("android", "ios"): unsigned and display-only.
-    /// Absent from a record that names none (a token refresh keeps the stored one) and from an older sender.
+    /// The bound device's platform hint a v2 record's bind named ("android", "ios"): unsigned, shown by the status
+    /// and spacing an iOS device's pushes (`light_binding::platform_hint`). Absent from a record that names none (a
+    /// token refresh keeps the stored one) and from an older sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) platform:   Option<String>,
-    /// The bound device's model hint a v2 record's bind named (`light_binding::model_hint`), as `platform`:
-    /// unsigned, display-only, absent when none and from an older sender, ignored by an older receiver.
+    /// The bound device's model hint a v2 record's bind named (`light_binding::model_hint`): unsigned,
+    /// display-only, absent when none and from an older sender, ignored by an older receiver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) model:      Option<String>,
 }

@@ -95,7 +95,7 @@ function assertState(next, previous) {
     if (!exactKeys(p, PENDING_TRANSFER_KEYS)) fail('pendingTransfer keys');
     for (const f of ['nonce', 'amountNano', 'feeNano']) if (!/^(0|[1-9][0-9]*)$/.test(p[f])) fail(`pendingTransfer ${f}`);
     if (typeof p.body !== 'string' || !(p.txHash === null || typeof p.txHash === 'string')) fail('pendingTransfer body');
-    if (!['pending', 'replaced', 'passed', 'superseded', 'refused'].includes(p.outcome)) fail('pendingTransfer outcome');
+    if (!['pending', 'confirmed', 'replaced', 'passed', 'superseded', 'refused'].includes(p.outcome)) fail('pendingTransfer outcome');
     if (p.kind === 'transfer' ? p.call !== null : p.kind !== 'call' || !exactKeys(p.call, ['method', 'recipient', 'amount'])) fail('pendingTransfer kind');
   }
 }
@@ -134,19 +134,6 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
       async forgetViews(names) {
         env.forgotten.push(...names);
         for (const name of names) env.views[name] = null;
-      },
-      // session.keepSendProof / keptSendProof / forgetSendProofs: the certified figures a send may stand on, kept in the
-      // session's storage (a fresh worker of the same session finds them)
-      async keepSendProof(address, figure) {
-        if (env.locked) return;
-        env.sendProofs[address] = clone(figure);
-      },
-      async keptSendProof(address) {
-        if (env.locked) return null;
-        return Object.hasOwn(env.sendProofs, address) ? clone(env.sendProofs[address]) : null;
-      },
-      async forgetSendProofs() {
-        env.sendProofs = {};
       },
     },
     vault: {
@@ -218,7 +205,6 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
     anchorWrites: 0,
     capsule: null,
     capsuleWrites: 0,
-    sendProofs: {},
     keys: {
       async signQnetTransfer(fields) {
         if (env.locked) throw new WalletError('LOCKED');

@@ -51,20 +51,18 @@ import * as vault from './vault.js';
  * @property {object} details connect: {alreadyGranted: boolean};
  *   signMessage: {message: string, byteLength: number};
  *   sendTransaction: {to, amountNano, feeNano, totalNano, nonce: string|null, balanceNano: string|null,
- *   verified: boolean, verification: 'proof'|'none', balanceProblem, recipient: {known, lookalike, incomingOnly,
- *   historyRead}|null, outstanding, duplicate, replaces, inFlight} (nonce and balance are null until unlocked and until a
- *   committee-certified balance was read; u64 decimals; verification 'proof': balance and nonce from a proof folded to a
- *   committee-certified state root; balanceProblem: why no balance was read yet, 'NETWORK' (no node answered),
- *   'BALANCE_UNCONFIRMED' (none certified a recent state) or 'BALANCE_FOREIGN_PENDING' (a transaction from another device
- *   is not confirmed yet), else null; recipient: qnet.recipientCheck(to) for the first-time, look-alike and poisoning
- *   warnings, null while locked or when it could not be read; inFlight: an earlier transaction of this wallet still holds
- *   the nonce before this one's, so confirm waits);
+ *   verified: boolean, verification: 'proof'|'live'|'none', balanceProblem, recipient: {known, lookalike, incomingOnly,
+ *   historyRead}|null, outstanding, replaces, inFlight} (nonce and balance are null until unlocked and until a balance was
+ *   read; u64 decimals; verification 'live': balance and nonce from a proof folded to a pinned node's live root, the send
+ *   rule's base (qnet.liveSend), 'none' before one was read; balanceProblem: why no balance was read yet, 'NETWORK' (no
+ *   node answered) or 'BALANCE_UNCONFIRMED' (none gave a proof of the account), else null; recipient:
+ *   qnet.recipientCheck(to) for the first-time, look-alike and poisoning warnings, null while locked or when it could not
+ *   be read; inFlight: an earlier transaction of this wallet still holds the nonce before this one's, so confirm waits);
  *   tokenTransfer: {token, to, amount, amountBase, name, symbol, decimals, reserved, burn, gasLimit, feeNano,
  *   depositNano, totalNano, nonce, balanceNano, verified, verification, balanceProblem, tokenBalance, tokenProblem,
- *   outstanding, duplicate, replaces, inFlight, recipient} (name, symbol and decimals two nodes' word; tokenBalance the
- *   committee-certified one less this wallet's own token transfers since, null with tokenProblem 'NETWORK' or
- *   'BALANCE_UNCONFIRMED' when it cannot be had; reserved: named after QNet's own coin; burn: `to` destroys tokens; the
- *   preview fields null until read);
+ *   outstanding, replaces, inFlight, recipient} (name, symbol and decimals two nodes' word; tokenBalance the live one less
+ *   this wallet's own unconfirmed token transfers, null with tokenProblem 'NETWORK' or 'BALANCE_UNCONFIRMED' when it cannot
+ *   be had; reserved: named after QNet's own coin; burn: `to` destroys tokens; the preview fields null until read);
  *   contractCall: {contract, method, args, argsBytes, argsText, gasLimit, feeNano, totalNano, nonce, balanceNano,
  *   verified, verification, balanceProblem, outstanding, replaces, inFlight} (args lowercase hex, '' for none; argsText
  *   the input as UTF-8 when the window draws it exactly, else null);
@@ -129,9 +127,9 @@ const QUEUE_MAX_TOTAL = 12;
 // A window whose approved action failed, or whose activation finished, stays this long so the user can
 // read the outcome, then closes.
 const ERROR_LINGER_MS = 30000;
-// Raised before anything is signed: the approval stays open for a fresh review (a balance the send rule could not have
-// certified yet is read again by it, and the window says why meanwhile).
-const REVIEW_AGAIN = new Set(['FEE_CHANGED', 'NONCE_CHANGED', 'NONCE_UNAVAILABLE', 'BALANCE_UNCONFIRMED', 'BALANCE_FOREIGN_PENDING']);
+// Raised before anything is signed: the approval stays open for a fresh review (a balance the send rule could not read
+// is read again by it, and the window says why meanwhile).
+const REVIEW_AGAIN = new Set(['FEE_CHANGED', 'NONCE_CHANGED', 'NONCE_UNAVAILABLE', 'BALANCE_UNCONFIRMED']);
 // An activation confirm that failed on these stays open: an unlock, or (PRICE_CHANGED) a fresh review of the burn.
 const RETRY_IN_WINDOW = new Set(['LOCKED', 'PRICE_CHANGED']);
 // The error codes a qnet_activateNode result may carry (QNet Link v1 section 7); anything else is INTERNAL.
@@ -181,7 +179,7 @@ const TX_KINDS = new Set(['sendTransaction', 'tokenTransfer', 'contractCall']);
 const REVISIONED = new Set([...TX_KINDS, 'activateNode', 'claimNodeBalance', 'unlinkNodeDevice']);
 const U128_RE = /^(0|[1-9][0-9]{0,38})$/;
 // Why no balance a send is decided by could be had (qnet's send rule), as the approval window names it.
-const BALANCE_PROBLEMS = new Set(['NETWORK', 'BALANCE_UNCONFIRMED', 'BALANCE_FOREIGN_PENDING']);
+const BALANCE_PROBLEMS = new Set(['NETWORK', 'BALANCE_UNCONFIRMED']);
 // The most decimals a token amount converts with (amount.parseUnits).
 const TOKEN_DECIMALS_MAX = 18;
 const STATUSES = new Set(['pending', 'in_block', 'unknown']);
@@ -908,13 +906,12 @@ export function createProviderService(options = {}) {
 
   // -------------------------------------------------------------- previews and actions
 
-  // The account part of every transaction preview, checked: whether balance and nonce come from a committee-certified
-  // proof, the earlier transactions not seen applied, the refused one this takes the place of, and whether one still
-  // holds the nonce.
+  // The account part of every transaction preview, checked: where balance and nonce come from, the earlier transactions
+  // not seen applied, the refused one this takes the place of, and whether one still holds the nonce.
   function accountView(preview) {
-    // only a proof folded to a committee-certified root verifies a balance (EXT-CHAINS-04)
+    // only a proof folded to a committee-certified root verifies a balance (EXT-CHAINS-04); a send's is a live one
     const verified = preview.verified === true && preview.verification === 'proof';
-    const verification = verified ? 'proof' : 'none';
+    const verification = verified ? 'proof' : (preview.verification === 'live' ? 'live' : 'none');
     // earlier transactions of this wallet not seen applied: the window names them (R2-EXTQ-03)
     const outstanding = Array.isArray(preview.outstanding) ? preview.outstanding.filter(isPlainObject) : [];
     // a transaction a node refused, which this one takes the place of at its nonce (R5-EXTQ-02): the window names it
@@ -942,8 +939,6 @@ export function createProviderService(options = {}) {
       verified,
       verification,
       outstanding: outstanding.length,
-      // qnet.prepareTransfer's own records: outstanding or signed in the last 30 minutes (R3-EXTQ-01)
-      duplicate: preview.duplicate === true || outstanding.some((p) => p.kind !== 'call' && p.to === to && p.amountNano === amountNano),
       replaces,
       inFlight,
     });
@@ -978,26 +973,24 @@ export function createProviderService(options = {}) {
     if (!token) return Object.freeze(common);
     return Object.freeze({
       ...common, depositNano: preview.depositNano, tokenBalance: preview.tokenBalance, tokenProblem: preview.tokenProblem,
-      duplicate: preview.duplicate === true,
     });
   }
 
-  const RECIPIENT_FLAGS = Object.freeze(['known', 'lookalike', 'incomingOnly', 'historyRead', 'recentSame']);
+  const RECIPIENT_FLAGS = Object.freeze(['known', 'lookalike', 'incomingOnly', 'historyRead']);
 
-  // Why a preview found no balance to decide by, as the window says it: no node answered, none certified a recent state,
-  // or a transaction from another device is not confirmed yet; null for any other failure.
+  // Why a preview found no balance to decide by, as the window says it: no node answered, or none gave a proof of the
+  // account; null for any other failure.
   const balanceProblemOf = (error) => (error instanceof WalletError && BALANCE_PROBLEMS.has(error.code) ? error.code : null);
 
   // Read once per approval; a failed read is tried again on the next approval.get.
   async function loadRecipient(approval) {
     if (approval.recipient !== null) return;
     try {
-      // a QNC amount names a same-amount payment; a token amount is in other units
-      const check = await d.qnet.recipientCheck(approval.payload.to, approval.payload.amountNano ?? null);
-      const ok = isPlainObject(check) && RECIPIENT_FLAGS.slice(0, 4).every((name) => typeof check[name] === 'boolean');
+      const check = await d.qnet.recipientCheck(approval.payload.to);
+      const ok = isPlainObject(check) && RECIPIENT_FLAGS.every((name) => typeof check[name] === 'boolean');
       if (!ok) throw new WalletError('INTERNAL');
       const { known, lookalike, incomingOnly, historyRead } = check;
-      approval.recipient = Object.freeze({ known, lookalike, incomingOnly, historyRead, recentSame: check.recentSame === true });
+      approval.recipient = Object.freeze({ known, lookalike, incomingOnly, historyRead });
     } catch (error) {
       log.warn('recipient check unavailable', error?.code ?? error?.name);
     }
@@ -1038,7 +1031,7 @@ export function createProviderService(options = {}) {
       const totalNano = (BigInt(amountNano) + BigInt(feeNano)).toString();
       return {
         to, amountNano, feeNano, totalNano, nonce: null, balanceNano: null, verified: false, verification: 'none',
-        balanceProblem: current === null ? null : approval.balanceProblem ?? null, outstanding: 0, duplicate: false, replaces: null,
+        balanceProblem: current === null ? null : approval.balanceProblem ?? null, outstanding: 0, replaces: null,
         inFlight: false, recipient,
       };
     }
@@ -1095,7 +1088,7 @@ export function createProviderService(options = {}) {
     const unread = {
       gasLimit: null, feeNano: null, totalNano: null, nonce: null, balanceNano: null, verified: false, verification: 'none',
       balanceProblem: current === null ? null : approval.balanceProblem ?? null, outstanding: 0, replaces: null, inFlight: false,
-      ...(token ? { depositNano: null, tokenBalance: null, tokenProblem: null, duplicate: false } : {}),
+      ...(token ? { depositNano: null, tokenBalance: null, tokenProblem: null } : {}),
     };
     const details = { ...callBase(approval), ...(approval.preview === null ? unread : { ...approval.preview, balanceProblem: null }) };
     if (!token) return details;

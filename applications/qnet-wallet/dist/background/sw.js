@@ -37,7 +37,8 @@ session.onLockChange((change) => {
     // the vault (decision 35).
     background('resubmit pending', () => qnet.resubmitPending());
     // the follow: a verified checkpoint kept at the certified head while the session is unlocked (qnet.followTick on the
-    // FOLLOW_ALARM), so a send's certified balance is at hand; the popup's own balance read covers the first minute
+    // FOLLOW_ALARM), so the background committee checks (the balance's verified mark, a recipient's certified leaf) find
+    // it verified; the popup's own balance read covers the first minute
     background('follow', () => qnet.startFollow());
     background('burn search', () => activation.resumeBurnSearches());
     background('node registration', () => nodes.resumeRegistration());

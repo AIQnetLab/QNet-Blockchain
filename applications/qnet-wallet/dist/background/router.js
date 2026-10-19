@@ -235,11 +235,13 @@ export const UI_MESSAGES = Object.freeze({
   'qnet.txLookup': uiEntry(POPUP, { hash: string({ min: 16, max: 128, pattern: TX_HASH_RE }) }, qnet.txLookup, { unlocked: true }),
   'qnet.preview': uiEntry(POPUP, { to: F.qnetAddress, amount: F.qncAmount, replaceNonce: optional(F.u64) }, qnet.preview,
     { unlocked: true }),
-  // the Send tab's reads ahead of a review: the wallet's own certified balance when it opens, a typed recipient's checks
+  // the Send tab's reads ahead of a review: the certified head when it opens, a typed recipient's checks
   'qnet.sendWarm': uiEntry(POPUP, { to: optional(F.qnetAddress) }, qnet.sendWarm, { unlocked: true }),
   'qnet.send': uiEntry(POPUP, {
     to: F.qnetAddress, amount: F.qncAmount, expectedFeeNano: F.u64, expectedNonce: optional(F.u64), replaceNonce: optional(F.u64),
   }, qnet.send, { unlocked: true, activity: true }),
+  // the sent screen of a QNC or token transfer follows its transaction, known by its nonce, until it is in a block
+  'qnet.sentStatus': uiEntry(POPUP, { nonce: F.u64 }, qnet.sentStatus, { unlocked: true }),
   'solana.balances': uiEntry(POPUP, {}, remembered('solanaBalances', solana.getBalances), { unlocked: true }),
   // the Solana History (decision 39): the wallet's own transactions, newest first
   'solana.history': uiEntry(POPUP, {

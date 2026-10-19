@@ -60,7 +60,6 @@ const UI_APP = {
   ui_app_active: APP.node_active,
   ui_app_last_seen: APP.node_last_seen,
   ui_app_ago: APP.node_last_seen_ago,
-  ui_app_missed: APP.node_missed,
   copy: APP.seed_copy,
   action_move: APP.node_move,
 };
@@ -186,8 +185,8 @@ test('every label a picture draws is one the screen it draws shows', () => {
   assert.match(repo('applications/qnet-mobile/src/crypto/NodePreimages.js'), /return `light_mobile_\$\{bytesToHex\(blake3\(utf8ToBytes\(`LIGHT_NODE_PRIVACY_\$\{walletOf\(wallet\)\}`\)\)\)\.slice\(0, 16\)\}`;/);
   const node = repo('applications/qnet-mobile/src/screens/NodeTab.js');
   // The balance row, then the move: "Move to wallet", "Moving…" while it runs, "Moving X" while a move is in transit.
-  assert.match(node, /<InfoRow label=\{t\('node_balance'\)\} value=\{balanceText\(shownNano, hidden\)\}[^>]*\/>\s*<Button label=\{label\}/);
-  assert.match(node, /const label = move \? t\('node_moving', \{ amount: balanceText\(Number\(move\.amountNano\), hidden\) \}\)\s*: \(moving \? t\('claiming'\) : t\('node_move'\)\);/);
+  assert.match(node, /<InfoRow label=\{t\('node_balance'\)\} value=\{qncText\(shownNano, t\.lang, hidden\)\}[^>]*\/>\s*<Button label=\{label\}/);
+  assert.match(node, /const label = move \? t\('node_moving', \{ amount: qncText\(move\.amountNano, t\.lang, hidden\) \}\)\s*: \(moving \? t\('claiming'\) : t\('node_move'\)\);/);
   // A light node only on the device it is linked to: the Node tab draws no node it does not run (owner, 11.10).
   assert.match(node, /if \(view\.state === 'elsewhere' \|\| view\.state === 'no_device'\) return false;/);
   assert.equal(APP.node_no_device, undefined);
@@ -451,15 +450,15 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   // device to link: the wallet derives the super node's id from its own address and looks it up on QNet Blockchain
   // (WalletManager generateSuperNodePseudonym, WalletScreen loadAllUserNodes), and the Node tab's super node card
   // (NodeTab.js ServerNodeCard) shows its type, status (Active, Server offline, or registered and waiting for
-  // admission), last seen, missed epochs, node balance and Move to wallet, with no Use this device.
+  // admission), last seen, node balance and Move to wallet, with no Use this device.
   const app = step('app');
   assert.equal(sup[sup.indexOf(app) - 1].id, 'watch');
   assert.equal(app.text, 'guide_super_app');
   assert.equal(app.scene.frame, 'phone');
   assert.equal(app.scene.screen, 'app');
-  assert.deepEqual(sceneLabels(app.scene).filter((l) => typeof l === 'string'), ['ui_app_node_tab', 'ui_app_node_type', 'ui_app_super_node', 'ui_app_status_node', 'ui_app_active', 'ui_app_last_seen', 'ui_app_missed', 'ui_app_node_balance', 'action_move']);
+  assert.deepEqual(sceneLabels(app.scene).filter((l) => typeof l === 'string'), ['ui_app_node_tab', 'ui_app_node_type', 'ui_app_super_node', 'ui_app_status_node', 'ui_app_active', 'ui_app_last_seen', 'ui_app_node_balance', 'action_move']);
   assert.match(TEXTS.guide_super_app, /^Once the node is registered, QNet Wallet shows it by itself, with no device to link: open QNet Wallet on a phone or tablet with this same wallet, the one whose 12 words are on the server \(to add it there, tap "Import Existing Wallet" and type those words\)\./);
-  assert.match(TEXTS.guide_super_app, /Its "Node" tab shows the node's status, when it was last seen, its missed epochs \(an epoch is about 4 hours\), whether QNet Blockchain has admitted it \("Registered — waiting for admission to QNet Blockchain" until it does\) and its node balance with "Move to wallet"\. Every phone and tablet with this wallet shows the same card\.$/);
+  assert.match(TEXTS.guide_super_app, /Its "Node" tab shows the node's status, when it was last seen, whether QNet Blockchain has admitted it \("Registered — waiting for admission to QNet Blockchain" until it does\) and its node balance with "Move to wallet"\. Every phone and tablet with this wallet shows the same card\.$/);
   const manager = repo('applications/qnet-mobile/src/components/WalletManager.js');
   assert.match(manager, /const hashBytes = blake3\(Buffer\.from\(`SUPER_NODE_PRIVACY_\$\{walletAddress\}`, 'utf8'\)\);\s*return `super_node_\$\{Buffer\.from\(hashBytes\.slice\(0, 8\)\)\.toString\('hex'\)\}`;/);
   const screen = repo('applications/qnet-mobile/src/screens/WalletScreen.js');
@@ -467,7 +466,7 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   assert.match(screen, /const serverNode = serverNodes\.find\(n => n\.node_id === ids\.super\)/);
   const tab = repo('applications/qnet-mobile/src/screens/NodeTab.js');
   const card = tab.slice(tab.indexOf('function ServerNodeCard('), tab.indexOf('const LIGHT_NODE_STATES'));
-  const order = ["t('node_type')", "t('node_status_node')", "t('node_last_seen')", "t('node_missed')", '<BalanceBlock'].map((s) => card.indexOf(s));
+  const order = ["t('node_type')", "t('node_status_node')", "t('node_last_seen')", '<BalanceBlock'].map((s) => card.indexOf(s));
   assert.ok(order.every((at) => at > 0), String(order));
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.match(card, /const statusText = waiting \? t\('node_waiting_admission'\) : t\(status\.isOnline \? 'node_active' : 'node_server_offline'\);/);

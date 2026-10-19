@@ -42,7 +42,7 @@ function setup(over = {}) {
     signMessage: jest.fn(),
     tokenInfo: jest.fn(async () => ({ standard: 'qrc20', name: 'Gold', symbol: 'GOLD', decimals: 6 })),
     contractKind: jest.fn(async (a) => (a === WASM ? 'contract' : a === TOKEN ? 'token' : 'none')),
-    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [] })),
+    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: '10000000000', counterparties: [] })),
     send: jest.fn(async () => ({ txHash: 'a'.repeat(64), status: 'submitted', nonce: 5 })),
     transactionStatus: jest.fn(),
     isCurrent: () => current,
@@ -283,7 +283,7 @@ describe('MB-07: a transaction the wallet no longer sends is not pending', () =>
 describe('MB-08: nothing the wallet cannot pay for is sent', () => {
   it('a call or a token transfer the preview shows short is refused at approve, and nothing is signed', async () => {
     const s = setup();
-    s.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano: '1', verified: true, counterparties: [] });
+    s.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano: '1', counterparties: [] });
     const asked = call(s);
     await tick();
     await s.p.loadPreview(s.shown().id);
@@ -292,7 +292,7 @@ describe('MB-08: nothing the wallet cannot pay for is sent', () => {
     s.p.reject(s.shown().id);
     await outcome(asked);
     const token = setup();
-    token.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [], tokenBalanceBase: '5', depositNano: '0' });
+    token.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano: '10000000000', counterparties: [], tokenBalanceBase: '5', depositNano: '0' });
     token.p.request(token.ctx(), 'qnet_sendTransaction', { type: 'tokenTransfer', token: TOKEN, to: TO, amount: '1' }).catch(() => {});
     await tick();
     await tick();

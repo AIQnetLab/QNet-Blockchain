@@ -3,8 +3,8 @@
  * - a hedged read counts only a 2xx answer whose body was read and is no rate-limit answer; anything else hands over to
  *   the next node at once, a body that stalls times out, and only when every node failed is the last failure returned;
  *   balance and token proofs ask up to three genesis names;
- * - a send is decided only by a committee-certified balance: one read a moment ago at the nonce the send is about to use,
- *   else one verified read within a single deadline; never one node's word, never what genesis nodes agree on;
+ * - a send is checked against the wallet's figure at a genesis node's live tip, its proof folded, in one read (a figure
+ *   read a moment ago is taken as it is); the certified read decides nothing there (owner, 18.10);
  * - agreement reads settle as soon as the answers still out cannot change them, and never on anything else.
  */
 jest.mock('../src/crypto/DilithiumCrypto', () => ({ verifyDilithium: jest.fn(), isDilithiumAvailable: () => true }));
@@ -41,8 +41,8 @@ const genesisOf = (url) => GENESIS_NODES.find((g) => url.startsWith(`${g}/`));
 beforeEach(async () => {
   await AsyncStorage.clear();
   WalletManager.nodeHealth = {};
-  WalletManager.sendProofs.clear();
-  WalletManager.sendReads.clear();
+  WalletManager.liveFigures.clear();
+  WalletManager.liveReads.clear();
   WalletManager.nonceReads.clear();
   WalletManager.pkBound = {};
   lc.clearQcCache();
@@ -124,177 +124,107 @@ describe('a hedged read', () => {
   });
 });
 
-describe('the balance a send is decided by', () => {
-  const keep = (nonce, balanceNano = '7000000000') => WalletManager._keepSendProof(`qnc|${ME}`, {
-    ok: true, verified: true, balanceNano, nonce: String(nonce), balance: Number(balanceNano) / 1e9,
-  }, ROOT);
-
-  it('a certified proof read a moment ago at the same nonce: no network read at all', async () => {
-    const wm = new WalletManager();
-    wm.getQNCBalanceWithProof = jest.fn();
-    global.fetch = jest.fn(async () => { throw new TypeError('no network in this test'); });
-    keep(7);
-    await expect(wm.certifiedQncForSend(ME, { nonce: 7 })).resolves.toMatchObject({ ok: true, verified: true, balanceNano: '7000000000', cached: true });
-    expect(wm.getQNCBalanceWithProof).not.toHaveBeenCalled();
-    expect(global.fetch).not.toHaveBeenCalled();
+// Before (MB-R2-02), a send waited up to 20 s for a committee-certified balance and was refused when none came in time;
+// now it is checked against the genesis nodes' live tip in one read, and the certified read decides nothing (owner, 18.10).
+describe('the balance a send is checked against', () => {
+  const LIVE_BODY = `{"balance":5000000000,"nonce":3,"merkle_proof":[{"sibling":"${'00'.repeat(32)}","is_right":true}],"state_root":"${ROOT}","block_height":9000}`;
+  // A node that answers the live proof route, the account route and nothing else; `proofs` counts the proof reads.
+  const answering = (counter = { proofs: 0, certified: 0 }) => jest.fn(async (url) => {
+    if (url.includes('/balance/proof?mb=')) { counter.certified += 1; return reply(200, '{}'); }
+    if (url.endsWith('/balance/proof')) { counter.proofs += 1; return reply(200, LIVE_BODY); }
+    if (/\/api\/v1\/account\/[^/]+$/.test(url)) return reply(200, { nonce: 3, balance: 5000000000 });
+    return reply(500, {});
   });
 
-  it('the nonce moved (a spend made elsewhere), the proof aged past 30 s, or the nonce is unknown: one fresh read', async () => {
-    const wm = new WalletManager();
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, balanceNano: '2000000000', nonce: '8', balance: 2 }));
-    keep(7);
-    const moved = await wm.certifiedQncForSend(ME, { nonce: 8 });
-    expect(moved).toMatchObject({ ok: true, balanceNano: '2000000000', nonce: '8' });
-    expect(moved.cached).toBeUndefined();
-    keep(8);
-    WalletManager.sendProofs.get(`qnc|${ME}`).at -= WalletManager.SEND_PROOF_MAX_AGE_MS + 1;
-    await expect(wm.certifiedQncForSend(ME, { nonce: 8 })).resolves.not.toHaveProperty('cached');
-    keep(8);
-    await expect(wm.certifiedQncForSend(ME, { nonce: null })).resolves.not.toHaveProperty('cached');
-    expect(wm.getQNCBalanceWithProof).toHaveBeenCalledTimes(3);
-    expect(WalletManager.SEND_PROOF_MAX_AGE_MS).toBe(30_000);
-  });
-
-  it('without a nonce from the caller, the one genesis nodes agree on retires a kept proof, never stands for a balance', async () => {
-    global.fetch = jest.fn(async (url) => (/\/api\/v1\/account\/[^/]+$/.test(url) ? reply(200, { nonce: 7, balance: 999e9 }) : reply(500, {})));
-    const wm = new WalletManager();
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: false, verified: false }));
-    keep(7);
-    await expect(wm.certifiedQncForSend(ME)).resolves.toMatchObject({ ok: true, balanceNano: '7000000000', cached: true });
-    expect(wm.getQNCBalanceWithProof).not.toHaveBeenCalled();
-    WalletManager.sendProofs.clear();
-    // Nothing certified to be had: refused, though every genesis node names the same balance.
-    await expect(wm.certifiedQncForSend(ME)).resolves.toMatchObject({ ok: false, verified: false, balanceNano: null, error: 'unanswered' });
-  });
-
-  it('a walk that never ends does not hold the send check past its deadline', async () => {
-    expect(WalletManager.SEND_CHECK_DEADLINE_MS).toBe(20_000);
-    global.fetch = jest.fn(async (url) => (url.includes('/balance/proof')
-      ? reply(200, `{"balance":5000000000,"nonce":3,"merkle_proof":[{"sibling":"00","is_right":true}],"state_root":"${ROOT}","block_height":9000}`)
-      : reply(200, { nonce: 3, height: 9000 })));
+  it('one read of the live tip, its proof folded; no certified walk is waited for, none is even asked', async () => {
+    const counter = { proofs: 0, certified: 0 };
+    global.fetch = answering(counter);
     const wm = new WalletManager();
     wm.verifyMerkleProof = jest.fn(async () => true);
-    wm._certifiedFresh = jest.fn(() => new Promise(() => {})); // the lineage walk, never done
-    const saved = WalletManager.SEND_CHECK_DEADLINE_MS;
-    WalletManager.SEND_CHECK_DEADLINE_MS = 400;
-    try {
-      const t0 = Date.now();
-      // A node answered and its walk did not end in time: the balance is not confirmed yet, which is not "no answer".
-      await expect(wm.certifiedQncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: false, error: 'unconfirmed' });
-      const took = Date.now() - t0;
-      expect(took).toBeGreaterThanOrEqual(390);
-      expect(took).toBeLessThan(2500);
-      // The nonce a send signs at waits no longer for it either: the agreed nonce stands within the same deadline.
-      const t1 = Date.now();
-      await expect(wm._confirmedAccountNonce(ME)).resolves.toBe(3);
-      expect(Date.now() - t1).toBeLessThan(2500);
-      // Nothing answering at all is "unanswered", within the same deadline.
-      WalletManager.sendProofs.clear();
-      global.fetch = jest.fn(async (url, opts) => (url.includes('/balance/proof') ? hanging(opts) : reply(200, { nonce: 3 })));
-      await expect(wm.certifiedQncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: false, error: 'unanswered' });
-    } finally {
-      WalletManager.SEND_CHECK_DEADLINE_MS = saved;
-    }
+    wm._certifiedFresh = jest.fn(() => new Promise(() => {})); // a lineage walk that never ends
+    wm.getQNCBalanceWithProof = jest.fn(() => new Promise(() => {}));
+    const t0 = Date.now();
+    await expect(wm.qncForSend(ME)).resolves.toMatchObject({ ok: true, balanceNano: '5000000000', nonce: '3', accountNonce: 3, pending: [] });
+    expect(Date.now() - t0).toBeLessThan(2500);
+    expect([counter.proofs, counter.certified]).toEqual([1, 0]);
+    expect(wm._certifiedFresh).not.toHaveBeenCalled();
+    expect(wm.getQNCBalanceWithProof).not.toHaveBeenCalled();
+    // The nonce a send signs at waits for no walk either.
+    await expect(wm._confirmedAccountNonce(ME)).resolves.toBe(3);
   });
 
-  it('a check that joins a read already running waits its own full deadline (the tap after the Send screen opened)', async () => {
+  it('a figure read within LIVE_SEND_REUSE_MS is taken as it is (the Send screen read it); an older one is read again', async () => {
+    const counter = { proofs: 0, certified: 0 };
+    global.fetch = answering(counter);
     const wm = new WalletManager();
-    const saved = WalletManager.SEND_CHECK_DEADLINE_MS;
-    WalletManager.SEND_CHECK_DEADLINE_MS = 400;
-    try {
-      let reads = 0;
-      const fresh = (progress) => {
-        reads += 1;
-        progress.answered = true;
-        return new Promise((resolve) => { setTimeout(() => resolve({ figure: { balanceNano: '5' }, nonce: 1 }), 600); });
-      };
-      const opened = wm._sendBase('qnc|x', () => null, fresh, null);
-      await new Promise((resolve) => { setTimeout(resolve, 300); });
-      const tapped = wm._sendBase('qnc|x', () => null, fresh, null);
-      await expect(opened).resolves.toEqual({ error: 'unconfirmed' });
-      await expect(tapped).resolves.toMatchObject({ figure: { balanceNano: '5' } });
-      expect(reads).toBe(1);
-      // A check after the first read's window starts its own read.
-      await wm._sendBase('qnc|x', () => null, fresh, null);
-      expect(reads).toBe(2);
-    } finally {
-      WalletManager.SEND_CHECK_DEADLINE_MS = saved;
-    }
-  });
-
-  it('no path takes an unverified balance, one node\'s or what genesis nodes agree on', async () => {
-    const wm = new WalletManager();
-    // An answer no proof certified: refused, and never kept for the next check.
-    global.fetch = jest.fn(async (url) => {
-      if (url.includes('/balance/proof')) return reply(200, `{"balance":9000000000,"nonce":3,"merkle_proof":[{"sibling":"00","is_right":true}],"state_root":"${ROOT}","block_height":9000}`);
-      if (/\/api\/v1\/account\/[^/]+$/.test(url)) return reply(200, { nonce: 3, balance: 9000000000 });
-      return reply(500, {});
-    });
     wm.verifyMerkleProof = jest.fn(async () => true);
-    wm._certifiedFresh = jest.fn(async () => false);
-    await expect(wm.certifiedQncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: false, balanceNano: null });
-    expect(WalletManager.sendProofs.size).toBe(0);
-    // Every genesis node gives the same balance, so an agreement exists; the send check still refuses.
-    await expect(wm.agreedGenesisBalance(ME)).resolves.toBe(9);
-    await expect(wm.certifiedQncForSend(ME)).resolves.toMatchObject({ ok: false });
-    // A certified proof older than the account's nonce shows (a spend after it): refused as well.
-    wm._certifiedFresh = jest.fn(async () => true);
-    await expect(wm.certifiedQncForSend(ME, { nonce: 5 })).resolves.toMatchObject({ ok: false });
-    await expect(wm.certifiedQncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: true, verified: true, balanceNano: '9000000000' });
-    // Tokens: unverified answers alike from every node are no balance.
-    global.fetch = jest.fn(async () => reply(200, JSON.stringify({ token_balance: '9000000', block_height: 90, state_root: 'aa' })));
-    await expect(wm.checkedTokenBalance(TOKEN, ME, 6, { nonce: null })).resolves.toMatchObject({ ok: false, verified: false });
-  });
-
-  it('the send paths read only the certified balance', () => {
-    const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
-    const fresh = ws.slice(ws.indexOf('const freshQncNano = async () => {'), ws.indexOf('// Close Send Screen and go back to assets'));
-    expect(fresh).toMatch(/walletManager\.certifiedQncForSend\(addr\)/);
-    expect(fresh).toMatch(/r && r\.ok && r\.verified && /);
-    expect(fresh).not.toMatch(/getQNCBalanceWithProof|agreedGenesisBalance/);
-    const send = ws.slice(ws.indexOf('const handleSendTransaction = async () => {'), ws.indexOf('const pressSend = async'));
-    expect(send).not.toMatch(/agreedGenesisBalance|getQNCBalanceWithProof|tokenBalances\.qnc/);
-    const br = fs.readFileSync(path.join(__dirname, '../src/browser/BrowserScreen.js'), 'utf8');
-    expect((br.match(/walletManager\.certifiedQncForSend\(from/g) || []).length).toBe(2);
-    expect(br).not.toMatch(/getQNCBalanceWithProof|agreedGenesisBalance/);
-    const wmSrc = fs.readFileSync(path.join(__dirname, '../src/components/WalletManager.js'), 'utf8');
-    const checked = wmSrc.slice(wmSrc.indexOf('  async checkedTokenBalance('), wmSrc.indexOf('  static stillSent('));
-    expect(checked).not.toMatch(/MIN_GENESIS_AGREEMENT|getTrustedNodes/);
-  });
-
-  it('a token balance counts only beside the holder\'s certified QNC proof of the same state, which gives its nonce there', async () => {
-    const wm = new WalletManager();
-    wm.getTokenBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, balanceBase: '500', stateRoot: ROOT, index: null }));
-    global.fetch = jest.fn(async () => { throw new TypeError('no network in this test'); });
-    WalletManager._keepSendProof(`token|${TOKEN}|${ME}`, { balanceBase: '700' }, ROOT);
-    // No certified QNC proof of the holder to be had: its nonce in that state is unknown, so no token balance either.
-    await expect(wm.checkedTokenBalance(TOKEN, ME, 2, { nonce: 7 })).resolves.toMatchObject({ ok: false, balanceBase: null, error: 'unanswered' });
-    expect(wm.getTokenBalanceWithProof).not.toHaveBeenCalled();
-    keep(7);
-    WalletManager._keepSendProof(`token|${TOKEN}|${ME}`, { balanceBase: '700' }, ROOT);
-    await expect(wm.checkedTokenBalance(TOKEN, ME, 2, { nonce: 7 })).resolves.toMatchObject({ ok: true, balanceBase: '700', balance: '7', cached: true });
-    expect(wm.getTokenBalanceWithProof).not.toHaveBeenCalled();
-    // A token proof of another state than the QNC proof's is not paired with it: refused.
-    WalletManager.sendProofs.delete(`token|${TOKEN}|${ME}`);
-    wm.getTokenBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, balanceBase: '500', stateRoot: 'cd'.repeat(32), index: null }));
-    await expect(wm.checkedTokenBalance(TOKEN, ME, 2, { nonce: 7 })).resolves.toMatchObject({ ok: false, balanceBase: null });
-    // The holder's nonce moved past the certified one by a transaction this wallet does not know (another device):
-    // refused, though the token proof pairs.
-    WalletManager._keepSendProof(`token|${TOKEN}|${ME}`, { balanceBase: '700' }, ROOT);
-    await expect(wm.checkedTokenBalance(TOKEN, ME, 2, { nonce: 8 })).resolves.toMatchObject({ ok: false, balanceBase: null, error: 'foreign' });
+    await wm.qncForSend(ME);
+    await expect(wm.qncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: true, balanceNano: '5000000000' });
+    expect(counter.proofs).toBe(1);
+    WalletManager.liveFigures.get(ME).at -= WalletManager.LIVE_SEND_REUSE_MS + 1;
+    await wm.qncForSend(ME, { nonce: 3 });
+    expect(counter.proofs).toBe(2);
+    expect(WalletManager.LIVE_SEND_REUSE_MS).toBe(15_000);
+    // The screen's own read never takes a kept figure: it always reads anew.
+    await wm.liveQncFigure(ME);
+    expect(counter.proofs).toBe(3);
   });
 
   it('two checks at once share one read', async () => {
+    const counter = { proofs: 0, certified: 0 };
+    global.fetch = answering(counter);
     const wm = new WalletManager();
-    let release;
-    wm.getQNCBalanceWithProof = jest.fn(() => new Promise((r) => { release = () => r({ ok: true, verified: true, balanceNano: '1', nonce: '2' }); }));
-    const both = Promise.all([wm.certifiedQncForSend(ME, { nonce: 2 }), wm.certifiedQncForSend(ME, { nonce: 2 })]);
-    await sleep(10);
-    release();
-    const [x, y] = await both;
-    expect(x).toMatchObject({ ok: true, balanceNano: '1' });
-    expect(y).toMatchObject({ ok: true, balanceNano: '1' });
-    expect(wm.getQNCBalanceWithProof).toHaveBeenCalledTimes(1);
+    wm.verifyMerkleProof = jest.fn(async () => true);
+    const [x, y] = await Promise.all([wm.qncForSend(ME, { nonce: 3 }), wm.qncForSend(ME, { nonce: 3 })]);
+    expect([x.ok, y.ok, counter.proofs]).toEqual([true, true, 1]);
+  });
+
+  it('no figure whose proof folds: refused as unanswered, at once, though every genesis node names a balance', async () => {
+    global.fetch = answering();
+    const wm = new WalletManager();
+    wm.verifyMerkleProof = jest.fn(async () => false);
+    const t0 = Date.now();
+    await expect(wm.qncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: false, balanceNano: null, error: 'unanswered' });
+    await expect(wm.agreedGenesisBalance(ME)).resolves.toBe(5);
+    global.fetch = jest.fn(async (url, opts) => (url.endsWith('/balance/proof') ? reply(502, {}) : reply(200, { nonce: 3 })));
+    await expect(wm.qncForSend(ME, { nonce: 3 })).resolves.toMatchObject({ ok: false, error: 'unanswered' });
+    expect(Date.now() - t0).toBeLessThan(2500);
+    // Tokens: an answer whose two levels do not fold is no balance either.
+    global.fetch = jest.fn(async () => reply(200, JSON.stringify({ token_balance: '9000000', block_height: 90, state_root: 'aa' })));
+    await expect(wm.checkedTokenBalance(TOKEN, ME, 6, { nonce: null })).resolves.toMatchObject({ ok: false, balanceBase: null, error: 'unanswered' });
+  });
+
+  it('the send paths read the live base, and nothing of the certified send check is left', () => {
+    const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    const fresh = ws.slice(ws.indexOf('const freshQncNano = async () => {'), ws.indexOf('// Close Send Screen and go back to assets'));
+    expect(fresh).toMatch(/walletManager\.qncForSend\(addr\)/);
+    expect(fresh).not.toMatch(/getQNCBalanceWithProof|agreedGenesisBalance|verified/);
+    const send = ws.slice(ws.indexOf('const handleSendTransaction = async () => {'), ws.indexOf('const pressSend = async'));
+    expect(send).not.toMatch(/agreedGenesisBalance|getQNCBalanceWithProof|tokenBalances\.qnc/);
+    const br = fs.readFileSync(path.join(__dirname, '../src/browser/BrowserScreen.js'), 'utf8');
+    expect((br.match(/walletManager\.qncForSend\(from/g) || []).length).toBe(2);
+    expect(br).not.toMatch(/getQNCBalanceWithProof|agreedGenesisBalance|certifiedQncForSend/);
+    const wmSrc = fs.readFileSync(path.join(__dirname, '../src/components/WalletManager.js'), 'utf8');
+    const checked = wmSrc.slice(wmSrc.indexOf('  async checkedTokenBalance('), wmSrc.indexOf('  static stillSent('));
+    expect(checked).not.toMatch(/MIN_GENESIS_AGREEMENT|getTokenBalanceWithProof|_certified/);
+    expect(wmSrc).not.toMatch(/certifiedQncForSend|sendProofs|_sendBase|_certifiedQncBase|_keepSendProof/);
+  });
+
+  it('a token balance is read at the same moment as the holder\'s live QNC figure, from the same genesis names', async () => {
+    const wm = new WalletManager();
+    global.fetch = jest.fn(async () => reply(200, { nonce: 7 }));
+    wm.liveTokenFigure = jest.fn(async () => ({ balanceBase: '700', balance: '7', blockHeight: 9000 }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 1, balanceNano: '1000000000', nonce: '7', blockHeight: 9000 }));
+    await expect(wm.checkedTokenBalance(TOKEN, ME, 2, { nonce: 7 })).resolves.toEqual({ ok: true, balanceBase: '700', pending: [], balance: '7' });
+    const nodes = wm.liveTokenFigure.mock.calls[0][3].nodes;
+    expect(nodes.length).toBeGreaterThan(0);
+    // Read now, never a kept one: the token figure is of this moment too (SendAfterOwnSend.test.js).
+    expect(wm.liveQncFigure.mock.calls[0][1]).toMatchObject({ nodes, maxAgeMs: 0 });
+    // No live QNC figure of the holder: its nonce in that state is unknown, so no token balance either.
+    wm.liveQncFigure = jest.fn(async () => null);
+    await expect(wm.checkedTokenBalance(TOKEN, ME, 2, { nonce: 7 })).resolves.toMatchObject({ ok: false, balanceBase: null, error: 'unanswered' });
+    // A recipient's balance (nonce null) is its live figure as it is.
+    await expect(wm.checkedTokenBalance(TOKEN, 'x', 2, { nonce: null })).resolves.toEqual({ ok: true, balanceBase: '700', pending: [], balance: '7' });
   });
 });
 

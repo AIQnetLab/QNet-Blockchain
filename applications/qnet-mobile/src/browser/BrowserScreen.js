@@ -234,12 +234,10 @@ const BrowserScreen = forwardRef(function BrowserScreen({
   const engine = useMemo(() => {
     const grants = createGrantStore(walletManager, () => live.current.credential, { dev });
     // What this wallet's unsettled transactions may still take of each balance read (dappProvider spendableNano), and
-    // why a balance could not be read: 'foreign', 'unconfirmed' or 'unanswered' (the sheet says which), with the steps a
-    // long lineage walk still takes when that is why (WalletManager.walkSteps).
+    // why a balance could not be read: 'unconfirmed' or 'unanswered' (the sheet says which).
     const balanceRead = (balance, tokenBalance) => ({
       spends: balance && balance.ok && Array.isArray(balance.pending) ? balance.pending : [],
       balanceProblem: balance && balance.ok ? null : (balance && balance.error) || 'unanswered',
-      walkSteps: [balance, tokenBalance].map((b) => (b && !b.ok ? b.walkSteps : null)).find((n) => Number.isSafeInteger(n)) ?? null,
       ...(tokenBalance !== null ? {
         tokenSpends: tokenBalance && tokenBalance.ok && Array.isArray(tokenBalance.pending) ? tokenBalance.pending : [],
         tokenProblem: tokenBalance && tokenBalance.ok ? null : (tokenBalance && tokenBalance.error) || 'unanswered',
@@ -266,10 +264,10 @@ const BrowserScreen = forwardRef(function BrowserScreen({
       signMessage: (origin, message) => walletManager.signOffchainMessage(origin, message, live.current.credential),
       tokenInfo: (contract) => walletManager.agreedTokenInfo(contract),
       contractKind: (address) => walletManager.agreedContractKind(address),
-      // The balances a send is decided by are committee-certified (WalletManager.certifiedQncForSend and
-      // checkedTokenBalance: a proof read a moment ago, else one verified read within its deadline), less what this
-      // wallet's own transactions since that checkpoint took, counted up to the nonce the plan confirms; never one
-      // node's word nor what genesis nodes agree on. One that cannot be had is none, and says why (balanceProblem).
+      // The balances a send is checked against are the wallet's at a genesis node's live tip, their proofs folded
+      // (WalletManager.qncForSend and checkedTokenBalance: one read), less what this wallet's own transactions that the
+      // figure does not hold take, counted up to the nonce the plan confirms; the network refuses what it cannot pay.
+      // One that cannot be had is none, and says why (balanceProblem).
       prepareSend: async (d) => {
         const from = live.current.wallet.qnetAddress;
         const token = d.type === 'tokenTransfer';
@@ -277,7 +275,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
         const nonce = planned.then((p) => p.confirmed, () => null);
         const [plan, balance, sentTo, added, tokenBalance, need] = await Promise.all([
           planned,
-          walletManager.certifiedQncForSend(from, { nonce }).catch(() => null),
+          walletManager.qncForSend(from, { nonce }).catch(() => null),
           walletManager.sentRecipients().catch(() => []),
           d.type === 'transfer' ? [] : walletManager.addedTokens().catch(() => []),
           token ? walletManager.checkedTokenBalance(d.token, from, d.decimals, { nonce }).catch(() => null) : null,
@@ -294,18 +292,15 @@ const BrowserScreen = forwardRef(function BrowserScreen({
           nonce: plan.nonce,
           confirmed: plan.confirmed,
           balanceNano: balance && balance.ok ? balance.balanceNano : null,
-          verified: !!(balance && balance.ok && balance.verified),
           ...balanceRead(balance, token ? tokenBalance || { ok: false, error: 'unanswered' } : null),
           ...recipients,
           // This wallet's unconfirmed transactions: a site's send waits for them, or replaces the one at the confirmed
-          // nonce + 1, never goes in addition (dappProvider); the sheet warns about the same payment made a moment ago.
+          // nonce + 1, never goes in addition (dappProvider).
           pending: plan.live,
           replaceNonce: plan.replace ? plan.replace.nonce : null,
           replaceHash: plan.replace ? plan.replace.bodyHash : null,
-          recent: plan.recent,
           ...(token ? {
             tokenBalanceBase: tokenBalance && tokenBalance.ok ? tokenBalance.balanceBase : null,
-            tokenVerified: !!(tokenBalance && tokenBalance.ok && tokenBalance.verified),
             // An unreadable recipient balance counts as none: the deposit is shown rather than missed.
             depositNano: need ? String(need.depositNano) : String(STORAGE_DEPOSIT_NANO),
             listed: !!record,
@@ -318,7 +313,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
         const from = live.current.wallet.qnetAddress;
         const token = d.type === 'tokenTransfer';
         const [balance, tokenBalance, need] = await Promise.all([
-          walletManager.certifiedQncForSend(from).catch(() => null),
+          walletManager.qncForSend(from).catch(() => null),
           token ? walletManager.checkedTokenBalance(d.token, from, d.decimals).catch(() => null) : null,
           token ? walletManager.qrc20TransferQncNeedNano(d.token, d.to, d.amountBase).catch(() => null) : null,
         ]);

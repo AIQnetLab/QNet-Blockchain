@@ -43,7 +43,7 @@ function setup(over = {}) {
     signMessage: jest.fn(),
     tokenInfo: jest.fn(),
     contractKind: jest.fn(async () => 'none'),
-    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO] })),
+    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: String(10n * QNC), counterparties: [TO] })),
     recheckSend: jest.fn(async () => ({ balanceNano: String(10n * QNC) })),
     send: jest.fn(async () => ({ txHash: 'a'.repeat(64), status: 'submitted', nonce: 5, refusal: null, refusalFinal: false })),
     transactionStatus: jest.fn(),
@@ -80,7 +80,7 @@ describe('MB-R1-01: a site\'s QNC transfer is refused when the balance is unread
   it('the approval signs nothing on an unread or a short balance', async () => {
     for (const balanceNano of [null, String(10n * QNC)]) {
       const s = setup();
-      s.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano, verified: true, counterparties: [TO] });
+      s.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano, counterparties: [TO] });
       pay(s, '50').catch(() => {});
       await tick();
       await s.p.loadPreview(s.shown().id);
@@ -110,7 +110,7 @@ describe('MB-R1-01: a site\'s QNC transfer is refused when the balance is unread
     const pending = [{ nonce: 6, state: 'accepted', kind: 'transfer', to: TO, amountNano: Number(8n * QNC), ageMs: 60000 }];
     const s = setup();
     s.deps.prepareSend.mockResolvedValue({
-      nonce: null, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO], pending, replaceNonce: 6, replaceHash: 'h', appendNonce: 7,
+      nonce: null, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [TO], pending, replaceNonce: 6, replaceHash: 'h', appendNonce: 7,
     });
     pay(s, '5').catch(() => {});
     await tick();
@@ -144,7 +144,7 @@ describe('MB-R1-01: a site\'s QNC transfer is refused when the balance is unread
 
     it('a short or unread balance keeps Confirm off and says why', async () => {
       for (const [balanceNano, line] of [[String(10n * QNC), 'dapp_send_insufficient'], [null, 'dapp_send_preview_failed']]) {
-        const { tree } = await mount({ ...base, id: `t-${line}`, details: transfer, preview: { nonce: 5, balanceNano, verified: true, counterparties: [TO] } });
+        const { tree } = await mount({ ...base, id: `t-${line}`, details: transfer, preview: { nonce: 5, balanceNano, counterparties: [TO] } });
         expect(texts(tree)).toContain(t(line));
         await wait(SEND_ARM_MS + 100);
         // Short: Send stays off. Unread: no Send at all, and Try again reads the balance again (MB-R2-03).
@@ -155,9 +155,9 @@ describe('MB-R1-01: a site\'s QNC transfer is refused when the balance is unread
 
     it('a balance that covers the total but not with the unconfirmed transfers says that, until it replaces them', async () => {
       const preview = {
-        nonce: null, confirmed: 5, balanceNano: String(60n * QNC), verified: true, counterparties: [TO], transferFeeNano: FEE,
+        nonce: null, confirmed: 5, balanceNano: String(60n * QNC), counterparties: [TO], transferFeeNano: FEE,
         pending: [{ nonce: 6, state: 'accepted', kind: 'transfer', to: TO, amountNano: Number(20n * QNC), ageMs: 60000 }],
-        replaceNonce: 6, appendNonce: null, inFlight: false, recent: [],
+        replaceNonce: 6, appendNonce: null, inFlight: false,
       };
       const { tree } = await mount({ ...base, details: transfer, preview });
       const pick = (v) => tree.root.find((n) => n.props.testID === `pick-${v}` && typeof n.props.onPress === 'function');
@@ -179,6 +179,17 @@ describe('MB-R1-01: a site\'s QNC transfer is refused when the balance is unread
       expect(texts(heals.tree)).not.toMatch(/mempool full/);
       const quiet = await mount({ ...base, id: 'q', details: transfer, preview: null, outcome: { status: 'unknown', txHash: null } });
       expect(texts(quiet.tree)).toContain(t('dapp_send_unknown'));
+    });
+
+    it('a send the genesis nodes report in a block says so (owner, 18.10), and never that it did what it was meant to', async () => {
+      const sent = await mount({ ...base, id: 's', details: transfer, preview: null, outcome: { status: 'submitted', txHash: 'a'.repeat(64) } });
+      expect(texts(sent.tree)).toContain(t('dapp_send_submitted'));
+      expect(texts(sent.tree)).not.toContain(t('dapp_send_in_block'));
+      const inBlock = await mount({ ...base, id: 'b', details: transfer, preview: null,
+        outcome: { status: 'submitted', txHash: 'a'.repeat(64), inBlock: true } });
+      expect(texts(inBlock.tree)).toContain(t('dapp_send_in_block'));
+      expect(texts(inBlock.tree)).not.toContain(t('dapp_send_submitted'));
+      expect(t('dapp_send_in_block')).toBe('QNet Blockchain included the transaction in a block.');
     });
   });
 });

@@ -3,6 +3,7 @@ import { fetchNode } from '@/lib/node-api';
 import { getBlockByHeight, getBlockByHash, getTransactionsByBlock, BlockRow } from '../../../../../lib/db';
 import type { Block, BlockTransaction } from '@/lib/types';
 import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
+import { quoteBigInts } from '@/indexer/transform';
 
 // ============================================================================
 // PRODUCTION v2.97: PostgreSQL-first with Node RPC fallback
@@ -203,7 +204,8 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
       return null;
     }
     
-    const data = await response.json();
+    // Wide integers quoted before parsing: an amount beyond 2^53 reaches the page exact, as from the index.
+    const data = JSON.parse(quoteBigInts(await response.text()));
     if (data.error) return null;
     
     const block = (data.block || data) as Record<string, unknown>;

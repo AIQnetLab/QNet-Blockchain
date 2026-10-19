@@ -67,7 +67,7 @@ describe('the screens', () => {
   const styles = require('../src/screens/WalletScreen.styles').default;
 
   it('every screen keeps one centred column of at most 640', () => {
-    for (const k of ['scrollContentContainer', 'formContent', 'centerContent']) {
+    for (const k of ['scrollContentContainer', 'formContent', 'centerContent', 'lockColumn']) {
       expect([k, styles[k].maxWidth, styles[k].alignSelf, styles[k].width]).toEqual([k, 640, 'center', '100%']);
     }
     // Nothing reads the window width: the layout is flex only.

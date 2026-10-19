@@ -39,8 +39,8 @@ jest.mock('../src/components/WalletManager', () => {
     getTrustedNodes() { return []; }
     trustedNodeUrl() { return 'https://node.invalid'; }
     async getQNCBalanceWithProof() { return { ok: true, balance: 1, balanceNano: '1000000000', verified: true }; }
-    // The send check's read (a committee-certified balance): the same figure.
-    async certifiedQncForSend() { return { ok: true, verified: true, balanceNano: '1000000000', nonce: '4' }; }
+    // The send check's read (the live figure less this wallet's own unsettled spends): the same figure.
+    async qncForSend() { return { ok: true, balanceNano: '1000000000', nonce: '4', pending: [] }; }
     async getTokenHoldings() { return []; }
     async loadNodeRecord() { return mockState.node; }
     async saveNodeRecord(record) { mockState.saved.push(record); }
@@ -192,9 +192,8 @@ describe('the wallet\'s nodes on the Node tab', () => {
       expect(text).toContain(t('node_heartbeats_of', { n: 5, m: 9 }));
       // The epochs are read from the super node's registration on (node-events), never before it.
       expect(mockState.epochCalls).toContainEqual([mockSUPER, { walletAddress: mockQNET, registeredHeight: 2_000_123 }]);
-      expect(text).toContain(`${t('node_missed')}\n2`);
-      // Neither card counts epochs or names a device model: the site's cabinet does (owner, 11.10).
-      expect(text).not.toMatch(/Counted epochs|\bDevice\b/);
+      // Neither card counts or names missed epochs, or names a device model: the site's cabinet does (owner, 11.10, 18.10).
+      expect(text).not.toMatch(/Counted epochs|Missed|\bDevice\b/);
     } finally {
       require('../src/services/PushService').localBinding.mockImplementation(async () => null);
     }

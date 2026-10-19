@@ -10,9 +10,6 @@ export const requireUnlocked = (...args) => env().session.requireUnlocked(...arg
 export const touch = (...args) => env().session.touch(...args);
 export const cachedViews = (...args) => env().session.cachedViews(...args);
 export const forgetViews = (...args) => env().session.forgetViews(...args);
-export const keepSendProof = (...args) => env().session.keepSendProof(...args);
-export const keptSendProof = (...args) => env().session.keptSendProof(...args);
-export const forgetSendProofs = (...args) => env().session.forgetSendProofs(...args);
 
 export const readState = (...args) => env().vault.readState(...args);
 export const updateState = (...args) => env().vault.updateState(...args);
@@ -31,14 +28,6 @@ export const withRecipient = (state, address) => ({
 });
 export const withSolanaRecipient = (state, address) => ({
   ...state, solanaRecipients: [...state.solanaRecipients.filter((known) => known !== address), address].slice(-128),
-});
-// vault.withRecentTransfer / liveRecentTransfers: the same rules (RECENT_TRANSFERS_MAX 64, RECENT_TRANSFER_MS 30 min).
-export const RECENT_TRANSFER_MS = 30 * 60 * 1000;
-export const liveRecentTransfers = (state, since) => state.recentTransfers.filter((r) => r.createdAt >= since);
-export const withRecentTransfer = (state, transfer) => ({
-  ...state,
-  recentTransfers: [...liveRecentTransfers(state, transfer.createdAt - RECENT_TRANSFER_MS),
-    { to: transfer.to, amountNano: transfer.amountNano, createdAt: transfer.createdAt }].slice(-64),
 });
 
 export const signQnetTransfer = (...args) => env().keys.signQnetTransfer(...args);

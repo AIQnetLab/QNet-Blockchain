@@ -153,8 +153,10 @@ describe('MOBNET-R3-03: an accepted send is settled by its nonce too', () => {
     const screen = read('src/screens/WalletScreen.js');
     const poll = screen.slice(screen.indexOf('const startTxConfirmationPolling'), screen.indexOf('const startUnknownOutcomeResolution'));
     expect(poll).toMatch(/walletManager\.resolveSubmitByNonce\(settleWith\.from, settleWith\.nonce/);
-    // The row under the handed hash goes whether it is still pending or was marked not found (L-10).
-    expect(poll).toMatch(/if \(landedHash !== txHash\) setTxHistory\(prev => prev\.filter\(r => !\(unsettledRow\(r\) && r\.hash === txHash\)\)\)/);
+    // The row under the handed hash, still pending or marked not found (L-10), takes the hash that landed and shows it in
+    // a block, or goes when a row of that hash is listed already.
+    expect(poll).toMatch(/const handed = \(r\) => unsettledRow\(r\) && r\.hash === txHash;/);
+    expect(poll).toMatch(/const rows = listed \? prev\.filter\(r => !handed\(r\)\) : prev\.map\(r => \(handed\(r\) \? \{ \.\.\.r, hash: landedHash \} : r\)\);/);
     expect(screen).toMatch(/const unsettledRow = \(r\) => r\.status === 'pending' \|\| r\.status === 'dropped';/);
     expect(poll).toMatch(/res\.replaced \? 'tx_not_applied_title' : 'tx_unbound_title'/);
     expect(screen).toMatch(/const settle = \{\s*from: result\.from, nonce: result\.nonce, kind: 'transfer'/);

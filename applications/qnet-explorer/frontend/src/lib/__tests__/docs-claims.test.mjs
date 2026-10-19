@@ -369,10 +369,12 @@ test('the extension doc states the round-5 behaviour as the code has it', () => 
   assert.match(doc, /when Chrome refuses the position it opens once more where Chrome places it by default/);
 
   // History and pending transfers: Pending / Confirmed / Failed (28.09), Not found / Unverified (06.10: a row resolves),
-  // refused transfers, the resend intervals, the per-nonce reserve.
+  // a token row this wallet sent confirmed by its call (18.10), refused transfers, the resend intervals, the per-nonce
+  // reserve.
   assert.match(en, /historyConfirmed: 'Confirmed',/);
   assert.match(en, /historyNotFound: 'Not found',/);
-  assert.match(doc, /Confirmed when two pinned nodes list it alike \(a token row: when its logs proof verifies\), Failed when another transaction took its nonce, Not found for a dropped transfer, Unverified for an archive row no two pinned nodes list/);
+  assert.match(doc, /Confirmed when two pinned nodes list it alike \(a token row: its call, when this wallet sent it, or its logs proof verifies\), Failed when another transaction took its nonce, Not found for a dropped transfer, Unverified for an archive row no two pinned nodes list/);
+  assert.match(qnet, /return verdict === 'verified' \|\| \(verdict !== 'rejected' && item\.direction !== 'in' && confirmed\.has\(identityOf\(item\)\)\);/);
   assert.match(doc, /Two nodes listing a row says it is in a block, not that it applied/);
   assert.match(qnet, /const RESUBMIT_INTERVAL_MS = 30000;/);
   assert.match(qnet, /const RESEND_ACCEPTED_MS = 10 \* 60 \* 1000;/);

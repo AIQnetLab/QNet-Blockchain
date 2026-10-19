@@ -174,9 +174,9 @@ const tokenPreview = {
   kind: 'tokenTransfer', from: A.qnet, contract: TOKEN_GOLD, method: 'transfer', gasLimit: '45093', feeNano: '450930',
   depositNano: String(core.fees.STORAGE_DEPOSIT_NANO), totalNano: String(450930n + BigInt(core.fees.STORAGE_DEPOSIT_NANO)), nonce: '4',
   balanceNano: '12500000000', verified: true, verification: 'proof', outstanding, replacesNonce: '6', inFlight: false, to: LOOKALIKE,
-  amountBase: '18446744073709551615', tokenBalance: '100', tokenProblem: null, duplicate: true, token: TOKEN_GOLD, name: 'QNet operators cooperative membership token',
+  amountBase: '18446744073709551615', tokenBalance: '100', tokenProblem: null, token: TOKEN_GOLD, name: 'QNet operators cooperative membership token',
   symbol: 'GOLD', decimals: 6, amount: '18446744073709.551615', reserved: true, burn: true,
-  recipient: { known: false, lookalike: true, incomingOnly: true, historyRead: true, recentSame: false },
+  recipient: { known: false, lookalike: true, incomingOnly: true, historyRead: true },
 };
 // a QNet token row of the archive and a dropped send, for History and its detail
 const tokenItem = { ...item('in'), hash: 'cd'.repeat(32), amountNano: '0', feeNano: '0', kind: 'token', block: 2068700,
@@ -211,6 +211,7 @@ const popupBase = {
   'node.unlinkView': noDevice,
   'qnet.tokens': tokens,
   'qnet.sendWarm': { started: true },
+  'qnet.sentStatus': { status: 'in_block' },
 };
 
 const tab = (name) => ['click', `[data-tab="${name}"]`];
@@ -266,11 +267,11 @@ const POPUP = [
     steps: [['check', 'assets-walking-error']],
   },
   {
-    // the send rule refuses: a transaction from another device is not confirmed yet
-    name: 'send-qnet-foreign',
-    responses: { 'qnet.preview': { $error: 'BALANCE_FOREIGN_PENDING' } },
+    // the send rule refuses: no node gave a proof of the account
+    name: 'send-qnet-unconfirmed',
+    responses: { 'qnet.preview': { $error: 'BALANCE_UNCONFIRMED' } },
     steps: [tab('send'), ['type', 'input[name="to"]', HISTORY_PEER], ['type', 'input[name="amount"]', '1'], ['click', '[data-action="review"]'],
-      ['wait', 200], ['check', 'send-qnet-foreign']],
+      ['wait', 200], ['check', 'send-qnet-unconfirmed']],
   },
   {
     // the review is being read: the button busy and the status line under the form
@@ -310,19 +311,19 @@ const POPUP = [
       ['waitFor', '[data-action="done"]'], ['check', 'sent-qnet-unknown']],
   },
   {
-    // earlier unconfirmed sends: what is left to spend, the same payment again, and a replace at a nonce
+    // earlier unconfirmed sends: what is left to spend, and a replace at a nonce
     name: 'send-qnet-outstanding',
     responses: {
       'qnet.balance': { ...qnetBalance, spendableNano: '11499850000' },
       'qnet.preview': { $seq: [
         {
           from: A.qnet, to: HISTORY_PEER, amountNano: '1000000000', feeNano: '150000', totalNano: '1000150000', nonce: '7', balanceNano: '11499850000',
-          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: true },
+          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
           outstanding, replacesNonce: null,
         },
         {
           from: A.qnet, to: HISTORY_PEER, amountNano: '1000000000', feeNano: '150000', totalNano: '1000150000', nonce: '5', balanceNano: '12500000000',
-          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: true },
+          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
           outstanding, replacesNonce: '5',
         },
       ] },
@@ -332,20 +333,19 @@ const POPUP = [
       ['click', '[data-action="replace-pending"]'], ['waitFor', '[data-action="confirm-send"]'], ['check', 'review-qnet-replaces']],
   },
   {
-    // the replaced transfer was decided meanwhile: never a review of an additional send (R3-EXTQ-03); a history
-    // that could not be read is said (R3-EXTQ-01)
+    // the replaced transfer was decided meanwhile: never a review of an additional send (R3-EXTQ-03)
     name: 'send-qnet-replace-decided',
     responses: {
       'qnet.preview': { $seq: [
         {
           from: A.qnet, to: HISTORY_PEER, amountNano: '1000000000', feeNano: '150000', totalNano: '1000150000', nonce: '7', balanceNano: '11499850000',
-          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false, recentSame: false },
-          outstanding, replacesNonce: null, duplicate: true,
+          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false },
+          outstanding, replacesNonce: null,
         },
         {
           from: A.qnet, to: HISTORY_PEER, amountNano: '1000000000', feeNano: '150000', totalNano: '1000150000', nonce: '5', balanceNano: '12500000000',
-          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false, recentSame: false },
-          outstanding, replacesNonce: '5', duplicate: true,
+          verified: true, verification: 'proof', recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false },
+          outstanding, replacesNonce: '5',
         },
       ] },
       'qnet.send': { $error: 'NONCE_CHANGED' },
@@ -759,7 +759,7 @@ const tokenDetails = (extra = {}) => ({
   decimals: 6, reserved: false, burn: false, gasLimit: '100750', feeNano: '1511250', depositNano: '10000000', totalNano: '11511250',
   nonce: '17', balanceNano: '99999999999999', verified: true, verification: 'proof', balanceProblem: null, tokenBalance: '999999999999999999',
   tokenProblem: null,
-  outstanding: 0, duplicate: false, replaces: null, inFlight: false, recipient: { known: false, lookalike: false, incomingOnly: false, historyRead: true },
+  outstanding: 0, replaces: null, inFlight: false, recipient: { known: false, lookalike: false, incomingOnly: false, historyRead: true },
   ...extra,
 });
 const TOKEN_UNREAD = {
@@ -814,10 +814,8 @@ const APPROVE = [
   { name: 'send', responses: { 'approval.get': approvalView('sendTransaction', sendDetails()) }, steps: [['check', 'send-first-time']] },
   {
     name: 'send-outstanding',
-    responses: { 'approval.get': approvalView('sendTransaction', sendDetails({
-      recipient: { ...knownRecipient, recentSame: true }, outstanding: 2, duplicate: true,
-    })) },
-    steps: [['check', 'send-outstanding-duplicate']],
+    responses: { 'approval.get': approvalView('sendTransaction', sendDetails({ recipient: knownRecipient, outstanding: 2 })) },
+    steps: [['check', 'send-outstanding']],
   },
   {
     name: 'send-lookalike',
@@ -829,13 +827,6 @@ const APPROVE = [
   },
   { name: 'send-pending', responses: { 'approval.get': approvalView('sendTransaction', sendDetails({ nonce: null, balanceNano: null, verified: false, verification: 'none', recipient: null })) }, steps: [['check', 'send-preview-pending']] },
   // decision 44: why no balance a send is decided by was read, said in place of "Reading the account…"
-  {
-    name: 'send-balance-foreign',
-    responses: { 'approval.get': approvalView('sendTransaction', sendDetails({
-      nonce: null, balanceNano: null, verified: false, verification: 'none', recipient: null, balanceProblem: 'BALANCE_FOREIGN_PENDING',
-    })) },
-    steps: [['check', 'send-balance-foreign']],
-  },
   {
     name: 'send-balance-unconfirmed',
     responses: { 'approval.get': approvalView('sendTransaction', sendDetails({
@@ -872,7 +863,7 @@ const APPROVE = [
     name: 'token-transfer-warnings',
     responses: { 'approval.get': approvalView('tokenTransfer', tokenDetails({
       name: 'QNet Coin of the Realm with a very long name', symbol: 'QNC', reserved: true, burn: true, to: BURN_ADDRESS,
-      tokenBalance: '1', duplicate: true, inFlight: true, recipient: { known: false, lookalike: true, incomingOnly: true, historyRead: true },
+      tokenBalance: '1', inFlight: true, recipient: { known: false, lookalike: true, incomingOnly: true, historyRead: true },
       replaces: { nonce: '16', to: GAME_CONTRACT, amountNano: '0', kind: 'call' },
     })) },
     steps: [['check', 'token-transfer-warnings']],

@@ -2,7 +2,8 @@
  * Final audit, mobile fixer round 3, the wallet's sends (MOB-BR-R3-01 … MOB-BR-R3-03): a transfer or token transfer to a
  * contract (the token itself included) is refused before any sheet or review and read again before signing, as the
  * extension refuses it; what an unconfirmed call or token transfer may still take is kept out of the spendable balance;
- * and whether a token transfer owes the new-holder deposit is decided by a committee-certified balance, not by one answer.
+ * and whether a token transfer owes the new-holder deposit is decided by the balance a send is checked against (a genesis
+ * node's live tip, its proof folded), not by an unproven answer.
  */
 const fs = require('fs');
 const path = require('path');
@@ -43,8 +44,8 @@ function setup(over = {}) {
     tokenInfo: jest.fn(async () => ({ standard: 'qrc20', name: 'Game Gold', symbol: 'GOLD', decimals: 6 })),
     contractKind: jest.fn(async (a) => (a === WASM ? 'contract' : a === TOKEN ? 'token' : 'none')),
     prepareSend: jest.fn(async () => ({
-      nonce: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO],
-      tokenBalanceBase: '9000000', tokenVerified: true, depositNano: '10000000', listed: true,
+      nonce: 5, balanceNano: String(10n * QNC), counterparties: [TO],
+      tokenBalanceBase: '9000000', depositNano: '10000000', listed: true,
     })),
     recheckSend: jest.fn(async () => ({ balanceNano: String(10n * QNC), tokenBalanceBase: '9000000', depositNano: '10000000' })),
     send: jest.fn(async () => ({ txHash: 'a'.repeat(64), status: 'submitted', nonce: 5 })),
@@ -124,23 +125,25 @@ describe('MOB-BR-R3-01: a contract is never paid', () => {
     expect(s.deps.send).toHaveBeenCalledTimes(1);
   });
 
-  it('the wallet\'s rule: the certified leaf decides, the own address unread, anything else refused', async () => {
+  it('the wallet\'s rule: two genesis nodes decide at once, the own address unread, anything else refused', async () => {
     const wm = new WalletManager();
-    // The certified account leaf decides (WalletFollow.test.js); the nodes' word never does, not even as a fallback.
-    const certified = jest.spyOn(wm, 'certifiedRecipientKind').mockResolvedValue(null);
+    // The genesis nodes' live answer decides (owner, 18.10); the certified account leaf confirms it in the background
+    // (WalletFollow.test.js) and is never waited for.
+    const certified = jest.spyOn(wm, 'certifiedRecipientKind').mockImplementation(() => new Promise(() => {}));
     const kind = jest.spyOn(wm, 'agreedContractKind').mockResolvedValue('none');
-    expect(await wm.payableRecipientProblem(TO, QNET)).toBe('unchecked');
-    certified.mockRejectedValueOnce(new Error('x'));
-    expect(await wm.payableRecipientProblem(TO.toUpperCase(), QNET)).toBe('unchecked');
-    certified.mockClear();
-    expect(await wm.payableRecipientProblem(QNET, QNET)).toBe(null);
-    expect(certified).not.toHaveBeenCalled();
-    expect(await wm.payableRecipientProblem('ab'.repeat(32), QNET)).toBe('contract');
-    certified.mockResolvedValueOnce('none');
     expect(await wm.payableRecipientProblem(TO, QNET)).toBe(null);
-    certified.mockResolvedValueOnce('contract');
+    expect(certified).toHaveBeenCalledWith(TO);
+    kind.mockResolvedValueOnce('token');
+    expect(await wm.payableRecipientProblem(TO.toUpperCase(), QNET)).toBe('contract');
+    kind.mockResolvedValueOnce('contract');
     expect(await wm.payableRecipientProblem(TO, QNET)).toBe('contract');
-    expect(kind).not.toHaveBeenCalled();
+    kind.mockRejectedValueOnce(Object.assign(new Error('x'), { code: 'TOKEN_UNAVAILABLE' }));
+    expect(await wm.payableRecipientProblem(TO, QNET)).toBe('unchecked');
+    certified.mockClear();
+    kind.mockClear();
+    expect(await wm.payableRecipientProblem(QNET, QNET)).toBe(null);
+    expect(await wm.payableRecipientProblem('ab'.repeat(32), QNET)).toBe('contract');
+    expect([certified.mock.calls, kind.mock.calls]).toEqual([[], []]);
   });
 
   it('the Send form refuses it before the review and reads it again just before signing, with its own texts', () => {
@@ -203,7 +206,7 @@ describe('MOB-BR-R3-02: what an unconfirmed call or token transfer may take is n
 
     const s = setup();
     s.deps.prepareSend.mockResolvedValue({
-      nonce: null, confirmed: 5, balanceNano: String(1n * QNC), verified: true, counterparties: [TO], replaceNonce: 6, replaceHash: 'h', appendNonce: 7,
+      nonce: null, confirmed: 5, balanceNano: String(1n * QNC), counterparties: [TO], replaceNonce: 6, replaceHash: 'h', appendNonce: 7,
       pending: [{ nonce: 6, state: 'accepted', kind: 'call', to: TOKEN, amountNano: null, method: 'transfer', reserveNano: 11_500_000, ageMs: 1 }],
     });
     s.p.request(s.ctx, 'qnet_sendTransaction', { to: TO, amount: '0.99' }).catch(() => {});
@@ -217,16 +220,15 @@ describe('MOB-BR-R3-02: what an unconfirmed call or token transfer may take is n
   });
 });
 
-describe('MOB-BR-R3-03: the new-holder deposit is decided by a committee-certified balance', () => {
-  it('only a checked non-zero balance spares the deposit; one node\'s word is never asked', async () => {
+describe('MOB-BR-R3-03: the new-holder deposit is decided by the balance a send is checked against', () => {
+  it('only a checked non-zero balance spares the deposit; an unproven answer is never asked', async () => {
     const wm = new WalletManager();
     const one = jest.spyOn(wm, 'getTokenBalanceOf');
     const checked = jest.spyOn(wm, 'checkedTokenBalance');
     const fee = wm.qrc20TransferFeeNano(TOKEN, TO, '1');
     for (const [answer, deposit] of [
-      [{ ok: true, balanceBase: '5', verified: true }, 0],
-      [{ ok: true, balanceBase: '5', verified: false }, STORAGE_DEPOSIT_NANO], // an unverified figure spares nothing
-      [{ ok: true, balanceBase: '0', verified: true }, STORAGE_DEPOSIT_NANO],
+      [{ ok: true, balanceBase: '5' }, 0], // the live figure, its proof folded
+      [{ ok: true, balanceBase: '0' }, STORAGE_DEPOSIT_NANO],
       [{ ok: false, balanceBase: null }, STORAGE_DEPOSIT_NANO],
     ]) {
       checked.mockResolvedValueOnce(answer);
@@ -234,7 +236,7 @@ describe('MOB-BR-R3-03: the new-holder deposit is decided by a committee-certifi
     }
     checked.mockRejectedValueOnce(new Error('network'));
     expect((await wm.qrc20TransferQncNeedNano(TOKEN, TO, '1')).depositNano).toBe(STORAGE_DEPOSIT_NANO);
-    // The recipient's account nonce is not the send's: no proof read earlier stands in for a fresh one.
+    // The recipient's balance as it is: nothing of this wallet's own transactions counts against it.
     expect(checked).toHaveBeenCalledWith(TOKEN, TO, null, { nonce: null });
     expect(one).not.toHaveBeenCalled();
   });

@@ -196,13 +196,13 @@ describe('approve page', () => {
     assert.equal(input.getAttribute('type'), 'password');
     input.value = PASSWORD;
     page.app.button('Unlock').click();
-    await until(() => page.app.button('Burn 1500 1DEV') !== null);
+    await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     assert.deepEqual(page.app.querySelectorAll('input').map((node) => node.getAttribute('type')), ['checkbox']);
     const [ack] = page.app.querySelectorAll('input');
     ack.checked = true;
     ack.fire('change');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
-    page.app.button('Burn 1500 1DEV').click();
+    page.app.button('Burn 1,500 1DEV').click();
     await until(() => page.app.textContent.includes('The burn is finalized. The site received the activation code.'));
     assert.deepEqual(w.log.unlockAttempts, [PASSWORD]);
     assert.deepEqual(w.log.activations, [{ nodeType: 'light', expectedPrice: 1500 }]);
@@ -332,25 +332,6 @@ describe('approve page', () => {
     }
   });
 
-  // R3-EXTQ-01: the wallet's own records name a second payment the archive could not. An unread history is no longer
-  // described on screen (owner, 28.09); the check is unchanged.
-  it('sendTransaction: names a second payment from the wallet\'s records, with no text on an unread history (R3-EXTQ-01)', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
-    const w = createWorld();
-    w.state.recipient = { known: true, lookalike: false, incomingOnly: false, historyRead: false };
-    w.state.duplicate = true;
-    await w.grant(SITE);
-    const port = w.connect(`${SITE}/`);
-    port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-    const page = await openPage(w, await w.shown());
-    await until(() => page.app.button('Send') !== null);
-    const warning = page.app.byClass('ap-warning').map((node) => node.textContent).join(' ');
-    assert.ok(!warning.includes('history could not be read'), warning);
-    assert.ok(/twice/.test(warning), warning);
-    page.app.button('Reject').click();
-    await until(() => page.window.closed);
-  });
-
   it('a failed action stays on screen until closed; the dApp gets -32603', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     const w = createWorld();
@@ -391,13 +372,13 @@ describe('approve page', () => {
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
     const page = await openPage(w, await w.shown());
-    await until(() => page.app.button('Burn 1500 1DEV') !== null);
+    await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Activate a Light node?']);
     assert.deepEqual(texts(page, 'ap-kicker'), ['Activation request']);
     assert.deepEqual(texts(page, 'ap-origin-host'), [SITE]);
     const text = page.app.textContent;
-    for (const expected of ['1500 1DEV', SOLANA.ONE_DEV_MINT, core.SOLANA_PROGRAMS.TOKEN, ACCOUNTS.solana,
-      'I understand that 1500 1DEV will be destroyed and that this wallet gets exactly one code.', 'The site receives both addresses']) {
+    for (const expected of ['1,500 1DEV', SOLANA.ONE_DEV_MINT, core.SOLANA_PROGRAMS.TOKEN, ACCOUNTS.solana,
+      'I understand that 1,500 1DEV will be destroyed and that this wallet gets exactly one code.', 'The site receives both addresses']) {
       assert.ok(text.includes(expected), expected);
     }
     // the burn is irreversible: the acknowledgement is its one confirmation line, with no warning list (owner, 28.09)
@@ -412,7 +393,7 @@ describe('approve page', () => {
     assert.deepEqual(inputs.map((input) => input.getAttribute('type')), ['checkbox']);
     assert.ok(!page.app.textContent.includes('Wallet password'));
     const [ack] = inputs;
-    const burn = page.app.button('Burn 1500 1DEV');
+    const burn = page.app.button('Burn 1,500 1DEV');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     assert.equal(burn.disabled, true, 'no acknowledgement');
     ack.checked = true;
@@ -428,7 +409,7 @@ describe('approve page', () => {
     });
     burn.click();
     // while it burns: the title, a progress bar and the time, no list of what the wallet does inside (owner, 28.09)
-    await until(() => page.app.textContent.includes('Burning 1500 1DEV'));
+    await until(() => page.app.textContent.includes('Burning 1,500 1DEV'));
     assert.deepEqual(page.app.byClass('steps'), []);
     assert.ok(!/simulating|Deriving|no earlier burn|Checking the price/.test(page.app.textContent), page.app.textContent);
     open();
@@ -565,7 +546,7 @@ describe('approve page', () => {
       const port = w.connect(`${SITE}/activate`);
       port.send({ id: nodeType, method: 'qnet_activateNode', params: { nodeType } });
       const page = await openPage(w, await w.shown());
-      await until(() => page.app.button('Burn 1500 1DEV') !== null);
+      await until(() => page.app.button('Burn 1,500 1DEV') !== null);
       assert.deepEqual(texts(page, 'ap-title'), [title]);
       assert.ok(page.app.textContent.includes(line), `${nodeType}: ${page.app.textContent}`);
       assert.ok(!page.app.textContent.includes(not), nodeType);
@@ -684,7 +665,7 @@ describe('approve page', () => {
     const page = await openPage(w, await w.shown());
     await until(() => page.app.button('Ablehnen') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Einen Super-Knoten aktivieren?']);
-    assert.ok(page.app.button('1500 1DEV verbrennen') !== null);
+    assert.ok(page.app.button('1.500 1DEV verbrennen') !== null);
     assert.equal(page.document.title, 'Anfrage an QNet Wallet');
     page.app.button('Ablehnen').click();
     assert.equal((await replyTo(port, 'a')).error.code, 4001);
@@ -745,7 +726,7 @@ describe('approve page', () => {
     assert.deepEqual(w.log.signCalls.map((call) => call.message), [message]);
   });
 
-  it('sendTransaction: names the unconfirmed sends and a second payment of the same amount (R2-EXTQ-03)', async (t) => {
+  it('sendTransaction: names the unconfirmed sends; a payment of the same amount again gets no notice of its own (R2-EXTQ-03)', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     const w = createWorld();
     await w.grant(SITE);
@@ -757,7 +738,7 @@ describe('approve page', () => {
     const page = await openPage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     assert.ok(page.app.textContent.includes('Earlier transfers of this wallet are not confirmed yet: 2'));
-    assert.ok(page.app.textContent.includes('A transfer of this amount to this address is not confirmed yet'));
+    assert.ok(!/pay twice|30 minutes/.test(page.app.textContent), 'owner, 18.10: a send like any other');
     page.app.button('Reject').click();
     assert.equal((await replyTo(port, 't')).error.code, 4001);
   });
@@ -793,14 +774,14 @@ describe('approve page', () => {
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
     const page = await openPage(w, await w.shown());
-    await until(() => page.app.button('Burn 1500 1DEV') !== null);
+    await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     const [ack] = page.app.querySelectorAll('input');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     ack.checked = true;
     ack.fire('change');
-    page.app.button('Burn 1500 1DEV').click();
+    page.app.button('Burn 1,500 1DEV').click();
     await until(() => page.app.textContent.includes('Another device with this recovery phrase burned first'));
-    assert.ok(page.app.textContent.includes(`The burn of 1500 1DEV this window sent (${own}) also went through`));
+    assert.ok(page.app.textContent.includes(`The burn of 1,500 1DEV this window sent (${own}) also went through`));
     assert.equal((await replyTo(port, 'a')).result.status, 'exists');
   });
 
@@ -818,7 +799,7 @@ describe('approve page', () => {
     const tx = core.buildTokenTransfer({ from: ACCOUNTS.qnet, token: TOKEN, to: ACCOUNTS.qnet, amount: '2500000', nonce: '5' });
     const qnc = (nano) => `${formatUnits(BigInt(nano), 9)} QNC`;
     assert.deepEqual(values, [
-      'QNet Blockchain testnet (q1337)', '2.5 GOLD', qnc(tx.maxFeeNano), '0.01 QNC', qnc(BigInt(tx.maxFeeNano) + 10000000n), '5000 GOLD', '5',
+      'QNet Blockchain testnet (q1337)', '2.5 GOLD', qnc(tx.maxFeeNano), '0.01 QNC', qnc(BigInt(tx.maxFeeNano) + 10000000n), '5,000 GOLD', '5',
       '10 QNC',
     ]);
     const text = page.app.textContent;
@@ -859,12 +840,11 @@ describe('approve page', () => {
     await until(() => page.window.closed);
   });
 
-  // The send rule decides only by a committee-certified balance: when none can be had the window says why, as the app's
-  // sheet does, and offers no confirm.
-  it('sendTransaction: no certified balance says why (another device, not confirmed yet, no answer) and offers no confirm', async (t) => {
+  // The send rule decides by a pinned node's live figure: when none can be had the window says why, as the app's sheet
+  // does, and offers no confirm.
+  it('sendTransaction: no balance to decide by says why (not confirmed yet, no answer) and offers no confirm', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     const why = {
-      BALANCE_FOREIGN_PENDING: 'A transaction from another device is not confirmed yet. Try again in a minute.',
       BALANCE_UNCONFIRMED: 'The balance is not confirmed yet. Try again in a minute.',
       NETWORK: 'QNet Blockchain could not be reached. Try again.',
     };
@@ -881,7 +861,7 @@ describe('approve page', () => {
       assert.ok(!page.app.textContent.includes('Reading the account from QNet Blockchain'), code);
       t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS * 2);
       assert.ok(page.app.button('Send') === null || page.app.button('Send').disabled, code);
-      // the balance certified again: the window reads it and offers the confirm
+      // a balance read again: the window reads it and offers the confirm
       w.state.prepareError = null;
       t.mock.timers.tick(10000);
       await until(() => page.app.button('Send') !== null && !page.app.textContent.includes(text));
@@ -1002,7 +982,7 @@ describe('approve page: the one-code checks (decision 35)', () => {
     await until(() => page.app.textContent.includes('Checking this wallet: QNet Blockchain, Solana and aiqnet.io…'));
     assert.deepEqual(page.app.querySelectorAll('button').map((button) => button.textContent), ['Reject']);
     assert.equal(page.app.querySelectorAll('input').length, 0, 'no acknowledgement, no burn');
-    assert.ok(!/1500 1DEV/.test(page.app.textContent), 'no price while checking');
+    assert.ok(!/1,?500 1DEV/.test(page.app.textContent), 'no price while checking');
     noStrayValues(page);
     const reads = w.log.siteViews.length;
     for (let i = 0; i < 7; i += 1) {
@@ -1012,7 +992,7 @@ describe('approve page: the one-code checks (decision 35)', () => {
     assert.ok(w.log.siteViews.length >= reads + 6, 'read again every few seconds, past the retries of a missing view');
     w.state.siteView = null;
     t.mock.timers.tick(3000);
-    await until(() => page.app.button('Burn 1500 1DEV') !== null);
+    await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     assert.equal(answered(port, 'k'), false);
   });
 
@@ -1052,12 +1032,12 @@ describe('approve page: the one-code checks (decision 35)', () => {
       const port = w.connect(`${SITE}/`);
       port.send({ id: 'o', method: 'qnet_activateNode', params: { nodeType: 'light' } });
       const page = await openPage(w, await w.shown());
-      await until(() => page.app.button('Burn 1500 1DEV') !== null);
+      await until(() => page.app.button('Burn 1,500 1DEV') !== null);
       const [ack] = page.app.querySelectorAll('input');
       t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
       ack.checked = true;
       ack.fire('change');
-      page.app.button('Burn 1500 1DEV').click();
+      page.app.button('Burn 1,500 1DEV').click();
       await until(() => page.app.button('Close') !== null);
       assert.deepEqual(texts(page, 'ap-title'), [title]);
       assert.ok(!texts(page, 'ap-title').includes('Done'));

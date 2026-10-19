@@ -77,7 +77,7 @@ function setup(over = {}) {
     signMessage: jest.fn(),
     tokenInfo: jest.fn(async () => ({ standard: 'qrc20', name: 'Game Gold', symbol: 'GOLD', decimals: 6 })),
     contractKind: jest.fn(async (a) => (a === WASM ? 'contract' : a === TOKEN ? 'token' : 'none')),
-    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [] })),
+    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: '10000000000', counterparties: [] })),
     send: jest.fn(async () => ({ txHash: 'a'.repeat(64), status: 'submitted', nonce: 5 })),
     transactionStatus: jest.fn(async () => ({ status: 'in_block', blockHeight: 42, txHash: 'b'.repeat(64) })),
     isCurrent: () => true,
@@ -172,12 +172,12 @@ describe('a token transfer', () => {
       },
     });
     s.deps.prepareSend.mockResolvedValueOnce({
-      nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [TO],
-      tokenBalanceBase: '9000000', tokenVerified: true, depositNano: '10000000', listed: false,
+      nonce: 5, balanceNano: '10000000000', counterparties: [TO],
+      tokenBalanceBase: '9000000', depositNano: '10000000', listed: false,
     });
     await s.p.loadPreview(s.shown().id);
     expect(s.deps.prepareSend).toHaveBeenLastCalledWith(expect.objectContaining({ type: 'tokenTransfer', amountBase: '2500000' }));
-    expect(s.shown().preview).toMatchObject({ nonce: 5, tokenBalanceBase: '9000000', tokenVerified: true, depositNano: '10000000', listed: false });
+    expect(s.shown().preview).toMatchObject({ nonce: 5, tokenBalanceBase: '9000000', depositNano: '10000000', listed: false });
     await s.p.approve(s.shown().id);
     expect(s.deps.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'tokenTransfer', token: TOKEN, to: TO, amountBase: '2500000', nonce: 5, choice: null }));
     expect(await asked).toEqual({ status: 'submitted', from: QNET, token: TOKEN, to: TO, amount: '2.5', nonce: '5', txHash: 'a'.repeat(64) });
@@ -227,7 +227,7 @@ describe('a contract call', () => {
       gasLimit: tx.gasLimit, feeNano: tx.maxFeeNano, totalNano: tx.maxFeeNano,
     });
     // A preview never names a token for a call: the target is a contract that is no token (MB-02).
-    s.deps.prepareSend.mockResolvedValueOnce({ nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [], knownToken: { symbol: 'G', name: 'x' } });
+    s.deps.prepareSend.mockResolvedValueOnce({ nonce: 5, balanceNano: '10000000000', counterparties: [], knownToken: { symbol: 'G', name: 'x' } });
     await s.p.loadPreview(s.shown().id);
     expect(s.shown().preview).not.toHaveProperty('knownToken');
     expect(s.deps.contractKind).toHaveBeenCalledWith(WASM);
@@ -341,7 +341,7 @@ describe('the wallet signs what the sheet showed, through its own send path', ()
     wm.loadWallet = jest.fn(async () => ({
       secretKey: new Uint8Array(64), qnetAddress: FROM, qnetKeypair: { publicKey: [...publicKey], privateKey: [...secretKey] },
     }));
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, nonce: '3', balanceNano: '9000000000' }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 9, balanceNano: '9000000000', nonce: '3', blockHeight: 9000, figureClaimedEpoch: 0 }));
     return wm;
   }
 
@@ -383,7 +383,7 @@ describe('the wallet signs what the sheet showed, through its own send path', ()
     const v = vector('tokenTransfer');
     routes.push([/\/api\/v1\/account\/[^/]+$/, () => reply({ nonce: 1, has_dilithium_pk: true })]);
     const wm = wallet();
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, nonce: '1', balanceNano: '9000000000' }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 9, balanceNano: '9000000000', nonce: '1', blockHeight: 9000, figureClaimedEpoch: 0 }));
     await expect(contractSend(wm, { type: 'tokenTransfer', token: v.input.token, to: v.input.to, amountBase: v.input.amount }, 'pw',
       { expectNonce: 3, choice: null })).rejects.toMatchObject({ code: 'NONCE_CHANGED' });
     const r = await contractSend(wm, { type: 'tokenTransfer', token: v.input.token, to: v.input.to, amountBase: v.input.amount }, 'pw',
@@ -506,12 +506,12 @@ describe('the sheet of a token transfer and of a contract call', () => {
 
   it('a token: its name and contract, the amount in its units and base units, the fee, the deposit, both balances', async () => {
     const preview = {
-      nonce: 5, balanceNano: '1000000', verified: true, counterparties: [], tokenBalanceBase: '2000000', tokenVerified: true,
+      nonce: 5, balanceNano: '1000000', counterparties: [], tokenBalanceBase: '2000000',
       depositNano: '10000000', listed: false,
     };
     const { tree, props } = await mount({ ...base, details: token, preview });
     const shown = texts(tree);
-    for (const s of ['Send a token', 'GOLD · Game Gold', TOKEN, TO, '2.5 GOLD', '2500000', '0.00151125 QNC',
+    for (const s of ['Send a token', 'GOLD · Game Gold', TOKEN, TO, '2.5 GOLD', '2,500,000', '0.00151125 QNC',
       '0.01 QNC', '0.01151125 QNC', t('dapp_token_unlisted'), t('dapp_token_balance'), '2 GOLD',
       t('dapp_token_insufficient'), t('dapp_send_insufficient'), t('dapp_send_first_time')]) {
       expect([s, shown.includes(s)]).toEqual([s, true]);
@@ -534,7 +534,7 @@ describe('the sheet of a token transfer and of a contract call', () => {
 
   it('a token sent to the destruction address or named after QNC says so; decimals the token list records otherwise stop it', async () => {
     const { tree } = await mount({ ...base, details: { ...token, to: DESTROY, destroys: true, reservedName: true },
-      preview: { nonce: 5, balanceNano: '1000000000', verified: false, counterparties: [], tokenBalanceBase: null, depositNano: '0', listed: true } });
+      preview: { nonce: 5, balanceNano: '1000000000', counterparties: [], tokenBalanceBase: null, depositNano: '0', listed: true } });
     const shown = texts(tree);
     expect(shown).toContain(t('dapp_token_destroyed'));
     expect(shown).toContain(t('tok_reserved_warning'));
@@ -551,9 +551,9 @@ describe('the sheet of a token transfer and of a contract call', () => {
       type: 'contractCall', contract: WASM, method: 'play', args: '6c6576656c2d7570', argsBytes: 8, argsText: 'level-up',
       gasLimit: '300490', feeNano: '4507350', totalNano: '4507350',
     };
-    const { tree, props } = await mount({ ...base, details: call, preview: { nonce: 5, balanceNano: '9000000000', verified: true, counterparties: [] } });
+    const { tree, props } = await mount({ ...base, details: call, preview: { nonce: 5, balanceNano: '9000000000', counterparties: [] } });
     const shown = texts(tree);
-    for (const s of ['Call a contract', WASM, t('dapp_call_unknown'), 'play', 'Input (8 bytes, hex)', '6c6576656c2d7570', 'level-up', '300490',
+    for (const s of ['Call a contract', WASM, t('dapp_call_unknown'), 'play', 'Input (8 bytes, hex)', '6c6576656c2d7570', 'level-up', '300,490',
       '0.00450735 QNC']) {
       expect([s, shown.includes(s)]).toEqual([s, true]);
     }
@@ -563,7 +563,7 @@ describe('the sheet of a token transfer and of a contract call', () => {
     await act(async () => { confirm.onPressIn(); await confirm.onPress(); });
     expect(props.authenticate).toHaveBeenCalledWith(`Call play for ${new URL(SITE).host}`, null, WASM);
     // Too little QNC for its fee: the call is not offered (MB-08), and no preview ever calms the target down (MB-02).
-    const short = await mount({ ...base, id: 't3', details: call, preview: { nonce: 5, balanceNano: '1', verified: true, counterparties: [], knownToken: { symbol: 'GOLD', name: 'Game Gold' } } });
+    const short = await mount({ ...base, id: 't3', details: call, preview: { nonce: 5, balanceNano: '1', counterparties: [], knownToken: { symbol: 'GOLD', name: 'Game Gold' } } });
     expect(texts(short.tree)).toContain(t('dapp_call_unknown'));
     expect(texts(short.tree)).toContain(t('dapp_send_insufficient'));
     await wait(SEND_ARM_MS + 100);

@@ -904,17 +904,13 @@ pub(super) fn parse_ws_channels(channels_str: &str) -> Vec<WsChannel> {
         .collect()
 }
 
-/// Check if an event matches the subscribed channels
+/// Check if a broadcast event matches the subscribed channels. Account channels take no broadcast: their events
+/// come addressed from the account hub (`ws_accounts`).
 pub(super) fn event_matches_channels(event: &WsEvent, channels: &[WsChannel]) -> bool {
     for channel in channels {
         match (channel, event) {
             (WsChannel::Blocks, WsEvent::NewBlock { .. }) => return true,
             (WsChannel::Mempool, WsEvent::PendingTx { .. }) => return true,
-            (WsChannel::Account(addr), WsEvent::BalanceUpdate { address, .. }) => {
-                if address == addr {
-                    return true;
-                }
-            }
             (WsChannel::Contract(addr), WsEvent::ContractEvent { contract_address, .. }) => {
                 if contract_address == addr {
                     return true;
@@ -944,9 +940,11 @@ pub(super) fn event_matches_channels(event: &WsEvent, channels: &[WsChannel]) ->
 
 /// Handle a WebSocket connection. `slot` is its connection slot, taken before the upgrade; it is released when
 /// this returns or unwinds, and by warp dropping the upgrade callback when the upgrade never completes.
+/// `channels` and the `accounts` they follow were parsed and checked before the upgrade too.
 pub(super) async fn handle_ws_connection_with_cleanup(
     ws: WebSocket,
-    query: WsSubscribeQuery,
+    channels: Vec<WsChannel>,
+    accounts: Vec<String>,
     blockchain: Arc<BlockchainNode>,
     slot: WsSlot,
 ) {
@@ -959,12 +957,6 @@ pub(super) async fn handle_ws_connection_with_cleanup(
                  total, unique_ips);
     }
     
-    // Parse subscription channels
-    let channels = query.channels
-        .as_ref()
-        .map(|s| parse_ws_channels(s))
-        .unwrap_or_else(|| vec![WsChannel::Blocks]); // Default: subscribe to blocks
-    
     if is_info() {
         println!("[INFO][WS] subscribed channels={} types={:?}", channels.len(), 
                  channels.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>());
@@ -974,9 +966,10 @@ pub(super) async fn handle_ws_connection_with_cleanup(
     let (ws_tx, mut ws_rx) = ws.split();
     let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx));
     
-    // Subscribe to global event broadcaster
+    // Subscribe to global event broadcaster, and this connection's account channels to the account hub
     let mut rx = WS_BROADCASTER.subscribe();
-    
+    let (account_subs, mut account_rx) = ACCOUNT_HUB.subscribe(accounts);
+
     // Send welcome message with connection info
     let welcome = json!({
         "type": "connected",
@@ -985,7 +978,8 @@ pub(super) async fn handle_ws_connection_with_cleanup(
         "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "node_id": blockchain.get_public_display_name(),
         "rate_limit": {
-            "max_per_ip": 5,
+            "max_per_ip": WS_RATE_LIMITER.max_per_ip,
+            "max_account_channels": MAX_ACCOUNT_CHANNELS,
             "your_connections": WS_RATE_LIMITER.connections_per_ip
                 .get(&client_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
                 .map(|v| *v)
@@ -1105,23 +1099,26 @@ pub(super) async fn handle_ws_connection_with_cleanup(
     
     // Forward matching events until the client is gone: the receive task ending is the disconnect.
     let ws_tx_for_events = ws_tx.clone();
-    forward_until_closed(&mut rx, &mut reader, |event| event_matches_channels(event, &channels_clone), |text| {
+    forward_until_closed(&mut rx, &mut account_rx, &mut reader, |event| event_matches_channels(event, &channels_clone), |text| {
         let tx = ws_tx_for_events.clone();
         async move { tx.lock().await.send(Message::text(text)).await.map_err(|e| e.to_string()) }
     }).await;
     reader.abort();
 
+    drop(account_subs);
     drop(slot);
     let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
     if is_info() { println!("[INFO][WS] connection_closed total={} unique_ips={}", total, unique_ips); }
 }
 
-/// The send half of a WebSocket connection: forwards the broadcaster's events that `wanted` keeps until the
-/// client is gone. That is the receive task `reader` ending (close frame, receive error or EOF), a failed send,
-/// or the broadcaster closing. A loop that only noticed a failed send never ended for a subscription whose
-/// events stopped coming, and held its connection slot forever after the client left.
+/// The send half of a WebSocket connection: forwards the broadcaster's events that `wanted` keeps, and every
+/// event of its account queue (addressed to it already), until the client is gone. That is the receive task
+/// `reader` ending (close frame, receive error or EOF), a failed send, or the broadcaster closing. A loop that only
+/// noticed a failed send never ended for a subscription whose events stopped coming, and held its connection slot
+/// forever after the client left.
 pub(super) async fn forward_until_closed<W, S, F>(
     rx: &mut broadcast::Receiver<WsEvent>,
+    accounts: &mut tokio::sync::mpsc::Receiver<WsEvent>,
     reader: &mut tokio::task::JoinHandle<()>,
     mut wanted: W,
     mut send: S,
@@ -1130,16 +1127,21 @@ pub(super) async fn forward_until_closed<W, S, F>(
     S: FnMut(String) -> F,
     F: std::future::Future<Output = Result<(), String>>,
 {
+    let mut accounts_open = true;
     loop {
-        let next = tokio::select! {
+        let (next, addressed) = tokio::select! {
             _ = &mut *reader => {
                 if is_info() { println!("[INFO][WS] client_gone reason=receive_ended"); }
                 return;
             }
-            next = rx.recv() => next,
+            next = rx.recv() => (next, false),
+            event = accounts.recv(), if accounts_open => match event {
+                Some(event) => (Ok(event), true),
+                None => { accounts_open = false; continue; } // no account channel
+            },
         };
         let text = match next {
-            Ok(event) if wanted(&event) => match serde_json::to_string(&event) {
+            Ok(event) if addressed || wanted(&event) => match serde_json::to_string(&event) {
                 Ok(t) => t,
                 Err(_) => continue,
             },
@@ -1617,6 +1619,9 @@ mod ws_slot_tests {
     use super::*;
 
     fn limiter() -> &'static WsRateLimiter { Box::leak(Box::new(WsRateLimiter::new())) }
+    fn limiter_with_total(max_total: u32) -> &'static WsRateLimiter {
+        Box::leak(Box::new(WsRateLimiter { max_total, ..WsRateLimiter::new() }))
+    }
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, last))) }
     fn counts(l: &WsRateLimiter, a: Option<IpAddr>) -> (u32, u32) {
         (l.get_stats().0, a.and_then(|a| l.connections_per_ip.get(&a).map(|v| *v)).unwrap_or(0))
@@ -1627,10 +1632,11 @@ mod ws_slot_tests {
     #[test]
     fn a_slot_is_released_when_its_guard_drops() {
         let l = limiter();
-        let slots: Vec<WsSlot> = (0..5).map(|_| l.try_acquire(ip(1)).expect("within the per-address limit")).collect();
-        assert_eq!(counts(l, ip(1)), (5, 5));
-        assert!(l.try_acquire(ip(1)).is_none(), "the sixth from one address is refused");
-        assert_eq!(counts(l, ip(1)), (5, 5), "a refusal counts nothing");
+        let max = l.max_per_ip;
+        let slots: Vec<WsSlot> = (0..max).map(|_| l.try_acquire(ip(1)).expect("within the per-address limit")).collect();
+        assert_eq!(counts(l, ip(1)), (max, max));
+        assert!(l.try_acquire(ip(1)).is_none(), "one past the limit from one address is refused");
+        assert_eq!(counts(l, ip(1)), (max, max), "a refusal counts nothing");
         let other = l.try_acquire(ip(2)).expect("another address is not limited by the first");
         drop(slots);
         assert_eq!(counts(l, ip(1)), (1, 0));
@@ -1642,15 +1648,27 @@ mod ws_slot_tests {
     // The total limit is checked and counted in one step, and a refusal leaves the count as it was.
     #[test]
     fn the_total_limit_is_atomic() {
-        let mut raw = WsRateLimiter::new();
-        raw.max_total = 3;
-        let l: &'static WsRateLimiter = Box::leak(Box::new(raw));
+        let l = limiter_with_total(3);
         let held: Vec<WsSlot> = (1..=3).map(|i| l.try_acquire(ip(i)).expect("under the total")).collect();
         assert!(l.try_acquire(ip(9)).is_none());
         assert!(l.try_acquire(None).is_none(), "an unknown address counts toward the total too");
         assert_eq!(l.get_stats().0, 3);
         drop(held);
         assert_eq!(l.get_stats().0, 0);
+    }
+
+    // Phones behind a carrier NAT share one public address: 64 of them each get a socket, and the node-wide limit
+    // still binds across addresses.
+    #[test]
+    fn one_address_admits_the_phones_of_a_carrier_nat() {
+        let l = limiter_with_total(100);
+        let nat: Vec<WsSlot> = (0..64).map(|_| l.try_acquire(ip(4)).expect("a phone behind the shared address")).collect();
+        assert_eq!(counts(l, ip(4)), (64, 64));
+        let other: Vec<WsSlot> = (0..64).filter_map(|_| l.try_acquire(ip(5))).collect();
+        assert_eq!(other.len(), 36, "the node-wide limit refuses past 100 whatever the address");
+        assert_eq!(l.get_stats(), (100, 2));
+        drop((nat, other));
+        assert_eq!(l.get_stats(), (0, 0));
     }
 
     // An upgrade that never completes drops the callback that owns the slot, and with it the slot.
@@ -1669,11 +1687,12 @@ mod ws_slot_tests {
     #[tokio::test]
     async fn the_send_loop_ends_when_the_client_is_gone() {
         let (tx, mut rx) = broadcast::channel::<WsEvent>(8);
+        let (_, mut accounts) = tokio::sync::mpsc::channel::<WsEvent>(1); // no account channel
         let mut reader = tokio::spawn(async {});
         let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sent_in = sent.clone();
         let done = tokio::time::timeout(std::time::Duration::from_secs(5),
-            forward_until_closed(&mut rx, &mut reader, |_| false, move |_| {
+            forward_until_closed(&mut rx, &mut accounts, &mut reader, |_| false, move |_| {
                 sent_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Ok(()) }
             })).await;
@@ -1686,14 +1705,15 @@ mod ws_slot_tests {
     #[tokio::test]
     async fn a_failed_send_or_a_closed_broadcaster_ends_the_loop() {
         let (tx, mut rx) = broadcast::channel::<WsEvent>(8);
+        let (_queue, mut accounts) = tokio::sync::mpsc::channel::<WsEvent>(1); // open and quiet
         let mut reader = tokio::spawn(std::future::pending::<()>());
         tx.send(WsEvent::NewBlock { height: 1, hash: "h".into(), timestamp: 0, tx_count: 0, producer: "p".into() }).ok();
         let done = tokio::time::timeout(std::time::Duration::from_secs(5),
-            forward_until_closed(&mut rx, &mut reader, |_| true, |_| async { Err("closed".to_string()) })).await;
+            forward_until_closed(&mut rx, &mut accounts, &mut reader, |_| true, |_| async { Err("closed".to_string()) })).await;
         assert!(done.is_ok(), "a failed send ends the loop");
         drop(tx);
         let done = tokio::time::timeout(std::time::Duration::from_secs(5),
-            forward_until_closed(&mut rx, &mut reader, |_| true, |_| async { Ok(()) })).await;
+            forward_until_closed(&mut rx, &mut accounts, &mut reader, |_| true, |_| async { Ok(()) })).await;
         assert!(done.is_ok(), "a closed broadcaster ends the loop");
         reader.abort();
     }

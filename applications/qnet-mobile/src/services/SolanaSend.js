@@ -17,6 +17,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Buffer } from 'buffer';
 import { getSolanaRpcUrl, rotateSolanaRpc, ONE_DEV_MINT } from '../config/nodes';
 import { parseStrictJson } from '../utils/strictJson';
+import { amountText } from '../utils/amountFormat';
+import { currentLanguage } from '../i18n';
 import {
   SOL_DECIMALS, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_ACCOUNT_SIZE,
   associatedTokenAddress, base58Encode, decodeKey, fromBaseUnits, isOnCurve, serializeTransaction, toBaseUnits,
@@ -38,7 +40,8 @@ const MAX_ANSWER_CHARS = 512 * 1024;
 const RPC_TIMEOUT_MS = 8000;
 
 const fail = (code, params) => Object.assign(new Error(code), { code, params });
-const sol = (lamports) => `${fromBaseUnits(BigInt(lamports), SOL_DECIMALS)} SOL`;
+/** Lamports as a screen shows them, in the figures of `lang` (the open screen's by default), with the symbol. */
+export const solText = (lamports, lang = currentLanguage()) => `${amountText(fromBaseUnits(BigInt(lamports), SOL_DECIMALS), lang)} SOL`;
 
 // ── RPC ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -220,7 +223,8 @@ export async function quoteSolanaSend({ from, to, symbol, amount, request = null
     const heldBase = source ? source.amount : 0n;
     if (!source || heldBase < amountBase) {
       throw fail('SOL_SHORT_TOKEN', {
-        need: `${base.amountText} ${token.symbol}`, balance: `${fromBaseUnits(heldBase, token.decimals)} ${token.symbol}`,
+        need: `${amountText(base.amountText, currentLanguage())} ${token.symbol}`,
+        balance: `${amountText(fromBaseUnits(heldBase, token.decimals), currentLanguage())} ${token.symbol}`,
       });
     }
     rent = destinationInfo ? 0n : accountRent;
@@ -242,16 +246,16 @@ export async function quoteSolanaSend({ from, to, symbol, amount, request = null
   const self = recipient === from;
   const left = checks.balance - spent + (plan.kind === 'sol' && self ? amountBase : 0n);
   if (checks.balance < spent) {
-    if (plan.kind === 'sol') throw fail('SOL_SHORT_SOL', { need: sol(spent), fee: sol(fee), balance: sol(checks.balance) });
-    if (rent > 0n) throw fail('SOL_SHORT_FEE_ACCOUNT', { need: sol(spent), account: sol(rent), balance: sol(checks.balance) });
-    throw fail('SOL_SHORT_FEE', { need: sol(spent), balance: sol(checks.balance) });
+    if (plan.kind === 'sol') throw fail('SOL_SHORT_SOL', { need: solText(spent), fee: solText(fee), balance: solText(checks.balance) });
+    if (rent > 0n) throw fail('SOL_SHORT_FEE_ACCOUNT', { need: solText(spent), account: solText(rent), balance: solText(checks.balance) });
+    throw fail('SOL_SHORT_FEE', { need: solText(spent), balance: solText(checks.balance) });
   }
   // An account keeps at least the rent-exempt minimum, or nothing at all.
   if (left > 0n && left < checks.minimum) {
-    throw fail(plan.kind === 'sol' ? 'SOL_REMAINDER' : 'SOL_REMAINDER_FEE', { left: sol(left), min: sol(checks.minimum) });
+    throw fail(plan.kind === 'sol' ? 'SOL_REMAINDER' : 'SOL_REMAINDER_FEE', { left: solText(left), min: solText(checks.minimum) });
   }
   if (plan.kind === 'sol' && !self && checks.recipientBalance === 0n && amountBase < checks.minimum) {
-    throw fail('SOL_NEW_ACCOUNT_MIN', { min: sol(checks.minimum) });
+    throw fail('SOL_NEW_ACCOUNT_MIN', { min: solText(checks.minimum) });
   }
 
   return {

@@ -266,12 +266,12 @@ describe('vault: pure parts', () => {
     }
   });
 
-  it('checks the Solana recipients, the recent transfers and the passed outcome (R3-EXT-UI-03, R3-EXTQ-01, R3-EXTQ-04)', () => {
+  it('checks the Solana recipients, the recent transfers kept in the state format and the passed and confirmed outcomes (R3-EXT-UI-03, R3-EXTQ-04)', () => {
     const entropy = Uint8Array.from({ length: 16 }, (_, i) => i);
     const recent = { to: OTHER_EON, amountNano: '5', createdAt: 1_700_000_000_000 };
     const good = {
       ...vault.emptyState(), solanaRecipients: [OTHER_SOLANA], recentTransfers: [recent],
-      pendingTransfers: [{ ...pendingTransfer(1), outcome: 'passed' }],
+      pendingTransfers: [{ ...pendingTransfer(1), outcome: 'passed' }, { ...pendingTransfer(2), outcome: 'confirmed' }],
     };
     assert.deepEqual(vault.decodePlaintext(vault.encodePlaintext(entropy, good)).state, good);
     for (const bad of [
@@ -280,15 +280,13 @@ describe('vault: pure parts', () => {
       { recentTransfers: [{ ...recent, extra: 1 }] },
       { recentTransfers: [{ ...recent, amountNano: '-1' }] },
       { recentTransfers: Array.from({ length: vault.RECENT_TRANSFERS_MAX + 1 }, () => recent) },
-      { pendingTransfers: [{ ...pendingTransfer(1), outcome: 'confirmed' }] },
+      { pendingTransfers: [{ ...pendingTransfer(1), outcome: 'applied' }] },
     ]) {
       assert.throws(() => vault.encodePlaintext(entropy, { ...good, ...bad }), { code: 'INTERNAL' }, JSON.stringify(bad).slice(0, 80));
     }
-    // the newest recent transfers, none older than RECENT_TRANSFER_MS
-    let state = vault.emptyState();
-    state = vault.withRecentTransfer(state, { to: OTHER_EON, amountNano: '1', createdAt: 1000 });
-    state = vault.withRecentTransfer(state, { to: OTHER_EON, amountNano: '2', createdAt: 1000 + vault.RECENT_TRANSFER_MS + 1 });
-    assert.deepEqual(state.recentTransfers.map((r) => r.amountNano), ['2'], 'the old one went');
+    // a key of the state format that nothing reads: an older vault's entries still decode, a new vault holds none
+    assert.deepEqual(vault.emptyState().recentTransfers, []);
+    assert.equal(typeof vault.withRecentTransfer, 'undefined', 'nothing writes it');
     assert.deepEqual(vault.withSolanaRecipient(vault.withSolanaRecipient(vault.emptyState(), OTHER_SOLANA), OTHER_SOLANA).solanaRecipients, [OTHER_SOLANA]);
   });
 

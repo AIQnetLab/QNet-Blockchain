@@ -57,13 +57,13 @@ describe('qnet_activateNode: the light node\'s record on the QNet network', () =
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
     const page = await openPage(w, await w.shown());
-    await until(() => page.app.button('Burn 1500 1DEV') !== null);
+    await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     assert.ok(!page.app.textContent.includes('Then the wallet records its light node on QNet Blockchain'));
     const [ack] = page.app.querySelectorAll('input');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     ack.checked = true;
     ack.fire('change');
-    page.app.button('Burn 1500 1DEV').click();
+    page.app.button('Burn 1,500 1DEV').click();
     await replyTo(port, 'a');
     await until(() => page.app.textContent.includes('Recording on QNet Blockchain'));
     w.state.registration = { ...w.state.registration, state: 'onchain', automatic: false };

@@ -197,30 +197,32 @@ export default function QncPage() {
         {data.holders.length === 0 ? (
           <div className="detail-row"><span className="detail-value">No holders yet.</span></div>
         ) : (
-          <table className="block-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Address</th>
-                <th>Balance</th>
-                <th>%</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.holders.map((h, idx) => (
-                <tr key={h.address || idx}>
-                  <td>{idx + 1}</td>
-                  <td><AddrLink addr={h.address} /></td>
-                  <td>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                      <TokenIcon native size={16} /><span>{h.balance} QNC</span>
-                    </span>
-                  </td>
-                  <td>{h.percent}%</td>
+          <div className="table-wrapper">
+            <table className="block-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Address</th>
+                  <th>Balance</th>
+                  <th>%</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {data.holders.map((h, idx) => (
+                  <tr key={h.address || idx}>
+                    <td>{idx + 1}</td>
+                    <td><AddrLink addr={h.address} /></td>
+                    <td>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <TokenIcon native size={16} /><span>{h.balance} QNC</span>
+                      </span>
+                    </td>
+                    <td>{h.percent}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
       </>
@@ -238,39 +240,41 @@ export default function QncPage() {
         {transfers.length === 0 ? (
           <div className="detail-row"><span className="detail-value">No transfers yet.</span></div>
         ) : (
-          <table className="block-table">
-            <thead>
-              <tr>
-                <th>Hash</th>
-                <th>From</th>
-                <th>To</th>
-                <th>Amount</th>
-                <th>Block</th>
-                <th>Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {transfers.map((t, idx) => (
-                <tr key={`${t.hash}-${idx}`}>
-                  <td>
-                    <Link href={`/explorer/tx/${t.hash}`} className="address-link">{truncate(t.hash)}</Link>
-                  </td>
-                  <td><AddrLink addr={t.from} /></td>
-                  <td><AddrLink addr={t.to} /></td>
-                  <td>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                      {t.amount.includes('QNC') && <TokenIcon native size={16} />}
-                      <span>{t.amount}</span>
-                    </span>
-                  </td>
-                  <td>
-                    <Link href={`/explorer/block/${t.block}`} className="address-link">{t.block}</Link>
-                  </td>
-                  <td>{formatTimeAgo(t.timestamp)}</td>
+          <div className="table-wrapper">
+            <table className="block-table">
+              <thead>
+                <tr>
+                  <th>Hash</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Amount</th>
+                  <th>Block</th>
+                  <th>Time</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {transfers.map((t, idx) => (
+                  <tr key={`${t.hash}-${idx}`}>
+                    <td>
+                      <Link href={`/explorer/tx/${t.hash}`} className="address-link">{truncate(t.hash)}</Link>
+                    </td>
+                    <td><AddrLink addr={t.from} /></td>
+                    <td><AddrLink addr={t.to} /></td>
+                    <td>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        {t.amount.includes('QNC') && <TokenIcon native size={16} />}
+                        <span>{t.amount}</span>
+                      </span>
+                    </td>
+                    <td>
+                      <Link href={`/explorer/block/${t.block}`} className="address-link">{t.block}</Link>
+                    </td>
+                    <td>{formatTimeAgo(t.timestamp)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>

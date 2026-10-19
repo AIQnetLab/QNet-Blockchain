@@ -14,14 +14,13 @@ import { ScanIcon } from '../components/QrScanSheet';
 import { InfoRow } from '../components/InfoRow';
 import { looksLikeKnownAddress } from '../browser/DappSheet';
 import { errorText } from '../i18n';
-import { decodeKey, fromBaseUnits, toBaseUnits, SOL_DECIMALS } from '../crypto/SolanaTx';
+import { decodeKey, fromBaseUnits, toBaseUnits } from '../crypto/SolanaTx';
 import {
   BASE_FEE_LAMPORTS, SOLANA_TOKENS, loadSolanaSends, maxSendable, quoteSolanaSend, recordSolanaSend, solanaSendStatus,
-  solanaToken, submitSolanaSend, updateSolanaSend,
+  solText, solanaToken, submitSolanaSend, updateSolanaSend,
 } from '../services/SolanaSend';
 import { amountInput } from '../utils/sendAmount';
-
-const solText = (lamports) => `${fromBaseUnits(BigInt(lamports), SOL_DECIMALS)} SOL`;
+import { amountText } from '../utils/amountFormat';
 
 /**
  * One send, from the form's values to its outcome: { outcome: 'cancelled' } (the review or the fresh check declined),
@@ -48,18 +47,19 @@ export async function runSolanaSend({
   // The warnings of the QNet review, from the recipients this wallet paid on Solana from this device.
   const lookAlike = looksLikeKnownAddress(recipient, known);
   const warnings = recipient === from || known.includes(recipient) ? {} : { firstTime: !lookAlike, lookAlike };
+  const amountShown = `${amountText(q.amountText, t.lang)} ${q.symbol}`;
   const reviewed = await reviewSend({
     to: recipient,
     network: t('solana_devnet'),
-    amount: `${q.amountText} ${q.symbol}`,
-    fee: solText(fee),
-    account: q.createDestination ? solText(rent) : null,
+    amount: amountShown,
+    fee: solText(fee, t.lang),
+    account: q.createDestination ? solText(rent, t.lang) : null,
     memo: q.memo,
-    total: q.mint ? [`${q.amountText} ${q.symbol}`, `+ ${solText(fee + rent)}`] : solText(BigInt(q.amountBase) + fee),
+    total: q.mint ? [amountShown, `+ ${solText(fee + rent, t.lang)}`] : solText(BigInt(q.amountBase) + fee, t.lang),
     warnings,
   });
   if (!reviewed) return { outcome: 'cancelled' };
-  if (!(await confirmFresh(t('send_confirm_reason', { amount: `${q.amountText} ${q.symbol}` }), null, recipient))) {
+  if (!(await confirmFresh(t('send_confirm_reason', { amount: amountShown }), null, recipient))) {
     return { outcome: 'cancelled' };
   }
   let sent;
@@ -142,16 +142,19 @@ export function useSolanaSends(owner, onSettled) {
 }
 
 // Digits and one decimal point, no more decimal places than the token has; a leading point gets its zero (".5" is 0.5).
-// Separators are read by the rule both Send forms share (utils/sendAmount amountInput); a text it refuses gives back
-// `kept`, what the field had.
-export function cleanAmountInput(text, decimals, kept = '') {
-  const s = amountInput(text, decimals);
+// Separators are read by the rule both Send forms share (utils/sendAmount amountInput: a figure pasted over `kept`, what
+// the field had, is read as `lang` writes figures); a text it refuses gives back `kept`.
+export function cleanAmountInput(text, decimals, kept = '', lang) {
+  const s = amountInput(text, decimals, { previous: kept, lang });
   return s === null ? kept : s;
 }
 
-/** The form. `balances`: the figures on the Assets list by symbol (null while unknown). */
+/**
+ * The form. `balances`: the figures on the Assets list by symbol (null while unknown), canonical; `mask` writes one as
+ * the screen shows it (WalletScreen: the language's figures, or the mask while balances are hidden).
+ */
 export default function SolanaSendForm({
-  t, rtl, owner, symbol, onSymbol, address, onAddress, amount, onAmount, request, balances, mask = (s) => s,
+  t, rtl, owner, symbol, onSymbol, address, onAddress, amount, onAmount, request, balances, mask = (s) => amountText(s, t.lang),
   backArrow, onBack, onScan, known, reviewSend, confirmFresh, sign, onResult, onSent,
 }) {
   const [busy, setBusy] = useState(false);
@@ -164,8 +167,8 @@ export default function SolanaSendForm({
   try { amountBase = amount ? toBaseUnits(amount, token.decimals) : null; } catch (_) { amountBase = null; }
   // A token's total in two currencies: a line for each (components/InfoRow).
   const total = amountBase === null ? null
-    : (token.mint ? [`${fromBaseUnits(amountBase, token.decimals)} ${token.symbol}`, `+ ${solText(BASE_FEE_LAMPORTS)}`]
-      : solText(amountBase + BASE_FEE_LAMPORTS));
+    : (token.mint ? [`${amountText(fromBaseUnits(amountBase, token.decimals), t.lang)} ${token.symbol}`, `+ ${solText(BASE_FEE_LAMPORTS, t.lang)}`]
+      : solText(amountBase + BASE_FEE_LAMPORTS, t.lang));
 
   const setMax = async () => {
     const max = await maxSendable(owner, token.symbol).catch(() => null);
@@ -275,7 +278,7 @@ export default function SolanaSendForm({
             placeholderTextColor="#888"
             keyboardType="decimal-pad"
             value={amount}
-            onChangeText={(text) => onAmount(cleanAmountInput(text, token.decimals, amount))}
+            onChangeText={(text) => onAmount(cleanAmountInput(text, token.decimals, amount, t.lang))}
             maxLength={32}
             testID="solana-send-amount"
           />
@@ -288,7 +291,7 @@ export default function SolanaSendForm({
 
         {/* The fee of a one-signature transfer (the review shows the exact one the network charges), and the total. */}
         <View style={styles.sendFigures}>
-          <InfoRow label={t('send_network_fee')} value={solText(BASE_FEE_LAMPORTS)} ltr fit />
+          <InfoRow label={t('send_network_fee')} value={solText(BASE_FEE_LAMPORTS, t.lang)} ltr fit />
           {total ? <InfoRow label={t('send_total')} value={total} ltr fit total /> : null}
         </View>
 

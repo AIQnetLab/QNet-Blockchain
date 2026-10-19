@@ -18,12 +18,13 @@ import { Image, Text, TouchableOpacity, View } from 'react-native';
 import Svg, { Circle, Path } from 'react-native-svg';
 import { InfoField, InfoRow } from '../components/InfoRow';
 import { tokenIconSource } from '../components/TokenIcons';
+import { amountText, formatNano } from '../utils/amountFormat';
 import { historyBadge, txNodeId, txTypeName } from '../utils/txHistory';
 import { contractShortId, destroysTokens, tokenLabel, usesReservedName } from '../utils/tokenSafety';
 import styles from './WalletScreen.styles';
 
-// unverified: only the explorer archive lists it (or no logs proof anchors a token transfer); included: received QNC in a
-// block as two genesis nodes list it, not in the certified balance yet (utils/txHistory historyBadge).
+// unverified: only the explorer archive lists it; included: received QNC in a block as two genesis nodes list it, not in
+// the wallet's live figure yet (utils/txHistory historyBadge).
 const BADGE_KEY = {
   pending: 'hist_status_pending', confirmed: 'hist_status_confirmed', failed: 'hist_status_failed', dropped: 'hist_status_dropped',
   moving: 'hist_status_moving', unverified: 'hist_status_unverified', included: 'hist_status_included',
@@ -51,40 +52,41 @@ export function systemSenderKey(tx, kind = txKind(tx)) {
 const TONE = { in: '#00ff88', self: '#00d4ff', out: '#ffffff', void: '#8a8fa3' };
 
 const trimZeros = (s) => s.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
-const group = (digits) => digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
 /**
- * An amount as a row shows it: below 100,000 grouped, with at most 8 decimals below 1 (a dust amount reads
- * "<0.00000001"), 4 from 1 and 2 from 1,000 (98,765.43); from 100,000 with a suffix and at most 2 decimals (123.46K,
- * 1.5M, 4200T); from 10^18 (a token of 128-bit supply) in powers of ten (3.4e32). Never longer than 11 characters
- * before its sign, so a short symbol after it stays whole at 320 dp; the detail screen shows the exact figure. The
- * extension's History writes its rows by the same rule (popup.js compactAmount).
+ * An amount as a row shows it, in the figures of `lang` (utils/amountFormat): below 100,000 grouped, with at most 8
+ * decimals below 1 (a dust amount reads "<0.00000001"), 4 from 1 and 2 from 1,000 (98,765.43); from 100,000 with a
+ * suffix and at most 2 decimals (123.46K, 1.5M, 4200T); from 10^18 (a token of 128-bit supply) in powers of ten
+ * (3.4e32). Never longer than 11 characters before its sign, so a short symbol after it stays whole at 320 dp; the
+ * detail screen shows the exact figure. The extension's History writes its rows by the same rule (popup.js
+ * compactAmount).
  */
-export function compactAmount(value) {
+export function compactAmount(value, lang) {
   const n = Math.abs(Number(value) || 0);
   if (n === 0) return '0';
-  if (n < 1e-8) return '<0.00000001';
+  if (n < 1e-8) return `<${amountText('0.00000001', lang)}`;
   if (n >= 1e18) {
     const [mantissa, exponent] = n.toExponential(2).split('e');
-    return `${trimZeros(mantissa)}e${Number(exponent)}`;
+    return `${amountText(trimZeros(mantissa), lang)}e${Number(exponent)}`;
   }
   if (n >= 1e5) {
     for (const [unit, suffix] of SUFFIXES) {
       if (n >= unit) {
         const scaled = n / unit;
-        return `${trimZeros(scaled.toFixed(scaled >= 1000 ? 0 : 2))}${suffix}`;
+        return `${scaled >= 1000 ? scaled.toFixed(0) : amountText(trimZeros(scaled.toFixed(2)), lang)}${suffix}`;
       }
     }
   }
-  const text = trimZeros(n.toFixed(n >= 1000 ? 2 : (n >= 1 ? 4 : 8)));
-  const [int, frac] = text.split('.');
-  return frac ? `${group(int)}.${frac}` : group(int);
+  return amountText(trimZeros(n.toFixed(n >= 1000 ? 2 : (n >= 1 ? 4 : 8))), lang);
 }
 
-/** A decimal string (a token amount with thousands separators, any precision) written as compactAmount writes it. */
-export function compactDecimalText(text) {
-  const n = Number(String(text == null ? '0' : text).replace(/,/g, ''));
-  return Number.isFinite(n) ? compactAmount(n) : String(text);
+// A token amount as the history keeps it (utils/txHistory tokenAmountDisplay: grouped with ',') as a canonical decimal.
+const keptDecimal = (text) => String(text == null ? '0' : text).replace(/,/g, '');
+
+/** A decimal string (a token amount as the history keeps it, any precision) written as compactAmount writes it. */
+export function compactDecimalText(text, lang) {
+  const n = Number(keptDecimal(text));
+  return Number.isFinite(n) ? compactAmount(n, lang) : String(text);
 }
 
 /** An NFT's token id on a row: whole when short, else its start and end. */
@@ -177,7 +179,7 @@ const KINDS = {
  * One value row's amount: its number for the row and exact figure for the detail screen (each with its sign), its
  * symbol, colour and token warning, and whether it is zero. One place, so the row and the detail screen never disagree.
  */
-function legOf(tx, settled) {
+function legOf(tx, settled, lang) {
   const isSelf = tx.type === 'self';
   const isSend = tx.type === 'send';
   const isSolana = tx.chain === 'solana';
@@ -199,19 +201,21 @@ function legOf(tx, settled) {
   let number;
   let exact;
   if (isSolana) {
-    number = compactDecimalText(tx.solAmount);
-    exact = String(tx.solAmount);
+    number = compactDecimalText(tx.solAmount, lang);
+    exact = amountText(String(tx.solAmount), lang);
   } else if (isNft) {
     number = `#${tokenIdShort(tx.tokenId)}`;
     exact = `#${tx.tokenId == null ? '?' : tx.tokenId}`;
   } else if (isToken) {
-    number = compactDecimalText(tx.tokenAmountDisplay || '0');
-    exact = tx.tokenAmountDisplay || '0';
+    number = compactDecimalText(tx.tokenAmountDisplay || '0', lang);
+    exact = amountText(keptDecimal(tx.tokenAmountDisplay || '0'), lang);
   } else {
-    number = compactAmount(tx.amount);
-    exact = (Number(tx.amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 9 });
+    number = compactAmount(tx.amount, lang);
+    // The exact figure from the row's nanoQNC text; through the float only for a row that carries none (a pending send).
+    const nano = typeof tx.amountNano === 'string' && /^\d+$/.test(tx.amountNano) ? tx.amountNano : null;
+    exact = amountText(nano ? formatNano(nano) : trimZeros((Number(tx.amount) || 0).toFixed(9)), lang);
   }
-  const zero = !isNft && Number(String(isSolana ? tx.solAmount : (isToken ? tx.tokenAmountDisplay : tx.amount) || 0).replace(/,/g, '')) === 0;
+  const zero = !isNft && Number(keptDecimal(isSolana ? tx.solAmount : (isToken ? tx.tokenAmountDisplay : tx.amount))) === 0;
   return {
     tone, reserved, zero, incoming: !isSend && !isSelf,
     symbol: reserved ? `⚠ ${symbol}` : symbol,
@@ -232,9 +236,9 @@ const iconOf = (tx) => {
 /**
  * What a row and its detail say about one history entry (a row of utils/txHistory historyEntries): its kind, title,
  * badge, status, the line of whom it was with (`sub`, a key and its params, or plain text), its amounts (`legs`: none,
- * one, or a swap's two, incoming first), the icon, the fee and the token warning.
+ * one, or a swap's two, incoming first), the icon, the fee and the token warning. Amounts in the figures of `lang`.
  */
-export function describeTx(tx) {
+export function describeTx(tx, lang) {
   const kind = txKind(tx);
   const spec = KINDS[kind];
   // A move of a node balance in transit (services/ClaimTransit withMoveStates) says so until the wallet holds it.
@@ -242,7 +246,7 @@ export function describeTx(tx) {
   const settled = status !== 'failed' && status !== 'dropped';
   const rows = Array.isArray(tx.legs) && tx.legs.length > 1 ? tx.legs : [tx];
   // A single transfer shows its amount even at 0; a node or contract action, and a leg among several, only when not 0.
-  const legs = tx.nodeEvent || tx.nodeRegistration ? [] : rows.map((r) => legOf(r, settled))
+  const legs = tx.nodeEvent || tx.nodeRegistration ? [] : rows.map((r) => legOf(r, settled, lang))
     .filter((l) => (spec.transfer && rows.length === 1) || !l.zero)
     .sort((a, b) => Number(b.incoming) - Number(a.incoming));
   let sub = null;
@@ -259,8 +263,8 @@ export function describeTx(tx) {
   else sub = tx.from ? { key: 'hist_from', params: { who: shortAddress(tx.from) } } : null;
   const height = Number.isSafeInteger(tx.block) ? tx.block : (Number.isSafeInteger(tx.height) ? tx.height : null);
   if (!sub && kind !== 'self' && height !== null) sub = { key: 'hist_block', params: { height } };
-  const fee = tx.chain === 'solana' ? (tx.solFee != null ? `${tx.solFee} SOL` : null)
-    : (tx.fee > 0 ? `${trimZeros((Number(tx.fee) || 0).toFixed(9))} QNC` : null);
+  const fee = tx.chain === 'solana' ? (tx.solFee != null ? `${amountText(String(tx.solFee), lang)} SOL` : null)
+    : (tx.fee > 0 ? `${amountText(trimZeros((Number(tx.fee) || 0).toFixed(9)), lang)} QNC` : null);
   const iconRow = kind === 'swap' && Array.isArray(tx.legs) ? (tx.legs.find((l) => l.type === 'receive') || tx) : tx;
   return {
     // Nothing moved (failed, or not found): the red mark, as the extension's row.
@@ -380,7 +384,7 @@ export function DayHeader({ item, t }) {
  * detail screen.
  */
 export const HistoryRow = React.memo(function HistoryRow({ tx, t, hideAmounts, onOpen }) {
-  const d = describeTx(tx);
+  const d = describeTx(tx, t.lang);
   const sub = subText(d.sub, t);
   const showStatus = d.status !== 'confirmed';
   return (
@@ -442,7 +446,7 @@ export const HistoryRow = React.memo(function HistoryRow({ tx, t, hideAmounts, o
  * `onExplorer(hash, chain)` opens the explorer of 'qnet' or 'solana'; `copied` names the field copied last.
  */
 export function TxDetail({ tx, t, hideAmounts = false, onBack, onCopy, onExplorer, copied = '', backArrow = '←' }) {
-  const d = describeTx(tx);
+  const d = describeTx(tx, t.lang);
   const badge = d.status;
   // Each field as every screen draws one (components/InfoRow): a figure, a time or a word beside its label; an id or an
   // address whole on one line under it, a hash shortened in its middle, each copied whole on a tap; a memo wrapping.

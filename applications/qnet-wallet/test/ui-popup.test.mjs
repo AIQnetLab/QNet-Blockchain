@@ -62,6 +62,8 @@ function handlers(overrides = {}) {
     'qnet.tokens': () => ({ tokens: [], complete: true }),
     // the Send tab's reads ahead of a review (plan 2.7)
     'qnet.sendWarm': () => ({ started: true }),
+    // where a sent QNet transfer stands (owner, 18.10): in a block at the first ask, so no page a test leaves keeps asking
+    'qnet.sentStatus': () => ({ status: 'in_block' }),
     // the session's view cache, empty until a test fills it, and the Solana History (decision 39)
     'wallet.cached': () => ({ qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null }),
     'solana.history': () => ({ items: [], cursor: null }),
@@ -566,7 +568,7 @@ describe('popup: send', () => {
     assert.equal(page.callsOf('qnet.send').length, 0);
   });
 
-  it('QNet: names unconfirmed sends and a second payment, offers to replace it, and shows what is left to spend (R2-EXTQ-03)', async () => {
+  it('QNet: names unconfirmed sends, offers to replace one, and shows what is left to spend (R2-EXTQ-03)', async () => {
     const outstanding = [{ nonce: '4', to: RECIPIENT, amountNano: '1500000000', feeNano: '31500', createdAt: 1, stale: false }];
     const previews = [];
     let sent = null;
@@ -581,7 +583,7 @@ describe('popup: send', () => {
           from: ADDRESSES.qnet, to: params.to, amountNano: '1500000000', feeNano: '31500', totalNano: '1500031500',
           nonce: replacing ?? '5', balanceNano: '10999968500', verified: true, verification: 'proof',
           outstanding, replacesNonce: replacing,
-          recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+          recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
         };
       },
       'qnet.send': (params) => {
@@ -595,7 +597,8 @@ describe('popup: send', () => {
     type(page.$('input[name="amount"]'), '1.5');
     await page.click('[data-action="review"]');
     assert.match(page.text(), /not confirmed yet: 1/);
-    assert.match(page.text(), /do not pay twice/);
+    // a payment of the same amount again is a send like any other (owner, 18.10)
+    assert.doesNotMatch(page.text(), /pay twice|30 minutes/);
     // the replace button names the transfer it cancels: amount, recipient and nonce (R3-EXTQ-03)
     assert.match(page.$('[data-action="replace-pending"]').textContent, /1\.5 QNC to 5fce39…27531f \(nonce 4\)/);
     await page.click('[data-action="replace-pending"]');
@@ -620,7 +623,7 @@ describe('popup: send', () => {
         return {
           from: ADDRESSES.qnet, to: params.to, amountNano: '1500000000', feeNano: '31500', totalNano: '1500031500',
           nonce: replacing ?? '5', balanceNano: '10999968500', verified: true, verification: 'proof', outstanding, replacesNonce: replacing,
-          duplicate: true, recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+          recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
         };
       },
       'qnet.send': () => fail('NONCE_CHANGED'),
@@ -637,22 +640,86 @@ describe('popup: send', () => {
     assert.equal(page.$('[data-action="confirm-send"]'), null);
   });
 
-  // R3-EXTQ-01: the vault's own records name a second payment. A history that could not be read is no longer described
-  // on the screen (owner, 28.09): the duplicate check itself is unchanged.
-  it('QNet: names a second payment from the wallet\'s own records, with no text on a history that could not be read (R3-EXTQ-01)', async () => {
+  it('QNet: the sent screen asks where its transaction stands and turns Confirmed once it is in a block (owner, 18.10)', async () => {
+    for (const [final, title, lead] of [['in_block', 'Confirmed', null], ['replaced', 'Sent', /took its nonce: this one can never go through/]]) {
+      mock.timers.enable({ apis: ['setTimeout'] });
+      const answers = ['pending', 'unknown', final];
+      await openWallet({
+        'qnet.preview': (params) => ({
+          from: ADDRESSES.qnet, to: params.to, amountNano: '1000000000', feeNano: '31500', totalNano: '1000031500', nonce: '4',
+          balanceNano: '12500000000', verified: false, verification: 'live', outstanding: [], replacesNonce: null,
+          recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
+        }),
+        'qnet.send': () => ({ txHash: 'ab'.repeat(32), status: 'submitted', nonce: '4' }),
+        'qnet.sentStatus': (params) => {
+          assert.deepEqual(params, { nonce: '4' });
+          return { status: answers.shift() };
+        },
+      });
+      await page.click('[data-tab="send"]');
+      type(page.$('input[name="to"]'), RECIPIENT);
+      type(page.$('input[name="amount"]'), '1');
+      await page.click('[data-action="review"]');
+      await page.click('[data-action="confirm-send"]');
+      assert.equal(page.$('.tab-body h2').textContent, 'Sent');
+      assert.match(page.text(), /Waiting for QNet Blockchain to put it in a block…/);
+      assert.ok(page.$('.tab-body .spinner'));
+      for (let i = 0; i < 2; i += 1) {
+        mock.timers.tick(2000);
+        await page.settle();
+        assert.equal(page.$('.tab-body h2').textContent, 'Sent', final);
+      }
+      mock.timers.tick(2000);
+      await page.settle();
+      assert.equal(page.callsOf('qnet.sentStatus').length, 3);
+      assert.equal(page.$('.tab-body h2').textContent, title, final);
+      assert.equal(page.$('.tab-body .spinner'), null);
+      if (lead) assert.match(page.text(), lead);
+      mock.timers.tick(10000);
+      await page.settle();
+      assert.equal(page.callsOf('qnet.sentStatus').length, 3, 'nothing asked once it is decided');
+      mock.timers.reset();
+    }
+  });
+
+  it('QNet: the sent screen asks every 2 s at first, then every 5 s, then every 10 s, five minutes in all', async () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
     await openWallet({
       'qnet.preview': (params) => ({
-        from: ADDRESSES.qnet, to: params.to, amountNano: '1500000000', feeNano: '31500', totalNano: '1500031500', nonce: '5',
-        balanceNano: '10999968500', verified: true, verification: 'proof', outstanding: [], replacesNonce: null, duplicate: true,
-        recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false, recentSame: false },
+        from: ADDRESSES.qnet, to: params.to, amountNano: '1000000000', feeNano: '31500', totalNano: '1000031500', nonce: '4',
+        balanceNano: '12500000000', verified: false, verification: 'live', outstanding: [], replacesNonce: null,
+        recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
       }),
+      'qnet.send': () => ({ txHash: 'ab'.repeat(32), status: 'submitted', nonce: '4' }),
+      'qnet.sentStatus': () => ({ status: 'pending' }),
     });
     await page.click('[data-tab="send"]');
     type(page.$('input[name="to"]'), RECIPIENT);
-    type(page.$('input[name="amount"]'), '1.5');
+    type(page.$('input[name="amount"]'), '1');
     await page.click('[data-action="review"]');
-    assert.match(page.text(), /do not pay twice/);
-    assert.doesNotMatch(page.text(), /history could not be read/);
+    await page.click('[data-action="confirm-send"]');
+    const asks = () => page.callsOf('qnet.sentStatus').length;
+    const wait = async (ms) => {
+      mock.timers.tick(ms);
+      await page.settle();
+    };
+    for (let i = 1; i <= 5; i += 1) {
+      await wait(2000);
+      assert.equal(asks(), i);
+    }
+    await wait(2000);
+    assert.equal(asks(), 5, 'then every 5 s');
+    await wait(3000);
+    assert.equal(asks(), 6);
+    for (let i = 0; i < 9; i += 1) await wait(5000);
+    assert.equal(asks(), 15);
+    await wait(5000);
+    assert.equal(asks(), 15, 'then every 10 s');
+    await wait(5000);
+    assert.equal(asks(), 16);
+    for (let i = 0; i < 30; i += 1) await wait(10000);
+    assert.equal(asks(), 39, 'five minutes in all');
+    mock.timers.reset();
   });
 
   it('QNet: a changed fee sends the user back to a fresh review', async () => {
@@ -710,10 +777,10 @@ describe('popup: the QNet send reads ahead (plan 2.7)', () => {
   const previewOf = ({ to }) => ({
     from: ADDRESSES.qnet, to, amountNano: '1000000000', feeNano: '31500', totalNano: '1000031500', nonce: '4', balanceNano: '12500000000',
     verified: true, verification: 'proof', outstanding: [], replacesNonce: null,
-    recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+    recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
   });
 
-  it('opening the tab starts the wallet\'s own certified read, and a whole typed address its recipient checks, once', async () => {
+  it('opening the tab starts the certified head read, and a whole typed address its recipient checks, once', async () => {
     await openWallet({ 'qnet.preview': previewOf });
     await page.click('[data-tab="send"]');
     assert.deepEqual(page.callsOf('qnet.sendWarm').map((c) => c.params), [{}]);
@@ -874,7 +941,7 @@ describe('popup: Solana send', () => {
       },
     });
     await page.click('[data-value="1dev"]');
-    assert.match(page.text(), /Available: 5000 1DEV/);
+    assert.match(page.text(), /Available: 5,000 1DEV/);
     type(page.$('input[name="to"]'), SOLANA_RECIPIENT);
     type(page.$('input[name="amount"]'), '2.5');
     await page.click('[data-action="review"]');
@@ -1015,7 +1082,7 @@ describe('popup: Solana send', () => {
     assert.equal(page.$('input[name="amount"]').value, '1.999995');
     type(page.$('input[name="to"]'), SOLANA_RECIPIENT);
     await page.click('[data-value="1dev"]');
-    assert.match(page.text(), /Available: 5000 1DEV/);
+    assert.match(page.text(), /Available: 5,000 1DEV/);
     assert.match(page.text(), /Amount \(1DEV\)/);
     await page.click('[data-action="max"]');
     assert.equal(page.$('input[name="amount"]').value, '5000');
@@ -1283,7 +1350,7 @@ describe('popup: receive and history', () => {
         return {
           from: ADDRESSES.qnet, to: params.to, amountNano: '1500000000', feeNano: '31500', totalNano: '1500031500',
           nonce: replacing ?? '5', balanceNano: '10999968500', verified: true, verification: 'proof', outstanding, replacesNonce: replacing,
-          recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+          recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
         };
       },
     });
@@ -1371,15 +1438,15 @@ describe('popup: activate', () => {
       'activation.copy': () => ({ code: CODE }),
     });
     await page.click('[data-tab="activate"]');
-    assert.match(page.text(), /1500 1DEV/);
-    assert.match(page.text(), /3000 1DEV/);
+    assert.match(page.text(), /1,500 1DEV/);
+    assert.match(page.text(), /3,000 1DEV/);
     // no proof serves the price: it is labelled as what the nodes report
     assert.match(page.text(), /Price as reported by the nodes of QNet Blockchain./);
     await page.click('[data-action="choose-light"]');
     const text = page.text();
     assert.match(text, /Price as reported by the nodes of QNet Blockchain./);
     // the burn is irreversible: one confirmation line, the acknowledgement, and no warning list (owner, 28.09)
-    assert.match(text, /I understand that 1500 1DEV will be destroyed and that this wallet gets exactly one code\./);
+    assert.match(text, /I understand that 1,500 1DEV will be destroyed and that this wallet gets exactly one code\./);
     assert.equal(page.$$('.tab-body .notice').length, 0);
     assert.doesNotMatch(text, /Read before you burn|Nobody receives them|cannot be undone or refunded/);
     assert.ok(text.includes(SOLANA.ONE_DEV_MINT));
@@ -1399,7 +1466,7 @@ describe('popup: activate', () => {
     assert.equal(page.callsOf('activation.burn').length, 1, 'a second click never reaches the worker');
     assert.deepEqual(burnParams, { nodeType: 'light', expectedPrice: 1500 });
     // while it burns: the title, a progress bar and the time, no list of what the wallet does inside (owner, 28.09)
-    assert.match(page.text(), /Burning 1500 1DEV/);
+    assert.match(page.text(), /Burning 1,500 1DEV/);
     assert.ok(page.$('.progress'));
     assert.equal(page.$('.steps'), null);
     assert.doesNotMatch(page.text(), /simulating|Deriving|no earlier burn|Checking the price/);
@@ -1650,7 +1717,7 @@ describe('popup: activate', () => {
     assertOnlyTheLine();
     assertManageLine();
     assert.match(page.text(), /Another device with this recovery phrase burned first/);
-    assert.match(page.text(), /The burn of 1500 1DEV this device sent also went through/);
+    assert.match(page.text(), /The burn of 1,500 1DEV this device sent also went through/);
     await page.click('[data-action="superseded-burn"]');
     assert.ok(page.tabsCreated.at(-1).url.includes(own));
     assert.equal(page.callsOf('activation.registration').length, 0);
@@ -1658,7 +1725,7 @@ describe('popup: activate', () => {
     await page.settle();
     assert.equal(page.callsOf('activation.registration').length, 1, 'read at once');
     assert.deepEqual(shownLines(), ['Activate a node',
-      'Another device with this recovery phrase burned first: that burn is this wallet’s activation. The burn of 1500 1DEV this device sent also went through; it gives no second activation code.',
+      'Another device with this recovery phrase burned first: that burn is this wallet’s activation. The burn of 1,500 1DEV this device sent also went through; it gives no second activation code.',
       'Open in Solana Explorer', ...recordLines('Recording on QNet Blockchain… This usually takes a minute or two.'), MANAGE]);
     assert.ok(!page.text().includes(CODE), 'the code the burn answered is not drawn here');
     assert.match(shownText(), /Recording on QNet Blockchain/);
@@ -1691,7 +1758,7 @@ describe('popup: activate', () => {
     await page.click('[data-tab="activate"]');
     assert.equal(page.$('[data-action="choose-light"]').disabled, false);
     assert.equal(page.$('[data-action="choose-super"]').disabled, true);
-    assert.match(page.text(), /Not enough 1DEV: this needs 6000 1DEV\./);
+    assert.match(page.text(), /Not enough 1DEV: this needs 6,000 1DEV\./);
   });
 
   it('a burn refused because the wallet already burned points to Recover, and Recover reports what it found', async () => {
@@ -1879,7 +1946,7 @@ describe('popup: activate', () => {
     page.emit('activation');
     await page.settle();
     assert.equal(page.callsOf('activation.price').length, prices + 1);
-    assert.doesNotMatch(page.text(), /3000 1DEV/, 'no burn details');
+    assert.doesNotMatch(page.text(), /3,?000 1DEV/, 'no burn details');
     assert.notEqual(page.$('.tab-body a'), line);
     assert.deepEqual(activateParts(), ['heading', 'record:hidden', 'manage']);
   });
@@ -2081,7 +2148,7 @@ describe('popup: settings', () => {
     await page.click('[data-action="revoke"]');
     assert.deepEqual(page.callsOf('sites.revoke').map((entry) => entry.params), [{ origin: 'https://aiqnet.io' }]);
     assert.equal(page.$$('[data-action="revoke"]').length, 1);
-    assert.match(page.text(), /Version3\.1\.4/);
+    assert.match(page.text(), /Version3\.1\.5/);
   });
 
   it('checks a new password locally, then changes it with the current one', async () => {
@@ -2123,7 +2190,7 @@ describe('popup: round 5 notices', () => {
       'qnet.preview': (params) => ({
         from: ADDRESSES.qnet, to: params.to, amountNano: '1500000000', feeNano: '31500', totalNano: '1500031500',
         nonce: '4', balanceNano: '10999968500', verified: true, verification: 'proof', outstanding, replacesNonce: '4',
-        recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+        recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
       }),
       'qnet.send': (params) => {
         sent = params;
@@ -2154,7 +2221,7 @@ describe('popup: round 5 notices', () => {
     assert.deepEqual(shownActions(), ['record', 'superseded-burn']);
     assertOnlyTheLine();
     assert.match(page.text(), /Another device with this recovery phrase burned first/);
-    assert.match(page.text(), /The burn of 1500 1DEV this device sent also went through/);
+    assert.match(page.text(), /The burn of 1,500 1DEV this device sent also went through/);
     await page.click('[data-action="superseded-burn"]');
     assert.ok(page.tabsCreated.at(-1).url.includes(own));
   });
@@ -2392,7 +2459,7 @@ describe('popup: activate, one code per wallet (decision 35)', () => {
     await page.click('[data-tab="activate"]');
     assert.match(page.text(), /Checking this wallet: QNet Blockchain, Solana and aiqnet\.io…/);
     for (const action of ['choose-light', 'choose-super', 'recover', 'check-again']) assert.equal(page.$(`[data-action="${action}"]`), null, action);
-    assert.doesNotMatch(page.text(), /1500 1DEV|3000 1DEV/);
+    assert.doesNotMatch(page.text(), /1,?500 1DEV|3,?000 1DEV/);
     assert.doesNotMatch(page.text(), /Burn 1DEV on Solana to get/, 'no invitation to burn while the wallet is checked');
     current = view('none');
     mock.timers.tick(TIMINGS.ACTIVATE_RECHECK_MS);
@@ -2510,7 +2577,7 @@ describe('popup: activate, one code per wallet (decision 35)', () => {
     await page.click('[data-tab="activate"]');
     assert.deepEqual(activateParts(), ['heading', 'manage', 'kept-burn']);
     assert.deepEqual(shownLines(), ['Activate a node', MANAGE,
-      'aiqnet.io keeps another burn of this wallet as its activation: its code is the one in Settings. The burn of 1200 1DEV this extension keeps gives no second activation code.',
+      'aiqnet.io keeps another burn of this wallet as its activation: its code is the one in Settings. The burn of 1,200 1DEV this extension keeps gives no second activation code.',
       'Open in Solana Explorer']);
     assert.deepEqual(shownActions(), ['kept-burn']);
     assertOnlyTheLine();
@@ -2607,7 +2674,7 @@ describe('popup: the two histories (owner, 04.10)', () => {
     assert.ok(row.querySelector('.amount').parentNode === row, 'the amount is a column of the row, after what happened');
     assert.equal(page.$('.history-row .history-icon').getAttribute('src'), '../icons/qnc-token.png');
     await page.click('[data-action="open-detail"]');
-    assert.equal(page.$('.history-detail .detail-amount').textContent, '+18446744073.709551615 QNC');
+    assert.equal(page.$('.history-detail .detail-amount').textContent, '+18,446,744,073.709551615 QNC');
     await page.click('.history-detail [data-action="explorer"]');
     assert.deepEqual(page.tabsCreated.at(-1), { url: 'https://aiqnet.io/explorer/tx/h1' });
   });
@@ -2842,6 +2909,44 @@ describe('popup: balances at once (owner, 06.10)', () => {
     assert.equal(page.$('.asset-status').textContent, 'This balance is not confirmed yet.');
   });
 
+  it('a balance read at a pinned node\'s live tip is drawn with no line under it (owner, 18.10)', async () => {
+    await openWallet({
+      'qnet.balance': () => ({ balanceNano: '5000000000', spendableNano: '5000000000', nonce: '1', verified: false, verification: 'live', blockHeight: 4043134 }),
+    });
+    assert.match(page.$('.token-amount').textContent, /^5 QNC$/);
+    assert.equal(page.$('.asset-status').textContent, '');
+  });
+
+  it('every figure takes the UI language\'s group and decimal marks; a figure pasted in its format is read as written', async () => {
+    await openWallet({
+      'settings.get': () => ({ autoLockMinutes: 15, language: 'de' }),
+      'qnet.balance': () => ({ balanceNano: '12345678500000000', spendableNano: '12345678500000000', nonce: '1', verified: false, verification: 'live', blockHeight: 1 }),
+    });
+    // the German table is a module the page imports: the wallet comes once it is loaded
+    for (let turn = 0; turn < 400 && page.$('.token-amount') === null; turn += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    await page.settle();
+    assert.equal(page.$('.token-amount').textContent, '12.345.678,5 QNC');
+    await page.click('[data-tab="send"]');
+    assert.match(page.text(), /12\.345\.678,5 QNC/);
+    const amount = page.$('input[name="amount"]');
+    type(amount, '1.000');
+    assert.equal(amount.value, '1000', 'a paste of 1.000 in German is a thousand');
+    type(amount, '');
+    type(amount, '1');
+    type(amount, '1,');
+    type(amount, '1,5');
+    assert.equal(amount.value, '1.5', 'a typed comma is the decimal mark');
+  });
+
+  it('the send form says nothing is available while no live figure was read', async () => {
+    await openWallet({
+      'qnet.balance': () => ({ balanceNano: '5000000000', spendableNano: null, nonce: '1', verified: false, verification: 'none', blockHeight: null }),
+    });
+    await page.click('[data-tab="send"]');
+    await page.settle();
+    assert.equal(page.$('.tab-body .hint').textContent, '');
+  });
+
   it('lists the built-in QNet tokens the wallet holds after QNC, by symbol and name, with their balances', async () => {
     await openWallet({ 'qnet.tokens': () => ({ tokens: [goldToken(), { ...goldToken(null), contract: RECIPIENT, symbol: '', name: 'Unread' }], complete: false }) });
     await page.settle();
@@ -2856,8 +2961,8 @@ describe('popup: any QNet token can be sent (owner, 06.10)', () => {
   const tokenPreview = (extra = {}) => ({
     kind: 'tokenTransfer', from: ADDRESSES.qnet, contract: GOLD, method: 'transfer', gasLimit: '45093', feeNano: '450930', depositNano: '0',
     totalNano: '450930', nonce: '4', balanceNano: '12500000000', verified: true, verification: 'proof', outstanding: [], replacesNonce: null,
-    inFlight: false, to: RECIPIENT, amountBase: '2500000', tokenBalance: '7250000', duplicate: false, token: GOLD, name: 'Gold Coin', symbol: 'GOLD',
-    decimals: 6, amount: '2.5', reserved: false, burn: false, recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+    inFlight: false, to: RECIPIENT, amountBase: '2500000', tokenBalance: '7250000', token: GOLD, name: 'Gold Coin', symbol: 'GOLD',
+    decimals: 6, amount: '2.5', reserved: false, burn: false, recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
     ...extra,
   });
 
@@ -2921,14 +3026,22 @@ describe('popup: any QNet token can be sent (owner, 06.10)', () => {
     assert.equal(page.$('input[name="amount"]').value, '2.5');
   });
 
-  it('an amount with more decimals than the token has is refused before any request', async () => {
+  it('the amount field keeps the token\'s decimals; one left from QNC with more is refused before any request', async () => {
     await openWallet({ 'qnet.tokens': () => ({ tokens: [{ ...goldToken(), decimals: 2 }], complete: true }) });
     await page.click('[data-tab="send"]');
     const picker = page.$('select[name="asset"]');
+    const amount = page.$('input[name="amount"]');
     picker.value = GOLD;
     fire(picker, 'change');
     type(page.$('input[name="to"]'), RECIPIENT);
-    type(page.$('input[name="amount"]'), '1.234');
+    type(amount, '1.234');
+    assert.equal(amount.value, '1.23', 'no more decimals than the token has, as the app');
+    picker.value = 'QNC';
+    fire(picker, 'change');
+    type(amount, '1.234');
+    assert.equal(amount.value, '1.234');
+    picker.value = GOLD;
+    fire(picker, 'change');
     await page.click('[data-action="review"]');
     assert.match(page.text(), /at most 2 decimals/);
     assert.equal(page.callsOf('qnet.tokenPreview').length, 0);
@@ -3057,7 +3170,7 @@ describe('popup: tokens named after QNC, and a list that leaves tokens out (M-5,
     assert.deepEqual(page.$$('.token-row .token-contract').map((node) => node.textContent),
       [GOLD, FAKE, BIDI, RECIPIENT].map((contract) => core.contractShortId(contract)));
     assert.deepEqual(page.$$('.token-row .token-amount').map((node) => node.textContent),
-      ['12.5 QNC', '7.25 GOLD', '1000 \u26a0 QNC', '5 \u26a0 \ufffdCNQ', '7.25 \u26a0 QN\u0421']);
+      ['12.5 QNC', '7.25 GOLD', '1,000 \u26a0 QNC', '5 \u26a0 \ufffdCNQ', '7.25 \u26a0 QN\u0421']);
     // the real QNC row: no mark, no contract line
     assert.equal(page.$$('.token-row')[0].querySelector('.token-contract'), null);
     assert.equal(page.$('.tab-body .tokens-omitted').classList.contains('hidden'), true, 'every token listed: no note');

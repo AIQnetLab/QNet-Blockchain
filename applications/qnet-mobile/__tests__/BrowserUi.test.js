@@ -9,7 +9,8 @@ import { Text, TouchableOpacity, BackHandler } from 'react-native';
 const BottomBar = require('../src/components/BottomBar').default;
 const { BOTTOM_TABS } = require('../src/components/BottomBar');
 const DappSheet = require('../src/browser/DappSheet').default;
-const { formatNano, looksLikeKnownAddress, ARM_MS } = require('../src/browser/DappSheet');
+const { looksLikeKnownAddress, ARM_MS } = require('../src/browser/DappSheet');
+const { formatNano } = require('../src/utils/amountFormat');
 
 const t = require('../src/i18n').makeT('en'); // the app's translator: English, placeholders filled
 const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string' || typeof c === 'number').join('')).join('\n');
@@ -142,9 +143,9 @@ describe('the confirmation sheet', () => {
     const TO = '02dca74ef2eae3be97feon499504db891ae0c60e364a8';
     const { SEND_ARM_MS } = require('../src/browser/DappSheet');
     const preview = {
-      nonce: null, confirmed: 6, balanceNano: '9000000000', verified: true, counterparties: [TO],
+      nonce: null, confirmed: 6, balanceNano: '9000000000', counterparties: [TO],
       pending: [{ nonce: 7, state: 'accepted', kind: 'transfer', to: TO, amountNano: 1500000000, method: null, ageMs: 120000 }],
-      replaceNonce: 7, replaceHash: 'h7', appendNonce: null, inFlight: false, recent: [],
+      replaceNonce: 7, replaceHash: 'h7', appendNonce: null, inFlight: false,
     };
     const view = {
       ...connect, kind: 'send', details: { to: TO, amountNano: '1500000000', feeNano: '150000', totalNano: '1500150000' }, preview,
@@ -153,7 +154,7 @@ describe('the confirmation sheet', () => {
     const shown = texts(tree);
     expect(shown).toContain('Transactions from this wallet not confirmed yet: 1');
     expect(shown).toContain('1.5 QNC to 02dca74ef2eae3be97feon499504db891ae0c60e364a8 · 2 min');
-    expect(shown).toContain('This wallet sent the same amount to this address 2 min ago.');
+    expect(shown).not.toMatch(/same amount|min ago/); // no line about an earlier payment
     await wait(SEND_ARM_MS + 100);
     expect(button(tree, 'Send').props.disabled).toBe(true); // no choice yet
     const pick = (v) => tree.root.findAll((n) => n.props && n.props.testID === `pick-${v}` && typeof n.props.onPress === 'function')[0];
@@ -199,7 +200,7 @@ describe('the confirmation sheet', () => {
     expect(button(first.tree, 'Send').props.disabled).toBe(true); // no nonce yet
 
     const lookAlike = `${TO.slice(0, 4)}${'f'.repeat(37)}${TO.slice(-4)}`;
-    const ready = await mount({ ...send, preview: { nonce: 7, balanceNano: '1000000000', verified: true, counterparties: [lookAlike] } });
+    const ready = await mount({ ...send, preview: { nonce: 7, balanceNano: '1000000000', counterparties: [lookAlike] } });
     const shown = texts(ready.tree);
     expect(texts(ready.tree)).not.toMatch(/Transaction number|verified/i);
     for (const s of [TO, '1.5 QNC', '0.00015 QNC', '1.50015 QNC', 'Balance', '1 QNC',
@@ -207,7 +208,7 @@ describe('the confirmation sheet', () => {
       'The balance is lower than the total.']) {
       expect(shown).toContain(s);
     }
-    const fresh = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', verified: false, counterparties: [] } });
+    const fresh = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', counterparties: [] } });
     expect(texts(fresh.tree)).toContain('This wallet has never sent to this address.');
     expect(texts(fresh.tree)).toContain(t('dapp_send_balance'));
     expect(texts(fresh.tree)).not.toMatch(/verified/i);
@@ -218,14 +219,14 @@ describe('the confirmation sheet', () => {
   it('a dust sender is not known: first-time and "only ever sent to you" warnings, and the look-alike still fires', async () => {
     const TO = '02dca74ef2eae3be97feon499504db891ae0c60e364a8';
     const send = { ...connect, kind: 'send', details: { to: TO, amountNano: '1500000000', feeNano: '150000', totalNano: '1500150000' } };
-    const dust = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', verified: true, counterparties: [], paid: [], senders: [TO] } });
+    const dust = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', counterparties: [], paid: [], senders: [TO] } });
     const shown = texts(dust.tree);
     expect(shown).toContain('This wallet has never sent to this address.');
     expect(shown).toContain('This address has only ever sent to this wallet');
     const payee = `${TO.slice(0, 4)}${'e'.repeat(37)}${TO.slice(-4)}`;
-    const flooded = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', verified: true, counterparties: [payee], paid: [], senders: [TO] } });
+    const flooded = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', counterparties: [payee], paid: [], senders: [TO] } });
     expect(texts(flooded.tree)).toContain('This address looks like one you used before but is different. Check every character.');
-    const known = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', verified: true, counterparties: [TO], paid: [], senders: [TO] } });
+    const known = await mount({ ...send, preview: { nonce: 7, balanceNano: '9000000000', counterparties: [TO], paid: [], senders: [TO] } });
     expect(texts(known.tree)).not.toContain('This wallet has never sent to this address.');
     expect(texts(known.tree)).not.toContain('This address has only ever sent to this wallet');
   });

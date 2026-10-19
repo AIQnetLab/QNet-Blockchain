@@ -463,6 +463,6 @@ describe('MOBLINK-R5-02: a decided request outlives a lock', () => {
     expect(lock).not.toMatch(/setLinkRequest\(/);
     expect(s).toMatch(/settled=\{!!linkRequest\.settled\}/);
     expect(s).toMatch(/settledOutcome=\{linkRequest\.outcome \|\| null\}/);
-    expect(s).toMatch(/onOutcome=\{\(outcome\) => setLinkRequest\(\(r\) => \(r && r\.key === key \? \{ \.\.\.r, settled: true, outcome \} : r\)\)\}/);
+    expect(s).toMatch(/onOutcome=\{\(outcome\) => \{\s*setLinkRequest\(\(r\) => \(r && r\.key === key \? \{ \.\.\.r, settled: true, outcome \} : r\)\);/);
   });
 });

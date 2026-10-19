@@ -66,6 +66,20 @@ jest.mock('../src/i18n/translations', () => {
   return { __esModule: true, default: tables };
 });
 
+// The screens' figures are written as the suite's language writes them (utils/amountFormat), the screen itself running
+// in 'en': each suite width-checks its own group and decimal marks, the longest table French ones (a narrow no-break
+// space, a decimal comma).
+jest.mock('../src/utils/amountFormat', () => {
+  const real = jest.requireActual('../src/utils/amountFormat');
+  const of = (lang) => (lang && lang !== 'en' ? lang : (mockTables.active === 'longest' ? 'fr' : mockTables.active));
+  return {
+    ...real,
+    amountSymbols: (lang) => real.amountSymbols(of(lang)),
+    amountText: (value, lang) => real.amountText(value, of(lang)),
+    qncText: (nano, lang, hidden) => real.qncText(nano, of(lang), hidden),
+  };
+});
+
 // ── The wallet's services, standing still ──────────────────────────────────────────────────────────────────────────
 const mockQNET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const mockSOL = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
@@ -85,6 +99,7 @@ const mockReset = () => Object.assign(mockState, {
   local: { nodeId: 'light_9f3a2c1d0e7b', seq: 1790000000, pushType: 'fcm' },
   pending: null,
   devAuth: false,
+  devLock: false, // the wallet opens with the device's screen lock (WalletManager.deviceAuthState 'yes')
   device: { capable: true, platform: 'ios', flags: 'mac=0,vision=0,idiom=phone', report: null }, // NodeDeviceKey.checkDevice
   // The chain's registrations of the wallet's nodes (PushService.getWalletNodeEvents) and aiqnet.io's record of it.
   events: { success: true, nodes: [{ nodeId: 'super_9f3a2c1d0e7b', nodeType: 'super', height: 0 }] },
@@ -148,6 +163,9 @@ jest.mock('../src/components/WalletManager', () => {
     walkSteps() { return mockState.walk; }
     async loadNodeRecord() { return mockState.node; }
     async deviceAuthAvailable() { return mockState.devAuth; }
+    async deviceAuthState() { return mockState.devLock ? 'yes' : 'no'; }
+    // The screen lock that kept the wallet's secret was removed: only the recovery phrase opens it now.
+    async unlockWithBiometrics() { return { ok: false, gone: true }; }
     async switchToDeviceAuth() { return { ok: false, cancelled: true }; } // the system prompt refused
     generateQNetAddressFromSolana() { return mockQNET; }
     generateLightNodePseudonym() { return 'light_9f3a2c1d0e7b'; }
@@ -510,6 +528,9 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const WalletScreen = require('../src/screens/WalletScreen').default;
 const walletStyles = require('../src/screens/WalletScreen.styles').default;
 const Svg = require('react-native-svg').default;
+// A figure with its symbol as the suite's language writes it (the mock above).
+const { amountText } = require('../src/utils/amountFormat');
+const figure = (value, symbol) => `${amountText(value, 'en')} ${symbol}`;
 
 // The Send form's scan: one button inside the recipient field's own container, beside the address input, named by the
 // scan's title for screen readers and drawn as an icon, with no text. Returns the button.
@@ -524,6 +545,18 @@ function expectScanInField(tree, placeholder, title) {
   expect(field.findAll((n) => n === scan[0])).toHaveLength(1);
   expect(field.findAll((n) => n.type === TextInput && plain(n.props.placeholder || '') === placeholder)).toHaveLength(1);
   return scan[0];
+}
+
+// The lock screen's message for `key`: whole width and centred under the title, and nothing in the lock column pulled up
+// over what is above it (a negative top margin), in a column that scrolls when the text is very large.
+function expectLockMessage(tree, key) {
+  const message = tree.root.find((n) => n.props.testID === 'unlock-message' && n.type === Text);
+  expect(plain([].concat(message.props.children).join(''))).toBe(label(key));
+  expect(StyleSheet.flatten(message.props.style)).toMatchObject({ alignSelf: 'stretch', textAlign: 'center', marginTop: 8 });
+  const column = tree.root.find((n) => n.props.testID === 'lock-column' && n.props.contentContainerStyle);
+  expect(StyleSheet.flatten(column.props.contentContainerStyle)).toMatchObject({ flexGrow: 1, justifyContent: 'center' });
+  const pulled = column.findAll((n) => typeof n.type === 'string' && (StyleSheet.flatten(n.props.style) || {}).marginTop < 0);
+  expect(pulled.map((n) => n.type)).toEqual([]);
 }
 
 async function mountWallet() {
@@ -612,6 +645,9 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await pressKey(tree, 'import_title');
     issues.push(...check(tree, 'import step 2'));
     expect(texts(tree)).toContain(plain(L('import_word_count', { count: 5 })));
+    // The error under the live word count keeps a gap to it: its tuck under a field does not cancel the line's margin.
+    const error = tree.root.find((n) => n.props.testID === 'form-error' && n.type === Text);
+    expect(StyleSheet.flatten(error.props.style).marginTop + walletStyles.passwordHint.marginBottom).toBeGreaterThan(0);
     expect(issues).toEqual([]);
   });
 
@@ -643,6 +679,21 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await flush(6);
     expect(tree.root.findAll((n) => n.props.testID === 'erase-node-here' && n.type === Text)).toHaveLength(1);
     issues.push(...check(tree, 'erase dialog: the node stops here'));
+    await act(async () => { tree.unmount(); });
+    mounted.pop();
+    // An unlock that did not open the wallet, under the password field and under the screen lock (a long paragraph).
+    Object.assign(mockState, { vault: 'sealed', local: null });
+    tree = await mount();
+    await pressKey(tree, 'unlock_wallet'); // nothing typed
+    expectLockMessage(tree, 'incorrect_password');
+    issues.push(...check(tree, 'lock: wrong password'));
+    await act(async () => { tree.unmount(); });
+    mounted.pop();
+    mockState.devLock = true;
+    tree = await mount();
+    if (!tree.root.findAll((n) => n.props.testID === 'unlock-message').length) await pressKey(tree, 'unlock_wallet');
+    expectLockMessage(tree, 'auth_secret_gone');
+    issues.push(...check(tree, 'lock: screen lock gone'));
     expect(issues).toEqual([]);
   });
 
@@ -666,11 +717,13 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await AsyncStorage.setItem('qnet_shown_tokens', JSON.stringify(['a'.repeat(64), 'b'.repeat(64), 'd'.repeat(64)]));
     const tree = await unlocked();
     const issues = [...check(tree, 'assets')];
+    // Every figure in the language's own marks: QNC as read (1234567.123456, five places shown) and each token exactly.
+    expect(texts(tree)).toContain(amountText('1234567.12346', 'en'));
     // A balance is never cut: beside its token while it fits two fifths of the row at half its size at the large text
     // size, else under the token, whole (the strict walk measures the first at full size and at the large text size).
     const balances = tree.root.findAll((n) => n.type === Text && n.props.style === walletStyles.tokenAmount);
     for (const [balance, beside] of [['1234567.891234', true], ['0.000000000000000001', false], ['12345.123456789012345678', false]]) {
-      const shown = balances.filter((n) => [].concat(n.props.children).join('') === balance);
+      const shown = balances.filter((n) => [].concat(n.props.children).join('') === amountText(balance, 'en'));
       expect([balance, shown.length, shown.length === 1 && shown[0].props.numberOfLines === 1]).toEqual([balance, 1, beside]);
     }
     await pressKey(tree, 'assets_send');
@@ -843,10 +896,10 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     let tree = await nodeTab();
     shows(tree, ['node_answered', 'node_answered_no', 'node_epoch_ends', 'node_balance']);
     // Each a label with its value on one line (components/InfoRow): the status, the answer, when the epoch ends (in 3 h
-    // 47 min) and the balance (1234.567891 QNC); no device model and no count of epochs (owner, 11.10: the site's).
+    // 47 min) and the balance (1,234.567891 QNC); no device model and no count of epochs (owner, 11.10: the site's).
     expect(tree.root.findAll((n) => n.type === 'View' && isInfoRow(n)).length).toBeGreaterThanOrEqual(4);
     expect(texts(tree)).not.toContain('Phone Model 13 Pro+');
-    expect(texts(tree)).toContain('1234.567891 QNC');
+    expect(texts(tree)).toContain(figure('1234.567891', 'QNC'));
     issues.push(...checkWidths(tree, 'node: here, offline'));
     await reread(tree, { lightStatus: { ...base, needsReactivation: false, answered: true } });
     shows(tree, ['node_status_online', 'node_balance', 'node_move']);
@@ -859,7 +912,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
       txHash: 'ab'.repeat(32), time: Date.now() }], outcomes: [] }));
     await unmount(tree);
     tree = await nodeTab();
-    expect(texts(tree)).toContain(plain(L('node_moving', { amount: '1234.567891 QNC' })));
+    expect(texts(tree)).toContain(plain(L('node_moving', { amount: figure('1234.567891', 'QNC') })));
     issues.push(...checkWidths(tree, 'node: here, a move in transit'));
     await unmount(tree);
     await AsyncStorage.removeItem('qnet_claim_transit_v1');
@@ -874,12 +927,6 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     } finally {
       BackgroundFetch.status.mockResolvedValue(2);
     }
-    // The latest miss, one line: what happened, how long the wake took to reach this device, and what to do.
-    await reread(tree, { lightStatus: { ...base, lastMiss: {
-      epoch: 95, reason: 'answered_late', wokenAt: 1790000000, answeredAt: 1790008100, deliveryDelaySecs: 8040, refused: null,
-    } } });
-    shows(tree, ['node_miss_do_background']);
-    issues.push(...checkWidths(tree, 'node: here, latest miss'));
     // A binding with no device key once two genesis nodes take them: the card offers Use this device.
     await reread(tree, { lightStatus: { ...base, features: ['device_v1'] } });
     shows(tree, ['node_device_again', 'node_use']);
@@ -928,7 +975,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     Object.assign(mockState, { device: { capable: true, platform: 'ios', flags: 'mac=0,vision=0,idiom=phone', report: null } });
     mockState.node = { nodeType: 'super', pseudonym: 'super_9f3a2c1d0e7b' };
     tree = await nodeTab();
-    shows(tree, ['node_balance', 'node_move', 'node_type', 'node_last_seen', 'node_heartbeats', 'node_missed',
+    shows(tree, ['node_balance', 'node_move', 'node_type', 'node_last_seen', 'node_heartbeats',
       'node_epoch_ends', 'node_reputation', 'node_banned', 'node_banned_hint']);
     issues.push(...checkWidths(tree, 'node: server node'));
     await unmount(tree);
@@ -1072,25 +1119,25 @@ describe.each(SUITES)('the sheets, the link screen, the result card and the cras
       { ...base, kind: 'connect' },
       { ...base, kind: 'sign', details: { message: 'Log in to dapp.example', byteLength: 22 } },
       { ...base, kind: 'send', details: { to: 'e'.repeat(45), amountNano: '1234567890000000', feeNano: '150000', totalNano: '1234567890150000' },
-        preview: { nonce: 7, balanceNano: '1000', verified: false, counterparties: [`eeee${'f'.repeat(37)}eeee`] } },
+        preview: { nonce: 7, balanceNano: '1000', counterparties: [`eeee${'f'.repeat(37)}eeee`] } },
       { ...base, kind: 'send', details: { to: 'e'.repeat(45), amountNano: '1', feeNano: '1', totalNano: '2' }, previewError: true },
-      // A balance not confirmed while a long lineage walk runs: how far it is.
+      // No balance to check against: what an earlier transaction of this wallet takes is not known yet.
       { ...base, kind: 'send', details: { to: 'e'.repeat(45), amountNano: '1', feeNano: '1', totalNano: '2' },
-        preview: { nonce: 7, balanceNano: null, verified: false, counterparties: [], balanceProblem: 'unconfirmed', walkSteps: 480 } },
+        preview: { nonce: 7, balanceNano: null, counterparties: [], balanceProblem: 'unconfirmed' } },
       { ...base, kind: 'send', details: { to: 'e'.repeat(45), amountNano: '1', feeNano: '1', totalNano: '2' }, outcome: { status: 'unknown', txHash: 'f'.repeat(64) } },
       { ...base, kind: 'send',
         details: {
           type: 'tokenTransfer', token: 'c'.repeat(45), to: 'e'.repeat(45), amount: '1234567.123456', amountBase: '1234567123456', symbol: 'GOLDCOIN',
           name: 'Game Gold Coin', decimals: 6, gasLimit: '100750', feeNano: '1511250', destroys: true, reservedName: true,
         },
-        preview: { nonce: 7, balanceNano: '1000', verified: true, counterparties: [], tokenBalanceBase: '1', tokenVerified: false, depositNano: '10000000', listed: false } },
+        preview: { nonce: 7, balanceNano: '1000', counterparties: [], tokenBalanceBase: '1', depositNano: '10000000', listed: false } },
       { ...base, kind: 'send', details: { type: 'tokenTransfer', token: 'c'.repeat(45), to: 'e'.repeat(45), amount: '1', amountBase: '1', symbol: 'G', name: '', decimals: 0, gasLimit: '1', feeNano: '1', destroys: false, reservedName: false }, previewError: 'TOKEN_DECIMALS' },
       { ...base, kind: 'send',
         details: {
           type: 'contractCall', contract: 'd'.repeat(45), method: 'claim_reward_for_level', args: 'ab'.repeat(300), argsBytes: 300,
           argsText: 'level 12 cleared', gasLimit: '301500', feeNano: '4522500', totalNano: '4522500',
         },
-        preview: { nonce: 7, balanceNano: '1000', verified: false, counterparties: [] } },
+        preview: { nonce: 7, balanceNano: '1000', counterparties: [] } },
     ]) {
       const tree = await render(<DappSheet view={view} actions={actions} t={L} authenticate={async () => false} accounts={{ qnet: QNET, solana: SOL }} />);
       issues.push(...check(tree, `sheet ${view.kind}${view.details.type ? ` ${view.details.type}` : ''}${view.outcome ? ' outcome' : ''}`));
@@ -1114,8 +1161,9 @@ describe.each(SUITES)('the sheets, the link screen, the result card and the cras
   it('the review of a Solana token send, with the new token account and a memo', async () => {
     const SendReview = require('../src/components/SendReview').default;
     const review = {
-      to: SOL, network: L('solana_devnet'), amount: '123456.123456 1DEV', fee: '0.000005 SOL', account: '0.00203928 SOL',
-      memo: 'order 42 from the shop', total: ['123456.123456 1DEV', '+ 0.00204428 SOL'], warnings: { firstTime: true },
+      to: SOL, network: L('solana_devnet'), amount: figure('123456.123456', '1DEV'), fee: figure('0.000005', 'SOL'),
+      account: figure('0.00203928', 'SOL'), memo: 'order 42 from the shop',
+      total: [figure('123456.123456', '1DEV'), `+ ${figure('0.00204428', 'SOL')}`], warnings: { firstTime: true },
     };
     const tree = await render(<SendReview review={review} t={L} onCancel={() => {}} onConfirm={() => {}} />);
     expect(texts(tree)).toContain(label('send_review_account'));
@@ -1123,8 +1171,10 @@ describe.each(SUITES)('the sheets, the link screen, the result card and the cras
     const issues = [...check(tree, 'review: solana')];
     // A QNet token's review (its fee in QNC on a line of its own) and a QNC one.
     for (const [where, r] of [
-      ['qnet token', { to: QNET, network: 'QNet Blockchain', amount: '1234.5 LONGSYM', fee: '0.00015 QNC', total: ['1234.5 LONGSYM', '+ 0.00015 QNC'] }],
-      ['qnc', { to: QNET, network: 'QNet Blockchain', amount: '1234567.123456 QNC', fee: '0.00015 QNC', total: '1234567.123606 QNC' }],
+      ['qnet token', { to: QNET, network: 'QNet Blockchain', amount: figure('1234.5', 'LONGSYM'), fee: figure('0.00015', 'QNC'),
+        total: [figure('1234.5', 'LONGSYM'), `+ ${figure('0.00015', 'QNC')}`] }],
+      ['qnc', { to: QNET, network: 'QNet Blockchain', amount: figure('1234567.123456', 'QNC'), fee: figure('0.00015', 'QNC'),
+        total: figure('1234567.123606', 'QNC') }],
     ]) {
       const t2 = await render(<SendReview review={{ warnings: {}, ...r }} t={L} onCancel={() => {}} onConfirm={() => {}} />);
       issues.push(...check(t2, `review: ${where}`));
@@ -1217,7 +1267,8 @@ describe('a label with its value is held to one line', () => {
     expect(now).toEqual([]);
     expect(await walk((t) => <InfoRow label={t('node_answered')} value={t('node_answered_yes', { time: '14:05' })} />, 'ru')).toEqual([]);
     // A figure may shrink to half its size, the label beside it giving way far less.
-    expect(await walk((t) => <InfoRow label={t('node_balance')} value="1234567.123456 QNC" tone="accent" ltr fit />, 'ru')).toEqual([]);
+    expect(await walk((t) => <InfoRow label={t('node_balance')} value={`${amountText('1234567.123456', 'ru')} QNC`} tone="accent" ltr fit />, 'ru'))
+      .toEqual([]);
   });
 
   it('the longest table pairs labels and values no screen shows together: held only to the shrink every text has', async () => {

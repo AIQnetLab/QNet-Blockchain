@@ -173,12 +173,18 @@ describe('what each state shows', () => {
     for (const [l, key] of [
       [null, 'node_checking'],
       [light({ status: status({ onChain: false }), pending: { nodeId: NODE, T: 1, expired: false } }), 'node_linking'],
+      // The registration in the genesis nodes' pool, on its way into a block (owner, 18.10: before, the tab said nothing
+      // of it while the owners reported it).
+      [light({ status: status({ onChain: false, registrationPending: true }), pending: { nodeId: NODE, T: 1, expired: false } }), 'node_linking_pool'],
       [light({ status: status({ onChain: false }), pending: { nodeId: NODE, T: 1, expired: true } }), 'node_link_failed'],
     ]) {
       const tree = render({ light: l });
       expect(shown(tree)).toContain(t(key));
       expect(buttons(tree)).toEqual([]);
     }
+    expect(nodeView({ status: status({ onChain: false, registrationPending: true }), pending: { expired: false } }))
+      .toEqual({ state: 'linking', pooled: true });
+    expect(nodeView({ status: status({ onChain: false }), pending: { expired: false } })).toEqual({ state: 'linking' });
   });
 
   it('checking and unreachable keep the balance and Move of the node this device runs (owner, 05.10)', () => {
@@ -188,7 +194,7 @@ describe('what each state shows', () => {
     ]) {
       const tree = render({ light: l });
       expect(shown(tree)).toContain(t(key));
-      expect(shown(tree)).toContain('4714.356375 QNC');
+      expect(shown(tree)).toContain('4,714.356375 QNC');
       expect(buttons(tree)).toEqual(['node-move']);
       expect(tree.root.find((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function').props.disabled).toBe(false);
     }
@@ -327,9 +333,10 @@ describe('what each state shows', () => {
     lastSeenAgoSeconds: 125, heartbeatCount: 4, requiredHeartbeats: 9, pendingRewards: 2e9, reputation: 70, ...over,
   });
 
-  it('a server node shows last seen, its heartbeats this epoch, missed epochs, and the balance', () => {
+  // The app shows no missed epochs: the site's node cabinet does (owner, 18.10); before, a "Missed epochs" row.
+  it('a server node shows last seen, its heartbeats this epoch and the balance, and no missed epochs', () => {
     const tree = render({
-      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: { counted: 5, missed: 1 } }, light: null,
+      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: { counted: 5, missed: 1, notAdmitted: 0 } }, light: null,
     });
     const text = shown(tree);
     expect(text).toContain(SUPER);
@@ -337,7 +344,8 @@ describe('what each state shows', () => {
     expect(text).toContain(`${t('node_last_seen')}\n${t('node_last_seen_ago', { time: t('node_ago_m', { m: 2 }) })}`);
     expect(text).toContain(`${t('node_heartbeats')}\n${t('node_heartbeats_of', { n: 4, m: 9 })}`);
     expect(text).not.toMatch(/Counted epochs|5 of 6/); // the site's node cabinet counts epochs (owner, 11.10)
-    expect(text).toContain(`${t('node_missed')}\n1`);
+    expect(text).not.toMatch(/Missed|node_missed/);
+    expect(hasKey('node_missed')).toBe(false);
     expect(text).toContain('2 QNC');
     expect(buttons(tree)).toEqual(['node-move']);
     // Offline, as a node that has it offline answers: no time seen, no epochs yet (unknown until read).
@@ -348,7 +356,6 @@ describe('what each state shows', () => {
     expect(off).toContain(t('node_badge_offline'));
     expect(off).toContain(t('node_server_offline'));
     expect(off).not.toContain(t('node_last_seen'));
-    expect(off).not.toContain(t('node_missed'));
   });
 
   // Owner, 11.10: a coming network rule holds outside super nodes back from consensus while registrations stay open. Such
@@ -394,7 +401,7 @@ describe('what each state shows', () => {
     expect(rewardAdmission(serverStatus({ admission: 'waiting', registered: false }))).toBe(null);
     expect(rewardAdmission(null)).toBe(null);
     const text = card({ admission: 'waiting' }, { counted: 3, missed: 1, notAdmitted: 4 });
-    expect(text).toContain(`${t('node_missed')}\n1`);
+    expect(text).not.toMatch(/Missed/);
     expect(text).toContain(`${t('node_not_admitted')}\n4`);
     expect(card({}, { counted: 3, missed: 0, notAdmitted: 0 })).not.toContain(t('node_not_admitted'));
   });

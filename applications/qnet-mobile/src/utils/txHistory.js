@@ -25,9 +25,10 @@ const nanoText = (v) => {
 
 // The statuses of a row an archive or node listed (receive labels, wallet-galc plan P1; the extension's rule):
 // 'unverified' while only the explorer archive (the site's host, not a node) or one node lists it; 'included' for a
-// received QNC transfer two genesis nodes list alike whose block the certified balance read last does not cover yet (in
-// a block, not credited yet: only the certified balance is spendable); 'confirmed' once it does (and for every other
-// row two genesis nodes list alike, or a token transfer whose inclusion a committee-certified logs root proves).
+// received QNC transfer two genesis nodes list alike whose block the wallet's live figure does not cover yet (in a block,
+// not in the balance yet); 'confirmed' once it does (and for every other row two genesis nodes list alike, or a token
+// transfer a genesis node reports applied). A row flagged `inBlock` (a genesis node reported it in a block: this
+// wallet's send its result card saw included, a token transfer a node reported) shows as confirmed whatever else holds.
 const LISTED_RANK = { unverified: 0, included: 1, confirmed: 2 };
 const archived = (status) => Object.prototype.hasOwnProperty.call(LISTED_RANK, status);
 
@@ -90,9 +91,9 @@ export function historyRowKey(t) {
  * A token transfer event (node shape: tx_hash, log_index, contract, from, to, amount, kind, std, token_id,
  * symbol, decimals, logo, timestamp in seconds) as a history row. Decimals and symbol come from the
  * wallet's own added-token list when it has the contract, never from the serving source alone, so the
- * trust badge never sits next to a magnitude a node or the explorer chose. An `archived` event is
- * the archive's word ('unverified'); any other waits for its inclusion proof. Either is 'confirmed' only once a
- * committee-certified logs root proves it.
+ * trust badge never sits next to a magnitude a node or the explorer chose. An event a genesis node `reported` (its
+ * token-transfer feed decodes only transactions that applied) is 'confirmed' and `inBlock`; an `archived` one only the
+ * archive holds is its word ('unverified'). A committee-certified logs root that proves it adds `verified`.
  */
 export function tokenRowFromEvent(ev, myAddress, trustedTokenMeta) {
   const tm = trustedTokenMeta.get(lc(ev.contract));
@@ -103,8 +104,9 @@ export function tokenRowFromEvent(ev, myAddress, trustedTokenMeta) {
     from: ev.from,
     to: ev.to,
     amount: 0,
-    status: ev.archived ? 'unverified' : 'pending',
+    status: ev.reported ? 'confirmed' : (ev.archived ? 'unverified' : 'pending'),
     verified: false,
+    ...(ev.reported ? { inBlock: true } : {}),
     timestamp: (Number(ev.timestamp) || 0) * 1000,
     type: txDirection(ev.from, ev.to, myAddress),
     fee: 0,
@@ -221,9 +223,9 @@ export function listingKeysOfNodeRow(row) {
   return keys;
 }
 
-// A listed row's status: received QNC is credited ('confirmed') only once the certified balance read last covers its
-// block (`coveredHeight`: the height of that read's checkpoint), 'included' before; every other listed row is
-// 'confirmed'. A row already credited stays so.
+// A listed row's status: received QNC is credited ('confirmed') once the wallet's live figure covers its block
+// (`coveredHeight`: the height of the newest figure read, live or certified), 'included' before; every other listed row
+// is 'confirmed'. A row already credited stays so.
 const listedStatus = (r, coveredHeight) => {
   if (r.status === 'confirmed' && r.listed) return 'confirmed';
   if (r.type !== 'receive') return 'confirmed';
@@ -235,7 +237,7 @@ const listedStatus = (r, coveredHeight) => {
  * `listed` (keys at least two genesis nodes list alike: WalletManager.agreedHistoryRows; null: none read now), or that
  * was listed before (`listed: true`), is 'included' or 'confirmed' by listedStatus; every other row keeps its status
  * (the archive's rows stay 'unverified', one node's 'reported'). Being listed proves a block carries the transaction,
- * never that it applied: only the certified balance shows that. A row that does not change is the same object.
+ * never that it applied: the balance shows that. A row that does not change is the same object.
  */
 export function withListing(rows, listed, coveredHeight = null) {
   return (Array.isArray(rows) ? rows : []).map((r) => {
@@ -249,14 +251,26 @@ export function withListing(rows, listed, coveredHeight = null) {
 
 /**
  * Rows read back from the device cache: one kept 'confirmed' by an older build on the explorer archive's word alone
- * (no `listed`, or a token row no logs proof verified) is 'unverified' again until genesis nodes list it.
+ * (not listed, not reported in a block by a genesis node, or a token row no logs proof verified) is 'unverified' again
+ * until genesis nodes list it.
  */
 export function checkedCachedRows(rows) {
   return (Array.isArray(rows) ? rows : []).map((r) => {
-    if (!r || r.status !== 'confirmed' || r.nodeEvent || r.chain === 'solana') return r;
+    if (!r || r.status !== 'confirmed' || r.nodeEvent || r.chain === 'solana' || r.inBlock) return r;
     if (r.tokenContract) return r.verified ? r : { ...r, status: 'unverified' };
     return r.listed ? r : { ...r, status: 'unverified' };
   });
+}
+
+/**
+ * The rows with the transaction `hash` marked as a genesis node reported it to this wallet's send result card: in a block
+ * (at `block` when it names one). Every row of that hash; a row that does not change is the same object.
+ */
+export function markInBlock(rows, hash, block = null) {
+  const h = lc(hash);
+  const at = blockOf(block);
+  return (Array.isArray(rows) ? rows : []).map((r) => (r && h && lc(r.hash) === h && !r.inBlock
+    ? { ...r, inBlock: true, ...(at !== null ? { block: at } : {}) } : r));
 }
 
 const newestFirst = (a, b) => (b.timestamp || 0) - (a.timestamp || 0);
@@ -294,7 +308,7 @@ export function rowsDueToDrop(prev, fresh, { myAddress, nowMs }) {
   const me = lc(myAddress);
   const freshHashes = new Set((fresh || []).map((t) => t.hash));
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
-  return (prev || []).filter((t) => t.status === 'pending' && lc(t.from) === me && !freshHashes.has(t.hash)
+  return (prev || []).filter((t) => t.status === 'pending' && !t.inBlock && lc(t.from) === me && !freshHashes.has(t.hash)
     && now - (t.timestamp || 0) >= PENDING_ROW_MAX_MS);
 }
 
@@ -311,7 +325,9 @@ export function rowsDueToDrop(prev, fresh, { myAddress, nowMs }) {
  * `settled` (L-10): what the chain answered by nonce about rows rowsDueToDrop named, by lowercase hash. `landed` (with
  * the hash that landed, a hedged copy's included) makes the row a node's 'reported' row under that hash, which the
  * archive's row replaces once it is listed; `gone` (another transaction took its nonce) removes it; `unread` (no answer)
- * keeps it pending until a later refresh can ask. A row with no answer at all is marked not found as before.
+ * keeps it pending until a later refresh can ask. A row with no answer at all is marked not found as before. A row a
+ * genesis node reported in a block (`inBlock`) is never marked not found, and passes the flag to every fresh row of its
+ * hash, so the node's or the archive's row of the same transaction never shows it as pending again.
  */
 export function mergeHistory(prev, fresh, { myAddress, coveredFromMs, nowMs, nodeEventsOk, settled = null }) {
   const me = lc(myAddress);
@@ -320,17 +336,18 @@ export function mergeHistory(prev, fresh, { myAddress, coveredFromMs, nowMs, nod
     const a = answerOf(t);
     return a && a.landed ? { ...t, status: 'reported', hash: a.txHash || t.hash } : t;
   });
-  // A token row proven on an earlier pass stays proven while the same transfer comes back unproven, and a row two genesis
-  // nodes listed stays listed while the archive returns it unverified (a node keeps about a day of history).
+  // A token row proven or reported applied on an earlier pass stays so while the same transfer comes back without it,
+  // and a row two genesis nodes listed stays listed while the archive returns it unverified (a node keeps about a day of
+  // history).
   const prevByKey = new Map(prev.map((t) => [historyRowKey(t), t]));
-  fresh = fresh.map((t) => {
+  const inBlock = new Set(prev.filter((t) => t.inBlock && t.hash).map((t) => lc(t.hash)));
+  fresh = fresh.map((t) => (inBlock.has(lc(t.hash)) && !t.inBlock ? { ...t, inBlock: true } : t)).map((t) => {
     const p = prevByKey.get(historyRowKey(t));
     if (t.status === 'reported') return p && archived(p.status) ? p : t;
     if (t.tokenContract) {
-      if (t.status !== 'pending' && t.status !== 'unverified') return t;
-      const same = p && p.status === 'confirmed' && p.verified && p.tokenRawAmount === t.tokenRawAmount
+      const same = p && p.status === 'confirmed' && (p.verified || p.inBlock) && p.tokenRawAmount === t.tokenRawAmount
         && lc(p.from) === lc(t.from) && lc(p.to) === lc(t.to);
-      return same ? { ...t, status: 'confirmed', verified: true } : t;
+      return same ? { ...t, status: 'confirmed', verified: !!(t.verified || p.verified), ...(p.inBlock ? { inBlock: true } : {}) } : t;
     }
     const kept = p && p.listed && archived(p.status) && archived(t.status) && LISTED_RANK[p.status] > LISTED_RANK[t.status]
       && listingKey(p) === listingKey(t);
@@ -347,7 +364,7 @@ export function mergeHistory(prev, fresh, { myAddress, coveredFromMs, nowMs, nod
     return ts < coveredFromMs || ts > nowMs - INDEX_LAG_GRACE_MS;
   });
   const pending = kept.filter((t) => t.status === 'pending' || t.status === 'dropped')
-    .map((t) => (t.status === 'pending' && now - (t.timestamp || 0) >= PENDING_ROW_MAX_MS && !(answerOf(t) || {}).unread
+    .map((t) => (t.status === 'pending' && !t.inBlock && now - (t.timestamp || 0) >= PENDING_ROW_MAX_MS && !(answerOf(t) || {}).unread
       ? { ...t, status: 'dropped' } : t));
   const rest = kept.filter((t) => t.status !== 'pending' && t.status !== 'dropped');
   return unique([...pending, ...fresh, ...rest]);
@@ -359,11 +376,11 @@ export function appendHistory(prev, older) {
 }
 
 /**
- * What goes to the device cache: the archive's and the listed rows, with their status (a pending row is local intent, a
- * reported one only a node's word).
+ * What goes to the device cache: the archive's and the listed rows, with their status, and the rows a genesis node
+ * reported in a block (otherwise a pending row is local intent, a reported one only a node's word).
  */
 export function cacheableHistory(rows) {
-  return rows.filter((t) => archived(t.status)).slice(0, HISTORY_CACHE_MAX);
+  return rows.filter((t) => archived(t.status) || t.inBlock).slice(0, HISTORY_CACHE_MAX);
 }
 
 /**
@@ -380,16 +397,18 @@ export function matchesAsset(row, asset) {
 }
 
 /**
- * The status a history row shows: 'confirmed' once two genesis nodes list it (received QNC: once the certified balance
- * covers it too) or a logs proof verifies a token transfer, 'included' for received QNC listed and not credited yet,
- * 'unverified' for a row only the explorer archive holds (or a token transfer no logs proof could anchor), 'failed' for
- * a failed one, 'dropped' for one sent from here that no source reported within PENDING_ROW_MAX_MS (not found), and
- * 'pending' for anything else (sent from here and not in a block yet, or only one node's word so far).
+ * The status a history row shows: 'confirmed' once a genesis node reported it in a block (`inBlock`: this wallet's send
+ * its result card saw included, a token transfer a node reported applied) or two genesis nodes list it (received QNC:
+ * once the wallet's live figure covers it too), 'included' for received QNC listed and not in the balance yet,
+ * 'unverified' for a row only the explorer archive holds, 'failed' for a failed one, 'dropped' for one sent from here
+ * that no source reported within PENDING_ROW_MAX_MS (not found), and 'pending' for anything else (sent from here and not
+ * in a block yet, or only one node's word so far).
  */
 export function historyBadge(row) {
   const s = row && row.status;
-  if (s === 'failed' || s === 'dropped' || archived(s)) return s;
-  return 'pending';
+  if (s === 'failed' || s === 'dropped') return s;
+  if ((row && row.inBlock) || s === 'confirmed') return 'confirmed';
+  return archived(s) ? s : 'pending';
 }
 
 /**

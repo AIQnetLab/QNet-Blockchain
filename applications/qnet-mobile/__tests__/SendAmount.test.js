@@ -2,7 +2,7 @@
 // at most six; QNC five after its fee), worked out in whole base units.
 const fs = require('fs');
 const path = require('path');
-const { amountShare } = require('../src/utils/sendAmount');
+const { amountShare, amountInput } = require('../src/utils/sendAmount');
 const WalletManager = require('../src/components/WalletManager').default;
 
 const token = (decimals, balanceText, percentage = 100) => amountShare({ contract: 'c', decimals, balanceText, balance: Number(balanceText), percentage });
@@ -54,8 +54,6 @@ it('the screen uses it, and says when an amount has more decimals than the token
 // The amount field of both Send forms: a pasted figure with thousands separators is the figure it says or nothing,
 // never a smaller one read with a separator taken for the decimal point.
 describe('amountInput: what the amount field keeps of a typed or pasted figure', () => {
-  const { amountInput } = require('../src/utils/sendAmount');
-
   it('both separators: the last is the decimal point, the other only groups thousands', () => {
     expect(amountInput('1,000.50', 6)).toBe('1000.50');
     expect(amountInput('1.000,50', 6)).toBe('1000.50');
@@ -80,11 +78,24 @@ describe('amountInput: what the amount field keeps of a typed or pasted figure',
     expect(amountInput('12,34,567', 6)).toBeNull();
   });
 
-  it('a single comma is the decimal point, as before', () => {
+  it('typed, a single comma is the decimal point, as before', () => {
     expect(amountInput('12,5', 6)).toBe('12.5');
     expect(amountInput(',25', 6)).toBe('0.25');
     expect(amountInput('1,000', 6)).toBe('1.000');
     expect(amountInput('0,1234567', 6)).toBe('0.123456');
+    // One character put in, by a comma-decimal keyboard: the same in the language that groups with ','.
+    expect(amountInput('1,000', 6, { previous: '1000', lang: 'en' })).toBe('1.000');
+    expect(amountInput('1.000', 6, { previous: '1.00', lang: 'de' })).toBe('1.000');
+    expect(amountInput('1,000', 6, { lang: 'en' })).toBe('1.000');
+  });
+
+  it('Arabic-Indic digits of both forms and the Arabic separators are read as digits, point and grouping', () => {
+    expect(amountInput('\u0661\u0662\u0663', 6)).toBe('123');
+    expect(amountInput('\u06F1\u06F2\u06F3\u066B\u06F5', 6)).toBe('123.5');
+    expect(amountInput('\u0661\u066C\u0662\u0663\u0664\u066C\u0665\u0666\u0667\u066B\u0668\u0669', 6))
+      .toBe('1234567.89');
+    expect(amountInput('\u0660\u066B\u0665', 6)).toBe('0.5');
+    expect(amountInput('\u0669', 6, { previous: '', lang: 'ar' })).toBe('9');
   });
 
   it('spaces, no-break spaces and apostrophes group; other marks go', () => {
@@ -106,13 +117,60 @@ describe('amountInput: what the amount field keeps of a typed or pasted figure',
     expect(amountInput('9'.repeat(40), 6)).toHaveLength(32);
   });
 
-  it('both forms use it, and a refused text leaves the field as it was', () => {
+  it('both forms use it over the text the field had, in the app\'s language, and a refused text leaves the field as it was', () => {
     const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     const qnet = ws.slice(ws.indexOf('const validateAmountInput = '), ws.indexOf('const setAmountPercentage = '));
-    expect(qnet).toMatch(/const normalized = amountInput\(text, 6\);\s*if \(normalized === null\) return;/);
+    expect(qnet).toMatch(/const normalized = amountInput\(text, 6, \{ previous: sendAmount, lang: t\.lang \}\);\s*if \(normalized === null\) return;/);
     expect(qnet).not.toMatch(/replace\(',', '\.'\)/);
     const sol = fs.readFileSync(path.join(__dirname, '../src/screens/SolanaSend.js'), 'utf8');
-    expect(sol).toMatch(/const s = amountInput\(text, decimals\);\s*return s === null \? kept : s;/);
-    expect(sol).toMatch(/onAmount\(cleanAmountInput\(text, token\.decimals, amount\)\)/);
+    expect(sol).toMatch(/const s = amountInput\(text, decimals, \{ previous: kept, lang \}\);\s*return s === null \? kept : s;/);
+    expect(sol).toMatch(/onAmount\(cleanAmountInput\(text, token\.decimals, amount, t\.lang\)\)/);
+  });
+});
+
+// A figure copied from the app's own screens, written in its language (utils/amountFormat), pasted back into the field
+// is the figure it says: never 1000 times smaller with a group symbol taken for the decimal point.
+describe('amountInput: a paste is read as the app language writes figures', () => {
+  const { amountText } = require('../src/utils/amountFormat');
+  const { LANGUAGES } = require('../src/i18n');
+  const paste = (text, lang, previous = '') => amountInput(text, 9, { previous, lang });
+
+  it("the language's group symbol once, before exactly three digits, groups them", () => {
+    expect(paste('1,000', 'en')).toBe('1000');
+    for (const lang of ['ja', 'ko', 'zh-CN', 'ar']) expect([lang, paste('999,999', lang)]).toEqual([lang, '999999']);
+    expect(paste('1.000', 'de')).toBe('1000');
+    expect(paste('1.500', 'pt')).toBe('1500');
+    expect(paste('15.000', 'es')).toBe('15000');
+    expect(paste('15.000', 'it')).toBe('15000');
+    expect(paste('\u0661,\u0660\u0660\u0660', 'ar')).toBe('1000');
+  });
+
+  it('the other separator, or a shape other than groups of three, is the decimal point as before', () => {
+    expect(paste('1.000', 'en')).toBe('1.000');
+    expect(paste('1,000', 'de')).toBe('1.000');
+    // Russian and French group with a no-break space: a comma is their decimal mark.
+    expect(paste('1,000', 'ru')).toBe('1.000');
+    expect(paste('1,000', 'fr')).toBe('1.000');
+    expect(paste('1,5', 'en')).toBe('1.5');
+    expect(paste('1,0000', 'en')).toBe('1.0000');
+    expect(paste('1234,567', 'en')).toBe('1234.567');
+    expect(paste('1.5', 'de')).toBe('1.5');
+    // No figure is grouped after a leading zero.
+    expect(paste('0,500', 'en')).toBe('0.500');
+    expect(paste('0.500', 'de')).toBe('0.500');
+  });
+
+  it('a paste counts by what it put in, a selection it replaced included', () => {
+    expect(paste('1,000', 'en', '999')).toBe('1000');
+    expect(paste('1,000', 'en', '5')).toBe('1000');
+    expect(paste('1.000', 'de', '7')).toBe('1000');
+  });
+
+  it('every figure the app writes, in every language, pastes back as itself', () => {
+    const values = ['0.5', '12.5', '123.456', '1.000', '1234', '1500', '15000', '999999', '1000.5', '1234567.891',
+      '2047243.4405', '18446744073.709551615'];
+    for (const { code } of LANGUAGES) {
+      for (const v of values) expect([code, v, paste(amountText(v, code), code)]).toEqual([code, v, v]);
+    }
   });
 });

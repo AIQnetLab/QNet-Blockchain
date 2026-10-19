@@ -45,7 +45,7 @@ function setup(over = {}) {
     signMessage: jest.fn(),
     tokenInfo: jest.fn(),
     contractKind: jest.fn(async () => 'none'),
-    prepareSend: jest.fn(async () => ({ nonce: 6, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO] })),
+    prepareSend: jest.fn(async () => ({ nonce: 6, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [TO] })),
     recheckSend: jest.fn(async () => ({ balanceNano: String(10n * QNC) })),
     send: jest.fn(async (d) => ({ txHash: 'a'.repeat(64), status: 'submitted', nonce: d.nonce })),
     transactionStatus: jest.fn(),
@@ -122,8 +122,8 @@ describe('MOB-BR-R4-02: a site\'s send signs only at the confirmed nonce + 1', (
   it('never in addition: an append pick signs nothing, and the preview offers none', async () => {
     const s = setup({
       prepareSend: jest.fn(async () => ({
-        nonce: null, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO],
-        pending: [entry(6)], replaceNonce: 6, replaceHash: 'h6', appendNonce: 7, recent: [],
+        nonce: null, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [TO],
+        pending: [entry(6)], replaceNonce: 6, replaceHash: 'h6', appendNonce: 7,
       })),
     });
     pay(s).catch(() => {});
@@ -141,10 +141,10 @@ describe('MOB-BR-R4-02: a site\'s send signs only at the confirmed nonce + 1', (
 
   it('two unconfirmed: the newest is above confirmed + 1, so nothing can be confirmed until they land', async () => {
     jest.useFakeTimers({ now: 1790000000000 });
-    const later = { nonce: 6, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO], pending: [], recent: [] };
+    const later = { nonce: 6, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [TO], pending: [] };
     const prepareSend = jest.fn(async () => ({
-      nonce: null, confirmed: 4, balanceNano: String(10n * QNC), verified: true, counterparties: [TO],
-      pending: [entry(5), entry(6)], replaceNonce: 6, replaceHash: 'h6', appendNonce: 7, recent: [],
+      nonce: null, confirmed: 4, balanceNano: String(10n * QNC), counterparties: [TO],
+      pending: [entry(5), entry(6)], replaceNonce: 6, replaceHash: 'h6', appendNonce: 7,
     }));
     const s = setup({ prepareSend });
     pay(s).catch(() => {});
@@ -170,8 +170,8 @@ describe('MOB-BR-R4-02: a site\'s send signs only at the confirmed nonce + 1', (
   it('one unconfirmed above a gap (not at confirmed + 1) cannot be replaced either', async () => {
     const s = setup({
       prepareSend: jest.fn(async () => ({
-        nonce: null, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO],
-        pending: [entry(7)], replaceNonce: 7, replaceHash: 'h7', appendNonce: null, recent: [],
+        nonce: null, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [TO],
+        pending: [entry(7)], replaceNonce: 7, replaceHash: 'h7', appendNonce: null,
       })),
     });
     pay(s).catch(() => {});
@@ -212,8 +212,8 @@ describe('the sheet of a site\'s send while an earlier transaction is unconfirme
     id: 's1', kind: 'send', origin: SITE, busy: false, queued: 0, outcome: null, notice: null,
     details: { type: 'transfer', to: TO, amountNano: String(QNC), feeNano: '150000', totalNano: String(QNC + 150000n) },
     preview: {
-      nonce: null, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [TO], paid: [], senders: [],
-      recent: [], transferFeeNano: '150000', appendNonce: null, ...preview,
+      nonce: null, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [TO], paid: [], senders: [],
+      transferFeeNano: '150000', appendNonce: null, ...preview,
     },
   });
   async function mount(v) {
@@ -261,8 +261,8 @@ describe('MOB-BR-R4-03: QNC sent to the burn address is said to be destroyed', (
       view: {
         id: 'b1', kind: 'send', origin: SITE, busy: false, queued: 0, outcome: null, notice: null, details: s.shown().details,
         preview: {
-          nonce: 6, confirmed: 5, balanceNano: String(10n * QNC), verified: true, counterparties: [], paid: [], senders: [],
-          pending: [], recent: [], transferFeeNano: '150000', replaceNonce: null, appendNonce: null, inFlight: false,
+          nonce: 6, confirmed: 5, balanceNano: String(10n * QNC), counterparties: [], paid: [], senders: [],
+          pending: [], transferFeeNano: '150000', replaceNonce: null, appendNonce: null, inFlight: false,
         },
       },
       t, authenticate: jest.fn(async () => true), accounts: { qnet: QNET, solana: SOL },

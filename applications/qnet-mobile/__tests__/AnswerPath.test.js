@@ -29,7 +29,7 @@ const { lightShardOwnerUrls } = require('../src/config/nodes');
 const Push = require('../src/services/PushService');
 const { readNodeStatus, latestMiss, latestAnswer, freshMiss, MISS_REASONS } = require('../src/services/LightNode');
 const NodeTab = require('../src/screens/NodeTab').default;
-const { missText, nodeView } = require('../src/screens/NodeTab');
+const { nodeView } = require('../src/screens/NodeTab');
 const { makeT } = require('../src/i18n');
 const translations = require('../src/i18n/translations').default;
 
@@ -900,134 +900,49 @@ describe('the status contract: device.last_miss and device.last_answer, read str
   });
 });
 
-describe('the Node tab\'s one line for the last missed epoch', () => {
+describe('a missed epoch on the Node tab', () => {
   const status = (lastMiss, over = {}) => ({
     reachable: true, onChain: true, deviceBound: true, deviceBoundAgreed: true, answered: false, needsReactivation: false,
     counted: { since: 20, counted: 18, last: 205 }, device: { platform: 'ios', linkedSince: null, lastAnswerEpoch: 205, state: 'online' },
     deviceTags: [], features: [], signed: null, keyOurs: null, bindingSeqAgreed: null, lastMiss, ...over,
   });
   const miss = (reason, over = {}) => ({ epoch: 210, reason, wokenAt: null, answeredAt: null, deliveryDelaySecs: null, refused: null, ...over });
-  const local = (ms) => { const d = new Date(ms); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  const L = { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: true };
 
-  it('says what happened, at the local time, how long the wake took to reach this device, and what to do', () => {
-    const late = missText(t, status(miss('answered_late', { wokenAt: 1800000000, answeredAt: 1800009000, deliveryDelaySecs: 8040 })));
-    expect(late).toBe([
-      t('node_miss_late_at', { time: local(1800009000 * 1000) }), t('node_miss_delay', { n: 134 }), t('node_miss_do_background'),
-    ].join(' '));
-    expect(missText(t, status(miss('woken_no_answer', { wokenAt: 1800000000 }))))
-      .toBe(`${t('node_miss_woken_at', { time: local(1800000000 * 1000) })} ${t('node_miss_do_background')}`);
-    expect(missText(t, status(miss('answer_refused', { deliveryDelaySecs: 12 }))))
-      .toBe(`${t('node_miss_refused')} ${t('node_miss_delay_short')} ${t('node_miss_do_use')}`);
-    expect(missText(t, status(miss('not_woken_inactive')))).toBe(`${t('node_miss_inactive')} ${t('node_miss_do_open')}`);
-    expect(missText(t, status(miss('no_push_address')))).toBe(`${t('node_miss_no_address')} ${t('node_miss_do_open_once')}`);
-  });
-
-  it('a wake the app\'s report accounted for says when it reached this device, how long it took, and why there was no answer', () => {
-    const at0 = 1800000000;
-    const reached = (over) => missText(t, status(miss('woken_no_answer', { wokenAt: at0, ...over })));
-    const why = {
-      not_opened_since_boot: 'node_miss_why_not_opened', swiped: 'node_miss_why_swiped', after_commit: 'node_miss_why_after_commit',
-      answer_failed: 'node_miss_why_answer_failed', already_counted: 'node_miss_why_already_counted', no_key: 'node_miss_why_no_key',
-    };
-    for (const [outcome, key] of Object.entries(why)) {
-      expect(reached({ deliveredAt: at0 + 600, deliveryDelaySecs: 600, appOutcome: outcome }))
-        .toBe(t('node_miss_reached_after', { time: local((at0 + 600) * 1000), n: 10, why: t(key) }));
-    }
-    expect(reached({ deliveredAt: at0 + 20, deliveryDelaySecs: 20, appOutcome: 'swiped' }))
-      .toBe(t('node_miss_reached_soon', { time: local((at0 + 20) * 1000), why: t('node_miss_why_swiped') }));
-    expect(reached({ deliveredAt: at0 + 20, deliveryDelaySecs: null, appOutcome: 'swiped' }))
-      .toBe(t('node_miss_reached_at', { time: local((at0 + 20) * 1000), why: t('node_miss_why_swiped') }));
-    expect(reached({ deliveredAt: null, deliveryDelaySecs: null, appOutcome: 'swiped' }))
-      .toBe(t('node_miss_reached', { why: t('node_miss_why_swiped') }));
-    expect(t('node_miss_reached_after', { time: '14:05', n: 3, why: t('node_miss_why_not_opened') })).toBe(
-      'The wake reached this device at 14:05, 3 min after it was sent, and the app did not answer: QNet Wallet had not been opened '
-      + 'since the device restarted. Open it once after every restart.');
-    // The app answered that wake: never said as "did not answer", and nothing for this device to change.
-    expect(reached({ deliveredAt: at0 + 20, deliveryDelaySecs: 20, appOutcome: 'answered' })).toBe(t('node_miss_answered'));
-    expect(t('node_miss_answered')).toBe('This device answered the wake, but QNet Blockchain did not count the answer in that epoch. '
-      + 'Nothing needs doing on this device.');
-    // The app's record shows no push of that epoch reached it.
-    expect(missText(t, status(miss('not_delivered', { wokenAt: at0 }))))
-      .toBe(`${t('node_miss_not_delivered')} ${t('node_miss_do_background')}`);
-    expect(t('node_miss_not_delivered')).toBe('The wake never reached this device: the push service or the device held it.');
-  });
-
-  it('a wake this device could not answer for want of the node\'s key offers Use this device', () => {
-    const L = { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: true };
-    const view = (appOutcome) => nodeView({
-      nodeId: NODE, status: status(miss('woken_no_answer', { appOutcome })), local: L, pending: null, check: null, height: at(3000, 211),
+  it('a wake this device could not answer for want of the node\'s key offers Use this device while nothing counted it since', () => {
+    const view = (appOutcome, over) => nodeView({
+      nodeId: NODE, status: status(miss('woken_no_answer', { appOutcome }), over), local: L, pending: null, check: null, height: at(3000, 212),
     });
     expect(view('no_key')).toMatchObject({ state: 'here', offerUse: true });
     expect(view('swiped')).toMatchObject({ state: 'here', offerUse: false });
-  });
-
-  it('nothing once the node was counted or answered in that epoch or later, and nothing without a record', () => {
-    expect(missText(t, status(miss('woken_no_answer', { epoch: 205 })))).toBeNull();
-    expect(missText(t, status(miss('woken_no_answer'), { device: { lastAnswerEpoch: 211, state: 'online' } }))).toBeNull();
-    expect(missText(t, status(null))).toBeNull();
-    expect(freshMiss(status(miss('woken_no_answer')))).toMatchObject({ epoch: 210 });
-  });
-
-  it('a miss this device accounted for stays once counted again, under its epoch and with the day of a time not today', () => {
-    const at0 = 1800000000;
     const counted = { device: { platform: 'ios', linkedSince: null, lastAnswerEpoch: 212, state: 'online' }, counted: { since: 20, counted: 19, last: 211 } };
-    const past = (over) => missText(t, status(miss('woken_no_answer', { wokenAt: at0, ...over }), counted), (at0 + 600) * 1000);
-    const lead = t('node_miss_past', { epoch: 210 });
-    expect(lead).toBe('Epoch 210 was not counted.');
-    expect(past({ deliveredAt: at0 + 600, deliveryDelaySecs: 600, appOutcome: 'swiped' }))
-      .toBe(`${lead} ${t('node_miss_reached_after', { time: local((at0 + 600) * 1000), n: 10, why: t('node_miss_why_swiped') })}`);
-    const d = new Date((at0 + 600) * 1000);
-    const dayOf = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    expect(missText(t, status(miss('woken_no_answer', { wokenAt: at0, deliveredAt: at0 + 600, appOutcome: 'swiped' }), counted),
-      (at0 + 3 * 86400) * 1000)).toBe(`${lead} ${t('node_miss_reached_at', { time: `${dayOf} ${local((at0 + 600) * 1000)}`, why: t('node_miss_why_swiped') })}`);
-    expect(past({ appOutcome: 'answered' })).toBe(`${lead} ${t('node_miss_answered')}`);
-    expect(missText(t, status(miss('not_delivered', { wokenAt: at0 }), counted), at0 * 1000))
-      .toBe(`${lead} ${t('node_miss_not_delivered')} ${t('node_miss_do_background')}`);
-    // Without the account of the device a miss counted since says nothing, nor does it offer Use this device.
-    expect(past({})).toBeNull();
-    for (const reason of ['answered_late', 'answer_refused', 'no_push_address', 'not_woken_inactive']) {
-      expect(missText(t, status(miss(reason, { deliveredAt: at0 + 600, appOutcome: 'swiped' }), counted))).toBeNull();
-    }
-    const L = { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: true };
-    expect(nodeView({ nodeId: NODE, status: status(miss('woken_no_answer', { appOutcome: 'no_key' }), counted), local: L, pending: null,
-      check: null, height: at(3000, 212) })).toMatchObject({ state: 'here', offerUse: false });
-    // A fresh miss keeps its words, with no epoch in front.
-    expect(missText(t, status(miss('woken_no_answer', { wokenAt: at0, deliveredAt: at0 + 20, deliveryDelaySecs: 20, appOutcome: 'swiped' }))))
-      .toBe(t('node_miss_reached_soon', { time: local((at0 + 20) * 1000), why: t('node_miss_why_swiped') }));
+    expect(view('no_key', counted)).toMatchObject({ state: 'here', offerUse: false });
   });
 
-  it('the line shows on this device\'s card, and a refused answer offers Use this device', async () => {
-    const L = { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: false };
-    const light = { nodeId: NODE, status: status(miss('answer_refused')), local: L, pending: null, check: null, answeredAt: null, balanceNano: 0, device: null };
+  it('a miss is fresh only while the node was not counted or answered in that epoch or later', () => {
+    expect(freshMiss(status(miss('woken_no_answer')))).toMatchObject({ epoch: 210 });
+    expect(freshMiss(status(miss('woken_no_answer', { epoch: 205 })))).toBeNull();
+    expect(freshMiss(status(miss('woken_no_answer'), { device: { lastAnswerEpoch: 211, state: 'online' } }))).toBeNull();
+    expect(freshMiss(status(null))).toBeNull();
+  });
+
+  it('the card names no missed epoch, and a refused answer still offers Use this device', async () => {
+    const light = { nodeId: NODE, status: status(miss('answer_refused')), local: { ...L, hw: false }, pending: null, check: null, answeredAt: null, balanceNano: 0, device: null };
     expect(nodeView({ ...light, height: at(3000, 211) })).toMatchObject({ state: 'here', offerUse: true });
     let tree;
     await act(async () => {
       tree = renderer.create(<NodeTab t={t} light={light} height={at(3000, 211)} onMove={() => {}} onUse={() => {}} onCopy={() => {}} nodeTitle={() => ''} />);
     });
-    const line = tree.root.find((n) => n.props.testID === 'node-miss' && n.type === Text);
-    expect(line.props.children).toBe(`${t('node_miss_refused')} ${t('node_miss_do_use')}`);
+    expect(tree.root.findAll((n) => n.props.testID === 'node-miss')).toEqual([]);
+    const text = tree.root.findAll((n) => n.type === Text).map((n) => [].concat(n.props.children).join('')).join('\n');
+    expect(text).not.toMatch(/210|not counted|wake|refused/i);
     expect(tree.root.findAll((n) => n.props.testID === 'node-use' && typeof n.props.onPress === 'function').length).toBeGreaterThan(0);
     await act(async () => { tree.unmount(); });
   });
 
-  it('every language has every text of the line, with the same placeholders, and no word of a price or a payout', () => {
-    const keys = Object.keys(translations.en).filter((k) => k.startsWith('node_miss_'));
-    expect(keys.length).toBe(30);
-    const holes = (s) => (s.match(/\{\w+\}/g) || []).sort().join();
+  it('no language keeps a text for a missed epoch', () => {
     for (const [lang, table] of Object.entries(translations)) {
-      for (const k of keys) {
-        expect([lang, k, typeof table[k]]).toEqual([lang, k, 'string']);
-        expect([lang, k, holes(table[k])]).toEqual([lang, k, holes(translations.en[k])]);
-      }
-    }
-    expect(Object.keys(translations).length).toBe(11);
-    const en = keys.map((k) => translations.en[k]).join(' ');
-    expect(en).not.toMatch(/reward|burn|price|mining|\bcode\b|support|fault|blame|\bphone/i);
-    // The sentence the app's report completes keeps its {why} in every language.
-    for (const table of Object.values(translations)) {
-      for (const k of ['node_miss_reached', 'node_miss_reached_at', 'node_miss_reached_after', 'node_miss_reached_soon']) {
-        expect(table[k]).toContain('{why}');
-      }
+      expect([lang, Object.keys(table).filter((k) => k.startsWith('node_miss_'))]).toEqual([lang, []]);
     }
   });
 });

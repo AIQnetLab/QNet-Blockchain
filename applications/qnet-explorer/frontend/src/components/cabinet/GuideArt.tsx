@@ -25,7 +25,8 @@ const C = {
 };
 
 const SANS = "Inter, -apple-system, 'Segoe UI', sans-serif";
-const MONO = 'ui-monospace, Menlo, Consolas, monospace';
+// Monospace text takes the site's one stack (--font-mono in globals.css); the rest inherits the picture's SANS.
+const MONO = { fontFamily: 'var(--font-mono)' };
 
 function say(label: Label): string {
   if (typeof label === 'string') return t(label);
@@ -149,7 +150,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
       const size = 7.6 * s;
       const lines = wrap(say(part.label), w, size, 0.55, 3);
       const raw = isRaw(part.label);
-      return { h: lines.length * size * 1.25, node: <g key={key}>{textLines(lines, x, y - 1, size, { fill: raw ? C.text : C.muted, fontFamily: raw ? MONO : SANS })}</g> };
+      return { h: lines.length * size * 1.25, node: <g key={key}>{textLines(lines, x, y - 1, size, { fill: raw ? C.text : C.muted, style: raw ? MONO : undefined })}</g> };
     }
     case 'lines': {
       const widths = [1, 0.86, 0.93, 0.68, 0.8];
@@ -195,7 +196,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
             {part.hot && <Ring x={x} y={y + labelH} w={w} h={box} r={4} />}
             <rect x={x} y={y + labelH} width={w} height={box} rx={4} fill="rgba(0, 0, 0, 0.45)" stroke={C.frame} strokeWidth={0.8} />
             {shown && (
-              <text x={x + 5} y={y + labelH + box / 2 + size * 0.36} fontSize={size} fill={part.secret || raw ? C.text : C.muted} fontFamily={raw ? MONO : SANS}>
+              <text x={x + 5} y={y + labelH + box / 2 + size * 0.36} fontSize={size} fill={part.secret || raw ? C.text : C.muted} style={raw ? MONO : undefined}>
                 {shown}
               </text>
             )}
@@ -211,7 +212,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
         node: (
           <g key={key}>
             <text x={x} y={y + size} fontSize={size} fill={C.muted}>{say(part.label)}</text>
-            <text x={x + w} y={y + size} fontSize={size} fontWeight={700} textAnchor="end" fill={C.text} fontFamily={raw ? MONO : SANS}>{say(part.value)}</text>
+            <text x={x + w} y={y + size} fontSize={size} fontWeight={700} textAnchor="end" fill={C.text} style={raw ? MONO : undefined}>{say(part.value)}</text>
           </g>
         ),
       };
@@ -292,7 +293,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
         node: (
           <g key={key}>
             <rect x={x} y={y} width={w} height={box} rx={4} fill="rgba(0, 0, 0, 0.5)" stroke={C.frame} strokeWidth={0.8} />
-            <text x={x + w / 2} y={y + box / 2 + size * 0.36} fontSize={size} fontWeight={700} textAnchor="middle" fill={C.white} fontFamily={MONO}>
+            <text x={x + w / 2} y={y + box / 2 + size * 0.36} fontSize={size} fontWeight={700} textAnchor="middle" fill={C.white} style={MONO}>
               {wrap(say(part.label), w - 8, size, 0.62, 1)[0]}
             </text>
           </g>
@@ -403,7 +404,7 @@ function Phone({ x, y, w, h, screen, url, urlHot, parts, clip, s = 1 }: {
           <g>
             {urlHot && <Ring x={x + 12} y={y + 20} w={w - 24} h={15} r={7.5} />}
             <rect x={x + 12} y={y + 20} width={w - 24} height={15} rx={7.5} fill={C.bar} stroke={urlHot ? C.hot : 'none'} strokeWidth={0.8} />
-            <text x={x + w / 2} y={y + 30.6} fontSize={7.8} textAnchor="middle" fill={C.text} fontFamily={MONO}>{url}</text>
+            <text x={x + w / 2} y={y + 30.6} fontSize={7.8} textAnchor="middle" fill={C.text} style={MONO}>{url}</text>
           </g>
         )}
         {layout(parts, x + 13, top, w - 26, s).nodes}
@@ -449,7 +450,7 @@ function Browser({ scene, clip, narrow = false }: { scene: Extract<Scene, { fram
         <line x1={x} y1={y + 26} x2={x + w} y2={y + 26} stroke={C.frame} strokeWidth={0.8} />
         {[0, 1, 2].map((i) => <circle key={i} cx={x + 12 + i * 10} cy={y + 13} r={3} fill={C.line} />)}
         <rect x={x + 44} y={y + 5} width={barEnd - 44} height={16} rx={8} fill={C.bar} />
-        <text x={x + 54} y={y + 16.2} fontSize={8.6} fill={C.text} fontFamily={scene.url ? MONO : SANS}>{address}</text>
+        <text x={x + 54} y={y + 16.2} fontSize={8.6} fill={C.text} style={scene.url ? MONO : undefined}>{address}</text>
         {scene.pin && (
           <g>
             <Ring x={x + w - 24} y={y + 5} w={16} h={16} r={4} />
@@ -490,7 +491,7 @@ function Scan({ scene, clip, narrow = false }: { scene: Extract<Scene, { frame: 
       <rect x={4} y={30} width={panelW} height={bottom - 30} rx={9} fill={C.body} stroke={C.frame} strokeWidth={1.4} />
       <line x1={4} y1={48} x2={4 + panelW} y2={48} stroke={C.frame} strokeWidth={0.8} />
       {[0, 1, 2].map((i) => <circle key={i} cx={(narrow ? 12 : 15) + i * (narrow ? 7 : 9)} cy={39} r={narrow ? 2.2 : 2.6} fill={C.line} />)}
-      <text x={narrow ? 33 : 46} y={42} fontSize={8} fill={C.text} fontFamily={MONO}>aiqnet.io/node</text>
+      <text x={narrow ? 33 : 46} y={42} fontSize={8} fill={C.text} style={MONO}>aiqnet.io/node</text>
       {page.nodes}
       <path d={narrow ? 'M 112 112 L 118 112' : 'M 184 112 L 198 112'} stroke={C.hot} strokeWidth={1.4} strokeDasharray="3 3" />
       <Phone x={narrow ? 120 : 202} y={4} w={narrow ? 112 : 114} h={212} screen="app" parts={scene.phone} clip={clip} s={1.1} />

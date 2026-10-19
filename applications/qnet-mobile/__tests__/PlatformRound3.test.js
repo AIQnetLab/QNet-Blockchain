@@ -4,7 +4,8 @@
 // imports as the wallet it names (R3-XPD-07).
 const fs = require('fs');
 const path = require('path');
-const { SEED_INPUT_PROPS, SEED_FIELD_ID, looksPasted, insertedText } = require('../src/utils/sensitiveInput');
+const { SEED_INPUT_PROPS, SEED_FIELD_ID, looksPasted } = require('../src/utils/sensitiveInput');
+const { insertedText } = require('../src/utils/textEdit');
 const { explorerTxUrl } = require('../src/config/nodes');
 const { WalletManager } = require('../src/components/WalletManager');
 

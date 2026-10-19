@@ -15,6 +15,8 @@ import {
   openSession, prepareOffer, performIntent, deliverAnswer, markHandled, groupCheckNumber, LinkRefusal,
 } from '../services/QNetLink';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
+import { moveNote } from '../services/ClaimTransit';
+import { qncText } from '../utils/amountFormat';
 
 export const ARM_MS = 1000;
 
@@ -34,8 +36,6 @@ const WORKING = {
 const WALLET_UNLINK = { title: 'link_title_unlink_wallet', auth: 'link_auth_unlink_wallet', working: 'link_working_unlink_wallet' };
 const byWallet = (o) => !!o && o.kind === 'unlink' && o.mode === 'wallet';
 
-// A node balance in nanoQNC as the sheet shows it.
-const qncText = (nano) => `${(Number(nano) / 1e9).toFixed(6).replace(/\.?0+$/, '')} QNC`;
 // A wallet named on the sheet: its start and its end.
 const shortAddress = (a) => (typeof a === 'string' && a.length > 20 ? `${a.slice(0, 10)}…${a.slice(-6)}` : String(a || ''));
 // The day this device was linked (Unix seconds), as the sheet shows it.
@@ -50,12 +50,13 @@ const dayText = (s) => { const d = new Date(s * 1000); return `${d.getFullYear()
 // still being carried out, without one, until it arrives), so what the user must see is never lost with the screen
 // (MOBLINK-R5-02). `node`: the Node side of the open wallet (services/NodeLinkActions); `onPrivacy` opens the privacy
 // policy in the system browser; `onOpenNode` shows the Node tab; `onPlayDialog(kind)` shows Google Play's own dialog
-// where the build has one.
+// where the build has one; `moveOf(txHash)` what became of a move the sheet submitted (ClaimTransit.moveOutcome), which
+// its outcome says as it happens.
 export default function QNetLinkScreen({
   link, wallet, t, authenticate, onClose, node = null,
   onSettled = () => {}, onShown = () => {}, onGone = () => {}, afterOther = false,
   onOutcome = () => {}, settled = false, settledOutcome = null,
-  onPrivacy = () => {}, onOpenNode = null, onPlayDialog = null,
+  onPrivacy = () => {}, onOpenNode = null, onPlayDialog = null, moveOf = null,
 }) {
   // loading | refused | unavailable | confirm | working | done
   const [phase, setPhase] = useState(settled ? (settledOutcome ? 'done' : 'working') : 'loading');
@@ -308,7 +309,7 @@ export default function QNetLinkScreen({
         {o.kind === 'claim' ? null : <Text style={s.text}>{t('link_claim_empty')}</Text>}
         <InfoField label={t(o.nodeType === 'super' ? 'node_title_super' : 'node_title_light')} value={o.nodeId} mono fit t={t}
           testID="link-claim-node" />
-        {o.kind === 'claim' ? <InfoRow label={t('link_claim_amount')} value={qncText(o.amountNano)} ltr fit /> : null}
+        {o.kind === 'claim' ? <InfoRow label={t('link_claim_amount')} value={qncText(o.amountNano, t.lang)} ltr fit /> : null}
         {addressField(t('link_wallet'), o.qnet)}
       </>
     );
@@ -340,12 +341,12 @@ export default function QNetLinkScreen({
     if (a.status === 'linked') return <Text style={s.text}>{t('link_result_linked')}</Text>;
     if (a.status === 'empty') return <Text style={s.text}>{t('link_result_claim_empty')}</Text>;
     if (link.intent === 'claim') {
+      const n = moveNote(moveOf && a.txHash ? moveOf(a.txHash) : null, a.stoppedAtEpoch);
       return (
         <>
-          <Text style={s.text}>{t('link_result_claim', { amount: qncText(a.amountNano) })}</Text>
+          <Text style={s.text}>{t('link_result_claim', { amount: qncText(a.amountNano, t.lang) })}</Text>
           <Text style={s.hint}>
-            {a.stoppedAtEpoch !== null && a.stoppedAtEpoch !== undefined
-              ? t('claim_stopped_at', { epoch: a.stoppedAtEpoch }) : t('claim_credited_on_block')}
+            {t(n.key, n.appliedNano !== undefined ? { amount: qncText(n.appliedNano, t.lang) } : { epoch: n.epoch })}
           </Text>
         </>
       );

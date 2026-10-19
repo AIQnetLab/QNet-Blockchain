@@ -224,55 +224,57 @@ export default function TokensDirectoryPage() {
           </div>
         ) : (
           <>
-            <table className="block-table">
-              <thead>
-                <tr>
-                  <th>Token</th>
-                  <th>Symbol</th>
-                  <th>Contract</th>
-                  <th>Total Supply</th>
-                  <th>Deployer</th>
-                  <th>Deployed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tokens.map((t, idx) => (
-                  <tr key={t.contract_address || idx}>
-                    <td>
-                      <Link href={`/explorer/token/${t.contract_address}`} className="address-link">
-                        {t.name || t.symbol || truncate(t.contract_address, 6, 4)}
-                      </Link>
-                    </td>
-                    <td>
-                      {t.symbol ? (
-                        <span className="type-badge type-token-transfer">{t.symbol}</span>
-                      ) : (
-                        <span className="address-link">—</span>
-                      )}
-                    </td>
-                    <td>
-                      <Link href={`/explorer/token/${t.contract_address}`} className="address-link">
-                        {truncate(t.contract_address, 6, 4)}
-                      </Link>
-                    </td>
-                    <td>
-                      {t.total_supply}
-                      {t.symbol ? ` ${t.symbol}` : ''}
-                    </td>
-                    <td>
-                      {t.deployer && t.deployer.length > 10 && t.deployer.includes('eon') ? (
-                        <Link href={`/explorer/address/${t.deployer}`} className="address-link">
-                          {truncate(t.deployer, 6, 4)}
-                        </Link>
-                      ) : (
-                        <span className="address-link">{t.deployer || '—'}</span>
-                      )}
-                    </td>
-                    <td>{formatDeployed(t.deployed_at)}</td>
+            <div className="table-wrapper">
+              <table className="block-table">
+                <thead>
+                  <tr>
+                    <th>Token</th>
+                    <th>Symbol</th>
+                    <th>Contract</th>
+                    <th>Total Supply</th>
+                    <th>Deployer</th>
+                    <th>Deployed</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {tokens.map((t, idx) => (
+                    <tr key={t.contract_address || idx}>
+                      <td>
+                        <Link href={`/explorer/token/${t.contract_address}`} className="address-link">
+                          {t.name || t.symbol || truncate(t.contract_address, 6, 4)}
+                        </Link>
+                      </td>
+                      <td>
+                        {t.symbol ? (
+                          <span className="type-badge type-token-transfer">{t.symbol}</span>
+                        ) : (
+                          <span className="address-link">—</span>
+                        )}
+                      </td>
+                      <td>
+                        <Link href={`/explorer/token/${t.contract_address}`} className="address-link">
+                          {truncate(t.contract_address, 6, 4)}
+                        </Link>
+                      </td>
+                      <td>
+                        {t.total_supply}
+                        {t.symbol ? ` ${t.symbol}` : ''}
+                      </td>
+                      <td>
+                        {t.deployer && t.deployer.length > 10 && t.deployer.includes('eon') ? (
+                          <Link href={`/explorer/address/${t.deployer}`} className="address-link">
+                            {truncate(t.deployer, 6, 4)}
+                          </Link>
+                        ) : (
+                          <span className="address-link">{t.deployer || '—'}</span>
+                        )}
+                      </td>
+                      <td>{formatDeployed(t.deployed_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
 
             {totalPages > 1 && (
               <div className="details-grid">

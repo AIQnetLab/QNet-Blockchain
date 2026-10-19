@@ -651,6 +651,26 @@ describe('token rules and the window\'s text rule', () => {
   });
 });
 
+describe('amounts (compiled from the mobile source)', () => {
+  it('writes a figure as the language does, every digit kept, and passes any other text through', () => {
+    assert.equal(core.amountText('2047243.4405', 'en'), '2,047,243.4405');
+    assert.equal(core.amountText('2047243.4405', 'ru'), '2\u00a0047\u00a0243,4405');
+    assert.equal(core.amountText('2047243.4405', 'de'), '2.047.243,4405');
+    assert.equal(core.amountText('1234', 'es'), '1234');
+    assert.equal(core.amountText('18446744073709551615', 'en'), '18,446,744,073,709,551,615');
+    assert.equal(core.amountText('+0.000000001', 'fr'), '+0,000000001');
+    for (const text of ['—', '1e+21', '.5']) assert.equal(core.amountText(text, 'en'), text);
+  });
+
+  it('reads a figure pasted in the language\'s format as written; typed text keeps the decimal comma', () => {
+    assert.equal(core.amountInput('1,000', 9, { previous: '', lang: 'en' }), '1000');
+    assert.equal(core.amountInput('1.000', 9, { previous: '', lang: 'de' }), '1000');
+    assert.equal(core.amountInput('1,000', 9, { previous: '1,00', lang: 'en' }), '1.000');
+    assert.equal(core.amountInput('1,000.5', 9), '1000.5');
+    assert.equal(core.amountInput('1.2.3', 9), null);
+  });
+});
+
 describe('bundle surface', () => {
   const EXPORTS = [
     // transactions (compiled from the mobile TxBuilders.js; test/tx-builders.test.mjs)
@@ -662,6 +682,9 @@ describe('bundle surface', () => {
     // the token rules a token transfer's approval shows (compiled from the mobile utils/tokenSafety.js), and the text rule
     // of the approval window (message.js)
     'contractShortId', 'destroysTokens', 'tokenLabel', 'usesReservedName', 'isVisibleText',
+    // amounts as the language writes them, and the amount field's reading of a typed or pasted figure (compiled from the
+    // mobile utils/amountFormat.js and utils/sendAmount.js)
+    'amountInput', 'amountText',
     // the light node messages (compiled from the mobile NodePreimages.js; test/light-node-vectors.test.mjs)
     'claimPayloadPreimage', 'claimQuotePreimage', 'consentPreimage', 'lightNodeId', 'ownerBindPreimage', 'publicKeySha3',
     'registrationProof',

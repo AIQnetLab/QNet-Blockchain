@@ -184,7 +184,7 @@ describe('the quote: everything a send needs, read now, and what the network wou
     expect(await wm.getTokenBalance(FROM, ONE_DEV_MINT)).toBe(300);
     expect(await maxSendable(FROM, '1DEV')).toBe('300');
     await expect(quoteSolanaSend({ from: FROM, to: TO, symbol: '1DEV', amount: '1500' })).rejects.toEqual(
-      coded('SOL_SHORT_TOKEN', { need: '1500 1DEV', balance: '300 1DEV' }));
+      coded('SOL_SHORT_TOKEN', { need: '1,500 1DEV', balance: '300 1DEV' }));
     // Both balances are read at 'confirmed', as the quote reads them (getBalance reads the answer with json()).
     const rpc = global.fetch;
     global.fetch = jest.fn(async (...args) => {

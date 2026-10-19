@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { formatTokenAmount } from '@/lib/token-format';
+import { formatQnc } from '@/lib/token-format';
 import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
@@ -10,7 +10,7 @@ import { fetchNode } from '@/lib/node-api';
 
 // nanoQNC (u64 base units, 9 decimals) → exact QNC decimal string (BigInt, >2^53 safe).
 const qnc = (raw: unknown): string =>
-  formatTokenAmount(typeof raw === 'string' ? raw : String(raw ?? '0'), 9);
+  formatQnc(typeof raw === 'string' ? raw : String(raw ?? '0'));
 
 export async function GET(request: Request) {
   const url = new URL(request.url);

@@ -3,11 +3,12 @@
 // registered (a "no" only from nodes at the network's height, and only while none lists it), the genesis that wakes
 // the node's device asked first (lightShardOwners) and every owner of its shard asked for a miss the page names, the
 // node balance, and the node's epochs one by one, a page at a time (the nodes' reward history, with the explorer's archive
-// for the dates, the moves to the wallet and the registration: epoch-archive.ts), and a super node's status (online, last seen, its heartbeats, its
+// for the dates, the moves to the wallet and the registration: epoch-archive.ts; a light node's shard owners for why each
+// epoch not counted was missed), and a super node's status (online, last seen, its heartbeats, its
 // standing and balance, its pace this epoch, the heights, and its admission as the node names it, else whether the
 // network's eligible set lists it: eligible-set.ts) from the nodes' server status. The history's first page also carries
-// what the wallet earned (earnedOf); the status read for an address only viewed (`?view=1`) leaves the device's own
-// details out (node-view.ts publicStatus). Each route takes only a node id, answers exact shapes
+// what the wallet earned (earnedOf); the status and history reads for an address only viewed (`?view=1`) leave the
+// device's own details out (node-view.ts publicStatus, publicHistory). Each route takes only a node id, answers exact shapes
 // (src/lib/cabinet/node-view.ts), caches per node for about the page's poll interval ("not registered" a little longer),
 // shares one upstream round between concurrent readers of a node, meters every client (limits.ts) and, apart, each
 // client's reads that miss the cache and go upstream, and asks each genesis node at most a set number of reads a second,
@@ -19,9 +20,10 @@ import { GENESIS_NODES } from '../../lib/genesis-nodes.ts';
 import { isLightNodeId, isSuperNodeId } from '../../lib/qnet-link.ts';
 import { isEonAddress } from '../../lib/qnet-provider.ts';
 import { epochOfHeight, epochOfKey } from '../../lib/cabinet/epochs.ts';
-import { asksOtherOwners, latestMiss, parseNodeMiss, type LastMiss } from '../../lib/cabinet/last-miss.ts';
+import { MISS_HISTORY_EPOCHS, asksOtherOwners, latestMiss, missesByEpoch, parseNodeMiss, type LastMiss } from '../../lib/cabinet/last-miss.ts';
 import {
-  DEVICE_PLATFORMS, DEVICE_STATES, HISTORY_KEPT_MS, HISTORY_PAGE_MAX, HISTORY_PAGE_ROWS, STATUS_KEPT_MS, isDeviceModel, isFeatureList, isSuperAdmission, publicStatus,
+  DEVICE_PLATFORMS, DEVICE_STATES, HISTORY_KEPT_MS, HISTORY_PAGE_MAX, HISTORY_PAGE_ROWS, STATUS_KEPT_MS, isDeviceModel, isFeatureList, isSuperAdmission,
+  publicHistory, publicStatus,
   type DevicePlatform, type DeviceState, type DeviceView, type HistoryEarned, type HistoryResult, type HistoryRow, type HistoryView, type NodeStatusView,
   type SuperAdmission, type SuperStatusView,
 } from '../../lib/cabinet/node-view.ts';
@@ -43,6 +45,9 @@ export const RESERVE_CACHE_MS = 5_000;
 // when the wallet moves its balance (each move takes every settled epoch, however old).
 export const HISTORY_CACHE_MS = HISTORY_KEPT_MS;
 const NODE_TIMEOUT_MS = 4_000;
+// A shard owner's misses only add a line under epochs not counted: an owner slower than this adds none rather than
+// holding the page.
+export const MISS_TIMEOUT_MS = 1_500;
 const NODE_BODY_MAX_BYTES = 64 * 1024;
 export const ELIGIBLE_WAIT_MS = 3_000;
 
@@ -242,6 +247,18 @@ export function parseHistory(body: unknown): NodeHistory | null {
   return { wallet: isEonAddress(body.wallet) ? body.wallet : null, rows, more, lastClaimed: isCount(body.last_claimed_epoch) ? body.last_claimed_epoch : null };
 }
 
+// GET /api/v1/light-node/misses?node_id= of one shard owner (section 7): the node's misses as that owner keeps them,
+// each read as `last_miss` is (one this site cannot read is passed over). Null for any other answer, also a node that
+// does not know the id; a node of an earlier release has no such route and answers 404 or 405, which read() takes as none.
+export function parseMisses(body: unknown): LastMiss[] | null {
+  if (!isObject(body) || body.success !== true || !Array.isArray(body.misses) || body.misses.length > MISS_HISTORY_EPOCHS) return null;
+  return body.misses.map(parseNodeMiss).filter((m): m is LastMiss => m !== null);
+}
+
+export function missesPath(nodeId: string): string {
+  return `/api/v1/light-node/misses?node_id=${encodeURIComponent(nodeId)}&limit=${MISS_HISTORY_EPOCHS}`;
+}
+
 // A second node's answer fills the epochs the first could not serve; an answer for another wallet adds nothing. The
 // watermark stays the first's, which the balance read before it goes with.
 export function mergeHistory(a: NodeHistory, b: NodeHistory): NodeHistory {
@@ -267,8 +284,12 @@ const RESULTS: Record<NodeStatus, HistoryResult> = {
 // not counted. Older epochs follow while the node has more, names a
 // wallet (a made-up id names none) and the page did not reach the registration. Without the archive (`facts` null)
 // nothing is dated and no epoch is left out. `balance`: the first page's node balance, read from the node that gave the
-// page just before it (earnedOf).
-export function historyView(node: NodeHistory, facts: ArchiveFacts | null, balance: PendingAt | null = null): HistoryView {
+// page just before it (earnedOf). `misses`: the shard owners' misses by epoch, each named on its epoch when the nodes
+// report the light node itself not counted; an epoch not counted only because the super node earned nothing has none,
+// since no node of an unchecked group could be counted whatever its device did.
+export function historyView(
+  node: NodeHistory, facts: ArchiveFacts | null, balance: PendingAt | null = null, misses: ReadonlyMap<number, LastMiss> | null = null,
+): HistoryView {
   const registeredEpoch = facts && facts.registeredHeight !== null ? epochOfHeight(facts.registeredHeight) : null;
   const superEpoch = facts && facts.superHeight !== null ? epochOfHeight(facts.superHeight) : null;
   const rows: HistoryRow[] = [];
@@ -295,6 +316,7 @@ export function historyView(node: NodeHistory, facts: ArchiveFacts | null, balan
       startedAt: facts?.times.get(span.start) ?? null,
       endedAt: facts?.times.get(span.end) ?? null,
       claimTx: result === 'moved' ? claim?.tx ?? null : null,
+      miss: result === 'missed' && r.status === 'not_eligible' ? misses?.get(span.epoch) ?? null : null,
     });
   }
   rows.sort((a, b) => b.epoch - a.epoch);
@@ -316,12 +338,16 @@ export function earnedOf(node: NodeHistory, facts: ArchiveFacts | null, balance:
   return { movedNano: moved.nano, balanceNano: balance.nano };
 }
 
-// `?view=1` of the status route, the read of an address only viewed (node-view.ts publicStatus): true; absent: false;
-// anything else is null.
+// `?view=1` of the status and history routes, the read of an address only viewed (node-view.ts publicStatus,
+// publicHistory): true; absent: false; anything else is null.
 export function viewRead(request: Request): boolean | null {
   const raw = new URL(request.url).searchParams.get('view');
   return raw === null ? false : raw === '1' ? true : null;
 }
+
+// Whether a page holds an epoch the light node itself was not counted in (the only one historyView names a miss on), of
+// a node that names a wallet, so that its shard owners are asked why; a made-up id names none and asks no owner.
+const mayMiss = (node: NodeHistory): boolean => node.wallet !== null && node.rows.some((r) => r.status === 'not_eligible');
 
 // `?page=N` of the history route: absent is the first page; anything but a whole number up to HISTORY_PAGE_MAX is null.
 export function historyPage(request: Request): number | null {
@@ -432,8 +458,8 @@ export type LastHeartbeat = (nodeId: string) => Promise<number | null>;
 
 export interface NodeProxy {
   status(request: Request, nodeId: string): Promise<Response>;
-  // `archive`: the explorer's archive (epoch-archive.ts); without it the epochs come undated. A light or a super id, and
-  // the page the request's `?page=` names.
+  // `archive`: the explorer's archive (epoch-archive.ts); without it the epochs come undated. A light or a super id, the
+  // page the request's `?page=` names, and `?view=1` for an address only viewed.
   history(request: Request, nodeId: string, archive?: EpochArchive): Promise<Response>;
   // GET /api/cabinet/super/:id: a super node's status (SuperStatusView).
   superStatus(request: Request, nodeId: string, lastHeartbeat?: LastHeartbeat): Promise<Response>;
@@ -454,6 +480,8 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
   const statusCache = memo<NodeStatusView | null>((v) => (v !== null && !v.registered && !v.pending ? NONE_CACHE_MS : STATUS_CACHE_MS), now);
   const reserveCache = memo<NodeStatusView | null>(RESERVE_CACHE_MS, now);
   const historyCache = memo<HistoryView | null>(HISTORY_CACHE_MS, now);
+  // A light node's misses (loadMisses), kept as long as a page of its epochs and shared by all of them.
+  const missesCache = memo<Map<number, LastMiss> | null>(HISTORY_CACHE_MS, now);
   const superCache = memo<SuperStatusView | null>((v) => (v !== null && !v.registered ? NONE_CACHE_MS : SUPER_CACHE_MS), now);
   // A page's read of an id: on the budget of ids seen registered, or on the small one of every other id.
   const pageKind = (nodeId: string): UpstreamKind => (known.has(nodeId) ? 'readKnown' : 'readUnknown');
@@ -482,15 +510,16 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
   };
   const ownerBases = (nodeId: string): string[] => (nodes.length === 5 ? lightShardOwners(nodeId).map((i) => nodes[i]) : []);
 
-  // A node's answer, or null; a node whose budget of `kind` this second is spent is not asked (upstream.ts).
-  async function read(url: string, kind: UpstreamKind): Promise<unknown> {
+  // A node's answer within `timeoutMs`, or null; a node whose budget of `kind` this second is spent is not asked
+  // (upstream.ts).
+  async function read(url: string, kind: UpstreamKind, timeoutMs: number = NODE_TIMEOUT_MS): Promise<unknown> {
     if (!budget(kind, url)) return null;
     try {
       const res = await fetchFn(url, {
         headers: { Accept: 'application/json' },
         redirect: 'error',
         cache: 'no-store',
-        signal: AbortSignal.timeout(NODE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (res.status !== 200) {
         await res.body?.cancel().catch(() => undefined);
@@ -559,9 +588,20 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
     return listed.length === 0 ? view : mergeStatus(pair[0], pair[1], balance, all, ofOwners(all));
   }
 
+  // A light node's misses as its three shard owners keep them, each asked once with MISS_TIMEOUT_MS, merged per epoch;
+  // an owner that gives none (down, slow, over its budget, or of an earlier release without the route) adds none, and
+  // null when none gives any. Each owner answers its whole window whatever the page, so one read serves every page of
+  // the node while it is kept.
+  async function loadMisses(nodeId: string, kind: UpstreamKind): Promise<Map<number, LastMiss> | null> {
+    const answers = await Promise.all(ownerBases(nodeId).map(async (base) => parseMisses(await read(`${base}${missesPath(nodeId)}`, kind, MISS_TIMEOUT_MS))));
+    return answers.some((a) => a !== null) ? missesByEpoch(answers) : null;
+  }
+
   // One node's history of the page, and a second node's for the epochs the first could not serve; then the archive's
-  // facts for the wallet the nodes name (none for a made-up id). For the first page with the archive, the node balance
-  // too, from the node that gives the page, read just before it, and the archive's moves (the wallet's total earned).
+  // facts for the wallet the nodes name (none for a made-up id) and, for a light node's page that holds an epoch it was
+  // not counted in (mayMiss), its shard owners' misses, kept per node, the two read together. For the first page with
+  // the archive, the node balance too, from the node that gives the page, read just before it, and the archive's moves
+  // (the wallet's total earned).
   async function loadHistory(nodeId: string, page: number, archive: EpochArchive | undefined): Promise<HistoryView | null> {
     const order = shuffled();
     const kind = pageKind(nodeId);
@@ -579,15 +619,18 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
       got = got === null ? value : mergeHistory(got, value);
     }
     if (got === null) return null;
-    let facts: ArchiveFacts | null = null;
-    if (archive && got.wallet) {
+    const node = got;
+    const readFacts = async (): Promise<ArchiveFacts | null> => {
+      if (!archive || !node.wallet) return null;
       try {
-        facts = await archive(got.wallet, nodeId, got.rows.map((r) => r.key), earning);
+        return await archive(node.wallet, nodeId, node.rows.map((r) => r.key), earning);
       } catch {
-        facts = null;
+        return null;
       }
-    }
-    return historyView(got, facts, balance);
+    };
+    const readMisses = isLightNodeId(nodeId) && mayMiss(node) ? missesCache(nodeId, () => loadMisses(nodeId, kind), (m) => m !== null) : null;
+    const [facts, misses] = await Promise.all([readFacts(), readMisses]);
+    return historyView(node, facts, balance, misses);
   }
 
   // A super node's status: one node that lists it registered answers "yes" (the details are its own, its admission among
@@ -669,17 +712,19 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
       return cabinetJson(200, viewed ? publicStatus(view) : view);
     },
 
-    // GET /api/cabinet/node/:id/history[?page=N]
+    // GET /api/cabinet/node/:id/history[?page=N][&view=1]
     async history(request, nodeId, archive) {
       const refused = gate(request, 'node');
       if (refused) return refused;
       const page = historyPage(request);
-      if ((!isLightNodeId(nodeId) && !isSuperNodeId(nodeId)) || page === null) return cabinetJson(400, { error: 'invalid_request' });
+      const viewed = viewRead(request);
+      if ((!isLightNodeId(nodeId) && !isSuperNodeId(nodeId)) || page === null || viewed === null) return cabinetJson(400, { error: 'invalid_request' });
       const key = `${nodeId}:${page}`;
       const limited = spent(request, historyCache.has(key));
       if (limited) return limited;
       const view = await historyCache(key, () => loadHistory(nodeId, page, archive), (v) => v !== null);
-      return view ? cabinetJson(200, view) : cabinetJson(503, { error: 'unavailable' });
+      if (!view) return cabinetJson(503, { error: 'unavailable' });
+      return cabinetJson(200, viewed ? publicHistory(view) : view);
     },
   };
 }

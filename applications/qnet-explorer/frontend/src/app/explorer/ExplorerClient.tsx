@@ -78,7 +78,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
         ) : (
           <span className="addr">{txPartyLabel(item.from || 'N/A', full)}</span>
         )}
-        <span className="arr">→</span>
+        {' '}<span className="arr">→</span>{' '}
         {item.to === 'batch_transfers' ? (
           <span className="addr">batch recipients</span>
         ) : item.to && item.to.length > 10 && item.to.includes('eon') ? (

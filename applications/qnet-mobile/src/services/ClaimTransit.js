@@ -1,17 +1,20 @@
 /**
- * A move of a node balance in transit (owner, 11.10). The node balance and its claim watermark are the wallet's, not a
- * node's (the network sums one wallet's reward leaves whichever of its node ids is asked), so everything here is per
- * wallet. A Move to wallet the network took (the Node tab's card, or a QNet Link claim sheet) is held from the moment
- * it was submitted until a certified read of the wallet shows its claim watermark at the batch's last epoch: the claim
- * credits the wallet and moves the watermark in one step of the same block, so that read's QNC figure holds the amount.
- * While a move is held Assets shows the amount on a line of its own under QNC (never inside the QNC figure), the Node
- * tab says "Moving X" with its button off and the rest of the node balance, and the move's history row says so too:
- * the amount is never shown twice, nor nowhere. A watermark past the batch's start but short of its end is a move that
- * went through in part (the network stops a batch at an epoch it cannot prove). Nothing else ends a move, neither the
- * clock nor what nodes say of their live state (owner, 12.10: settleMoves says why). The wallet's last certified
- * watermark (`floor`) also judges every node balance read: a node whose state is behind it still holds a moved amount
- * (acceptedBalance). Kept on the device per wallet (`qnet_claim_transit_v1`, no secret in it); the screen reads and
- * writes it, every rule here is a pure function of the record and is tested without the screen.
+ * A move of a node balance in transit (owner, 11.10 and 18.10). The node balance and its claim watermark are the
+ * wallet's, not a node's (the network sums one wallet's reward leaves whichever of its node ids is asked), so everything
+ * here is per wallet. A Move to wallet the network took (the Node tab's card, or a QNet Link claim sheet) is in transit
+ * from the moment it was submitted until the wallet's live figure (a genesis node's live tip, its proof folded to that
+ * node's root) shows its claim watermark at the batch's last epoch: the claim credits the wallet and moves the watermark
+ * in one step of the same block, so that figure holds the amount. A watermark past the batch's start but short of its end
+ * is a move that went through in part (the network stops a batch at an epoch it cannot prove). While a move is in
+ * transit the Node tab says "Moving X" with its button off and the rest of the node balance, and the move's history row
+ * says so too: the amount is never shown twice, nor nowhere. Nothing else ends a move, neither the clock nor what nodes
+ * say of the node balance (owner, 12.10: settleMoves says why). The record itself stays until a certified read of the
+ * wallet shows the watermark, in the background: only that read raises the wallet's durable watermark (`floor`), which
+ * judges every node balance read (acceptedBalance), and a certified read of the live figure's height or later that shows
+ * a lower watermark puts the move back in transit. The live watermark (`liveLce`, with the height of the figure that
+ * showed it, `liveHeight`) is held in memory only, never written. The record is kept on the device per wallet
+ * (`qnet_claim_transit_v1`, no secret in it); the screen reads and writes it, every rule here is a pure function of the
+ * record and is tested without the screen.
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -30,8 +33,12 @@ const isNano = (v) => typeof v === 'string' && /^\d{1,30}$/.test(v);
 
 /** Nothing held: what a wallet without a move in transit has. */
 export function emptyTransit(owner = null) {
-  return { owner, moves: [], outcomes: [], floor: null };
+  return { owner, moves: [], outcomes: [], floor: null, liveLce: null, liveHeight: null };
 }
+
+// The live watermark of `s` and the height it was seen at, both or neither.
+const liveOf = (s) => (isEpoch(s.liveLce) && isEpoch(s.liveHeight)
+  ? { liveLce: s.liveLce, liveHeight: s.liveHeight } : { liveLce: null, liveHeight: null });
 
 // The batch's epochs with their amounts ([epoch, nanoText], strictly ascending above `prev`, the last one `last`,
 // summing to `amountNano`), or null when they do not: the record then falls back to its whole amount.
@@ -47,6 +54,14 @@ function cleanParts(parts, prev, last, amountNano) {
   return at === last && sum.toString() === amountNano ? parts.map((p) => [p[0], p[1]]) : null;
 }
 
+/** The nanoQNC a move's answer (claimRewards) names, as decimal text: its quoted batch, else its QNC amount; or null. */
+export function claimedNano(result) {
+  if (!result) return null;
+  if (isNano(result.amountNano)) return result.amountNano;
+  const qnc = Number(result.amount);
+  return Number.isFinite(qnc) && qnc > 0 ? String(Math.round(qnc * 1e9)) : null;
+}
+
 /**
  * The record of a move the network took, from claimRewards' answer (`result`: amountNano or amount, txHash,
  * prevWatermark, lastEpoch, parts), or null when the answer names no batch to follow (a node that quoted none).
@@ -57,10 +72,7 @@ export function transitRecord({ nodeId, result, balanceNano = null, now = Date.n
   if (!nodeId || !result || result.success === false) return null;
   const { prevWatermark, lastEpoch } = result;
   if (!isEpoch(prevWatermark) || !isEpoch(lastEpoch) || lastEpoch <= prevWatermark) return null;
-  let amountNano = isNano(result.amountNano) ? result.amountNano : null;
-  if (amountNano === null && Number.isFinite(Number(result.amount)) && Number(result.amount) > 0) {
-    amountNano = String(Math.round(Number(result.amount) * 1e9));
-  }
+  const amountNano = claimedNano(result);
   if (amountNano === null || amountNano === '0') return null;
   const before = balanceNano === null || balanceNano === undefined ? NaN : Number(balanceNano);
   const restNano = Number.isFinite(before) && before >= 0 ? Math.max(0, before - Number(amountNano)) : null;
@@ -81,8 +93,20 @@ export function addMove(state, move) {
     moves: [...s.moves.filter((m) => !overlaps(m, move)), move].slice(-MAX_MOVES),
     outcomes: s.outcomes,
     floor: isEpoch(s.floor) ? s.floor : null,
+    ...liveOf(s),
   };
 }
+
+// What watermark `lce` says of `move`: 'done' at or past its last epoch, 'partial' past its start only, else null (the
+// move is not in that state yet, or no watermark is known).
+const outcomeAt = (move, lce) => {
+  if (!isEpoch(lce)) return null;
+  if (lce >= move.lastEpoch) return 'done';
+  return lce > move.prevWatermark ? 'partial' : null;
+};
+
+// The moves the wallet's live watermark does not show through yet: the ones in transit on screen.
+const movingMoves = (state) => (state ? state.moves.filter((m) => outcomeAt(m, state.liveLce) === null) : []);
 
 // The part of `move` the network applied by watermark `lce`, nanoQNC as a number (the whole amount without its parts).
 function appliedNano(move, lce) {
@@ -99,33 +123,68 @@ const outcomeOf = (move, result, at, lce) => ({
 });
 
 /**
- * What a certified read tells of the moves held: `lastClaimedEpoch` the wallet's claim watermark in a state the
- * committee certified (null when the read certified none: then only outcomes past their day go), `now` the clock. A
- * watermark at or past a move's last epoch: 'done'; past its start only: 'partial'; otherwise the move stays held. The
- * watermark becomes the wallet's `floor`. { state, settled: [{ move, result, returnedNano }] }; `state` is the same
- * object when nothing changed.
+ * What a certified read tells of the moves held, in the background: `lastClaimedEpoch` the wallet's claim watermark in a
+ * state the committee certified (null when the read certified none: then only outcomes past their day go), `blockHeight`
+ * the height of that state, `now` the clock. A watermark at or past a move's last epoch: 'done'; past its start only:
+ * 'partial'; otherwise the move stays held. The watermark becomes the wallet's `floor`. One lower than the live
+ * watermark, in a state at or past the height of the live figure that showed it, contradicts that figure (a node on a
+ * branch the chain left, or a faulty one): the live watermark is dropped and what it ended is in transit again
+ * (`reverted`). { state, settled: [{ move, result, returnedNano, liveSeen }], reverted }, `liveSeen` when the live
+ * watermark showed that move through already (the screen said so then); `state` is the same object when nothing changed.
  */
-export function settleMoves(state, { lastClaimedEpoch = null, now = Date.now() } = {}) {
+export function settleMoves(state, { lastClaimedEpoch = null, blockHeight = null, now = Date.now() } = {}) {
   const s = state || emptyTransit();
   const lce = isEpoch(lastClaimedEpoch) ? lastClaimedEpoch : null;
+  const seen = liveOf(s);
+  const reverted = lce !== null && seen.liveLce !== null && lce < seen.liveLce && isEpoch(blockHeight)
+    && blockHeight >= seen.liveHeight;
+  const { liveLce: live, liveHeight } = reverted ? { liveLce: null, liveHeight: null } : seen;
   const settled = [];
   const moves = [];
   for (const move of s.moves) {
-    // Only the certified watermark decides, never a timer or nodes' live answers: a QNet transaction has no consensus
-    // expiry (no valid_until height; each node's mempool TTL is its own), so a batch not seen yet can still be included
-    // later and nothing can say it never will. A "did not go through" state waits for such a rule.
-    const result = lce === null ? null : (lce >= move.lastEpoch ? 'done' : (lce > move.prevWatermark ? 'partial' : null));
+    // A certified watermark ends the record, never a timer or nodes' answers of the node balance: a QNet transaction has
+    // no consensus expiry (no valid_until height; each node's mempool TTL is its own), so a batch not seen yet can still
+    // be included later and nothing can say it never will. A "did not go through" state waits for such a rule.
+    const result = outcomeAt(move, lce);
     if (result) {
       const o = outcomeOf(move, result, now, lce);
-      settled.push({ move, result, returnedNano: o.returnedNano, outcome: o });
+      settled.push({ move, result, returnedNano: o.returnedNano, liveSeen: outcomeAt(move, live) !== null, outcome: o });
     } else moves.push(move);
   }
   const kept = s.outcomes.filter((o) => now - o.at < OUTCOME_KEEP_MS);
   const was = isEpoch(s.floor) ? s.floor : null;
   const floor = lce !== null && !(was !== null && was >= lce) ? lce : was;
-  if (settled.length === 0 && kept.length === s.outcomes.length && floor === was) return { state: s, settled };
+  if (settled.length === 0 && kept.length === s.outcomes.length && floor === was && !reverted) {
+    return { state: s, settled, reverted };
+  }
   const outcomes = [...kept, ...settled.map((x) => x.outcome)].slice(-MAX_OUTCOMES);
-  return { state: { owner: s.owner, moves, outcomes, floor }, settled: settled.map(({ outcome, ...x }) => x) };
+  return {
+    state: { owner: s.owner, moves, outcomes, floor, liveLce: live, liveHeight },
+    settled: settled.map(({ outcome, ...x }) => x),
+    reverted,
+  };
+}
+
+/**
+ * `state` with the claim watermark of the wallet's live figure (a genesis node's live tip, its proof folded to that
+ * node's root) and that figure's `height`, for the screen and in memory only: only ever raised, as the chain's watermark
+ * only moves forward, until a certified read contradicts it (settleMoves). A move it shows at or past its last epoch is
+ * no longer in transit ('done'), one it shows past its start only went through in part ('partial'); the record stays
+ * until a certified read settles it. { state, settled: [{ move, result, returnedNano }] }: the moves this watermark is the
+ * first to show through; `state` is the same object when nothing changed.
+ */
+export function noteLiveWatermark(state, liveLce, height) {
+  const s = state || emptyTransit();
+  const was = liveOf(s).liveLce;
+  if (!isEpoch(liveLce) || !isEpoch(height) || (was !== null && was >= liveLce)) return { state: s, settled: [] };
+  const settled = [];
+  for (const move of s.moves) {
+    const result = outcomeAt(move, liveLce);
+    if (result && outcomeAt(move, was) === null) {
+      settled.push({ move, result, returnedNano: outcomeOf(move, result, 0, liveLce).returnedNano });
+    }
+  }
+  return { state: { ...s, liveLce, liveHeight: height }, settled };
 }
 
 /**
@@ -133,32 +192,58 @@ export function settleMoves(state, { lastClaimedEpoch = null, now = Date.now() }
  * of the node balance the latest move left), or null.
  */
 export function heldMove(state) {
-  if (!state || state.moves.length === 0) return null;
-  const last = state.moves[state.moves.length - 1];
-  return { ...last, amountNano: String(transitTotal(state)) };
+  const moving = movingMoves(state);
+  if (moving.length === 0) return null;
+  return { ...moving[moving.length - 1], amountNano: String(transitTotal(state)) };
 }
 
 /** All that is in transit to the wallet, nanoQNC (0 when nothing is). */
 export function transitTotal(state) {
-  return state ? state.moves.reduce((sum, m) => sum + Number(m.amountNano), 0) : 0;
+  return movingMoves(state).reduce((sum, m) => sum + Number(m.amountNano), 0);
 }
 
 /**
- * What Assets' line shows in transit beside a QNC figure whose leaf has watermark `figureLce` (null: not known): the
- * epochs of each move that figure does not hold yet. A figure on screen that holds a move before a certified read ended
- * it (one not verified yet) does not show it twice; the move itself still waits for that read.
+ * What became of the move submitted as `txHash`, as its result card says it: { result: 'moving' } while it is in transit,
+ * { result: 'done' | 'partial', appliedNano (what of it is in the wallet) } once the live or a certified watermark shows
+ * it, null when no record names it.
  */
-export function shownTransitNano(state, figureLce = null) {
-  if (!state) return 0;
-  const w = isEpoch(figureLce) ? figureLce : null;
-  return state.moves.reduce((sum, m) => {
-    if (w === null || w <= m.prevWatermark) return sum + Number(m.amountNano);
-    return sum + Number(m.amountNano) - appliedNano(m, w);
-  }, 0);
+export function moveOutcome(state, txHash) {
+  if (!state || !txHash) return null;
+  const move = state.moves.find((m) => m.txHash === txHash);
+  if (move) {
+    const result = outcomeAt(move, state.liveLce);
+    return result ? { result, appliedNano: appliedNano(move, state.liveLce) } : { result: 'moving' };
+  }
+  const o = state.outcomes.find((x) => x.txHash === txHash);
+  return o ? { result: o.result, appliedNano: Number(o.amountNano) - o.returnedNano } : null;
 }
 
 /**
- * Whether a node balance answer may be shown for the wallet whose last certified claim watermark is `floor` (null: none
+ * What a move's result card (the Node tab's, a QNet Link claim sheet's) says under it, as a text key and its values:
+ * `outcome` from moveOutcome. Done: in the wallet; in part: the part that is (`appliedNano`); still in transit: that the
+ * batch stopped at `stoppedAtEpoch` when the quote did, else that it is credited once in a block.
+ */
+export function moveNote(outcome, stoppedAtEpoch = null) {
+  if (outcome && outcome.result === 'done') return { key: 'claim_note_done' };
+  if (outcome && outcome.result === 'partial') return { key: 'claim_note_partial', appliedNano: outcome.appliedNano };
+  if (stoppedAtEpoch !== null && stoppedAtEpoch !== undefined) return { key: 'claim_stopped_at', epoch: stoppedAtEpoch };
+  return { key: 'claim_credited_on_block' };
+}
+
+/**
+ * The watermark node balance answers are judged by (balanceAnswerCounts): the wallet's durable certified `floor`, raised
+ * to its live watermark only while a move that watermark ended still waits for its certified settle (so a node behind
+ * that move does not bring its amount back meanwhile); null while neither counts.
+ */
+export function answerFloor(state) {
+  if (!state) return null;
+  const live = state.moves.some((m) => outcomeAt(m, state.liveLce) !== null) ? state.liveLce : null;
+  const marks = [state.floor, live].filter(isEpoch);
+  return marks.length ? Math.max(...marks) : null;
+}
+
+/**
+ * Whether a node balance answer may be shown for the wallet whose claim watermark is `floor` (answerFloor; null: none
  * known, every answer counts): only a node whose state is not behind it, its first unclaimed epoch past it, or with
  * nothing left to claim (the answer the network gives right after a whole move). A node behind it still counts epochs
  * the wallet moved already.
@@ -172,8 +257,8 @@ export function balanceAnswerCounts(r, floor = null) {
 
 /**
  * The node balance (nanoQNC) from genesis answers: the largest of those that count (balanceAnswerCounts: a claim is
- * re-verified on chain against the certified reward root, so among nodes not behind the wallet's certified watermark an
- * honest one can only under-report), or null when none does.
+ * re-verified on chain against the certified reward root, so among nodes not behind the wallet's watermark an honest one
+ * can only under-report), or null when none does.
  */
 export function acceptedBalance(answers, floor = null) {
   const ok = (Array.isArray(answers) ? answers : []).filter((r) => balanceAnswerCounts(r, floor));
@@ -181,13 +266,16 @@ export function acceptedBalance(answers, floor = null) {
 }
 
 /**
- * History rows with the state of the moves: the row of a move in transit is `moving`; the row of one a certified read
- * saw through is confirmed by that, whatever one node reported of it (its explorer row may not have come yet).
+ * History rows with the state of the moves: the row of a move in transit is `moving`; the row of one the live or a
+ * certified watermark showed through is confirmed by that, whatever one node reported of it (its explorer row may not
+ * have come yet).
  */
 export function withMoveStates(rows, state) {
   if (!Array.isArray(rows) || !state || (state.moves.length === 0 && state.outcomes.length === 0)) return rows;
-  const moving = new Set(state.moves.map((m) => m.txHash).filter(Boolean));
-  const through = new Set(state.outcomes.map((o) => o.txHash).filter(Boolean));
+  const inTransit = movingMoves(state);
+  const moving = new Set(inTransit.map((m) => m.txHash).filter(Boolean));
+  const through = new Set([...state.outcomes, ...state.moves.filter((m) => !inTransit.includes(m))]
+    .map((x) => x.txHash).filter(Boolean));
   let changed = false;
   const next = rows.map((row) => {
     if (!row || !row.hash) return row;
@@ -236,6 +324,8 @@ function cleanState(owner, raw) {
     moves: [...revived, ...held].slice(-MAX_MOVES),
     outcomes: outcomes.map(cleanOutcome).filter(Boolean).slice(-MAX_OUTCOMES),
     floor,
+    liveLce: null,
+    liveHeight: null,
   };
 }
 
@@ -257,16 +347,20 @@ export async function readTransit(owner) {
   }
 }
 
-/** Keeps `state` for its wallet beside the others'; a failed write only loses the record for the next start. */
+/**
+ * Keeps `state` for its wallet beside the others', without the live watermark (one node's word: memory only); a failed
+ * write only loses the record for the next start.
+ */
 export async function writeTransit(state) {
   try {
     if (!state || !state.owner) return;
     let all = {};
     try { all = await readAll(); } catch (_) { all = {}; }
     const { [state.owner]: _old, ...others } = all;
+    const { liveLce: _live, liveHeight: _height, ...record } = state;
     const empty = state.moves.length === 0 && state.outcomes.length === 0 && !isEpoch(state.floor);
     const kept = Object.keys(others).slice(-(MAX_WALLETS - (empty ? 0 : 1))).reduce((o, k) => ({ ...o, [k]: others[k] }), {});
-    const wallets = empty ? kept : { ...kept, [state.owner]: state };
+    const wallets = empty ? kept : { ...kept, [state.owner]: record };
     if (Object.keys(wallets).length === 0) {
       await AsyncStorage.removeItem(TRANSIT_KEY);
       return;

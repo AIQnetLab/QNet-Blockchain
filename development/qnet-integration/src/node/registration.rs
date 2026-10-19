@@ -1186,7 +1186,8 @@ impl BlockchainNode {
 
     /// Write a canonical block's side indices. THE single durable writer for them: called only after
     /// the block owns its slot, so a losing sibling can never plant a row that lowest-height-wins and
-    /// add-only semantics make impossible to remove.
+    /// add-only semantics make impossible to remove. Then hints the websocket followers of the addresses
+    /// the block touched.
     pub fn flush_block_side_indices(storage: &crate::storage::Storage, h: u64, s: &BlockSideIndices) {
         // The global vote/certificate caches had a pruner with ZERO callers, so their retention
         // window never executed and they grew for the process lifetime. This is the one hook that
@@ -1222,6 +1223,11 @@ impl BlockchainNode {
                 Err(e) => if is_warn() { println!("[WARN][REWARDS] super_elig_snapshot_failed epoch={} err={}", epoch, e); },
             }
         }
+        // Touched = the rich-list set (every tx's affected addresses, and the fee wallet when the block credits it fees)
+        // and the token transfers' parties, whose native accounts a token move leaves alone. One hand-off to the account
+        // hub that never waits; its task sends the events.
+        crate::rpc::notify_account_block(h, s.richlist.iter().map(|(a, _)| a.as_str())
+            .chain(s.token_rows.iter().flat_map(|r| [r.from.as_str(), r.to.as_str()])));
     }
 
     /// B (liveness-from-chain): at the epoch boundary, snapshot the finalized epoch's committed light

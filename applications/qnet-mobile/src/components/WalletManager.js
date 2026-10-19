@@ -2952,7 +2952,7 @@ export class WalletManager {
   /**
    * The light client's state in one line for a support screenshot (long press on the title): the capsule held, the
    * last capsule answer and the last walk to a certified root, with the steps a walk to the head still takes, and the
-   * certified balance the next send of `address` would be checked against.
+   * live figure the next send of `address` would be checked against.
    */
   async lightClientDiagnostics(address = null) {
     const c = this._lastCapsule || {};
@@ -2962,8 +2962,8 @@ export class WalletManager {
       'capsule ask: ' + (c.reason || 'never') + (c.index ? ' K=' + c.index : '') + ' (' + age(c.at) + ')',
       'walk: ' + (w.ok === undefined ? 'never' : w.ok ? 'ok' : (w.why || 'failed')) + (w.index ? ' to ' + w.index : '') + ' (' + age(w.at) + ')',
       'verified up to: ' + highestVerifiedIndex(), 'steps left: ' + (this.walkSteps() ?? 'none')];
-    const kept = address ? WalletManager.sendProofs.get(`qnc|${address}`) : null;
-    lines.push('send check base: ' + (kept ? 'K=' + kept.index + ' (' + age(kept.at) + ')' : 'none yet'));
+    const kept = address ? WalletManager.liveFigures.get(address) : null;
+    lines.push('send check base: ' + (kept ? 'live at ' + kept.figure.blockHeight + ' (' + age(kept.at) + ')' : 'none yet'));
     const refused = capsuleRefusal();
     if (refused) lines.push('capsule refused: K=' + refused.index + ' (' + age(Date.now() - refused.ageMs) + ')');
     const step = lastStepFailure();
@@ -4980,59 +4980,13 @@ export class WalletManager {
     return new Set([...counts].filter(([, n]) => n >= MIN_GENESIS_AGREEMENT).map(([k]) => k));
   }
 
-  // A send is decided only by a balance the committee certified (MB-R2-02, the owner's rule): a proof whose state root
-  // a committee QC certifies through the light client. Never one node's unverified word, never what genesis nodes agree
-  // on, never the figure on screen. The certified state lags the chain by minutes, so right after this wallet's own
-  // send the next one's nonce is above the certified one: what this wallet's own transactions from the certified nonce
-  // on take is counted against the certified figure (services/PendingTx spendableFrom), anything received since never
-  // is, and a nonce in between that is none of this wallet's own transactions (spent from another device) refuses the
-  // send. A kept proof is used again while it is at most SEND_PROOF_MAX_AGE_MS old; a kept QNC proof after that too, by
-  // the macroblock it names (wallet-galc plan 2.4): while that is within PROOF_MAX_LAG_MACROBLOCKS of the certified
-  // head and its nonce is not below the account nonce, however long ago it was read (the foreground follow keeps one at
-  // the head: followTick). A token proof, and a proof that names no macroblock (a node from before certified proofs),
-  // by its age only: a token balance can drop without the holder's nonce (another account's transferFrom). Otherwise
-  // one verified read with SEND_CHECK_DEADLINE_MS for all of it: as long as the first certification after a launch takes
-  // (the capsule, then the few steps from it; the extension's send check has the same 20 s), never a walk from the pin.
-  static SEND_PROOF_MAX_AGE_MS = 30_000;
-  static SEND_CHECK_DEADLINE_MS = 20_000;
-  static SEND_PROOFS_MAX = 32;
-  static sendProofs = new Map(); // 'qnc|address' | 'token|contract|holder' -> { figure, stateRoot, index, at }
-  static sendReads = new Map();  // the same keys -> { work, progress }: the verified read in flight
-
-  static _keepSendProof(key, figure, stateRoot, index = null) {
-    WalletManager.sendProofs.delete(key);
-    WalletManager.sendProofs.set(key, {
-      figure, stateRoot: String(stateRoot || ''), index: Number.isSafeInteger(index) ? index : null, at: Date.now(),
-    });
-    while (WalletManager.sendProofs.size > WalletManager.SEND_PROOFS_MAX) {
-      WalletManager.sendProofs.delete(WalletManager.sendProofs.keys().next().value);
-    }
-  }
-
-  static _keptSendProof(key) {
-    const e = WalletManager.sendProofs.get(key);
-    return e && Date.now() - e.at <= WalletManager.SEND_PROOF_MAX_AGE_MS ? e : null;
-  }
-
-  // A kept proof by its age (_keptSendProof), else by the macroblock it names: within PROOF_MAX_LAG_MACROBLOCKS of the
-  // certified head (the higher of `network`, the head the genesis nodes report, and the newest macroblock this device
-  // verified). One that names none, or with no head to judge it by, by its age only.
-  static _keptByIndex(key, network) {
-    const young = WalletManager._keptSendProof(key);
-    if (young) return young;
-    const e = WalletManager.sendProofs.get(key);
-    if (!e || !Number.isSafeInteger(e.index) || !Number.isSafeInteger(network)) return null;
-    const head = Math.max(highestVerifiedIndex(), network);
-    return e.index >= head - WalletManager.PROOF_MAX_LAG_MACROBLOCKS ? e : null;
-  }
-
-  // The certified head a kept QNC proof is judged by, read only when it is needed: the proof names its macroblock and is
-  // past the age rule (a proof read a moment ago needs no read at all). Cached a minute (_networkHeadIndex).
-  async _keptHead(key) {
-    const e = WalletManager.sendProofs.get(key);
-    if (!e || !Number.isSafeInteger(e.index) || WalletManager._keptSendProof(key)) return null;
-    return this._networkHeadIndex().catch(() => null);
-  }
+  // A send is checked against the wallet's figure at a genesis node's live tip (the owner's rule, 18.10): the proof route
+  // without `mb`, its proof folded to that node's root (liveQncFigure), less what this wallet's own transactions that
+  // figure does not hold may still take (services/PendingTx spendableFrom); the network itself refuses what it cannot
+  // pay. One read: the figure and the account nonce the genesis nodes report are read at once, and a figure read within
+  // LIVE_SEND_REUSE_MS (the Send screen reads one when it opens) is taken as it is. The committee-certified read runs in
+  // the background only (getQNCBalanceWithProof) and decides nothing here.
+  static LIVE_SEND_REUSE_MS = 15_000;
 
   // An account nonce as a number, or null.
   static _nonceOf(v) {
@@ -5042,9 +4996,8 @@ export class WalletManager {
 
   // The account nonce a send check counts this wallet's transactions up to: `nonce` (a value, its promise or a function
   // reading it; undefined: the one genesis nodes agree on), never below the highest this device confirmed (so a later
-  // read never leaves out a transaction an earlier plan counted as settled). A read that fails gives that highest one
-  // (every own transaction above the certified nonce is then counted as unsettled); null only for `nonce` null
-  // (another account's balance, where nothing of this wallet counts).
+  // read never leaves out a transaction an earlier plan counted as settled). A read that fails gives that highest one;
+  // null only for `nonce` null (another account's balance, where nothing of this wallet counts).
   async _sendAccountNonce(address, nonce) {
     if (nonce === null) return null;
     const given = await Promise.resolve()
@@ -5053,150 +5006,79 @@ export class WalletManager {
     return Math.max(given === null ? 0 : given, await this._nonceHighWater(address));
   }
 
-  // A certified base for a send check. `kept()`: { nonce, figure, ... } of a proof read a moment ago, or null.
-  // `fresh(progress)`: one verified read as { figure, nonce, ... }, or null; `progress.answered` is set once a node
-  // answered. A kept proof at least as new as `accountNonce` is used at once; otherwise a fresh one is read (a newer
-  // certified state may already hold the spends the account nonce shows) and the kept one stands in when none comes in
-  // time. One read for the callers that come while it is younger than SEND_CHECK_DEADLINE_MS (a later one starts its
-  // own: a read that never ends holds nobody after it), each waiting SEND_CHECK_DEADLINE_MS from its own call: the tap
-  // on Send joins the read the Send screen started when it opened and still waits its own full time.
-  // The base, or { error: 'unanswered' (no node answered) | 'unconfirmed' (answers came, none certified in time) }.
-  async _sendBase(key, kept, fresh, accountNonce) {
-    const k = kept();
-    if (k && k.nonce !== null && accountNonce !== null && k.nonce >= accountNonce) return { ...k, cached: true };
-    let read = WalletManager.sendReads.get(key);
-    if (!read) {
-      const progress = { answered: false };
-      let expiry = null;
-      const drop = () => {
-        clearTimeout(expiry);
-        if (WalletManager.sendReads.get(key) === read) WalletManager.sendReads.delete(key);
-      };
-      const work = Promise.resolve().then(() => fresh(progress)).catch(() => null).finally(drop);
-      read = { work, progress };
-      expiry = setTimeout(drop, WalletManager.SEND_CHECK_DEADLINE_MS);
-      if (expiry && typeof expiry.unref === 'function') expiry.unref();
-      WalletManager.sendReads.set(key, read);
-    }
-    const { work, progress } = read;
-    const none = () => ({ error: progress.answered ? 'unconfirmed' : 'unanswered' });
-    let timer;
-    const r = await Promise.race([
-      work.then((v) => v || none()),
-      new Promise((resolve) => { timer = setTimeout(() => resolve(none()), WalletManager.SEND_CHECK_DEADLINE_MS); }),
-    ]).finally(() => clearTimeout(timer));
-    if (r && r.figure) return r;
-    return k ? { ...k, cached: true } : r;
-  }
-
-  // The holder's certified QNC base: { base: { figure, nonce, stateRoot, index, cached }, accountNonce } or { error }.
-  // A kept proof counts by its macroblock (_keptByIndex); `byIndex` false: by its age, as for a token check, whose
-  // token proof is paired with this base.
-  async _certifiedQncBase(address, nonce, { byIndex = true } = {}) {
-    const key = `qnc|${address}`;
-    const [accountNonce, network] = await Promise.all([
+  // The live figure a send of `address` is checked against, and the account nonce it is counted up to: { live
+  // (liveQncFigure), liveNonce, accountNonce }, or { error: 'unanswered' } when no genesis node answered with a proof that
+  // folds. `nodes`: the genesis names to ask, in order; `maxAgeMs`: how old a figure read before may be (a token check
+  // reads one at the same moment as its token figure, from the same names).
+  async _liveSendBase(address, nonce, { nodes = null, maxAgeMs = WalletManager.LIVE_SEND_REUSE_MS } = {}) {
+    const [live, accountNonce] = await Promise.all([
+      this.liveQncFigure(address, { maxAgeMs, nodes }).catch(() => null),
       this._sendAccountNonce(address, nonce),
-      byIndex ? this._keptHead(key) : null,
     ]);
-    const kept = () => {
-      const e = byIndex ? WalletManager._keptByIndex(key, network) : WalletManager._keptSendProof(key);
-      return e ? { nonce: WalletManager._nonceOf(e.figure.nonce), figure: e.figure, stateRoot: e.stateRoot, index: e.index } : null;
-    };
-    const fresh = async (progress) => {
-      const r = await this.getQNCBalanceWithProof(address, true, { onAnswer: () => { progress.answered = true; } });
-      if (r && (r.ok || r.reason === 'unconfirmed')) progress.answered = true;
-      if (!r || !r.ok || !r.verified || WalletManager._nonceOf(String(r.nonce)) === null) return null;
-      const index = Number.isSafeInteger(r.index) ? r.index : null;
-      const figure = { ok: true, verified: true, balanceNano: r.balanceNano, nonce: String(r.nonce), balance: r.balance, index };
-      return { figure, nonce: WalletManager._nonceOf(String(r.nonce)), stateRoot: String(r.stateRoot || ''), index };
-    };
-    const base = await this._sendBase(key, kept, fresh, accountNonce);
-    return base.figure ? { base, accountNonce } : { error: base.error };
+    const liveNonce = live ? WalletManager._nonceOf(String(live.nonce)) : null;
+    if (!live || liveNonce === null || !/^\d+$/.test(String(live.balanceNano))) return { error: 'unanswered' };
+    return { live, liveNonce, accountNonce };
   }
 
   /**
-   * The QNC balance a send is checked against (the Send form, the in-app browser's sheet, the nonce a send signs at),
-   * from a committee-certified proof (see _sendBase): { ok: true, verified: true, balanceNano (the certified figure
-   * less what this wallet's transactions settled since its checkpoint took), certifiedNano, nonce (the account nonce
-   * in the certified state), accountNonce (the one counted up to), pending ([{ nonce, amount }]: what this wallet's
-   * unsettled transactions may still take, nano), balance, index, cached }, or { ok: false, verified: false, error }:
-   * 'unanswered' (the network did not answer), 'unconfirmed' (not certified in time, or what one of this wallet's
-   * transactions takes is not known; with `walkSteps` while a long lineage walk is the reason: walkSteps) or 'foreign'
-   * (a transaction from another device is not confirmed yet).
+   * The QNC balance a send is checked against (the Send form, the in-app browser's sheet): { ok: true, balanceNano (the
+   * live figure less what this wallet's transactions that applied after it took), nonce (the account nonce in that
+   * state), accountNonce (the one counted up to), pending ([{ nonce, amount }]: what this wallet's unsettled transactions
+   * may still take, nano), balance, blockHeight }, or { ok: false, error }: 'unanswered' (no genesis node answered with a
+   * proof that folds) or 'unconfirmed' (what one of this wallet's transactions takes is not known here).
    * `nonce`: the account nonce the chain confirms (a value or its promise; null: unknown, nothing of this wallet is
    * counted); without it the one genesis nodes agree on.
    */
-  async certifiedQncForSend(address, { nonce } = {}) {
-    const refused = (error, extra = {}) => ({ ok: false, verified: false, balanceNano: null, nonce: null, error, ...extra });
+  async qncForSend(address, { nonce } = {}) {
+    const refused = (error) => ({ ok: false, balanceNano: null, nonce: null, error });
     if (!address || typeof address !== 'string') return refused('Invalid address');
-    const got = await this._certifiedQncBase(address, nonce);
-    if (!got.base) return refused(got.error, await this._walkNote(got.error));
-    const { base, accountNonce } = got;
-    const figure = base.figure;
+    const got = await this._liveSendBase(address, nonce);
+    if (got.error) return refused(got.error);
+    const { live, liveNonce, accountNonce } = got;
     const out = (balanceNano, pending, through) => ({
-      ok: true, verified: true, balanceNano, certifiedNano: figure.balanceNano, nonce: figure.nonce, balance: Number(balanceNano) / 1e9,
-      index: Number.isSafeInteger(base.index) ? base.index : null, accountNonce: through, pending, ...(base.cached ? { cached: true } : {}),
+      ok: true, balanceNano, nonce: String(liveNonce), accountNonce: through, pending, balance: Number(balanceNano) / 1e9,
+      blockHeight: live.blockHeight,
     });
-    if (accountNonce === null) return out(figure.balanceNano, [], null);
+    if (accountNonce === null) return out(String(live.balanceNano), [], null);
     let spends;
     try { spends = await ownSpends(address); } catch (_) { return refused('unconfirmed'); }
-    const certifiedNonce = WalletManager._nonceOf(figure.nonce);
-    const r = spendableFrom({ certified: figure.balanceNano, certifiedNonce, accountNonce, spends });
-    if (!r.ok) return refused(r.reason, r.nonce !== undefined ? { foreignNonce: r.nonce } : {});
-    return out(r.balance, r.pending, Math.max(accountNonce, certifiedNonce));
+    const r = spendableFrom({ base: String(live.balanceNano), baseNonce: liveNonce, accountNonce, spends });
+    if (!r.ok) return refused(r.reason);
+    return out(r.balance, r.pending, Math.max(accountNonce, liveNonce));
   }
 
   /**
-   * A token balance a send may be decided by (the Send form, the in-app browser's token transfers, a recipient's
-   * deposit), from a committee-certified proof: { ok: true, verified: true, balanceBase (the certified figure less the
-   * tokens this wallet's transactions settled since its checkpoint moved), certifiedBase, pending ([{ nonce, amount }]:
-   * the tokens its unsettled transactions may still move), balance, cached } or { ok: false, error } as for
-   * certifiedQncForSend. The holder's account nonce in the certified state comes from its certified QNC proof at the
-   * same macroblock (the same state root, for a node from before certified proofs). `nonce` as for
-   * certifiedQncForSend; null for another account (a recipient): its certified figure as it is.
+   * A token balance a send is checked against (the Send form, the in-app browser's token transfers, a recipient's
+   * deposit): the holder's live token figure (liveTokenFigure) less the tokens this wallet's transactions that applied
+   * after it moved: { ok: true, balanceBase, pending ([{ nonce, amount }]: the tokens its unsettled transactions may still
+   * move), balance } or { ok: false, error } as for qncForSend. The holder's account nonce in that state comes from its
+   * live QNC figure, read at the same moment from the same genesis names, and counts only of the same block: another
+   * block may hold one of this wallet's token spends on one side only (counted twice, or not at all). Two of different
+   * blocks are read again once, both from the node that gave the token figure, else refused as unanswered. `nonce` as
+   * for qncForSend; null for another account (a recipient): its live figure as it is.
    */
   async checkedTokenBalance(contract, holder, decimals = null, { nonce } = {}) {
-    const refused = (error, extra = {}) => ({ ok: false, balance: null, balanceBase: null, verified: false, error, ...extra });
+    const refused = (error) => ({ ok: false, balance: null, balanceBase: null, error });
     if (!contract || !holder) return refused('unanswered');
-    const key = `token|${contract}|${holder}`;
-    const formatted = (base) => (decimals != null ? this._formatBaseUnits(base, decimals) : base);
-    const readToken = (index) => async (progress) => {
-      const r = await this.getTokenBalanceWithProof(contract, holder, null, true, { index });
-      if (r && (r.ok || r.reason === 'unconfirmed')) progress.answered = true;
-      if (!r || !r.ok || !r.verified || !/^\d+$/.test(String(r.balanceBase))) return null;
-      return { figure: { balanceBase: String(r.balanceBase) }, nonce: null, stateRoot: String(r.stateRoot || ''), index: r.index };
-    };
-    if (nonce === null) {
-      const got = await this._sendBase(key, () => null, readToken(null), null);
-      if (!got.figure) return refused(got.error, await this._walkNote(got.error));
-      return { ok: true, verified: true, balanceBase: got.figure.balanceBase, certifiedBase: got.figure.balanceBase, pending: [], cached: false, balance: formatted(got.figure.balanceBase) };
-    }
-    const qnc = await this._certifiedQncBase(holder, nonce, { byIndex: false });
-    if (!qnc.base) return refused(qnc.error, await this._walkNote(qnc.error));
-    const { base, accountNonce } = qnc;
-    const index = Number.isSafeInteger(base.index) ? base.index : null;
-    // Only a token proof of the same certified state as the QNC proof: the macroblock it names, else its root.
-    const paired = (p) => !!p && (index !== null ? p.index === index : !!base.stateRoot && p.stateRoot === base.stateRoot);
-    const kept = () => {
-      const e = WalletManager._keptSendProof(key);
-      return e && paired(e) ? { nonce: base.nonce, figure: e.figure, stateRoot: e.stateRoot, index: e.index } : null;
-    };
-    const fresh = async (progress) => {
-      const r = await readToken(index)(progress);
-      return r && paired(r) ? { ...r, nonce: base.nonce } : null;
-    };
-    const got = await this._sendBase(key, kept, fresh, base.nonce);
-    if (!got.figure) return refused(got.error, await this._walkNote(got.error));
-    // A read another check started may be of another state: it counts only paired with this one.
-    if (!paired(got) || accountNonce === null) return refused('unconfirmed');
+    const formatted = (b) => (decimals != null ? this._formatBaseUnits(b, decimals) : b);
+    const read = (nodes) => Promise.all([
+      this.liveTokenFigure(contract, holder, null, { nodes }).catch(() => null),
+      nonce === null ? null : this._liveSendBase(holder, nonce, { nodes, maxAgeMs: 0 }),
+    ]);
+    let [token, base] = await read(this._proofOrder(this.getTrustedNodes(3)));
+    const apart = () => !!token && !!base && !base.error && token.blockHeight !== base.live.blockHeight;
+    if (apart() && token.node) [token, base] = await read([token.node]);
+    if (!token) return refused('unanswered');
+    if (nonce === null) return { ok: true, balanceBase: token.balanceBase, pending: [], balance: formatted(token.balanceBase) };
+    if (base.error) return refused(base.error);
+    if (apart()) return refused('unanswered');
     let spends;
     try { spends = await ownSpends(holder); } catch (_) { return refused('unconfirmed'); }
-    const r = spendableFrom({ certified: got.figure.balanceBase, certifiedNonce: base.nonce, accountNonce, spends, token: contract });
-    if (!r.ok) return refused(r.reason, r.nonce !== undefined ? { foreignNonce: r.nonce } : {});
-    return {
-      ok: true, verified: true, balanceBase: r.balance, certifiedBase: got.figure.balanceBase, pending: r.pending,
-      cached: !!got.cached, balance: formatted(r.balance),
-    };
+    const r = spendableFrom({
+      base: token.balanceBase, baseNonce: base.liveNonce, accountNonce: base.accountNonce, spends, token: contract,
+    });
+    if (!r.ok) return refused(r.reason);
+    return { ok: true, balanceBase: r.balance, pending: r.pending, balance: formatted(r.balance) };
   }
 
   /**
@@ -5286,26 +5168,24 @@ export class WalletManager {
   static NONCE_HWM_KEY = 'qnet_nonce_hwm';
 
   /**
-   * The account nonce the chain confirms, from a QC-verified account proof and the value at least two genesis
-   * nodes report. A certified state can be old (a proof from before a spend), so a verified value never
-   * overrides a higher one the genesis nodes agree on; the higher of the two counts. Without an agreement, the
-   * nonce never goes below the highest this device already confirmed for the address, so an old certified
-   * state cannot make the wallet plan a nonce the chain has used. An agreement of the genesis nodes may set it
-   * lower again (a chain rolled back), never one node's answer. Throws when neither is to be had.
+   * The account nonce the chain confirms: the value at least two genesis nodes report at their live tip. Without such an
+   * agreement, the nonce of the wallet's live figure (a genesis node's live tip, its proof folded to that node's root),
+   * never below the highest this device already confirmed for the address. An agreement of the genesis nodes may set it
+   * lower again (a chain rolled back), never one node's answer alone. Throws when neither is to be had.
    */
   async _confirmedAccountNonce(address) {
-    // Both at once: the genesis answers also say whether the chain holds this wallet's key (pk elision). The proof is
-    // the send check's certified base (_certifiedQncBase): one read a moment ago at least as new as the agreed nonce,
-    // else one verified read within its deadline, never a long lineage walk. Only its nonce counts here.
+    // Both at once: the genesis answers also say whether the chain holds this wallet's key (pk elision). The live figure
+    // is the send check's (_liveSendBase): one read a moment ago, else one read now, waited for only without an agreement.
     const agreement = this._agreedGenesisNonce(address).then((n) => ({ n }), (e) => ({ e }));
-    const proof = await this._certifiedQncBase(address, agreement.then((a) => (a.e ? null : a.n))).catch(() => null);
+    const live = this.liveQncFigure(address, { maxAgeMs: WalletManager.LIVE_SEND_REUSE_MS }).catch(() => null);
     const agreed = await agreement;
-    const proofNonce = proof && proof.base && Number.isSafeInteger(proof.base.nonce) ? proof.base.nonce : null;
-    const agreedNonce = !agreed.e && Number.isSafeInteger(agreed.n) ? agreed.n : null;
-    if (proofNonce === null && agreedNonce === null) throw agreed.e || new Error('No confirmed account nonce');
-    const confirmed = agreedNonce !== null
-      ? Math.max(agreedNonce, proofNonce === null ? 0 : proofNonce)
-      : Math.max(proofNonce, await this._nonceHighWater(address));
+    let confirmed = !agreed.e && Number.isSafeInteger(agreed.n) ? agreed.n : null;
+    if (confirmed === null) {
+      const f = await live;
+      const liveNonce = f ? WalletManager._nonceOf(String(f.nonce)) : null;
+      if (liveNonce === null) throw agreed.e || new Error('No confirmed account nonce');
+      confirmed = Math.max(liveNonce, await this._nonceHighWater(address));
+    }
     await this._setNonceHighWater(address, confirmed);
     return confirmed;
   }
@@ -5489,17 +5369,14 @@ export class WalletManager {
 
   /**
    * What a confirmation screen needs before a send: { confirmed, nonce (with nothing unsettled, else null),
-   * live, replace, canAppend, recent }. `live` are this wallet's unsettled transactions and `replace` the one a
-   * replacement takes the place of (services/PendingTx pendingChoices); `recent` the ones settled in the last
-   * half hour, for the "same payment again" warning.
+   * live, replace, canAppend }. `live` are this wallet's unsettled transactions and `replace` the one a
+   * replacement takes the place of (services/PendingTx pendingChoices).
    */
   async previewSend(address) {
     const confirmed = await this._confirmedAccountNonce(address);
     const live = await settle(address, confirmed);
     const choices = pendingChoices(confirmed, live);
-    return {
-      confirmed, nonce: live.length ? null : confirmed + 1, ...choices, recent: await recentSettled(address),
-    };
+    return { confirmed, nonce: live.length ? null : confirmed + 1, ...choices };
   }
 
   /** The nonce a choice made on a preview signs at (null when the choice is not valid for it). */
@@ -5543,8 +5420,8 @@ export class WalletManager {
         // later send in addition must leave for it (dappProvider spendableNano, MOB-BR-R3-02).
         reserveNano: Number.isSafeInteger(extra.reserveNano) && extra.reserveNano >= 0 ? extra.reserveNano : null,
       };
-      // The most it can take (services/PendingTx ownSpends): what a send after it is checked against until the
-      // certified state reaches its nonce.
+      // The most it can take (services/PendingTx ownSpends): what a send after it is checked against until the live
+      // state it is checked by holds its nonce.
       const spend = normalSpend(extra.spend);
       const entry = {
         from, nonce: plan.nonce, path, body, bodyHash: bodyHashOf(body), pk: pk || null, summary, spend, createdAt: Date.now(),
@@ -5731,11 +5608,6 @@ export class WalletManager {
    */
   stopPendingTransaction(address, nonce, bodyHash) {
     return stopFrom(address, nonce, { bodyHash });
-  }
-
-  /** Summaries of this wallet's transactions settled in the last half hour, newest first (services/PendingTx). */
-  recentSettledTransactions(address) {
-    return recentSettled(address);
   }
 
   /**
@@ -6060,21 +5932,12 @@ export class WalletManager {
     return Number.isFinite(steps) && steps > WalletManager.LONG_WALK_STEPS ? steps : null;
   }
 
-  // What a refused send check adds while a long walk is why nothing was certified: { walkSteps }, else nothing. The
-  // head it is judged by is the one read last (a minute at most), else read now.
-  async _walkNote(error) {
-    if (error !== 'unconfirmed') return {};
-    await this._networkHeadIndex().catch(() => null);
-    const steps = this.walkSteps();
-    return steps === null ? {} : { walkSteps: steps };
-  }
-
   // The foreground follow (wallet-galc plan 2.4): while the wallet is open and the app in front, the screen calls
   // followTick every FOLLOW_MS. One tick reads the certified head, makes one walk step toward it on its parity (both
   // parities for OWN_SEND_LATEST_MS after this wallet's own send, and up to FOLLOW_CATCH_UP_STEPS each while either is
   // more than a step behind; the capsule refreshed first while that walk is long),
-  // reads the open wallet's QNC proof (kept for the next send check by its macroblock: _balanceProofFrom, _keptByIndex;
-  // its read walks what is left while the device is behind) and keeps the anchors and the capsule. One tick runs at a
+  // reads the open wallet's QNC proof (its read walks what is left while the device is behind; a certified watermark it
+  // shows settles a move in transit for good: ClaimTransit) and keeps the anchors and the capsule. One tick runs at a
   // time.
   static FOLLOW_MS = 90_000;
   // The walk steps a follow tick takes on each parity while one is behind (about 16 s and 0.9 MB at today's speed).
@@ -6381,16 +6244,9 @@ export class WalletManager {
         if (onAnswer) { try { onAnswer(); } catch (_) { /* the caller's note never stops the read */ } }
         return this._judgeAccountAnswer(address, res, verify, early);
       });
-    if (got.verified) {
-      const r = got.verified;
-      // A certified answer is what the next send check may use again (certifiedQncForSend).
-      WalletManager._keepSendProof(`qnc|${address}`, {
-        ok: true, verified: true, balanceNano: r.balanceNano, nonce: r.nonce, balance: r.balance, index: r.index,
-      }, r.stateRoot, r.index);
-      return r;
-    }
+    if (got.verified) return got.verified;
     // A folded figure, 0 included, under the same rule: shown as not verified (the screen never lowers a shown figure with
-    // one, and a send checks its own certified figure). ok:false only when no answer folded.
+    // one). ok:false only when no answer folded.
     if (got.figure) return { ok: true, verified: false, ...got.figure, reason: 'unconfirmed' };
     if (!got.answered) logger.warn('[BALANCE] proof fetch failed:', got.error);
     return { ok: false, balance: null, verified: false, error: got.error, reason: got.answered ? 'unconfirmed' : 'unanswered' };
@@ -6473,39 +6329,96 @@ export class WalletManager {
   }
 
   /**
-   * The open wallet's QNC figure at a genesis node's live tip (the proof route without `mb`: the node's live state and a
-   * proof of the account under that state's root), for the screen only, as a wallet that shows its node's answer does:
-   * money that came in shows within seconds instead of after the next certified checkpoint. { balance, balanceNano,
-   * nonce, blockHeight, figureClaimedEpoch } once its proof folds to the root the node served, else null. Never a send's
-   * base (certifiedQncForSend) and never verified: the certified read confirms it.
+   * One read of a genesis node's live tip (a proof route without `mb`: the node's live state and a proof under that
+   * state's root): the first answer `judge(data)` folds into a figure, the next of `nodes` (genesis names, in order) asked
+   * when one answers with nothing that folds; null when none does. `judge(data, node)` is told which node answered. A body
+   * in the certified form, or one that names no height, is no answer here. Never marks a node old and keeps nothing for a
+   * certified read.
    */
-  async liveQncFigure(address) {
-    if (!address || typeof address !== 'string') return null;
-    let res;
-    try {
-      res = await this._hedged(`/api/v1/account/${address}/balance/proof`, {
-        timeoutMs: 5000, hedgeMs: 800, raw: true, nodes: this.getTrustedNodes(3), maxBytes: WalletManager.PROOF_ANSWER_MAX_BYTES,
-      });
-    } catch (_) {
-      return null;
+  async _liveFigure(path, nodes, judge) {
+    const order = Array.isArray(nodes) && nodes.length ? nodes : this._proofOrder(this.getTrustedNodes(3));
+    const tried = [];
+    for (;;) {
+      const left = order.filter((u) => !tried.includes(u));
+      if (left.length === 0) return null;
+      let res;
+      try {
+        res = await this._hedged(path, {
+          timeoutMs: 5000, hedgeMs: 800, raw: true, nodes: left, maxBytes: WalletManager.PROOF_ANSWER_MAX_BYTES,
+        });
+      } catch (_) {
+        return null;
+      }
+      if (!res || !res.ok || !res.data) return null;
+      const node = left.includes(res.base) ? res.base : null;
+      tried.push(node || left[0]);
+      let data;
+      try { data = parseStrictJson(res.data); } catch (_) { continue; }
+      if (!data || typeof data !== 'object' || Array.isArray(data) || data.proof_format !== undefined) continue;
+      if (!Number.isSafeInteger(data.block_height) || data.block_height < 0) continue;
+      const figure = await judge(data, node);
+      if (figure) return figure;
     }
-    if (!res || !res.ok || !res.data) return null;
-    let data;
-    try { data = parseStrictJson(res.data); } catch (_) { return null; }
-    if (!data || typeof data !== 'object' || Array.isArray(data) || data.proof_format !== undefined) return null;
-    if (!Number.isSafeInteger(data.block_height) || data.block_height < 0) return null;
-    const got = await this._liveAccountFigure(address, data);
-    if (!got.folded) return null;
-    const f = got.figure;
-    return { balance: f.balance, balanceNano: f.balanceNano, nonce: f.nonce, blockHeight: f.blockHeight, figureClaimedEpoch: f.figureClaimedEpoch };
+  }
+
+  static liveFigures = new Map(); // address -> { at, figure }: the last live QNC figure read
+  static liveReads = new Map();   // address -> the live QNC read in flight
+
+  /**
+   * The wallet's QNC figure at a genesis node's live tip, as a wallet that shows its node's answer does: money that came
+   * in shows within seconds, and a send is checked against it (qncForSend). { balance, balanceNano, nonce, blockHeight,
+   * figureClaimedEpoch } once its proof folds to the root the node served, else null. Never verified: the certified read
+   * confirms it in the background. One read at a time per address; `maxAgeMs`: a figure read that recently is taken as
+   * it is (a send check; the screen always reads anew). `nodes`: the genesis names to ask, in order.
+   */
+  liveQncFigure(address, { maxAgeMs = 0, nodes = null } = {}) {
+    if (!address || typeof address !== 'string') return Promise.resolve(null);
+    const kept = WalletManager.liveFigures.get(address);
+    if (kept && maxAgeMs > 0 && Date.now() - kept.at <= maxAgeMs) return Promise.resolve(kept.figure);
+    const running = WalletManager.liveReads.get(address);
+    if (running) return running;
+    const read = this._liveFigure(`/api/v1/account/${address}/balance/proof`, nodes, async (data) => {
+      const got = await this._liveAccountFigure(address, data);
+      if (!got.folded) return null;
+      const f = got.figure;
+      return { balance: f.balance, balanceNano: f.balanceNano, nonce: f.nonce, blockHeight: f.blockHeight, figureClaimedEpoch: f.figureClaimedEpoch };
+    }).catch(() => null).then((figure) => {
+      if (figure) {
+        const map = WalletManager.liveFigures;
+        map.delete(address);
+        map.set(address, { at: Date.now(), figure });
+        while (map.size > 8) map.delete(map.keys().next().value);
+      }
+      return figure;
+    }).finally(() => {
+      if (WalletManager.liveReads.get(address) === read) WalletManager.liveReads.delete(address);
+    });
+    WalletManager.liveReads.set(address, read);
+    return read;
+  }
+
+  /**
+   * `holder`'s balance of the QRC-20 `contract` at a genesis node's live tip (the token proof route without `mb`, both
+   * levels folded to the root the node served), modelled on liveQncFigure: { balanceBase (exact text), balance (scaled by
+   * `decimals` when given), blockHeight, node (the genesis name that answered) }, else null. Never verified: the certified
+   * token read confirms it.
+   */
+  async liveTokenFigure(contract, holder, decimals = null, { nodes = null } = {}) {
+    if (!contract || !holder) return null;
+    return this._liveFigure(`/api/v1/token/${contract}/${holder}/balance/proof`, nodes, async (data, node) => {
+      const got = await this._liveTokenBody(contract, holder, data);
+      if (!got.folded) return null;
+      const b = got.figure.balanceBase;
+      const balance = decimals != null ? this._formatBaseUnits(b, decimals) : b;
+      return { balanceBase: b, balance, blockHeight: data.block_height, node };
+    });
   }
 
   // V2: TRUSTLESS QRC-20 balance — exactly the getQNCBalanceWithProof trust model, one level deeper.
   //   GET /api/v1/token/{contract}/{holder}/balance/proof?mb= -> two-level proof (the contract account under the
   // certified state root, the holder's entry under the storage root that account commits to). `verified` is true only
   // when both levels fold to the committee-certified root (_judgeTokenAnswer). Balance is exact u64 text.
-  // Names the holder, so genesis names only (see getQNCBalanceWithProof). `opts.index`: the macroblock to ask for (a
-  // send check pairs it with the holder's QNC proof at the same index).
+  // Names the holder, so genesis names only (see getQNCBalanceWithProof). `opts.index`: the macroblock to ask for.
   async getTokenBalanceWithProof(contract, holder, decimals = null, verify = true, opts = null) {
     const index = opts && Number.isSafeInteger(opts.index) ? opts.index : null;
     return this._tokenProofFrom(contract, holder, decimals, verify, this.getTrustedNodes(3), { index });
@@ -6519,11 +6432,7 @@ export class WalletManager {
       ok: true, balance: decimals != null ? this._formatBaseUnits(f.balanceBase, decimals) : f.balanceBase,
       balanceBase: f.balanceBase, verified, blockHeight: f.blockHeight, stateRoot: f.stateRoot, index: f.index,
     });
-    if (got.verified) {
-      const f = got.verified;
-      WalletManager._keepSendProof(`token|${contract}|${holder}`, { balanceBase: f.balanceBase }, f.stateRoot, f.index);
-      return shaped(f, true);
-    }
+    if (got.verified) return shaped(got.verified, true);
     // A folded figure, 0 included (a contract or holder entry proven absent), as the QNC read: shown as not verified.
     if (got.figure) return { ...shaped(got.figure, false), reason: 'unconfirmed' };
     return { ok: false, balance: null, verified: false, error: got.error, reason: got.answered ? 'unconfirmed' : 'unanswered' };
@@ -6547,16 +6456,25 @@ export class WalletManager {
       return { figure: folded ? figure : null, error: 'unconfirmed' };
     }
     if (isLegacyProofBody(data, 'token')) markNodeOld(res.base);
-    // token_balance is the stored decimal string the storage leaf commits to, byte for byte.
+    const got = await this._liveTokenBody(contract, holder, data, verify);
+    if (got.error) return { error: got.error };
+    if (!verify) return { figure: got.figure };
+    if (!got.folded) return { error: 'bad proof' };
+    if (await this._certifiedFresh(data.state_root, data.block_height)) return { verified: got.figure };
+    return { figure: got.figure, error: 'unconfirmed' };
+  }
+
+  // A token answer in the body of the node's live state (no proof_format): { figure, folded (both levels fold to the
+  // root the node served; checked only with `fold`) } or { error }. token_balance is the stored decimal string the
+  // storage leaf commits to, byte for byte.
+  async _liveTokenBody(contract, holder, data, fold = true) {
     const raw = data.token_balance === undefined ? '0' : data.token_balance;
     const baseUnitsStr = typeof raw === 'number' ? u64Text(raw) : (typeof raw === 'string' && /^\d{1,20}$/.test(raw) ? raw : null);
     if (baseUnitsStr === null) return { error: 'bad proof' };
     const figure = { balanceBase: baseUnitsStr, blockHeight: data.block_height, stateRoot: data.state_root, index: null };
-    if (!verify) return { figure };
-    if (!Array.isArray(data.storage_proof) || !Array.isArray(data.account_proof)) return { error: 'bad proof' };
-    if (!(await this.verifyTokenBalanceProof({ ...data, token_balance: baseUnitsStr }, contract, holder))) return { error: 'bad proof' };
-    if (await this._certifiedFresh(data.state_root, data.block_height)) return { verified: figure };
-    return { figure, error: 'unconfirmed' };
+    const folded = fold && Array.isArray(data.storage_proof) && Array.isArray(data.account_proof)
+      && await this.verifyTokenBalanceProof({ ...data, token_balance: baseUnitsStr }, contract, holder);
+    return { figure, folded: !!folded };
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -6739,55 +6657,61 @@ export class WalletManager {
     return agreed;
   }
 
-  // What recipients are in a certified state (certifiedRecipientKind): address -> { kind, index }.
+  // What recipients are in a certified state (certifiedRecipientKind): address -> { kind, index }; the reads in flight.
   static recipientKinds = new Map();
+  static recipientReads = new Map();
   static RECIPIENT_KINDS_MAX = 64;
 
   /**
-   * What `address` is in a state the committee certified (wallet-galc plan P1): the is_contract field of its account
-   * leaf, folded to the certified root of the macroblock its proof names (SmtFold readCertifiedAccount,
-   * _certifiedRootFresh): 'contract', 'none' (no contract: an account, or no account at all, both proven), or null when
-   * no certified answer came within SEND_CHECK_DEADLINE_MS. A contract stays one, so that answer is kept; 'none' is
-   * used again while its macroblock is within PROOF_MAX_LAG_MACROBLOCKS of the certified head, as a send proof (the
-   * second check before signing is then instant).
+   * What `address` is in a state the committee certified, in the background of a send's recipient check
+   * (payableRecipientProblem): the is_contract field of its account leaf, folded to the certified root of the macroblock
+   * its proof names (SmtFold readCertifiedAccount, _certifiedRootFresh): 'contract', 'none' (no contract: an account, or
+   * no account at all, both proven), or null when no certified answer came. A contract stays one, so that answer is kept
+   * and refuses every later send to it at once; 'none' is used again while its macroblock is within
+   * PROOF_MAX_LAG_MACROBLOCKS of the certified head. One read at a time per address.
    */
-  async certifiedRecipientKind(address) {
-    const known = WalletManager.recipientKinds.get(address);
-    if (known && known.kind === 'contract') return 'contract';
-    const network = await this._networkHeadIndex().catch(() => null);
-    if (known && network !== null
-        && known.index >= Math.max(highestVerifiedIndex(), network) - WalletManager.PROOF_MAX_LAG_MACROBLOCKS) return known.kind;
-    const judge = async (res) => {
-      let data;
-      try { data = parseStrictJson(res.data); } catch (_) { return { error: 'bad json' }; }
-      const r = readCertifiedAccount(data, address, sha3Hex);
-      if (!r.ok) return { error: 'bad proof' };
-      const root = await this._certifiedRootFresh(r.index);
-      if (!root.ok || !r.fold(root.stateRoot)) return { error: 'unconfirmed' };
-      return { verified: { kind: r.account.is_contract ? 'contract' : 'none', index: r.index } };
-    };
-    let timer;
-    const got = await Promise.race([
-      this._proofAnswers(`/api/v1/account/${address}/balance/proof`, this.getTrustedNodes(3), this._proofPasses(address, null), judge)
-        .catch(() => null),
-      new Promise((resolve) => { timer = setTimeout(() => resolve(null), WalletManager.SEND_CHECK_DEADLINE_MS); }),
-    ]).finally(() => clearTimeout(timer));
-    const v = got && got.verified;
-    if (!v) return null;
-    const kinds = WalletManager.recipientKinds;
-    kinds.delete(address);
-    kinds.set(address, v);
-    while (kinds.size > WalletManager.RECIPIENT_KINDS_MAX) kinds.delete(kinds.keys().next().value);
-    return v.kind;
+  certifiedRecipientKind(address) {
+    const running = WalletManager.recipientReads.get(address);
+    if (running) return running;
+    const read = (async () => {
+      const known = WalletManager.recipientKinds.get(address);
+      if (known && known.kind === 'contract') return 'contract';
+      const network = await this._networkHeadIndex().catch(() => null);
+      const head = network !== null ? Math.max(highestVerifiedIndex(), network) : null;
+      if (known && head !== null && known.index >= head - WalletManager.PROOF_MAX_LAG_MACROBLOCKS) return known.kind;
+      const judge = async (res) => {
+        let data;
+        try { data = parseStrictJson(res.data); } catch (_) { return { error: 'bad json' }; }
+        const r = readCertifiedAccount(data, address, sha3Hex);
+        if (!r.ok) return { error: 'bad proof' };
+        const root = await this._certifiedRootFresh(r.index);
+        if (!root.ok || !r.fold(root.stateRoot)) return { error: 'unconfirmed' };
+        return { verified: { kind: r.account.is_contract ? 'contract' : 'none', index: r.index } };
+      };
+      const got = await this._proofAnswers(`/api/v1/account/${address}/balance/proof`, this.getTrustedNodes(3),
+        this._proofPasses(address, null), judge).catch(() => null);
+      const v = got && got.verified;
+      if (!v) return null;
+      const kinds = WalletManager.recipientKinds;
+      kinds.delete(address);
+      kinds.set(address, v);
+      while (kinds.size > WalletManager.RECIPIENT_KINDS_MAX) kinds.delete(kinds.keys().next().value);
+      return v.kind;
+    })().catch(() => null).finally(() => {
+      if (WalletManager.recipientReads.get(address) === read) WalletManager.recipientReads.delete(address);
+    });
+    WalletManager.recipientReads.set(address, read);
+    return read;
   }
 
   /**
    * Why `to` may not be paid QNC or a built-in token, or null (the extension's assertPayableRecipient, MOB-BR-R3-01):
    * 'contract' when it is a contract account (a built-in token, the token being sent included, or another contract;
    * none has a key, and no contract sends QNC or a token on, so what it is paid stays there for good), 'unchecked' when
-   * that cannot be told. Only the certified account leaf decides (certifiedRecipientKind; the extension's
-   * RECIPIENT_UNCHECKED): without a certified answer in time nothing is paid, never on what nodes say. `from`, the
-   * wallet's own address, is no contract and is not read.
+   * that cannot be told. Decided at once by what the genesis nodes report of their live state, two agreeing
+   * (agreedContractKind, as the in-app browser's sheet decides), in one read with the normal network timeout; the
+   * certified account leaf confirms it in the background (certifiedRecipientKind), and a contract it proved refuses at
+   * once. `from`, the wallet's own address, is no contract and is not read.
    */
   async payableRecipientProblem(to, from = null) {
     let address;
@@ -6797,9 +6721,12 @@ export class WalletManager {
       return 'contract'; // not an account a key controls (MOBNET-R4-01)
     }
     if (from && address === String(from).trim().toLowerCase()) return null;
-    const certified = await this.certifiedRecipientKind(address).catch(() => null);
-    if (certified === 'contract') return 'contract';
-    return certified === 'none' ? null : 'unchecked';
+    this.certifiedRecipientKind(address);
+    const known = WalletManager.recipientKinds.get(address);
+    if (known && known.kind === 'contract') return 'contract';
+    const kind = await this.agreedContractKind(address).catch(() => null);
+    if (kind === null) return 'unchecked';
+    return kind === 'none' ? null : 'contract';
   }
 
   static CUSTOM_TOKENS_KEY = 'qnet_custom_tokens';
@@ -7652,7 +7579,7 @@ export class WalletManager {
       let claimResult = claimRes.data || {};
       if (!claimRes.ok) throw WalletManager.claimRefusal(claimResult, claimRes.status);
       // The batch signed: the epoch below its first one, its last epoch and its parts ([epoch, nanoQNC text] each). The
-      // move is in the wallet once a certified read shows the watermark at its last epoch (ClaimTransit).
+      // move shows in the wallet once the wallet's live figure has its watermark at the batch's last epoch (ClaimTransit).
       let quoteWatermark = null;
       let quoteLastEpoch = null;
       let quoteParts = [];
@@ -7681,6 +7608,8 @@ export class WalletManager {
         const dilithiumKeys = await this._walletDilithiumKeys(password);
         const claimsSignature = await signWithDilithium(
           checked.signMessage, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+        // Signed by this wallet as a send is: its proof reads ask for the newest certified state from now on (_proofIndex).
+        WalletManager.lastOwnSendAt.set(walletAddress, Date.now());
         const submitRes = await this._submitClaim({
           node_id: nodeId,
           wallet_address: walletAddress,
@@ -8010,13 +7939,12 @@ export class WalletManager {
     return feeNano(GAS_PRICE, contractCallIntrinsicGas(contractCallData(contract, 'transfer', [to, this._amt(amount)])));
   }
   // QNC the sender must hold: the fee, plus a refundable deposit when the recipient holds none of the token. The
-  // recipient counts as a holder only by a balance a send may be decided by (checkedTokenBalance: committee-certified),
-  // never by one node's word (MOB-BR-R3-03); anything else counts as none, the safe side. The recipient's account nonce
-  // is not the send's, so no proof read earlier stands in for a fresh one.
+  // recipient counts as a holder only by the balance a send is checked against (checkedTokenBalance: a genesis node's
+  // live tip, its proof folded), never by an unproven answer (MOB-BR-R3-03); anything else counts as none, the safe side.
   async qrc20TransferQncNeedNano(contract, to, amount) {
     const fee = this.qrc20TransferFeeNano(contract, to, amount);
     const r = await this.checkedTokenBalance(contract, to, null, { nonce: null }).catch(() => null);
-    const holds = !!r && r.ok && r.verified === true && /^\d+$/.test(String(r.balanceBase)) && BigInt(r.balanceBase) > 0n;
+    const holds = !!r && r.ok && /^\d+$/.test(String(r.balanceBase)) && BigInt(r.balanceBase) > 0n;
     const depositNano = holds ? 0 : STORAGE_DEPOSIT_NANO;
     return { feeNano: fee, depositNano, needNano: fee + depositNano };
   }

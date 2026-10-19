@@ -1,4 +1,5 @@
 import { Platform } from 'react-native';
+import { insertedText } from './textEdit';
 
 // TextInput props for anything secret typed into the wallet: no autocorrect, no spell check (which can
 // leave the device), no autofill, no suggestions a keyboard could learn and offer elsewhere. The native
@@ -34,18 +35,6 @@ export const SEED_INPUT_PROPS = {
 
 /** Typed confirmations such as ERASE. */
 export const CONFIRM_INPUT_PROPS = { ...base, autoCapitalize: 'characters' };
-
-/** The text one change inserted: the part of `next` between the prefix and the suffix it shares with `prev`. */
-export function insertedText(prev, next) {
-  const a = String(prev || '');
-  const b = String(next || '');
-  const max = Math.min(a.length, b.length);
-  let p = 0;
-  while (p < max && a[p] === b[p]) p++;
-  let s = 0;
-  while (s < max - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
-  return b.slice(p, b.length - s);
-}
 
 /**
  * Whether one change looks like text that arrived at once — a paste, a keyboard's clipboard chip — rather than typing

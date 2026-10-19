@@ -11,8 +11,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import jsSha3 from 'js-sha3';
 import { CABINET_LIMITS, CLIENT_BUDGETS, createGate } from '../../server/cabinet/limits.ts';
 import {
-  HISTORY_CACHE_MS, NONE_CACHE_MS, RESERVE_CACHE_MS, STATUS_CACHE_MS, SUPER_CACHE_MS, createNodeProxy, historyPath, historyView, lightShardOwners,
-  mergeHistory, mergeStatus, parseHistory, parsePending, parsePublicStatus, settlingPair, stillNeeded,
+  HISTORY_CACHE_MS, MISS_TIMEOUT_MS, NONE_CACHE_MS, RESERVE_CACHE_MS, STATUS_CACHE_MS, SUPER_CACHE_MS, createNodeProxy, historyPath, historyView, lightShardOwners,
+  mergeHistory, mergeStatus, missesPath, parseHistory, parsePending, parsePublicStatus, settlingPair, stillNeeded,
 } from '../../server/cabinet/node-proxy.ts';
 import { createKnownNodes } from '../../server/cabinet/known-nodes.ts';
 import {
@@ -427,7 +427,7 @@ test('the history: a page of the epochs a node settled, a second node for the on
   const res = await p.history(get(`${BASE}/history`), NODE, archive);
   assert.equal(res.status, 200);
   const body = await json(res);
-  const row = (epoch, result, amountQnc = null, claimTx = null, startedAt = null, endedAt = null) => ({ epoch, result, amountQnc, startedAt, endedAt, claimTx });
+  const row = (epoch, result, amountQnc = null, claimTx = null, startedAt = null, endedAt = null) => ({ epoch, result, amountQnc, startedAt, endedAt, claimTx, miss: null });
   assert.deepEqual(body, {
     registeredEpoch: 140,
     archived: true,
@@ -451,14 +451,18 @@ test('the history: a page of the epochs a node settled, a second node for the on
   assert.deepEqual(parseHistoryView(body), body);
   assert.equal(JSON.stringify(body).includes('eon'), false, 'the wallet the node names is not passed on');
   // Two nodes, one page of 30 epochs each, the first one's node balance read just before its page; the archive for the
-  // wallet the nodes name, which is the node's.
-  assert.deepEqual(calls.map((c) => c.path), [`/api/v1/rewards/pending/${NODE}`, `/api/v1/rewards/history/${NODE}?limit=30`, `/api/v1/rewards/history/${NODE}?limit=30`]);
+  // wallet the nodes name, which is the node's. Epoch 155 was not counted, so the three shard owners were asked why (none
+  // answers here; the next test has the reasons).
+  const owners = lightShardOwners(NODE).map((i) => host(i + 1)).sort();
+  const isMisses = (c) => c.path === missesPath(NODE);
+  assert.deepEqual(calls.filter((c) => !isMisses(c)).map((c) => c.path), [`/api/v1/rewards/pending/${NODE}`, `/api/v1/rewards/history/${NODE}?limit=30`, `/api/v1/rewards/history/${NODE}?limit=30`]);
+  assert.deepEqual(calls.filter(isMisses).map((c) => c.host).sort(), owners);
   assert.deepEqual(asked, [{ wallet: WALLET, nodeId: NODE, keys: first.history.filter((r) => r.status !== 'a_status_to_come').map((r) => r.epoch) }]);
   await p.history(get(`${BASE}/history`), NODE, archive);
-  assert.equal(calls.length, 3, 'cached');
+  assert.equal(calls.length, 6, 'cached');
   advance(HISTORY_CACHE_MS);
   await p.history(get(`${BASE}/history`), NODE, archive);
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 12);
   assert.equal((await proxy({}).p.history(get(`${BASE}/history`), NODE)).status, 503);
 });
 
@@ -477,12 +481,15 @@ test('the history without the archive: undated, nothing left out; one node when 
   assert.deepEqual(body, {
     registeredEpoch: null,
     archived: false,
-    rows: [{ epoch: 10, result: 'missed', amountQnc: null, startedAt: null, endedAt: null, claimTx: null }, { epoch: 9, result: 'moved', amountQnc: 1, startedAt: null, endedAt: null, claimTx: null }],
+    rows: [
+      { epoch: 10, result: 'missed', amountQnc: null, startedAt: null, endedAt: null, claimTx: null, miss: null },
+      { epoch: 9, result: 'moved', amountQnc: 1, startedAt: null, endedAt: null, claimTx: null, miss: null },
+    ],
     more: true,
     earned: null,
   });
-  // The node balance asked before the page (none here), and the page.
-  assert.equal(calls.length, 2);
+  // The node balance asked before the page (none here), the page, and the three shard owners for the epoch not counted.
+  assert.equal(calls.length, 5);
   assert.equal(archived, 1);
   // A node that names a wallet the id does not derive from (a genesis node's): the archive is asked for that wallet, and
   // older pages are offered.
@@ -497,10 +504,164 @@ test('the history without the archive: undated, nothing left out; one node when 
   const genesis = await json(await other.p.history(get('https://aiqnet.io/api/cabinet/node/genesis_node_001/history'), 'genesis_node_001', facts));
   assert.deepEqual([genesis.registeredEpoch, genesis.archived, genesis.more], [0, true, true]);
   assert.deepEqual(asked, [[otherWallet, 'genesis_node_001']]);
-  // An id the nodes resolve to no wallet (a made-up one): no archive, no older page.
+  // An id the nodes resolve to no wallet (a made-up one): no archive, no older page, and no shard owner asked why its
+  // epochs were not counted (each would answer that it does not know the id), so it costs the small budget of unknown
+  // ids two reads, not five.
   const made = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...answer, wallet: '' } : undefined)));
   assert.equal((await json(await made.p.history(get(`${BASE}/history`), NODE, failing))).more, false);
   assert.equal(archived, 1);
+  assert.deepEqual(made.calls.map((c) => c.path), [`/api/v1/rewards/pending/${NODE}`, `/api/v1/rewards/history/${NODE}?limit=30`]);
+});
+
+// A miss in the public form a shard owner serves.
+const miss = (epoch, reason, delivered = null) => ({ epoch, reason, delivered });
+
+// Batch 18.10: each shard owner serves the node's misses of the 64 epochs up to its newest record (GET
+// /api/v1/light-node/misses); a backup
+// owner records nothing while it stands down, so the site asks all three and merges them per epoch by the rule for
+// `last_miss` (last-miss.ts missesByEpoch). A node of an earlier release has no such route: the rows then come without a
+// reason, never as an error.
+test('why an epoch was not counted: the shard owners\' misses merged per epoch, on epochs not counted only; an owner of an earlier release adds none; a view gets none', async () => {
+  const answer = {
+    node_id: NODE, wallet: WALLET, pagination: { has_more: false },
+    history: [
+      { epoch: key(160), status: 'claimable', amount_qnc: 1 },
+      { epoch: key(159), status: 'not_eligible', amount_qnc: 0 },
+      { epoch: key(158), status: 'not_eligible', amount_qnc: 0 },
+      { epoch: key(157), status: 'not_eligible', amount_qnc: 0 },
+      { epoch: key(156), status: 'shard_not_certified', amount_qnc: 0 },
+      { epoch: key(155), status: 'not_eligible', amount_qnc: 0 },
+    ],
+  };
+  const [a, b, c] = lightShardOwners(NODE).map((i) => host(i + 1));
+  const byOwner = {
+    // The owner that woke the device: no answer in 159, a wake not got out in 158, a reason this site does not know in
+    // 157, no committed check in 156 (shown as not checked, with its own note, never with a miss line).
+    [a]: { success: true, node_id: NODE, misses: [miss(159, 'woken_no_answer'), miss(158, 'not_sent'), miss(157, 'paused'), miss(156, 'not_committed')] },
+    // The owner that took the device's next answer: its account of 159, and a wake that reached the device in 158.
+    [b]: { success: true, node_id: NODE, misses: [miss(159, 'woken_no_answer', true), miss(158, 'woken_no_answer')] },
+  };
+  const serve = (oldOwner) => (path, hostName) => {
+    if (path.startsWith('/api/v1/rewards/history/')) return answer;
+    if (path !== missesPath(NODE)) return undefined;
+    return byOwner[hostName] ?? oldOwner;
+  };
+  const table = (oldOwner) => Object.fromEntries([1, 2, 3, 4, 5].map((n) => [host(n), (path) => serve(oldOwner)(path, host(n))]));
+  const { p, calls } = proxy(table(404));
+  const body = await json(await p.history(get(`${BASE}/history`), NODE));
+  const shown = body.rows.map((r) => [r.epoch, r.result, r.miss]);
+  assert.deepEqual(shown, [
+    [160, 'counted', null],
+    // Equal reasons: the record that knows whether the wake reached the device.
+    [159, 'missed', miss(159, 'woken_no_answer', true)],
+    // The device was reached: more telling than a wake the network did not get out.
+    [158, 'missed', miss(158, 'woken_no_answer')],
+    // A reason the site does not know is passed over; no other owner keeps the epoch.
+    [157, 'missed', null],
+    [156, 'unchecked', null],
+    [155, 'missed', null],
+  ]);
+  assert.deepEqual(parseHistoryView(body), body);
+  // Each owner asked once, for its whole window, and no other genesis node.
+  assert.equal(missesPath(NODE), `/api/v1/light-node/misses?node_id=${NODE}&limit=64`);
+  assert.deepEqual(calls.filter((x) => x.path === missesPath(NODE)).map((x) => x.host).sort(), [a, b, c].sort());
+  // A viewed address: the same cached page, no reason on any row; anything but view=1 is 400.
+  const before = calls.length;
+  const viewed = await p.history(get(`${BASE}/history?view=1`), NODE);
+  assert.equal(viewed.status, 200);
+  const text = await viewed.text();
+  assert.doesNotMatch(text, /woken_no_answer|delivered/);
+  assert.deepEqual(JSON.parse(text), { ...body, rows: body.rows.map((r) => ({ ...r, miss: null })) });
+  assert.equal(calls.length, before, 'no second round upstream');
+  assert.equal((await p.history(get(`${BASE}/history?page=1&view=1`), NODE)).status, 200);
+  for (const bad of ['?view=0', '?view=', '?page=1&view=yes']) assert.equal((await p.history(get(`${BASE}/history${bad}`), NODE)).status, 400, bad);
+  // Every owner on an earlier release (404, 405), or unreachable: the page stands, its rows without a reason.
+  for (const oldOwner of [404, 405, undefined]) {
+    const old = proxy({ ...table(oldOwner), [a]: (path) => serve(oldOwner)(path, 'old'), [b]: (path) => serve(oldOwner)(path, 'old') });
+    const res = await old.p.history(get(`${BASE}/history`), NODE);
+    assert.equal(res.status, 200, String(oldOwner));
+    const rows = (await json(res)).rows;
+    assert.deepEqual(rows.map((r) => [r.epoch, r.result]), shown.map(([epoch, result]) => [epoch, result]), String(oldOwner));
+    assert.ok(rows.every((r) => r.miss === null), String(oldOwner));
+  }
+  // A page with no epoch that can be not counted, and a super node's page, ask no owner.
+  const counted = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...answer, history: [answer.history[0]] } : undefined)));
+  await counted.p.history(get(`${BASE}/history`), NODE);
+  assert.ok(counted.calls.every((x) => !x.path.startsWith('/api/v1/light-node/misses')));
+  const genesis = proxy(table(404));
+  await genesis.p.history(get('https://aiqnet.io/api/cabinet/node/genesis_node_001/history'), 'genesis_node_001');
+  assert.ok(genesis.calls.every((x) => !x.path.startsWith('/api/v1/light-node/misses')));
+  // A wallet whose super node registered: an epoch of the light node's group not checked turns not counted because the
+  // super node earned nothing, and carries no miss line, since no node of the group could be counted whatever the device
+  // did; an epoch the light node itself was not counted in keeps its miss.
+  const misses = new Map([[15, miss(15, 'woken_no_answer')], [14, miss(14, 'no_push_address')], [13, miss(13, 'not_committed')]]);
+  const both = historyView(
+    { wallet: WALLET, more: false, rows: [
+      { key: key(15), status: 'not_eligible', amountQnc: 0 },
+      ...[key(14), key(13)].map((k) => ({ key: k, status: 'shard_not_certified', amountQnc: 0 })),
+    ] },
+    { registeredHeight: null, superHeight: 13 * 14_400 + 9, claims: new Map(), times: new Map() }, null, misses,
+  );
+  assert.deepEqual(both.rows.map((r) => [r.epoch, r.result, r.miss]), [[15, 'missed', miss(15, 'woken_no_answer')], [14, 'missed', null], [13, 'unchecked', null]]);
+  // Such a page, every epoch not checked, asks no owner.
+  const unchecked = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? { ...answer, history: [answer.history[4]] } : undefined)));
+  await unchecked.p.history(get(`${BASE}/history`), NODE);
+  assert.ok(unchecked.calls.every((x) => !x.path.startsWith('/api/v1/light-node/misses')));
+});
+
+// The misses only add a line under epochs not counted: an owner slower than MISS_TIMEOUT_MS adds none rather than hold
+// the page (the archive and the nodes keep their 4 s). Each owner answers its whole window whatever the page, so one read
+// serves every page of the node while it is kept; an older page's epochs can still be in a window, since an owner keeps
+// the 64 epochs up to its newest record, which for a device the network stopped waking lies far back.
+test('the misses never hold the page: a slow owner adds none past MISS_TIMEOUT_MS; one read serves every page of the node while kept', async () => {
+  const page = (offset) => ({
+    node_id: NODE, wallet: WALLET, pagination: { has_more: true },
+    history: Array.from({ length: offset === 0 ? 30 : 31 }, (_, i) => ({ epoch: key(200 - offset - i), status: 'not_eligible', amount_qnc: 0 })),
+  });
+  const [a, b] = lightShardOwners(NODE).map((i) => host(i + 1));
+  // Owner b keeps a miss of epoch 200 and, from before the network stopped waking the device, one of epoch 110 (page 3).
+  const kept = { success: true, node_id: NODE, misses: [miss(200, 'woken_no_answer', true), miss(110, 'not_delivered', false)] };
+  const net = network(Object.fromEntries([1, 2, 3, 4, 5].map((n) => [host(n), (path) => {
+    if (path.startsWith('/api/v1/rewards/history/')) return page(Number(new URL(path, 'https://x').searchParams.get('offset') ?? 0));
+    if (path === missesPath(NODE)) return host(n) === b ? kept : { success: true, node_id: NODE, misses: [] };
+    return undefined;
+  }])));
+  // Owner a hangs until its read is given up, on the first round only.
+  let hung = 0;
+  const fetchFn = (url, init) => {
+    if (hung === 0 && new URL(url).host === a && url.includes('/api/v1/light-node/misses')) {
+      hung += 1;
+      return new Promise((_, reject) => {
+        // The read's own timeout timer does not keep the test process up.
+        const alive = setInterval(() => {}, 1_000);
+        init.signal.addEventListener('abort', () => { clearInterval(alive); reject(init.signal.reason); }, { once: true });
+      });
+    }
+    return net.fetchFn(url, init);
+  };
+  const { p, advance } = proxy({}, { fetchFn });
+  const ownerReads = () => net.calls.filter((x) => x.path === missesPath(NODE)).length;
+  const began = Date.now();
+  const zero = await json(await p.history(get(`${BASE}/history`), NODE));
+  const waited = Date.now() - began;
+  assert.ok(waited >= MISS_TIMEOUT_MS - 100 && waited < MISS_TIMEOUT_MS + 1_000, `${waited} ms`);
+  assert.deepEqual([hung, ownerReads()], [1, 2], 'a given up; b and c answered');
+  assert.deepEqual(zero.rows[0].miss, miss(200, 'woken_no_answer', true));
+  // Pages 1 and 3 while the misses are kept ask no owner again; page 3 still names epoch 110's miss.
+  const one = await json(await p.history(get(`${BASE}/history?page=1`), NODE));
+  const three = await json(await p.history(get(`${BASE}/history?page=3`), NODE));
+  assert.ok(one.rows.every((r) => r.result === 'missed' && r.miss === null));
+  assert.deepEqual(three.rows.filter((r) => r.miss !== null).map((r) => r.miss), [miss(110, 'not_delivered', false)]);
+  assert.equal(ownerReads(), 2);
+  // Once they are no longer kept, the next page asks the three owners again.
+  advance(HISTORY_CACHE_MS);
+  await p.history(get(`${BASE}/history?page=2`), NODE);
+  assert.equal(ownerReads(), 5);
+  // A round no owner answered is not kept: the next page asks again.
+  const old = proxy(everyNode((path) => (path.startsWith('/api/v1/rewards/history/') ? page(0) : path === missesPath(NODE) ? 404 : undefined)));
+  await old.p.history(get(`${BASE}/history`), NODE);
+  await old.p.history(get(`${BASE}/history?page=1`), NODE);
+  assert.equal(old.calls.filter((x) => x.path === missesPath(NODE)).length, 6);
 });
 
 // Owner, 11.10: every epoch, a page at a time. A page after the first starts at the epoch before its own, so a page read
@@ -585,8 +746,8 @@ test('the epochs from the registration on: its own epoch, not counted, is marked
   const lost = historyView({ wallet: WALLET, more: false, rows: [{ key: key(3), status: 'unavailable', amountQnc: 0 }, { key: key(2), status: 'unavailable', amountQnc: 0 }] },
     { registeredHeight: null, superHeight: null, claims: new Map([[key(3), { tx: TX('g'), amountNano: null }]]), times: new Map([[startOf(3), 5], [endOf(3), 6]]) });
   assert.deepEqual(lost.rows, [
-    { epoch: 3, result: 'moved', amountQnc: null, startedAt: 5, endedAt: 6, claimTx: TX('g') },
-    { epoch: 2, result: 'unknown', amountQnc: null, startedAt: null, endedAt: 5, claimTx: null },
+    { epoch: 3, result: 'moved', amountQnc: null, startedAt: 5, endedAt: 6, claimTx: TX('g'), miss: null },
+    { epoch: 2, result: 'unknown', amountQnc: null, startedAt: null, endedAt: 5, claimTx: null, miss: null },
   ]);
   // A second node's answer fills only what the first could not serve, and only for the same wallet; the first's paging stays.
   const a = { wallet: WALLET, more: true, rows: [{ key: key(2), status: 'unavailable', amountQnc: 0 }, { key: key(1), status: 'claimable', amountQnc: 1 }] };
@@ -729,8 +890,12 @@ test('the parsers take only the fields they know, in their forms', () => {
   assert.equal(parseStatusView({ ...view, extra: 1 }), null);
   assert.equal(parseStatusView({ ...view, balanceNano: 1 }), null);
   assert.equal(parseStatusView({ ...view, balanceNano: '01' }), null);
-  const epochs = { registeredEpoch: 3, archived: true, rows: [{ epoch: 4, result: 'missed', amountQnc: null, startedAt: 0, endedAt: 1, claimTx: null }], more: false, earned: null };
+  const epochs = { registeredEpoch: 3, archived: true, rows: [{ epoch: 4, result: 'missed', amountQnc: null, startedAt: 0, endedAt: 1, claimTx: null, miss: null }], more: false, earned: null };
   assert.deepEqual(parseHistoryView(epochs), epochs);
+  // An epoch not counted with why, as the owners keep it: exactly the three fields of a miss, of that epoch.
+  const why = { epoch: 4, reason: 'woken_no_answer', delivered: true };
+  const missed = { ...epochs, rows: [{ ...epochs.rows[0], miss: why }] };
+  assert.deepEqual(parseHistoryView(missed), missed);
   const full = { ...epochs, rows: Array.from({ length: HISTORY_PAGE_ROWS + 1 }, (_, i) => ({ ...epochs.rows[0], epoch: i })) };
   assert.deepEqual(parseHistoryView(full), full);
   for (const bad of [
@@ -754,6 +919,13 @@ test('the parsers take only the fields they know, in their forms', () => {
     { ...epochs, rows: [{ ...epochs.rows[0], amountQnc: -1 }] },
     { ...epochs, rows: [{ ...epochs.rows[0], claimTx: '<b>' }] },
     { lastClaimedEpoch: 1, rows: [] },
+    { ...epochs, rows: [{ epoch: 4, result: 'missed', amountQnc: null, startedAt: 0, endedAt: 1, claimTx: null }] },
+    { ...missed, rows: [{ ...missed.rows[0], miss: { ...why, epoch: 5 } }] },
+    { ...missed, rows: [{ ...missed.rows[0], result: 'counted' }] },
+    { ...missed, rows: [{ ...missed.rows[0], result: 'unchecked' }] },
+    { ...missed, rows: [{ ...missed.rows[0], miss: { ...why, woken_at: 1 } }] },
+    { ...missed, rows: [{ ...missed.rows[0], miss: { ...why, reason: 'paused' } }] },
+    { ...missed, rows: [{ ...missed.rows[0], miss: 'woken_no_answer' }] },
   ]) {
     assert.equal(parseHistoryView(bad), null, JSON.stringify(bad));
   }
@@ -850,7 +1022,7 @@ test('each genesis node gets a bounded number of calls a second from the site, w
   // Owner, 11.10: no I'm back on the site, so no wake route and no wake budget.
   assert.equal(existsSync(new URL('../../server/cabinet/wake.ts', import.meta.url)), false);
   assert.equal(existsSync(new URL('../../app/api/cabinet/wake/route.ts', import.meta.url)), false);
-  assert.match(src('node-proxy.ts'), /async function read\(url: string, kind: UpstreamKind\): Promise<unknown> \{\s*if \(!budget\(kind, url\)\) return null;/);
+  assert.match(src('node-proxy.ts'), /async function read\(url: string, kind: UpstreamKind, timeoutMs: number = NODE_TIMEOUT_MS\): Promise<unknown> \{\s*if \(!budget\(kind, url\)\) return null;/);
 });
 // R4: a super node's status for My node: one node that lists it registered answers "yes" with its details; "no" needs
 // two nodes; the balance from rewards/pending; a last-seen time from the nodes, else the archive's newest heartbeat;

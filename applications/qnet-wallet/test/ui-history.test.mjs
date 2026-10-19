@@ -258,7 +258,40 @@ describe('popup: History rows (owner, 06.10)', () => {
     assert.match(page.$$('.history-row')[5].getAttribute('aria-label'), new RegExp(`^Received, \\+1\\.5 ${LONG}, `));
     page.$$('[data-action="open-detail"]')[3].click();
     await page.settle();
-    assert.equal(page.$('.history-detail .detail-amount').textContent, '+340282366920938463463374607431768.211455 GOLD');
+    assert.equal(page.$('.history-detail .detail-amount').textContent, '+340,282,366,920,938,463,463,374,607,431,768.211455 GOLD');
+  });
+
+  it('a row takes the UI language\'s marks: German groups with a dot and writes a decimal comma, Spanish leaves four digits', async () => {
+    const items = [
+      qnetItem({ n: 1, amountNano: '98765432100000', timestamp: NOW - 1000 }),
+      qnetItem({ n: 2, direction: 'out', from: ADDRESSES.qnet, to: PEER, amountNano: '123456700000000', timestamp: NOW - 2000 }),
+      qnetItem({ n: 3, amountNano: '1234500000000', timestamp: NOW - 3000 }),
+      qnetItem({ n: 4, amountNano: '1', timestamp: NOW - 4000 }),
+    ];
+    const shown = {
+      de: [['+98.765,43', 'QNC'], ['\u2212123,46K', 'QNC'], ['+1.234,5', 'QNC'], ['+<0,00000001', 'QNC']],
+      es: [['+98.765,43', 'QNC'], ['\u2212123,46K', 'QNC'], ['+1234,5', 'QNC'], ['+<0,00000001', 'QNC']],
+    };
+    for (const [language, expected] of Object.entries(shown)) {
+      mock.timers.enable({ apis: ['Date'], now: NOW });
+      page = await openPage('popup', {
+        handlers: handlers({
+          'settings.get': () => ({ autoLockMinutes: 15, language }), 'qnet.history': () => ({ items, cursor: null, pending: [] }),
+        }),
+      });
+      // the language's table is a module the page imports: the wallet comes once it is loaded
+      for (let turn = 0; turn < 400 && page.$('[data-tab="history"]') === null; turn += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+      await page.click('[data-tab="history"]');
+      await page.settle();
+      assert.deepEqual(page.$$('.history-row .amount').map((node) => [...node.children].map((part) => part.textContent)), expected, language);
+      page.$$('[data-action="open-detail"]')[0].click();
+      await page.settle();
+      assert.equal(page.$('.history-detail .detail-amount').textContent, '+98.765,4321 QNC', language);
+      assert.deepEqual(page.violations, [], language);
+      page.close();
+      page = null;
+      mock.timers.reset();
+    }
   });
 
   it('a day header follows the day: a list read again after midnight says Yesterday for what was Today', async () => {

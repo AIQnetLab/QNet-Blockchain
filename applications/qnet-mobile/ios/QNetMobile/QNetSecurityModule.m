@@ -2,8 +2,7 @@
  * QNetSecurityModule.m — iOS side of the QNetSecurity native module (Android: SecurityModule.kt).
  *
  * - Secret screens: while one is shown and the screen is being captured (recording, mirroring, AirPlay) the
- *   window is covered; a screenshot taken on one raises a warning. The app-switcher snapshot is covered by
- *   AppDelegate on every resign-active.
+ *   window is covered. The app-switcher snapshot is covered by AppDelegate on every resign-active.
  * - The recovery-phrase field: the pasteboard's change count, and clearing what was copied while it was open.
  * - The recovery phrase's Copy: this device only, expiring after a set time, cleared at once by Delete wallet.
  * - The device seal of a password wallet's wrap: a P-256 key in the Secure Enclave, this device only, usable while it
@@ -68,7 +67,6 @@ RCT_EXPORT_MODULE(QNetSecurity)
     _secretCopyCount = -1;
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserver:self selector:@selector(captureChanged) name:UIScreenCapturedDidChangeNotification object:nil];
-    [nc addObserver:self selector:@selector(screenshotTaken) name:UIApplicationUserDidTakeScreenshotNotification object:nil];
   }
   return self;
 }
@@ -131,22 +129,6 @@ static UIWindow *QNetKeyWindow(void)
 - (void)captureChanged
 {
   dispatch_async(dispatch_get_main_queue(), ^{ [self updateCaptureCover]; });
-}
-
-- (void)screenshotTaken
-{
-  if (!_secureOn) return;
-  dispatch_async(dispatch_get_main_queue(), ^{
-    UIViewController *root = QNetKeyWindow().rootViewController;
-    while (root.presentedViewController) root = root.presentedViewController;
-    if (!root) return;
-    UIAlertController *alert = [UIAlertController
-      alertControllerWithTitle:[self text:@"screenshotTitle" fallback:@"Screenshot taken"]
-                       message:[self text:@"screenshotBody" fallback:@"This screen shows secret wallet data. Delete the screenshot from the device's photos and from any cloud backup: anyone who has it controls the wallet."]
-                preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:[self text:@"ok" fallback:@"OK"] style:UIAlertActionStyleDefault handler:nil]];
-    [root presentViewController:alert animated:YES completion:nil];
-  });
 }
 
 // The texts this module shows by itself, in the app's language (JS: DeviceSecurity.setNativeTexts).

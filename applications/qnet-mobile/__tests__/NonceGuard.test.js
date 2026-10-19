@@ -17,7 +17,7 @@ const { signDetached } = require('../src/crypto/DilithiumCrypto');
 const { WalletManager } = require('../src/components/WalletManager');
 const {
   planNonce, pendingFor, updateEntry, TooManyPendingError, HELD_MS, PendingChoiceError, PendingSettledError,
-  PendingChangedError,
+  PendingChangedError, recentSettled,
 } = require('../src/services/PendingTx');
 const { GENESIS_NODES } = require('../src/config/nodes');
 
@@ -61,12 +61,12 @@ beforeEach(async () => {
   });
 });
 
-function wallet({ verifiedNonce = 4 } = {}) {
+// `liveNonce`: the nonce of the wallet's live figure (a genesis node's live tip, its proof folded), null for none.
+function wallet({ liveNonce = 4 } = {}) {
   const wm = new WalletManager();
   wm.loadWallet = jest.fn(async () => WALLET);
-  wm.getQNCBalanceWithProof = jest.fn(async () => (verifiedNonce == null
-    ? { ok: true, verified: false, nonce: '999' }
-    : { ok: true, verified: true, nonce: String(verifiedNonce) }));
+  wm.liveQncFigure = jest.fn(async () => (liveNonce == null ? null
+    : { balance: 1, balanceNano: '1000000000', nonce: String(liveNonce), blockHeight: 9000, figureClaimedEpoch: 0 }));
   return wm;
 }
 
@@ -152,13 +152,13 @@ describe('a node that answers an error and keeps the signed bytes', () => {
     // Now 5 applied before the next replacement is signed: nothing is signed.
     const again = await wm.previewSend(ME);
     Object.values(accounts).forEach((a) => { a.nonce = 5; });
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, nonce: '5' }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 1, balanceNano: '1000000000', nonce: '5', blockHeight: 9000, figureClaimedEpoch: 0 }));
     const signedBefore = signDetached.mock.calls.length;
     await expect(wm.sendQNC(TO, 1, 'pw', { choice: { mode: 'replace', nonce: 5, bodyHash: again.replace.bodyHash } }))
       .rejects.toMatchObject({ code: 'PENDING_SETTLED' });
     expect(signDetached.mock.calls.length).toBe(signedBefore);
-    // And the settled one is remembered for the "same payment again" warning.
-    expect(await wm.recentSettledTransactions(ME)).toEqual([expect.objectContaining({ nonce: 5, kind: 'transfer', to: TO, amountNano: 1_000_000_000 })]);
+    // And the settled one is remembered, for the status of a transaction this wallet signed.
+    expect(await recentSettled(ME)).toEqual([expect.objectContaining({ nonce: 5, kind: 'transfer', to: TO, amountNano: 1_000_000_000 })]);
   });
 
   it('resends the kept transaction byte for byte; it never signs again', async () => {
@@ -208,22 +208,22 @@ describe('a node that answers an error and keeps the signed bytes', () => {
 });
 
 describe('a node that lies about the nonce', () => {
-  // MOBNET-R1-04: a certified state can be old (a proof from before a spend). A lower verified nonce never
+  // MOBNET-R1-04: a live figure can be of an older state (a node a block behind a spend). Its lower nonce never
   // overrides a higher one the genesis nodes agree on, and without an agreement the nonce never goes below what
   // this device already confirmed.
-  it('a verified but older proof never overrides a higher nonce two genesis nodes agree on', async () => {
-    const wm = wallet({ verifiedNonce: 4 });
+  it('a live figure of an older state never overrides a higher nonce two genesis nodes agree on', async () => {
+    const wm = wallet({ liveNonce: 4 });
     Object.values(accounts).forEach((a) => { a.nonce = 13; });
     submit = () => ({ tx_hash: 'h' });
     await wm.sendQNC(TO, 1, 'pw');
     expect(signedNonces()).toEqual([14]);
   });
 
-  it('with no agreement to be had, an older certified proof cannot take the nonce back below what was confirmed', async () => {
-    const wm = wallet({ verifiedNonce: 4 });
+  it('with no agreement to be had, a live figure of an older state cannot take the nonce back below what was confirmed', async () => {
+    const wm = wallet({ liveNonce: 4 });
     Object.values(accounts).forEach((a) => { a.nonce = 9; });
     expect(await wm._confirmedAccountNonce(ME)).toBe(9);
-    // The genesis nodes go quiet; a node serves a genuinely certified state from before those transactions.
+    // The genesis nodes go quiet but for one node's live figure of a state from before those transactions.
     GENESIS_NODES.forEach((g) => { accounts[g] = null; });
     expect(await wm._confirmedAccountNonce(ME)).toBe(9);
     const plan = await wm.resolveNonce(ME);
@@ -232,19 +232,19 @@ describe('a node that lies about the nonce', () => {
     accounts[GENESIS_NODES[0]] = { nonce: 2 };
     expect(await wm._confirmedAccountNonce(ME)).toBe(9);
     accounts[GENESIS_NODES[1]] = { nonce: 2 };
-    expect(await wm._confirmedAccountNonce(ME)).toBe(4); // the agreement (2) and the proof (4): the higher counts
+    expect(await wm._confirmedAccountNonce(ME)).toBe(2); // the agreement decides; one node's live figure (4) does not
   });
 
-  it('without a verified proof, one lying genesis node is outvoted by the others', async () => {
-    const wm = wallet({ verifiedNonce: null });
+  it('one lying genesis node is outvoted by the others, its live figure too', async () => {
+    const wm = wallet({ liveNonce: 13 });
     accounts[GENESIS_NODES[0]].nonce = 13;
     submit = () => ({ tx_hash: 'h' });
     await wm.sendQNC(TO, 1, 'pw');
     expect(signedNonces()).toEqual([5]);
   });
 
-  it('with neither a proof nor two genesis nodes agreeing, nothing is signed', async () => {
-    const wm = wallet({ verifiedNonce: null });
+  it('with neither a live figure nor two genesis nodes agreeing, nothing is signed', async () => {
+    const wm = wallet({ liveNonce: null });
     GENESIS_NODES.forEach((g, i) => { accounts[g] = i === 0 ? { nonce: 4 } : null; });
     await expect(wm.sendQNC(TO, 1, 'pw')).rejects.toThrow(/could not confirm/);
     expect(signDetached).not.toHaveBeenCalled();
@@ -255,11 +255,11 @@ describe('a node that lies about the nonce', () => {
 describe('sending in sequence', () => {
   it('a second payment goes in addition only when the user says so; a settled one is forgotten', async () => {
     submit = (body) => ({ tx_hash: `h${body.nonce}` });
-    const wm = wallet({ verifiedNonce: 4 });
+    const wm = wallet({ liveNonce: 4 });
     expect((await wm.sendQNC(TO, 1, 'pw')).nonce).toBe(5);
     await expect(wm.sendQNC(TO, 2, 'pw')).rejects.toMatchObject({ code: 'PENDING_CHOICE' });
     expect((await wm.sendQNC(TO, 2, 'pw', { choice: { mode: 'append' } })).nonce).toBe(6);
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, nonce: '6' }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 1, balanceNano: '1000000000', nonce: '6', blockHeight: 9000, figureClaimedEpoch: 0 }));
     Object.values(accounts).forEach((a) => { a.nonce = 6; });
     expect((await wm.sendQNC(TO, 1, 'pw')).nonce).toBe(7);
     expect((await pendingFor(ME)).map((e) => e.nonce)).toEqual([7]);

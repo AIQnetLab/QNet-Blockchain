@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { headHub } from '@/server/head-hub';
+import { formatQncTruncated } from '@/lib/token-format';
 import { query } from '../../../../../lib/db';
 
 export const dynamic = 'force-dynamic';
@@ -40,9 +41,6 @@ export async function GET() {
     const rewardEpoch = Math.floor(height / EPOCH);
     const blocksUntilReward = EPOCH - (height % EPOCH);
     const emissionNano = BigInt(s.stats.emission_total || '0');
-    const whole = emissionNano / 1_000_000_000n;
-    const frac = (emissionNano % 1_000_000_000n).toString().padStart(9, '0').slice(0, 2);
-    const circulatingFormatted = `${whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`;
     return NextResponse.json({
       success: true,
       source: 'database',
@@ -53,8 +51,8 @@ export async function GET() {
         height,
         blocksUntilReward,
         secondsUntilReward: blocksUntilReward,
-        circulatingSupply: Number(whole),
-        circulatingFormatted,
+        circulatingSupply: Number(emissionNano / 1_000_000_000n),
+        circulatingFormatted: formatQncTruncated(emissionNano, 2),
         totalTransactions: s.stats.tx_total,
         totalBlocks: s.stats.blocks_total,
         sync: { head: s.sync.last_height, prefix: s.sync.indexed_prefix, nodeHeight: s.sync.node_height, live: s.sync.ws_connected },

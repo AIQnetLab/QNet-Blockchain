@@ -125,7 +125,9 @@ pub(crate) struct PushRead {
 /// tick, with its grace: the drawn slot `slot - g - offset` for each g of the grace read (`ping_buckets_to_read`), due in
 /// `slot - g`, never wrapping into the window's end. A bucket two due points reach in one catch-up tick is read once,
 /// with both, and a push a catch-up made late meets the next due point when that one is nearer than
-/// `rpc::MIN_PUSH_GAP_SLOTS` (`rpc::Due::spaced`): no two pushes this genesis records for a node go out closer. `done` is
+/// `rpc::MIN_PUSH_GAP_SLOTS` (`rpc::Due::spaced`): no two pushes this genesis records for a node go out closer. An iOS
+/// device is pushed at four of the six from the same reads, no two this genesis records closer than
+/// `rpc::IOS_MIN_PUSH_GAP_SLOTS` and none after `rpc::IOS_LAST_PUSH_SLOT`. `done` is
 /// the last slot a run of this genesis before a restart read, when this tick's reads join it (`rpc::push_read_mark`): no
 /// due point up to it is read again with the spaced rounds, as its push went out or was shed once already and the
 /// record that would close it went with the restart.
@@ -2428,23 +2430,24 @@ impl SimplifiedP2P {
         let cache = self.light_ping_slot_cache.read();
         let mut foreign = FOREIGN_INDEX.lock();
         foreign.sync(&cache.1, SLOT_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed), current_window, &wanted);
-        let mut due: Vec<&String> = Vec::new();
+        let mut due: Vec<(&String, &[crate::rpc::Due])> = Vec::new();
         for r in &reads {
             due.extend(cache.1.get(r.bucket).into_iter().flatten().chain(foreign.ids(&cache.1, r.bucket))
-                .filter(|id| crate::rpc::PUSH_LEDGER.may_push(id, now_slot, &r.dues, || held_from(id))));
+                .filter(|id| crate::rpc::PUSH_LEDGER.may_push(id, now_slot, &r.dues, || held_from(id)))
+                .map(|id| (id, r.dues.as_slice())));
         }
         if !wanted.is_empty() {
             // A node drawn into two buckets this tick reads is offered once.
             let mut seen = std::collections::HashSet::with_capacity(due.len());
-            due.retain(|id| seen.insert(*id));
+            due.retain(|(id, _)| seen.insert(*id));
         }
         let registry = self.light_node_registry.read();
         let elig = self.epoch_light_eligible.read();
         let held_in = |id: &str, e: Option<u64>| e.and_then(|e| elig.get(&e)).map_or(false, |s| s.contains(id));
         let this_epoch = |id: &str| elig.get(&current_window).map(|s| s.contains(id)).unwrap_or(false);
-        // (node id, role, shard, whether the dormant rule must be read for it)
-        let mut candidates: Vec<(String, PingerRole, usize, bool)> = Vec::new();
-        for node_id in due {
+        // (node id, role, shard, whether the dormant rule must be read for it, the due points it was read for)
+        let mut candidates: Vec<(String, PingerRole, usize, bool, &[crate::rpc::Due])> = Vec::new();
+        for (node_id, dues) in due {
             let node = match registry.get(node_id) { Some(n) => n, None => continue };
             if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
             let shard = crate::node::light_shard_of(node_id);
@@ -2457,20 +2460,21 @@ impl SimplifiedP2P {
             let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_EPOCHS * 14400;
             let answered_before = held_in(node_id, current_window.checked_sub(1)) || held_in(node_id, current_window.checked_sub(2));
             let check = !fresh && !facts.neutral(shard) && !answered_before;
-            candidates.push((node_id.clone(), role, shard, check));
+            candidates.push((node_id.clone(), role, shard, check, dues));
         }
         drop(elig);
         drop(registry);
         drop(foreign);
         drop(cache);
         // The dormant rule, then: push only an on-chain node with a device bound to it, with how its device is reached
-        // (`rpc::push_reach_at`), so the push itself reads nothing again. These are storage point reads, so they run
-        // after the locks above are released.
+        // (`rpc::push_reach_at`), so the push itself reads nothing again, and only at a due point of its device's
+        // schedule (`rpc::PushLedger::may_push_on`: an iOS device's are half an hour apart). These are storage point
+        // reads, so they run after the locks above are released.
         match storage {
             Some(storage) => {
                 let (device_epoch, device_now) = (crate::light_device::current_epoch(), crate::light_device::now_secs());
                 let mut dormant = 0usize;
-                for (node_id, role, shard, check) in candidates {
+                for (node_id, role, shard, check, dues) in candidates {
                     // Two proven device misses: not woken, and held so (`SendOutcome::Dormant`) until its own answer, so
                     // the epoch counts toward the rule next epoch too and the node never flips back every third epoch.
                     if check && (crate::rpc::PUSH_LEDGER.held_dormant(&node_id, current_window)
@@ -2480,7 +2484,9 @@ impl SimplifiedP2P {
                         continue;
                     }
                     if let Some(reach) = crate::rpc::push_reach_at(storage, &node_id, device_epoch, device_now) {
-                        result.nodes.push((node_id, role, reach));
+                        if crate::rpc::PUSH_LEDGER.may_push_on(&node_id, now_slot, dues, || held_from(&node_id), reach.ios) {
+                            result.nodes.push((node_id, role, reach.channel));
+                        }
                     }
                 }
                 if dormant > 0 && crate::node::is_debug() {
@@ -4131,11 +4137,14 @@ mod tests_ping_slot_index {
         mark: Option<(u64, u64)>,
         /// Whether a shard another owner may have pushed earlier in the window is read under that owner's draw too.
         foreign: bool,
+        /// The nodes (indices) whose device the selection reads as an iOS one (`rpc::PushReach::ios`).
+        ios: std::collections::HashSet<usize>,
     }
 
     impl SimOwner {
         fn new(me: usize, schedule: (u64, u64)) -> Self {
-            SimOwner { me, schedule, ledger: crate::rpc::PushLedger::new(), reads: ShardReads::new(), last: None, mark: None, foreign: true }
+            SimOwner { me, schedule, ledger: crate::rpc::PushLedger::new(), reads: ShardReads::new(), last: None, mark: None, foreign: true,
+                       ios: Default::default() }
         }
 
         /// A restart: the ledger, the reads and the slot last read go; the mark stays.
@@ -4179,19 +4188,22 @@ mod tests_ping_slot_index {
                 draws.extend(foreign_draws(w, self.me, shard, &schedules));
             }
             let held = self.reads.held_from[shard];
-            let mut offered: Vec<usize> = Vec::new();
+            let mut offered: Vec<(usize, &[crate::rpc::Due])> = Vec::new();
             let mut once = std::collections::HashSet::new();
             for r in &reads {
                 for d in &draws {
                     for i in bucket(*d, r.bucket) {
                         if !once.contains(&i) && self.ledger.may_push(&nodes[i], now, &r.dues, || held) {
                             once.insert(i);
-                            offered.push(i);
+                            offered.push((i, &r.dues));
                         }
                     }
                 }
             }
-            offered.retain(|i| !counted(*i));
+            // As the selection: a hold is recorded before the device is read, a push only at its device's due point.
+            offered.retain(|(i, dues)| !counted(*i) && (outcome(*i) == crate::rpc::SendOutcome::Dormant
+                || self.ledger.may_push_on(&nodes[*i], now, dues, || held, self.ios.contains(i))));
+            let offered: Vec<usize> = offered.into_iter().map(|(i, _)| i).collect();
             for i in &offered { self.ledger.record(&nodes[*i], now, outcome(*i), 1_800_000_000 + now); }
             offered
         }
@@ -4203,8 +4215,16 @@ mod tests_ping_slot_index {
     /// its read mark kept. Every tick offers the node once at most. The slots a push, a challenge or a hold went out in.
     fn sim(w: u64, s: u64, spaced: bool, ticks: impl IntoIterator<Item = u64>, counted: impl Fn(u64) -> bool,
            outcome: impl Fn(u64) -> crate::rpc::SendOutcome, restart: Option<u64>) -> Vec<u64> {
+        sim_on(false, w, s, spaced, ticks, counted, outcome, restart)
+    }
+
+    /// `sim` for a node whose device the selection reads as an iOS one (`ios`) or not.
+    #[allow(clippy::too_many_arguments)]
+    fn sim_on(ios: bool, w: u64, s: u64, spaced: bool, ticks: impl IntoIterator<Item = u64>, counted: impl Fn(u64) -> bool,
+              outcome: impl Fn(u64) -> crate::rpc::SendOutcome, restart: Option<u64>) -> Vec<u64> {
         let schedule = if spaced { (0, 0) } else { (0, u64::MAX) };
         let mut o = SimOwner::new(0, schedule);
+        if ios { o.ios.insert(0); }
         let nodes = ["light_mobile_sim".to_string()];
         let mut sent = Vec::new();
         for t in ticks {
@@ -4368,6 +4388,84 @@ mod tests_ping_slot_index {
         let src = include_str!("propagation.rs");
         assert!(src.contains("crate::rpc::keep_push_read_mark(st, now_slot, shard_reads.read_from[our_genesis_idx]);"));
         assert!(src.contains("if first_tick { reads_state.done = resumed.map(|(l, _)| l); }"));
+    }
+
+    /// An iOS device is pushed at every other due point of the spaced rounds, 0, 30, 60 and 90 slots after its drawn
+    /// slot: four an epoch, evenly half an hour apart, two an hour, none after IOS_LAST_PUSH_SLOT (three for a node drawn
+    /// after slot 130). Whatever a shed push or a stall did in one run, or a stop and the restart that ends it, never two
+    /// within IOS_MIN_PUSH_GAP_SLOTS, the next epoch's first included, nor more than three within an hour; every other
+    /// device of the same buckets keeps its six.
+    #[test]
+    fn an_ios_device_gets_four_pushes_half_an_hour_apart_and_every_other_device_six() {
+        use crate::rpc::SendOutcome::{Accepted, Unsent};
+        use crate::rpc::{IOS_LAST_PUSH_SLOT, IOS_MIN_PUSH_GAP_SLOTS, IOS_PUSH_SPACING_SLOTS};
+        let w = 4_100u64;
+        let never = |_: u64| false;
+        // The last push leaves room for the next epoch's first, in its slot 0 at the earliest.
+        let kept_apart = |sent: &[u64]| sent.len() <= 4 && sent.windows(2).all(|p| p[1] - p[0] >= IOS_MIN_PUSH_GAP_SLOTS)
+            && sent.windows(4).all(|p| p[3] - p[0] >= 60) && sent.last().map_or(true, |l| 240 - l >= IOS_MIN_PUSH_GAP_SLOTS);
+        for s in [0u64, 1, 47, 89, 90, 120, 130, 131, 137] {
+            let ios = sim_on(true, w, s, true, 0..240, never, |_| Accepted, None);
+            let due: Vec<u64> = [s, s + 30, s + 60, s + 90].into_iter().filter(|t| *t <= IOS_LAST_PUSH_SLOT).collect();
+            assert_eq!(ios, due, "slot {s}");
+            assert_eq!(ios.len(), if s <= 130 { 4 } else { 3 }, "slot {s}");
+            assert!(ios.windows(2).all(|p| p[1] - p[0] == IOS_PUSH_SPACING_SLOTS) && ios.windows(3).all(|p| p[2] - p[0] >= 60));
+            assert!(kept_apart(&ios), "slot {s}: {ios:?}");
+            assert_eq!(sim(w, s, true, 0..240, never, |_| Accepted, None), vec![s, s + 15, s + 30, s + 60, s + 75, s + 90]);
+            for k in 1..=ios.len() {
+                let answered = ios[k - 1] + 1;
+                assert_eq!(sim_on(true, w, s, true, 0..240, |t| t >= answered, |_| Accepted, None), ios[..k].to_vec(), "slot {s}, k {k}");
+            }
+        }
+        let s = 40u64;
+        // Shed in its slot: out in the next one of its grace, and the next due point keeps its slot.
+        assert_eq!(sim_on(true, w, s, true, 0..240, never, |t| if t == s { Unsent } else { Accepted }, None),
+                   vec![s + 1, s + 30, s + 60, s + 90]);
+        // A catch-up push made late stands in for the next due point when that one is nearer than IOS_MIN_PUSH_GAP_SLOTS.
+        let ticks = |skip: std::ops::Range<u64>| (0..240u64).filter(move |t| !skip.contains(t));
+        assert_eq!(sim_on(true, w, s, true, ticks(s..s + 10), never, |_| Accepted, None), vec![s + 10, s + 30, s + 60, s + 90]);
+        assert_eq!(sim_on(true, w, s, true, ticks(s..s + 11), never, |_| Accepted, None), vec![s + 11, s + 60, s + 90]);
+        for s in [s, 125, 130, 137] {
+            for start in s..s + 95 {
+                for len in 1..=MAX_PING_CATCHUP_SLOTS {
+                    let sent = sim_on(true, w, s, true, ticks(start..start + len), never, |_| Accepted, None);
+                    assert!(kept_apart(&sent), "slot {s}, stall {start}+{len}: {sent:?}");
+                }
+            }
+        }
+        // A restart in any slot sends what an uninterrupted genesis sends: the repeat 15 slots on, due to a node it has no
+        // record of, is refused once the device is read as an iOS one.
+        for restart in 1..240 {
+            assert_eq!(sim_on(true, w, s, true, 0..240, never, |_| Accepted, Some(restart)), vec![s, s + 30, s + 60, s + 90],
+                       "restart at slot {restart}");
+        }
+        let down = |from: u64, len: u64| (0..240u64).filter(move |t| !(from..from + len).contains(t));
+        for from in 1..200u64 {
+            for len in [0u64, 1, 2, 5, 13, 15, 16, 30] {
+                let sent = sim_on(true, w, s, true, down(from, len), never, |_| Accepted, Some(from + len));
+                assert!(kept_apart(&sent), "stop {from}+{len}: {sent:?}");
+            }
+        }
+        // One shard, both platforms in the same buckets: each gets its own schedule from the same reads.
+        let mut o = SimOwner::new(0, (0, 0));
+        let nodes: Vec<String> = (0..4).map(|i| format!("light_mobile_mixed{i}")).collect();
+        o.ios.extend([1, 3]);
+        let mut got = vec![Vec::new(); nodes.len()];
+        for t in 0..240u64 {
+            let b = |_: u64, bucket: usize| if bucket as u64 == s { vec![0, 1] } else if bucket as u64 == s + 7 { vec![2, 3] } else { vec![] };
+            for i in o.tick(w * 240 + t, 0, [(0, 0); 5], &nodes, &b, &|_| false, &|_| Accepted) { got[i].push(t); }
+        }
+        assert_eq!(got[0], vec![s, s + 15, s + 30, s + 60, s + 75, s + 90]);
+        assert_eq!(got[1], vec![s, s + 30, s + 60, s + 90]);
+        assert_eq!(got[2], vec![s + 7, s + 22, s + 37, s + 67, s + 82, s + 97]);
+        assert_eq!(got[3], vec![s + 7, s + 37, s + 67, s + 97]);
+        // The selection asks the ledger again on the device's schedule once the device is read, before the push.
+        let src = include_str!("propagation.rs");
+        let sel = &src[src.find("pub(crate) fn get_light_nodes_to_ping(&self, tip: u64)").unwrap()..];
+        let sel = &sel[..sel.find("fn maybe_pull_push_channel").unwrap()];
+        let read = sel.find("crate::rpc::push_reach_at(storage, &node_id, device_epoch, device_now)").unwrap();
+        let again = sel.find("crate::rpc::PUSH_LEDGER.may_push_on(&node_id, now_slot, dues, || held_from(&node_id), reach.ios)").unwrap();
+        assert!(read < again && again < sel.find("result.nodes.push((node_id, role, reach.channel));").unwrap());
     }
 
     /// A node the dormant rule holds is read again only at the round's first push and the retry round's: a hold closes

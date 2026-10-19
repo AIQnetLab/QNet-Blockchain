@@ -184,7 +184,10 @@ describe('MB-R2-01: a kept transaction is sent again whatever tab is open', () =
     const ws = read('src/screens/WalletScreen.js');
     const sweep = between(ws, '// A kept transaction the wallet still sends by itself goes out again whatever tab is open', 'useEffect(() => { activeTabRef.current');
     expect(sweep).toMatch(/if \(!address \|\| !appActive \|\| activeTab === 'assets'\) return undefined;/);
-    expect(sweep).toMatch(/const kept = await walletManager\.pendingTransactions\(address\);\s*if \(!live \|\| !kept\.some\(\(e\) => autoSendable\(e\)\)\) return;\s*await walletManager\.sendDuePending\(address\);/);
+    expect(sweep).toMatch(/const kept = await walletManager\.pendingTransactions\(address\);\s*if \(live && kept\.some\(\(e\) => autoSendable\(e\)\)\) await sendKeptDue\(address\);/);
+    // One send of the kept transactions for the sweep, the balance read and an account event's follow.
+    expect(ws).toMatch(/const sendKeptDue = \(address\) => walletManager\.sendDuePending\(address\)\.catch\(\(\) => \{\}\)\s*\.finally\(\(\) => \{ refreshKept\(address\); \}\);/);
+    expect(ws.match(/walletManager\.sendDuePending\(/g)).toHaveLength(1);
     expect(sweep).toMatch(/const timer = setInterval\(sweep, KEPT_SWEEP_MS\);/);
     expect(sweep).toMatch(/return \(\) => \{ live = false; clearInterval\(timer\); \};/);
     expect(ws).toMatch(/const KEPT_SWEEP_MS = 15_000;/);
@@ -194,13 +197,12 @@ describe('MB-R2-01: a kept transaction is sent again whatever tab is open', () =
 describe('MB-R2-02: the Send form checks what the wallet may still spend, read now', () => {
   const ws = read('src/screens/WalletScreen.js');
 
-  it('a balance no certified proof gave refuses the send, saying why; the figure on screen never stands in for it', () => {
+  it('no balance read at the live tip refuses the send, saying why; the figure on screen never stands in for it', () => {
     const fresh = between(ws, 'const freshQncNano = async () => {', '};');
     expect(fresh).not.toMatch(/tokenBalances/);
-    // While a long lineage walk is why nothing was certified, the refusal carries how far it is (walkSteps).
-    expect(fresh).toMatch(/r && r\.ok && r\.verified && \/\^\\d\+\$\/\.test\(String\(r\.balanceNano\)\) \? r\s*: \{ error: \(r && r\.error\) \|\| 'unanswered', walkSteps: r \? r\.walkSteps : undefined $/m);
+    expect(fresh).toMatch(/return r && r\.ok && \/\^\\d\+\$\/\.test\(String\(r\.balanceNano\)\) \? r : \{ error: \(r && r\.error\) \|\| 'unanswered' $/m);
     const send = between(ws, 'const handleSendTransaction = async () => {', 'setSendingTransaction(true);');
-    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error, qncCheck\.walkSteps\) \}\);\s*return;/);
+    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error\) \}\);\s*return;/);
     // A token send is checked against the token balance read again, and its QNC fee against what may still be spent.
     expect(send).toMatch(/walletManager\.checkedTokenBalance\(sendingToken\.contract, myQnetAddress, sendingToken\.decimals\)/);
     expect(send).not.toMatch(/amount > sendingToken\.balance/);
@@ -209,7 +211,7 @@ describe('MB-R2-02: the Send form checks what the wallet may still spend, read n
     expect(send).toMatch(/const replaceNonce = pendingChoice && pendingChoice\.mode === 'replace' \? pendingChoice\.nonce : null;\s*spendable = afterPending\(qncNano, qncCheck\.pending, replaceNonce\);/);
     expect(ws).toMatch(/if \(spendable === null \|\| BigInt\(need\.needNano\) > spendable\) \{/);
     expect(t('send_balance_unreadable')).toBe('QNet Blockchain did not answer, so nothing was sent. Try again.');
-    expect(t('balance_unconfirmed')).toBe('The balance is not confirmed yet. Try again in a minute.');
+    expect(t('balance_unconfirmed')).toBe('What an earlier transaction from this wallet takes is not known yet. Try again in a minute.');
   });
 
   it('the finding\'s case: 10 QNC, 8 QNC unconfirmed, 5 QNC "in addition" is refused; replacing the 8 is not', () => {
@@ -234,7 +236,7 @@ describe('MB-R2-03: the sheet offers to read an unread balance again', () => {
     const view = {
       id: 'a1', kind: 'send', origin: 'https://app.dapp.example', busy: false, queued: 0, outcome: null, previewError: null,
       details: { to: TO, amountNano: '1500000000', feeNano: '150000', totalNano: '1500150000' },
-      preview: { nonce: 8, balanceNano: null, verified: false, counterparties: [], pending: [], recent: [], replaceNonce: null, appendNonce: null },
+      preview: { nonce: 8, balanceNano: null, counterparties: [], pending: [], replaceNonce: null, appendNonce: null },
     };
     let tree;
     await act(async () => {

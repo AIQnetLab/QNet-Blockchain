@@ -19,7 +19,7 @@ against a committee quorum certificate, and runs this wallet's light node on the
   QNet Wallet [browser extension](browser-wallet.md).
 - Shows this wallet's super node, which is activated only in the QNet Wallet browser extension on a computer and runs on a
   server with the QNet Blockchain node software ([running a node](../operators/running-a-node.md)): its status, when it was last
-  seen, its heartbeats this epoch, its missed epochs and its node balance ([The Node tab](#the-node-tab)).
+  seen, its heartbeats this epoch and its node balance ([The Node tab](#the-node-tab)).
   The app only shows it; it activates no node of either type.
 - Confirms that aiqnet.io may prepare this wallet's light node with a one-time payment address, gives this wallet's
   consent to its node, links it to this device, unlinks it from the device it runs on (from that device, or from any
@@ -50,7 +50,20 @@ line for each. An id or an address to share sits whole on one line under its lab
 and copied whole on a tap, and a text that must be read whole (a memo, a recipient to confirm) wraps under its label.
 A value stays selectable. A balance on Assets sits beside its token while it fits two fifths of the row at half its
 size; a longer one (a token's exact balance has up to 18 decimals) takes a line of its own under the token, whole, and a
-token's symbol and name wrap rather than lose their ends. Receive has the title "Receive", the QR code and one
+token's symbol and name wrap rather than lose their ends. Every amount on screen (Assets, the Send forms with their
+review, refusals and result card, a pending transaction's line, History rows and details, the Node tab, the QNet Link
+sheet, a site's request sheet, the Solana form) is written as the app's language writes figures
+(`src/utils/amountFormat.js` `amountText`): the whole part grouped by three and the language's decimal mark,
+"2,047,243.4405" in English, Chinese, Japanese, Korean and Arabic (Latin digits), "2 047 243,4405" in Russian (a
+no-break space) and French (a narrow no-break space), "2.047.243,4405" in German and Portuguese, and the same in Spanish
+and Italian, which leave a four-digit whole part ungrouped ("1234"). The marks come from the platform's number
+formatting, read once per language, with a fixed table where it fails or writes other digits; the figure itself is put
+together from its exact decimal text, never through a floating-point number, so a 64- or 128-bit amount keeps every
+digit. A QNC amount counted in nano (a node balance, a move's amount and the part of it in the wallet, the figures of a
+site's request sheet) is written exact to the nano the same way on every screen (`amountFormat` `formatNano`,
+`qncText`), "••••" while amounts are hidden and "—" while it is not known, never "0 QNC". What a field, a signature,
+a site's answer and the history cache hold stays canonical (digits and a point).
+Receive has the title "Receive", the QR code and one
 line: "Your address for QNC and tokens on QNet Blockchain." or "Your Solana address for SOL and Solana tokens.", with no
 warning boxes. The screens carry titles, labels, short buttons and short errors; a confirmation line appears only
 where an action cannot be undone (a send, deleting the wallet, the recovery phrase). Creating a wallet ends when the
@@ -71,7 +84,8 @@ the purpose strings iOS itself shows (Face ID, camera) come in each (`ios/QNetMo
 lays the screen out right to left; addresses, hashes, codes and amounts stay left to right, and a value put into an
 Arabic sentence is wrapped in a bidi isolate. The wallet's own errors are translated by code; what a node answered
 is shown after them as details. The native prompts (biometric and Face ID reasons, the Android biometric button, the
-iOS screen-recording cover and screenshot warning) get their words from the same tables. Recovery phrases,
+iOS screen-recording cover, the Android notice for a tap through another app's window) get their words from the same
+tables. Recovery phrases,
 addresses, env names (`QNET_*`), token symbols and brand names are never translated. The few texts that name Google
 Play live in `src/i18n/overlays/android/` (`overlay.android.js`), which no iOS build carries. Tests: every key in every
 language with the same placeholders (`__tests__/I18n.test.js`), no hard-coded user-visible string in the screens
@@ -225,7 +239,10 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
 - The lock screen is plain, the same at launch, after Lock Wallet and after an auto-lock: the app's mark and name, and
   the unlock itself. Under the screen lock the system prompt opens by itself and nothing stands under it; once the
   prompt ended without opening the wallet (cancelled, failed), an **Unlock your wallet** button asks again. A password
-  wallet shows its password field, the same button and, where set up, biometric unlock. At the foot of the screen a
+  wallet shows its password field, the same button and, where set up, biometric unlock. What an unlock that did not
+  open the wallet says sits under the title (under the password field in a password wallet) across the column's width,
+  centred in every language and clear of the lines around it (`styles.lockMessage`); the column scrolls when a very
+  large system text size makes it taller than the screen. At the foot of the screen a
   small link **Forgot? Reset the wallet** opens the erase confirmation (typed ERASE, and under the screen lock a fresh
   device check), after which the wallet is restored from its recovery phrase; it is never shown while the system
   prompt is up. No erase choice stands next to Unlock. Before the stored wallet was read the screen shows only the
@@ -358,9 +375,10 @@ quorum certificate it opened signature by signature, and whose committee it deri
 to the pinned genesis identities — the answering node contributes bytes, never trust. The macroblock a
 certified proof folds to is the one the answering node names, and the device verifies that macroblock
 rather than requiring it to be the chain tip; it counts only within two macroblocks of the certified head
-(above). Recency beyond that comes from the polling cadence and the WebSocket push, which is why the app
-re-reads on wallet-screen focus, and a send counts this wallet's own transactions since the certified
-state and takes its nonce from a fresh confirmed read before signing.
+(above). Recency beyond that comes from the figure at a genesis node's live tip, which the screen shows and a send is
+checked against, its proof folded to that node's root, and the certified read confirms in the background; a send takes
+its nonce, before signing, from what two genesis nodes agree on at their live tip, and only without an agreement from
+that figure, never below the highest nonce this device confirmed (`WalletManager._confirmedAccountNonce`).
 
 ### Trust anchor
 
@@ -442,14 +460,19 @@ no proof badge; only the checks above make a value count as proven where the app
   after the second answer; a row compared by its hash, both parties and its amount in nanoQNC, a contract call, deploy
   or registration by its hash alone). They are asked with every read that asks the explorer, and with any other that
   brought a row one node reports which no earlier read found listed. A listed row is Confirmed, except received QNC, which says
-  "Not credited yet" until the certified balance read last (Assets' or the foreground follow's) covers its block, and
-  Confirmed from then on: being listed proves a block carries the transaction, never that it applied, which only the
-  certified balance shows. A token transfer a logs proof verifies is Confirmed; an archived one no committee-certified
-  logs root anchors (older than the nodes' proof window, or a leaf that folds only to a root a node claimed) is
-  Unverified. A row once listed or proven stays so while the archive returns it unverified. Up to 500 rows (the
-  archive's and the listed ones, with their status) are cached per wallet address and shown while a session's first
-  fetch is in flight; a row an older build cached as confirmed on the archive's word alone reads as Unverified
-  (`checkedCachedRows`). A node's row of a transaction the archive holds under another key (a batch
+  "Not credited yet" until the wallet's figure read last covers its block (the live figure's height, read after each
+  account event of the address socket, every 15 seconds on Assets while the socket is not live, and once by a History
+  read that lists such a row; a certified read's checkpoint), and Confirmed from
+  then on: being listed proves a block carries the transaction, never that it applied, which the balance shows. A send
+  of this wallet whose result card saw it in a block is Confirmed at once, with that block (`markInBlock`: the row is
+  flagged `inBlock`, and every row of its hash a node or the archive brings later takes the flag, so it never shows
+  Pending again); so is a token transfer a genesis node reports (its token-transfer feed decodes only transactions that
+  applied). A logs proof anchored to a committee-certified logs root adds the verified mark to a token row in the
+  background and never takes Confirmed away; a token transfer only the archive holds is Unverified. A row once listed,
+  reported in a block or proven stays so while the archive returns it unverified. Up to 500 rows (the archive's, the
+  listed ones and the ones reported in a block, with their status) are cached per wallet address and shown while a
+  session's first fetch is in flight; a row an older build cached as confirmed on the archive's word alone reads as
+  Unverified (`checkedCachedRows`). A node's row of a transaction the archive holds under another key (a batch
   payment's credit `hash:bN`) goes as soon as the archive's row is there, so no payment shows twice. The tab is titled
   "History" and is split by network exactly as Assets is, with the same QNet Blockchain · Solana selector (one choice shared with Assets): QNet Blockchain lists the wallet's transactions there of every asset and its node lifecycle rows, Solana the sends made
   on this device (said once above that list); there are no filter chips. It says "No transactions yet" when empty
@@ -482,7 +505,7 @@ no proof badge; only the checks above make a value count as proven where the app
   reports 65 minutes after it was sent (the wallet sends it again by itself for 30 minutes, a node keeps each copy 30
   minutes, and a 5-minute margin: `PENDING_ROW_MAX_MS`, as long as `services/PendingTx` `mayLandUntil` allows it to
   land) is Not found instead of staying Pending for ever, and a source's row with its hash still replaces it; neither
-  Pending nor Not found rows are kept on the device. Before a row is marked Not found the chain is asked by the send's
+  Pending nor Not found rows are kept on the device, and a send reported in a block is never Not found. Before a row is marked Not found the chain is asked by the send's
   nonce: one that landed, under its own hash or as a copy under another, becomes a node's reported row under the hash
   that landed (the archive's row replaces it once listed); one whose nonce another transaction took goes; one no node
   answered for stays Pending until a later refresh can ask (`rowsDueToDrop`, `mergeHistory` `settled`), and so does one
@@ -490,7 +513,7 @@ no proof badge; only the checks above make a value count as proven where the app
   or reported row with the same hash always replaces a Pending or Not found row, an older page's included, and the result
   card's own check by nonce removes either. The amount is written compactly, by the extension's rule too
   (grouped below 100,000 with at most two decimals from 1,000, four from 1 and eight below 1; K, M, B, T from 100,000
-  with at most two) and never shrinks or ends in an ellipsis; only a token's symbol, a name, may. The amounts take at
+  with at most two), in the language's marks; the detail shows the exact figure in them and never shrinks or ends in an ellipsis; only a token's symbol, a name, may. The amounts take at
   most 45% of the row, so what happened and whom with keep the rest, and a single amount whose number and symbol run
   past 13 characters (a long symbol, a dust amount) puts the symbol under the number, as the extension does. A token the
   wallet did not add carries its contract id, and one named after QNC or QNet Blockchain a ⚠ (in any spelling a reader takes for it:
@@ -508,10 +531,17 @@ no proof badge; only the checks above make a value count as proven where the app
   source named it, a memo when there is one, and one button: "View in the explorer" for a transaction the network ran (a QNet Blockchain one in a block opens QNet Blockchain Explorer, a Solana send the cluster's public explorer, `config/nodes.js`
   `solanaExplorerTxUrl`), otherwise (one still pending or not found, a Solana send that expired unrun) "Copy the
   transaction hash"; a node event the registry alone reports has no transaction hash, so neither.
-- **WebSocket events.** A `BalanceUpdate` naming this wallet, or a block event carrying one of its
-  transactions, only triggers a fresh balance read and a history reload; the pushed value itself is
-  never displayed. The Assets tab keeps the last known QNC balance when a read fails and does not lower
-  it from an unverified read (`src/utils/balanceMerge.js`).
+- **Account events.** The node sends `{"type":"BalanceUpdate","data":{"address","block_height"}}` on the address
+  socket after each block that touched this wallet (a native balance, the fee wallet, a token transfer). It carries no
+  amount and is a hint only (`WalletScreen.followAccountEvent`): 1 second later the live QNC figure is read, again a
+  second after each read while the figure shown is of a state before `block_height` (a genesis node behind the one that
+  sent it), three reads at most; then the token rows and History's newest rows are read, and a kept transaction now due
+  is sent again (a send "in addition" goes once the one before applied). An event that comes while a follow runs raises
+  the block that follow waits for instead of starting it over, so a wallet touched in every block still gets to the end
+  of each follow. Once one came, the connection is live and Assets and History poll less often ([Requests from the open
+  app](#requests-from-the-open-app)). The Assets tab keeps the last known QNC figure when a read fails; one unproven
+  answer of the certified route does not lower it, while a newer live figure or two genesis nodes agreeing on a lower
+  figure do (`src/utils/balanceMerge.js`).
 - **The first figures.** The last balances a proof certified (QNC, with SOL and 1DEV of the same read and the token rows
   a proof certified) are kept per wallet, sealed under the vault's data key and tagged with the chain
   (`WalletManager.saveBalanceSnapshot`, `qnet_balance_cache`; resealed by a password change, gone with the wallet), and
@@ -528,18 +558,33 @@ no proof badge; only the checks above make a value count as proven where the app
   `WalletManager.networkPause`) the line says so instead, whatever the reads give: "QNet Blockchain has confirmed nothing new since {time}. Balances are as of then.", the time being the one that head's checkpoint names, which the
   committee's QC signs, once this device verified it (one walk step is taken for it, at most once a minute, when the
   head is a step above what the device holds). Until then no time is named: "QNet Blockchain has confirmed nothing new for some time. Balances are as of its last confirmed state." (the time the device first saw the head is not when the
-  network certified it). It goes once the head moves. A head that cannot be read keeps what was known. Otherwise, while
-  a long lineage walk keeps QNC from being certified, the line says how many steps are left ([Following the
-  head](#following-the-head)). Nothing on Assets
+  network certified it). It goes once the head moves. A head that cannot be read keeps what was known. Nothing on Assets
   pops up on a timer. One read runs at a time per wallet (the unlock and the Assets tab share it), and each figure lands
   as soon as its own source answers: SOL and 1DEV from Solana, QNC as soon as its answer is read and its Merkle proof
   folded (not verified yet: it cannot lower the figure shown), then again once the lineage walk decided; an answer whose
   proof did not fold is never shown. Nothing kept or early is ever marked or used as verified: sends read their own
   balance and nonce. The QNC figure at a genesis node's live tip (the proof route without `mb`: its live state, a proof
   under that state's root) shows as soon as its proof folds, so money that came in shows within seconds
-  (`WalletManager.liveQncFigure`); a certified figure of an older state does not go over it, one that reaches its
-  height confirms it. A move of a node balance in transit is not shown on Assets: History says Moving and the Node tab
-  "Moving X" ([Moving the node balance](#moving-the-node-balance)). A refresh that changes nothing renders
+  (`WalletManager.liveQncFigure`), read again after each account event of the address socket and every 15 seconds while
+  Assets is in front and the socket is not live; a live figure of a newer state
+  than the one shown replaces it, lower too (a spend made elsewhere), one of an older state (a node a block behind)
+  never does, nor does a certified figure of an older state; a certified one that reaches its height confirms it. A
+  live figure is judged by the chain's height as the app read it within the last two minutes (`GET /api/v1/height` of a
+  genesis node, read again beside a live read once the last read is a minute old and never waited for, counted on at
+  one block a second; `requestPace.liveHeightFits`, `TIP_FRESH_MS`, `TIP_READ_MS`): one of a block more than 30 past it
+  (`LIVE_TIP_MARGIN`; a node on a branch the chain left, or a faulty one) is not shown, and one taken while no height
+  was known is dropped once a height read shows it past that, so it neither refuses later figures nor counts received
+  History rows in the balance. After a QNC send the balance less the amount and the fee shows at once, unmarked, until
+  a figure shows the send applied (its account nonce reached the send's, whatever came in meanwhile, or it is at or
+  below that balance) or two minutes passed (`WalletScreen.heldAfterSend`). Each added token's row shows its figure at a
+  genesis node's live tip the same way (`liveTokenFigure`, both levels folded, judged by the same height), and its
+  certified figure replaces it, with the mark, only when it is of the same state or newer (`balanceMerge`
+  `tokenFigureRow`). The holdings answer (one node's, unproven, of no stated height) only adds and removes token rows
+  and fills a row no proven figure covers yet: a row whose figure was proven for a state keeps it, with that state and
+  its mark (`WalletScreen.loadQrcTokens`), so neither that answer nor a proven figure of an older state takes a row back
+  to a balance from before a send or a receipt. A token proof still running is shared by the next load that asks for
+  it. A move of a node balance in transit is not shown on Assets: History says Moving and the Node tab "Moving X" ([Moving the node
+  balance](#moving-the-node-balance)). A refresh that changes nothing renders
   nothing new: a merge that changes no figure keeps the object on screen (`src/utils/balanceMerge.js`), as do the token
   list, the kept transactions and the time of the QNC read.
 - **The transport.** Every connection is HTTPS; see *Platforms and build* below.
@@ -583,9 +628,10 @@ answer of another index. The next genesis name is asked, one after another, at m
 (HTTP 200, no `proof_format`, a boolean `proof_valid`, a numeric `block_height` and its proof arrays: never a rate limit
 or an error) is marked for ten minutes and asked after the others (`SmtFold.isLegacyProofBody`, `markNodeOld`). A
 figure is shown only when its proof folded; a folded 0 is shown as any other figure. Every figure carries the claim
-watermark of its own leaf (`last_claimed_epoch`, `figureClaimedEpoch`), as certain as the figure: Assets' in-transit
-line follows the figure on screen by it. Only a verified figure carries it as `lastClaimedEpoch` too, the certified
-watermark, the one thing that ends a move of a node balance in transit (an older body's, once its root was certified).
+watermark of its own leaf (`last_claimed_epoch`, `figureClaimedEpoch`), as certain as the figure: the live figure's
+ends a move of a node balance in transit on screen. Only a verified figure carries it as `lastClaimedEpoch` too, the
+certified watermark, which settles the move's record and becomes the wallet's durable watermark (an older body's, once
+its root was certified).
 
 A macroblock is certified some blocks after its height; until then a node answers it with HTTP 200
 `{"error": "macroblock_not_found"}`. For the macroblock a walk is for, that answer is no failure of the node: the step
@@ -638,13 +684,9 @@ While a wallet is open and the app is in front, the screen calls `WalletManager.
 tab (`FOLLOW_MS`; one tick at a time, nothing while the wallet is locked). A tick reads the certified head and makes one
 walk step toward it on its parity (`QcLightClient.followStep`), up to 16 on both parities while either is more than a
 step behind, and both parities for ten minutes after this wallet's own send; while that walk is long it refreshes the
-capsule first. It then reads the open wallet's QNC proof, which stands for the next send check by the macroblock it
-names ([Sending](#requests-signing-and-sending)), and keeps the anchors and the capsule. A device that follows the head
-thus walks by committee signatures from what it verified. While a QNC balance is not certified because the walk to a
-recent checkpoint still takes more than two steps (`WalletManager.walkSteps`, `LONG_WALK_STEPS`), the line under Send
-and Receive on Assets says "Checking the balance against QNet Blockchain: {n} steps left." until a certified read lands,
-and a send refused as not confirmed (the in-app browser's sheet too) says the same in place of "The balance is not
-confirmed yet. Try again in a minute."
+capsule first. It then reads the open wallet's QNC proof and keeps the anchors and the capsule; a certified watermark
+that proof shows settles the record of a move of a node balance in transit. A device that follows the head thus walks
+by committee signatures from what it verified, in the background: nothing the user does waits for it.
 
 ## Requests, signing and sending
 
@@ -751,29 +793,32 @@ Send button turns busy, with a spinner, from the tap until the send is over, and
 the review the form reads, all at once, the QNC balance, a token send's token balance, what the recipient is and the
 wallet's kept transactions. A recipient that is a contract (a built-in token, the token being sent included, or any
 other contract: none sends QNC or a token on) is refused with "This address is a contract, not an account. …", decided
-only by the `is_contract` field of its account leaf folded to a certified root, as the balance is
-(`WalletManager.certifiedRecipientKind`, `payableRecipientProblem`); with no certified answer within 20 seconds nothing
-is sent ("QNet Blockchain could not confirm that this address is an account and not a contract, so nothing was sent.
-Try again."). A contract answer is kept for the session and an account answer while its macroblock is within two of
-the certified head, so the same check just before signing is instant. A send is decided only by a balance the
-committee certified (`WalletManager.certifiedQncForSend`, `checkedTokenBalance`): a certified proof read at most 30
-seconds before, or for QNC one of any age whose macroblock is still within two of the certified head (the foreground
-follow keeps one there: `_keptByIndex`; a token proof, and one naming no macroblock, count by their age only, since a
-token balance can drop without the holder's nonce), used at once while it is at least as new as the account nonce the
-chain confirms, else one verified read within 20 seconds (as long as the first certification after a launch takes: the
-capsule, then the few steps from it; the extension's send check has the same 20 s), started when the Send screen
-opens, so the tap usually finds it done; never one node's answer, never what genesis nodes agree
-on, never the figure on screen. The certified state lags the chain by up to a few minutes, so right after the wallet's
-own send the next one's nonce is above the certified nonce: the decision stays on the certified figure less the amount
-and most fee (a token transfer: the tokens it moves) of each of this wallet's own transactions from the certified
-nonce up to the next nonce, as kept when each was signed (settled or not; two signed at one nonce count as the larger),
-and nothing received after the checkpoint is counted (`services/PendingTx` `ownSpends`, `spendableFrom`). A nonce in
-that range that is none of this wallet's own transactions refuses the send with "A transaction from another device is
-not confirmed yet. Try again in a minute."; a balance not certified in time (or a transaction whose cost the wallet
-cannot know, such as a contract call before a token send) with "The balance is not confirmed yet. Try again in a
-minute."; no answer at all with "QNet Blockchain did not answer, so nothing was sent. Try again." A token balance counts
-only beside the holder's certified QNC proof of the same macroblock (the same root, for an older node), which gives the
-holder's nonce in that state. The form then checks the amount and fee, and a token send's tokens, against what may
+at once by what the genesis nodes report of their live state, two agreeing (`GET /api/v1/token/{address}`:
+`WalletManager.agreedContractKind`, `payableRecipientProblem`, as the in-app browser's sheet decides), in one read with
+the normal network timeout; with no two agreeing nothing is sent ("QNet Blockchain could not confirm that this address
+is an account and not a contract, so nothing was sent. Try again."). The `is_contract` field of the recipient's account
+leaf folded to a certified root confirms it in the background (`certifiedRecipientKind`, one read at a time per
+address, never waited for): a contract it proved is kept for the session and refused at once by every later check, an
+account answer is kept while its macroblock is within two of the certified head. The same check runs again just before
+signing. A send is checked against the wallet's figure
+at a genesis node's live tip, as a wallet that shows its node's answer does (the owner's rule, 18.10;
+`WalletManager.qncForSend`, `checkedTokenBalance`): the proof route without `mb`, its proof folded to the root that
+node served (`liveQncFigure`, `liveTokenFigure`, asked of the genesis names one after another while an answer does not
+fold), read at once with the account nonce the genesis nodes agree on, in one read with the normal network timeout. A
+figure read within 15 seconds is taken as it is (`LIVE_SEND_REUSE_MS`: the Send screen reads one when it opens, so the
+tap usually finds it); never the figure on screen. From that figure come off the amount and most fee (a token transfer:
+the tokens it moves) of each of this wallet's own transactions it does not hold yet, as kept when each was signed
+(settled or not; two signed at one nonce count as the larger): one between its nonce and the agreed one applied a block
+after it, one above both may still take its amount (`services/PendingTx` `ownSpends`, `spendableFrom`). A nonce in
+between that is none of this wallet's own transactions was spent from another device; what it took is not known here,
+and the network itself refuses a send it cannot pay. A transaction of this wallet whose cost it cannot know (such as a
+contract call before a token send) refuses with "What an earlier transaction from this wallet takes is not known yet.
+Try again in a minute."; no figure at all with "QNet Blockchain did not answer, so nothing was sent. Try again." A token
+figure is read at the same moment as the holder's QNC figure (read now, never a kept one), from the same genesis names,
+whose nonce counts the token spends, and the two count only of the same block (another block may hold one of the
+wallet's token spends on one side only): two of different blocks are read again once, both from the node that gave the
+token figure, else the send is refused as unanswered. The committee-certified read runs in the background only and
+decides nothing here. The form then checks the amount and fee, and a token send's tokens, against what may
 still be spent, the checked balance less what the wallet's unconfirmed transactions may still take, the one a
 "replace" signs over excepted: the in-app browser's rule. A QNet Link request that arrives
 meanwhile ends the review and any open password prompt of the wallet's own flows; a prompt never opens over it.
@@ -788,7 +833,11 @@ both Send forms (`src/utils/sendAmount.js` `amountInput`) keeps digits and one d
 and apostrophes go; a single comma is the decimal point; when a comma and a point both appear the last one is the
 decimal point and the other may only group thousands (groups of exactly three digits), and several of one separator
 alone may only group thousands too. Any other mix is refused and the field keeps what it had, so "1,000.50" is 1000.50
-and never 1.00050.
+and never 1.00050. A figure pasted (more than one character put in at once) is read as the app's language writes
+figures: its group mark once, after one to three digits and before exactly three, groups them, so "1,000" copied from
+an English screen or "1.000" from a German one is 1000; typed one character at a time, a single comma or point stays
+the decimal point. Arabic-Indic digits and the Arabic decimal and thousands marks are read as digits, point and
+grouping.
 
 The QNet Blockchain Send form's 25 %, 50 %, 75 % and MAX buttons fill that share of what may be sent, floored, with as many
 decimals as the asset takes: a token at most six and never more than its own decimals (a token of 2 decimals gets 2, one
@@ -908,15 +957,15 @@ device). Step 1's `node_id` is then the node the request names (`NodePreimages.c
 super node id), the same quote and claim the Node tab makes for that node.
 
 **In transit** (`src/services/ClaimTransit.js`). The claim credits the wallet and moves the wallet's claim watermark
-(`last_claimed_epoch`) in one step when a block includes it, and Assets shows only certified state, so between the move
-and the certification of that block the amount is on neither side. The node balance and its watermark are the
-wallet's, not a node's: the network sums one wallet's reward leaves whichever of its node ids is asked, so all of this
-is per wallet. Once the network took a move (the Node tab's card, or a QNet Link claim sheet, whose answer the sheet
-hands to the screen), the device keeps a record of it (`qnet_claim_transit_v1`, a record for each of up to four wallets
-on the device, no secret in it): the node id it was made by, the amount (the sum of the batch signed), the epoch below
-the batch's first one, its last epoch, each epoch's amount, the transaction hash, the time and the rest of the node
-balance. The epochs come from the batch signed, never from the quoting node's own watermark, so no node can make the
-first certified read look like the move went through. While it is held:
+(`last_claimed_epoch`) in one step when a block includes it, so the wallet's figure at a genesis node's live tip holds
+the amount from that block on. The node balance and its watermark are the wallet's, not a node's: the network sums one
+wallet's reward leaves whichever of its node ids is asked, so all of this is per wallet. Once the network took a move
+(the Node tab's card, or a QNet Link claim sheet, whose answer the sheet hands to the screen), the device keeps a record
+of it (`qnet_claim_transit_v1`, a record for each of up to four wallets on the device, no secret in it): the node id it
+was made by, the amount (the sum of the batch signed), the epoch below the batch's first one, its last epoch, each
+epoch's amount, the transaction hash, the time and the rest of the node balance. The epochs come from the batch signed,
+never from the quoting node's own watermark, so no node can make a read look like the move went through. While it is in
+transit:
 
 - Assets shows the QNC figure alone, never the amount in transit inside it or on a line under it;
 - the Node tab shows the rest of the node balance and, on its move button, off, "Moving X", on the card that shows the
@@ -924,31 +973,43 @@ first certified read look like the move went through. While it is held:
 - the move's History row says "Moving";
 - another move (any card of the Node tab, or a claim sheet: `CLAIM_BUSY`) waits for it, and the node balance is neither
   read nor locked to an epoch;
-- the wallet is read every minute on every tab but Assets (which reads at its own pace) and on every return to the
-  app, so the certified read that ends the move comes wherever the user stays.
+- the result card (the Node tab's, and a claim sheet's outcome) follows the claim transaction by its hash on the genesis
+  nodes, as a send's card does (from 2 seconds, growing by half up to 15, for three minutes); once a block holds it, its
+  History row shows it and the wallet's live figure is read at once. The live figure is also read every 15 seconds on
+  every tab while the move is in transit, and on every return to the app.
 
-A certified read of the wallet (a verified figure) whose watermark is at or past the batch's last epoch holds the
-amount: the record goes in the same update that puts that figure on screen, so the amount is never shown twice nor
-nowhere; a watermark past the batch's first epoch but short of its last is a move that went through in part (the network
-stops a batch at an epoch it cannot prove), and what it did not apply is back on the node balance at once. The move's
-History row is then Confirmed by that read, whatever one node reported of it. A figure not verified yet never ends a
-move. The node balance is read again at once, with no epoch lock.
+The live figure whose watermark is at or past the batch's last epoch holds the amount: the move ends on screen in the
+same update that puts that figure on screen (the card says "The amount is in the wallet."), so the amount is never shown
+twice nor nowhere; a watermark past the batch's first epoch but short of its last is a move that went through in part
+(the network stops a batch at an epoch it cannot prove): the card says what of it is in the wallet, and what it did not
+apply is back on the node balance at once (`noteLiveWatermark`, `moveOutcome`, `moveNote`). The move's History row is
+then Confirmed, whatever one node reported of it. The node balance is read again at once, with no epoch lock. The record
+itself stays until a certified read of the wallet (Assets', or the foreground follow's every 90 seconds) shows the
+watermark, in the background: only that read removes it and raises the wallet's durable watermark (`settleMoves`,
+`floor`). The live watermark is one genesis node's answer, so it is held in memory only, with the height of the figure
+that showed it (`liveLce`, `liveHeight`; never written: after a restart the move is in transit until the next live
+figure shows it), and only ever raised until a certified read contradicts it: a certified watermark lower than it, in a
+state at or past that height, means that figure was of a branch the chain left (or a faulty node), so the live
+watermark is dropped and what it ended is in transit again ("Moving X" on the Node tab and History, the card back to
+in transit), or ends as the certified watermark says (in part).
 
 Every node balance read (the Node tab's cards, a claim sheet's) counts only answers of genesis nodes not behind the
-wallet's last certified watermark, which is kept with the record (`floor`): a `first_unclaimed_epoch` past it, or
-nothing left to claim (0 with no first unclaimed epoch, the answer the node gives right after a whole move); the
-largest of those is shown, and with none the last figure stays. So a node lagging behind a move never brings the
-moved amount back, on that read or any later one.
+wallet's claim watermark (`answerFloor`): the certified `floor`, raised to the live watermark only while a move that
+watermark ended still waits for its certified settle: a `first_unclaimed_epoch` past it, or nothing left to claim (0
+with no first unclaimed epoch, the answer the node gives right after a whole move); the largest of those is shown, and
+with none the last figure stays. So a node lagging behind a move never brings the moved amount back, on that read or
+any later one, and a live answer that was wrong judges no node balance once a certified read settled or reverted it.
 
-Nothing else ends a move: no time limit, and no node's live answer about its own state. A QNet Blockchain transaction carries no
-expiry the consensus enforces (no `valid_until` height); a node drops a transaction from its mempool after its own
-TTL, but that is the node's local choice, not a rule of the chain, so a batch not seen yet can still be included later.
-The only states are therefore the ones certified data shows: in transit (no certified watermark past the batch's first
-epoch yet), done, or in part. However long a move stays in transit, the Node tab says "Moving X" with Move to wallet
-off; there is no "did not go through" until the network has a consensus expiry rule for transactions. A record an
-earlier build marked as not gone through is read back as a move in transit, until a certified read settles it, unless
-the wallet's kept certified watermark is past its first epoch already (its epochs are then in the QNC figure or back on
-the node balance, none of it in transit).
+Nothing else ends a move: no time limit, and no node's answer about the node balance. A QNet Blockchain transaction
+carries no expiry the consensus enforces (no `valid_until` height); a node drops a transaction from its mempool after
+its own TTL, but that is the node's local choice, not a rule of the chain, so a batch not seen yet can still be
+included later. The only states are therefore the ones the chain shows: in transit (no watermark past the batch's
+first epoch yet), done, or in part. However long a move stays in transit, the Node tab says "Moving X" with Move to
+wallet off; there is no "did not go through" until the network has a consensus expiry rule for transactions. A record
+an earlier build marked as not gone through is read back as a move in transit, until a watermark settles it, unless the
+wallet's kept certified watermark is past its first epoch already (its epochs are then in the QNC figure or back on the
+node balance, none of it in transit). A claim is signed by this wallet as a send is, so its proof reads ask for the
+newest certified state for ten minutes after it (`lastOwnSendAt`).
 
 ## The Node tab
 
@@ -995,48 +1056,23 @@ says that the device's key for the node is missing, with **Use this device**.
 | State | What the tab shows |
 |---|---|
 | no node | "This wallet has no node." Nothing to tap, no link. Also a light node bound to another device, to none, or with no binding on this device, and one aiqnet.io recorded that the network does not list yet (no device is bound to it). |
-| linking | "The node will run on this device once QNet Blockchain records it." (a pending-link record of the link sheet) |
+| linking | "The node will run on this device once QNet Blockchain records it." (a pending-link record of the link sheet); while the owners report the registration in the genesis nodes' pool (`registration_pending`), "QNet Blockchain is recording the node in a block. It will run on this device once that is done." While a link is pending and the chain does not list the node, its status is read again every 10 seconds for the first two minutes after the link, then every minute, on every tab while the app is in front (`requestPace.linkingReadMs`), starting at once when the QNet Link sheet answers `ok` |
 | not recorded | "QNet Blockchain did not record the node. Nothing changed on this device." (the record's 24 hours passed and two owners say the node is not on the chain; the binding the sheet kept, with its ping key, push token and wakes, goes with the record, as it does when two owners refuse its ping key) |
 | this device | Online or Offline (Online only from the network's `needs_reactivation`), "Answered this epoch", the epoch clock ("Epoch ends in ~3 h 47 min": the time left, at least a minute), "Background: Unrestricted" or "Restricted" with, while restricted, one button to the system settings ([Background priority](#background-priority-on-android-and-ios)), the node balance and **Move to wallet** (it takes a balance of 1 QNC or more, with no note under it); no button ends the node here (below); with the device state: from the next epoch, a device check that waits (below), paused until a date; a device check not finished once the chain's epoch is past the key rotation's due epoch plus the node's 30-day grace (180 epochs: until then the node still counts the unrotated key, and a check not finished waits for something a new key does not end) says the key was not renewed in time and offers **Use this device**; a pause with no end (the device's certificate chain was revoked) says the device can't run the node right now and offers **Use this device**, the one way back; a binding that holds no device key once two genesis nodes take them (made before they did, or its key is gone after a reinstall, a restore or an offload) says so as advice (until the network requires the device signature its replies still count, so it never says the node is not counted) and offers **Use this device**, unless the device cannot run a node at all, which says only that |
 | checking, network not reached | for the node this device holds a binding of: "Checking node status…" or "QNet Blockchain could not be reached.", then the node balance and **Move to wallet** |
-| server node | a super or genesis node of this wallet, which runs on its server, on every device that holds the wallet: its id heading the card, Online or Offline, its type and status, "Last seen: {time} ago" (from the node's `last_seen_ago_seconds`, only when the answering node saw it), "Network admission: Admitted" when the node reports its admission to the epoch's rewarded set (`admission` `admitted`, `NodeTab.rewardAdmission`), "Epoch heartbeats: n of m needed", "Missed epochs: k" and, when any, "Epochs not admitted: k" (below), the epoch clock, a permanent ban when there is one ("Reputation: Banned", its reason, double signing, under it), the node balance and **Move to wallet**; no code, price or link. Before its first answer "Checking node status…"; a read that fails keeps the last good status of the node on screen, with "QNet Blockchain could not be reached. Pull down to try again." above it (`NodeTab.keptServerStatus`), and with none that sentence alone; the server text ("Super nodes run on a server") only when the network says the node is not registered |
+| server node | a super or genesis node of this wallet, which runs on its server, on every device that holds the wallet: its id heading the card, Online or Offline, its type and status, "Last seen: {time} ago" (from the node's `last_seen_ago_seconds`, only when the answering node saw it), "Network admission: Admitted" when the node reports its admission to the epoch's rewarded set (`admission` `admitted`, `NodeTab.rewardAdmission`), "Epoch heartbeats: n of m needed", "Epochs not admitted: k" when any (below; no missed epochs: the site's cabinet shows them), the epoch clock, a permanent ban when there is one ("Reputation: Banned", its reason, double signing, under it), the node balance and **Move to wallet**; no code, price or link. Before its first answer "Checking node status…"; a read that fails keeps the last good status of the node on screen, with "QNet Blockchain could not be reached. Pull down to try again." above it (`NodeTab.keptServerStatus`), and with none that sentence alone; the server text ("Super nodes run on a server") only when the network says the node is not registered |
 | server node waiting for admission | a super node the network registered and does not admit yet (a network rule holds outside super nodes back while registrations stay open): its status `admission` `waiting`, as the site shows it, or `consensus_admitted` false (`PushService.checkServerNodeStatus` `admission` and `consensusAdmitted`, `NodeTab.waitingAdmission`). The badge says WAITING and the status row "Registered — waiting for admission to QNet Blockchain", never Offline; the balance and **Move to wallet** as above. A node that names no admission (every node before that rule) reads as before |
 | not on the network yet | for a super node: "This wallet's super node has not joined QNet Blockchain yet. It runs on a server with QNet Blockchain node software." (aiqnet.io records the node, below, and the network does not list a super node); nothing to tap |
 
-**Why an epoch was missed.** The device view also carries `last_miss` and `last_answer` (light node messages section
-7), read strictly: a missing field (an older node), an unknown reason or a field of another type gives nothing, and no
-reason is ever shown raw. Of the owners that say the node is on the chain, the record with the highest epoch is taken,
+**The last missed epoch.** The device view also carries `last_miss` and `last_answer` (light node messages section
+7), read strictly: a missing field (an older node), an unknown reason or a field of another type gives nothing. Of the owners that say the node is on the chain, the record with the highest epoch is taken,
 at equal epochs the most specific (`not_committed`, `answered_late`, `not_delivered`, `answer_refused`,
 `woken_no_answer`, `no_push_address`, `not_sent`, `not_woken_inactive`), at an equal reason the one with
 `delivered_at`, else with `app_outcome` (the
-owner that took this device's account of the wake); of `last_answer`, the latest. While that epoch is newer than the last one the node was counted in
-(and than the epoch the device view last counted it in), the card shows one line under the status rows
-(`NodeTab.missText`): what happened, at the local time the owner noted ("QNet Blockchain sent this device a wake at 14:05 and got no answer before the epoch closed.": the push service took the push, which is all the network can know, "This device answered at 16:30, after the epoch had closed.", a refused answer,
-two epochs with no answer after which the network stopped waking it, no address to wake it); how long the wake took to
-reach this device where an answer told the owner ("The wake reached this device 134 min after it was sent.", or within
-a minute: the push's own time on its way, apart from the app's handling of it, so a late answer is shown to be the
-delivery's or not); and what to do: allow QNet Wallet to run in the background and do not swipe it away (woken with no
-answer, answered late), opening it on this device is enough (no longer woken), opening it once gives the network its
-address again (no address), **Use this device** (a refused answer, which also shows the button). Two reasons are the
-network's own misses, which never count toward the rule that stops waking a node, and the line says so and that
-nothing is needed on the device: `not_sent` ("QNet Blockchain did not send this device a wake in that epoch.": the owner's
-push did not go out) and `not_committed` ("QNet Blockchain did not finish counting that epoch for this node.": no row of
-the node's shard was committed, so nothing the device did could count; it ranks first, as it explains the miss whole),
-each followed by "This was the network's miss, not this device's: nothing is needed here." A wake with no answer
-that this device's later answer accounted for (`delivered_at` and `app_outcome` of the record, from the pushes this
-device reported, [Liveness](#liveness-pings-and-self-attestation)) says instead when it reached this device, how long
-after it was sent, and why the app did not answer, with what to do: "The wake reached this device at 14:05, 3 min after
-it was sent, and the app did not answer: QNet Wallet had not been opened since the device restarted. Open it once after
-every restart." Likewise: it had been swiped away (open it and leave it running in the background), it came after the
-epoch had closed (allow it to run in the background so wakes are not held back), its answer did not get through to the
-network (check that the device is online), it had already answered in that epoch (nothing to do), or the node's key is
-no longer on this device (**Use this device**, which the card then shows). An outcome `answered` reads "This device answered the wake, but QNet Blockchain did not count the answer in that epoch. Nothing needs doing on this device.", and an
-outcome this build does not know is not read. A wake the device's record shows never reached it
-(`not_delivered`) reads "The wake never reached this device: the push service or the device held it." with the advice to
-let it run in the background. Such a record of this device's own account (a wake with no answer that carries
-`delivered_at` or `app_outcome`, or `not_delivered`) reaches the network only with a later answer, which counts the node
-again: the card keeps it after that too, as the site's Device tab does, led by "Epoch {n} was not counted." and with the
-day of a time not today, until a newer miss replaces it (`LightNode.shownMiss`); it offers no button then. A miss put down to no
+owner that took this device's account of the wake); of `last_answer`, the latest. The tab names no missed epoch.
+While that epoch is newer than the last one the node was counted in (and than the epoch the device view last counted it
+in: `LightNode.freshMiss`), a refused answer, or a wake this device could not answer because the node's key is no
+longer on it (`app_outcome` `no_key`), makes the card offer **Use this device**. A miss put down to no
 push address, or an owner's signed `push_reregister` (it cannot push this device) before any miss, also makes the
 tab's read send this device's push token again, a new one in place of the one the owners lost, as an open of the app does ([Liveness](#liveness-pings-and-self-attestation)).
 
@@ -1066,15 +1102,15 @@ the light node still answers `NODE_OTHER`. Under a server node the light card sh
 device (on the chain and bound here, or a link of it pending here), and its status is read again (every 5 minutes) only
 then.
 
-**Missed epochs of a super node** (`PushService.getNodeEpochs`): the node's verdict on each of the last 64
+**Epochs not admitted of a super node** (`PushService.getNodeEpochs`): the node's verdict on each of the last 64
 epochs the network settled (`/api/v1/rewards/history/{node_id}?limit=64`), from a genesis node, and a second one for
 the epochs the first could not serve (three are asked at most); an answer for another wallet counts for nothing. Paid
 (`claimable`, `claimed`) is counted and `not_eligible` is missed; epochs before the node's registration height
 (node-events) are left out, its registration epoch is never missed, and an epoch no node could serve, or whose light
 group was not checked, is neither. A `not_admitted` epoch (the node outside the network's admitted set: the network's
-admission, not missed heartbeats) is never missed: it is counted apart and shown as "Epochs not admitted" when there is
-any. Only the missed (and not admitted) count is shown; the count of epochs is the site's. They are read only once the
-registration height is known, again at most every five minutes while the tab is open.
+admission, not missed heartbeats) is never missed: it is counted apart. Only the not admitted count is shown, as
+"Epochs not admitted" when there is any; the counts of epochs and of missed epochs are the site's. They are read only
+once the registration height is known, again at most every five minutes while the tab is open.
 
 **Before the network lists the node** (`src/services/NodeRecordRead.js`): while the tab is open and the network lists no
 node for the wallet, the app reads aiqnet.io's record of the wallet's node
@@ -1403,7 +1439,8 @@ section 14; the app side is `src/services/QNetLink.js` (parser, request, relay c
     the amount as a decimal string, the transaction and the epoch a partial move stopped at, or `empty`. The amount is at least 1 QNC, except for a batch the node's quote capped
     (the stopping epoch is set, more epochs remain), which may be smaller and is answered as moved, since its
     transaction is on the way. A move `ok` is in transit on this device as one made from the Node tab (Moving the node
-    balance above), and the Node tab reads the node again.
+    balance above), followed the same way, and the Node tab reads the node again; the outcome says, as it happens,
+    that the amount is in the wallet, or what part of it is.
 - **The answer** is sealed to the page's one-time key (X25519, HKDF-SHA256, AES-256-GCM with a fresh app key and IV)
   under an AAD that binds the session, the intent and the request hash, checked against the site's own rules before
   it goes (`plaintextProblem`: a `claim` answer names the node the request named, the light or super node of its
@@ -1524,8 +1561,8 @@ website works the same with both.
   form), then for a connect both addresses, for a message the exact text and its size, for a send the recipient,
   amount, fee, total, the balance and a warning when the
   balance is short. A token transfer shows the token's symbol, name and contract, a "not QNC" warning when the token is named after QNC or QNet Blockchain, a warning when it is not in the user's token list, the recipient, the amount in the token's units and in base units, the QNC fee, the refundable deposit
-  of 0.01 QNC when the recipient holds none of the token, the QNC total, the token balance (from a certified proof)
-  and the QNC balance, and a warning when the recipient is the canonical burn address, whose tokens are
+  of 0.01 QNC when the recipient holds none of the token, the QNC total, the token balance (a genesis node's live
+  tip, its proof folded) and the QNC balance, and a warning when the recipient is the canonical burn address, whose tokens are
   destroyed; a QNC transfer to that address says the QNC is destroyed, in place of the recipient warnings. A contract call shows the contract with an "unknown contract" warning, the method, the input as hex with
   its size (and as text when it is visible UTF-8), the gas limit and the most it can cost; a call sends no QNC. A send
   the preview shows the wallet cannot pay for, or whose balances it could not read (it then offers Try again), keeps
@@ -1535,10 +1572,10 @@ website works the same with both.
   of the wallet may still take, and a token transfer's tokens against the token balance less what they may still move,
   the one a "replace" signs over excepted (`dappProvider.previewShort`, `spendableNano`, `spendableTokenBase`). A
   payment the chain would refuse for its balance never becomes a kept transaction that could go out after a later
-  top-up. A QNC or token balance counts only when the committee certified it, less what this wallet's own transactions
-  since took, by the Send form's rule above, counted up to the confirmed nonce the sheet shows; a balance that cannot be
-  read says why: a transaction from another device not confirmed yet, a balance not confirmed yet, or the wallet's state
-  not read (`DappSheet.unreadKey`). The approval reads the QNC balance (and a token transfer's token balance and deposit)
+  top-up. A QNC or token balance is the one the Send form checks against (above): at a genesis node's live tip, less
+  what this wallet's own transactions that figure does not hold may still take, counted up to the confirmed nonce the
+  sheet shows; a balance that cannot be read says why: what one of the wallet's transactions takes is not known yet, or
+  the wallet's state not read (`DappSheet.unreadKey`). The approval reads the QNC balance (and a token transfer's token balance and deposit)
   again just before signing any send and signs nothing when one cannot be read, is too low now, or the deposit
   changed; the sheet then says so. The recipient warnings rest on the addresses this wallet signed transfers to (kept sealed under the
   vault's data key) and its unconfirmed transfers, never on who sent to it: a recipient never paid, one with the same
@@ -1600,7 +1637,10 @@ website works the same with both.
   it; a refusal waiting may heal (or one that came while another node's copy went unanswered) keeps `'unknown'`, and
   the sheet says the wallet sends it again for up to half an hour, which it does whatever tab is open while the app is
   in front (a sweep every 15 seconds while a kept transaction is still sent). A transaction is identified by (`from`, `nonce`); `txHash` is the hash one node
-  gave its copy, and another node's copy, with another hash, may be the one that lands.
+  gave its copy, and another node's copy, with another hash, may be the one that lands. While the sheet shows the
+  outcome it follows the transaction by (`from`, `nonce`), as `qnet_getTransactionStatus` answers it (from 2 seconds,
+  growing by half up to 10), and says "QNet Blockchain included the transaction in a block." once that is `'in_block'`;
+  it never says that a contract call did what it was meant to (`dappProvider` `followOutcome`).
 - **Transaction status.** `qnet_getTransactionStatus {from, nonce}` (no sheet; the connected account only, else 4100)
   answers `{status, blockHeight, txHash}`: `'pending'` while the account has not reached the nonce and this wallet
   still sends the transaction there (not stopped, not refused for good, and still able to land: the extension's rule),
@@ -1651,10 +1691,10 @@ self-attestation then carries, as the string field `push_receipts` with `answere
 `{"since": E, "pushes": [{"epoch", "sent_at", "received_at", "outcome"}]}` for the epochs from `since` to the one
 before its own, at most six (a full report stays far under the node's 2,048 bytes); none when the record covers none of
 them or this device's answer of every one of them was taken.
-It is display data: the shard owner that takes the answer refines the node's last miss with it (when the wake reached the
-device on its own clock, `its receive time - (answered_at - received_at)`, how long after it was sent, and the app's
-outcome; a miss of an epoch the record covers and holds no push of becomes `not_delivered`), and it never changes what
-counts. An older node ignores the field.
+It is display data: the shard owner that takes the answer refines with it the misses of each epoch the report covers,
+at most six (when the wake reached the device on its own clock, `its receive time - (answered_at - received_at)`, how
+long after it was sent, and the app's outcome; a miss of an epoch the record covers and holds no push of becomes
+`not_delivered`), and it never changes what counts. An older node ignores the field.
 
 A linked node is woken by Firebase Cloud Messaging when the device has a push token, else by polling. Either
 way the device also gets a periodic BackgroundFetch wake with a 30-minute minimum interval; after its answer a wake also does the device
@@ -1818,17 +1858,25 @@ At ten million devices a million apps may be open at once, so the app asks the n
 seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it is not in front:
 
 - **Node tab**: the statuses (the light node's owners, a server node, aiqnet.io's record) when the tab opens, on
-  pull-to-refresh, on every return to the app and after Use this device, and in between every 5 minutes. The node
-  balance once per epoch and node (it changes only when an epoch settles), and at once on pull-to-refresh and when a
-  move settles; nothing while a move is in transit. The epoch clock from one height read, with each of those refreshes, counted on at one block a second in
-  between (for at most 10 minutes past the read).
-- **Assets**: the balances when the tab opens, then every 60 seconds while the address socket is open (its events ask
-  for a read as soon as this wallet's balance changes) and every 30 seconds while it is not. While a move of a node
-  balance is in transit, the same read every 60 seconds on the other tabs too, and on every return to the app.
+  pull-to-refresh, on every return to the app and after Use this device, and in between every 5 minutes; while a light
+  node is being linked, its status every 10 seconds for the first two minutes after the link and then every minute, on
+  every tab. The node balance once per epoch and node (it changes only when an epoch settles), and at once on
+  pull-to-refresh and when a move ends; nothing while a move is in transit. The epoch clock from one height read, with
+  each of those refreshes, counted on at one block a second in between (for at most 10 minutes past the read).
+- **Assets**: the balances when the tab opens, then every 30 seconds, and the wallet's live QNC figure every 15
+  seconds. A live figure read within 2 seconds is taken as it is (`LIVE_SHARE_MS`): the 15-second read skips while one
+  is younger than 13 seconds and the balance read takes one just read, so an open Assets asks for it twice in 30 seconds
+  whichever fires first. While the address socket is live (it delivered an account event on this connection: below),
+  the balances every 60 seconds and no 15-second read, the events asking for the figure (`requestPace.pollMs`,
+  `SOCKET_LIVE_POLL_MS`); a socket that delivered none (an older node) or was refused keeps the 30 and 15 seconds. While a
+  move of a node balance is in transit, the live figure every 15 seconds on every tab, live socket or not, and the
+  balances on every return to the app. Beside the live reads the chain's height, at most once a minute. An
+  account event's follow reads the live figure up to three times and the token rows once, at its end.
 - **History**: everything (the explorer too) when the tab opens, on pull-to-refresh and on a return to the app; in
-  between one genesis node's newest rows, every 60 seconds while the address socket is open and every 30 seconds while
-  it is not. The genesis nodes' listing (all five at once) with every read that asks the explorer, and with any other
-  that brought a row one node reports which no earlier read found listed.
+  between one genesis node's newest rows every 30 seconds, every 60 while the address socket is live. The genesis
+  nodes' listing (all five at once) with every read that asks the explorer, and with any other that brought a row one
+  node reports which no earlier read found listed; the live figure once when a read lists a received transfer it does
+  not cover yet.
 - **Every tab**: one follow tick every 90 seconds while a wallet is open ([Following the head](#following-the-head)):
   the certified head, one walk step, the open wallet's QNC proof. A capsule is asked for only while the walk is long, at
   most once a node in 10 minutes from a node that has none.
@@ -1836,13 +1884,15 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   every block. After a drop the next try waits a time drawn evenly between zero and 5 seconds doubled with each failure
   in a row, 5 minutes at most; after a refusal (it closed before it opened: the node's limit of connections, or no
   network) 5 minutes plus up to 5 more drawn evenly. It closes when the app goes to the background and opens again on
-  the return, not before the wait it had.
+  the return, not before the wait it had. It is live from its first account event (a `BalanceUpdate` for this wallet:
+  [Account events](#served-by-the-connected-node)) until it closes; a new connection starts not live. Assets and
+  History take that state each time they set their next wait, the 15-second read at each of its ticks.
 
 ## Platforms and build
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.1 (28) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.1 (29) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds enable R8 minification and resource shrinking.
   iOS: bundle id `com.qnetmobile`, iPhone and iPad (`TARGETED_DEVICE_FAMILY = "1,2"`), not offered on Mac or
   Vision Pro; deployment target 15.6 for the app target.

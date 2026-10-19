@@ -68,6 +68,8 @@ const VALID = Object.freeze({
   'qnet.tokenSend': { token: QNET_TOKEN, to: QNET, amount: '2.25', expectedFeeNano: '4509375', expectedDepositNano: '0', expectedNonce: '8' },
   'qnet.txLookup': { hash: 'ab'.repeat(32) },
   'qnet.send': { to: QNET, amount: '0.000000001', expectedFeeNano: '150000', expectedNonce: '7' },
+  // the sent screen follows its transaction by its nonce (owner, 18.10)
+  'qnet.sentStatus': { nonce: '7' },
   'solana.balances': {},
   'solana.history': { cursor: null, limit: 10 },
   'solana.quote': { asset: '1dev', to: SOL, amount: '12.5' },
@@ -178,7 +180,7 @@ describe('router: message table', () => {
     assert.deepEqual(UI_MESSAGES['vault.removeEarlier'].pages, ['setup', 'popup']);
     for (const type of ['vault.reveal', 'vault.wipe', 'vault.changePassword', 'vault.resetBegin', 'vault.reset',
       'activation.burn', 'activation.copy', 'activation.register', 'activation.lookup', 'qnet.send', 'solana.send', 'solana.max',
-      'solana.status', 'sites.revoke', 'node.unlinkView', 'node.unlink', 'wallet.cached', 'solana.history']) {
+      'solana.status', 'qnet.sentStatus', 'sites.revoke', 'node.unlinkView', 'node.unlink', 'wallet.cached', 'solana.history']) {
       assert.deepEqual(UI_MESSAGES[type].pages, ['popup'], type);
     }
     // the activation window reads the light node's registration after its answer; nothing else reaches it from there
@@ -187,7 +189,8 @@ describe('router: message table', () => {
 
   it('requires an unlocked session for every type that reads the wallet or spends', () => {
     for (const type of ['vault.changePassword', 'vault.reveal', 'wallet.addresses', 'qnet.balance', 'qnet.history',
-      'qnet.preview', 'qnet.send', 'solana.balances', 'solana.quote', 'solana.send', 'solana.max', 'solana.status', 'activation.status',
+      'qnet.preview', 'qnet.send', 'qnet.sentStatus', 'solana.balances', 'solana.quote', 'solana.send', 'solana.max', 'solana.status',
+      'activation.status',
       'activation.lookup', 'activation.price', 'activation.burn', 'activation.recover', 'activation.copy', 'activation.register',
       'activation.registration', 'sites.list', 'sites.revoke', 'settings.set', 'node.unlinkView', 'node.unlink', 'wallet.cached',
       'solana.history', 'vault.removeEarlier']) {
@@ -359,6 +362,10 @@ describe('router: UI message schema', () => {
       ['qnet.send', { ...VALID['qnet.send'], expectedFeeNano: 150000 }, 'expectedFeeNano'],
       ['qnet.send', { ...VALID['qnet.send'], expectedNonce: '-1' }, 'expectedNonce'],
       ['qnet.send', { ...VALID['qnet.send'], expectedNonce: null }, 'expectedNonce'],
+      ['qnet.sentStatus', {}, 'nonce'],
+      ['qnet.sentStatus', { nonce: 7 }, 'nonce'],
+      ['qnet.sentStatus', { nonce: '07' }, 'nonce'],
+      ['qnet.sentStatus', { nonce: '7', hash: 'ab'.repeat(32) }, 'hash'],
       ['solana.send', { ...VALID['solana.send'], asset: 'usdc' }, 'asset'],
       ['solana.send', { ...VALID['solana.send'], to: '0OIl'.repeat(9) }, 'to'],
       ['solana.send', { ...VALID['solana.send'], expectedRentLamports: undefined }, 'expectedRentLamports'],

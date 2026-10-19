@@ -7,6 +7,7 @@
 // wake: a node of an earlier version that still sends them is read for the delivery alone. The Overview names the miss
 // only while it is newer than the node's last counted epoch and no answer came after it; the Device tab also names an
 // earlier one that carries the device's own account of the wake, which reaches the network only with a later answer.
+// History names, under each epoch not counted, that epoch's miss from the owners' misses routes (missesByEpoch).
 // Every answer belongs to its own epoch: nothing here says one counts for another. Pure, shared by the site route
 // (src/server/cabinet/node-proxy.ts) and the page.
 
@@ -82,6 +83,21 @@ export function latestMiss(records: readonly (LastMiss | null | undefined)[]): L
     if (rank < 0 || (rank === 0 && best.delivered === null && r.delivered !== null)) best = r;
   }
   return best;
+}
+
+// The epochs a shard owner keeps the misses of (development/qnet-integration/src/rpc/light_push.rs
+// MISS_HISTORY_EPOCHS): the most entries its misses route answers.
+export const MISS_HISTORY_EPOCHS = 64;
+
+// The shard owners' misses of a node (each owner's list, null for an owner that gave none), one per epoch: of the
+// entries for one epoch, the one latestMiss takes.
+export function missesByEpoch(answers: readonly (readonly LastMiss[] | null)[]): Map<number, LastMiss> {
+  const byEpoch = new Map<number, LastMiss>();
+  for (const miss of answers.flatMap((a) => a ?? [])) {
+    const best = latestMiss([byEpoch.get(miss.epoch), miss]);
+    if (best !== null) byEpoch.set(miss.epoch, best);
+  }
+  return byEpoch;
 }
 
 // The miss the Overview names: newer than the last epoch the node was counted in, with no answer of that epoch or a

@@ -38,7 +38,7 @@ export default function PrivacyPage() {
               <li>The wallet is non-custodial. Your recovery phrase and private keys are created on your device and never leave it.</li>
               <li>There is no account, no sign-up, no analytics or advertising SDK, and no tracking for advertising or across other apps and websites.</li>
               <li>Transactions you sign are public on the blockchain, as on every public chain.</li>
-              <li>If you run a light node, QNet Blockchain needs a way to reach your phone or tablet and to tell that it is one real device: a push token, your node identity, the device&apos;s platform and model name and the device check described below are registered with the network&apos;s nodes and its device-check service, and the node&apos;s answers report how the network&apos;s wake-up messages reached the device (light node answers, below). Those records, the node&apos;s latest epoch not counted and latest answer that the network keeps from those reports, and the aiqnet.io server&apos;s record of each node activation that starts or finishes through the node pages or the browser extension (the activation record, below), are the only data the software keeps anywhere other than your device and the public blockchain; beyond them the aiqnet.io server holds the few request details described below in memory only, for at most a day.</li>
+              <li>If you run a light node, QNet Blockchain needs a way to reach your phone or tablet and to tell that it is one real device: a push token, your node identity, the device&apos;s platform and model name and the device check described below are registered with the network&apos;s nodes and its device-check service, and the node&apos;s answers report how the network&apos;s wake-up messages reached the device (light node answers, below). Those records, what the network keeps from those reports (why each of the node&apos;s epochs not counted, among the last 64, was missed, and its latest answer), and the aiqnet.io server&apos;s record of each node activation that starts or finishes through the node pages or the browser extension (the activation record, below), are the only data the software keeps anywhere other than your device and the public blockchain; beyond them the aiqnet.io server holds the few request details described below in memory only, for at most a day.</li>
             </ul>
           </div>
 
@@ -56,7 +56,10 @@ export default function PrivacyPage() {
             </p>
             <p>
               Not encrypted, in the mobile app&apos;s own storage: the wallet&apos;s public addresses; its settings
-              (language, auto-lock, and how balances and tokens are shown); the light node&apos;s link details and cached
+              (language, auto-lock, and how balances and tokens are shown); the time this device&apos;s screen lock last
+              failed to keep a wallet&apos;s secret, or you chose a wallet password after it kept failing, so that for up
+              to seven days the app puts no wallet&apos;s secret behind the screen lock and a new wallet is protected with
+              a password instead; the light node&apos;s link details and cached
               public data of QNet Blockchain such as the node&apos;s status; the record of the wake-up messages the device received
               in the last six epochs (light node answers, below); the last ten errors the app ran into, kept on the phone
               only; the in-app browser&apos;s list of recent pages (at most 20, each as its address without the query or
@@ -87,8 +90,8 @@ export default function PrivacyPage() {
               may ask.
             </p>
             <p>
-              Deleting the wallet removes all of this: in the mobile app everything but the language setting, in the
-              browser extension everything. Uninstalling the app or the extension removes it too; an iPhone keeps an
+              Deleting the wallet removes all of this: in the mobile app everything but the language setting and that
+              screen-lock time, in the browser extension everything but the chosen language. Uninstalling the app or the extension removes it too; an iPhone keeps an
               app&apos;s Keychain items after it is uninstalled, and the app deletes them the first time it starts after
               being installed again.
             </p>
@@ -158,14 +161,16 @@ export default function PrivacyPage() {
                 device is unlinked. The genesis nodes that wake the device use these reports only to tell why an epoch was
                 not counted, never to count it, and copy them to no other node: while an epoch runs they hold in memory when
                 each wake-up message was sent and taken by the push service, until that epoch&apos;s check closes (about
-                four hours); then each keeps, for the node, only its latest epoch not counted (the epoch, the reason, the
+                four hours); then each keeps, for the node, a record of each epoch not counted (the epoch, the reason, the
                 times of its wake-up message and of a late answer, the delay, the network&apos;s refusal code and what the
-                app reported) and its latest counted answer (when it arrived, the delay and how long the app took), each
-                replaced by the next one. The node&apos;s public status, which anyone can read by the node identity, as the
-                Device page of aiqnet.io does, shows the device&apos;s platform and model, the day it was linked, its state,
-                the epoch of its last answer and, for an epoch not counted, the epoch, the reason and whether the wake-up
-                message reached the device; it shows no exact time, delay or what the app reported. Those are shown only to
-                the node&apos;s own keys, in the app on the linked device.
+                app reported) until a newer record or a counted answer is 64 epochs (about eleven days) after it, and its
+                latest counted answer (when it arrived, the delay and how long the app took), replaced by the next one.
+                The node&apos;s public status, which anyone can read by the node identity, as the Device page of aiqnet.io
+                does, shows the device&apos;s platform and model, the day it was linked, its state, the epoch of its last
+                answer and, for its latest epoch not counted, the epoch, the reason and whether the wake-up message reached
+                the device; its public list of misses, which the History page of aiqnet.io reads, shows the same three for
+                each epoch not counted that the network keeps. Neither shows an exact time, delay or what the app reported.
+                Those are shown only to the node&apos;s own keys, in the app on the linked device.
               </li>
               <li>
                 <strong>Solana.</strong> The mobile app uses Solana for the SOL and 1DEV of your Solana address, on Solana
@@ -398,7 +403,7 @@ export default function PrivacyPage() {
           <div className="privacy-section">
             <h3>Retention</h3>
             <ul>
-              <li>Data on your device: until you delete the wallet (the mobile app then keeps only its language setting) or uninstall the app or the extension.</li>
+              <li>Data on your device: until you delete the wallet (the mobile app then keeps only its language setting and the screen-lock time, which lapses after seven days, and the extension only its chosen language) or uninstall the app or the extension.</li>
               <li>Push token on the nodes of QNet Blockchain: until the device is unlinked, until the node is linked to another device, or until the token no longer accepts deliveries — for example after the app is uninstalled. The node registration is part of the chain and stays.</li>
               <li>Device check: the device record while the node is linked and 90 days after; the operating system&apos;s proof (on Android with Google Play Integrity&apos;s report of app activity: apps running that could view the screen or control the device, and whether apps from Google Play, from the device maker or from elsewhere are installed) 7 days, or 90 days after a refusal or a pause; token hashes 24 hours; Apple&apos;s and Google&apos;s device bits as stated above.</li>
               <li>Requests from aiqnet.io to the mobile app and their encrypted answers: in server memory, at most ten minutes.</li>
@@ -406,7 +411,7 @@ export default function PrivacyPage() {
               <li>The server&apos;s search of a wallet&apos;s Solana history for an activation burn: in server memory, five minutes.</li>
               <li>The ids of registered nodes the node pages read: in server memory, a day after the last read.</li>
               <li>Testnet faucet claims (the Solana address and the time of its last claim, and with a faucet pass the wallet&apos;s QNet Blockchain address and that time): in server memory, 24 hours.</li>
-              <li>A light node&apos;s answer reports: on the device, the last six epochs (about a day), deleted when the device is unlinked; on the genesis nodes that wake the device, in memory until the epoch&apos;s check closes (about four hours), then only the latest epoch not counted and the latest counted answer, each replaced by the next one.</li>
+              <li>A light node&apos;s answer reports: on the device, the last six epochs (about a day), deleted when the device is unlinked; on the genesis nodes that wake the device, in memory until the epoch&apos;s check closes (about four hours), then the record of each epoch not counted until a newer record or a counted answer is 64 epochs (about eleven days) after it, and the latest counted answer, replaced by the next one.</li>
               <li>IP addresses counted for request limits: in server memory, for the length of each limit (at most an hour).</li>
               <li>Blockchain records: permanent by design and outside anyone&apos;s control, including ours.</li>
               <li>Server access logs: a short, fixed period.</li>

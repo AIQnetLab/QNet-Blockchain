@@ -253,7 +253,7 @@ describe('right to left, and the one source of rows', () => {
     for (const [lang, table] of Object.entries(translations)) {
       // No label of a row ends in a colon: the row itself sets the label apart.
       const colon = ['node_name', 'node_type', 'node_status_node', 'node_background', 'node_epoch_ends',
-        'node_reputation', 'node_balance', 'node_answered', 'node_last_seen', 'node_heartbeats', 'node_missed']
+        'node_reputation', 'node_balance', 'node_answered', 'node_last_seen', 'node_heartbeats', 'node_not_admitted']
         .filter((k) => /[:：]\s*$/.test(table[k]));
       expect([lang, colon]).toEqual([lang, []]);
       expect([lang, table.node_about.includes('{time}'), table.node_banned_hint.length > 0]).toEqual([lang, true, true]);

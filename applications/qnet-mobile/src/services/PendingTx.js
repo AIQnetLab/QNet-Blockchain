@@ -38,7 +38,7 @@ export const HELD_MS = NODE_MEMPOOL_TTL_MS - 60_000;
 export const LANDING_MARGIN_MS = 5 * 60_000;
 // A held transaction is sent again this often while the wallet still sends it: a node that restarted lost it.
 export const RESEND_HELD_MS = 10 * 60_000;
-export const RECENT_MS = 30 * 60_000;        // how long a settled transaction is remembered for the repeat warning
+export const RECENT_MS = 30 * 60_000;        // how long a settled transaction is remembered (WalletManager.transactionStatusAt)
 // How long after signing the wallet sends a kept transaction again by itself (MOBNET-R3-01): the half hour the
 // screens promise. After that, and at once after a refusal that waiting cannot heal, nothing goes out again unless
 // the user sends anew; the entry stays listed (and keeps its nonce) until it settles or the user stops it.
@@ -279,8 +279,8 @@ async function writeAll(all, now = Date.now()) {
 }
 
 // ── what this wallet's own transactions can take, per nonce ─────────────────────────────────────────────────────
-// A send is decided by a committee-certified balance, and the certified state lags the chain by minutes: right after a
-// send, the next one's nonce is above the certified nonce. So every transaction this wallet signed is remembered by
+// A send is checked against a balance read at a genesis node's live tip, which may not hold this wallet's sends that
+// are not in a block yet, nor one that applied a block after it. So every transaction this wallet signed is remembered by
 // its nonce with the most it can take (QNC: amount and most fee and deposit; a token: the amount it moves), kept while
 // it is unsettled and for SPENT_KEEP_MS after it settled. Two signed at one nonce (a replacement) count as the larger
 // of the two: either may be the one that applies.
@@ -357,27 +357,24 @@ export async function ownSpends(from) {
 }
 
 /**
- * What a send may still spend on top of a committee-certified state, by this wallet's own transactions (the owner's
- * rule): `certified` the certified balance (QNC nano, or a token's base units with `token`), `certifiedNonce` the
- * account nonce in that state, `accountNonce` the nonce the chain confirms now, `spends` (ownSpends). Every nonce from
- * certifiedNonce + 1 to accountNonce must be one of this wallet's own known transactions; anything received after the
- * checkpoint never counts. { ok: true, balance: the certified figure less what this wallet's transactions settled
- * since took, pending: [{ nonce, amount }] what its unsettled ones (above accountNonce) may still take } or
- * { ok: false, reason: 'foreign' (a nonce no transaction of this wallet holds: sent from another device), nonce } or
- * { ok: false, reason: 'unconfirmed' (what one of them takes is not known here) }.
+ * What a send may still spend on top of a balance read at a genesis node's live tip, by this wallet's own transactions
+ * (the owner's rule): `base` that balance (QNC nano, or a token's base units with `token`), `baseNonce` the account nonce
+ * in the same state, `accountNonce` the nonce the chain confirms now, `spends` (ownSpends). An own transaction from
+ * baseNonce + 1 to accountNonce applied after that state (a node a block behind): it comes off the balance; one above
+ * both may still take its amount (`pending`). A nonce in between that is none of this wallet's own transactions applied
+ * too, sent from another device: what it took is not known here, and the network refuses a send it cannot pay.
+ * { ok: true, balance, pending: [{ nonce, amount }] } or { ok: false, reason: 'unconfirmed' (what one of this wallet's
+ * transactions takes is not known here) }.
  */
-export function spendableFrom({ certified, certifiedNonce, accountNonce, spends, token = null }) {
-  if (!DECIMAL.test(String(certified)) || !Number.isSafeInteger(certifiedNonce) || certifiedNonce < 0) {
+export function spendableFrom({ base, baseNonce, accountNonce, spends, token = null }) {
+  if (!DECIMAL.test(String(base)) || !Number.isSafeInteger(baseNonce) || baseNonce < 0) {
     return { ok: false, reason: 'unconfirmed' };
   }
-  const through = Number.isSafeInteger(accountNonce) && accountNonce > certifiedNonce ? accountNonce : certifiedNonce;
-  for (let n = certifiedNonce + 1; n <= through; n++) {
-    if (!spends.has(n)) return { ok: false, reason: 'foreign', nonce: n };
-  }
+  const through = Number.isSafeInteger(accountNonce) && accountNonce > baseNonce ? accountNonce : baseNonce;
   let settled = 0n;
   const pending = [];
   for (const [nonce, s] of [...spends].sort((a, b) => a[0] - b[0])) {
-    if (nonce <= certifiedNonce) continue;
+    if (nonce <= baseNonce) continue;
     let amount;
     if (token) {
       if (s.tokenUnknown) return { ok: false, reason: 'unconfirmed' };
@@ -389,8 +386,8 @@ export function spendableFrom({ certified, certifiedNonce, accountNonce, spends,
     if (nonce <= through) settled += amount;
     else pending.push({ nonce, amount: amount.toString() });
   }
-  const base = BigInt(certified);
-  return { ok: true, balance: (base > settled ? base - settled : 0n).toString(), pending };
+  const left = BigInt(base);
+  return { ok: true, balance: (left > settled ? left - settled : 0n).toString(), pending };
 }
 
 const RECENT_PREFIX = '~recent:'; // settled entries (summaries only) share the value under a non-address key

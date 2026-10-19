@@ -27,6 +27,7 @@ import {
 import { ACTIVATIONS_KEY, keepAnswer, loadKept, type KeptActivation, type KeptActivations } from '@/lib/cabinet/kept-activation';
 import { SCAN_CACHE_MS, parseActivationRecord, type ActivationRecordView, type ScanView } from '@/lib/cabinet/burn-record';
 import { WATCH_MAX_MS, activationView, nextStep, watchInterval, type ActivationView, type ExtensionRead, type Read } from '@/lib/cabinet/wallet-activation';
+import type { DevicePlatform } from '@/lib/cabinet/node-view';
 import { superNodeId, type ActivationAnswer } from '@/lib/qnet-link';
 
 interface CabinetValue {
@@ -39,6 +40,9 @@ interface CabinetValue {
   walletHash: string | null;
   // View by address: no wallet is connected; the typed address is shown read only, never acted for.
   viewOnly: boolean;
+  // The light node's device platform as its status names it, for what a miss line says to do; null when not known
+  // (none for a view).
+  devicePlatform: DevicePlatform | null;
   // The site's CABINET_PHONE_FLOWS: `link`, `reserve`, `unlink` and `claim` requests to QNet Wallet are offered.
   phoneFlows: boolean;
   // The activation the QNet extension reported in this browser for the shown wallet, or null.
@@ -373,12 +377,13 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
     };
   }, [watch, step, watchSuper, refreshNetwork, refreshLight, refreshSuper]);
 
+  const devicePlatform = light.state.phase === 'ok' ? light.state.value.device?.platform ?? null : null;
   const value = useMemo<CabinetValue>(() => ({
-    ready, choice: current, nodeId: cv?.nodeId ?? null, walletHash: cv?.walletHash ?? null, viewOnly, phoneFlows,
+    ready, choice: current, nodeId: cv?.nodeId ?? null, walletHash: cv?.walletHash ?? null, viewOnly, phoneFlows, devicePlatform,
     activation: kept, view, record: server.read.phase === 'ok' ? server.read.value : null, superId, refreshActivation, choose, forget, viewAddress,
     stopViewing, keepActivation,
-  }), [ready, current, cv?.nodeId, cv?.walletHash, viewOnly, phoneFlows, kept, view, server.read, superId, refreshActivation, choose, forget, viewAddress,
-    stopViewing, keepActivation]);
+  }), [ready, current, cv?.nodeId, cv?.walletHash, viewOnly, phoneFlows, devicePlatform, kept, view, server.read, superId, refreshActivation, choose, forget,
+    viewAddress, stopViewing, keepActivation]);
 
   return <CabinetContext.Provider value={value}>{children}</CabinetContext.Provider>;
 }

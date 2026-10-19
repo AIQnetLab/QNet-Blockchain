@@ -1,10 +1,10 @@
 // ============================================================================
-// Shared QRC-20 token amount formatting
+// Exact amount formatting: QRC-20 tokens and QNC
 // ============================================================================
-// Token amounts are u64 base units on-chain. Each token declares its OWN
-// `decimals`, so scaling MUST use that token's decimals — never the hardcoded
-// QNC 1e9 formatter and never float math (u64 exceeds 2^53). All scaling here
-// is exact BigInt/string math.
+// Amounts are integer base units on chain (u64, past 2^53), so all scaling here
+// is BigInt/string math, never a float. A token is scaled by its own `decimals`,
+// QNC by QNC_DECIMALS (formatQnc; the cabinet re-exports it). The whole part is
+// grouped as English writes it.
 
 // Format a raw base-unit amount (u64) into a human decimal string using the
 // token's own `decimals`. Trailing zeros in the fractional part are trimmed;
@@ -56,6 +56,20 @@ export function formatTokenAmount(raw: string | number | bigint | undefined, dec
   // Left-pad fractional to `dec` digits, then trim trailing zeros.
   let fracStr = fracPart.toString().padStart(dec, '0').replace(/0+$/, '');
   return fracStr ? `${intStr}.${fracStr}` : intStr;
+}
+
+// QNC's base unit is the nano QNC.
+export const QNC_DECIMALS = 9;
+
+// Nano QNC as exact QNC: formatQnc('12345678901234') -> '12,345.678901234'.
+export function formatQnc(nano: string | number | bigint | undefined): string {
+  return formatTokenAmount(nano, QNC_DECIMALS);
+}
+
+// The same, cut (never rounded) to exactly `places` decimals: formatQncTruncated('12345600000000', 2) -> '12,345.60'.
+export function formatQncTruncated(nano: string | number | bigint | undefined, places: number): string {
+  const [whole, fraction = ''] = formatQnc(nano).split('.');
+  return places > 0 ? `${whole}.${fraction.padEnd(places, '0').slice(0, places)}` : whole;
 }
 
 // Format `<amount> <SYMBOL>` in one shot.

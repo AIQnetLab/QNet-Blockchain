@@ -101,21 +101,6 @@ describe('SD-R3-02: an iPhone or iPad opens in the phone\'s language, and the bu
   });
 });
 
-describe('SD-R3-07: the shared texts name no platform service', () => {
-  it('the screenshot notice speaks of the device\'s photos and any cloud backup, in every language and natively', () => {
-    for (const [lang, table] of Object.entries(translations)) {
-      const text = table.native_screenshot_body;
-      expect([lang, /icloud/i.test(text) || /\bPhotos\b|«Фото»|„Fotos“|“照片”|app Fotos|사진 앱/.test(text)]).toEqual([lang, false]);
-    }
-    expect(translations.en.native_screenshot_body).toBe(
-      "This screen shows secret wallet data. Delete the screenshot from the device's photos and from any cloud backup: anyone who has it controls the wallet.",
-    );
-    const native = read('ios/QNetMobile/QNetSecurityModule.m');
-    expect(native).toContain(`fallback:@"${translations.en.native_screenshot_body}"]`);
-    expect(native).not.toMatch(/iCloud/);
-  });
-});
-
 describe('MN-R3-04: the device-check consent is the protocol\'s block and says all the system\'s check can report', () => {
   it('the English text is qnet-link-v1 section 14.8 item 5, word for word', () => {
     const doc = fs.readFileSync(path.join(ROOT, '..', '..', 'docs', 'protocols', 'qnet-link-v1.md'), 'utf8');

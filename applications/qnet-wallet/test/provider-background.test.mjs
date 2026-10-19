@@ -402,8 +402,8 @@ describe('provider: qnet_sendTransaction', () => {
     const shown = await w.shown();
     assert.deepEqual((await shown.get()).result.details, {
       to: ACCOUNTS.qnet, amountNano: '1500000000', feeNano: '150000', totalNano: '1500150000', nonce: '5',
-      balanceNano: '10000000000', verified: true, verification: 'proof', balanceProblem: null, outstanding: 0, duplicate: false,
-      replaces: null, inFlight: false, recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+      balanceNano: '10000000000', verified: false, verification: 'live', balanceProblem: null, outstanding: 0,
+      replaces: null, inFlight: false, recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
     });
     w.state.nonce = '6';
     assert.equal(errorCode(await shown.resolve(true)), 'NONCE_CHANGED');
@@ -423,10 +423,10 @@ describe('provider: qnet_sendTransaction', () => {
     assert.equal(w.log.sendCalls.length, 2);
   });
 
-  // The send rule refuses before signing when the balance is not certified yet or another device's transaction is not: the
-  // approval stays open, reads the account again, and confirms once it can.
+  // The send rule refuses before signing when no balance could be read (no node answered, or none gave a proof of the
+  // account): the approval stays open, reads the account again, and confirms once it can.
   it('a confirm the send rule refuses before signing keeps the approval open for a fresh review', async () => {
-    for (const code of ['BALANCE_UNCONFIRMED', 'BALANCE_FOREIGN_PENDING']) {
+    for (const code of ['BALANCE_UNCONFIRMED', 'NONCE_CHANGED']) {
       const w = createWorld();
       await w.grant(SITE);
       const port = w.connect(`${SITE}/`);
@@ -456,10 +456,10 @@ describe('provider: qnet_sendTransaction', () => {
     w.state.recipientError = null;
     w.state.recipient = { known: false, lookalike: true, incomingOnly: true, historyRead: true };
     assert.deepEqual((await shown.get()).result.details.recipient,
-      { known: false, lookalike: true, incomingOnly: true, historyRead: true, recentSame: false });
+      { known: false, lookalike: true, incomingOnly: true, historyRead: true });
     w.state.recipient = { known: true, lookalike: false, incomingOnly: false, historyRead: true };
     assert.deepEqual((await shown.get()).result.details.recipient,
-      { known: false, lookalike: true, incomingOnly: true, historyRead: true, recentSame: false }, 'read once per approval');
+      { known: false, lookalike: true, incomingOnly: true, historyRead: true }, 'read once per approval');
     assert.deepEqual(w.log.recipientChecks, [ACCOUNTS.qnet, ACCOUNTS.qnet]);
     w.state.recipient = { known: 'yes', lookalike: false, incomingOnly: false, historyRead: true };
     w.state.unlocked = false;
@@ -495,7 +495,7 @@ describe('provider: qnet_sendTransaction', () => {
     assert.equal(locked.locked, true);
     assert.deepEqual(locked.details, {
       to: ACCOUNTS.qnet, amountNano: '1', feeNano: '150000', totalNano: '150001', nonce: null, balanceNano: null, verified: false,
-      verification: 'none', balanceProblem: null, outstanding: 0, duplicate: false, replaces: null, inFlight: false, recipient: null,
+      verification: 'none', balanceProblem: null, outstanding: 0, replaces: null, inFlight: false, recipient: null,
     });
     assert.deepEqual(w.log.recipientChecks, [], 'nothing of the wallet is read while locked');
     assert.equal(errorCode(await shown.resolve(true)), 'LOCKED');
@@ -575,9 +575,9 @@ describe('provider: qnet_sendTransaction tokenTransfer and contractCall', () => 
     assert.deepEqual((await shown.get()).result.details, {
       token: TOKEN, to: ACCOUNTS.qnet, amount: '2.5', amountBase: '2500000', name: 'Gold Coin', symbol: 'GOLD', decimals: 6,
       reserved: false, burn: false, gasLimit: tx.gasLimit, feeNano: tx.maxFeeNano, totalNano: (BigInt(tx.maxFeeNano) + 10000000n).toString(),
-      nonce: '5', balanceNano: '10000000000', verified: true, verification: 'proof', balanceProblem: null, outstanding: 0, replaces: null,
-      inFlight: false, depositNano: '10000000', tokenBalance: '5000000000', tokenProblem: null, duplicate: false,
-      recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false },
+      nonce: '5', balanceNano: '10000000000', verified: false, verification: 'live', balanceProblem: null, outstanding: 0, replaces: null,
+      inFlight: false, depositNano: '10000000', tokenBalance: '5000000000', tokenProblem: null,
+      recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
     });
     assert.deepEqual(w.log.contractReads, [TOKEN]);
     assert.deepEqual(w.log.recipientReads, [ACCOUNTS.qnet], 'the recipient is checked before the window too');
@@ -654,7 +654,7 @@ describe('provider: qnet_sendTransaction tokenTransfer and contractCall', () => 
     assert.equal(Number(tx.gasLimit), Number(tx.intrinsicGas) + core.WASM_DEFAULT_FUEL, 'the default fuel');
     assert.deepEqual((await shown.get()).result.details, {
       contract: GAME, method: 'play', args, argsBytes: 9, argsText: 'move e2e4', gasLimit: tx.gasLimit, feeNano: tx.maxFeeNano,
-      totalNano: tx.maxFeeNano, nonce: '5', balanceNano: '10000000000', verified: true, verification: 'proof', balanceProblem: null,
+      totalNano: tx.maxFeeNano, nonce: '5', balanceNano: '10000000000', verified: false, verification: 'live', balanceProblem: null,
       outstanding: 0, replaces: null, inFlight: false,
     });
     assert.equal((await shown.resolve(true)).ok, true);

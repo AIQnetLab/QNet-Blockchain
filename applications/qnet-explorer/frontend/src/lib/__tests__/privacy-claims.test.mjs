@@ -265,14 +265,16 @@ test('what is encrypted, what is not, and what Delete wallet leaves, as the apps
   assert.doesNotMatch(encrypted, /language|display|network|auto-lock|recent pages|history|address/i);
   assert.doesNotMatch(policy, /language and display settings\. They are encrypted/);
   for (const item of [/the wallet's public addresses/, /settings \(language, auto-lock, and how balances and tokens are shown\)/,
+    /the time this device's screen lock last failed to keep a wallet's secret, or you chose a wallet password after it kept failing, so that for up to seven days the app puts no wallet's secret behind the screen lock and a new wallet is protected with a password instead;/,
     /list of recent pages/, /the confirmed history it last showed/, /not confirmed yet/, /the SOL and 1DEV sends it made on this device/,
     /Not encrypted, in the browser extension's storage: the chosen language; the list of websites approved to see your addresses/]) {
     assert.match(plain, item);
   }
-  // Retention: Delete wallet removes all of it but the app's language.
+  // Retention: Delete wallet removes all of it but the app's language and the time its screen lock failed, which lapses,
+  // and the extension's language.
   assert.doesNotMatch(policy, /That history stays when a wallet is deleted/);
-  assert.match(text, /Deleting the wallet removes all of this: in the mobile app everything but the language setting, in the browser extension everything\./);
-  assert.match(policy, /Data on your device: until you delete the wallet \(the mobile app then keeps only its language setting\) or uninstall the app or the extension\./);
+  assert.match(text, /Deleting the wallet removes all of this: in the mobile app everything but the language setting and that screen-lock time, in the browser extension everything but the chosen language\./);
+  assert.match(policy, /Data on your device: until you delete the wallet \(the mobile app then keeps only its language setting and the screen-lock time, which lapses after seven days, and the extension only its chosen language\) or uninstall the app or the extension\./);
 
   // The mobile app: recent pages are plain AsyncStorage JSON; connected sites are sealed; it keeps no activation code
   // (it burns nothing and uses no codes).
@@ -288,15 +290,29 @@ test('what is encrypted, what is not, and what Delete wallet leaves, as the apps
     assert.match(screen, new RegExp(`AsyncStorage\\.setItem\\('${key}'`), key);
   }
   assert.doesNotMatch(screen, /AsyncStorage\.setItem\('qnet_testnet'/);
-  // Delete wallet: every key but the language, the Keychain and the Keystore keys.
-  assert.match(wm, /static ERASE_ALLOW_LIST = \['qnet_language'\];/);
+  // Delete wallet: every key but the language and the screen-lock failure time, the Keychain and the Keystore keys. That
+  // time is a plain value, it stops counting after seven days and is removed then, and a read-back that works clears it.
+  assert.match(wm, /static ERASE_ALLOW_LIST = \['qnet_language', WalletManager\.DEVICE_AUTH_BROKEN_KEY\];/);
+  assert.match(wm, /static DEVICE_AUTH_BROKEN_KEY = 'qnet_device_auth_broken';\s*static DEVICE_AUTH_BROKEN_MS = 7 \* 24 \* 3600_000;/);
+  assert.match(wm, /async _markDeviceAuthBroken\(\) \{\s*await AsyncStorage\.setItem\(WalletManager\.DEVICE_AUTH_BROKEN_KEY, String\(Date\.now\(\)\)\)/);
+  assert.match(wm, /async useWalletPassword\(\) \{\s*await this\._markDeviceAuthBroken\(\);\s*\}/);
+  // Any wallet's secret: an existing wallet's move to the screen lock that cannot read its secret back marks it too, and
+  // while it stands no secret goes behind the screen lock (a new wallet gets a password, a move is refused).
+  assert.match(wm, /async _moveReadBackRefused\(back, secret\) \{[\s\S]*?if \(verdict === 'broken'\) await this\._markDeviceAuthBroken\(\);/);
+  assert.match(wm, /const avail = await this\._deviceAuthAvailability\(\);\s*if \(avail === 'no'\) return 'unavailable';/);
+  assert.match(wm, /!\(await this\.deviceAuthAvailable\(\)\)\) return \{ ok: false, unavailable: true \};/);
+  assert.match(wm, /if \(Number\(raw\) > 0 && age >= 0 && age < WalletManager\.DEVICE_AUTH_BROKEN_MS\) return 'no';\s*await AsyncStorage\.removeItem\(WalletManager\.DEVICE_AUTH_BROKEN_KEY\);/);
+  assert.match(wm, /async _deviceAuthWorks\(\) \{\s*await AsyncStorage\.removeItem\(WalletManager\.DEVICE_AUTH_BROKEN_KEY\)/);
   assert.match(wm, /async eraseAllData\(\) \{[\s\S]*?const doomed = all\.filter\(\(k\) => !WalletManager\.ERASE_ALLOW_LIST\.includes\(k\)\);[\s\S]*?await this\._wipeKeychain\(\);\s*await deleteDeviceKeys\(\);/);
   assert.match(screen, /const eraseWallet = async \(\) => \{[\s\S]*?await walletManager\.eraseAllData\(\);/);
   // A reinstall on iOS: Keychain items left from before are wiped at the first start.
   assert.match(wm, /if \(state === 'none'\) \{\s*await this\._wipeKeychain\(\);\s*await deleteDeviceKeys\(\);/);
-  // The extension: Delete wallet clears its whole chrome.storage.local (language and approvals included).
+  // The extension: Delete wallet clears its whole chrome.storage.local (approvals included) but the settings key when it
+  // holds nothing but an allowed language.
   const vault = read(REPO, 'applications/qnet-wallet/dist/background/vault.js');
-  assert.match(vault, /async function eraseAll\(\) \{[\s\S]*?await clearArea\(storage\.local\);/);
+  assert.match(vault, /async function eraseAll\(\) \{[\s\S]*?const language = \(await session\.storedLanguage\(\)\) !== null \? \[STORAGE_KEYS\.SETTINGS\] : \[\];\s*await clearArea\(storage\.local, \[\], language\);/);
+  assert.match(read(REPO, 'applications/qnet-wallet/dist/background/session.js'),
+    /export async function storedLanguage\(\) \{\s*try \{\s*const stored = [^;]+;\s*return hasExactKeys\(stored, \['language'\]\) && SUPPORTED_LANGUAGES\.includes\(stored\.language\) \? stored\.language : null;/);
 });
 
 // R5-XPD-05: the policy listed two unencrypted items of the extension. The vault record keeps the wallet's
@@ -562,27 +578,34 @@ test('SITE-R3-03: what an activation keeps in the browser and on the server is w
 test('M-1: what a light node answer reports, what the network keeps and for how long, and what the public status shows', () => {
   assert.doesNotMatch(policy, /no analytics, no advertising SDK and no tracking of any kind/);
   assert.match(policy, /There is no account, no sign-up, no analytics or advertising SDK, and no tracking for advertising or across other apps and websites\./);
-  assert.match(policy, /and the node's answers report how the network's wake-up messages reached the device \(light node answers, below\)\. Those records, the node's latest epoch not counted and latest answer that the network keeps from those reports, and the aiqnet\.io server's record of each node activation/);
+  assert.match(policy, /and the node's answers report how the network's wake-up messages reached the device \(light node answers, below\)\. Those records, what the network keeps from those reports \(why each of the node's epochs not counted, among the last 64, was missed, and its latest answer\), and the aiqnet\.io server's record of each node activation/);
   assert.match(policy, /Light node answers\. With each answer the app also reports, for the earlier epochs whose wake-up messages reached the device without an answer, when QNet Blockchain sent the message, when the device received it, and whether QNet Wallet could answer it: for example that it had been closed by a swipe since it was last opened, had not been opened since the phone restarted, held no key for the node, answered after the epoch's check had closed, or answered and the answer did not get through\./);
   assert.match(policy, /The device keeps its record for the last six epochs \(about a day\) and deletes it when the device is unlinked\./);
-  assert.match(policy, /while an epoch runs they hold in memory when each wake-up message was sent and taken by the push service, until that epoch's check closes \(about four hours\); then each keeps, for the node, only its latest epoch not counted \(the epoch, the reason, the times of its wake-up message and of a late answer, the delay, the network's refusal code and what the app reported\) and its latest counted answer \(when it arrived, the delay and how long the app took\), each replaced by the next one\./);
-  assert.match(policy, /The node's public status, which anyone can read by the node identity, as the Device page of aiqnet\.io does, shows the device's platform and model, the day it was linked, its state, the epoch of its last answer and, for an epoch not counted, the epoch, the reason and whether the wake-up message reached the device; it shows no exact time, delay or what the app reported\. Those are shown only to the node's own keys, in the app on the linked device\./);
-  assert.match(policy, /A light node's answer reports: on the device, the last six epochs \(about a day\), deleted when the device is unlinked; on the genesis nodes that wake the device, in memory until the epoch's check closes \(about four hours\), then only the latest epoch not counted and the latest counted answer, each replaced by the next one\./);
+  assert.match(policy, /while an epoch runs they hold in memory when each wake-up message was sent and taken by the push service, until that epoch's check closes \(about four hours\); then each keeps, for the node, a record of each epoch not counted \(the epoch, the reason, the times of its wake-up message and of a late answer, the delay, the network's refusal code and what the app reported\) until a newer record or a counted answer is 64 epochs \(about eleven days\) after it, and its latest counted answer \(when it arrived, the delay and how long the app took\), replaced by the next one\./);
+  assert.match(policy, /The node's public status, which anyone can read by the node identity, as the Device page of aiqnet\.io does, shows the device's platform and model, the day it was linked, its state, the epoch of its last answer and, for its latest epoch not counted, the epoch, the reason and whether the wake-up message reached the device; its public list of misses, which the History page of aiqnet\.io reads, shows the same three for each epoch not counted that the network keeps\. Neither shows an exact time, delay or what the app reported\. Those are shown only to the node's own keys, in the app on the linked device\./);
+  assert.match(policy, /A light node's answer reports: on the device, the last six epochs \(about a day\), deleted when the device is unlinked; on the genesis nodes that wake the device, in memory until the epoch's check closes \(about four hours\), then the record of each epoch not counted until a newer record or a counted answer is 64 epochs \(about eleven days\) after it, and the latest counted answer, replaced by the next one\./);
+  assert.doesNotMatch(policy, /only (?:its|the) latest epoch not counted/);
   assert.match(onDevice(), /the record of the wake-up messages the device received in the last six epochs \(light node answers, below\)/);
   // On Android the model is the maker and the model, never the name the user gave the device.
   assert.match(policy, /on Android the maker and the model the system reports, never the name you gave the device in its settings; never a serial number, IMEI or other identifier/);
   assert.doesNotMatch(policy, /the device name in the system settings when it reads as a model/);
-  // The node: an epoch's ledger in memory until its commit, one row per node of its last miss and last answer, each
-  // overwritten by the next, never gossiped; the public form of the device, and the full one for the node's own keys.
+  // The node: an epoch's ledger in memory until its commit, one row per node of its misses in a 64-epoch window (a newer
+  // miss and a counted answer prune it) and its last answer, overwritten by the next, never gossiped; the public form of
+  // the device and of the misses route, and the full one for the node's own keys.
   const push = read(REPO, 'development/qnet-integration/src/rpc/light_push.rs');
   assert.match(push, /pub\(crate\) fn take_epoch\(&self, epoch: u64\) -> Vec<\(String, PushEntry\)> \{/);
-  assert.match(push, /One node's row here \(`Storage::light_push_row`\): its last miss and its last answer, each overwritten by the\s*\n\/\/\/ next\. Node-local, never gossiped/);
+  assert.match(push, /One node's row here \(`Storage::light_push_row`\): its misses, newest first, one an epoch, of the MISS_HISTORY_EPOCHS\s*\n\/\/\/ epochs up to the newest \(`LightMiss::merge_into`\) and to a counted answer's \(`record_answer`\)[\s\S]*?and its last answer, overwritten by the next\. Node-local, never gossiped/);
+  assert.match(push, /pub\(crate\) const MISS_HISTORY_EPOCHS: u64 = crate::storage::LIGHT_UPTIME_WINDOW;/);
+  assert.match(read(REPO, 'development/qnet-integration/src/storage/roster.rs'), /pub const LIGHT_UPTIME_WINDOW: u64 = 64;/);
+  assert.match(push, /fn in_miss_window\(epoch: u64, newest: u64\) -> bool \{\s*epoch\.saturating_add\(MISS_HISTORY_EPOCHS\) > newest\s*\}/);
   assert.match(push, /const EPOCH_BLOCKS: u64 = 14_400;/);
   assert.match(push, /json!\(\{ "epoch": self\.epoch, "reason": self\.reason\.as_str\(\), "delivered": self\.delivered\(\) \}\)/);
   const status = read(REPO, 'development/qnet-integration/src/rpc/light_status.rs');
   const publicDevice = status.slice(status.indexOf('pub(crate) fn public_json(&self) -> Value {'), status.indexOf('pub(crate) fn signed_json(&self) -> Value {'));
   for (const field of ['"platform"', '"model"', '"linked_since"', '"last_answer_epoch"', '"state"', '"last_miss"']) assert.ok(publicDevice.includes(field), field);
   assert.doesNotMatch(publicDevice, /last_answer_at|"last_answer"|app_outcome|woken_at/);
+  // The misses route serves each miss in that same public form.
+  assert.match(status, /d\.misses\.iter\(\)\.take\(limit\)\.map\(LightMiss::public_json\)\.collect\(\)/);
   // The app: the record of the last six epochs, gone with the binding.
   const receipts = read(REPO, 'applications/qnet-mobile/src/services/PushReceipts.js');
   assert.match(receipts, /export const REPORT_EPOCHS = 6;/);
@@ -590,6 +613,7 @@ test('M-1: what a light node answer reports, what the network keeps and for how 
   // The site: neither the route's answer nor its shared cache holds a time, a delay or what the app reported.
   const view = read(SRC, 'lib/cabinet/node-view.ts');
   assert.match(view, /const DEVICE_KEYS = \['platform', 'model', 'linkedSince', 'lastAnswerEpoch', 'state', 'lastMiss'\];/);
+  assert.match(view, /if \(!isLastMiss\(r\.miss\) \|\| /, 'a History row\'s miss has the same three fields');
   assert.match(read(SRC, 'lib/cabinet/last-miss.ts'), /const MISS_KEYS = \['epoch', 'reason', 'delivered'\];/);
 });
 

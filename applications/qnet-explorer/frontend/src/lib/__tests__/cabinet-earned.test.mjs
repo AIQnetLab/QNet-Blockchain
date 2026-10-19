@@ -183,14 +183,16 @@ test('the line on the Overview\'s balance of a light and a super node and on His
   const history = code('components/cabinet/NodeHistory.tsx');
   assert.match(history, /<p className="activate-note">\{t\('epoch_note'\)\}<\/p>\s*<Earned nodeId=\{nodeId\} balanceNano=\{null\} \/>\s*<Epochs nodeId=\{nodeId\} show="all" \/>/);
   const line = history.slice(history.indexOf('export function Earned('), history.indexOf('function EpochCard('));
-  // One shared read with the epochs; read again while the balances differ, at once and then after the site's copy.
-  assert.match(line, /const \{ state, refresh \} = useNodeHistory\(nodeId\);/);
+  // One shared read with the epochs (a view's on its own address, as theirs); read again while the balances differ, at
+  // once and then after the site's copy.
+  assert.match(line, /const \{ viewOnly \} = useCabinet\(\);\s*const \{ state, refresh \} = useNodeHistory\(nodeId, viewOnly\);/);
   assert.match(line, /const differs = earned !== null && balanceNano !== null && earned\.balanceNano !== balanceNano;/);
   assert.match(line, /\}, tries === 0 \? 0 : HISTORY_KEPT_MS \+ 1_000\);/);
   assert.match(line, /const shown = earnedView\(earned, balanceNano, tries >= EARNED_RETRIES\);/);
   assert.match(line, /<p>\{t\('earned_unknown'\)\}<\/p>/);
   assert.match(line, /<p>\{t\('earned_total', \{ amount: formatQnc\(shown\.totalNano\) \}\)\}<\/p>/);
-  assert.doesNotMatch(line, /viewOnly/, 'public chain data: no difference for a view');
+  // Public chain data: a view only reads its own address, and the line shows the same.
+  assert.equal(line.match(/viewOnly/g)?.length, 2, 'public chain data: no difference for a view');
   // The site keeps a page as long as the line waits for.
   assert.match(code('server/cabinet/node-proxy.ts'), /export const HISTORY_CACHE_MS = HISTORY_KEPT_MS;/);
 });

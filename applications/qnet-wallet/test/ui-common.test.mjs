@@ -327,6 +327,63 @@ describe('ui kit', () => {
     for (const [text, decimals, expected] of cases) assert.equal(kit.canonicalAmount(text, decimals), expected, text);
   });
 
+  it('formatAmount() and figureText() write a figure as the UI language does, every digit kept (core.amountText)', async () => {
+    const shown = {
+      en: '18,446,744,073.709551615 QNC',
+      ru: '18 446 744 073,709551615 QNC',
+      fr: '18 446 744 073,709551615 QNC',
+      de: '18.446.744.073,709551615 QNC',
+      es: '18.446.744.073,709551615 QNC',
+      ar: '18,446,744,073.709551615 QNC',
+    };
+    for (const [language, text] of Object.entries(shown)) {
+      await common.loadLocale(language);
+      assert.equal(kit.formatAmount('18446744073709551615', 9, 'QNC'), text, language);
+    }
+    await common.loadLocale('es');
+    assert.equal(kit.figureText(1500), '1500', 'Spanish leaves four digits as they are');
+    assert.equal(kit.figureText(15000), '15.000');
+    await common.loadLocale('en');
+    assert.equal(kit.figureText(1500), '1,500');
+    assert.equal(kit.formatAmount('12500000000', 9, 'QNC'), '12.5 QNC');
+    assert.equal(kit.formatAmount('x', 9, 'QNC'), '— QNC');
+    assert.equal(kit.figureText(null), '');
+    assert.equal(kit.figureText('—'), '—');
+  });
+
+  it('keepAmountCanonical() keeps an amount field canonical: a paste in the language\'s format is read as written, a typed comma is the decimal mark', async () => {
+    const input = common.el('input');
+    let decimals = 9;
+    kit.keepAmountCanonical(input, () => decimals);
+    type(input, '1,000');
+    assert.equal(input.value, '1000', 'a pasted 1,000 in English is a thousand');
+    type(input, '');
+    for (const typed of ['1', '1,', '1,5']) type(input, typed);
+    assert.equal(input.value, '1.5', 'typed one character at a time, a comma is the decimal mark');
+    type(input, '1.5 QNC');
+    assert.equal(input.value, '1.5', 'what is no figure goes');
+    type(input, '1.2.3,4');
+    assert.equal(input.value, '1.5', 'a text the rule refuses leaves the field as it was');
+    decimals = 2;
+    type(input, '1.2345');
+    assert.equal(input.value, '1.23', 'no more decimals than the asset has');
+    await common.loadLocale('de');
+    type(input, '');
+    type(input, '1.000');
+    assert.equal(input.value, '1000', 'a pasted 1.000 in German is a thousand');
+    type(input, '');
+    type(input, '2.500,75');
+    assert.equal(input.value, '2500.75');
+    type(input, '');
+    type(input, '1,000');
+    assert.equal(input.value, '1.00', 'in German a pasted comma is the decimal mark (two decimals kept)');
+    // Arabic-Indic digits are read as digits
+    await common.loadLocale('ar');
+    type(input, '');
+    type(input, '١٫٥');
+    assert.equal(input.value, '1.5');
+  });
+
   it('looksLikeKnownAddress() flags same-edges look-alikes only', () => {
     const known = 'AbCd1234567890efghWxYz';
     assert.equal(kit.looksLikeKnownAddress(known, [known]), false);

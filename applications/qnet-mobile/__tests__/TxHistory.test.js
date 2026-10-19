@@ -6,6 +6,7 @@
 import {
   historyRowKey, splitExplorerItems, tokenRowFromEvent, mergeHistory, appendHistory, cacheableHistory, fmtTokenBaseUnits,
   txDirection, nodeNativeRow, withListing, listingKey, listingKeysOfNodeRow, checkedCachedRows, historyBadge, historyEntries,
+  markInBlock,
 } from '../src/utils/txHistory';
 
 const ME = 'aaaaaaaaaaaaaaaaaaaeonaaaaaaaaaaaaaaaaaaaaaa';
@@ -145,7 +146,7 @@ describe('a node\'s transaction lookup (MOBNET-R2-01)', () => {
   });
   it('the result card polls with this rule, not with "found"', () => {
     const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
-    expect(src).toMatch(/if \(txLookupState\(txData, txHash\) === 'included'\) \{/);
+    expect(src).toMatch(/return txLookupState\(txData, txHash\) === 'included' \? txData\.transaction\.block_height : null;/);
     expect(src).not.toMatch(/txData\.status !== 'not_found'/);
   });
 });
@@ -204,6 +205,52 @@ describe('a landed send is never left "Not found" (L-10)', () => {
     expect(later.filter((r) => r.hash === 'hedged-copy').map((r) => r.status)).toEqual(['confirmed']);
   });
 
+  // Before, a send the result card saw in a block went back to "Pending" in History (one node's 'reported' row) until two
+  // genesis nodes listed it, and the archive's row said "Unverified" over it (owner, 18.10).
+  it('a send the result card saw in a block is confirmed at once, and every later row of its hash stays so', () => {
+    const shown = markInBlock([sent('h-sent', NOW - 5_000), row('other', NOW - 6_000)], 'H-SENT', 4043400);
+    expect(shown[0]).toMatchObject({ status: 'pending', inBlock: true, block: 4043400 });
+    expect(shown[1]).toBe(markInBlock(shown, 'h-sent')[1]); // other rows are the same objects
+    expect(shown.map(historyBadge)).toEqual(['confirmed', 'confirmed']);
+    expect(markInBlock(shown, 'h-sent')[0]).toBe(shown[0]);
+    // One node's row of it, then the archive's: confirmed, not Pending or Unverified.
+    const node = { ...nodeNativeRow({ hash: 'h-sent', from: ME, to: OTHER, amount: 1e9, timestamp: (NOW - 4_000) / 1000 }, ME) };
+    const merged = mergeHistory(shown, [node], opts());
+    expect(merged.filter((r) => r.hash === 'h-sent').map((r) => [r.status, r.inBlock, historyBadge(r)])).toEqual([['reported', true, 'confirmed']]);
+    const archive = splitExplorerItems([{ source: 'tx', hash: 'h-sent', idx: 0, block: 4043400, timestamp: NOW - 4_000, from: ME, to: OTHER,
+      amount: '1000000000', tx_type: 'Transfer', fee: '150000' }], ME).native;
+    const later = mergeHistory(merged, archive, opts({ coveredFromMs: 0 }));
+    expect(later.filter((r) => r.hash === 'h-sent').map((r) => [r.status, historyBadge(r)])).toEqual([['unverified', 'confirmed']]);
+    // Never Not found, however long no source lists it, and kept on the device.
+    const old = markInBlock([sent('h-old', NOW - PENDING_ROW_MAX_MS - 1)], 'h-old');
+    expect(rowsDueToDrop(old, [], { myAddress: ME, nowMs: NOW })).toEqual([]);
+    expect(mergeHistory(old, [], opts())[0].status).toBe('pending');
+    expect(historyBadge(mergeHistory(old, [], opts())[0])).toBe('confirmed');
+    expect(cacheableHistory(old).map((r) => r.hash)).toEqual(['h-old']);
+  });
+
+  it('a token transfer a genesis node reports is confirmed at once; a logs proof adds the mark and is kept', () => {
+    const ev = { tx_hash: 'ht', log_index: 0, contract: 'c', from: OTHER, to: ME, amount: '10', timestamp: (NOW - 1000) / 1000 };
+    const reported = tokenRowFromEvent({ ...ev, reported: true }, ME, new Map());
+    expect([reported.status, reported.inBlock, reported.verified, historyBadge(reported)]).toEqual(['confirmed', true, false, 'confirmed']);
+    // The archive's word alone stays unverified.
+    expect(tokenRowFromEvent({ ...ev, archived: true }, ME, new Map()).status).toBe('unverified');
+    // Proven on an earlier pass: the mark stays while the node reports it again without it.
+    const proven = { ...reported, verified: true };
+    expect(mergeHistory([proven], [reported], opts())[0]).toMatchObject({ status: 'confirmed', verified: true, inBlock: true });
+    // Reported once: the archive's row of it later (the node's window passed) stays confirmed.
+    expect(mergeHistory([reported], [tokenRowFromEvent({ ...ev, archived: true }, ME, new Map())], opts())[0])
+      .toMatchObject({ status: 'confirmed', inBlock: true });
+  });
+
+  it('the result card marks the row in a block where it sees the send included', () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    const poll = src.slice(src.indexOf('const startTxConfirmationPolling ='), src.indexOf('const startUnknownOutcomeResolution ='));
+    expect(poll).toMatch(/setTxHistory\(prev => markInBlock\(prev, txHash, block\)\);/);
+    expect(poll).toMatch(/return markInBlock\(rows, landedHash\);/);
+    expect(poll).not.toMatch(/updateTxStatus\(txHash, 'reported'\)/);
+  });
+
   it('the screen asks by nonce before marking, and the result card\'s settle removes a not-found row too', () => {
     const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     const load = src.slice(src.indexOf('const loadTxHistory = async'), src.indexOf('const loadOlderHistory = async'));
@@ -219,7 +266,7 @@ describe('a landed send is never left "Not found" (L-10)', () => {
 });
 
 // Receive labels (wallet-galc plan, P1; the extension's rule): the archive's row is unverified, a row two genesis nodes
-// list alike is in a block, and received QNC is credited only once the certified balance covers its block.
+// list alike is in a block, and received QNC is in the balance once the wallet's live figure covers its block.
 describe('receive labels', () => {
   const [sent, received] = splitExplorerItems([
     { source: 'tx', hash: 'h1', idx: 0, block: 900, timestamp: NOW - 1000, from: ME, to: OTHER, amount: '2500000000', tx_type: 'Transfer', fee: '150000' },
@@ -229,13 +276,13 @@ describe('receive labels', () => {
   const listedBy = (...rows) => new Set(rows.flatMap((r) => listingKeysOfNodeRow(r)));
   const nodeRow = (r, over = {}) => ({ hash: r.hash, from: r.from, to: r.to, amount: Number(r.amountNano), type: 'transfer', ...over });
 
-  it('an archive row is unverified; listed alike it is confirmed, received QNC only once the certified balance covers it', () => {
+  it('an archive row is unverified; listed alike it is confirmed, received QNC once the figure read last covers it', () => {
     expect([sent, received].map(historyBadge)).toEqual(['unverified', 'unverified']);
     const listed = listedBy(nodeRow(sent), nodeRow(received));
     const below = withListing([sent, received], listed, 1799);
     expect(below.map((r) => [r.status, r.listed])).toEqual([['confirmed', true], ['included', true]]);
     expect(below.map(historyBadge)).toEqual(['confirmed', 'included']);
-    // The certified read covers its block: credited, and it stays so whatever comes after.
+    // The live figure covers its block: credited, and it stays so whatever comes after.
     const covered = withListing(below, null, 1800);
     expect(covered.map((r) => r.status)).toEqual(['confirmed', 'confirmed']);
     expect(withListing(covered, null, null)[1].status).toBe('confirmed');
@@ -281,6 +328,14 @@ describe('receive labels', () => {
       { hash: 'e', status: 'pending' },
     ]);
     expect(rows.map((r) => r.status)).toEqual(['unverified', 'confirmed', 'unverified', 'confirmed', 'confirmed', 'pending']);
+  });
+
+  it('a row a genesis node reported in a block or applied keeps that through the cache', () => {
+    const rows = checkedCachedRows([
+      { hash: 'f', status: 'confirmed', type: 'send', inBlock: true },
+      { hash: 'g', status: 'confirmed', tokenContract: 'C1', verified: false, inBlock: true },
+    ]);
+    expect(rows.map((r) => r.status)).toEqual(['confirmed', 'confirmed']);
   });
 
   it('a registration the registry holds is settled, the unverified row of the archive too', () => {

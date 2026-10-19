@@ -64,11 +64,13 @@ import * as session from './session.js';
  * @property {string} feeNano u64 decimal: what the gas limit may cost at most
  * @property {string} body the exact JSON text POSTed to /api/v1/transaction (a transfer) or /api/v1/contract/call (a
  *   call); a retry resends it unchanged
- * @property {string|null} txHash
+ * @property {string|null} txHash the hash a node returned for it; once confirmed, the hash two pinned nodes list for it
  * @property {number} createdAt
  * @property {number} lastSubmitAt
- * @property {'pending'|'replaced'|'passed'|'superseded'|'refused'} outcome replaced: another transaction took its
- *   nonce; passed: the chain's nonce passed it and no two pinned nodes agree yet on what applied there (R3-EXTQ-04);
+ * @property {'pending'|'confirmed'|'replaced'|'passed'|'superseded'|'refused'} outcome confirmed: two pinned nodes list it
+ *   at its nonce, so the chain took it: listed until the archive lists its row (qnet.historyOf); replaced: another
+ *   transaction took its nonce; passed: the chain's nonce passed it and no two pinned nodes agree yet on what applied
+ *   there (R3-EXTQ-04);
  *   superseded: a replacement at its nonce is being submitted, so it is no longer resent but still listed and
  *   reserved until that replacement's outcome is known (R4-EXTQ-01); refused: the only node sent it refused it, which
  *   is one node's word: never resent by the wallet, still listed and reserved until its nonce is used, and the next
@@ -78,17 +80,16 @@ import * as session from './session.js';
  *   its method, and for a token transfer its recipient and the token base units it moves (u64 decimal)
  *
  * @typedef {object} SpendRecord  the most one transaction this wallet signed can take, kept by nonce from its signing
- *   until its transaction is gone unused, or for an hour after the chain's nonce reached it: what a send counts above a
- *   certified state, whose nonce may be below it (qnet.withSpends)
+ *   until its transaction is gone unused, or for an hour after the pinned nodes' agreed nonce reached it: what the send
+ *   rule counts off the live balance of a node a block or more behind (qnet.withSpends, qnet.liveSend)
  * @property {string} nonce u64 decimal
  * @property {string} qncNano u64 decimal: its amount (a call: the storage deposit) and its most fee
  * @property {string|null} token the token contract a token transfer moves, else null
  * @property {string|null} tokenAmount u64 decimal: the token base units it moves, with `token`
  * @property {boolean} tokenUnknown a contract call that may move tokens by an amount not known here
- * @property {number|null} settledAt when the chain's nonce reached it, null before
+ * @property {number|null} settledAt when the pinned nodes' agreed nonce reached it, null before
  *
- * @typedef {object} RecentTransfer  a QNC transfer this wallet signed, kept RECENT_TRANSFER_MS for the
- *   double-payment warning whatever became of it (R3-EXTQ-01)
+ * @typedef {object} RecentTransfer  a QNC transfer this wallet signed
  * @property {string} to
  * @property {string} amountNano
  * @property {number} createdAt
@@ -106,8 +107,8 @@ import * as session from './session.js';
  * @property {null} legacy always null, a key of the state format
  * @property {string[]} solanaRecipients the Solana addresses this wallet signed SOL or 1DEV transfers to,
  *   oldest first, at most RECIPIENTS_MAX: the same warnings for a Solana send (R3-EXT-UI-03)
- * @property {RecentTransfer[]} recentTransfers oldest first, at most RECENT_TRANSFERS_MAX, none older than
- *   RECENT_TRANSFER_MS
+ * @property {RecentTransfer[]} recentTransfers a key of the state format that nothing reads, at most RECENT_TRANSFERS_MAX;
+ *   [] in every vault created now
  * @property {boolean} exposedAdvice a key of the state format that nothing reads; false in every vault written now
  * @property {SupersededBurn|null} supersededBurn this wallet's own finalized burn that another device of the phrase
  *   beat to it: the activation is that older burn, and this one gives no code of its own (XP-R5-03)
@@ -148,9 +149,8 @@ export function emptyState() {
 
 // Recipients kept for the send warnings; the oldest drop out first.
 export const RECIPIENTS_MAX = 128;
-// Signed QNC transfers kept for the double-payment warning, and for how long (R3-EXTQ-01).
+// The most entries the state format's recentTransfers holds.
 export const RECENT_TRANSFERS_MAX = 64;
-export const RECENT_TRANSFER_MS = 30 * 60 * 1000;
 
 /**
  * The state with `address` as the newest known recipient (moved to the end when it is already there).
@@ -172,30 +172,6 @@ export function withRecipient(state, address) {
 export function withSolanaRecipient(state, address) {
   const solanaRecipients = [...state.solanaRecipients.filter((known) => known !== address), address].slice(-RECIPIENTS_MAX);
   return { ...state, solanaRecipients };
-}
-
-/**
- * The state with a signed transfer of `amountNano` to `to` recorded for the double-payment warning; entries
- * older than RECENT_TRANSFER_MS go (R3-EXTQ-01).
- * @param {VaultState} state
- * @param {{to: string, amountNano: string, createdAt: number}} transfer
- * @returns {VaultState}
- */
-export function withRecentTransfer(state, transfer) {
-  const since = transfer.createdAt - RECENT_TRANSFER_MS;
-  const recentTransfers = [...liveRecentTransfers(state, since), { to: transfer.to, amountNano: transfer.amountNano, createdAt: transfer.createdAt }]
-    .slice(-RECENT_TRANSFERS_MAX);
-  return { ...state, recentTransfers };
-}
-
-/**
- * The recorded transfers created at or after `since`.
- * @param {VaultState} state
- * @param {number} since ms epoch
- * @returns {RecentTransfer[]}
- */
-export function liveRecentTransfers(state, since) {
-  return state.recentTransfers.filter((r) => r.createdAt >= since);
 }
 
 // The default is the R04 floor itself. A cheaper m=32 MiB/t=4 was measured to save only ~40% and is below
@@ -254,7 +230,7 @@ const PENDING_TRANSFER_KEYS = Object.freeze(['nonce', 'to', 'amountNano', 'feeNa
 // A record written before calls were kept is a QNC transfer; one written before its outcome was kept is still pending.
 const PENDING_TRANSFER_KEYS_BEFORE_CALLS = Object.freeze(PENDING_TRANSFER_KEYS.filter((key) => key !== 'kind' && key !== 'call'));
 const PENDING_TRANSFER_KEYS_BEFORE = Object.freeze(PENDING_TRANSFER_KEYS_BEFORE_CALLS.filter((key) => key !== 'outcome'));
-export const PENDING_OUTCOMES = Object.freeze(['pending', 'replaced', 'passed', 'superseded', 'refused']);
+export const PENDING_OUTCOMES = Object.freeze(['pending', 'confirmed', 'replaced', 'passed', 'superseded', 'refused']);
 export const PENDING_KINDS = Object.freeze(['transfer', 'call']);
 const PENDING_CALL_KEYS = Object.freeze(['method', 'recipient', 'amount']);
 const METHOD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;

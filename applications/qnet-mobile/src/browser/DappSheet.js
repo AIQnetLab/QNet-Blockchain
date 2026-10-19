@@ -18,12 +18,12 @@ import {
 } from './dappProvider';
 import { formatUnits } from './dappRequests';
 import { refusalReason } from '../utils/txRefusal';
+import { amountText, formatNano, qncText } from '../utils/amountFormat';
 import { InfoField, InfoRow } from '../components/InfoRow';
 
 // A send moves money: a longer untouched look before it arms (the times live with the provider, which also counts
 // a page that leaves under an armed sheet as a rejection).
 export { ARM_MS, SEND_ARM_MS, armDelayFor };
-export const REPEAT_WINDOW_MS = 30 * 60_000;
 // The message box's border: what it shows of its text is its height less the border above and below.
 const MESSAGE_BORDER = 1;
 
@@ -54,34 +54,16 @@ export function untilActive(timeoutMs = 3000) {
 }
 
 /**
- * Minutes since this wallet last sent exactly `amountNano` to `to` (an unconfirmed transaction, or one settled in
- * the last half hour), or null.
+ * One unconfirmed transaction of this wallet as a line, on this sheet and on the Send form's question: what it is and
+ * how long ago it was signed.
  */
-export function repeatedPaymentMinutes(to, amountNano, pending, recent, now = Date.now()) {
-  const amount = String(amountNano);
-  let best = null;
-  for (const p of pending || []) {
-    if (p && p.to === to && p.amountNano !== null && String(p.amountNano) === amount) {
-      const ms = Number(p.ageMs) || 0;
-      if (best === null || ms < best) best = ms;
-    }
-  }
-  for (const r of recent || []) {
-    if (r && r.to === to && r.amountNano !== null && String(r.amountNano) === amount) {
-      const ms = now - (Number(r.settledAt) || 0);
-      if (ms < REPEAT_WINDOW_MS && (best === null || ms < best)) best = ms;
-    }
-  }
-  return best === null ? null : Math.max(1, Math.round(best / 60_000));
-}
-
-/** Nano QNC (decimal string) as a QNC amount: "1500000000" → "1.5". */
-export function formatNano(nano) {
-  if (typeof nano !== 'string' || !/^\d+$/.test(nano)) return '—';
-  const v = BigInt(nano);
-  const whole = v / 1_000_000_000n;
-  const frac = (v % 1_000_000_000n).toString().padStart(9, '0').replace(/0+$/, '');
-  return frac ? `${whole}.${frac}` : whole.toString();
+export function pendingLine(t, p) {
+  const age = t('time_min', { n: Math.max(1, Math.round((Number(p.ageMs) || 0) / 60_000)) });
+  const what = p.kind === 'transfer' && p.amountNano !== null
+    ? t('pending_line_transfer', { amount: qncText(String(p.amountNano), t.lang), to: p.to || '—' })
+    : p.kind === 'call' ? t('pending_line_call', { method: p.method || '—', to: p.to || '—' })
+      : p.kind === 'deploy' ? t('pending_line_deploy') : t('pending_line_other');
+  return `${what} · ${age}`;
 }
 
 /** Token base units (decimal string) in the token's own units: "1500" with 3 decimals → "1.5". */
@@ -107,24 +89,12 @@ export function sendUnread(type, preview) {
 }
 
 /**
- * What the sheet says when a balance went unread: a transaction from another device not confirmed yet, a balance not
- * confirmed yet (try again in a minute), or the wallet's state not read (the network did not answer).
+ * What the sheet says when a balance went unread: what one of this wallet's transactions takes is not known yet (try
+ * again in a minute), or the wallet's state not read (the network did not answer).
  */
 export function unreadKey(type, preview) {
   const problems = [preview && preview.balanceProblem, type === 'tokenTransfer' ? preview && preview.tokenProblem : null];
-  if (problems.includes('foreign')) return 'balance_foreign_pending';
-  if (problems.includes('unconfirmed')) return 'balance_unconfirmed';
-  return 'dapp_send_preview_failed';
-}
-
-/**
- * unreadKey said: while a long lineage walk is why a balance is not confirmed, how far it is (wallet-galc plan, Part 3
- * item 6).
- */
-export function unreadText(t, type, preview) {
-  const key = unreadKey(type, preview);
-  const steps = preview && preview.walkSteps;
-  return key === 'balance_unconfirmed' && Number.isSafeInteger(steps) && steps > 0 ? t('balance_verifying_steps', { steps }) : t(key);
+  return problems.includes('unconfirmed') ? 'balance_unconfirmed' : 'dapp_send_preview_failed';
 }
 
 /**
@@ -205,9 +175,9 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     const host = site ? site.host : view.origin;
     if (kind === 'connect') return t('dapp_auth_connect', { site: host });
     if (kind === 'sign') return t('dapp_auth_sign', { site: host });
-    if (type === 'tokenTransfer') return t('dapp_auth_token', { amount: `${view.details.amount} ${view.details.symbol}` });
+    if (type === 'tokenTransfer') return t('dapp_auth_token', { amount: `${amountText(view.details.amount, t.lang)} ${view.details.symbol}` });
     if (type === 'contractCall') return t('dapp_auth_call', { method: view.details.method, site: host });
-    return t('dapp_auth_send', { amount: formatNano(view.details.amountNano) });
+    return t('dapp_auth_send', { amount: amountText(formatNano(view.details.amountNano), t.lang) });
   };
 
   const confirm = async () => {
@@ -262,16 +232,6 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     </TouchableOpacity>
   );
 
-  // One unconfirmed transaction of this wallet, as a line: what it is and how long ago it was signed.
-  const pendingLine = (p) => {
-    const age = t('time_min', { n: Math.max(1, Math.round((Number(p.ageMs) || 0) / 60_000)) });
-    const what = p.kind === 'transfer' && p.amountNano !== null
-      ? t('pending_line_transfer', { amount: `${formatNano(String(p.amountNano))} QNC`, to: p.to || '—' })
-      : p.kind === 'call' ? t('pending_line_call', { method: p.method || '—', to: p.to || '—' })
-        : p.kind === 'deploy' ? t('pending_line_deploy') : t('pending_line_other');
-    return `${what} · ${age}`;
-  };
-
   const choiceButton = (value, label, disabled) => (
     <TouchableOpacity
       key={value}
@@ -289,7 +249,7 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
   const pendingBlock = () => (
     <View style={s.pendingBox}>
       <Text style={s.warning}>{t('pending_title', { count: pending.length })}</Text>
-      {pending.map((p) => <Text key={`p${p.nonce}`} style={s.mono}>{pendingLine(p)}</Text>)}
+      {pending.map((p) => <Text key={`p${p.nonce}`} style={s.mono}>{pendingLine(t, p)}</Text>)}
       {inFlight ? <Text style={s.hint} testID="in-flight">{t('dapp_in_flight')}</Text> : (
         <>
           <Text style={s.hint}>{t('dapp_replace_or_wait')}</Text>
@@ -374,7 +334,7 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
   const walletRows = () => (
     <>
       {needsPick || inFlight ? pendingBlock() : null}
-      {preview.balanceNano !== null ? figureRow(t('dapp_send_balance'), `${formatNano(preview.balanceNano)} QNC`) : null}
+      {preview.balanceNano !== null ? figureRow(t('dapp_send_balance'), qncText(preview.balanceNano, t.lang)) : null}
     </>
   );
 
@@ -402,21 +362,19 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
 
   const transferBody = () => {
     const d = view.details;
-    const repeatMin = preview ? repeatedPaymentMinutes(d.to, d.amountNano, pending, preview.recent) : null;
     return (
       <>
         {wholeField(t('dapp_send_to'), d.to)}
         {d.destroys ? <Text style={s.alert} testID="qnc-destroyed">{t('dapp_qnc_destroyed')}</Text> : null}
-        {figureRow(t('dapp_send_amount'), `${formatNano(d.amountNano)} QNC`)}
-        {figureRow(t('dapp_send_fee'), `${formatNano(d.feeNano)} QNC`)}
-        {figureRow(t('dapp_send_total'), `${formatNano(d.totalNano)} QNC`, { total: true })}
+        {figureRow(t('dapp_send_amount'), qncText(d.amountNano, t.lang))}
+        {figureRow(t('dapp_send_fee'), qncText(d.feeNano, t.lang))}
+        {figureRow(t('dapp_send_total'), qncText(d.totalNano, t.lang), { total: true })}
         {preview ? (
           <>
-            {repeatMin !== null ? <Text style={s.alert}>{t('send_repeat_body', { minutes: repeatMin })}</Text> : null}
             {walletRows()}
             {d.destroys ? null : recipientWarnings(d.to)}
             {shortLine(d.totalNano)}
-            {sendUnread(type, preview) ? <Text style={s.alert}>{unreadText(t, type, preview)}</Text> : null}
+            {sendUnread(type, preview) ? <Text style={s.alert}>{t(unreadKey(type, preview))}</Text> : null}
           </>
         ) : reading()}
       </>
@@ -437,21 +395,21 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
         {d.reservedName ? <Text style={s.alert}>{t('tok_reserved_warning')}</Text> : null}
         {wholeField(t('dapp_send_to'), d.to)}
         {d.destroys ? <Text style={s.alert}>{t('dapp_token_destroyed')}</Text> : null}
-        {figureRow(t('dapp_send_amount'), `${d.amount} ${d.symbol}`)}
-        {figureRow(t('dapp_token_base'), d.amountBase)}
-        {figureRow(t('dapp_send_fee'), `${formatNano(d.feeNano)} QNC`)}
+        {figureRow(t('dapp_send_amount'), `${amountText(d.amount, t.lang)} ${d.symbol}`)}
+        {figureRow(t('dapp_token_base'), amountText(d.amountBase, t.lang))}
+        {figureRow(t('dapp_send_fee'), qncText(d.feeNano, t.lang))}
         {preview ? (
           <>
-            {depositNano !== null && depositNano !== '0' ? figureRow(t('dapp_token_deposit'), `${formatNano(depositNano)} QNC`) : null}
-            {figureRow(t('dapp_send_total'), `${formatNano(totalNano)} QNC`, { total: true })}
+            {depositNano !== null && depositNano !== '0' ? figureRow(t('dapp_token_deposit'), qncText(depositNano, t.lang)) : null}
+            {figureRow(t('dapp_send_total'), qncText(totalNano, t.lang), { total: true })}
             {preview.listed ? null : <Text style={s.warning}>{t('dapp_token_unlisted')}</Text>}
             {walletRows()}
             {preview.tokenBalanceBase !== null
-              ? figureRow(t('dapp_token_balance'), `${formatTokenUnits(preview.tokenBalanceBase, d.decimals)} ${d.symbol}`) : null}
+              ? figureRow(t('dapp_token_balance'), `${amountText(formatTokenUnits(preview.tokenBalanceBase, d.decimals), t.lang)} ${d.symbol}`) : null}
             {d.destroys ? null : recipientWarnings(d.to)}
             {tokenShort ? <Text style={s.alert}>{t('dapp_token_insufficient')}</Text> : null}
             {shortLine(totalNano)}
-            {sendUnread(type, preview) ? <Text style={s.alert}>{unreadText(t, type, preview)}</Text> : null}
+            {sendUnread(type, preview) ? <Text style={s.alert}>{t(unreadKey(type, preview))}</Text> : null}
           </>
         ) : reading()}
       </>
@@ -474,13 +432,13 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
           </ScrollView>
         </InfoField>
         {d.argsText ? wholeField(t('dapp_call_input_text'), d.argsText, false) : null}
-        {figureRow(t('dapp_call_gas'), d.gasLimit)}
-        {figureRow(t('dapp_call_max_fee'), `${formatNano(d.feeNano)} QNC`)}
+        {figureRow(t('dapp_call_gas'), amountText(d.gasLimit, t.lang))}
+        {figureRow(t('dapp_call_max_fee'), qncText(d.feeNano, t.lang))}
         {preview ? (
           <>
             {walletRows()}
             {shortLine(d.feeNano)}
-            {sendUnread(type, preview) ? <Text style={s.alert}>{unreadText(t, type, preview)}</Text> : null}
+            {sendUnread(type, preview) ? <Text style={s.alert}>{t(unreadKey(type, preview))}</Text> : null}
           </>
         ) : reading()}
       </>
@@ -500,6 +458,8 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
 
   // A node's refusal is said as the Send form says it: final (never sent again, listed under Assets until the next
   // send takes its place), or one the wallet sends again while waiting may heal it; its reason in the app's language.
+  // Once the genesis nodes report the transaction in a block, the sheet says so (dappProvider followOutcome), and never
+  // that a call did what it was meant to.
   const outcomeBody = () => {
     if (outcome.refusal && outcome.final) {
       return <Text style={s.text}>{t('tx_note_refused_final', { reason: refusalReason(t, outcome.refusal) })}</Text>;
@@ -507,8 +467,9 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     // A recipient found to be a contract when it was read again at the approval (MOB-BR-R3-01): said as the Send form says it.
     if (outcome.recipient === 'contract') return <Text style={s.text}>{t('send_recipient_contract')}</Text>;
     if (outcome.error !== undefined) return <Text style={s.text}>{t('dapp_send_failed')}</Text>;
-    const said = outcome.status === 'submitted' ? t('dapp_send_submitted')
-      : outcome.refusal ? t('tx_note_refused', { reason: refusalReason(t, outcome.refusal) }) : t('dapp_send_unknown');
+    const said = outcome.inBlock ? t('dapp_send_in_block')
+      : outcome.status === 'submitted' ? t('dapp_send_submitted')
+        : outcome.refusal ? t('tx_note_refused', { reason: refusalReason(t, outcome.refusal) }) : t('dapp_send_unknown');
     return (
       <>
         <Text style={s.text}>{said}</Text>

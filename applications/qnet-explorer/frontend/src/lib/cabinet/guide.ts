@@ -123,8 +123,8 @@ const APP_NODE_TAB: Scene = {
 };
 
 // QNet Wallet's Node tab with a super node of the wallet (NodeTab.js ServerNodeCard), the same on every phone and
-// tablet that holds the wallet: its id, then its rows in the card's order (type, status, last seen, missed epochs), the
-// node balance and its move.
+// tablet that holds the wallet: its id, then its rows in the card's order (type, status, last seen), the node balance and
+// its move.
 const APP_SUPER_CARD: Scene = {
   frame: 'phone', screen: 'app', parts: [
     { kind: 'title', label: 'ui_app_node_tab' },
@@ -132,7 +132,6 @@ const APP_SUPER_CARD: Scene = {
     { kind: 'row', label: 'ui_app_node_type', value: 'ui_app_super_node' },
     { kind: 'row', label: 'ui_app_status_node', value: 'ui_app_active' },
     { kind: 'row', label: 'ui_app_last_seen', value: { key: 'ui_app_ago', vars: { time: '1 min' } } },
-    { kind: 'row', label: 'ui_app_missed', value: { raw: '0' } },
     { kind: 'row', label: 'ui_app_node_balance', value: APP_BALANCE },
     appButton('action_move'),
   ],

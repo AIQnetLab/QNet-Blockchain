@@ -51,13 +51,16 @@ jest.mock('../src/components/WalletManager', () => {
     getTrustedNodes() { return []; }
     trustedNodeUrl() { return 'https://node.invalid'; }
     async getQNCBalanceWithProof() { return { ok: true, balance: 1, balanceNano: '1000000000', verified: true }; }
-    // The send check's read (a committee-certified balance): the same figure.
-    async certifiedQncForSend() { return { ok: true, verified: true, balanceNano: '1000000000', nonce: '4' }; }
+    // The send check's read (the live figure less this wallet's own unsettled spends): the same figure.
+    async qncForSend() { return { ok: true, balanceNano: '1000000000', nonce: '4', pending: [] }; }
     async getTokenHoldings() { return []; }
     async pendingTransactions() { return mockState.pending; }
-    async recentSettledTransactions() { return mockState.recent; }
+    // This wallet's kept transactions as Assets lists them (WalletManager.keptTransactions).
+    async keptTransactions() { return mockState.kept; }
+    // The wallet's figure at a genesis node's live tip: what the test says (none by default).
+    async liveQncFigure() { return mockState.live; }
     async previewSend() { return mockState.preview; }
-    async sendTransaction(...args) { mockState.sends.push(args); return { success: true, txHash: 'f'.repeat(64) }; }
+    async sendTransaction(...args) { mockState.sends.push(args); return { success: true, txHash: 'f'.repeat(64), ...mockState.sent }; }
     generateQNetAddressFromSolana() { return mockQNET; }
     generateLightNodePseudonym() { return 'light_x'; }
     generateSuperNodePseudonym() { return 'super_x'; }
@@ -142,8 +145,8 @@ async function mount() {
 beforeEach(async () => {
   await AsyncStorage.clear();
   Object.assign(mockState, {
-    vault: 'none', instances: [], closed: 0, generated: 0, pending: [], recent: [], preview: null, sends: [],
-    bio: false, bioCalls: [], bioAnswer: { ok: false, fallback: true }, lock: false,
+    vault: 'none', instances: [], closed: 0, generated: 0, pending: [], preview: null, sends: [],
+    bio: false, bioCalls: [], bioAnswer: { ok: false, fallback: true }, lock: false, kept: [], live: null, sent: null,
   });
   mockClock.mono = 1_000_000;
   mockReaders.list = [];
@@ -493,13 +496,12 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
 
   it('names it, and signs nothing until the user chooses; Replace signs at its nonce', async () => {
     mockState.pending = [{ nonce: 5 }];
-    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false, recent: [] };
+    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false };
     const tree = await sendForm();
     await tap(tree, 'send_button');
     const shown = texts(tree);
     expect(shown).toContain(t('pending_dialog_title'));
     expect(shown).toContain(`0.5 QNC to ${TO}`);
-    expect(shown).toContain(t('send_repeat_body', { minutes: 2 })); // the same payment, two minutes ago
     expect(shown).toContain(t('pending_append_unavailable'));
     expect(mockState.sends).toEqual([]);
     expect(() => pressable(tree, t('pending_append'))).toThrow(); // not offered over a transaction no node holds
@@ -514,13 +516,26 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
 
   it('a recipient pasted with spaces or a line break around it is the bare address in every check', async () => {
     mockState.pending = [{ nonce: 5 }];
-    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false, recent: [] };
+    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false };
     const tree = await sendForm(`  ${TO}\n`);
     expect(input(tree, 'send_placeholder_eon').props.value).toBe(TO);
     await tap(tree, 'send_button');
-    // The same payment two minutes ago is found: the comparison sees the address, not the pasted text.
-    expect(texts(tree)).toContain(t('send_repeat_body', { minutes: 2 }));
-    expect(mockState.sends).toEqual([]);
+    await tap(tree, 'pending_replace');
+    await flush(4);
+    await review(tree);
+    expect(texts(tree)).toContain(require('../src/utils/addressDisplay').groupAddress(TO));
+    await confirmPassword(tree);
+    expect(mockState.sends).toHaveLength(1);
+    expect(mockState.sends[0][1]).toBe(TO);
+  });
+
+  it('a figure pasted as the app writes it is the figure it says; a comma typed alone is the decimal point', async () => {
+    const tree = await sendForm();
+    const field = () => tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0];
+    await act(async () => { field().props.onChangeText('1,234'); });
+    expect(field().props.value).toBe('1234');
+    await act(async () => { field().props.onChangeText('1234,'); });
+    expect(field().props.value).toBe('1234.');
   });
 
   it('every send asks for the password again; without it nothing is signed (MPLAT-R2-01)', async () => {
@@ -561,9 +576,50 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
     expect(shown).not.toContain('✓ ');
   });
 
+  // Before, the expected balance stood for up to two minutes whenever money came in with the send: a figure above it was
+  // taken for one of before the send, though its nonce showed the send applied.
+  it('after a send, a figure whose nonce shows the send applied is shown at once, money received with it too', async () => {
+    mockState.sent = { nonce: 5 };
+    const tree = await sendForm();
+    await tap(tree, 'send_button');
+    await flush(4);
+    await review(tree);
+    await confirmPassword(tree);
+    expect(mockState.sends).toHaveLength(1);
+    await press(tree, 'common_done');
+    const refresh = async () => { await emit('background'); await emit('active'); await flush(8); };
+    const lines = () => texts(tree).split('\n');
+    // A node that has not applied the send (nonce 4) with 0.7 QNC received: the expected balance stands.
+    mockState.live = { balance: 1.2, balanceNano: '1200000000', nonce: '4', blockHeight: 100, figureClaimedEpoch: 0 };
+    await refresh();
+    expect(lines()).not.toContain('1.2');
+    // The send applied (nonce 5) in a state that holds the 0.7 QNC too: that figure, at once.
+    mockState.live = { balance: 1.2, balanceNano: '1200000000', nonce: '5', blockHeight: 101, figureClaimedEpoch: 0 };
+    await refresh();
+    expect(lines()).toContain('1.2');
+  });
+
+  // Before, Assets called the two-argument line of the browser's sheet with the entry alone, and the tab fell into the
+  // error screen whenever a kept transaction was listed (right after any send, until it settled).
+  it('Assets lists a kept transaction with its line, its status and Stop sending', async () => {
+    mockState.vault = 'ok';
+    mockState.kept = [{
+      ...pendingView, held: false, sending: true, sendsUntil: now + 25 * 60_000, canStop: true, mayLandUntil: null, stopLandsUntil: null,
+    }];
+    const tree = await mount();
+    await type(tree, 'enter_password', 'Otter-Canyon-58');
+    await press(tree, 'unlock_wallet');
+    await flush(6);
+    const shown = texts(tree);
+    expect(shown).toContain(t('kept_title', { count: 1 }));
+    expect(shown).toContain(`${t('pending_line_transfer', { amount: '0.5 QNC', to: TO })} · ${t('time_min', { n: 2 })}`);
+    expect(shown).toContain(t('kept_sending', { minutes: 25 }));
+    expect(shown).toContain(t('kept_stop'));
+  });
+
   it('Cancel sends nothing', async () => {
     mockState.pending = [{ nonce: 5 }];
-    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false, recent: [] };
+    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false };
     const tree = await sendForm();
     await tap(tree, 'send_button');
     await press(tree, 'cancel');
@@ -571,13 +627,9 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
     expect(mockState.sends).toEqual([]);
   });
 
-  it('with nothing unconfirmed, the same payment settled minutes ago is named before anything is signed', async () => {
-    mockState.recent = [{ nonce: 4, kind: 'transfer', to: TO, amountNano: 500_000_000, method: null, settledAt: now - 5 * 60_000 }];
+  it('with nothing unconfirmed, a send goes straight to its review: no question about an earlier payment', async () => {
     const tree = await sendForm();
     await tap(tree, 'send_button');
-    expect(texts(tree)).toContain(t('send_repeat_body', { minutes: 5 }));
-    expect(mockState.sends).toEqual([]);
-    await tap(tree, 'send_repeat_send_anyway');
     await flush(4);
     await review(tree);
     await confirmPassword(tree);

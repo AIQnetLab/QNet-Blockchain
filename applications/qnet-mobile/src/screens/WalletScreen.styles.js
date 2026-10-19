@@ -1,5 +1,16 @@
 import { Platform, StyleSheet } from 'react-native';
 
+// One centred column of at most 640 on every screen, so a tablet or a wide window shows the phone layout, not lines
+// stretched across the screen. Flex only: nothing reads the window width. The screen's own background shows beside it.
+const COLUMN = {
+  width: '100%',
+  maxWidth: 640,
+  alignSelf: 'center',
+  justifyContent: 'center',
+  alignItems: 'center',
+  padding: 20,
+};
+
 const styles = StyleSheet.create({
   // The layout direction of a whole screen (Arabic is right to left), and runs that stay left to right in any
   // language: addresses, hashes, amounts.
@@ -28,16 +39,14 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#11131f', // Same as splash screen background for smooth transition
   },
-  // One centred column of at most 640 on every screen, so a tablet or a wide window shows the phone layout, not lines
-  // stretched across the screen. Flex only: nothing reads the window width. The screen's own background shows beside it.
   centerContent: {
     flex: 1,
-    width: '100%',
-    maxWidth: 640,
-    alignSelf: 'center',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
+    ...COLUMN,
+  },
+  // The lock screen's column, in a scroll view: it scrolls when a very large system font makes it taller than the screen.
+  lockColumn: {
+    flexGrow: 1,
+    ...COLUMN,
   },
   formContent: {
     flexGrow: 1,
@@ -145,6 +154,10 @@ const styles = StyleSheet.create({
     marginTop: -15,
     marginBottom: 15,
     alignSelf: 'flex-start',
+  },
+  // An error under a feedback line, which already ends 15 below its field: 6 between the two lines, not 0.
+  errorAfterLine: {
+    marginTop: -9,
   },
   balanceCard: {
     backgroundColor: '#16213e',
@@ -1806,6 +1819,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     textAlign: 'center',
     textDecorationLine: 'underline',
+  },
+  // What the lock screen says when an unlock did not open the wallet: the column's whole width, centred in every
+  // direction, clear of the title above and the field or button around it, wrapping at any system text size.
+  lockMessage: {
+    alignSelf: 'stretch',
+    color: '#ff4444',
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+    marginTop: 8,
+    marginBottom: 16,
+    paddingHorizontal: 8,
   },
   lockoutBanner: {
     backgroundColor: '#2a1a1a',

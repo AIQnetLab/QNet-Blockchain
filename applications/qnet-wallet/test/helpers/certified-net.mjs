@@ -2,6 +2,9 @@
 // checkpoint, whose state root is the root of a reference state tree built here the way the node builds its tree
 // (buckets of the leading 40 key bits, 40 tree levels above them), and the pinned nodes serve certified account and token
 // proofs (proof_format 2) against it, or, for a node marked old, the older live-root body that ignores the `mb` query.
+// Asked without `mb`, every node serves the live-root body of its live tip: the newest certified state, or the state set
+// as the tip (setTip, or setTip with a node for that node alone: one a block or more behind), at a height past that
+// state's macroblock.
 // The light client the bundle compiles verifies every step itself: the macroblocks two below the first one are imported
 // as anchors an earlier session kept (install), so its walk starts there.
 import { existsSync } from 'node:fs';
@@ -245,6 +248,12 @@ export function certifiedNet({ accounts = {}, tokens = {}, chain = null, logsRoo
     chain,
     // nodes that serve the older live-root bodies and no /api/v1/state/certified
     old: new Set(),
+    // false: a proof asked without `mb` is refused (400), as before the live route; else the live tip's body
+    live: true,
+    // the live tip: {state, height} (setTip), else the newest certified state at its macroblock's height + 45
+    tip: null,
+    // node -> the live tip that node serves instead (setTip with a node)
+    nodeTips: new Map(),
     // nodes that answer nothing (a network failure)
     down: new Set(),
     // node -> what /api/v1/state/certified reports as newest_certified_index (default: the newest state)
@@ -266,15 +275,32 @@ export function certifiedNet({ accounts = {}, tokens = {}, chain = null, logsRoo
       return state;
     },
     /**
+     * The state the nodes' live tip holds (accounts and tokens as in certifiedNet; no committee certifies it) at `height`
+     * (default: past the newest certified macroblock); null puts the tip back on the newest certified state. With `node`,
+     * the tip of that node alone (null: it serves the others' again).
+     */
+    setTip(tipAccounts, tipTokens = {}, height = null, node = null) {
+      const tip = tipAccounts === null ? null
+        : { state: buildState(net.newest().index, tipAccounts, tipTokens), height: height ?? net.newest().index * 90 + 60 };
+      if (node === null) net.tip = tip;
+      else if (tip === null) net.nodeTips.delete(node);
+      else net.nodeTips.set(node, tip);
+      return tip;
+    },
+    /** The live tip `node` serves: {state, height}. */
+    tipNow(node = null) {
+      return net.nodeTips.get(node) ?? net.tip ?? { state: net.newest(), height: net.newest().index * 90 + 45 };
+    },
+    /**
      * A fresh light client rooted at the anchors two below the first certified macroblock (on both parity chains). A net
      * is another chain than any installed before it: what the wallet kept of an earlier one (the anchors, now with their
-     * roots, the capsule and the send proofs of the installed environment) is not its.
+     * roots, and the capsule of the installed environment) is not its.
      */
     install() {
       core.clearQcCache();
       core.clearCapsule();
       const env = globalThis.__qnetChainsEnv;
-      if (env) Object.assign(env, { anchors: null, capsule: null, sendProofs: {} });
+      if (env) Object.assign(env, { anchors: null, capsule: null });
       const anchor = { eligible_ids: [MEMBER], beacon: BEACON, registry_root: REGISTRY_ROOT };
       core.importVerifiedAnchors({ [FIRST_INDEX - 2]: anchor, [FIRST_INDEX - 1]: anchor });
       return net;
@@ -324,6 +350,12 @@ export function certifiedNet({ accounts = {}, tokens = {}, chain = null, logsRoo
           return json(legacyTokenAnswer(newest, tokenProof[1], tokenProof[2], height));
         }
         const mb = query.getAll('mb');
+        if (mb.length === 0 && net.live) {
+          const { state: tip, height } = net.tipNow(node);
+          if (accountProof) return json(legacyAccountAnswer(tip, accountProof[1], height));
+          if (!tip.storage.has(tokenProof[1])) return json({ error: 'Token not found' }, 404);
+          return json(legacyTokenAnswer(tip, tokenProof[1], tokenProof[2], height));
+        }
         if (mb.length !== 1) return json({ proof_format: 2, error: 'bad_parameter', parameter: 'mb' }, 400, { 'cache-control': 'no-store' });
         const top = net.frontier.get(node) ?? newest.index;
         const held = net.states.filter((s) => s.index <= top).slice(-net.retained);

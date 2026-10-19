@@ -20,4 +20,8 @@ it('one app version across package.json, package-lock, Android and iOS', () => {
   expect(marketing.length).toBeGreaterThan(0);
   marketing.forEach((v) => expect(v).toBe(version));
   builds.forEach((b) => expect(b).toBe(code));
+
+  // The wallet document names the same build, and the Play listing says what it brings.
+  expect(read('../../docs/applications/mobile-wallet.md')).toContain(`- Version ${version} (${code}) on both platforms.`);
+  expect(fs.existsSync(path.join(ROOT, `../../fastlane/metadata/android/en-US/changelogs/${code}.txt`))).toBe(true);
 });

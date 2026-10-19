@@ -1,12 +1,13 @@
 //! Pushes to a light node's device (U12, U13) and "I'm back" (U11). One payload on every platform, naming
 //! no node; pushes only to an on-chain node with a device bound to it: a round of up to three pushes a
-//! quarter of an hour apart from its drawn slot and one retry round an hour later, each only while the node
+//! quarter of an hour apart from its drawn slot and one retry round an hour later (to an iOS device every other
+//! one, half an hour apart), each only while the node
 //! has not answered this epoch, every push living only until its epoch's commit; a wake capped per node and
 //! held to a tenth of the push budget. Every push and every answer belongs to its own epoch: nothing is moved to the next.
 //! What each node got is kept for the epoch and its miss recorded at the commit, refined by the receipts the
-//! device sends with a later answer; with the node's last answer it is one row per node (`LightPushRow`, the
-//! status's `device.last_miss` and `device.last_answer`). Push policy of the genesis nodes; no block rule
-//! reads any of it.
+//! device sends with a later answer; its misses of the last 64 epochs and its last answer are one row per node
+//! (`LightPushRow`: the status's `device.last_miss`, the newest, and `device.last_answer`; the misses route). Push
+//! policy of the genesis nodes; no block rule reads any of it.
 //!
 //! Wire forms: `docs/protocols/light-node-messages.md` sections 4, 5.8, 5.10 and 7.
 
@@ -69,11 +70,27 @@ pub(crate) const MAX_PUSHES_PER_EPOCH: u8 = 2 * ROUND_PUSHES as u8;
 /// that one is nearer, instead of being repeated a slot or two after it.
 pub(crate) const MIN_PUSH_GAP_SLOTS: u64 = ROUND_SPACING_SLOTS - DUE_GRACE_SLOTS;
 
+/// Slots between two due points of an iOS device: every other one of the spaced rounds (0, 30, 60 and 90 slots after the
+/// drawn slot), four an epoch, evenly half an hour apart: iOS holds back background pushes that come close together and
+/// asks for no more than two or three an hour.
+pub(crate) const IOS_PUSH_SPACING_SLOTS: u64 = 2 * ROUND_SPACING_SLOTS;
+/// The fewest slots between two pushes to an iOS device: a push a catch-up made late meets its next due point when that
+/// one is nearer (`Due::ios_met_from`), so never more than three go out within an hour.
+pub(crate) const IOS_MIN_PUSH_GAP_SLOTS: u64 = 20;
+/// The last slot of an epoch an iOS device is pushed in: the next epoch's first push, from its slot 0 on, comes at least
+/// IOS_MIN_PUSH_GAP_SLOTS later, whatever a catch-up made late.
+pub(crate) const IOS_LAST_PUSH_SLOT: u64 = SLOTS_PER_EPOCH - IOS_MIN_PUSH_GAP_SLOTS;
+// The retry round keeps the even spacing, and a due point's iOS reach stops short of the grace of the one before.
+const _: () = assert!(RETRY_AFTER_SLOTS % IOS_PUSH_SPACING_SLOTS == 0
+    && IOS_MIN_PUSH_GAP_SLOTS + DUE_GRACE_SLOTS <= IOS_PUSH_SPACING_SLOTS && IOS_MIN_PUSH_GAP_SLOTS > MIN_PUSH_GAP_SLOTS);
+
 /// One due point of a node's epoch, as a tick reads it (`PushLedger::may_push`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Due {
     /// A push or challenge that went out in this absolute slot (epoch * 240 + slot) or after it meets the due point.
     pub(crate) met_from: u64,
+    /// `met_from` for an iOS device (`PushReach::ios`), None when the due point is not one of its schedule.
+    pub(crate) ios_met_from: Option<u64>,
     /// A repeat of a push of its round: due only to a node this genesis offered a push in the epoch, unless the round
     /// began before this genesis held the node's shard (`round`).
     pub(crate) repeat: bool,
@@ -84,20 +101,32 @@ pub(crate) struct Due {
 impl Due {
     /// Due in `slot` alone: before the spaced rounds each slot of a round was a due point of its own.
     pub(crate) fn once(slot: u64) -> Due {
-        Due { met_from: slot, repeat: false, round: slot }
+        Due { met_from: slot, ios_met_from: Some(slot), repeat: false, round: slot }
     }
 
     /// A due point of the spaced rounds in `slot`, `into_round` slots after its round's first push (0 for that push):
-    /// met by any push from MIN_PUSH_GAP_SLOTS - 1 slots before it, which reaches no earlier due point's grace.
+    /// met by any push from MIN_PUSH_GAP_SLOTS - 1 slots before it, which reaches no earlier due point's grace. Every
+    /// IOS_PUSH_SPACING_SLOTS one is an iOS device's too, met from IOS_MIN_PUSH_GAP_SLOTS - 1 slots before it.
     pub(crate) fn spaced(slot: u64, into_round: u64) -> Due {
-        Due { met_from: slot.saturating_sub(MIN_PUSH_GAP_SLOTS - 1), repeat: into_round > 0, round: slot.saturating_sub(into_round) }
+        Due {
+            met_from: slot.saturating_sub(MIN_PUSH_GAP_SLOTS - 1),
+            ios_met_from: (into_round % IOS_PUSH_SPACING_SLOTS == 0).then(|| slot.saturating_sub(IOS_MIN_PUSH_GAP_SLOTS - 1)),
+            repeat: into_round > 0,
+            round: slot.saturating_sub(into_round),
+        }
+    }
+
+    /// From which slot a push to the device meets this due point, None when it is not one of the device's schedule.
+    fn met_from_on(&self, ios: bool) -> Option<u64> {
+        if ios { self.ios_met_from } else { Some(self.met_from) }
     }
 }
 
 /// The due points of a spaced epoch as offsets from the drawn slot, earliest first, each with how far into its round it
 /// falls (0 for a round's first push, else a repeat): the round (0, 15, 30) and the retry round (60, 75, 90). The round's
 /// first push and the retry round's are due to every node not counted, so the retry round survives a restart of this
-/// genesis; the repeats to a node offered a push here, or one whose round began before this genesis held its shard.
+/// genesis; the repeats to a node offered a push here, or one whose round began before this genesis held its shard. An
+/// iOS device's are 0, 30, 60 and 90 (`IOS_PUSH_SPACING_SLOTS`), read from the same buckets, up to IOS_LAST_PUSH_SLOT.
 pub(crate) fn spaced_due_offsets() -> impl Iterator<Item = (u64, u64)> {
     [0, RETRY_AFTER_SLOTS].into_iter()
         .flat_map(|start| (0..ROUND_PUSHES).map(move |i| (start + i * ROUND_SPACING_SLOTS, i * ROUND_SPACING_SLOTS)))
@@ -410,23 +439,23 @@ pub(crate) fn push_channel(storage: &crate::storage::Storage, node_id: &str) -> 
 ///   the registration applied carries its own key and links nothing. Writes follow the same rule
 ///   (`Storage::save_fcm_token_by`).
 pub(crate) fn device_reach(storage: &crate::storage::Storage, node_id: &str) -> Option<Option<PushChannel>> {
-    reach_with(storage, node_id, storage.light_binding_reach(node_id).as_ref())
+    reach_with(storage, node_id, storage.light_binding_reach(node_id).as_ref(), storage.get_fcm_entry(node_id).as_ref())
 }
 
-/// `device_reach` with the node's binding row already read (`Storage::light_binding_reach`).
-fn reach_with(storage: &crate::storage::Storage, node_id: &str, binding: Option<&crate::light_binding::BindingReach>)
-    -> Option<Option<PushChannel>>
+/// `device_reach` with the node's binding row and push record already read (`Storage::light_binding_reach`,
+/// `Storage::get_fcm_entry`).
+fn reach_with(storage: &crate::storage::Storage, node_id: &str, binding: Option<&crate::light_binding::BindingReach>,
+              record: Option<&crate::storage::FcmEntry>) -> Option<Option<PushChannel>>
 {
-    let record = storage.get_fcm_entry(node_id);
     if let Some(row) = binding {
         if !row.never_v2() && !row.device_bound() { return None; }
         if row.device_bound() && storage.light_binding_reach_vouched(node_id, row) {
-            return Some(record.filter(|e| row.owns_record(e.seq, &e.writer)).and_then(|e| record_target(&e)));
+            return Some(record.filter(|e| row.owns_record(e.seq, &e.writer)).and_then(record_target));
         }
     }
     let e = record.filter(|e| e.seq == 0)?;
     if !storage.unbound_record_writer_ok(node_id, &e.writer) { return None; }
-    record_target(&e).map(Some)
+    record_target(e).map(Some)
 }
 
 /// A record's push target. A UnifiedPush endpoint counts only while it passes the check every write path
@@ -535,6 +564,12 @@ pub(crate) struct PushEntry {
     pub(crate) dormant: bool,
     /// The absolute slot the dormant rule last held it in: like a push, it closes the due points it meets.
     pub(crate) dormant_slot: Option<u64>,
+    /// The selection read an iOS device for it this epoch (`PushLedger::may_push_on`): its next due points are judged on
+    /// that schedule in RAM, before any storage read.
+    pub(crate) ios: bool,
+    /// The absolute slot of the last wake the provider took (`PushLedger::woke`): on an iOS device's schedule it closes
+    /// the due points it meets, as a push does.
+    pub(crate) woke_slot: Option<u64>,
 }
 
 impl PushEntry {
@@ -626,19 +661,41 @@ impl PushLedger {
     /// push in the epoch (sent or shed, not answered here, not pruned as counted elsewhere) or whose round began before
     /// `held_from()`, the slot since which this genesis holds the records of the node's shard (its first tick after a
     /// restart, or the tick it took the shard over at): those nodes' first pushes went out from a record it does not
-    /// have. A node only woken, refused or held dormant here gets no repeat. A RAM read, made before any storage read;
+    /// have. A node only woken, refused or held dormant here gets no repeat. Judged on the schedule of the device's
+    /// platform the entry keeps (`PushEntry::ios`), else on every node's. A RAM read, made before any storage read;
     /// `held_from` is asked only for a repeat of such a node.
     pub(crate) fn may_push(&self, node_id: &str, abs_slot: u64, dues: &[Due], held_from: impl Fn() -> u64) -> bool {
-        let (closed, offered) = match self.map().get(node_id) {
+        self.judge(node_id, abs_slot, dues, held_from, None)
+    }
+
+    /// `may_push` asked again once the selection read the node's device (`PushReach::ios`), on that device's schedule: an
+    /// iOS device only for its own due points (`Due::ios_met_from`), none after IOS_LAST_PUSH_SLOT and none a wake meets
+    /// (`PushEntry::woke_slot`), also when no entry told `may_push` its platform (a restart, a takeover, a device changed in
+    /// the epoch). The platform is kept in the entry when it differs, so the node's next due points are judged on its
+    /// schedule in RAM.
+    pub(crate) fn may_push_on(&self, node_id: &str, abs_slot: u64, dues: &[Due], held_from: impl Fn() -> u64, ios: bool) -> bool {
+        let epoch = abs_slot / SLOTS_PER_EPOCH;
+        if ios != self.map().get(node_id).map_or(false, |e| e.epoch == epoch && e.ios) {
+            if let Some(mut e) = self.entry(node_id, epoch) { e.ios = ios; }
+        }
+        self.judge(node_id, abs_slot, dues, held_from, Some(ios))
+    }
+
+    /// `may_push` on an iOS device's schedule or not (`ios`), or on the one the entry keeps (None).
+    fn judge(&self, node_id: &str, abs_slot: u64, dues: &[Due], held_from: impl Fn() -> u64, ios: Option<bool>) -> bool {
+        let (closed, offered, kept, woke) = match self.map().get(node_id) {
             Some(e) if e.epoch == abs_slot / SLOTS_PER_EPOCH => {
                 if e.last_slot >= abs_slot || e.sends >= MAX_PUSHES_PER_EPOCH { return false; }
-                (e.sent_slot.max(e.dormant_slot), e.sends > 0 || e.unsent > 0)
+                (e.sent_slot.max(e.dormant_slot), e.sends > 0 || e.unsent > 0, e.ios, e.woke_slot)
             }
-            _ => (None, false),
+            _ => (None, false, false, None),
         };
+        let ios = ios.unwrap_or(kept);
+        if ios && abs_slot % SLOTS_PER_EPOCH > IOS_LAST_PUSH_SLOT { return false; }
+        let closed = if ios { closed.max(woke) } else { closed };
         let mut held = None;
         dues.iter().any(|d| {
-            closed.map_or(true, |s| s < d.met_from)
+            d.met_from_on(ios).map_or(false, |m| closed.map_or(true, |s| s < m))
                 && (!d.repeat || offered || d.round < *held.get_or_insert_with(&held_from))
         })
     }
@@ -664,14 +721,16 @@ impl PushLedger {
     }
 
     /// A wake went out to the node in `abs_slot`: the provider took the push, or (`polled`) a challenge was left
-    /// for its poll. Not one of the epoch's pushes: the round and the retry round are left as they were.
+    /// for its poll. Not one of the epoch's pushes: the round and the retry round are left as they were, but for an iOS
+    /// device's due points it meets (`woke_slot`).
     pub(crate) fn woke(&self, node_id: &str, abs_slot: u64, polled: bool, now: u64) {
         let Some(mut e) = self.entry(node_id, abs_slot / SLOTS_PER_EPOCH) else { return; };
         if polled {
             e.polled_slot.get_or_insert(abs_slot);
-        } else if e.woken_at == 0 {
-            e.woken_at = now;
+            return;
         }
+        e.woke_slot = Some(abs_slot);
+        if e.woken_at == 0 { e.woken_at = now; }
     }
 
     /// The device fetched a challenge in `epoch`: only for a node a challenge was left for here this epoch, so a
@@ -906,21 +965,34 @@ pub(crate) fn light_push_target(storage: &crate::storage::Storage, node_id: &str
         && push_reach_at(storage, node_id, crate::light_device::current_epoch(), crate::light_device::now_secs()).is_some()
 }
 
-/// The pinger's decision for one node the ledger let through (`PushLedger::may_push`, read in RAM before this) and how
-/// its device is reached: None when it is not pushed, else the channel to push on (None: a stamped challenge for its
-/// poll). The registration, then one slim read of the binding row (`Storage::light_binding_reach`), which the push
-/// record's check and the device layer's share instead of each reading the row again (M-11). `epoch` and `now` are the
-/// device layer's (`device_pushable_at`).
-pub(crate) fn push_reach_at(storage: &crate::storage::Storage, node_id: &str, epoch: u64, now: u64)
-    -> Option<Option<PushChannel>>
-{
-    if !storage.is_node_registration_onchain(node_id) { return None; }
-    let binding = storage.light_binding_reach(node_id);
-    let reach = reach_with(storage, node_id, binding.as_ref())?;
-    device_pushable_with(storage, node_id, binding.as_ref(), true, epoch, now).then_some(reach)
+/// How the pinger reaches a node's device (`push_reach_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushReach {
+    /// The channel to push on, None for a stamped challenge (`device_reach`).
+    pub(crate) channel: Option<PushChannel>,
+    /// The device is an iOS one, by the platform the status shows (`device_platform_of`): pushed only at its own due
+    /// points (`PushLedger::may_push_on`). Any other or none keeps every node's schedule.
+    pub(crate) ios: bool,
 }
 
-// ── The node's last miss and last answer here (`device.last_miss`, `device.last_answer` of the status) ──
+/// The pinger's decision for one node the ledger let through (`PushLedger::may_push`, read in RAM before this) and how
+/// its device is reached: None when it is not pushed. The registration, then one slim read of the binding row
+/// (`Storage::light_binding_reach`), one of the push record and one of the device record, which the push record's
+/// check, the device layer's and the platform's share instead of each reading them again (M-11). `epoch` and `now` are
+/// the device layer's (`device_pushable_at`).
+pub(crate) fn push_reach_at(storage: &crate::storage::Storage, node_id: &str, epoch: u64, now: u64) -> Option<PushReach> {
+    if !storage.is_node_registration_onchain(node_id) { return None; }
+    let binding = storage.light_binding_reach(node_id);
+    let entry = storage.get_fcm_entry(node_id);
+    let channel = reach_with(storage, node_id, binding.as_ref(), entry.as_ref())?;
+    let device = storage.device_record(node_id);
+    if !device_pushable_with(device.as_ref(), binding.as_ref(), true, epoch, now) { return None; }
+    let bound = binding.as_ref().filter(|b| b.v2 && b.device_bound()).map(|b| b.seq);
+    let ios = device_platform_of(bound, entry.as_ref(), device.as_ref()).0 == crate::light_device::Platform::Ios.as_str();
+    Some(PushReach { channel, ios })
+}
+
+// ── The node's misses and last answer here (`device.last_miss`, `device.last_answer`, the misses route) ──
 
 /// A registration's first epochs, pushed whatever came before (the dormant rule never reaches it): 43,200 s. From
 /// then on a node stops being woken only after two proven device misses in a row (`proven_dormant`); an answer of
@@ -1057,13 +1129,9 @@ pub(crate) struct LightMiss {
 }
 
 impl LightMiss {
-    /// What the row keeps of `prior` and `new`: the later epoch; at one epoch the reason that tells more (of two
-    /// equal ones the first), with the wake time and, but for `not_delivered`, the delivery either of them knew.
-    pub(crate) fn merge(prior: Option<LightMiss>, new: LightMiss) -> LightMiss {
-        let Some(prior) = prior else { return new; };
-        if new.epoch != prior.epoch {
-            return if new.epoch > prior.epoch { new } else { prior };
-        }
+    /// Of two records of one epoch, the one whose reason tells more (of two equal ones the first), with the wake time
+    /// and, but for `not_delivered`, the delivery either of them knew.
+    pub(crate) fn merge(prior: LightMiss, new: LightMiss) -> LightMiss {
         let (mut keep, other) = if new.reason.rank() > prior.reason.rank() { (new, prior) } else { (prior, new) };
         keep.woken_at = keep.woken_at.or(other.woken_at);
         if keep.reason != MissReason::NotDelivered {
@@ -1074,6 +1142,23 @@ impl LightMiss {
             keep.app_outcome = keep.app_outcome.or(other.app_outcome);
         }
         keep
+    }
+
+    /// Merge `m` into `misses` (newest first, one record an epoch): at its epoch by `merge`, else as a record of its
+    /// own; only the MISS_HISTORY_EPOCHS epochs up to the newest stay. True when it changed them.
+    pub(crate) fn merge_into(misses: &mut Vec<LightMiss>, m: LightMiss) -> bool {
+        let at = misses.iter().position(|x| x.epoch <= m.epoch).unwrap_or(misses.len());
+        if misses.get(at).map_or(false, |x| x.epoch == m.epoch) {
+            let merged = LightMiss::merge(misses[at].clone(), m);
+            if merged == misses[at] { return false; }
+            misses[at] = merged;
+            return true;
+        }
+        let newest = misses.first().map_or(m.epoch, |x| x.epoch.max(m.epoch));
+        if !in_miss_window(m.epoch, newest) { return false; }
+        misses.insert(at, m);
+        misses.retain(|x| in_miss_window(x.epoch, newest));
+        true
     }
 
     /// Whether the push reached the phone: true when a receipt or the answer dated its delivery or told what the app
@@ -1119,19 +1204,29 @@ impl LastAnswer {
     }
 }
 
-/// One node's row here (`Storage::light_push_row`): its last miss and its last answer, each overwritten by the
-/// next. Node-local, never gossiped; read by the status alone.
+/// One node's row here (`Storage::light_push_row`): its misses, newest first, one an epoch, of the MISS_HISTORY_EPOCHS
+/// epochs up to the newest (`LightMiss::merge_into`) and to a counted answer's (`record_answer`), stored as runs of
+/// epochs with the same record (`encode`), and its last answer, overwritten by the next. Node-local, never gossiped;
+/// read by the status and the misses route alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LightPushRow {
-    pub(crate) miss: Option<LightMiss>,
+    pub(crate) misses: Vec<LightMiss>,
     pub(crate) answer: Option<LastAnswer>,
 }
 
-const ROW_VERSION: u8 = 2;
+const ROW_VERSION: u8 = 3;
+/// Epochs of misses a row keeps: the newest and the ones before it, the span the status's `counted` covers.
+pub(crate) const MISS_HISTORY_EPOCHS: u64 = crate::storage::LIGHT_UPTIME_WINDOW;
+const _: () = assert!(MISS_HISTORY_EPOCHS <= u8::MAX as u64, "the row counts its runs and a run its epochs in one byte");
 /// The refusal code a row keeps, at most this long.
 const REFUSED_MAX: usize = 32;
 /// A word for "none".
 const NO_TIME: u64 = u64::MAX;
+
+/// A miss of `epoch` stays in a row whose newest miss is of `newest`.
+fn in_miss_window(epoch: u64, newest: u64) -> bool {
+    epoch.saturating_add(MISS_HISTORY_EPOCHS) > newest
+}
 
 fn word(v: &[u8], at: &mut usize) -> Option<u64> {
     let w = v.get(*at..*at + 8)?;
@@ -1143,35 +1238,115 @@ fn opt_word(v: &[u8], at: &mut usize) -> Option<Option<u64>> {
     word(v, at).map(|w| (w != NO_TIME).then_some(w))
 }
 
+fn put_word(v: &mut Vec<u8>, w: Option<u64>) {
+    v.extend_from_slice(&w.unwrap_or(NO_TIME).to_be_bytes());
+}
+
+/// The miss flags byte: `by_push`, and (version 3) a run, followed by the epochs it spans and its oldest record's
+/// `recorded_at` (`miss_runs`).
+const MISS_BY_PUSH: u8 = 1;
+const MISS_RUN: u8 = 2;
+
+/// `older` continues the run `newer` ends: the epoch before, recorded no later (as `decode_miss` requires of a run, so
+/// a clock stepped back splits it), and the same record but for the times, each present in both or in neither.
+fn same_run(newer: &LightMiss, older: &LightMiss) -> bool {
+    let times = |m: &LightMiss| [m.woken_at, m.answered_at, m.delivery_delay_secs, m.delivered_at].map(|t| t.is_some());
+    older.epoch + 1 == newer.epoch && older.recorded_at <= newer.recorded_at && older.reason == newer.reason
+        && older.refused == newer.refused && older.app_outcome == newer.app_outcome && older.by_push == newer.by_push
+        && times(older) == times(newer)
+}
+
+/// `misses` (newest first) as runs of consecutive epochs with the same record (`same_run`): each run's newest record,
+/// the epochs it spans and its oldest record's `recorded_at`. A node missed the same way every epoch keeps one record.
+fn miss_runs(misses: &[LightMiss]) -> Vec<(&LightMiss, u8, u64)> {
+    let mut runs: Vec<(&LightMiss, u8, u64)> = Vec::new();
+    for (i, m) in misses.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if same_run(&misses[i - 1], m) => { run.1 += 1; run.2 = m.recorded_at; }
+            _ => runs.push((m, 1, m.recorded_at)),
+        }
+    }
+    runs
+}
+
+/// One record of a row; `run` the epochs a run spans and its oldest record's `recorded_at`, None for one epoch.
+fn encode_miss(v: &mut Vec<u8>, m: &LightMiss, run: Option<(u8, u64)>) {
+    put_word(v, Some(m.epoch));
+    v.push(m.reason as u8);
+    put_word(v, m.woken_at);
+    put_word(v, m.answered_at);
+    put_word(v, m.delivery_delay_secs);
+    put_word(v, Some(m.recorded_at));
+    let refused = m.refused.as_deref().unwrap_or("").as_bytes();
+    let refused = &refused[..refused.len().min(REFUSED_MAX)];
+    v.push(refused.len() as u8);
+    v.extend_from_slice(refused);
+    put_word(v, m.delivered_at);
+    v.push(m.app_outcome.map_or(0, |o| o as u8));
+    v.push(if m.by_push { MISS_BY_PUSH } else { 0 } | if run.is_some() { MISS_RUN } else { 0 });
+    if let Some((span, oldest_recorded_at)) = run {
+        v.push(span);
+        put_word(v, Some(oldest_recorded_at));
+    }
+}
+
+/// One record of a row: the record, the epochs it spans (1 but for a run) and its oldest record's `recorded_at`.
+fn decode_miss(v: &[u8], at: &mut usize, version: u8) -> Option<(LightMiss, u64, u64)> {
+    let epoch = word(v, at)?;
+    let reason = MissReason::from_code(*v.get(*at)?)?;
+    *at += 1;
+    let (woken_at, answered_at, delay) = (opt_word(v, at)?, opt_word(v, at)?, opt_word(v, at)?);
+    let recorded_at = word(v, at)?;
+    let len = *v.get(*at)? as usize;
+    let refused = std::str::from_utf8(v.get(*at + 1..*at + 1 + len)?).ok()?;
+    *at += 1 + len;
+    let (delivered_at, app_outcome, by_push, run) = if version >= 2 {
+        let delivered_at = opt_word(v, at)?;
+        let outcome = match *v.get(*at)? { 0 => None, c => Some(AppOutcome::from_code(c)?) };
+        let flags = *v.get(*at + 1)?;
+        let known = if version >= 3 { MISS_BY_PUSH | MISS_RUN } else { MISS_BY_PUSH };
+        if flags & !known != 0 { return None; }
+        *at += 2;
+        let run = if flags & MISS_RUN != 0 {
+            let span = *v.get(*at)? as u64;
+            *at += 1;
+            Some((span, word(v, at)?))
+        } else {
+            None
+        };
+        (delivered_at, outcome, flags & MISS_BY_PUSH != 0, run)
+    } else {
+        (None, None, false, None)
+    };
+    if run.map_or(false, |(span, oldest)| span < 2 || oldest > recorded_at) { return None; }
+    let (span, oldest_recorded_at) = run.unwrap_or((1, recorded_at));
+    Some((LightMiss { epoch, reason, woken_at, answered_at, delivery_delay_secs: delay,
+                      refused: (!refused.is_empty()).then(|| refused.to_string()), recorded_at,
+                      delivered_at, app_outcome, by_push }, span, oldest_recorded_at))
+}
+
 impl LightPushRow {
-    /// Version 2: the version byte, a byte of flags (1 a miss, 2 an answer), then 8-byte big-endian words, u64::MAX
-    /// for none. The miss: epoch, a reason byte, woken_at, answered_at, the delay, recorded_at, the refusal code (a
-    /// length byte and its bytes), delivered_at, an outcome byte (0 none) and a byte of miss flags (1 `by_push`).
-    /// The answer: at, the delay and the handling. Version 1, read too, ends the miss at the refusal code.
+    /// Version 3: the version byte, a byte of flags (1 misses, 2 an answer), then 8-byte big-endian words, u64::MAX
+    /// for none. The misses: a count byte, then each run of epochs with the same record (`miss_runs`), newest first, as
+    /// its newest record: epoch, a reason byte, woken_at, answered_at, the delay, recorded_at, the refusal code (a length
+    /// byte and its bytes), delivered_at, an outcome byte (0 none) and a byte of miss flags (1 `by_push`, 2 a run, then
+    /// the epochs it spans in a byte and its oldest record's recorded_at). Read back, a run's older epochs carry its
+    /// newest record's times and its oldest record's recorded_at, so `since` keeps none that may be another binding's.
+    /// The answer: at, the delay and the handling. Version 2, read too, holds one miss and no count byte; version 1 also
+    /// ends that miss at the refusal code.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(112);
+        let runs = miss_runs(&self.misses);
+        let mut v = Vec::with_capacity(32 + 72 * runs.len());
         v.push(ROW_VERSION);
-        v.push(self.miss.is_some() as u8 | (self.answer.is_some() as u8) << 1);
-        let put = |v: &mut Vec<u8>, w: Option<u64>| v.extend_from_slice(&w.unwrap_or(NO_TIME).to_be_bytes());
-        if let Some(m) = &self.miss {
-            put(&mut v, Some(m.epoch));
-            v.push(m.reason as u8);
-            put(&mut v, m.woken_at);
-            put(&mut v, m.answered_at);
-            put(&mut v, m.delivery_delay_secs);
-            put(&mut v, Some(m.recorded_at));
-            let refused = m.refused.as_deref().unwrap_or("").as_bytes();
-            let refused = &refused[..refused.len().min(REFUSED_MAX)];
-            v.push(refused.len() as u8);
-            v.extend_from_slice(refused);
-            put(&mut v, m.delivered_at);
-            v.push(m.app_outcome.map_or(0, |o| o as u8));
-            v.push(m.by_push as u8);
+        v.push(!self.misses.is_empty() as u8 | (self.answer.is_some() as u8) << 1);
+        if !runs.is_empty() {
+            v.push(runs.len() as u8);
+            for (m, span, oldest_recorded_at) in runs { encode_miss(&mut v, m, (span > 1).then_some((span, oldest_recorded_at))); }
         }
         if let Some(a) = &self.answer {
-            put(&mut v, Some(a.at));
-            put(&mut v, a.delivery_delay_secs);
-            put(&mut v, a.handling_secs);
+            put_word(&mut v, Some(a.at));
+            put_word(&mut v, a.delivery_delay_secs);
+            put_word(&mut v, a.handling_secs);
         }
         v
     }
@@ -1179,44 +1354,40 @@ impl LightPushRow {
     pub(crate) fn decode(v: &[u8]) -> Option<Self> {
         if v.len() < 2 || !(1..=ROW_VERSION).contains(&v[0]) || v[1] > 3 { return None; }
         let mut at = 2usize;
-        let miss = if v[1] & 1 != 0 {
-            let epoch = word(v, &mut at)?;
-            let reason = MissReason::from_code(*v.get(at)?)?;
-            at += 1;
-            let (woken_at, answered_at, delay) = (opt_word(v, &mut at)?, opt_word(v, &mut at)?, opt_word(v, &mut at)?);
-            let recorded_at = word(v, &mut at)?;
-            let len = *v.get(at)? as usize;
-            let refused = std::str::from_utf8(v.get(at + 1..at + 1 + len)?).ok()?;
-            at += 1 + len;
-            let (delivered_at, app_outcome, by_push) = if v[0] >= 2 {
-                let delivered_at = opt_word(v, &mut at)?;
-                let outcome = match *v.get(at)? { 0 => None, c => Some(AppOutcome::from_code(c)?) };
-                let flags = *v.get(at + 1)?;
-                if flags > 1 { return None; }
-                at += 2;
-                (delivered_at, outcome, flags == 1)
-            } else {
-                (None, None, false)
+        let mut misses = Vec::new();
+        if v[1] & 1 != 0 {
+            let count = if v[0] < 3 { 1 } else {
+                let c = *v.get(at)? as usize;
+                at += 1;
+                c
             };
-            Some(LightMiss { epoch, reason, woken_at, answered_at, delivery_delay_secs: delay,
-                             refused: (!refused.is_empty()).then(|| refused.to_string()), recorded_at,
-                             delivered_at, app_outcome, by_push })
-        } else {
-            None
-        };
+            for _ in 0..count {
+                let (m, span, oldest_recorded_at) = decode_miss(v, &mut at, v[0])?;
+                if misses.len() as u64 + span > MISS_HISTORY_EPOCHS { return None; }
+                let older: Vec<LightMiss> = (m.epoch.checked_sub(span - 1)?..m.epoch).rev()
+                    .map(|epoch| LightMiss { epoch, recorded_at: oldest_recorded_at, ..m.clone() }).collect();
+                misses.push(m);
+                misses.extend(older);
+            }
+            // Only as `LightMiss::merge_into` keeps them: newest first, one an epoch, within the window.
+            let newest = misses.first()?.epoch;
+            if misses.windows(2).any(|w| w[0].epoch <= w[1].epoch) || !misses.iter().all(|m| in_miss_window(m.epoch, newest)) {
+                return None;
+            }
+        }
         let answer = if v[1] & 2 != 0 {
             Some(LastAnswer { at: word(v, &mut at)?, delivery_delay_secs: opt_word(v, &mut at)?, handling_secs: opt_word(v, &mut at)? })
         } else {
             None
         };
-        (at == v.len()).then_some(LightPushRow { miss, answer })
+        (at == v.len()).then_some(LightPushRow { misses, answer })
     }
 
     /// The row as the status serves it under a binding this genesis stored at `bound_at`: what came before was
     /// another binding's, so another device's.
     pub(crate) fn since(self, bound_at: u64) -> LightPushRow {
         LightPushRow {
-            miss: self.miss.filter(|m| m.recorded_at >= bound_at),
+            misses: self.misses.into_iter().filter(|m| m.recorded_at >= bound_at).collect(),
             answer: self.answer.filter(|a| a.at >= bound_at),
         }
     }
@@ -1251,14 +1422,9 @@ fn update_row(storage: &crate::storage::Storage, node_id: &str, f: impl FnOnce(&
     }
 }
 
-/// Merge `m` into the node's row. True when it changed the row.
+/// Merge `m` into the node's misses (`LightMiss::merge_into`). True when it changed the row.
 fn merge_miss(storage: &crate::storage::Storage, node_id: &str, m: LightMiss) -> bool {
-    update_row(storage, node_id, |row| {
-        let merged = LightMiss::merge(row.miss.clone(), m);
-        if row.miss.as_ref() == Some(&merged) { return false; }
-        row.miss = Some(merged);
-        true
-    })
+    update_row(storage, node_id, |row| LightMiss::merge_into(&mut row.misses, m))
 }
 
 /// This genesis owns the node's light shard (any rank): the misses it records are read from it.
@@ -1287,11 +1453,13 @@ pub(crate) fn save_misses(storage: &crate::storage::Storage, misses: Vec<(String
     misses.into_iter().filter(|(id, m)| merge_miss(storage, id, m.clone())).count()
 }
 
-/// The node's row already holds a late answer to `epoch`, or a miss of a later epoch: a late answer to `epoch`
-/// would change nothing.
+/// The node's row already holds a late answer to `epoch`, or `epoch` is older than the misses it keeps: a late answer
+/// to `epoch` would change nothing.
 pub(crate) fn late_recorded(storage: &crate::storage::Storage, node_id: &str, epoch: u64) -> bool {
-    stored_row(storage, node_id).and_then(|r| r.miss)
-        .map_or(false, |m| m.epoch > epoch || (m.epoch == epoch && m.reason == MissReason::AnsweredLate))
+    stored_row(storage, node_id).map_or(false, |r| {
+        r.misses.first().map_or(false, |newest| !in_miss_window(epoch, newest.epoch))
+            || r.misses.iter().any(|m| m.epoch == epoch && m.reason == MissReason::AnsweredLate)
+    })
 }
 
 /// An answer to `epoch`'s challenge came at `now`, after that epoch's commit opened: the node's miss of `epoch`
@@ -1314,16 +1482,21 @@ pub(crate) fn record_late_answer(storage: &crate::storage::Storage, node_id: &st
 }
 
 /// An answer that counted the node came at `now`: its last answer here, and what the push receipts it carried tell
-/// of the node's last miss (`refine_miss`, `answered_at` the answer's own device time). A report covers the epochs
-/// before its answer's own (`answer_epoch`, of the anchor), so a miss of that epoch or a later one, recorded while the
-/// answer was being taken, is left as it is. One write.
+/// of each of the node's misses (`refine_miss`, `answered_at` the answer's own device time). A report covers the
+/// RECEIPT_REPORT_EPOCHS epochs before its answer's own (`answer_epoch`, of the anchor), so a miss of that epoch or a
+/// later one, recorded while the answer was being taken, is left as it is, and so is an older one; a miss older than the
+/// window up to that epoch goes. One write.
 pub(crate) fn record_answer(storage: &crate::storage::Storage, node_id: &str, now: u64, d: Delivery,
                             receipts: Option<&PushReceipts>, answered_at: Option<u64>, answer_epoch: Option<u64>) -> bool {
     update_row(storage, node_id, |row| {
         row.answer = Some(LastAnswer { at: now, delivery_delay_secs: d.delay_secs, handling_secs: d.handling_secs });
-        let covered = row.miss.as_ref().filter(|m| answer_epoch.map_or(false, |a| m.epoch < a));
-        if let Some(refined) = covered.zip(receipts).and_then(|(m, r)| refine_miss(m, r, answered_at, now)) {
-            row.miss = Some(refined);
+        if let Some(a) = answer_epoch {
+            // A node that misses no more keeps no misses past the window, so its row shrinks back.
+            row.misses.retain(|m| in_miss_window(m.epoch, a));
+            let covered = a.saturating_sub(RECEIPT_REPORT_EPOCHS)..a;
+            for m in row.misses.iter_mut().filter(|m| covered.contains(&m.epoch)) {
+                if let Some(refined) = receipts.and_then(|r| refine_miss(m, r, answered_at, now)) { *m = refined; }
+            }
         }
         true
     })
@@ -1334,6 +1507,9 @@ pub(crate) fn record_answer(storage: &crate::storage::Storage, node_id: &str, no
 /// Receipts one report may carry, and its text at most.
 pub(crate) const PUSH_RECEIPTS_MAX: usize = 8;
 pub(crate) const PUSH_RECEIPTS_MAX_BYTES: usize = 2048;
+/// The epochs before its answer's own one report refines at most, as many as the app's record of receipts keeps,
+/// whatever `since` it names.
+pub(crate) const RECEIPT_REPORT_EPOCHS: u64 = 6;
 /// The longest a receipt may be held on the device before the answer that reports it and still date its push.
 const MAX_RECEIPT_AGE_SECS: u64 = 7 * 86_400;
 
@@ -1349,7 +1525,7 @@ pub(crate) struct PushReceipt {
 }
 
 /// The device's record of the pushes it received and did not answer, every one from epoch `since` on. Unsigned
-/// display data that rides in a verified answer: it never changes crediting, only the node's last miss here.
+/// display data that rides in a verified answer: it never changes crediting, only the node's misses here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PushReceipts {
     pub(crate) since: u64,
@@ -1599,15 +1775,15 @@ pub(crate) fn device_layer_pushable(storage: &crate::storage::Storage, node_id: 
 
 /// `device_layer_pushable` in `epoch` at Unix time `now`.
 pub(crate) fn device_pushable_at(storage: &crate::storage::Storage, node_id: &str, epoch: u64, now: u64) -> bool {
-    device_pushable_with(storage, node_id, storage.light_binding_reach(node_id).as_ref(),
+    device_pushable_with(storage.device_record(node_id).as_ref(), storage.light_binding_reach(node_id).as_ref(),
                          storage.is_node_registration_onchain(node_id), epoch, now)
 }
 
-/// `device_pushable_at` with the node's binding row and registration already read: the record that governs its
-/// replies is the device record that binding still holds (`light_device::ping::governing_record`).
-fn device_pushable_with(storage: &crate::storage::Storage, node_id: &str, binding: Option<&crate::light_binding::BindingReach>,
+/// `device_pushable_at` with the node's device record, binding row and registration already read: the record that
+/// governs its replies is the device record that binding still holds (`light_device::ping::governing_record`).
+fn device_pushable_with(record: Option<&crate::light_device::record::DeviceRecord>, binding: Option<&crate::light_binding::BindingReach>,
                         onchain: bool, epoch: u64, now: u64) -> bool {
-    match storage.device_record(node_id).filter(|r| !crate::light_device::attest::binding_released_by(binding, r)) {
+    match record.filter(|r| !crate::light_device::attest::binding_released_by(binding, r)) {
         Some(r) => r.state_now(onchain, epoch, now).counts(),
         None => crate::light_device::ping::legacy_counts(epoch),
     }
@@ -2440,6 +2616,80 @@ mod tests {
         assert!(send[..send.find("deliver_push(").unwrap()].contains("has_attestation_in_window(node_id)"));
     }
 
+    /// An iOS device's due points are every other one of the spaced rounds, met from IOS_MIN_PUSH_GAP_SLOTS - 1 slots
+    /// before. The entry keeps the platform the selection read, so the next due points are judged in RAM; a node
+    /// `may_push` met with no entry (a restart) or another platform's (a device changed) is judged again on its device's.
+    #[test]
+    fn an_ios_device_is_pushed_only_at_its_own_due_points() {
+        use super::SendOutcome::Accepted;
+        let at = |o: u64| Due::spaced(1000 + o, o % RETRY_AFTER_SLOTS).ios_met_from;
+        let offsets: Vec<(u64, Option<u64>)> = spaced_due_offsets().map(|(o, _)| (o, at(o))).collect();
+        assert_eq!(offsets, vec![(0, Some(981)), (15, None), (30, Some(1011)), (60, Some(1041)), (75, None), (90, Some(1071))]);
+        assert_eq!(Due::once(1000).ios_met_from, Some(1000), "before the spaced rounds every device has one schedule");
+        let l = PushLedger::new();
+        let (s, t) = (500 * SLOTS_PER_EPOCH + 40, 1_800_000_000u64);
+        let due = |o: u64| [Due::spaced(s + o, o % RETRY_AFTER_SLOTS)];
+        let n = "light_mobile_ios";
+        assert!(l.may_push(n, s, &due(0), || 0) && l.may_push_on(n, s, &due(0), || 0, true));
+        l.record(n, s, Accepted, t);
+        assert!(l.get(n).map_or(false, |e| e.ios), "the entry keeps the platform");
+        assert!(!l.may_push(n, s + 15, &due(15), || 0), "not an iOS due point: refused in RAM, before any storage read");
+        assert!(l.may_push(n, s + 30, &due(30), || 0));
+        // Met with no entry (a restart): let through in RAM as an orphan repeat, refused on the device's schedule, and the
+        // entry then keeps its platform.
+        let m = "light_mobile_ios_restart";
+        assert!(l.may_push(m, s + 15, &due(15), || s + 1));
+        assert!(!l.may_push_on(m, s + 15, &due(15), || s + 1, true));
+        assert!(!l.may_push(m, s + 16, &due(15), || s + 1));
+        assert!(l.may_push_on(m, s + 30, &due(30), || s + 1, true));
+        // Every other device: no entry added for its platform, and the six due points.
+        let a = "light_mobile_other";
+        assert!(l.may_push_on(a, s, &due(0), || 0, false) && l.get(a).is_none());
+        l.record(a, s, Accepted, t);
+        assert!(l.may_push(a, s + 15, &due(15), || 0) && l.may_push_on(a, s + 15, &due(15), || 0, false));
+        // A device changed to another platform in the epoch: judged on the new one from its next read.
+        assert!(l.may_push_on(n, s + 30, &due(30), || 0, false) && l.get(n).map_or(false, |e| !e.ios));
+        // The gap: a push a catch-up made 11 slots late meets the iOS due point 30 slots on, not every other device's.
+        let c = "light_mobile_ios_late";
+        l.record(c, s + 11, Accepted, t);
+        assert!(!l.may_push_on(c, s + 30, &due(30), || 0, true), "19 slots: too close for an iOS device");
+        assert!(l.may_push_on(c, s + 30, &due(30), || 0, false), "19 slots: far enough for every other device");
+        let d = "light_mobile_ios_late_by_ten";
+        l.record(d, s + 10, Accepted, t);
+        assert!(l.may_push_on(d, s + 30, &due(30), || 0, true), "IOS_MIN_PUSH_GAP_SLOTS apart");
+    }
+
+    /// An iOS device is pushed in no slot after IOS_LAST_PUSH_SLOT, so the next epoch's first push, from its slot 0 on,
+    /// comes at least IOS_MIN_PUSH_GAP_SLOTS after the last; and a wake the provider took closes the due points it meets on
+    /// that schedule as a push does. Every other device's due points are left as they were.
+    #[test]
+    fn an_ios_device_is_kept_apart_from_the_next_epoch_and_from_a_wake() {
+        let l = PushLedger::new();
+        let e = 600 * SLOTS_PER_EPOCH;
+        assert!(SLOTS_PER_EPOCH - IOS_LAST_PUSH_SLOT >= IOS_MIN_PUSH_GAP_SLOTS);
+        let (n, other) = ("light_mobile_ios_tail", "light_mobile_other_tail");
+        // The retry round's last due point of a node drawn late (227 for slot 137), or a catch-up made late.
+        for slot in [IOS_LAST_PUSH_SLOT + 1, 227, 236] {
+            let due = [Due::spaced(e + slot, 30)];
+            assert!(!l.may_push_on(n, e + slot, &due, || u64::MAX, true), "slot {slot}");
+            assert!(!l.may_push(n, e + slot, &due, || u64::MAX), "slot {slot}: refused in RAM once the platform is kept");
+            assert!(l.may_push_on(other, e + slot, &due, || u64::MAX, false), "slot {slot}");
+        }
+        let due = [Due::spaced(e + IOS_LAST_PUSH_SLOT, 30)];
+        assert!(l.may_push_on(n, e + IOS_LAST_PUSH_SLOT, &due, || u64::MAX, true));
+        // A wake in slot `w` closes the iOS due points less than IOS_MIN_PUSH_GAP_SLOTS after it.
+        let (w, t) = (e + 50, 1_800_000_000u64);
+        let (ios, android) = ("light_mobile_ios_woken", "light_mobile_other_woken");
+        for node in [ios, android] { l.woke(node, w, false, t); }
+        let first = |o: u64| [Due::spaced(w + o, 0)];
+        assert!(!l.may_push_on(ios, w + 19, &first(19), || 0, true), "19 slots after the wake");
+        assert!(l.may_push_on(android, w + 19, &first(19), || 0, false));
+        assert!(l.may_push_on(ios, w + 20, &first(20), || 0, true), "IOS_MIN_PUSH_GAP_SLOTS after it");
+        // A challenge left for a poll is no push: it closes nothing.
+        l.woke("light_mobile_ios_polled", w, true, t);
+        assert!(l.may_push_on("light_mobile_ios_polled", w + 5, &first(5), || 0, true));
+    }
+
     /// The reason a miss names comes from what this genesis did for the node in the epoch, most telling first.
     #[test]
     fn each_miss_names_why_from_what_this_genesis_did() {
@@ -2645,63 +2895,125 @@ mod tests {
                     delivered_at: None, app_outcome: None, by_push: woken.is_some() }
     }
 
-    /// The row: one per node, its last miss and last answer, read back exactly; anything else reads as none. A row of
-    /// the first version is still read.
+    /// The row: one per node, its misses and last answer, read back exactly, a run of epochs with the same record stored
+    /// once; anything else, misses out of the order the merge keeps included, reads as none. Rows of the first and second
+    /// versions, one miss each, are still read.
     #[test]
     fn the_push_row_round_trips_and_refuses_what_it_did_not_write() {
+        let late = LightMiss { epoch: 210, reason: MissReason::AnsweredLate, woken_at: Some(1_800_000_000),
+                               answered_at: Some(1_800_009_000), delivery_delay_secs: Some(0),
+                               refused: None, recorded_at: 1_800_009_000, delivered_at: Some(1_800_008_990),
+                               app_outcome: None, by_push: false };
         let full = LightPushRow {
-            miss: Some(LightMiss { epoch: 210, reason: MissReason::AnsweredLate, woken_at: Some(1_800_000_000),
-                                   answered_at: Some(1_800_009_000), delivery_delay_secs: Some(0),
-                                   refused: None, recorded_at: 1_800_009_000, delivered_at: Some(1_800_008_990),
-                                   app_outcome: None, by_push: false }),
+            misses: vec![late.clone()],
             answer: Some(LastAnswer { at: 1_799_990_000, delivery_delay_secs: Some(12), handling_secs: None }),
         };
         let refined = LightMiss { reason: MissReason::WokenNoAnswer, app_outcome: Some(AppOutcome::NoKey), by_push: true,
-                                  answered_at: None, ..full.miss.clone().unwrap() };
-        for row in [full.clone(), LightPushRow::default(), LightPushRow { miss: None, ..full.clone() },
+                                  answered_at: None, ..late.clone() };
+        let older = LightMiss { epoch: 150, reason: MissReason::AnswerRefused, refused: Some("superseded".into()),
+                                recorded_at: 1_799_000_000, ..refined.clone() };
+        for row in [full.clone(), LightPushRow::default(), LightPushRow { misses: vec![], ..full.clone() },
                     LightPushRow { answer: None, ..full.clone() },
-                    LightPushRow { miss: Some(refined.clone()), ..full.clone() },
-                    LightPushRow { miss: Some(LightMiss { reason: MissReason::NotDelivered, ..refined.clone() }), answer: None },
-                    LightPushRow { miss: Some(LightMiss { refused: Some("x".repeat(40)), ..full.miss.clone().unwrap() }), answer: None }] {
+                    LightPushRow { misses: vec![refined.clone()], ..full.clone() },
+                    LightPushRow { misses: vec![LightMiss { reason: MissReason::NotDelivered, ..refined.clone() }], answer: None },
+                    LightPushRow { misses: vec![late.clone(), older.clone()], ..full.clone() },
+                    LightPushRow { misses: vec![LightMiss { refused: Some("x".repeat(40)), ..late.clone() }], answer: None }] {
             let back = LightPushRow::decode(&row.encode()).expect("decodes");
-            let want_refused = row.miss.as_ref().and_then(|m| m.refused.clone()).map(|r| r[..r.len().min(REFUSED_MAX)].to_string());
-            assert_eq!(back.miss.as_ref().and_then(|m| m.refused.clone()), want_refused, "the code is kept to its bound");
-            if row.miss.as_ref().and_then(|m| m.refused.as_ref()).map_or(true, |r| r.len() <= REFUSED_MAX) { assert_eq!(back, row); }
+            let codes = |r: &LightPushRow| r.misses.iter().map(|m| m.refused.clone()).collect::<Vec<_>>();
+            let want: Vec<_> = codes(&row).into_iter().map(|c| c.map(|r| r[..r.len().min(REFUSED_MAX)].to_string())).collect();
+            assert_eq!(codes(&back), want, "the code is kept to its bound");
+            if row.misses.iter().all(|m| m.refused.as_ref().map_or(true, |r| r.len() <= REFUSED_MAX)) { assert_eq!(back, row); }
         }
         for o in AppOutcome::ALL {
-            let row = LightPushRow { miss: Some(LightMiss { app_outcome: Some(o), ..refined.clone() }), answer: None };
+            let row = LightPushRow { misses: vec![LightMiss { app_outcome: Some(o), ..refined.clone() }], answer: None };
             assert_eq!(LightPushRow::decode(&row.encode()), Some(row));
             assert_eq!(AppOutcome::parse(o.as_str()), Some(o));
         }
         let enc = full.encode();
         assert!(enc.len() < 112, "a small row: {} bytes", enc.len());
-        for bad in [vec![], vec![3u8, 1], vec![0u8, 0], vec![2u8, 4], enc[..enc.len() - 1].to_vec(), [enc.clone(), vec![0]].concat()] {
+        // A node missed the same way every epoch of the window: one record, the size of a row of one miss.
+        let same = LightPushRow {
+            misses: (0..MISS_HISTORY_EPOCHS).rev().map(|k| LightMiss { epoch: 1_000 + k, ..refined.clone() }).collect(),
+            answer: full.answer,
+        };
+        let h = same.encode();
+        assert!(h.len() < 112, "{} bytes", h.len());
+        assert_eq!(LightPushRow::decode(&h), Some(same.clone()));
+        // Every epoch another way than the one before: one record an epoch, a few kilobytes at most.
+        let mixed = LightPushRow {
+            misses: (0..MISS_HISTORY_EPOCHS).rev()
+                .map(|k| LightMiss { epoch: 1_000 + k, by_push: k % 2 == 0, ..refined.clone() }).collect(),
+            answer: full.answer,
+        };
+        let h = mixed.encode();
+        assert!(h.len() < 56 * MISS_HISTORY_EPOCHS as usize + 32, "{} bytes", h.len());
+        assert_eq!(LightPushRow::decode(&h), Some(mixed));
+        // A run reads back with its newest record's times, its older epochs with its oldest record's `recorded_at`: a
+        // binding stored inside the run keeps only the epoch known to come after it.
+        let run: Vec<LightMiss> = [(12u64, 300u64), (11, 200), (10, 100)].into_iter()
+            .map(|(epoch, at)| LightMiss { epoch, recorded_at: at, woken_at: Some(at), ..refined.clone() }).collect();
+        let back = LightPushRow::decode(&LightPushRow { misses: run, answer: None }.encode()).expect("a run");
+        assert_eq!(back.misses.iter().map(|m| (m.epoch, m.recorded_at, m.woken_at)).collect::<Vec<_>>(),
+                   vec![(12, 300, Some(300)), (11, 100, Some(300)), (10, 100, Some(300))]);
+        assert_eq!(back.clone().since(150).misses.iter().map(|m| m.epoch).collect::<Vec<_>>(), vec![12]);
+        assert_eq!(back.since(100).misses.len(), 3);
+        // A clock stepped back between commits: each newer record recorded before the older one is a record of its own,
+        // so the row still reads back exactly.
+        let stepped = LightPushRow {
+            misses: [(12u64, 100u64), (11, 200), (10, 300)].into_iter()
+                .map(|(epoch, at)| LightMiss { epoch, recorded_at: at, woken_at: Some(at), ..refined.clone() }).collect(),
+            answer: None,
+        };
+        assert_eq!(LightPushRow::decode(&stepped.encode()), Some(stepped));
+        // A run's byte of epochs and oldest `recorded_at` (the record's last nine bytes): one epoch, more than the window,
+        // past epoch 0 or an oldest time after the newest read as none, and so does a run in a second-version row.
+        let r = LightPushRow { misses: same.misses[..3].to_vec(), answer: None }.encode();
+        let span_at = r.len() - 9;
+        for (at, byte) in [(span_at, 1u8), (span_at, MISS_HISTORY_EPOCHS as u8 + 1), (span_at + 1, 0xff)] {
+            let mut bad = r.clone();
+            bad[at] = byte;
+            assert_eq!(LightPushRow::decode(&bad), None, "byte {at} = {byte}");
+        }
+        let mut past_zero = LightPushRow { misses: (0..3).rev().map(|k| LightMiss { epoch: k, ..refined.clone() }).collect(),
+                                           answer: None }.encode();
+        let low_span = past_zero.len() - 9;
+        past_zero[low_span] = 4;
+        assert_eq!(LightPushRow::decode(&past_zero), None);
+        assert_eq!(LightPushRow::decode(&[vec![2u8, r[1]], r[3..].to_vec()].concat()), None, "no run in a second-version row");
+        for bad in [vec![], vec![3u8, 1], vec![3u8, 1, 0], vec![0u8, 0], vec![4u8, 0], vec![2u8, 4], enc[..enc.len() - 1].to_vec(),
+                    [enc.clone(), vec![0]].concat()] {
             assert_eq!(LightPushRow::decode(&bad), None, "{bad:?}");
         }
+        for misses in [vec![older.clone(), late.clone()], vec![late.clone(), late.clone()],
+                       vec![late.clone(), LightMiss { epoch: 210 - MISS_HISTORY_EPOCHS, ..older.clone() }]] {
+            assert_eq!(LightPushRow::decode(&LightPushRow { misses, answer: None }.encode()), None,
+                       "newest first, one an epoch, within the window");
+        }
         let mut wrong_reason = enc.clone();
-        wrong_reason[10] = 9;
+        wrong_reason[11] = 9;
         assert_eq!(LightPushRow::decode(&wrong_reason), None);
-        // The miss's last three bytes: an outcome this genesis does not know, a flag it does not know.
+        // The miss's last two bytes: an outcome this genesis does not know, a flag it does not know.
         let miss_end = enc.len() - 24;
         let mut wrong_outcome = enc.clone();
         wrong_outcome[miss_end - 2] = 99;
         assert_eq!(LightPushRow::decode(&wrong_outcome), None);
         let mut wrong_flag = enc.clone();
-        wrong_flag[miss_end - 1] = 2;
+        wrong_flag[miss_end - 1] = 4;
         assert_eq!(LightPushRow::decode(&wrong_flag), None);
-        // A first-version row: the miss ends at the refusal code.
-        let mut v1 = enc[..miss_end - 10].to_vec();
-        v1[0] = 1;
-        v1.extend_from_slice(&enc[miss_end..]);
+        // A second-version row: one miss and no count byte; a first-version one also ends it at the refusal code.
+        let v2 = [vec![2u8, enc[1]], enc[3..].to_vec()].concat();
+        assert_eq!(LightPushRow::decode(&v2), Some(full.clone()));
+        let v1 = [vec![1u8, enc[1]], enc[3..miss_end - 10].to_vec(), enc[miss_end..].to_vec()].concat();
         let back = LightPushRow::decode(&v1).expect("a version 1 row");
-        assert_eq!(back.miss, Some(LightMiss { delivered_at: None, ..full.miss.clone().unwrap() }));
+        assert_eq!(back.misses, vec![LightMiss { delivered_at: None, ..late.clone() }]);
         assert_eq!(back.answer, full.answer);
-        // What came before the binding held here was another device's.
-        let since = full.clone().since(1_800_000_000);
-        assert_eq!((since.miss.is_some(), since.answer.is_none()), (true, true));
-        assert_eq!(full.clone().since(0), full);
+        // What came before the binding held here was another device's, miss by miss.
+        let both = LightPushRow { misses: vec![late.clone(), older.clone()], ..full.clone() };
+        let since = both.clone().since(1_800_000_000);
+        assert_eq!((since.misses, since.answer.is_none()), (vec![late.clone()], true));
+        assert_eq!(both.clone().since(0), both);
         // The JSON the signed status serves; `by_push` is not served.
-        assert_eq!(full.miss.as_ref().unwrap().to_json(), json!({"epoch": 210, "reason": "answered_late", "delivered": true,
+        assert_eq!(late.to_json(), json!({"epoch": 210, "reason": "answered_late", "delivered": true,
             "woken_at": 1_800_000_000u64,
             "answered_at": 1_800_009_000u64, "delivery_delay_secs": 0, "refused": null, "delivered_at": 1_800_008_990u64,
             "app_outcome": null}));
@@ -2709,20 +3021,17 @@ mod tests {
         assert_eq!(full.answer.unwrap().to_json(), json!({"at": 1_799_990_000u64, "delivery_delay_secs": 12, "handling_secs": null}));
     }
 
-    /// The row keeps the latest epoch, at one epoch the reason that tells more, as every reader does; a late
+    /// The row keeps one record an epoch, at one epoch the reason that tells more, as every reader does; a late
     /// answer turns the epoch's miss into `answered_late` and keeps when the node was woken, whichever was written
     /// first; the last answer sits beside it.
     #[test]
     fn a_miss_is_merged_by_epoch_then_by_what_it_tells() {
         let m = |e, r, w| miss(e, r, w, 1);
-        assert_eq!(LightMiss::merge(None, m(5, MissReason::NoPushAddress, None)).reason, MissReason::NoPushAddress);
-        assert_eq!(LightMiss::merge(Some(m(5, MissReason::AnsweredLate, None)), m(6, MissReason::NotWokenInactive, None)).epoch, 6);
-        assert_eq!(LightMiss::merge(Some(m(6, MissReason::NotWokenInactive, None)), m(5, MissReason::AnsweredLate, None)).epoch, 6);
-        let kept = LightMiss::merge(Some(m(5, MissReason::AnsweredLate, None)), m(5, MissReason::WokenNoAnswer, Some(9)));
+        let kept = LightMiss::merge(m(5, MissReason::AnsweredLate, None), m(5, MissReason::WokenNoAnswer, Some(9)));
         assert_eq!((kept.reason, kept.woken_at), (MissReason::AnsweredLate, Some(9)), "the wake time either knew");
         let first = LightMiss { answered_at: Some(1), ..m(5, MissReason::AnsweredLate, None) };
         let second = LightMiss { answered_at: Some(2), ..m(5, MissReason::AnsweredLate, None) };
-        assert_eq!(LightMiss::merge(Some(first.clone()), second).answered_at, Some(1), "the first of two equal ones");
+        assert_eq!(LightMiss::merge(first.clone(), second).answered_at, Some(1), "the first of two equal ones");
         let mut order = MissReason::ALL.to_vec();
         order.sort_by_key(|r| r.rank());
         assert_eq!(order.iter().rev().map(|r| r.as_str()).collect::<Vec<_>>(),
@@ -2732,18 +3041,18 @@ mod tests {
         assert_eq!(MissReason::ALL.iter().map(|r| *r as u8).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8], "the row's codes stay");
         // The two system misses round-trip in a row like every other reason.
         for r in [MissReason::NotSent, MissReason::NotCommitted] {
-            let row = LightPushRow { miss: Some(m(9, r, None)), answer: None };
+            let row = LightPushRow { misses: vec![m(9, r, None)], answer: None };
             assert_eq!(LightPushRow::decode(&row.encode()), Some(row));
         }
         // A late answer over a receipt-refined wake keeps what the receipt told; `not_delivered` never shows a delivery.
         let told = LightMiss { delivered_at: Some(40), delivery_delay_secs: Some(30), app_outcome: Some(AppOutcome::Swiped),
                                ..m(5, MissReason::WokenNoAnswer, Some(10)) };
-        let late = LightMiss::merge(Some(told.clone()), m(5, MissReason::AnsweredLate, None));
+        let late = LightMiss::merge(told.clone(), m(5, MissReason::AnsweredLate, None));
         assert_eq!((late.reason, late.woken_at, late.delivered_at, late.delivery_delay_secs, late.app_outcome),
                    (MissReason::AnsweredLate, Some(10), Some(40), Some(30), Some(AppOutcome::Swiped)));
-        let held = LightMiss::merge(Some(told), m(5, MissReason::NotDelivered, None));
+        let held = LightMiss::merge(told, m(5, MissReason::NotDelivered, None));
         assert_eq!((held.reason, held.delivered_at, held.app_outcome), (MissReason::NotDelivered, None, None));
-        assert_eq!(LightMiss::merge(Some(m(5, MissReason::NotDelivered, Some(10))), m(5, MissReason::AnswerRefused, None)).reason,
+        assert_eq!(LightMiss::merge(m(5, MissReason::NotDelivered, Some(10)), m(5, MissReason::AnswerRefused, None)).reason,
                    MissReason::NotDelivered, "ranked above a refusal");
 
         let (s, _d) = storage();
@@ -2753,22 +3062,95 @@ mod tests {
         assert!(!late_recorded(&s, node, 200));
         let late = Delivery { delay_secs: Some(5_400), handling_secs: Some(3) };
         assert!(record_late_answer(&s, node, 200, 1_800_009_000, late));
-        let row = stored_row(&s, node).unwrap().miss.unwrap();
+        let row = stored_row(&s, node).unwrap().misses.remove(0);
         assert_eq!((row.reason, row.woken_at, row.answered_at, row.delivery_delay_secs, row.delivered_at),
                    (MissReason::AnsweredLate, Some(1_800_000_000), Some(1_800_009_000), Some(5_400), Some(1_800_008_997)));
-        assert!(late_recorded(&s, node, 200) && late_recorded(&s, node, 199) && !late_recorded(&s, node, 201));
+        assert!(late_recorded(&s, node, 200) && !late_recorded(&s, node, 199) && !late_recorded(&s, node, 201));
         assert!(!record_late_answer(&s, node, 200, 1_800_009_500, Delivery::default()), "the first late answer is kept");
         assert_eq!(save_misses(&s, vec![(node.to_string(), m(200, MissReason::WokenNoAnswer, Some(1)))]), 0,
                    "the commit's record written after the late answer changes nothing");
         assert!(record_answer(&s, node, 1_800_020_000, Delivery { delay_secs: Some(4), handling_secs: Some(1) }, None, None, None));
         let r = stored_row(&s, node).unwrap();
-        assert_eq!(r.miss.map(|m| m.reason), Some(MissReason::AnsweredLate), "the answer sits beside the miss");
+        assert_eq!(r.misses.iter().map(|m| m.reason).collect::<Vec<_>>(), vec![MissReason::AnsweredLate],
+                   "the answer sits beside the misses");
         assert_eq!(r.answer, Some(LastAnswer { at: 1_800_020_000, delivery_delay_secs: Some(4), handling_secs: Some(1) }));
         assert_eq!(save_misses(&s, vec![(node.to_string(), m(201, MissReason::NoPushAddress, None))]), 1);
-        assert_eq!(stored_row(&s, node).unwrap().miss.map(|m| (m.epoch, m.reason)), Some((201, MissReason::NoPushAddress)));
-        assert!(!record_late_answer(&s, node, 200, 1_800_030_000, Delivery::default()), "an older epoch never overwrites a newer");
+        assert_eq!(stored_row(&s, node).unwrap().misses.iter().map(|m| (m.epoch, m.reason)).collect::<Vec<_>>(),
+                   vec![(201, MissReason::NoPushAddress), (200, MissReason::AnsweredLate)], "a newer epoch beside, never over");
+        // A late answer to an older epoch lands at its own epoch, behind the newest.
+        assert!(record_late_answer(&s, node, 199, 1_800_030_000, Delivery::default()));
+        assert_eq!(stored_row(&s, node).unwrap().misses.iter().map(|m| (m.epoch, m.reason)).collect::<Vec<_>>(),
+                   vec![(201, MissReason::NoPushAddress), (200, MissReason::AnsweredLate), (199, MissReason::AnsweredLate)]);
         // The rows sit apart from the push record they share a column with.
         assert!(s.get_fcm_entry(node).is_none());
+    }
+
+    /// The misses of the last MISS_HISTORY_EPOCHS epochs: newest first, one an epoch, whatever order they come in; a
+    /// newer one prunes what falls out of the window, an older one outside it is refused. Every write site keeps them:
+    /// the commit's records, a refusal among them, a late answer; a counted answer prunes them to its own window.
+    #[test]
+    fn the_misses_of_the_last_epochs_are_kept_merged_and_pruned() {
+        let m = |e: u64, r| miss(e, r, Some(1), 1);
+        let epochs = |v: &[LightMiss]| v.iter().map(|x| x.epoch).collect::<Vec<_>>();
+        let mut h = Vec::new();
+        for (e, changed) in [(10u64, true), (12, true), (11, true), (12, false), (9, true)] {
+            assert_eq!(LightMiss::merge_into(&mut h, m(e, MissReason::WokenNoAnswer)), changed, "{e}");
+        }
+        assert_eq!(epochs(&h), vec![12, 11, 10, 9], "newest first, one an epoch");
+        assert!(LightMiss::merge_into(&mut h, m(11, MissReason::AnsweredLate)), "a record that tells more at its epoch");
+        assert_eq!(h[1].reason, MissReason::AnsweredLate);
+        assert!(!LightMiss::merge_into(&mut h, m(11, MissReason::WokenNoAnswer)), "one that tells less changes nothing");
+        // The window: the newest epoch and the MISS_HISTORY_EPOCHS - 1 before it.
+        let top = 9 + MISS_HISTORY_EPOCHS;
+        assert!(LightMiss::merge_into(&mut h, m(top, MissReason::NotSent)));
+        assert_eq!(epochs(&h), vec![top, 12, 11, 10], "epoch 9 fell out of the window");
+        assert!(!LightMiss::merge_into(&mut h, m(9, MissReason::AnsweredLate)), "older than the window: refused");
+        assert!(LightMiss::merge_into(&mut h, m(top - 1, MissReason::NoPushAddress)));
+        assert_eq!(epochs(&h), vec![top, top - 1, 12, 11, 10]);
+        let mut full = Vec::new();
+        for e in 0..3 * MISS_HISTORY_EPOCHS { LightMiss::merge_into(&mut full, m(e, MissReason::WokenNoAnswer)); }
+        assert_eq!(full.len() as u64, MISS_HISTORY_EPOCHS, "never more than the window");
+        assert_eq!((full[0].epoch, full.last().unwrap().epoch), (3 * MISS_HISTORY_EPOCHS - 1, 2 * MISS_HISTORY_EPOCHS));
+        assert_eq!(LightPushRow::decode(&LightPushRow { misses: full, answer: None }.encode()).map(|r| r.misses.len() as u64),
+                   Some(MISS_HISTORY_EPOCHS));
+
+        // Through the store: the commit's records of several epochs, a refusal among them, and a late answer.
+        let (s, _d) = storage();
+        let node = "light_mobile_history000000000";
+        let refused = LightMiss { refused: Some("superseded".into()), ..m(301, MissReason::AnswerRefused) };
+        assert_eq!(save_misses(&s, vec![(node.to_string(), m(300, MissReason::WokenNoAnswer))]), 1);
+        assert_eq!(save_misses(&s, vec![(node.to_string(), refused)]), 1);
+        assert_eq!(save_misses(&s, vec![(node.to_string(), m(303, MissReason::NoPushAddress))]), 1);
+        assert!(record_late_answer(&s, node, 302, 1_800_000_000, Delivery::default()));
+        let row = stored_row(&s, node).unwrap();
+        assert_eq!(row.misses.iter().map(|x| (x.epoch, x.reason)).collect::<Vec<_>>(),
+                   vec![(303, MissReason::NoPushAddress), (302, MissReason::AnsweredLate), (301, MissReason::AnswerRefused),
+                        (300, MissReason::WokenNoAnswer)]);
+        assert_eq!(row.misses[2].refused.as_deref(), Some("superseded"));
+        assert!(!late_recorded(&s, node, 300) && late_recorded(&s, node, 302));
+        assert!(late_recorded(&s, node, 303 - MISS_HISTORY_EPOCHS), "outside the window a late answer changes nothing");
+        assert!(!record_late_answer(&s, node, 303 - MISS_HISTORY_EPOCHS, 1_800_000_000, Delivery::default()));
+        assert_eq!(save_misses(&s, vec![(node.to_string(), m(300 + MISS_HISTORY_EPOCHS, MissReason::NotSent))]), 1);
+        assert_eq!(stored_row(&s, node).unwrap().misses.iter().map(|x| x.epoch).collect::<Vec<_>>(),
+                   vec![300 + MISS_HISTORY_EPOCHS, 303, 302, 301], "pruned to the window in the same write");
+        // A counted answer drops what is older than the window up to its own epoch: a node that misses no more ends
+        // with no misses, its last answer kept.
+        let answer = |epoch: u64| record_answer(&s, node, 1_800_100_000, Delivery::default(), None, None, Some(epoch));
+        assert!(answer(301 + MISS_HISTORY_EPOCHS));
+        assert_eq!(stored_row(&s, node).unwrap().misses.iter().map(|x| x.epoch).collect::<Vec<_>>(),
+                   vec![300 + MISS_HISTORY_EPOCHS, 303, 302]);
+        assert!(answer(300 + 2 * MISS_HISTORY_EPOCHS));
+        let row = stored_row(&s, node).unwrap();
+        assert_eq!((row.misses.len(), row.answer.map(|a| a.at)), (0, Some(1_800_100_000)));
+        // A node missed the same way at every commit (a poll never fetched, a provider failing) keeps one stored record
+        // however long it lasts, every epoch of the window still read back.
+        let stuck = "light_mobile_stuck0000000000";
+        for e in 0..2 * MISS_HISTORY_EPOCHS {
+            let at = 1_800_000_000 + e * 14_400;
+            assert_eq!(save_misses(&s, vec![(stuck.to_string(), miss(1_000 + e, MissReason::NoPushAddress, None, at))]), 1);
+        }
+        assert!(s.light_push_row(stuck).map_or(0, |v| v.len()) < 112);
+        assert_eq!(stored_row(&s, stuck).unwrap().misses.len() as u64, MISS_HISTORY_EPOCHS);
     }
 
     fn receipts_text(since: u64, pushes: &[(u64, Option<u64>, u64, &str)]) -> HashMap<String, String> {
@@ -2886,40 +3268,55 @@ mod tests {
         let unknown = PushReceipts { since: e, pushes: vec![PushReceipt { epoch: e, sent_at: None, received_at: 5, outcome: None }] };
         assert_eq!(refine_miss(&woke, &unknown, None, now), None, "a receipt that tells nothing changes nothing");
 
-        // Through the row: the counted answer's report refines the node's last miss in the same write, the first report
-        // is kept, a later epoch's miss is never touched by a report of an older one.
+        // Through the row: the counted answer's report refines the node's misses in the same write and the first report
+        // is kept.
         let (s, _d) = storage();
         let node = "light_mobile_receipts0000000";
         assert_eq!(save_misses(&s, vec![(node.to_string(), woke.clone())]), 1);
         let report = PushReceipts::from_params(&receipts_text(e, &[(e, Some(sent), 1_000, "answer_failed")])).unwrap();
         assert!(record_answer(&s, node, now, Delivery::default(), Some(&report), Some(1_000 + 20_002), Some(e + 2)));
         let row = stored_row(&s, node).unwrap();
-        assert_eq!(row.miss.as_ref().map(|m| (m.reason, m.delivered_at, m.delivery_delay_secs, m.app_outcome)),
-                   Some((MissReason::WokenNoAnswer, Some(now - 20_002), Some(90), Some(AppOutcome::AnswerFailed))));
+        assert_eq!(row.misses.iter().map(|m| (m.reason, m.delivered_at, m.delivery_delay_secs, m.app_outcome)).collect::<Vec<_>>(),
+                   vec![(MissReason::WokenNoAnswer, Some(now - 20_002), Some(90), Some(AppOutcome::AnswerFailed))]);
         assert_eq!(row.answer.map(|a| a.at), Some(now));
-        assert_eq!(row.miss.unwrap().to_json()["app_outcome"], json!("answer_failed"));
+        assert_eq!(row.misses[0].to_json()["app_outcome"], json!("answer_failed"));
         let nothing = PushReceipts::from_params(&receipts_text(e, &[])).unwrap();
         assert!(record_answer(&s, node, now + 10, Delivery::default(), Some(&nothing), Some(5), Some(e + 2)));
-        assert_eq!(stored_row(&s, node).unwrap().miss.map(|m| m.reason), Some(MissReason::WokenNoAnswer), "the first report is kept");
+        assert_eq!(stored_row(&s, node).unwrap().misses[0].reason, MissReason::WokenNoAnswer, "the first report is kept");
+        // A report refines every epoch it covers in one write, each by its own receipts; a later report changes none of
+        // them, and an epoch before the report's record is left as it is.
         let other = "light_mobile_receipts0000001";
-        save_misses(&s, vec![(other.to_string(), woke.clone())]);
-        save_misses(&s, vec![(other.to_string(), LightMiss { epoch: e + 1, ..woke.clone() })]);
-        assert!(record_answer(&s, other, now, Delivery::default(), Some(&nothing), Some(5), Some(e + 2)));
-        let m = stored_row(&s, other).unwrap().miss.unwrap();
-        assert_eq!((m.epoch, m.reason), (e + 1, MissReason::NotDelivered), "the report covers the newest miss");
-        let report_old = PushReceipts::from_params(&receipts_text(e, &[(e, Some(sent), 1_000, "swiped")])).unwrap();
-        assert!(record_answer(&s, other, now + 5, Delivery::default(), Some(&report_old), Some(1_005), Some(e + 2)));
-        assert_eq!(stored_row(&s, other).unwrap().miss.map(|m| (m.epoch, m.reason, m.app_outcome)),
-                   Some((e + 1, MissReason::NotDelivered, None)), "a receipt of an older epoch touches nothing");
+        for k in 0..3 { save_misses(&s, vec![(other.to_string(), LightMiss { epoch: e - 1 + k, ..woke.clone() })]); }
+        let two = PushReceipts::from_params(&receipts_text(e, &[(e, Some(sent), 1_000, "swiped")])).unwrap();
+        assert!(record_answer(&s, other, now, Delivery::default(), Some(&two), Some(1_000 + 20_002), Some(e + 2)));
+        let seen = |id: &str| stored_row(&s, id).unwrap().misses.iter()
+            .map(|m| (m.epoch, m.reason, m.app_outcome, m.delivered_at.is_some())).collect::<Vec<_>>();
+        let refined_all = vec![(e + 1, MissReason::NotDelivered, None, false),
+                               (e, MissReason::WokenNoAnswer, Some(AppOutcome::Swiped), true),
+                               (e - 1, MissReason::WokenNoAnswer, None, false)];
+        assert_eq!(seen(other), refined_all);
+        assert!(record_answer(&s, other, now + 5, Delivery::default(), Some(&nothing), Some(1_005), Some(e + 2)));
+        assert_eq!(seen(other), refined_all, "the first report of each epoch is kept");
+        // No epoch more than RECEIPT_REPORT_EPOCHS before the answer's own, whatever `since` the report names.
+        let fourth = "light_mobile_receipts0000003";
+        let a = e + 10;
+        for k in [a - RECEIPT_REPORT_EPOCHS - 1, a - RECEIPT_REPORT_EPOCHS, a - 1] {
+            save_misses(&s, vec![(fourth.to_string(), LightMiss { epoch: k, ..woke.clone() })]);
+        }
+        let from_zero = PushReceipts::from_params(&receipts_text(0, &[])).unwrap();
+        assert!(record_answer(&s, fourth, now, Delivery::default(), Some(&from_zero), Some(5), Some(a)));
+        assert_eq!(seen(fourth).into_iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(),
+                   vec![(a - 1, MissReason::NotDelivered), (a - RECEIPT_REPORT_EPOCHS, MissReason::NotDelivered),
+                        (a - RECEIPT_REPORT_EPOCHS - 1, MissReason::WokenNoAnswer)]);
         // A report covers the epochs before its answer's own: a miss of that epoch (recorded while the answer was being
         // taken) or a reply naming no epoch (a server stamp) leaves the miss as it is.
         let third = "light_mobile_receipts0000002";
         save_misses(&s, vec![(third.to_string(), woke.clone())]);
         assert!(record_answer(&s, third, now, Delivery::default(), Some(&nothing), Some(5), Some(e)));
         assert!(record_answer(&s, third, now, Delivery::default(), Some(&nothing), Some(5), None));
-        assert_eq!(stored_row(&s, third).unwrap().miss.map(|m| m.reason), Some(MissReason::WokenNoAnswer));
+        assert_eq!(stored_row(&s, third).unwrap().misses[0].reason, MissReason::WokenNoAnswer);
         assert!(record_answer(&s, third, now, Delivery::default(), Some(&nothing), Some(5), Some(e + 1)));
-        assert_eq!(stored_row(&s, third).unwrap().miss.map(|m| m.reason), Some(MissReason::NotDelivered));
+        assert_eq!(stored_row(&s, third).unwrap().misses[0].reason, MissReason::NotDelivered);
         // The ingress passes the answer's anchor epoch.
         assert!(include_str!("light_nodes.rs").contains("receipts.as_ref(), timing.answered_at,\r\n                      anchor.as_ref().map(|a| a.epoch()));")
                 || include_str!("light_nodes.rs").contains("receipts.as_ref(), timing.answered_at,\n                      anchor.as_ref().map(|a| a.epoch()));"));
@@ -3342,10 +3739,22 @@ mod tests {
         let seq = 1_800_000_000;
         let cert = hex::encode(d3::detached_sign(lb::delegation_v2_message(&pp_hex, &node, seq).as_bytes(), &sk).as_bytes());
         s.bind_light_v2(&node, &pp_hex, &cert, &pk_hex, seq, seq).unwrap().unwrap();
-        assert_eq!(push_reach_at(&s, &node, epoch, now), Some(None), "bound, no channel: a challenge");
+        assert_eq!(push_reach_at(&s, &node, epoch, now), Some(PushReach { channel: None, ios: false }), "bound, no channel: a challenge");
         s.save_fcm_token_seq(&node, "tok_sel", "fcm", None, seq, seq).unwrap();
-        assert_eq!(push_reach_at(&s, &node, epoch, now), Some(Some(PushChannel::Fcm("tok_sel".into()))));
-        assert_eq!(push_reach_at(&s, &node, epoch, now), device_reach(&s, &node), "one reading");
+        let fcm = Some(PushChannel::Fcm("tok_sel".into()));
+        assert_eq!(push_reach_at(&s, &node, epoch, now), Some(PushReach { channel: fcm.clone(), ios: false }), "no platform named");
+        assert_eq!(push_reach_at(&s, &node, epoch, now).map(|r| r.channel), device_reach(&s, &node), "one reading");
+        // The platform from the same reads, by the status's rule: the bind's hint, unless the device record proved another.
+        s.save_fcm_token_seq_platform(&node, "tok_sel", "fcm", None, seq + 60, seq, "ios", "").unwrap();
+        assert_eq!(push_reach_at(&s, &node, epoch, now), Some(PushReach { channel: fcm, ios: true }));
+        let entry = s.get_fcm_entry(&node);
+        let mut proven = crate::light_device::record::tests::rec(1, 150, crate::light_device::DeviceState::Active);
+        proven.seq = seq;
+        proven.platform = crate::light_device::Platform::Android;
+        assert_eq!(device_platform_of(Some(seq), entry.as_ref(), Some(&proven)), ("android", false));
+        assert_eq!(device_platform_of(Some(seq), entry.as_ref(), None), ("ios", true));
+        assert_eq!(device_platform_of(Some(seq + 1), entry.as_ref(), None), ("", true), "the push record of another binding");
+        assert_eq!(device_platform_of(None, entry.as_ref(), Some(&proven)), ("", false), "no device bound");
         // The slim read and the whole row agree, for a legacy row too.
         let whole = |s: &crate::storage::Storage, n: &str| s.get_light_binding(n).map(|b| lb::BindingReach::of(&b));
         assert_eq!(s.light_binding_reach(&node), whole(&s, &node));

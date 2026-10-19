@@ -442,7 +442,9 @@ Light-node reward eligibility is separately committed
 on-chain through a `LightNodeEligibilityBitmap` transaction, at most one per shard and owner per epoch, with a shard's owner rows bit-ORed, indexed
 by each node's permanent registration index; a light node's first push falls in a randomized per-window
 slot among the first 138 of 240, with repeats 15 and 30 slots later and a retry round of the same shape an
-hour after the first, each only while the node is not counted, so the last push and its answer end before
+hour after the first (an iOS device 30, 60 and 90 slots after the first, half an hour apart, none after the epoch's
+slot 220), each only while the
+node is not counted, so the last push and its answer end before
 the commit window opens (light node messages section 5.10). A registration stamped below
 `epoch_start + 14_250`, when the commit window opens, joins that epoch's reward roster, including the
 node's own registration epoch; one stamped in the closing 150 blocks joins from the next epoch. See

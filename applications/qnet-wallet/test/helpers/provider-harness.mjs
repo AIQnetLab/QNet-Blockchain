@@ -107,7 +107,8 @@ export function createWorld(options = {}) {
     outstanding: [],
     // promises a test holds a collaborator on (a slow read, a slow unlock check), or null
     gates: { prepare: null, siteView: null, unlock: null },
-    verification: 'proof',
+    // the previews' balance and nonce come from a pinned node's live tip (qnet.liveSend)
+    verification: 'live',
     // a WalletError the previews (qnet.prepareTransfer, prepareCall) fail with, e.g. the send rule's BALANCE_UNCONFIRMED
     prepareError: null,
     // an earlier transaction still holds the nonce before this one's (qnet previews' inFlight)
@@ -207,12 +208,10 @@ export function createWorld(options = {}) {
       totalNano: (BigInt(amountNano) + 150000n).toString(),
       nonce: state.nonce,
       balanceNano: state.balanceNano,
-      verified: state.verification !== 'none',
+      verified: state.verification === 'proof',
       verification: state.verification,
-      // qnet.prepareTransfer's earlier sends not seen applied (R2-EXTQ-03), and its own record of a same-amount send
-      // to the same address in the last 30 minutes (R3-EXTQ-01)
+      // qnet.prepareTransfer's earlier sends not seen applied (R2-EXTQ-03)
       outstanding: state.outstanding,
-      duplicate: state.duplicate === true,
       // a transfer a node refused, which a new one replaces by default (R5-EXTQ-02)
       replacesNonce: state.replacesNonce ?? null,
       inFlight: state.inFlight,
@@ -253,12 +252,12 @@ export function createWorld(options = {}) {
       const preview = {
         kind: tx.kind, from: ACCOUNTS.qnet, contract: tx.contract, method: tx.method, gasLimit: tx.gasLimit, feeNano: tx.maxFeeNano,
         depositNano, totalNano: (BigInt(tx.maxFeeNano) + BigInt(depositNano)).toString(), nonce: state.nonce,
-        balanceNano: state.balanceNano, verified: state.verification !== 'none', verification: state.verification, outstanding: state.outstanding,
+        balanceNano: state.balanceNano, verified: state.verification === 'proof', verification: state.verification, outstanding: state.outstanding,
         replacesNonce: state.replacesNonce ?? null, inFlight: state.inFlight,
       };
       return token ? {
         ...preview, to: tx.to, amountBase: tx.amount, tokenBalance: state.tokenBalance,
-        tokenProblem: state.tokenBalance === null ? state.tokenProblem : null, duplicate: state.duplicate === true,
+        tokenProblem: state.tokenBalance === null ? state.tokenProblem : null,
       }
         : { ...preview, args: tx.args };
     }),

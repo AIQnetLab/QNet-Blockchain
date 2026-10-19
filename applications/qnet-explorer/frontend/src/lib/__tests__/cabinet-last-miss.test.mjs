@@ -13,10 +13,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  MISS_REASONS, asksOtherOwners, deviceMiss, hasDeviceAccount, isLastMiss, latestMiss, missNotice, missText, parseNodeMiss, shownMiss,
+  MISS_HISTORY_EPOCHS, MISS_REASONS, asksOtherOwners, deviceMiss, hasDeviceAccount, isLastMiss, latestMiss, missNotice, missText, missesByEpoch,
+  parseNodeMiss, shownMiss,
 } from '../cabinet/last-miss.ts';
 import { parseStatusView } from '../cabinet/node-view.ts';
-import { createNodeProxy, lightShardOwners, mergeStatus, parsePublicStatus } from '../../server/cabinet/node-proxy.ts';
+import { createNodeProxy, lightShardOwners, mergeStatus, parseMisses, parsePublicStatus } from '../../server/cabinet/node-proxy.ts';
 import { TEXTS } from '../texts.ts';
 
 const SRC = new URL('../../', import.meta.url);
@@ -383,6 +384,77 @@ test('the pages: the miss line in the device rows, no answer time, an address on
   const proxy = code('server/cabinet/node-proxy.ts');
   assert.doesNotMatch(proxy, /last_answer_at|parseNodeAnswer|latestAnswer|lastAnswer\b|woken_at|delivered_at|app_outcome/);
   assert.doesNotMatch(code('lib/cabinet/last-miss.ts'), /wokenAt|answeredAt|deliveredAt|deliveryDelaySecs|appOutcome|missTime/);
+});
+
+// Batch 18.10: the History tab names, under each epoch not counted, why, from the misses routes of the node's shard
+// owners (GET /api/v1/light-node/misses: each owner's records of its last 64 epochs, newest first, in the public form
+// of `last_miss`), merged per epoch by the reader's rule for `last_miss`.
+test('the misses route: each owner\'s list read as last_miss is, merged per epoch by the rule for last_miss; a node of an earlier release gives none', () => {
+  assert.equal(MISS_HISTORY_EPOCHS, 64);
+  const body = (misses, over = {}) => ({ success: true, node_id: NODE, misses, ...over });
+  assert.deepEqual(parseMisses(body([miss({ epoch: 201, reason: 'not_sent' }), miss(), miss({ epoch: 199, reason: 'not_delivered' })])),
+    [site({ epoch: 201, reason: 'not_sent' }), site(), site({ epoch: 199, reason: 'not_delivered', delivered: false })]);
+  assert.deepEqual(parseMisses(body([])), []);
+  // An entry this site cannot read is passed over, the rest stand; an earlier node's times give the delivery alone.
+  assert.deepEqual(parseMisses(body([miss({ reason: 'paused' }), null, miss({ epoch: '7' }), oldMiss({ epoch: 198, delivered_at: REACHED })])), [told({ epoch: 198 })]);
+  assert.equal(parseMisses(body(Array.from({ length: MISS_HISTORY_EPOCHS }, (_, i) => miss({ epoch: 300 - i })))).length, MISS_HISTORY_EPOCHS);
+  // Anything else is no answer: more than an owner keeps, a node that does not know the id, an error body, and what a
+  // node of an earlier release answers (its 404 or 405 never reaches the parser: the read takes it as none).
+  for (const bad of [
+    body(Array.from({ length: MISS_HISTORY_EPOCHS + 1 }, (_, i) => miss({ epoch: 300 - i }))),
+    body([miss()], { success: false }), { success: false, error: 'node_id parameter required' }, body('x'), { misses: [miss()] }, {}, null, [],
+  ]) {
+    assert.equal(parseMisses(bad), null, JSON.stringify(bad)?.slice(0, 80));
+  }
+
+  // Per epoch, the owners' entries as latestMiss ranks them; every epoch any owner keeps, once.
+  const merged = missesByEpoch([
+    [site({ epoch: 201, reason: 'not_sent' }), site({ epoch: 200 }), site({ epoch: 199, reason: 'no_push_address' })],
+    null,
+    [site({ epoch: 201, reason: 'woken_no_answer' }), told({ epoch: 200 }), site({ epoch: 197, reason: 'answer_refused' })],
+  ]);
+  assert.deepEqual([...merged.keys()].sort((x, y) => y - x), [201, 200, 199, 197]);
+  assert.deepEqual(merged.get(201), site({ epoch: 201, reason: 'woken_no_answer' }), 'a device reached over a wake not got out');
+  assert.deepEqual(merged.get(200), told({ epoch: 200 }), 'equal reasons: the record that knows the delivery');
+  assert.deepEqual(merged.get(199), site({ epoch: 199, reason: 'no_push_address' }));
+  assert.equal(missesByEpoch([]).size, 0);
+  assert.equal(missesByEpoch([null, [], null]).size, 0);
+  // The same miss whichever owner answers first, for every pair of reasons and deliveries.
+  for (const r1 of MISS_REASONS) {
+    for (const r2 of MISS_REASONS) {
+      for (const [d1, d2] of [[null, null], [null, true], [false, null], [true, false]]) {
+        const x = site({ reason: r1, delivered: r1 === 'not_delivered' ? false : d1 });
+        const y = site({ reason: r2, delivered: r2 === 'not_delivered' ? false : d2 });
+        assert.deepEqual(missesByEpoch([[x], [y]]).get(200), latestMiss([x, y]), `${r1} ${r2}`);
+        if (r1 !== r2 || (x.delivered === null) !== (y.delivered === null)) assert.deepEqual(missesByEpoch([[y], [x]]).get(200), latestMiss([x, y]), `${r2} ${r1}`);
+      }
+    }
+  }
+});
+
+// The line under an epoch not counted on History is the Device tab's line for that epoch's miss (missText), with the
+// device's platform from the light node's status; the Overview's newest epochs carry none (it names the latest miss
+// beside the device's state), and an address only viewed gets none (its history read carries no miss).
+test('History: one line under each epoch not counted, in the Device tab\'s words; none on the Overview\'s epochs or for a view', () => {
+  const history = code('components/cabinet/NodeHistory.tsx');
+  assert.match(history, /function Table\(\{ rows, reasons = false \}: \{ rows: HistoryRow\[\]; reasons\?: boolean \}\) \{\s*const \{ devicePlatform \} = useCabinet\(\);/);
+  assert.match(history, /<tr className=\{`cabinet-epoch \$\{row\.result\}`\}>/);
+  assert.match(history, /\{reasons && row\.miss && <tr className="cabinet-epoch-why"><td colSpan=\{4\}>\{missText\(row\.miss, devicePlatform\)\}<\/td><\/tr>\}/);
+  assert.equal(history.match(/missText\(/g)?.length, 1);
+  assert.match(history, /<Table rows=\{list\.rows\} reasons \/>/);
+  assert.match(history, /<Table rows=\{view\.rows\.slice\(0, 6\)\} \/>/);
+  assert.match(code('components/cabinet/CabinetProvider.tsx'), /const devicePlatform = light\.state\.phase === 'ok' \? light\.state\.value\.device\?\.platform \?\? null : null;/);
+  assert.match(code('app/globals.css'), /\.cabinet-table \.cabinet-epoch-why td \{[^}]*border-block-start: none;/);
+  // The line for a row's miss, exactly as the Device tab words that miss.
+  assert.equal(missText(told({ epoch: 159 }), 'ios'),
+    'Epoch 159 was not counted: QNet Blockchain sent the device a wake, and no answer came before that epoch\'s check closed. The wake reached the device. '
+    + TEXTS.miss_todo_background_ios);
+  // Every reason has its words; no new text was needed.
+  for (const reason of MISS_REASONS) {
+    const notice = missNotice(site({ reason }), null);
+    assert.ok(TEXTS[notice.what] && TEXTS[notice.todo], reason);
+    assert.match(missText(site({ epoch: 7, reason }), null), /^Epoch 7 was not counted: /, reason);
+  }
 });
 
 test('the texts: self-service, no contact to write to, no other names, no word for earnings, no time', () => {

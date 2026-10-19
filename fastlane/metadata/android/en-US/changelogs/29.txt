@@ -1,0 +1,4 @@
+• Money that comes in and every transaction show at once, as soon as they are in a block
+• Amounts are written with the thousands separators of the app's language
+• Pull to refresh ends as soon as the new balance is on screen
+• Unlock with the device's screen lock where it has one, otherwise with a password

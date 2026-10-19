@@ -15,7 +15,7 @@ import {
   DECIMALS, call, clear, clearPageStorage, el, formatUnits, hardenSecretInput, loadLocale, log, onWalletEvent, refuseAutoFocus,
   refuseFramed, t, wipeInputs,
 } from './common.js';
-import { codeText, errorText, formatAmount, formatDay } from './kit.js';
+import { codeText, errorText, figureText, formatAmount, formatDay } from './kit.js';
 
 refuseFramed();
 // no field takes the cursor on its own (owner, 06.10)
@@ -374,16 +374,11 @@ function recipientWarning(details) {
   return el('div', { className: 'ap-warning', attrs: { role: 'note' } }, el('p', { text: t('apFirstTime') }));
 }
 
-// Earlier sends of this wallet the chain has not taken yet, and a second payment of the same amount to the
-// same address (unconfirmed, or sent in the last 30 minutes): this one goes in addition (R2-EXTQ-03).
-// The wallet's own records name a second payment even when the archive cannot (R3-EXTQ-01).
+// Earlier sends of this wallet the chain has not taken yet: this one goes in addition (R2-EXTQ-03).
 function outstandingNotice(details) {
-  const duplicate = details.duplicate === true || details.recipient?.recentSame === true;
   const count = Number.isSafeInteger(details.outstanding) ? details.outstanding : 0;
-  if (!duplicate && count === 0) return null;
-  return el('div', { className: 'ap-warning', attrs: { role: duplicate ? 'alert' : 'note' } },
-    duplicate ? el('p', { className: 'ap-error ap-strong', text: t('apDuplicate') }) : null,
-    count > 0 ? el('p', { text: t('apOutstanding', [count]) }) : null);
+  if (count === 0) return null;
+  return el('div', { className: 'ap-warning', attrs: { role: 'note' } }, el('p', { text: t('apOutstanding', [count]) }));
 }
 
 // A transaction a node refused that this one takes the place of at its nonce (R5-EXTQ-02): at most one of the two
@@ -403,9 +398,9 @@ function inFlightNotice(details) {
   return el('div', { className: 'ap-warning', attrs: { role: 'status' } }, el('p', { text: t('apInFlight') }));
 }
 
-// Why no balance a send is decided by could be read (the worker's send rule), said as it is: no node answered, the
-// balance is not confirmed yet, or a transaction from another device is not confirmed yet.
-const BALANCE_PROBLEMS = new Set(['NETWORK', 'BALANCE_UNCONFIRMED', 'BALANCE_FOREIGN_PENDING']);
+// Why no balance a send is decided by could be read (the worker's send rule), said as it is: no node answered, or the
+// balance is not confirmed yet.
+const BALANCE_PROBLEMS = new Set(['NETWORK', 'BALANCE_UNCONFIRMED']);
 const problemText = (code) => (BALANCE_PROBLEMS.has(code) ? codeText(code) : null);
 
 // The parts after the amounts that every transaction body shows: nonce, QNC balance, and why confirm may not be
@@ -438,11 +433,12 @@ function transferBody(details) {
   return { body, confirmable: ready && covered && details.inFlight !== true };
 }
 
-// A token amount in the token's decimals with its symbol, or the bare number when the token has no symbol to show.
+// A token amount in the token's decimals with its symbol, or the bare figure when the token has no symbol to show, as the
+// UI language writes figures (figureText).
 function tokenAmount(units, details) {
   if (details.symbol !== '') return formatAmount(units, details.decimals, details.symbol);
   try {
-    return formatUnits(units, details.decimals);
+    return figureText(formatUnits(units, details.decimals));
   } catch {
     return '—';
   }
@@ -479,7 +475,6 @@ function tokenTransferBody(details) {
     details.burn ? alertBox(t('apTokenBurn'), true) : null,
     recipientWarning(details),
     replacesNotice(details),
-    details.duplicate === true ? alertBox(t('apDuplicate'), true) : null,
     row(t('reviewAmount'), tokenAmount(details.amountBase, details), 'ap-strong'),
     row(t('reviewFee'), ready ? qnc(details.feeNano) : '—'),
     ready && details.depositNano !== '0' ? row(t('apDeposit'), qnc(details.depositNano)) : null,
@@ -691,7 +686,7 @@ function activationSummary(details, mode) {
       row(t('activateNodeType'), nodeLabel(details.nodeType)),
       // where the node runs: a Light node in QNet Wallet on a phone or tablet, a Super node on the user's own server
       el('p', { className: 'ap-muted', text: t(`activateAbout_${details.nodeType}`) }),
-      row(t('activateBurnAmount'), t('amount1dev', [cost]), 'ap-strong'),
+      row(t('activateBurnAmount'), t('amount1dev', [figureText(cost)]), 'ap-strong'),
       // no proof serves the price: it is what the pinned nodes all quote alike
       el('p', { className: 'ap-muted', text: t('activatePriceReported') }),
       row(t('activateToken'), t('activateTokenValue', [details.cluster])),
@@ -709,7 +704,7 @@ function activationSummary(details, mode) {
   return [
     el('p', { text: t(mode === 'exists' ? 'apActivateIntro_exists' : 'apActivateIntro_pending') }),
     row(t('activateNodeType'), nodeLabel(burn.nodeType)),
-    row(t('activateBurnAmount'), t('amount1dev', [burn.burnAmount])),
+    row(t('activateBurnAmount'), t('amount1dev', [figureText(burn.burnAmount)])),
     ...block(t('activateBurnTx'), burn.burnTx),
     mode === 'exists' ? row(t('codeLabel'), burn.codeMasked, 'ap-mono') : null,
     el('p', { className: 'ap-muted', text: t(mode === 'exists' ? 'apActivateShares_code' : 'apActivateShares_pending') }),
@@ -745,7 +740,7 @@ function renderActivation(next) {
     frame(next,
       el('section', { className: 'ap-card' },
         reason,
-        details.cost !== null ? row(t('activateBurnAmount'), t('amount1dev', [details.cost])) : null,
+        details.cost !== null ? row(t('activateBurnAmount'), t('amount1dev', [figureText(details.cost)])) : null,
         ...balanceRows(details.balances)),
       el('div', { className: 'ap-actions' }, close));
     return;
@@ -759,7 +754,7 @@ function renderActivation(next) {
   }
   // a redraw (what the view shows changed) arms the confirm again from the start, and a burn's acknowledgement is
   // given again (EXT-FA1-02)
-  const confirm = button(mode === 'burn' ? t('activateBurnButton', [details.cost]) : t(`apConfirm_${mode}`), true);
+  const confirm = button(mode === 'burn' ? t('activateBurnButton', [figureText(details.cost)]) : t(`apConfirm_${mode}`), true);
   let ack = null;
   if (mode === 'burn') {
     ack = el('input', { attrs: { type: 'checkbox', id: 'ap-ack' } });
@@ -768,7 +763,7 @@ function renderActivation(next) {
     el('section', { className: 'ap-card' },
       ...activationSummary(details, mode),
       ack ? el('label', { className: 'ap-check', attrs: { for: 'ap-ack' } }, ack,
-        el('span', { text: t('activateAck', [details.cost]) })) : null),
+        el('span', { text: t('activateAck', [figureText(details.cost)]) })) : null),
     el('div', { className: 'ap-actions' }, rejectButton(), confirm));
   const update = armConfirm(confirm, () => runActivation(next, mode), () => ack === null || ack.checked,
     TIMINGS.CONFIRM_ARM_VALUE_MS);
@@ -787,7 +782,7 @@ function progressBody(next, mode) {
   ticker = setInterval(() => {
     elapsed.textContent = t('activateElapsed', [Math.floor((Date.now() - started) / 1000)]);
   }, 1000);
-  const title = t('activateProgressTitle', [next.details.cost]);
+  const title = t('activateProgressTitle', [figureText(next.details.cost)]);
   return el('section', { className: 'ap-card' },
     el('p', { className: 'ap-strong', text: title }),
     el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': title } }, el('div', { className: 'progress-bar' })),
@@ -845,7 +840,7 @@ function renderActivationOutcome(next, result) {
       el('p', { className: status === 'pending' ? 'ap-warn' : 'ap-ok', text: t(`apOutcome_${status}`) }),
       server ? el('p', { className: 'ap-muted', text: t('apOutcome_super') }) : null,
       own && typeof own.burnTx === 'string'
-        ? el('p', { className: 'ap-warn', attrs: { role: 'note' }, text: t('apOutcomeSuperseded', [String(own.burnAmount), own.burnTx]) })
+        ? el('p', { className: 'ap-warn', attrs: { role: 'note' }, text: t('apOutcomeSuperseded', [figureText(own.burnAmount), own.burnTx]) })
         : null,
       result?.registration ? registrationLine(result.registration) : null);
   } else {

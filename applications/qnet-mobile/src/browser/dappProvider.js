@@ -24,28 +24,29 @@
  *   contractKind(address): 'token' | 'contract' | 'none' as two genesis nodes agree (a built-in token, another
  *     contract, or nothing there); throws when it cannot be read. A contract call's target must be 'contract'; a
  *     transfer's or token transfer's recipient must be 'none' (MOB-BR-R3-01),
- *   prepareSend(details): { nonce, confirmed, balanceNano, verified, counterparties (the recipients this wallet signed
- *     transfers to), paid and senders (warnings only, from the cached history), pending, replaceNonce, replaceHash,
- *     recent } — `confirmed` the account nonce the chain confirms; `nonce` is null while this wallet has unconfirmed
+ *   prepareSend(details): { nonce, confirmed, balanceNano, counterparties (the recipients this wallet signed
+ *     transfers to), paid and senders (warnings only, from the cached history), pending, replaceNonce, replaceHash }
+ *     — `confirmed` the account nonce the chain confirms; `nonce` is null while this wallet has unconfirmed
  *     transactions (`pending`). A site's send signs only at `confirmed` + 1, as the extension's (one transaction in
  *     flight): while an earlier transaction holds that nonce the sheet waits for it, re-reading the preview every
  *     IN_FLIGHT_RECHECK_MS, and the user may only replace the one unconfirmed transaction at `confirmed` + 1
- *     (`replaceNonce`); nothing is ever sent in addition. `balanceNano` is the committee-certified balance less what
- *     this wallet's transactions settled since its checkpoint took, `spends` ([{ nonce, amount }]) what its unsettled
- *     ones may still take, `balanceProblem` why no balance could be read ('foreign', 'unconfirmed', 'unanswered'), and
- *     `walkSteps` the steps a long lineage walk still takes when that is why it is not confirmed (or null). A
- *     token transfer adds tokenBalanceBase, tokenSpends, tokenProblem, tokenVerified, depositNano and listed (in the
- *     user's token list),
+ *     (`replaceNonce`); nothing is ever sent in addition. `balanceNano` is the wallet's balance at a genesis node's live
+ *     tip, its proof folded, less what this wallet's transactions that applied after it took, `spends`
+ *     ([{ nonce, amount }]) what its unsettled ones may still take, `balanceProblem` why no balance could be read
+ *     ('unconfirmed', 'unanswered'). A token transfer adds tokenBalanceBase, tokenSpends, tokenProblem, depositNano and
+ *     listed (in the user's token list),
  *   recheckSend(details): { balanceNano, tokenBalanceBase, depositNano, spends, tokenSpends, balanceProblem, tokenProblem }
- *     read again just before any send is signed (null where a balance cannot be read; every balance only as the
- *     committee certified it, less what this wallet's own transactions since took),
+ *     read again just before any send is signed (null where a balance cannot be read; every balance as prepareSend
+ *     reads it),
  *   send({ ...details, nonce, choice }): { txHash, status: 'submitted' | 'unknown', nonce, refusal, refusalFinal },
  *     signed only at the confirmed nonce + 1 (NONCE_CHANGED otherwise):
  *     `refusal` the text a node refused it with (null when none did), `refusalFinal` when every node it went to answered
  *     and waiting cannot change the refusal (the wallet never sends it again); throws code NONCE_CHANGED /
  *     PENDING_CHANGED / PENDING_CHOICE when the wallet's next nonce is no longer the one shown, PENDING_SETTLED when the
  *     transaction the user chose to replace went through meanwhile (nothing is sent),
- *   transactionStatus({ from, nonce }): { status: 'pending' | 'in_block' | 'unknown', blockHeight, txHash },
+ *   transactionStatus({ from, nonce }): { status: 'pending' | 'in_block' | 'unknown', blockHeight, txHash }; the sheet of a
+ *     send follows it too, and says "in a block" once the genesis nodes report it there (never that a call did what it
+ *     was meant to),
  *   isCurrent(binding): the page that asked is still the one on screen,
  *   emit(origin, event, data),
  *   onChange(view | null): the sheet to show,
@@ -78,6 +79,8 @@ export const LIMITS = Object.freeze({
 export const TIMINGS = Object.freeze({
   APPROVAL_TIMEOUT_MS: 600_000, COOLDOWN_MS: 0, COOLDOWN_LONG_MS: 60_000, COOLDOWN_WINDOW_MS: 600_000,
   SHEET_BUDGET_SHORT_MS: 60_000, STATUS_CACHE_MS: 3_000, IN_FLIGHT_RECHECK_MS: 4_000,
+  // A sent transaction's status, while its sheet shows the outcome: first after this long, growing by half to the most.
+  OUTCOME_FOLLOW_FIRST_MS: 2_000, OUTCOME_FOLLOW_MAX_MS: 10_000,
 });
 export const COOLDOWN_MESSAGE = 'Too many rejected requests from this site, try again later';
 // How long a sheet stays on screen untouched before its confirm arms (browser/DappSheet); a send moves money, so it
@@ -224,8 +227,8 @@ export function spendableTokenBase(p, pick = null) {
 
 /**
  * Whether the preview could not read a balance the send `d` is checked against: the QNC balance for every send, and the
- * token balance for a token transfer, each only as the committee certified it (verified through the light client).
- * Such a send is never offered or signed (the extension's NETWORK).
+ * token balance for a token transfer (each at a genesis node's live tip, its proof folded). Such a send is never offered
+ * or signed (the extension's NETWORK).
  */
 export function previewUnread(d, p) {
   if (!d || !p) return false;
@@ -648,14 +651,14 @@ export function createDappProvider(deps) {
       .filter((e) => e && Number.isSafeInteger(e.nonce) && decimal(e.amount))
       .map((e) => Object.freeze({ nonce: e.nonce, amount: String(e.amount) })));
   }
-  const problemOf = (v) => (v === 'foreign' || v === 'unconfirmed' || v === 'unanswered' ? v : null);
+  const problemOf = (v) => (v === 'unconfirmed' || v === 'unanswered' ? v : null);
 
   // What a token transfer's or a call's preview adds, as the sheet may show it.
   function typePreview(type, p) {
     const digits = (v) => (/^\d+$/.test(String(v)) ? String(v) : null);
     if (type === 'tokenTransfer') {
       return {
-        tokenBalanceBase: digits(p.tokenBalanceBase), tokenVerified: p.tokenVerified === true,
+        tokenBalanceBase: digits(p.tokenBalanceBase),
         tokenSpends: spendsOf(p.tokenSpends), tokenProblem: problemOf(p.tokenProblem),
         depositNano: digits(p.depositNano), listed: p.listed === true,
       };
@@ -683,7 +686,6 @@ export function createDappProvider(deps) {
         nonce: pending.length ? null : nonceOrNull(p.nonce),
         confirmed,
         balanceNano: /^\d+$/.test(String(p.balanceNano)) ? String(p.balanceNano) : null,
-        verified: p.verified === true,
         counterparties: Array.isArray(p.counterparties) ? p.counterparties.slice(0, 200) : [],
         paid: Array.isArray(p.paid) ? p.paid.slice(0, 500) : [],
         senders: Array.isArray(p.senders) ? p.senders.slice(0, 500) : [],
@@ -693,12 +695,10 @@ export function createDappProvider(deps) {
         appendNonce: null,
         // An earlier transaction holds the nonce this send would need, and none can be replaced: Confirm stays off.
         inFlight: pending.length > 0 && replaceNonce === null,
-        recent: Object.freeze(summaries(p.recent, ['nonce', 'kind', 'to', 'amountNano', 'settledAt'])),
         // What each unconfirmed transaction may still take (spendableNano), and why no balance could be read.
         transferFeeNano: String(deps.feeNano()),
         spends: spendsOf(p.spends),
         balanceProblem: problemOf(p.balanceProblem),
-        walkSteps: Number.isSafeInteger(p.walkSteps) && p.walkSteps > 0 ? p.walkSteps : null,
         ...typePreview(a.payload.type, p),
       });
       a.previewError = null;
@@ -860,6 +860,7 @@ export function createDappProvider(deps) {
       // A refusal that waiting may heal goes to the sheet only: the page's result is the extension's `unknown`.
       if (a.kind === 'send') a.outcome = refusal ? { ...result, refusal } : { ...result };
       settle(a, null, result, { hold: a.kind === 'send' });
+      if (a.kind === 'send') followOutcome(a);
       if (a.kind === 'connect') {
         deps.emit(a.origin, 'accountsChanged', { ...result });
         for (const other of [...queue]) {
@@ -889,6 +890,33 @@ export function createDappProvider(deps) {
       settle(a, err(code), undefined, { hold: a.kind === 'send' });
       return { status: 'failed', code };
     }
+  }
+
+  // A send's sheet, while it shows the outcome, follows the transaction by (from, nonce) (deps.transactionStatus) and
+  // says "in a block" once the genesis nodes report it there; never that a call did what it was meant to. It stops when
+  // the sheet closes.
+  function followOutcome(a) {
+    const from = a.outcome && a.outcome.from;
+    const nonce = Number(a.outcome && a.outcome.nonce);
+    if (!deps.transactionStatus || !from || !Number.isSafeInteger(nonce) || nonce < 1) return;
+    let wait = TIMINGS.OUTCOME_FOLLOW_FIRST_MS;
+    const later = () => {
+      const timer = setTimeout(tick, wait);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    };
+    const tick = async () => {
+      if (slot !== a) return;
+      const r = await Promise.resolve().then(() => deps.transactionStatus({ from, nonce })).catch(() => null);
+      if (slot !== a) return;
+      if (r && r.status === 'in_block') {
+        a.outcome = { ...a.outcome, inBlock: true };
+        changed();
+        return;
+      }
+      wait = Math.min(Math.round(wait * 1.5), TIMINGS.OUTCOME_FOLLOW_MAX_MS);
+      later();
+    };
+    later();
   }
 
   /** Closes a sheet that shows an outcome. */

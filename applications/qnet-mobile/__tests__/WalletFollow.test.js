@@ -4,9 +4,8 @@
  *   a lineage reset of the anchors, dropped with the walk's onCapsuleDropped and when the chain goes back;
  * - the foreground follow tick: the head, one walk step (both parities after an own send, and catching up on a parity
  *   behind), the QNC proof, the capsule; the first proof read after a relaunch asks for the newest kept macroblock;
- * - the send check's kept QNC proof valid by its macroblock, not its age; token checks by age as before;
- * - while a long walk runs, a refused send check says how far it is;
- * - the recipient kind from the certified account leaf only, never the nodes' word;
+ * - a long walk refuses no send: the send check reads the genesis nodes' live tip, never a certified proof;
+ * - the recipient kind from two genesis nodes at once, the certified account leaf confirming it in the background;
  * - the move of a node balance checked as the extension checks it: no batch that skips an epoch is ever signed;
  * - the rows of this wallet's history two genesis nodes list alike.
  * The light client's capsule and walk functions are stubbed: their own tests are GalcCapsule, LineageWalk, LineageReset.
@@ -62,9 +61,10 @@ beforeEach(async () => {
   lc.certifiedHeadHint.mockImplementation(async () => at(156));
   lc.exportCapsule.mockImplementation(() => null);
   lc.importCapsule.mockImplementation(async () => ({ ok: true, index: at(106) }));
-  WalletManager.sendProofs.clear();
-  WalletManager.sendReads.clear();
+  WalletManager.liveFigures.clear();
+  WalletManager.liveReads.clear();
   WalletManager.recipientKinds.clear();
+  WalletManager.recipientReads.clear();
   WalletManager.lastOwnSendAt.clear();
   global.fetch = jest.fn(async () => { throw new TypeError('Network request failed'); });
 });
@@ -302,68 +302,17 @@ describe('the first proof read after a relaunch', () => {
 });
 
 describe('the send check', () => {
-  const kept = (index, ageMs) => {
-    WalletManager._keepSendProof(`qnc|${W}`, {
-      ok: true, verified: true, balanceNano: '7000000000', nonce: '5', balance: 7, index,
-    }, 'aa'.repeat(32), index);
-    WalletManager.sendProofs.get(`qnc|${W}`).at -= ageMs;
-  };
-  const manager = (fresh = null) => {
-    const wm = new WalletManager();
-    wm.getQNCBalanceWithProof = jest.fn(async () => fresh);
-    return wm;
-  };
-
-  it('uses a kept QNC proof by its macroblock, however long ago it was read', async () => {
-    kept(at(154), 10 * 60_000);
-    const wm = manager();
-    const r = await wm.certifiedQncForSend(W, { nonce: 5 });
-    expect(r).toMatchObject({ ok: true, verified: true, balanceNano: '7000000000', index: at(154), cached: true });
-    expect(wm.getQNCBalanceWithProof).not.toHaveBeenCalled();
-    // One read a moment ago is used as before, with no head read at all.
-    lc.certifiedHeadHint.mockClear();
-    kept(at(56), 1000);
-    expect(await manager().certifiedQncForSend(W, { nonce: 5 })).toMatchObject({ ok: true, cached: true });
-    expect(lc.certifiedHeadHint).not.toHaveBeenCalled();
-  });
-
-  it('reads again once the head moved past it, or the account nonce passed it', async () => {
-    kept(at(153), 60_000); // a minute old, and three macroblocks below the head
-    const wm = manager({ ok: true, verified: true, balanceNano: '6000000000', nonce: '6', balance: 6, index: at(156), stateRoot: 'bb'.repeat(32) });
-    expect(await wm.certifiedQncForSend(W, { nonce: 6 })).toMatchObject({ ok: true, balanceNano: '6000000000', index: at(156) });
-    expect(wm.getQNCBalanceWithProof).toHaveBeenCalledTimes(1);
-    kept(at(156), 10 * 60_000);
-    const later = manager({ ok: true, verified: true, balanceNano: '5000000000', nonce: '7', balance: 5, index: at(156), stateRoot: 'cc'.repeat(32) });
-    expect(await later.certifiedQncForSend(W, { nonce: 7 })).toMatchObject({ ok: true, balanceNano: '5000000000' });
-    expect(later.getQNCBalanceWithProof).toHaveBeenCalledTimes(1);
-  });
-
-  it('a token check pairs with a QNC proof by its age, as before (a token balance drops without the holder\'s nonce)', async () => {
-    kept(at(155), 10 * 60_000);
-    const wm = manager(null);
-    const got = await wm._certifiedQncBase(W, 5, { byIndex: false });
-    expect(wm.getQNCBalanceWithProof).toHaveBeenCalledTimes(1);
-    expect(got.base).toBeUndefined();
-    expect((await manager()._certifiedQncBase(W, 5)).base).toMatchObject({ index: at(155), cached: true });
-  });
-
-  it('with no head to judge it by, a kept proof counts by its age', async () => {
-    lc.certifiedHeadHint.mockImplementation(async () => null);
-    kept(at(155), 10 * 60_000);
-    const wm = manager(null);
-    expect((await wm._certifiedQncBase(W, 5)).base).toBeUndefined();
-    kept(at(155), 1000);
-    expect((await manager(null)._certifiedQncBase(W, 5)).base).toMatchObject({ cached: true });
-  });
-
-  it('while a long walk is why nothing was certified, the refusal says how many steps are left', async () => {
-    const unconfirmed = { ok: true, verified: false, reason: 'unconfirmed', balance: 1 };
+  // Before, a send leaned on a certified QNC proof the follow kept by its macroblock, and while a long walk ran it was
+  // refused as not confirmed, saying how many steps were left; now the walk decides nothing for a send (owner, 18.10).
+  it('a long lineage walk refuses nothing: the live figure decides, and no certified read or head is asked', async () => {
     lc.stepsToVerify.mockImplementation(() => 57);
-    expect(await manager(unconfirmed).certifiedQncForSend(W, { nonce: 5 })).toMatchObject({ ok: false, error: 'unconfirmed', walkSteps: 57 });
-    lc.stepsToVerify.mockImplementation(() => 1);
-    const short = await manager(unconfirmed).certifiedQncForSend(W, { nonce: 5 });
-    expect(short).toMatchObject({ ok: false, error: 'unconfirmed' });
-    expect(short.walkSteps).toBeUndefined();
+    const wm = new WalletManager();
+    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: false, reason: 'unconfirmed', balance: 1 }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 7, balanceNano: '7000000000', nonce: '5', blockHeight: 9000, figureClaimedEpoch: 0 }));
+    await expect(wm.qncForSend(W, { nonce: 5 })).resolves.toMatchObject({ ok: true, balanceNano: '7000000000', accountNonce: 5 });
+    expect(wm.getQNCBalanceWithProof).not.toHaveBeenCalled();
+    expect(lc.certifiedHeadHint).not.toHaveBeenCalled();
+    expect(wm.walkSteps()).toBe(null); // no head was read for it
   });
 });
 
@@ -453,41 +402,64 @@ describe('the recipient kind', () => {
       const address = /\/api\/v1\/account\/([^/]+)\/balance\/proof/.exec(path)[1];
       return { ok: true, status: 200, data: answer(address), base: opts.nodes[0] };
     });
-    wm.agreedContractKind = jest.fn(async () => 'none');
+    wm.agreedContractKind = jest.fn(async (address) => (address === CONTRACT ? 'contract' : 'none'));
     return wm;
   };
 
-  it('is decided by the certified account leaf: a contract is refused, an account or no account is paid', async () => {
+  // Before (owner, 18.10), a send waited up to 20 s for the certified leaf and was refused without one: a send to a
+  // fresh recipient right after launch waited and failed. These two tests fail on that rule.
+  it('two genesis nodes decide at once; the certified leaf runs beside, and a contract it proved is refused at once', async () => {
     const wm = manager();
     expect(await wm.payableRecipientProblem(CONTRACT, W)).toBe('contract');
     expect(await wm.payableRecipientProblem(TO, W)).toBe(null);
     expect(await wm.payableRecipientProblem(ABSENT, W)).toBe(null);
-    expect(wm.agreedContractKind).not.toHaveBeenCalled();
-    // A contract stays one: asked again, nothing is read; an account's answer is used again while its macroblock is recent.
-    const reads = wm._hedged.mock.calls.length;
+    expect(wm.agreedContractKind.mock.calls.map((c) => c[0])).toEqual([CONTRACT, TO, ABSENT]);
+    expect(wm._hedged).toHaveBeenCalled(); // the certified reads, in the background
+    await flush(10);
+    expect(WalletManager.recipientKinds.get(CONTRACT)).toMatchObject({ kind: 'contract' });
+    // What the certified leaf proved a contract is refused at once, whatever the nodes say now.
+    wm.agreedContractKind = jest.fn(async () => 'none');
     expect(await wm.payableRecipientProblem(CONTRACT, W)).toBe('contract');
-    expect(await wm.payableRecipientProblem(TO, W)).toBe(null);
-    expect(wm._hedged.mock.calls.length).toBe(reads);
-    // Once the head moved on, the kept answer is not used: read again, and a proof of a macroblock no longer recent
-    // decides nothing.
-    lc.certifiedHeadHint.mockImplementation(async () => at(166));
-    const later = manager();
-    expect(await later.payableRecipientProblem(TO, W)).toBe('unchecked');
-    expect(later._hedged).toHaveBeenCalled();
+    expect(wm.agreedContractKind).not.toHaveBeenCalled();
   });
 
-  it('a proof that does not fold to the certified root decides nothing, and the nodes\' word never does', async () => {
+  it('a certified read that never ends delays nothing, and two checks share it; no agreement refuses as unchecked', async () => {
     const wm = manager();
-    mockRoots[at(155)] = 'ff'.repeat(32);
-    wm.agreedContractKind = jest.fn(async () => 'none');
+    wm._hedged = jest.fn(() => new Promise(() => {}));
+    const t0 = Date.now();
+    expect(await wm.payableRecipientProblem(TO, W)).toBe(null);
+    expect(await wm.payableRecipientProblem(TO, W)).toBe(null); // the second check, just before signing
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(WalletManager.recipientReads.size).toBe(1);
+    wm.agreedContractKind = jest.fn(async () => { throw Object.assign(new Error('x'), { code: 'TOKEN_UNAVAILABLE' }); });
     expect(await wm.payableRecipientProblem(TO, W)).toBe('unchecked');
-    expect(wm.agreedContractKind).not.toHaveBeenCalled();
-    // No answer at all: likewise.
-    const silent = manager();
-    silent._hedged = jest.fn(async () => { throw new Error('down'); });
-    expect(await silent.payableRecipientProblem(TO, W)).toBe('unchecked');
     // The wallet's own address is never read.
-    expect(await silent.payableRecipientProblem(W, W)).toBe(null);
+    wm.agreedContractKind.mockClear();
+    expect(await wm.payableRecipientProblem(W, W)).toBe(null);
+    expect(wm.agreedContractKind).not.toHaveBeenCalled();
+  });
+
+  it('the certified leaf: a contract, an account or no account; kept while recent; a proof that does not fold says nothing', async () => {
+    const wm = manager();
+    expect(await wm.certifiedRecipientKind(CONTRACT)).toBe('contract');
+    expect(await wm.certifiedRecipientKind(TO)).toBe('none');
+    expect(await wm.certifiedRecipientKind(ABSENT)).toBe('none');
+    // A contract stays one: asked again, nothing is read; an account's answer is used again while its macroblock is recent.
+    const reads = wm._hedged.mock.calls.length;
+    expect(await wm.certifiedRecipientKind(CONTRACT)).toBe('contract');
+    expect(await wm.certifiedRecipientKind(TO)).toBe('none');
+    expect(wm._hedged.mock.calls.length).toBe(reads);
+    // Once the head moved on, the kept answer is not used: read again, and a proof of a macroblock no longer recent
+    // says nothing.
+    lc.certifiedHeadHint.mockImplementation(async () => at(166));
+    const later = manager();
+    expect(await later.certifiedRecipientKind(TO)).toBe(null);
+    expect(later._hedged).toHaveBeenCalled();
+    lc.certifiedHeadHint.mockImplementation(async () => at(156));
+    WalletManager.recipientKinds.clear();
+    const forged = manager();
+    mockRoots[at(155)] = 'ff'.repeat(32);
+    expect(await forged.certifiedRecipientKind(TO)).toBe(null);
   });
 });
 
@@ -529,6 +501,9 @@ describe('the move of a node balance', () => {
     expect(r).toMatchObject({ success: true, amountNano: '3000000000', prevWatermark: 4, lastEpoch: 9, parts: [[5, '1000000000'], [6, '1500000000'], [9, '500000000']] });
     expect(signedClaims().map((c) => c[0])).toEqual([q.sign_message]);
     expect(wm._submitClaim).toHaveBeenCalledWith(expect.objectContaining({ claims_data: q.claims_data, claim_timestamp: TS }));
+    // Signed by this wallet as a send is (owner, 18.10: before, a claim left the proof reads pinned to an older certified
+    // macroblock): the next proof reads ask for the newest certified state.
+    expect(WalletManager.lastOwnSendAt.get(W)).toBeGreaterThan(Date.now() - 5000);
   });
 
   it('a whole batch is held to a second node\'s quote too: one that left out a middle epoch is never signed', async () => {

@@ -14,9 +14,9 @@ import {
 } from './common.js';
 import { LANGUAGE_NAMES } from './i18n/index.js';
 import {
-  addressCopy, addressText, button, canonicalAmount, checkbox, codeText, countdown, earlierRemoval, errorCode, errorText, field, formatAmount,
-  formatDay, formatTime, heading, kvList, looksLikeKnownAddress, messageLine, newPasswordFields, notice, noticeList, onEnter, openTab,
-  parseSolanaRecipient, passwordInput, qnetTxUrl, segmented, solanaTxUrl, textInput, valueCopy, whileBusy,
+  addressCopy, addressText, button, canonicalAmount, checkbox, codeText, countdown, earlierRemoval, errorCode, errorText, field, figureText,
+  formatAmount, formatDay, formatTime, heading, keepAmountCanonical, kvList, looksLikeKnownAddress, messageLine, newPasswordFields, notice,
+  noticeList, onEnter, openTab, parseSolanaRecipient, passwordInput, qnetTxUrl, segmented, solanaTxUrl, textInput, valueCopy, whileBusy,
 } from './kit.js';
 import { qrMatrix } from './qr.js';
 
@@ -760,8 +760,9 @@ async function renderAssets() {
 }
 
 // The quiet line under the balances: "Updating…" while the first read behind balances drawn from the cache runs, a
-// warning when that read failed (the balances shown are the last ones read) or when no committee certificate verified the
-// QNet balance yet (verification 'none': never drawn as if verified), else nothing.
+// warning when that read failed (the balances shown are the last ones read) or when the QNet balance shown is a certified
+// answer whose certificate is not verified yet (verification 'none', drawn only when no live figure came: never drawn as
+// if verified), else nothing; a balance read at a pinned node's live tip (verification 'live') needs no line.
 function assetStatus(node, text, kind = 'muted') {
   node.className = `small asset-status ${kind === 'warn' ? 'hint-warn' : 'muted'}`;
   node.textContent = text;
@@ -897,6 +898,7 @@ function renderQnetForm(prefill = {}) {
   to.value = prefill.to ?? '';
   amount.value = prefill.amount ?? '';
   const picker = el('select', { className: 'input select', attrs: { name: 'asset' } });
+  keepAmountCanonical(amount, () => (asset === QNC_ASSET ? DECIMALS.QNC : tokenOf(asset)?.decimals ?? DECIMALS.QNC));
   const amountField = field(t('sendAmount', ['QNC']), amount);
   const amountLabel = amountField.querySelector('label');
   const available = el('div', { className: 'hint' });
@@ -905,8 +907,8 @@ function renderQnetForm(prefill = {}) {
   const message = messageLine();
   const next = button(t('sendReview'), null, { kind: 'primary', action: 'review', block: true });
   let qncSpendable = null;
-  // the reads a review makes start ahead of it: the wallet's own certified balance now, a recipient's checks once a whole
-  // address is typed (qnet.sendWarm); the review finds them done
+  // the reads a review makes beside its live read start ahead of it: the certified head now, a recipient's checks once a
+  // whole address is typed (qnet.sendWarm); the review finds them done
   let warmed = null;
   const warm = (params) => call('qnet.sendWarm', params).catch((error) => log.warn('send read ahead failed', error?.code));
   // a form drawn again with its recipient (Back from the review) reads that recipient's checks too
@@ -1010,7 +1012,8 @@ function renderQnetForm(prefill = {}) {
     const [balance] = await Promise.allSettled([
       call('qnet.balance').then((read) => {
         if (!isCurrent()) return;
-        qncSpendable = read.spendableNano ?? read.balanceNano;
+        // null without a live figure: nothing is said available then
+        qncSpendable = read.spendableNano ?? null;
         drawPicker();
       }),
       readSeen('qnet', 'tokens').then(() => {
@@ -1039,9 +1042,7 @@ const CALL_NAMED = Object.freeze({
 const namedText = (key, named) => t(named.call ? CALL_NAMED[key] : key, named.subs);
 
 // The earlier sends not seen applied: this one goes in addition to them, unless it replaces one (signed at
-// its nonce, so only one of the two can apply). A same-amount send to the same address, unconfirmed or signed
-// by this wallet in the last 30 minutes (the vault's own records, R3-EXTQ-01) or in the archive, is named
-// first.
+// its nonce, so only one of the two can apply); a same-amount one to the same address is offered first to replace.
 function outstandingNotices(input, preview) {
   const outstanding = Array.isArray(preview.outstanding) ? preview.outstanding : [];
   if (preview.replacesNonce !== null && preview.replacesNonce !== undefined) {
@@ -1051,10 +1052,8 @@ function outstandingNotices(input, preview) {
     return [notice('warn', namedText('reviewReplaces', replaced ? transferNamed(replaced) : { call: false, subs: [preview.replacesNonce] }))];
   }
   const same = outstanding.filter((p) => p.kind !== 'call' && p.to === preview.to && p.amountNano === preview.amountNano);
-  const duplicate = preview.duplicate === true || same.length > 0 || preview.recipient?.recentSame === true;
   const replaceable = same.length > 0 ? same : outstanding;
   return [
-    duplicate ? notice('danger', t('reviewDuplicate')) : null,
     outstanding.length > 0 ? notice('warn', t('reviewOutstanding', [outstanding.length])) : null,
     ...replaceable.map((p) => button(namedText('reviewReplace', transferNamed(p)),
       () => refreshQnetReview({ ...input, replaceNonce: p.nonce, replacing: transferNamed(p) }, null), { action: 'replace-pending' })),
@@ -1150,10 +1149,9 @@ function tokenTitle(token) {
  * The review of a built-in token transfer (owner, 06.10), what the approval window shows for a dApp's: from, to, the
  * token as two nodes name it and its contract, the amount in its units, the network fee in QNC (the most the gas limit can
  * cost), the refundable storage deposit for a new holder, the QNC total, the token balance, the nonce; a token named
- * after QNC, a burn address, a same transfer not confirmed yet, the transaction it takes the place of, and the recipient
- * warnings. Send stays off while a balance does not cover it or the token balance could not be had (the review says
- * why: no node answered, or it is not confirmed yet); it arms after TIMINGS.CONFIRM_ARM_VALUE_MS. A changed fee or nonce
- * reviews again.
+ * after QNC, a burn address, the transaction it takes the place of, and the recipient warnings. Send stays off while a
+ * balance does not cover it or the token balance could not be had (the review says why: no node answered, or it is not
+ * confirmed yet); it arms after TIMINGS.CONFIRM_ARM_VALUE_MS. A changed fee or nonce reviews again.
  * @param {{token: object, to: string, amount: string}} input
  * @param {object} preview qnet.tokenPreview
  * @param {string|null} [note]
@@ -1193,7 +1191,6 @@ function renderTokenReview(input, preview, note = null) {
     kvList(rows),
     preview.reserved ? notice('danger', t('apTokenReserved')) : null,
     preview.burn ? notice('danger', t('apTokenBurn')) : null,
-    preview.duplicate === true ? notice('danger', t('reviewDuplicate')) : null,
     preview.replacesNonce ? notice('warn', namedText(replaced?.refused === true ? 'reviewReplacesRefused' : 'reviewReplaces',
       replaced ? transferNamed(replaced) : { call: false, subs: [preview.replacesNonce] })) : null,
     !preview.replacesNonce && outstanding.length > 0 ? notice('warn', t('reviewOutstanding', [outstanding.length])) : null,
@@ -1239,16 +1236,85 @@ async function refreshTokenReview(input, note) {
   }
 }
 
-// The hash a node returned is not shown or linked: every node that took the signed body stamps its own
-// copy, and the one that lands may have another hash (R2-EXTQ-06). The transfer is known by its nonce, and
-// History shows the applied one with its real hash.
+// How a sent screen asks where its transaction stands while it is shown: [asks, ms between them] in turn, every 2 s for
+// the first 10 s, every 5 s to the first minute, then every 10 s, five minutes in all (a Solana blockhash expires within
+// about two, which ends that wait as 'expired'). Each QNet ask reads several pinned nodes.
+const SENT_STATUS_STEPS = Object.freeze([[5, 2000], [10, 5000], [24, 10000]]);
+
+// The wait before the ask after `asked` asks (SENT_STATUS_STEPS), or null once they are all made.
+function sentStatusDelay(asked) {
+  let before = 0;
+  for (const [asks, ms] of SENT_STATUS_STEPS) {
+    if (asked < before + asks) return ms;
+    before += asks;
+  }
+  return null;
+}
+
+/**
+ * Asks read() where a sent transaction stands by SENT_STATUS_STEPS while its screen is shown (isCurrent); settle(answer)
+ * draws an answer that decides it and says so (true), which ends the asking.
+ * @param {() => boolean} isCurrent
+ * @param {() => Promise<object>} read
+ * @param {(answer: object|null) => boolean} settle
+ * @returns {void}
+ */
+function followSent(isCurrent, read, settle) {
+  let polls = 0;
+  let timer = null;
+  onDispose(() => clearTimeout(timer));
+  const poll = async () => {
+    timer = null;
+    polls += 1;
+    let answer = null;
+    try {
+      answer = await read();
+    } catch (error) {
+      log.warn('send status unreadable', error?.code);
+    }
+    if (!isCurrent() || settle(answer)) return;
+    const wait = sentStatusDelay(polls);
+    if (wait !== null) timer = setTimeout(poll, wait);
+  };
+  timer = setTimeout(poll, sentStatusDelay(0));
+}
+
+/**
+ * After qnet.send or qnet.tokenSend. The hash a node returned is not shown or linked: every node that took the signed body
+ * stamps its own copy, and the one that lands may have another hash (R2-EXTQ-06). The transfer is known by its nonce: while
+ * the screen is shown it asks where that stands by the pinned nodes' live word (qnet.sentStatus, followSent) and turns
+ * Confirmed once the transaction is in a block, or says so when another transaction of this wallet took its nonce.
+ * History shows the applied one with its real hash.
+ * @param {{status: 'submitted'|'unknown', nonce: string}} result
+ * @returns {void}
+ */
 function renderQnetSent(result) {
-  const submitted = result.status === 'submitted';
-  showTab(el('div', { className: 'stack' },
-    heading(t(submitted ? 'sentTitle' : 'sentUnknownTitle')),
+  const head = el('div', { className: 'heading' });
+  const statusBox = el('div');
+  const isCurrent = showTab(el('div', { className: 'stack' },
+    head,
+    statusBox,
     kvList([[t('reviewNonce'), String(result.nonce)]]),
     actionsRow(button(t('done'), () => selectTab('history'), { kind: 'primary', action: 'done' }))));
+  const draw = (status) => {
+    const title = status === 'in_block' ? 'sentConfirmedTitle' : (result.status === 'submitted' ? 'sentTitle' : 'sentUnknownTitle');
+    head.replaceChildren(el('h2', { text: t(title) }));
+    clear(statusBox);
+    if (status === 'replaced') statusBox.append(notice('warn', t('historyReplacedLead')));
+    else if (status !== 'in_block') statusBox.append(pendingLine(t('sentQnetPendingLead')));
+  };
+  draw('pending');
+  followSent(isCurrent, () => call('qnet.sentStatus', { nonce: result.nonce }), (answer) => {
+    if (answer?.status !== 'in_block' && answer?.status !== 'replaced') return false;
+    draw(answer.status);
+    return true;
+  });
 }
+
+// The line of a sent transaction that waits for its network: a spinner and what it waits for.
+const pendingLine = (text) => el('div', { className: 'row pending-line' },
+  el('div', { className: 'spinner', attrs: { 'aria-hidden': 'true' } }),
+  el('span', { className: 'muted small', text }));
 
 // The tokens of the Solana send: SOL and the SPL tokens this wallet lists (a payment request names a token by its mint).
 const SOLANA_ASSETS = Object.freeze([
@@ -1260,10 +1326,6 @@ const solanaAsset = (asset) => SOLANA_ASSETS.find((entry) => entry.asset === ass
 const REQUEST_REFUSED = Object.freeze({ invalid: 'sendRequestInvalid', token: 'sendRequestInvalid', amount: 'sendRequestAmount' });
 const PAYMENT_REQUEST_RE = /^\s*solana:/i;
 const SOLANA_RECIPIENT_MAX_CHARS = 2048;
-// A submitted Solana send's status is read this often while its screen is shown, at most this many times (its
-// blockhash expires within about two minutes, which ends the wait as 'expired').
-const SOLANA_STATUS_POLL_MS = 2000;
-const SOLANA_STATUS_POLLS_MAX = 150;
 
 // A payment request's parts a Solana send carries, as solana.quote and solana.send take them: none, no key at all.
 function requestParams(request) {
@@ -1326,6 +1388,7 @@ function renderSolanaForm(prefill = {}) {
   const amount = textInput({ name: 'amount', placeholder: '0.0', inputMode: 'decimal', maxLength: 40, ltr: true });
   to.value = prefill.to ?? '';
   amount.value = prefill.amount ?? '';
+  keepAmountCanonical(amount, () => solanaAsset(asset).decimals);
   const max = button(t('sendMax'), null, { kind: 'ghost', action: 'max' });
   const amountField = field(t('sendAmount', [solanaAsset(asset).symbol]), amount, null, max);
   const amountLabel = amountField.querySelector('label');
@@ -1557,7 +1620,7 @@ const SOLANA_SENT = Object.freeze({
 
 /**
  * After solana.send: the signature and where the transaction stands. A submitted one is pending, and its status is
- * read every SOLANA_STATUS_POLL_MS while the screen is shown (solana.status) until it is confirmed (finalized reads as
+ * read while the screen is shown (solana.status, followSent) until it is confirmed (finalized reads as
  * confirmed), failed or expired (it never landed: nothing was spent; Send again). The balance of the token sent is read
  * again while the screen is shown and at once when the transaction settles.
  * @param {{asset: string, to: string, amount: string}} input
@@ -1585,9 +1648,7 @@ function renderSolanaSent(input, result, request = null) {
     head.replaceChildren(el('h2', { text: t(titleKey) }));
     clear(statusBox);
     if (status === 'pending') {
-      statusBox.append(el('div', { className: 'row pending-line' },
-        el('div', { className: 'spinner', attrs: { 'aria-hidden': 'true' } }),
-        el('span', { className: 'muted small', text: t(leadKey) })));
+      statusBox.append(pendingLine(t(leadKey)));
     } else if (leadKey) {
       statusBox.append(notice(kind, t(leadKey)));
     }
@@ -1601,28 +1662,14 @@ function renderSolanaSent(input, result, request = null) {
   });
   readFresh();
   if (result.status !== 'submitted') return;
-  let polls = 0;
-  let timer = null;
-  onDispose(() => clearTimeout(timer));
-  const poll = async () => {
-    timer = null;
-    polls += 1;
-    let answer = null;
-    try {
-      answer = await call('solana.status', { signature: result.signature, lastValidBlockHeight: result.lastValidBlockHeight ?? null });
-    } catch (error) {
-      log.warn('send status unreadable', error?.code);
-    }
-    if (!isCurrent()) return;
-    const status = answer?.status === 'finalized' ? 'confirmed' : answer?.status ?? 'pending';
-    if (Object.hasOwn(SOLANA_SENT, status) && status !== 'pending') {
+  followSent(isCurrent, () => call('solana.status', { signature: result.signature, lastValidBlockHeight: result.lastValidBlockHeight ?? null }),
+    (answer) => {
+      const status = answer?.status === 'finalized' ? 'confirmed' : answer?.status ?? 'pending';
+      if (!Object.hasOwn(SOLANA_SENT, status) || status === 'pending') return false;
       draw(status);
       readFresh({ queue: true });
-      return;
-    }
-    if (polls < SOLANA_STATUS_POLLS_MAX) timer = setTimeout(poll, SOLANA_STATUS_POLL_MS);
-  };
-  timer = setTimeout(poll, SOLANA_STATUS_POLL_MS);
+      return true;
+    });
 }
 
 // ---------------------------------------------------------------- receive
@@ -1771,7 +1818,9 @@ const trimZeros = (text) => text.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')
  * An amount as a row writes it, by the app's rule so both histories read the same (owner, 06.10): below 100,000
  * grouped, with at most 8 decimals below 1 (dust reads "<0.00000001"), 4 from 1 and 2 from 1,000 (98,765.43); from
  * 100,000 with a suffix and at most 2 decimals (123.46K, 18.45B, 4200T); from 10^18 (a token of 128-bit supply) in
- * powers of ten (3.4e32). Never longer than 11 characters; the detail gives the exact figure.
+ * powers of ten (3.4e32). The figures take the UI language's group and decimal marks (figureText; 98.765,43 in German),
+ * a suffixed figure of four digits stays as it is (4200T). Never longer than 11 characters; the detail gives the exact
+ * figure.
  * @param {string} decimal an unsigned decimal string (formatUnits)
  * @returns {string}
  */
@@ -1779,19 +1828,17 @@ function compactAmount(decimal) {
   const n = Math.abs(Number(decimal));
   if (!Number.isFinite(n)) return '—';
   if (n === 0) return '0';
-  if (n < 1e-8) return '<0.00000001';
+  if (n < 1e-8) return `<${figureText('0.00000001')}`;
   if (n >= 1e18) {
     const [mantissa, exponent] = n.toExponential(2).split('e');
-    return `${trimZeros(mantissa)}e${Number(exponent)}`;
+    return `${figureText(trimZeros(mantissa))}e${Number(exponent)}`;
   }
   if (n >= 1e5) {
     const [unit, suffix] = COMPACT_UNITS.find(([size]) => n >= size);
     const scaled = n / unit;
-    return `${trimZeros(scaled.toFixed(scaled >= 1000 ? 0 : 2))}${suffix}`;
+    return `${scaled >= 1000 ? scaled.toFixed(0) : figureText(trimZeros(scaled.toFixed(2)))}${suffix}`;
   }
-  const [whole, fraction] = trimZeros(n.toFixed(n >= 1000 ? 2 : (n >= 1 ? 4 : 8))).split('.');
-  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return fraction ? `${grouped}.${fraction}` : grouped;
+  return figureText(trimZeros(n.toFixed(n >= 1000 ? 2 : (n >= 1 ? 4 : 8))));
 }
 
 /**
@@ -2252,7 +2299,7 @@ function solanaHistoryPages(list, message, more, isCurrent, rowOf) {
 
 function burnShortfall(balances, cost) {
   try {
-    if (BigInt(balances.oneDev.raw) < BigInt(cost) * 10n ** BigInt(DECIMALS.ONE_DEV)) return t('activateNeed1dev', [cost]);
+    if (BigInt(balances.oneDev.raw) < BigInt(cost) * 10n ** BigInt(DECIMALS.ONE_DEV)) return t('activateNeed1dev', [figureText(cost)]);
     if (BigInt(balances.lamports) < BigInt(SOLANA.FEE_BUFFER_LAMPORTS)) {
       return t('activateNeedSol', [formatAmount(String(SOLANA.FEE_BUFFER_LAMPORTS), DECIMALS.SOL, 'SOL')]);
     }
@@ -2286,7 +2333,7 @@ function priceCards(priceResult, balancesResult, blocked) {
     return el('div', { className: `card node-card node-${nodeType}` },
       el('div', { className: 'row between' },
         el('h3', { text: nodeLabel(nodeType) }),
-        el('span', { className: 'price', text: valid ? t('amount1dev', [cost]) : '—' })),
+        el('span', { className: 'price', text: valid ? t('amount1dev', [figureText(cost)]) : '—' })),
       el('p', { className: 'muted small', text: t(`activateAbout_${nodeType}`) }),
       shortfall ? el('p', { className: 'hint hint-warn', text: shortfall }) : null,
       button(t(`activateChoose_${nodeType}`), () => renderBurnConfirm(nodeType, cost), {
@@ -2308,7 +2355,7 @@ function manageLine() {
 function pendingCard(pending) {
   return el('div', { className: 'card' },
     el('div', { className: 'card-label', text: t('activatePendingTitle') }),
-    el('p', { text: t('activatePendingLead', [nodeLabel(pending.nodeType), pending.burnAmount]) }),
+    el('p', { text: t('activatePendingLead', [nodeLabel(pending.nodeType), figureText(pending.burnAmount)]) }),
     el('div', { className: 'mono small wrap', text: pending.burnTx }),
     el('p', { className: 'muted small', text: t('activatePendingNote') }),
     actionsRow(button(t('openSolanaExplorer'), () => openTab(solanaTxUrl(pending.burnTx)), { action: 'pending-explorer' })));
@@ -2472,7 +2519,7 @@ function lookupCodeMasked(lookup) {
 function keptBurnNotice(kept) {
   if (!kept || typeof kept.burnTx !== 'string') return null;
   return el('div', { className: 'stack' },
-    notice('warn', t('activateRecordOther', [String(kept.burnAmount)])),
+    notice('warn', t('activateRecordOther', [figureText(kept.burnAmount)])),
     button(t('openSolanaExplorer'), () => openTab(solanaTxUrl(kept.burnTx)), { action: 'kept-burn' }));
 }
 
@@ -2602,15 +2649,15 @@ async function refreshActivate() {
 function renderBurnConfirm(nodeType, cost) {
   state.activateIdle = false;
   const back = button(t('back'), () => renderActivate(), { action: 'back' });
-  const burn = button(t('activateBurnButton', [cost]), null, { kind: 'danger', action: 'burn', disabled: true });
-  const ack = checkbox('acknowledge', t('activateAck', [cost]), (checked) => {
+  const burn = button(t('activateBurnButton', [figureText(cost)]), null, { kind: 'danger', action: 'burn', disabled: true });
+  const ack = checkbox('acknowledge', t('activateAck', [figureText(cost)]), (checked) => {
     burn.disabled = !checked;
   });
   showTab(el('div', { className: 'stack' },
     heading(t(`activateConfirmTitle_${nodeType}`)),
     kvList([
       [t('activateNodeType'), nodeLabel(nodeType)],
-      [t('activateBurnAmount'), el('strong', { text: t('amount1dev', [cost]) })],
+      [t('activateBurnAmount'), el('strong', { text: t('amount1dev', [figureText(cost)]) })],
       [t('activateToken'), t('activateTokenValue', [SOLANA.CLUSTER])],
       [t('activateMint'), addressText(SOLANA.ONE_DEV_MINT)],
       [t('activateProgram'), el('span', {
@@ -2635,8 +2682,8 @@ async function runBurn(nodeType, cost) {
   state.activateIdle = false;
   const elapsed = el('p', { className: 'muted small' });
   const isCurrent = showTab(el('div', { className: 'stack' },
-    heading(t('activateProgressTitle', [cost])),
-    el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': t('activateProgressTitle', [cost]) } },
+    heading(t('activateProgressTitle', [figureText(cost)])),
+    el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': t('activateProgressTitle', [figureText(cost)]) } },
       el('div', { className: 'progress-bar' })),
     elapsed,
     notice('info', t('activateKeepOpen'))));
@@ -2681,7 +2728,7 @@ function burnFailed(error) {
 function supersededNotice(superseded) {
   if (!superseded || typeof superseded.burnTx !== 'string') return null;
   return el('div', { className: 'stack' },
-    notice('warn', t('activateSuperseded', [String(superseded.burnAmount)])),
+    notice('warn', t('activateSuperseded', [figureText(superseded.burnAmount)])),
     button(t('openSolanaExplorer'), () => openTab(solanaTxUrl(superseded.burnTx)), { action: 'superseded-burn' }));
 }
 

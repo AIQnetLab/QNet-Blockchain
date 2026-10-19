@@ -478,6 +478,29 @@ describe('the link and claim sheets', () => {
     await act(async () => { tree.unmount(); });
   });
 
+  // Before, the done screen said "Credited once confirmed." however long ago the move landed (owner, 18.10).
+  it('the done screen follows the move: in the wallet, or the part of it that is, once the wallet\'s live figure shows it', async () => {
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: SUPER_ID, nodeType: 'super', qnet: ADDRESSES.qnet, amountNano: 48000000000 });
+    QNetLink.performIntent.mockResolvedValue({
+      status: 'ok', qnet: ADDRESSES.qnet, nodeId: SUPER_ID, amountNano: '48000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null,
+    });
+    let outcome = { result: 'moving' };
+    const moveOf = jest.fn(() => outcome);
+    const tree = await mount(CLAIM_L, { moveOf });
+    await wait(ARMED);
+    await act(async () => { await press(button(tree, 'Confirm')); });
+    expect(texts(tree)).toContain(t('claim_credited_on_block'));
+    expect(moveOf).toHaveBeenCalledWith('ab'.repeat(32));
+    outcome = { result: 'done', appliedNano: 48e9 };
+    await act(async () => { tree.update(<QNetLinkScreen {...props} moveOf={() => outcome} />); });
+    expect(texts(tree)).toContain(t('claim_note_done'));
+    expect(texts(tree)).not.toContain(t('claim_credited_on_block'));
+    outcome = { result: 'partial', appliedNano: 12.5e9 };
+    await act(async () => { tree.update(<QNetLinkScreen {...props} moveOf={() => ({ ...outcome })} />); });
+    expect(texts(tree)).toContain(t('claim_note_partial', { amount: '12.5 QNC' }));
+    await act(async () => { tree.unmount(); });
+  });
+
   it('below 1 QNC there is nothing to move, and the answer after Confirm says so', async () => {
     QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim_empty', nodeId: SUPER_ID, nodeType: 'super', qnet: ADDRESSES.qnet });
     QNetLink.performIntent.mockResolvedValue({ status: 'empty', qnet: ADDRESSES.qnet, nodeId: SUPER_ID });

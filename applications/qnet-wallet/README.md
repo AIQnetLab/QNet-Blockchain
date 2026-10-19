@@ -22,7 +22,7 @@ npm run build            # dist/lib/qnet-core.js
 npm test                 # offline tests: bundle, modules, pages, the whole extension, the package
 npm run test:live        # read-only checks against Solana devnet and the QNet Blockchain nodes
 npm run build:dev        # dist-dev/: dist plus localhost content-script matches (git-ignored); again after every dist change, npm test refuses a stale one
-npm run package          # qnet-wallet-3.1.4.zip: the store package (git-ignored)
+npm run package          # qnet-wallet-3.1.5.zip: the store package (git-ignored)
 npm run check:overflow   # headless Chrome: every screen in every language, nothing overflows
 ```
 
@@ -30,7 +30,9 @@ npm run check:overflow   # headless Chrome: every screen in every language, noth
 module (its Argon2id is hash-wasm's WebAssembly, which is why the extension CSP allows
 `'wasm-unsafe-eval'`). `tools/crypto-bundle` compiles it from pinned packages and from the mobile app's
 `WalletIdentity`, `TxBuilders`, `NodePreimages`, `PasswordStrength`, `QcLightClient`, `SmtFold`,
-`fees`, `genesisConsensus`, `tokenSafety` and `boundedFetch` sources (one copy of each for both apps), and the tests
+`fees`, `genesisConsensus`, `tokenSafety` (with the `OffchainMessage` and `solanaFormat` it imports), `boundedFetch`,
+`strictJson`, `amountFormat`, `sendAmount` and `textEdit` sources (one copy of each for both
+apps: the same figures and the same amount field in both wallets), and the tests
 require the shipped file to be byte-identical to a rebuild. `npm run package` zips exactly the
 files `scripts/extension.mjs` lists as shipped. It runs only after the same module's load check
 passes: every file the manifest and pages name exists, every import resolves, and every shipped

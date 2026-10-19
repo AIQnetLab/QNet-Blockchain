@@ -403,13 +403,13 @@ const ownBurn = (activation, wallet) => activation.solanaAddress === wallet.sola
 
 // One step for the vault's light activation: the chain first (two nodes listing it end it: onchain when its
 // registration names this burn, other_burn when it names another, a submit never when that is not known yet), the hold
-// after an admission (the chain read at most every REGISTRATION_ADMIT_CHECK_MS; past the attempt cap, a hold that ends
-// without a block stops it), then a submit. `manual`: the user asked (Record on the network), so a stopped or not yet due
-// registration goes too, and an activation without a record is looked up at once. A record on chain (onchain or
-// other_burn) is read again when the user or a confirmed site request asks (`manual`, `recheck`), else at most every
-// REGISTRATION_CHECK_MS: two nodes that both say the chain does not list the node (a block a rollback took back) queue it
-// again from the start.
-async function attempt(manual, recheck = false) {
+// after an admission (the chain read at most every REGISTRATION_ADMIT_CHECK_MS, and on every read of a page that shows
+// the record being made: `watch`; past the attempt cap, a hold that ends without a block stops it), then a submit.
+// `manual`: the user asked (Record on the network), so a stopped or not yet due registration goes too, and an activation
+// without a record is looked up at once. A record on chain (onchain or other_burn) is read again when the user or a
+// confirmed site request asks (`manual`, `recheck`), else at most every REGISTRATION_CHECK_MS: two nodes that both say the
+// chain does not list the node (a block a rollback took back) queue it again from the start.
+async function attempt(manual, recheck = false, watch = false) {
   const wallet = await session.requireUnlocked();
   const state = await vault.readState();
   const { activation } = state;
@@ -442,7 +442,9 @@ async function attempt(manual, recheck = false) {
     if (registration?.state !== 'queued') return publicRegistration(registration);
     return publicRegistration(await submit(registration, wallet.qnetAddress, activation));
   }
-  if (!manual && !due(registration, now)) {
+  // an admitted registration a page is watching is looked up on chain at every read, a submit only when one is due
+  const watched = watch && registration.state === 'admitted';
+  if (!manual && !watched && !due(registration, now)) {
     await syncAlarm(registration);
     return publicRegistration(registration);
   }
@@ -458,6 +460,7 @@ async function attempt(manual, recheck = false) {
   }
   if (registration.state === 'admitted') {
     const holdEnds = (registration.admittedAt ?? 0) + TIMINGS.REGISTRATION_ADMIT_HOLD_MS;
+    if (now < holdEnds && !manual && !due(registration, now)) return publicRegistration(registration);
     if (now < holdEnds) {
       return publicRegistration(await patch(registration, { nextAt: Math.min(now + TIMINGS.REGISTRATION_ADMIT_CHECK_MS, holdEnds) }));
     }
@@ -479,21 +482,26 @@ function inLane(fn) {
 }
 
 let recheckAsked = false;
+let watchAsked = false;
 
 /**
  * The next automatic step of the registration when one is due (sw.js after an unlock, the REGISTRATION_ALARM,
  * activation.js after it queued one, a page reading it). Never throws.
- * @param {{recheck?: boolean}} [options] recheck: a confirmed site request for the activation asks the chain again about
- *   a record on chain (attempt)
+ * @param {{recheck?: boolean, watch?: boolean}} [options] recheck: a confirmed site request for the activation asks the
+ *   chain again about a record on chain; watch: a page shows the record being made, so an admitted registration is
+ *   looked up on chain now (attempt)
  * @returns {Promise<RegistrationView|null>}
  */
 export function resumeRegistration(options = {}) {
   if (options?.recheck === true) recheckAsked = true;
+  if (options?.watch === true) watchAsked = true;
   resumeWaiting ??= inLane(() => {
     resumeWaiting = null;
     const recheck = recheckAsked;
+    const watch = watchAsked;
     recheckAsked = false;
-    return attempt(false, recheck);
+    watchAsked = false;
+    return attempt(false, recheck, watch);
   }).catch(async (error) => {
     log.warn('node registration not resumed', error?.code ?? error?.name);
     // locked: the unlock resumes it (sw.js), so the alarm stops waking the worker meanwhile
@@ -522,15 +530,17 @@ export async function requestRecord() {
 }
 
 /**
- * Handler of `activation.registration` (the popup's status line, the activation window after its answer): the
- * vault's registration, and the next step started in the background when one is due.
+ * Handler of `activation.registration` (the popup's status line, the activation window after its answer; both read it
+ * every REGISTRATION_POLL_MS while the record is being made): the vault's registration, and the next step started in the
+ * background when one is due; an admitted registration is looked up on chain at each read (resumeRegistration's watch), so
+ * the page shows it on chain at the next read after its block.
  * @returns {Promise<{registration: RegistrationView|null}>}
  * @throws {WalletError} LOCKED
  */
 export async function getRegistration() {
   await session.requireUnlocked();
   const { registration } = await vault.readState();
-  resumeRegistration();
+  resumeRegistration({ watch: true });
   return { registration: publicRegistration(registration) };
 }
 

@@ -1,7 +1,7 @@
 // View by address (owner, 13.10): a typed address is a read-only view, never a connection. It is kept for the tab apart
 // from the connected wallet, the header and the progress never show it as connected, no action that needs the wallet is
-// offered, and neither the page nor the site's status route carries the device details that are the owner's, not the
-// network's (the platform, the model, the day it linked, its account of a missed epoch).
+// offered, and neither the page nor the site's status and history routes carry the device details that are the owner's,
+// not the network's (the platform, the model, the day it linked, its account of a missed epoch).
 // Run: npm run test:wallet
 
 import { test } from 'node:test';
@@ -11,7 +11,7 @@ import {
   VIEW_KEY, WALLET_KEY, loadViewing, parseChoice, saveChoice, saveViewing, shownWallet,
 } from '../cabinet/wallet-choice.ts';
 import { TABS, visibleTabs } from '../cabinet/tabs.ts';
-import { parseStatusView, publicStatus, statusPath } from '../cabinet/node-view.ts';
+import { historyPagePath, parseHistoryView, parseStatusView, publicHistory, publicStatus, statusPath } from '../cabinet/node-view.ts';
 import { createNodeProxy, viewRead } from '../../server/cabinet/node-proxy.ts';
 
 const SRC = new URL('../../', import.meta.url);
@@ -131,6 +131,36 @@ test('the device details that are the owner\'s are left out of a view: the route
   const dir = new URL('components/cabinet/', SRC);
   for (const name of readdirSync(dir).filter((n) => n.endsWith('.tsx'))) {
     for (const call of code(`components/cabinet/${name}`).match(/useNodeStatus\([^;]*?\)(?=\.state|;)/g) ?? []) {
+      assert.match(call, /, viewOnly\)$/, `${name}: ${call}`);
+    }
+  }
+  // History likewise (batch 18.10): a view's page carries no reason an epoch was missed, every other field stays, and its
+  // read is its own address too.
+  const why = { epoch: 150, reason: 'not_delivered', delivered: false };
+  const page = {
+    registeredEpoch: 140, archived: true, more: false, earned: null,
+    rows: [
+      { epoch: 151, result: 'counted', amountQnc: 1, startedAt: null, endedAt: null, claimTx: null, miss: null },
+      { epoch: 150, result: 'missed', amountQnc: null, startedAt: null, endedAt: null, claimTx: null, miss: why },
+    ],
+  };
+  const viewedPage = publicHistory(page);
+  assert.deepEqual(viewedPage, { ...page, rows: page.rows.map((r) => ({ ...r, miss: null })) });
+  assert.deepEqual(parseHistoryView(viewedPage), viewedPage);
+  assert.equal(page.rows[1].miss, why, 'the cached page itself is untouched');
+  assert.equal(historyPagePath(NODE, 0, false), `/api/cabinet/node/${NODE}/history`);
+  assert.equal(historyPagePath(NODE, 0, true), `/api/cabinet/node/${NODE}/history?view=1`);
+  assert.equal(historyPagePath(NODE, 2, false), `/api/cabinet/node/${NODE}/history?page=2`);
+  assert.equal(historyPagePath(NODE, 2, true), `/api/cabinet/node/${NODE}/history?page=2&view=1`);
+  const hooks = code('hooks/useNodeStatus.ts');
+  assert.match(hooks, /export function useNodeHistory\(nodeId: string \| null, view: boolean\) \{\s*return useSharedRead<HistoryView>\(nodeId \? historyPagePath\(nodeId, 0, view\) : null, parseHistoryView, false\);/);
+  assert.match(hooks, /void load\(historyPagePath\(nodeId, older\.length \+ 1, view\), parseHistoryView\)/);
+  assert.doesNotMatch(hooks, /\/history/);
+  const history = code('components/cabinet/NodeHistory.tsx');
+  assert.equal(history.match(/useNodeHistory\(nodeId, viewOnly\)/g)?.length, 2);
+  assert.match(history, /const list = useEpochList\(nodeId, first, viewOnly\);/);
+  for (const name of readdirSync(dir).filter((n) => n.endsWith('.tsx'))) {
+    for (const call of code(`components/cabinet/${name}`).match(/use(?:NodeHistory|EpochList)\([^;]*?\)(?=;)/g) ?? []) {
       assert.match(call, /, viewOnly\)$/, `${name}: ${call}`);
     }
   }

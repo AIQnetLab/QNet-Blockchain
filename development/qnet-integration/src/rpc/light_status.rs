@@ -10,7 +10,8 @@
 //! ping key or its wallet key, adds the binding's exact sequence, the registration record, the device record's state,
 //! lease window, rotation and pause (A13), whether the app should register its push token again, and the device's
 //! timeline (H-1): the time of its last counted answer, the times and the app's outcome of its last miss, and its last
-//! answer. Reads only; RPC policy, no block rule reads any of it.
+//! answer. `GET /api/v1/light-node/misses` serves the same view's misses, epoch by epoch, in the public form.
+//! Reads only; RPC policy, no block rule reads any of it.
 //!
 //! Wire forms: `docs/protocols/light-node-messages.md` sections 4 and 7.
 
@@ -108,9 +109,9 @@ pub(crate) struct DeviceView {
     pub(crate) last_answer_at: Option<u64>,
     /// "online", "offline", "unlinked" or "other_device_pending".
     pub(crate) state: &'static str,
-    /// The latest epoch the node was not counted in, as this genesis saw it (`shown_miss`); None while no device is
-    /// bound, and where this genesis recorded none.
-    pub(crate) last_miss: Option<LightMiss>,
+    /// The epochs the node was not counted in, newest first, as this genesis saw them (`shown_misses`); the newest is
+    /// the served `last_miss`. Empty while no device is bound, and where this genesis recorded none.
+    pub(crate) misses: Vec<LightMiss>,
     /// The node's last answer that counted, as this genesis took it; None while no device is bound.
     pub(crate) last_answer: Option<LastAnswer>,
 }
@@ -124,7 +125,7 @@ impl DeviceView {
             "linked_since": self.linked_since,
             "last_answer_epoch": self.last_answer_epoch,
             "state": self.state,
-            "last_miss": self.last_miss.as_ref().map(LightMiss::public_json),
+            "last_miss": self.misses.first().map(LightMiss::public_json),
         })
     }
 
@@ -133,7 +134,7 @@ impl DeviceView {
     pub(crate) fn signed_json(&self) -> Value {
         let mut v = self.public_json();
         v["last_answer_at"] = json!(self.last_answer_at);
-        v["last_miss"] = self.last_miss.as_ref().map_or(Value::Null, LightMiss::to_json);
+        v["last_miss"] = self.misses.first().map_or(Value::Null, LightMiss::to_json);
         v["last_answer"] = self.last_answer.as_ref().map_or(Value::Null, LastAnswer::to_json);
         v
     }
@@ -159,7 +160,7 @@ pub(crate) fn device_view(onchain: bool, binding: Option<&BindingRow>, needs_rea
         last_answer_epoch,
         last_answer_at: None,
         state,
-        last_miss: None,
+        misses: Vec::new(),
         last_answer: None,
     })
 }
@@ -217,14 +218,12 @@ pub(crate) fn recent_neutral(elig_shards: [Option<u8>; 2], shard: usize) -> bool
     elig_shards.iter().any(|m| m.map_or(true, |m| shard >= 8 || m & (1u8 << shard) == 0))
 }
 
-/// The device view's `last_miss`: of the record this genesis holds since the binding it holds (`LightPushRow::since`)
-/// and the derived one (`dormant_miss` proven by the dormant rule, or `not_committed_miss`), the later epoch, at one
-/// epoch the one that tells more.
-pub(crate) fn shown_miss(stored: Option<LightMiss>, dormant: Option<LightMiss>) -> Option<LightMiss> {
-    match (stored, dormant) {
-        (Some(s), Some(d)) => Some(LightMiss::merge(Some(s), d)),
-        (s, d) => s.or(d),
-    }
+/// The device view's misses, newest first: the ones this genesis holds since the binding it holds
+/// (`LightPushRow::since`) with the derived one (`dormant_miss` proven by the dormant rule, or `not_committed_miss`)
+/// merged in as the row merges a record (`LightMiss::merge_into`): at one epoch the one that tells more.
+pub(crate) fn shown_misses(mut stored: Vec<LightMiss>, derived: Option<LightMiss>) -> Vec<LightMiss> {
+    if let Some(d) = derived { LightMiss::merge_into(&mut stored, d); }
+    stored
 }
 
 /// The time of the answer that counted `node_id` in its latest counted epoch: the newest of this genesis's rows
@@ -235,29 +234,38 @@ pub(crate) fn last_counted_answer_at(storage: &crate::storage::Storage, node_id:
     (0..3u64).filter_map(|k| cur.checked_sub(k)).find_map(|e| storage.light_counted_answer_at(node_id, e))
 }
 
-/// The bound device's platform, a display hint: the device record's when a record holds this very binding (it
-/// is the platform the device proved), else the hint its bind named, kept with the push record of the same
-/// binding, else "" (`unknown`). A genesis that took the binding only by gossip or the identity pull, before the
-/// token sync reached it, knows none.
+/// The bound device's platform as the status shows it (`device_platform_of`), "" for `unknown`. A genesis that took
+/// the binding only by gossip or the identity pull, before the token sync reached it, knows none.
 #[cfg(test)]
 fn device_platform(storage: &crate::storage::Storage, node_id: &str, binding: &BindingRow,
                    record: Option<&crate::light_device::record::DeviceRecord>) -> &'static str {
     device_hints(storage, node_id, binding, record).0
 }
 
-/// The bound device's platform (as `device_platform` says it) and model, both display hints. The model is the one
+/// The bound device's platform (`device_platform_of`) and model, as the status shows them. The model is the one
 /// the bind named, kept with the push record of the same binding, else "": also when the bind named a platform
 /// other than the one the device record of this binding proved, since then neither hint describes that device.
 fn device_hints(storage: &crate::storage::Storage, node_id: &str, binding: &BindingRow,
                 record: Option<&crate::light_device::record::DeviceRecord>) -> (&'static str, String) {
-    if !(binding.v2 && binding.seq > 0 && binding.device_bound()) { return ("", String::new()); }
-    let entry = storage.get_fcm_entry(node_id).filter(|e| e.seq == binding.seq);
-    let named = entry.as_ref().map_or("", |e| lb::platform_hint(Some(e.platform.as_str())));
-    let model = entry.as_ref().map_or("", |e| lb::model_hint(Some(e.model.as_str()))).to_string();
-    match record.filter(|r| r.seq == binding.seq).map(|r| r.platform.as_str()) {
-        Some(proven) if !named.is_empty() && named != proven => (proven, String::new()),
-        Some(proven) => (proven, model),
-        None => (named, model),
+    let bound = (binding.v2 && binding.device_bound()).then_some(binding.seq);
+    let entry = storage.get_fcm_entry(node_id);
+    let (platform, named_holds) = device_platform_of(bound, entry.as_ref(), record);
+    let model = entry.filter(|e| named_holds && Some(e.seq) == bound)
+        .map_or(String::new(), |e| lb::model_hint(Some(e.model.as_str())).to_string());
+    (platform, model)
+}
+
+/// The bound device's platform, one rule for the status (`device_hints`) and the pinger's schedule
+/// (`PushReach::ios`): for the binding of sequence `bound` (a v2 binding with a device bound, else None and ""), the
+/// platform its device record proved, else the one its bind named, kept with its push record `entry`, else "". Also
+/// whether that bind's hint describes the device: false when it names another platform than the proven one.
+pub(crate) fn device_platform_of(bound: Option<u64>, entry: Option<&crate::storage::FcmEntry>,
+                                 record: Option<&crate::light_device::record::DeviceRecord>) -> (&'static str, bool) {
+    let Some(seq) = bound else { return ("", false); };
+    let named = entry.filter(|e| e.seq == seq).map_or("", |e| lb::platform_hint(Some(e.platform.as_str())));
+    match record.filter(|r| r.seq == seq).map(|r| r.platform.as_str()) {
+        Some(proven) => (proven, named.is_empty() || named == proven),
+        None => (named, true),
     }
 }
 
@@ -414,8 +422,8 @@ pub(crate) async fn light_status(blockchain: &BlockchainNode, node_id: &str, ask
                       else { counted.last_counted_epoch };
     let mut device_view = device_view(onchain, binding.as_ref(), needs_reactivation, platform, &model, last_answer, now);
     if let Some(d) = device_view.as_mut() { d.last_answer_at = last_counted_answer_at(&storage, node_id, cur_height); }
-    // Why the node was last not counted and its last answer, while a device is bound: only what came after the
-    // binding held here, so never the device it replaced.
+    // Why the node was not counted in each epoch and its last answer, while a device is bound: only what came after
+    // the binding held here, so never the device it replaced.
     let bound_at = binding.as_ref().filter(|b| b.device_bound()).map(|b| b.bound_at);
     if let (Some(d), Some(bound_at)) = (device_view.as_mut(), bound_at) {
         let row = stored_row(&storage, node_id).unwrap_or_default().since(bound_at);
@@ -423,7 +431,7 @@ pub(crate) async fn light_status(blockchain: &BlockchainNode, node_id: &str, ask
         // epoch (`proven_dormant`, an owner's reach records); a genesis that cannot prove them shows none.
         let dormant = dormant_miss(registered_height, cur_height, uptime, done)
             .filter(|m| proven_dormant(&storage, &REACH_CACHE, &DormantFacts::read(&storage, m.epoch), node_id, shard, m.epoch));
-        d.last_miss = shown_miss(row.miss, dormant.or_else(|| not_committed_miss(registered_height, cur_height, done_raw, committed)));
+        d.misses = shown_misses(row.misses, dormant.or_else(|| not_committed_miss(registered_height, cur_height, done_raw, committed)));
         d.last_answer = row.answer;
     }
     let push_reregister = onchain && device_bound && push_reregister(&storage, node_id, cur_height / EPOCH_BLOCKS);
@@ -524,6 +532,17 @@ fn parse_nonce(s: Option<&str>) -> Option<[u8; 16]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
+/// The `node_id` of a keyless light-node query, or the answer that refuses one without it.
+fn node_id_param(params: &HashMap<String, String>) -> Result<String, warp::reply::Json> {
+    match params.get("node_id") {
+        Some(id) if !id.is_empty() && id.len() <= 128 => Ok(id.clone()),
+        _ => Err(warp::reply::json(&json!({
+            "success": false,
+            "error": "node_id parameter required"
+        }))),
+    }
+}
+
 /// `GET /api/v1/light-node/status?node_id=&nonce=`: the public form.
 pub(super) async fn handle_light_node_status(
     params: HashMap<String, String>,
@@ -533,17 +552,47 @@ pub(super) async fn handle_light_node_status(
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
         return Ok(rate_limit_response);
     }
-    let node_id = match params.get("node_id") {
-        Some(id) if !id.is_empty() && id.len() <= 128 => id.clone(),
-        _ => return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "node_id parameter required"
-        }))),
+    let node_id = match node_id_param(&params) {
+        Ok(id) => id,
+        Err(refused) => return Ok(refused),
     };
     // `fwd=1` marks the shard-owner consultation of another genesis: answered from this view alone.
     let s = light_status(&blockchain, &node_id, !params.contains_key("fwd")).await;
     let nonce = parse_nonce(params.get("nonce").map(|n| n.as_str()));
     Ok(warp::reply::json(&public_json(&s, nonce.as_ref())))
+}
+
+/// The misses route's `limit`: 1 to MISS_HISTORY_EPOCHS, the whole history when absent or not a number.
+fn misses_limit(limit: Option<&String>) -> usize {
+    let max = MISS_HISTORY_EPOCHS as usize;
+    limit.and_then(|l| l.trim().parse::<usize>().ok()).unwrap_or(max).clamp(1, max)
+}
+
+/// The misses route's answer: the device view's misses (`DeviceView::misses`, the status's `last_miss` first), newest
+/// first, at most `limit`, each in the public form (`LightMiss::public_json`); none while no device is bound.
+pub(crate) fn misses_json(s: &LightStatus, limit: usize) -> Value {
+    let misses: Vec<Value> = s.device_view.as_ref()
+        .map_or(Vec::new(), |d| d.misses.iter().take(limit).map(LightMiss::public_json).collect());
+    json!({ "success": s.known, "node_id": s.node_id, "misses": misses })
+}
+
+/// `GET /api/v1/light-node/misses?node_id=&limit=`: why the node was not counted, epoch by epoch, as this genesis saw
+/// it. Only a shard owner keeps the records, the one that pushed the node or took its answer; a reader merges the
+/// owners' answers per epoch. Answered from this genesis's view alone.
+pub(super) async fn handle_light_node_misses(
+    params: HashMap<String, String>,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    let node_id = match node_id_param(&params) {
+        Ok(id) => id,
+        Err(refused) => return Ok(refused),
+    };
+    let s = light_status(&blockchain, &node_id, false).await;
+    Ok(warp::reply::json(&misses_json(&s, misses_limit(params.get("limit")))))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -726,7 +775,7 @@ mod tests {
         // Online: counted (or in its first epochs) with a device bound.
         assert_eq!(view(Some(&row), false, "ios", Some(155), NOW),
                    DeviceView { platform: Some("ios"), model: None, linked_since: Some(day), last_answer_epoch: Some(155),
-                                  last_answer_at: None, state: "online", last_miss: None, last_answer: None });
+                                  last_answer_at: None, state: "online", misses: Vec::new(), last_answer: None });
         // Offline: bound, not counted in this epoch or the last two, linked longer than an epoch ago.
         let off = view(Some(&row), true, "", Some(150), seq + LINK_GRACE_SECS);
         assert_eq!((off.state, off.platform, off.last_answer_epoch), ("offline", Some("unknown"), Some(150)));
@@ -738,7 +787,7 @@ mod tests {
         for b in [None, Some(&withdrawn)] {
             assert_eq!(view(b, true, "ios", Some(140), NOW),
                        DeviceView { platform: None, model: None, linked_since: None, last_answer_epoch: Some(140),
-                                      last_answer_at: None, state: "unlinked", last_miss: None, last_answer: None });
+                                      last_answer_at: None, state: "unlinked", misses: Vec::new(), last_answer: None });
         }
         // A legacy binding has no sequence: no day, and never "just linked".
         let legacy = BindingRow { cert: "legacy".into(), seq: 0, v2: false, ..row.clone() };
@@ -776,10 +825,10 @@ mod tests {
         let mut s = status(Some(bound_row()));
         if let Some(dv) = s.device_view.as_mut() {
             dv.last_answer_at = Some(1_800_000_100);
-            dv.last_miss = Some(LightMiss { epoch: 160, reason: MissReason::WokenNoAnswer, woken_at: Some(1_799_990_000),
-                                            answered_at: None, delivery_delay_secs: Some(240), refused: None, recorded_at: 9,
-                                            delivered_at: Some(1_799_990_240), app_outcome: Some(AppOutcome::Swiped),
-                                            by_push: true });
+            dv.misses = vec![LightMiss { epoch: 160, reason: MissReason::WokenNoAnswer, woken_at: Some(1_799_990_000),
+                                         answered_at: None, delivery_delay_secs: Some(240), refused: None, recorded_at: 9,
+                                         delivered_at: Some(1_799_990_240), app_outcome: Some(AppOutcome::Swiped),
+                                         by_push: true }];
             dv.last_answer = Some(LastAnswer { at: 1_800_000_100, delivery_delay_secs: Some(30), handling_secs: Some(2) });
         }
         let p = public_json(&s, None);
@@ -802,7 +851,7 @@ mod tests {
         assert_eq!(v["device"]["last_answer"], json!({"at": 1_800_000_100u64, "delivery_delay_secs": 30, "handling_secs": 2}));
         // `delivered`: false for a push that never reached the phone, unknown where nothing told.
         let miss = |r: MissReason| LightMiss { reason: r, delivered_at: None, delivery_delay_secs: None, app_outcome: None,
-                                               ..s.device_view.as_ref().unwrap().last_miss.clone().unwrap() };
+                                               ..s.device_view.as_ref().unwrap().misses[0].clone() };
         assert_eq!(miss(MissReason::NotDelivered).public_json()["delivered"], json!(false));
         assert_eq!(miss(MissReason::WokenNoAnswer).public_json()["delivered"], Value::Null);
         assert_eq!(miss(MissReason::NotWokenInactive).public_json(), json!({"epoch": 160, "reason": "not_woken_inactive",
@@ -816,7 +865,7 @@ mod tests {
 
     /// 05.10: the device view says why the node was last not counted and how its last answer reached it. The dormant
     /// rule's miss is derived from the committed index, alike at every genesis; a record written here wins at its
-    /// epoch, and a later epoch wins over both.
+    /// epoch, and the latest epoch is the last miss.
     #[test]
     fn the_device_view_names_the_last_miss_and_the_last_answer() {
         let reg = Some(100 * E + 5);
@@ -833,17 +882,21 @@ mod tests {
         assert_eq!(dormant_miss(reg, 0, None, done), None, "no finished epoch");
         let stored = |e, r| LightMiss { epoch: e, reason: r, woken_at: Some(5), answered_at: None, delivery_delay_secs: None,
                                         refused: None, recorded_at: 9, delivered_at: None, app_outcome: None, by_push: true };
-        assert_eq!(shown_miss(Some(stored(158, MissReason::WokenNoAnswer)), Some(d.clone())).map(|m| m.epoch), Some(159));
-        assert_eq!(shown_miss(Some(stored(159, MissReason::WokenNoAnswer)), Some(d.clone())).map(|m| m.reason),
-                   Some(MissReason::WokenNoAnswer), "what this genesis saw tells more at the same epoch");
-        assert_eq!(shown_miss(Some(stored(160, MissReason::AnsweredLate)), Some(d.clone())).map(|m| m.epoch), Some(160));
-        assert_eq!(shown_miss(None, Some(d.clone())), Some(d));
-        assert_eq!(shown_miss(None, None), None);
+        let shown = |stored: Vec<LightMiss>, derived: Option<LightMiss>| {
+            shown_misses(stored, derived).iter().map(|m| (m.epoch, m.reason)).collect::<Vec<_>>()
+        };
+        assert_eq!(shown(vec![stored(158, MissReason::WokenNoAnswer)], Some(d.clone())),
+                   vec![(159, MissReason::NotWokenInactive), (158, MissReason::WokenNoAnswer)], "the derived one at its epoch");
+        assert_eq!(shown(vec![stored(159, MissReason::WokenNoAnswer)], Some(d.clone())), vec![(159, MissReason::WokenNoAnswer)],
+                   "what this genesis saw tells more at the same epoch");
+        assert_eq!(shown(vec![stored(160, MissReason::AnsweredLate)], Some(d.clone()))[0], (160, MissReason::AnsweredLate));
+        assert_eq!(shown_misses(vec![], Some(d.clone())), vec![d.clone()]);
+        assert_eq!(shown_misses(vec![], None), vec![]);
         // Rendered in the public form by its epoch and reason, and in full in the signed one (H-1).
         let mut s = status(Some(bound_row()));
         if let Some(dv) = s.device_view.as_mut() {
-            dv.last_miss = Some(LightMiss { answered_at: Some(1_800_000_900), delivery_delay_secs: Some(7_200),
-                                            ..stored(160, MissReason::AnsweredLate) });
+            dv.misses = vec![LightMiss { answered_at: Some(1_800_000_900), delivery_delay_secs: Some(7_200),
+                                         ..stored(160, MissReason::AnsweredLate) }, d.clone()];
             dv.last_answer = Some(LastAnswer { at: 1_799_000_000, delivery_delay_secs: None, handling_secs: Some(2) });
         }
         let p = public_json(&s, None);
@@ -859,8 +912,8 @@ mod tests {
                                   app_outcome: Some(AppOutcome::Swiped), ..stored(160, MissReason::WokenNoAnswer) };
         assert_eq!((refined.to_json()["delivered_at"].clone(), refined.to_json()["app_outcome"].clone()),
                    (json!(1_800_000_300u64), json!("swiped")));
-        assert_eq!(shown_miss(Some(stored(159, MissReason::NotDelivered)), dormant_miss(reg, cur, row, done)).map(|m| m.reason),
-                   Some(MissReason::NotDelivered));
+        assert_eq!(shown(vec![stored(159, MissReason::NotDelivered)], dormant_miss(reg, cur, row, done)),
+                   vec![(159, MissReason::NotDelivered)]);
         assert_eq!(stored(159, MissReason::NotDelivered).to_json()["reason"], json!("not_delivered"));
         assert_eq!(v["device"]["last_answer"], json!({"at": 1_799_000_000u64, "delivery_delay_secs": null, "handling_secs": 2}));
         assert!(holds(&v["device"], &p["device"]));
@@ -871,6 +924,63 @@ mod tests {
         assert!(body.contains("let bound_at = binding.as_ref().filter(|b| b.device_bound()).map(|b| b.bound_at);"));
         assert!(body.contains("let row = stored_row(&storage, node_id).unwrap_or_default().since(bound_at);"));
         assert!(body.contains("dormant_miss(registered_height, cur_height, uptime, done)"));
+    }
+
+    /// The misses route: the device view's misses newest first, the status's `last_miss` the first of them, each in the
+    /// public form (no time, nothing of what the app did), at most `limit`, none while no device is bound; the keyless
+    /// route under the read-only limit, answered from this genesis's view alone.
+    #[test]
+    fn the_misses_route_serves_the_device_views_misses_in_the_public_form() {
+        let miss = |e: u64, r: MissReason| LightMiss {
+            epoch: e, reason: r, woken_at: Some(1_799_990_000), answered_at: Some(1_799_999_000), delivery_delay_secs: Some(240),
+            refused: None, recorded_at: 9, delivered_at: Some(1_799_990_240), app_outcome: Some(AppOutcome::Swiped), by_push: true,
+        };
+        let mut s = status(Some(bound_row()));
+        if let Some(dv) = s.device_view.as_mut() {
+            dv.misses = vec![miss(162, MissReason::NotDelivered), miss(160, MissReason::WokenNoAnswer),
+                             LightMiss { refused: Some("superseded".into()), ..miss(158, MissReason::AnswerRefused) }];
+        }
+        let v = misses_json(&s, MISS_HISTORY_EPOCHS as usize);
+        assert_eq!(v, json!({"success": true, "node_id": s.node_id, "misses": [
+            {"epoch": 162, "reason": "not_delivered", "delivered": false},
+            {"epoch": 160, "reason": "woken_no_answer", "delivered": true},
+            {"epoch": 158, "reason": "answer_refused", "delivered": true},
+        ]}));
+        assert_eq!(v["misses"][0], public_json(&s, None)["device"]["last_miss"], "the status's last miss is the newest");
+        let wire = v.to_string();
+        for leak in ["1799990000", "1799999000", "1799990240", "swiped", "superseded", "woken_at", "app_outcome", "recorded_at"] {
+            assert!(!wire.contains(leak), "{leak} in the public form");
+        }
+        assert_eq!(misses_json(&s, 2)["misses"].as_array().unwrap().len(), 2);
+        assert_eq!(misses_json(&s, 1)["misses"], json!([{"epoch": 162, "reason": "not_delivered", "delivered": false}]));
+        let unlinked = LightStatus { device_view: None, ..status(None) };
+        assert_eq!(misses_json(&unlinked, 64)["misses"], json!([]));
+        let absent = LightStatus { known: false, device_view: None, ..status(None) };
+        assert_eq!(misses_json(&absent, 64)["success"], json!(false));
+        // The limit: 1 to the history's window, the whole window when absent or not a number.
+        let max = MISS_HISTORY_EPOCHS as usize;
+        for (given, want) in [(None, max), (Some("10"), 10), (Some(" 3 "), 3), (Some("0"), 1), (Some("1000"), max),
+                              (Some("-1"), max), (Some("x"), max)] {
+            assert_eq!(misses_limit(given.map(str::to_string).as_ref()), want, "{given:?}");
+        }
+        // The node id: as the status takes it.
+        let p = |id: &str| HashMap::from([("node_id".to_string(), id.to_string())]);
+        assert_eq!(node_id_param(&p("light_x")).ok(), Some("light_x".to_string()));
+        for bad in [p(""), p(&"x".repeat(129)), HashMap::new()] { assert!(node_id_param(&bad).is_err()); }
+        // The route: keyless, read-only limit first, the same view as the status, no hop to another owner.
+        let src = include_str!("light_status.rs");
+        let h = &src[src.find("pub(super) async fn handle_light_node_misses(").unwrap()..];
+        let h = &h[..h.find("#[derive(Debug, Default, serde::Deserialize)]").unwrap()];
+        assert!(h.find("check_api_rate_limit(remote_addr, \"read_only\")").unwrap() < h.find("light_status(").unwrap());
+        assert!(h.contains("light_status(&blockchain, &node_id, false)") && h.contains("misses_json(&s, misses_limit("));
+        assert!(!h.contains("signed_json(") && !h.contains("to_json"));
+        let routes = include_str!("mod.rs");
+        let r = &routes[routes.find("let light_node_misses = api_v1").unwrap()..];
+        let r = &r[..r.find(".and_then(handle_light_node_misses);").unwrap()];
+        for part in [".and(warp::path(\"light-node\"))", ".and(warp::path(\"misses\"))", ".and(warp::get())"] {
+            assert!(r.contains(part), "{part}");
+        }
+        assert!(routes.contains(".or(light_node_misses)"));
     }
 
     /// The platform: the device record's while it holds this binding, else the hint the bind named, kept with the
@@ -1271,8 +1381,8 @@ mod tests {
         // It outranks every other reason of its epoch; a later epoch's record still wins.
         let stored = |e: u64, r: MissReason| LightMiss { epoch: e, reason: r, woken_at: None, answered_at: None, delivery_delay_secs: None,
                                                         refused: None, recorded_at: 1, delivered_at: None, app_outcome: None, by_push: false };
-        assert_eq!(shown_miss(Some(stored(4, MissReason::AnsweredLate)), Some(m.clone())).map(|x| x.reason), Some(MissReason::NotCommitted));
-        assert_eq!(shown_miss(Some(stored(5, MissReason::NotSent)), Some(m)).map(|x| x.reason), Some(MissReason::NotSent));
+        assert_eq!(shown_misses(vec![stored(4, MissReason::AnsweredLate)], Some(m.clone()))[0].reason, MissReason::NotCommitted);
+        assert_eq!(shown_misses(vec![stored(5, MissReason::NotSent)], Some(m))[0].reason, MissReason::NotSent);
         // The recency verdict: an epoch not derived, or one the shard committed nothing in, is neutral.
         assert!(recent_neutral([Some(1u8 << other), Some(1u8 << shard)], shard));
         assert!(recent_neutral([None, Some(0b1_1111)], shard));

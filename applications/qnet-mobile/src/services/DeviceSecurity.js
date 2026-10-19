@@ -19,8 +19,8 @@ const unb64 = (s) => new Uint8Array(Buffer.from(String(s), 'base64'));
 // ── Screen protection ──────────────────────────────────────────────────────────────────────────────
 // Android: FLAG_SECURE (no screenshots, recordings or recents thumbnail), overlay windows hidden (API 31+),
 // accessibility services that are not assistive tools see nothing (API 34+), obscured touches dropped and
-// keyboard learning off in the fields. iOS: the window is covered while the screen is captured, and a
-// screenshot raises a warning. Counted, so overlapping secret screens keep it on until the last one closes.
+// keyboard learning off in the fields. iOS: the window is covered while the screen is captured. Counted, so
+// overlapping secret screens keep it on until the last one closes.
 let secureDepth = 0;
 
 function applySecure(on) {
@@ -200,7 +200,8 @@ export async function clearBrowserData() {
 // ── Native texts ───────────────────────────────────────────────────────────────────────────────────
 /**
  * The words the native side shows by itself, in the app's language: the iOS cover shown while the screen is
- * recorded, the screenshot warning and the default authentication reason. A build without the method keeps English.
+ * recorded, the Android notice for a touch through another app's window and the default authentication reason. A build
+ * without the method keeps English.
  */
 export function setNativeTexts(texts) {
   if (!N || !N.setTexts || !texts) return;

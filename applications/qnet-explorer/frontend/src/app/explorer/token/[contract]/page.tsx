@@ -311,24 +311,26 @@ export default function TokenPage() {
             <span className="detail-value">No holders indexed yet.</span>
           </div>
         ) : (
-          <table className="block-table">
-            <thead>
-              <tr>
-                <th>Address</th>
-                <th>Balance</th>
-                <th>%</th>
-              </tr>
-            </thead>
-            <tbody>
-              {holders.map((h, idx) => (
-                <tr key={h.address || idx}>
-                  <td><AddrLink addr={h.address} /></td>
-                  <td>{h.balance}{data.symbol ? ` ${data.symbol}` : ''}</td>
-                  <td>{h.percent}%</td>
+          <div className="table-wrapper">
+            <table className="block-table">
+              <thead>
+                <tr>
+                  <th>Address</th>
+                  <th>Balance</th>
+                  <th>%</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {holders.map((h, idx) => (
+                  <tr key={h.address || idx}>
+                    <td><AddrLink addr={h.address} /></td>
+                    <td>{h.balance}{data.symbol ? ` ${data.symbol}` : ''}</td>
+                    <td>{h.percent}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
         {holders.length >= holderLimit && holderLimit < 500 && (
           <div style={{ textAlign: 'center', marginTop: 12 }}>
@@ -351,49 +353,51 @@ export default function TokenPage() {
             <span className="detail-value">No transfers indexed yet.</span>
           </div>
         ) : (
-          <table className="block-table">
-            <thead>
-              <tr>
-                <th>Hash</th>
-                <th>Method</th>
-                <th>From</th>
-                <th>To</th>
-                <th>Amount</th>
-                <th>Fee</th>
-                <th>Block</th>
-                <th>Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.transfers.map((t, idx) => (
-                <tr key={`${t.hash}-${idx}`}>
-                  <td>
-                    <Link href={`/explorer/tx/${t.hash}`} className="address-link">
-                      {truncate(t.hash, 6, 4)}
-                    </Link>
-                  </td>
-                  <td>
-                    <span className={`type-badge type-${t.method.toLowerCase()}`}>{t.method}</span>
-                  </td>
-                  <td><AddrLink addr={t.from} /></td>
-                  <td>{t.to ? <AddrLink addr={t.to} /> : <span className="address-link">🔥 Burn</span>}</td>
-                  <td>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                      <TokenIcon logo={data.logo} symbol={data.symbol} address={contract} size={16} />
-                      <span>{t.amount}{data.symbol ? ` ${data.symbol}` : ''}</span>
-                    </span>
-                  </td>
-                  <td>{t.fee}</td>
-                  <td>
-                    <Link href={`/explorer/block/${t.block}`} className="address-link">
-                      {t.block}
-                    </Link>
-                  </td>
-                  <td>{formatTimeAgo(t.timestamp)}</td>
+          <div className="table-wrapper">
+            <table className="block-table">
+              <thead>
+                <tr>
+                  <th>Hash</th>
+                  <th>Method</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Amount</th>
+                  <th>Fee</th>
+                  <th>Block</th>
+                  <th>Time</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {data.transfers.map((t, idx) => (
+                  <tr key={`${t.hash}-${idx}`}>
+                    <td>
+                      <Link href={`/explorer/tx/${t.hash}`} className="address-link">
+                        {truncate(t.hash, 6, 4)}
+                      </Link>
+                    </td>
+                    <td>
+                      <span className={`type-badge type-${t.method.toLowerCase()}`}>{t.method}</span>
+                    </td>
+                    <td><AddrLink addr={t.from} /></td>
+                    <td>{t.to ? <AddrLink addr={t.to} /> : <span className="address-link">🔥 Burn</span>}</td>
+                    <td>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <TokenIcon logo={data.logo} symbol={data.symbol} address={contract} size={16} />
+                        <span>{t.amount}{data.symbol ? ` ${data.symbol}` : ''}</span>
+                      </span>
+                    </td>
+                    <td>{t.fee}</td>
+                    <td>
+                      <Link href={`/explorer/block/${t.block}`} className="address-link">
+                        {t.block}
+                      </Link>
+                    </td>
+                    <td>{formatTimeAgo(t.timestamp)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
         {data.transfers.length >= txLimit && txLimit < 500 && (
           <div style={{ textAlign: 'center', marginTop: 12 }}>
@@ -451,20 +455,22 @@ export default function TokenPage() {
         </div>
 
         <h3 style={{ margin: '18px 0 8px', fontSize: '0.95rem', opacity: 0.9 }}>Standard Interface</h3>
-        <table className="block-table">
-          <thead>
-            <tr><th>Kind</th><th>Method</th><th>Description</th></tr>
-          </thead>
-          <tbody>
-            {tokenIface.map((m, i) => (
-              <tr key={i}>
-                <td><span className={`type-badge type-${m.kind === 'read' ? 'transfer' : 'contract-call'}`}>{m.kind}</span></td>
-                <td style={{ fontFamily: 'monospace' }}>{m.sig}</td>
-                <td style={{ opacity: 0.85 }}>{m.desc}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="table-wrapper">
+          <table className="block-table">
+            <thead>
+              <tr><th>Kind</th><th>Method</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+              {tokenIface.map((m, i) => (
+                <tr key={i}>
+                  <td><span className={`type-badge type-${m.kind === 'read' ? 'transfer' : 'contract-call'}`}>{m.kind}</span></td>
+                  <td>{m.sig}</td>
+                  <td style={{ opacity: 0.85 }}>{m.desc}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
       )}
     </div>

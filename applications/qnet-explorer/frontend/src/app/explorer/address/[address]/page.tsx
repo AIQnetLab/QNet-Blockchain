@@ -8,6 +8,7 @@ import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 import TokenIcon from '@/components/TokenIcon';
 import { useActivationContent } from '@/contexts/AppContext';
 import { txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
+import { formatQnc } from '@/lib/token-format';
 
 interface AddressData {
   address: string;
@@ -60,10 +61,10 @@ interface AddressData {
 }
 
 // The balance check's answer (/api/address/[address]/balance-proof): verified against the committee certificate of a
-// checkpoint, or why it is not.
+// checkpoint, or why it is not. The figure is shown from the exact nano QNC.
 interface BalanceProofResult {
   verified: boolean;
-  balance: string;
+  balanceNano: string;
   exists: boolean;
   macroblockIndex: number;
   stateHeight: number;
@@ -82,16 +83,16 @@ const BalanceVerification = ({ address }: { address: string }) => {
     setResult(null);
     const startTime = performance.now();
     const failed = (error: string): BalanceProofResult => ({
-      verified: false, balance: '', exists: false, macroblockIndex: 0, stateHeight: 0, stateRoot: '',
+      verified: false, balanceNano: '', exists: false, macroblockIndex: 0, stateHeight: 0, stateRoot: '',
       verificationTime: Math.round(performance.now() - startTime), error,
     });
     try {
       const response = await fetch(`/api/address/${address}/balance-proof`);
       const data = await response.json();
-      if (data.success && data.verified === true && typeof data.stateRoot === 'string' && typeof data.balance === 'string') {
+      if (data.success && data.verified === true && typeof data.stateRoot === 'string' && typeof data.balanceNano === 'string' && /^\d+$/.test(data.balanceNano)) {
         setResult({
           verified: true,
-          balance: data.balance,
+          balanceNano: data.balanceNano,
           exists: data.exists === true,
           macroblockIndex: Number(data.macroblockIndex) || 0,
           stateHeight: Number(data.stateHeight) || 0,
@@ -160,7 +161,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
             <>
               <div className="detail-row">
                 <span className="detail-label">Proven Balance</span>
-                <span className="detail-value">{result.balance} QNC{result.exists ? '' : ' (no account yet)'}</span>
+                <span className="detail-value">{formatQnc(result.balanceNano)} QNC{result.exists ? '' : ' (no account yet)'}</span>
               </div>
               <div className="detail-row">
                 <span className="detail-label">Checkpoint</span>
@@ -285,7 +286,7 @@ const truncate = (str: string, start = 8, end = 6): string => {
   return `${str.slice(0, start)}...${str.slice(-end)}`;
 };
 
-// Copy button (Keeta style)
+// Copy button
 const CopyBtn = ({ text }: { text: string }) => {
   const [copied, setCopied] = useState(false);
   
@@ -453,68 +454,70 @@ export default function AddressPage() {
                 Transaction history is temporarily unavailable — balance above is current.
               </p>
             )}
-            <table className="block-table">
-              <thead>
-                <tr>
-                  <th>Hash</th>
-                  <th>Type</th>
-                  <th>From / To</th>
-                  <th>Amount</th>
-                  <th>Block</th>
-                  <th>Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedTx.map((tx, idx) => {
-                  const isSend = tx.from === address;
-                  return (
-                    <tr key={idx}>
-                      <td>
-                        <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
-                          {truncate(tx.hash, 6, 4)}
-                        </Link>
-                      </td>
-                      <td>
-                        <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
-                      </td>
-                      <td>
-                        <span className={isSend ? 'tx-out' : 'tx-in'}>
-                          {isSend ? 'To: ' : 'From: '}
-                        </span>
-                        {(() => {
-                          const addr = isSend ? tx.to : tx.from;
-                          const isValid = addr && addr.length > 10 && addr.includes('eon');
-                          return isValid ? (
-                            <Link href={`/explorer/address/${addr}`} className="address-link">
-                              {truncate(addr, 6, 4)}
+            <div className="table-wrapper">
+              <table className="block-table">
+                <thead>
+                  <tr>
+                    <th>Hash</th>
+                    <th>Type</th>
+                    <th>From / To</th>
+                    <th>Amount</th>
+                    <th>Block</th>
+                    <th>Time</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedTx.map((tx, idx) => {
+                    const isSend = tx.from === address;
+                    return (
+                      <tr key={idx}>
+                        <td>
+                          <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
+                            {truncate(tx.hash, 6, 4)}
+                          </Link>
+                        </td>
+                        <td>
+                          <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
+                        </td>
+                        <td>
+                          <span className={isSend ? 'tx-out' : 'tx-in'}>
+                            {isSend ? 'To: ' : 'From: '}
+                          </span>
+                          {(() => {
+                            const addr = isSend ? tx.to : tx.from;
+                            const isValid = addr && addr.length > 10 && addr.includes('eon');
+                            return isValid ? (
+                              <Link href={`/explorer/address/${addr}`} className="address-link">
+                                {truncate(addr, 6, 4)}
+                              </Link>
+                            ) : (
+                              <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
+                            );
+                          })()}
+                        </td>
+                        <td className={isSend ? 'amount-out' : 'amount-in'}>
+                          {tx.amount.includes('QNC') ? (
+                            <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                              <TokenIcon native size={16} />
+                              <span>{isSend ? '-' : '+'}{tx.amount}</span>
                             </Link>
                           ) : (
-                            <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
-                          );
-                        })()}
-                      </td>
-                      <td className={isSend ? 'amount-out' : 'amount-in'}>
-                        {tx.amount.includes('QNC') ? (
-                          <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                            <TokenIcon native size={16} />
-                            <span>{isSend ? '-' : '+'}{tx.amount}</span>
+                            // No value moved (Heartbeat/Registration/etc.): bare amount, no +/- sign.
+                            <span>{tx.amount}</span>
+                          )}
+                        </td>
+                        <td>
+                          <Link href={`/explorer/block/${tx.block}`} className="address-link">
+                            {tx.block}
                           </Link>
-                        ) : (
-                          // No value moved (Heartbeat/Registration/etc.): bare amount, no +/- sign.
-                          <span>{tx.amount}</span>
-                        )}
-                      </td>
-                      <td>
-                        <Link href={`/explorer/block/${tx.block}`} className="address-link">
-                          {tx.block}
-                        </Link>
-                      </td>
-                      <td>{formatTimeAgo(tx.timestamp)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                        </td>
+                        <td>{formatTimeAgo(tx.timestamp)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
             
             {totalPages > 1 && (
               <div className="pagination">
@@ -543,64 +546,66 @@ export default function AddressPage() {
       {(data.tokenTransfers?.length ?? 0) > 0 && (
         <div className="block-card">
           <h2 className="card-title">Token Transfers ({data.tokenTransfers.length})</h2>
-          <table className="block-table">
-            <thead>
-              <tr>
-                <th>Hash</th>
-                <th>Token</th>
-                <th>Amount</th>
-                <th>Counterparty</th>
-                <th>Block</th>
-                <th>Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.tokenTransfers.map((t, idx) => {
-                const isOut = t.direction === 'out';
-                const isNft = t.std === 'qrc721';
-                // Counterparty = the other side of the transfer (or a mint/burn label).
-                const counter = isOut ? t.to : t.from;
-                const counterValid = counter && counter.length > 10 && counter.includes('eon');
-                return (
-                  <tr key={`${t.hash}-${idx}`}>
-                    <td>
-                      <Link href={`/explorer/tx/${t.hash}`} className="address-link">
-                        {truncate(t.hash, 6, 4)}
-                      </Link>
-                    </td>
-                    <td>
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                        <TokenIcon logo={t.logo} symbol={t.symbol} address={t.contract} size={16} />
-                        <Link href={`/explorer/token/${t.contract}`} className="address-link">
-                          {t.symbol || truncate(t.contract, 6, 4)}
+          <div className="table-wrapper">
+            <table className="block-table">
+              <thead>
+                <tr>
+                  <th>Hash</th>
+                  <th>Token</th>
+                  <th>Amount</th>
+                  <th>Counterparty</th>
+                  <th>Block</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.tokenTransfers.map((t, idx) => {
+                  const isOut = t.direction === 'out';
+                  const isNft = t.std === 'qrc721';
+                  // Counterparty = the other side of the transfer (or a mint/burn label).
+                  const counter = isOut ? t.to : t.from;
+                  const counterValid = counter && counter.length > 10 && counter.includes('eon');
+                  return (
+                    <tr key={`${t.hash}-${idx}`}>
+                      <td>
+                        <Link href={`/explorer/tx/${t.hash}`} className="address-link">
+                          {truncate(t.hash, 6, 4)}
                         </Link>
-                      </span>
-                    </td>
-                    <td className={isOut ? 'amount-out' : 'amount-in'}>
-                      {/* NFTs show "#<token_id>" (no +/− quantity sign); fungibles keep the signed amount. */}
-                      {isNft ? '' : (isOut ? '−' : '+')}{t.amount}{t.symbol ? ` ${t.symbol}` : ''}
-                    </td>
-                    <td>
-                      <span className={isOut ? 'tx-out' : 'tx-in'}>{isOut ? '→ ' : '← '}</span>
-                      {counterValid ? (
-                        <Link href={`/explorer/address/${counter}`} className="address-link">
-                          {truncate(counter, 6, 4)}
+                      </td>
+                      <td>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          <TokenIcon logo={t.logo} symbol={t.symbol} address={t.contract} size={16} />
+                          <Link href={`/explorer/token/${t.contract}`} className="address-link">
+                            {t.symbol || truncate(t.contract, 6, 4)}
+                          </Link>
+                        </span>
+                      </td>
+                      <td className={isOut ? 'amount-out' : 'amount-in'}>
+                        {/* NFTs show "#<token_id>" (no +/− quantity sign); fungibles keep the signed amount. */}
+                        {isNft ? '' : (isOut ? '−' : '+')}{t.amount}{t.symbol ? ` ${t.symbol}` : ''}
+                      </td>
+                      <td>
+                        <span className={isOut ? 'tx-out' : 'tx-in'}>{isOut ? '→ ' : '← '}</span>
+                        {counterValid ? (
+                          <Link href={`/explorer/address/${counter}`} className="address-link">
+                            {truncate(counter, 6, 4)}
+                          </Link>
+                        ) : (
+                          <span className="address-link">{t.kind === 'mint' ? 'Mint' : t.kind === 'burn' ? '🔥 Burn' : txPartyLabel(counter || 'N/A', full)}</span>
+                        )}
+                      </td>
+                      <td>
+                        <Link href={`/explorer/block/${t.block}`} className="address-link">
+                          {t.block}
                         </Link>
-                      ) : (
-                        <span className="address-link">{t.kind === 'mint' ? 'Mint' : t.kind === 'burn' ? '🔥 Burn' : txPartyLabel(counter || 'N/A', full)}</span>
-                      )}
-                    </td>
-                    <td>
-                      <Link href={`/explorer/block/${t.block}`} className="address-link">
-                        {t.block}
-                      </Link>
-                    </td>
-                    <td>{formatTimeAgo(t.timestamp)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                      </td>
+                      <td>{formatTimeAgo(t.timestamp)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </div>

@@ -32,7 +32,7 @@ pub struct FcmEntry {
     /// for a v2 record (its own signatures tie it to the binding) and for one written before it was kept.
     pub writer: String,
     /// The bound device's platform as its bind named it (`light_binding::platform_hint`: "android", "ios"),
-    /// empty when not known. Unsigned, a display hint for the public status only.
+    /// empty when not known. Unsigned: the public status shows it and the pinger spaces an iOS device's pushes by it.
     pub platform: String,
     /// The bound device's model as its bind named it (`light_binding::model_hint`), empty when not known. Unsigned,
     /// a display hint for the public status only, kept and dropped exactly as `platform`.
@@ -910,8 +910,8 @@ impl Storage {
         if token.is_empty() { None } else { Some((token, push_type, endpoint)) }
     }
 
-    /// A light node's push row (`rpc::LightPushRow`): its last miss and last answer at this genesis, one row per
-    /// node overwritten by the next. Kept beside the push records under `lpush:{node}`, a key no node id takes;
+    /// A light node's push row (`rpc::LightPushRow`): its misses of the last 64 epochs and its last answer at this
+    /// genesis, one row per node. Kept beside the push records under `lpush:{node}`, a key no node id takes;
     /// node-local like them, never gossiped, and no block rule reads it.
     pub fn light_push_row(&self, node_id: &str) -> Option<Vec<u8>> {
         let cf = self.persistent.db.cf_handle("fcm_tokens")?;

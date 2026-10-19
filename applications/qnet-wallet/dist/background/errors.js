@@ -34,10 +34,8 @@ export const ERROR_MESSAGES = Object.freeze({
   FEE_CHANGED: 'The fee changed, review again',
   NONCE_CHANGED: 'The account changed, review again',
   NONCE_UNAVAILABLE: 'The account nonce could not be verified',
-  // a balance is verified by the committee's certificate or it decides nothing: answers came, none certified a recent state
+  // answers came, but none with a balance its proof covers (a send's live read) or a recent certified state (a display)
   BALANCE_UNCONFIRMED: 'The balance is not confirmed yet',
-  // a nonce above the certified state that is none of this wallet's own transactions: one sent from another device
-  BALANCE_FOREIGN_PENDING: 'A transaction from another device is not confirmed yet',
   TOO_MANY_PENDING: 'Too many unconfirmed transactions',
   // a contract account has no key and no contract sends QNC or a built-in token on: what reaches one stays there
   RECIPIENT_IS_CONTRACT: 'The recipient is a contract: nothing can ever move what is sent to it',

@@ -6,7 +6,7 @@
 /** true only in dist-dev/, where scripts/build-dev.mjs rewrites this line; gates the logger. */
 export const DEV_BUILD = false;
 
-export const WALLET_VERSION = '3.1.4';
+export const WALLET_VERSION = '3.1.5';
 export const RELEASE_CHANNEL = 'testnet';
 
 export const QNET = Object.freeze({
@@ -116,9 +116,6 @@ export const STORAGE_KEYS = Object.freeze({
   APPROVAL_COOLDOWN: 'qnet_approval_cooldown_v3',
   // the popup's last balances and first history pages of this session (decision 39), gone with every lock
   VIEW_CACHE: 'qnet_view_cache_v3',
-  // the certified account figures a QNet send may stand on (qnet.js sendBase), by address and macroblock index, gone
-  // with every lock
-  SEND_PROOFS: 'qnet_send_proofs_v3',
   // what a woken worker takes over of the light client (qnet.js lightHintsRead): the certified head last seen and until
   // when no node is asked for a capsule; chain data, no wallet's
   LIGHT_HINTS: 'qnet_light_hints_v1',
@@ -167,8 +164,8 @@ export const LIMITS = Object.freeze({
   APPROVAL_BUDGET_SHORT: 5,
   APPROVAL_BUDGET_LONG: 20,
   PENDING_TRANSFERS_MAX: 16,
-  // the spend records the vault keeps of this wallet's recent transactions (vault.spends): what a send counts above a
-  // certified state
+  // the spend records the vault keeps of this wallet's recent transactions (vault.spends): what a send counts off the live
+  // balance of a node a block or more behind
   SPENDS_MAX: 64,
   HISTORY_PAGE_MAX: 50,
   // solana.history: transactions one page may hold (each is read once with getTransaction)

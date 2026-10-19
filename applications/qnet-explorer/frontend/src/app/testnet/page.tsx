@@ -249,7 +249,7 @@ export default function TestnetPage() {
                   marginBottom: '0.75rem'
                 }}>
                   <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>1DEV Transaction:</p>
-                  <p style={{ color: '#00ffff', fontSize: '0.85rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                  <p style={{ color: '#00ffff', fontSize: '0.85rem', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
                     {devTxHash}
                   </p>
                   <a
@@ -271,7 +271,7 @@ export default function TestnetPage() {
                   marginBottom: '1rem'
                 }}>
                   <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>SOL Transaction:</p>
-                  <p style={{ color: '#00ffb4', fontSize: '0.85rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                  <p style={{ color: '#00ffb4', fontSize: '0.85rem', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
                     {solTxHash}
                   </p>
                   <a

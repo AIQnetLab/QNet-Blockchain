@@ -46,7 +46,7 @@ function setup(over = {}) {
     feeNano: () => 150000,
     contractKind: jest.fn(async () => 'none'),
     signMessage: jest.fn(async () => ({ signature: 'ab'.repeat(8), publicKey: 'cd'.repeat(8), address: QNET })),
-    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [] })),
+    prepareSend: jest.fn(async () => ({ nonce: 5, balanceNano: '10000000000', counterparties: [] })),
     send: jest.fn(async () => ({ txHash: 'a'.repeat(64), status: 'submitted' })),
     isCurrent: () => current,
     emit: (o, e, d) => emitted.push([o, e, d]),
@@ -215,7 +215,7 @@ describe('send QNC', () => {
     });
     expect(await t.p.approve(id)).toEqual({ status: 'review' }); // nothing is sent before the nonce is shown
     await t.p.loadPreview(id);
-    expect(t.shown().preview).toMatchObject({ nonce: 5, balanceNano: '10000000000', verified: true });
+    expect(t.shown().preview).toMatchObject({ nonce: 5, balanceNano: '10000000000' });
     expect(await t.p.approve(id)).toMatchObject({ status: 'done' });
     expect(t.deps.send).toHaveBeenCalledWith({
       type: 'transfer', to: TO, amountNano: '1500000000', feeNano: '150000', totalNano: '1500150000', destroys: false, nonce: 5, choice: null,
@@ -229,6 +229,48 @@ describe('send QNC', () => {
     expect(t.shown()).toBe(null);
   });
 
+  // Before, the sheet said only that a node had accepted the transaction and never followed it (owner, 18.10).
+  it('the outcome follows the transaction by (from, nonce) and says it is in a block once the genesis nodes report it', async () => {
+    jest.useFakeTimers();
+    try {
+      const statuses = ['pending', 'unknown', 'in_block'];
+      const transactionStatus = jest.fn(async () => ({ status: statuses.shift() || 'in_block', blockHeight: 9, txHash: 'a'.repeat(64) }));
+      const t = setup({ transactionStatus });
+      t.grant();
+      t.p.request(t.ctx(), 'qnet_sendTransaction', { to: TO, amount: '1.5' });
+      await jest.advanceTimersByTimeAsync(0);
+      const id = t.shown().id;
+      await t.p.loadPreview(id);
+      expect(await t.p.approve(id)).toMatchObject({ status: 'done' });
+      expect(t.shown().outcome.inBlock).toBeUndefined();
+      await jest.advanceTimersByTimeAsync(TIMINGS.OUTCOME_FOLLOW_FIRST_MS);
+      expect(transactionStatus).toHaveBeenCalledWith({ from: QNET, nonce: 5 });
+      expect(t.shown().outcome.inBlock).toBeUndefined();
+      await jest.advanceTimersByTimeAsync(3000 + 4500);
+      expect(t.shown().outcome).toMatchObject({ status: 'submitted', nonce: '5', inBlock: true });
+      // Followed no further once in a block.
+      const asked = transactionStatus.mock.calls.length;
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect([asked, transactionStatus.mock.calls.length]).toEqual([3, 3]);
+      // A sheet closed before that follows nothing more.
+      const quiet = jest.fn(async () => ({ status: 'pending', blockHeight: null, txHash: null }));
+      const u = setup({ transactionStatus: quiet });
+      u.grant();
+      u.p.request(u.ctx(), 'qnet_sendTransaction', { to: TO, amount: '1' });
+      await jest.advanceTimersByTimeAsync(0);
+      const uid = u.shown().id;
+      await u.p.loadPreview(uid);
+      await u.p.approve(uid);
+      await jest.advanceTimersByTimeAsync(TIMINGS.OUTCOME_FOLLOW_FIRST_MS);
+      u.p.dismiss(uid);
+      const before = quiet.mock.calls.length;
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect([before, quiet.mock.calls.length]).toEqual([1, 1]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('a moved nonce is shown again instead of being signed', async () => {
     const t = setup();
     t.grant();
@@ -237,7 +279,7 @@ describe('send QNC', () => {
     await tick();
     const id = t.shown().id;
     await t.p.loadPreview(id);
-    t.deps.prepareSend.mockResolvedValueOnce({ nonce: 6, balanceNano: '10000000000', verified: true, counterparties: [] });
+    t.deps.prepareSend.mockResolvedValueOnce({ nonce: 6, balanceNano: '10000000000', counterparties: [] });
     expect(await t.p.approve(id)).toEqual({ status: 'review' });
     await tick();
     expect(t.shown().preview.nonce).toBe(6);
@@ -252,9 +294,9 @@ describe('send QNC', () => {
     const t = setup();
     t.grant();
     const pendingPreview = {
-      nonce: null, confirmed: 4, balanceNano: '10000000000', verified: true, counterparties: [],
+      nonce: null, confirmed: 4, balanceNano: '10000000000', counterparties: [],
       pending: [{ nonce: 5, state: 'accepted', kind: 'transfer', to: TO, amountNano: 2_000_000_000, ageMs: 60_000 }],
-      replaceNonce: 5, replaceHash: 'h5', appendNonce: 6, recent: [],
+      replaceNonce: 5, replaceHash: 'h5', appendNonce: 6,
     };
     t.deps.prepareSend.mockResolvedValue(pendingPreview);
     const asked = t.p.request(t.ctx(), 'qnet_sendTransaction', { to: TO, amount: '2' });
@@ -276,9 +318,9 @@ describe('send QNC', () => {
     const t = setup();
     t.grant();
     t.deps.prepareSend.mockResolvedValueOnce({
-      nonce: null, confirmed: 4, balanceNano: '10000000000', verified: true, counterparties: [],
+      nonce: null, confirmed: 4, balanceNano: '10000000000', counterparties: [],
       pending: [{ nonce: 5, state: 'open', kind: 'transfer', to: TO, amountNano: 1, ageMs: 1 }],
-      replaceNonce: 5, replaceHash: 'h5', appendNonce: null, recent: [],
+      replaceNonce: 5, replaceHash: 'h5', appendNonce: null,
     });
     t.deps.send.mockImplementationOnce(async () => { const e = new Error('went through'); e.code = 'PENDING_SETTLED'; throw e; });
     t.p.request(t.ctx(), 'qnet_sendTransaction', { to: TO, amount: '1' });
@@ -548,7 +590,7 @@ describe('a confirmed send goes through the wallet\'s own send path', () => {
     wm.loadWallet = jest.fn(async () => ({
       secretKey: new Uint8Array(64).fill(3), qnetAddress: QNET, qnetKeypair: { publicKey: Array(1952).fill(1), privateKey: Array(4032).fill(2) },
     }));
-    wm.getQNCBalanceWithProof = jest.fn(async () => ({ ok: true, verified: true, nonce: '4', balanceNano: '9000000000' }));
+    wm.liveQncFigure = jest.fn(async () => ({ balance: 9, balanceNano: '9000000000', nonce: '4', blockHeight: 9000, figureClaimedEpoch: 0 }));
     return wm;
   }
 

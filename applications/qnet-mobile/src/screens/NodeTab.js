@@ -20,8 +20,9 @@ import React from 'react';
 import { Text, TouchableOpacity, View } from 'react-native';
 import { hasKey } from '../i18n';
 import { InfoField, InfoRow } from '../components/InfoRow';
-import { BIND_SETTLE_MS, freshMiss, shownMiss } from '../services/LightNode';
+import { BIND_SETTLE_MS, freshMiss } from '../services/LightNode';
 import { heldMove } from '../services/ClaimTransit';
+import { qncText } from '../utils/amountFormat';
 import styles from './WalletScreen.styles';
 
 const EPOCH_BLOCKS = 14400;
@@ -50,31 +51,6 @@ const REFUSAL_TEXT = {
   not_registered: 'node_none',
   rate_limited: 'node_use_err_limit',
   device_rate_limited: 'node_use_err_limit',
-};
-
-// The latest epoch the network did not count the node in (LightNode.freshMiss), as the tab says it: what happened, with
-// the owner's time where it noted one (the untimed text, the timed text, which time), and what to do on this device. The
-// network's own misses (LightNode.NETWORK_MISSES) say so, and that nothing is needed on this device.
-const MISS_TEXT = {
-  not_committed: ['node_miss_not_committed', null, null, 'node_miss_do_nothing'],
-  not_sent: ['node_miss_not_sent', null, null, 'node_miss_do_nothing'],
-  woken_no_answer: ['node_miss_woken', 'node_miss_woken_at', 'wokenAt', 'node_miss_do_background'],
-  answered_late: ['node_miss_late', 'node_miss_late_at', 'answeredAt', 'node_miss_do_background'],
-  not_delivered: ['node_miss_not_delivered', null, null, 'node_miss_do_background'],
-  answer_refused: ['node_miss_refused', 'node_miss_refused_at', 'answeredAt', 'node_miss_do_use'],
-  not_woken_inactive: ['node_miss_inactive', null, null, 'node_miss_do_open'],
-  no_push_address: ['node_miss_no_address', null, null, 'node_miss_do_open_once'],
-};
-
-// A wake that reached this device and got no answer, by what the app reported of it later (`appOutcome`): why, in plain
-// words, and what to do; the text after "and the app did not answer:". An answer the app sent is not said this way.
-const WHY_TEXT = {
-  not_opened_since_boot: 'node_miss_why_not_opened',
-  swiped: 'node_miss_why_swiped',
-  after_commit: 'node_miss_why_after_commit',
-  answer_failed: 'node_miss_why_answer_failed',
-  already_counted: 'node_miss_why_already_counted',
-  no_key: 'node_miss_why_no_key',
 };
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -153,13 +129,14 @@ export function checkState(signed, { local = null, check = null, now = Date.now(
  * (a lapsed lease, a check), which a new key does not end (MN-R4-02): checkState says whether that check still runs,
  * ended with no verdict or was refused, and the last two offer Use this device, a new enrolment. `offerUse`: the tab
  * shows Use this device in this state, also under an answer the network refused in an epoch it did not count the node
- * in, with nothing counted since (missText). An expired link is `not_recorded` only on the network's word that the node is
+ * in, with nothing counted since (LightNode.freshMiss). An expired link is `not_recorded` only on the network's word that the node is
  * not on the chain; with no verdict it is `unreachable`.
  */
 export function nodeView({ status, local = null, pending = null, height = 0, check = null, now = Date.now() }) {
   if (!status) return { state: 'checking' };
   if (pending && status.onChain !== true) {
-    if (!pending.expired) return { state: 'linking' };
+    // `pooled`: the registration is in the genesis nodes' pool, on its way into a block.
+    if (!pending.expired) return status.registrationPending === true ? { state: 'linking', pooled: true } : { state: 'linking' };
     if (status.onChain === false) return { state: 'not_recorded' };
   }
   if (status.onChain === null) return { state: 'unreachable' };
@@ -235,48 +212,6 @@ export function refusalText(t, refusal, now = Date.now()) {
   return t(key);
 }
 
-/**
- * The one line under the status rows for the latest epoch the network did not count the node in (LightNode.shownMiss):
- * while nothing counted it since, and also after that when the record carries this device's own account of the wake,
- * which reaches the network only with a later answer; such a past one names its epoch first (`node_miss_past`) and the
- * day of a time not today. What happened, at the local time the owner noted where it noted one; how long the wake took to
- * reach this device where an answer told the owner (the push's own time on its way, apart from this app's handling of
- * it, so a late answer is shown to be the delivery's or not); and what the user can do. A wake with no answer that the
- * app's later answer accounted for says when it reached this device, how long after it was sent, and why the app did not
- * answer (reachedText); one the app answered says that the network did not count the answer; one the app's record shows
- * never reached this device says so (`not_delivered`). Null otherwise.
- */
-export function missText(t, status, now = Date.now()) {
-  const shown = shownMiss(status);
-  const miss = shown ? shown.miss : null;
-  const text = miss ? MISS_TEXT[miss.reason] : null;
-  if (!text) return null;
-  const stamp = (secs) => (shown.past && day(secs * 1000) !== day(now) ? `${day(secs * 1000)} ${clock(secs * 1000)}` : clock(secs * 1000));
-  const line = (...parts) => [shown.past ? t('node_miss_past', { epoch: miss.epoch }) : null, ...parts].filter(Boolean).join(' ');
-  if (miss.reason === 'woken_no_answer' && miss.appOutcome === 'answered') return line(t('node_miss_answered'));
-  const why = miss.reason === 'woken_no_answer' ? WHY_TEXT[miss.appOutcome] : null;
-  if (why) return line(reachedText(t, miss, t(why), stamp));
-  const [untimed, timed, field, advice] = text;
-  const at = field ? miss[field] : null;
-  const what = Number.isSafeInteger(at) && at > 0 ? t(timed, { time: stamp(at) }) : t(untimed);
-  const secs = miss.deliveryDelaySecs;
-  const delay = !Number.isSafeInteger(secs) || secs < 0 ? null
-    : (secs < 60 ? t('node_miss_delay_short') : t('node_miss_delay', { n: Math.round(secs / 60) }));
-  return line(what, delay, t(advice));
-}
-
-// "The wake reached this device at {time}, {n} min after it was sent, and the app did not answer: {why}", with as much of
-// the time as the owner could tell (`deliveredAt` on its own clock, as `stamp` writes it; `deliveryDelaySecs`).
-function reachedText(t, miss, why, stamp) {
-  const at = miss.deliveredAt;
-  if (!Number.isSafeInteger(at) || at <= 0) return t('node_miss_reached', { why });
-  const time = stamp(at);
-  const secs = miss.deliveryDelaySecs;
-  if (!Number.isSafeInteger(secs) || secs < 0) return t('node_miss_reached_at', { time, why });
-  return secs < 60 ? t('node_miss_reached_soon', { time, why })
-    : t('node_miss_reached_after', { time, n: Math.round(secs / 60), why });
-}
-
 function noticeText(t, notice, height, now) {
   if (!notice) return null;
   if (notice.key === 'node_next_epoch') {
@@ -332,14 +267,6 @@ export function backgroundView(background) {
   };
 }
 
-function balanceText(nano, hidden) {
-  if (hidden) return '••••';
-  // Not read yet, or no node answered: unknown, never "0 QNC".
-  if (!Number.isFinite(nano) || nano < 0) return '—';
-  const qnc = nano / ONE_QNC_NANO;
-  return qnc === 0 ? '0 QNC' : `${qnc.toFixed(6).replace(/\.?0+$/, '')} QNC`;
-}
-
 // `waiting`: a super node registered and not admitted to consensus yet, which is neither online nor offline.
 const Badge = ({ t, online, waiting = false }) => (
   <View style={[styles.statusBadge, online && !waiting ? styles.statusBadgeActivated : styles.statusBadgeInactive]}>
@@ -389,16 +316,16 @@ function CheckLines({ t, notice, onPlayDialog }) {
 // Balance rows and the move button, the same for a light node and a server node. The button takes a balance of 1 QNC
 // or more (the node refuses a smaller move), with no note about it (owner, 04.10). `alone`: the card holds nothing else.
 // The wallet's move in transit (`move`, ClaimTransit.heldMove): the balance is its rest and the button, off, says
-// "Moving X" until a certified read shows the wallet holds X, or a part of it (owner, 11.10 and 12.10).
+// "Moving X" until the wallet's live figure shows it holds X, or a part of it (owner, 11.10 and 18.10).
 function BalanceBlock({ t, balanceNano, hidden, moving, onMove, alone = false, move = null }) {
   const shownNano = move ? (move.restNano !== null ? move.restNano : Math.max(0, balanceNano - Number(move.amountNano))) : balanceNano;
   const known = Number.isFinite(shownNano) && shownNano >= 0;
   const movable = known && shownNano >= ONE_QNC_NANO;
-  const label = move ? t('node_moving', { amount: balanceText(Number(move.amountNano), hidden) })
+  const label = move ? t('node_moving', { amount: qncText(move.amountNano, t.lang, hidden) })
     : (moving ? t('claiming') : t('node_move'));
   return (
     <>
-      <InfoRow label={t('node_balance')} value={balanceText(shownNano, hidden)} tone="accent" ltr fit divider={!alone} />
+      <InfoRow label={t('node_balance')} value={qncText(shownNano, t.lang, hidden)} tone="accent" ltr fit divider={!alone} />
       <Button label={label} onPress={onMove} disabled={!movable || moving || !!move} testID="node-move" />
     </>
   );
@@ -427,8 +354,8 @@ function LightNodeCard({
     </View>
   ) : null;
   if (view.state === 'linking' || view.state === 'not_recorded') {
-    // A registration on its way: no node on the chain yet, so nothing to move.
-    const key = view.state === 'linking' ? 'node_linking' : 'node_link_failed';
+    // A registration on its way: no node on the chain yet, so nothing to move. In the pool, it says so.
+    const key = view.state === 'not_recorded' ? 'node_link_failed' : (view.pooled ? 'node_linking_pool' : 'node_linking');
     return <View style={styles.nodeMonitoringCard}><Text style={styles.nodeExplainer}>{t(key)}</Text></View>;
   }
   if (view.state === 'checking' || view.state === 'unreachable') {
@@ -445,7 +372,6 @@ function LightNodeCard({
   const cant = view.offerUse ? deviceText(t, light.device) : null;
   const offerUse = view.offerUse && !cant;
   const notice = cant || noticeText(t, view.notice, height, now);
-  const miss = missText(t, light.status, now);
   const background = backgroundView(light.background);
   return (
     <View>
@@ -470,7 +396,6 @@ function LightNodeCard({
         {background && background.open && onOpenBackground ? (
           <Button label={t('node_background_open')} onPress={onOpenBackground} secondary testID="node-background" />
         ) : null}
-        {miss ? <Text style={styles.rewardHint} testID="node-miss">{miss}</Text> : null}
         {showBalance ? (
           <BalanceBlock t={t} balanceNano={light.balanceNano} hidden={balancesHidden} moving={busy.move} onMove={onMove}
             move={move} />
@@ -524,10 +449,10 @@ export function keptServerStatus(prev, status, nodeId = null) {
 // (`recordedOnly`). Its id heads the card, as a light node's does, and its type is the first status row. One the
 // network registered and does not admit yet (waitingAdmission) says so in place of Active or Offline, as the site does;
 // what it earned moves all the same. An admitted one, when the node reports it (rewardAdmission), says so in a row of
-// its own, and epochs outside the admitted set are counted apart from missed ones (PushService.getNodeEpochs
-// notAdmitted). Before its first answer it is
-// being checked; a read that failed with no good status before it says the network could not be reached; the server
-// text alone is for a node the network says is not registered.
+// its own, and its epochs outside the admitted set are counted (PushService.getNodeEpochs notAdmitted); no missed epoch
+// is shown, the site's cabinet shows them. Before its first answer it is being checked; a read that failed with no good
+// status before it says the network could not be reached; the server text alone is for a node the network says is not
+// registered.
 function ServerNodeCard({ t, server, height, balancesHidden, busy, onMove, nodeTitle, recordedOnly = false, transit = null }) {
   const { nodeType, nodeId, status, epochs } = server || { nodeType: 'super', nodeId: '', status: null, epochs: null };
   if (!serverRegistered(status)) {
@@ -586,10 +511,8 @@ function ServerNodeCard({ t, server, height, balancesHidden, busy, onMove, nodeT
         {beats ? (
           <InfoRow label={t('node_heartbeats')} value={t('node_heartbeats_of', { n: status.heartbeatCount, m: status.requiredHeartbeats })} />
         ) : null}
-        {/* Over the last 64 epochs the network settled, from the node's registration on (PushService.getNodeEpochs); the
-            count of epochs is the site's (owner, 11.10). */}
-        {epochs ? <InfoRow label={t('node_missed')} value={String(epochs.missed)} tone={epochs.missed > 0 ? 'warn' : 'default'} /> : null}
-        {/* Epochs outside the admitted set are the network's admission, never missed ones: counted apart, when any. */}
+        {/* Of the last 64 epochs the network settled, from the node's registration on (PushService.getNodeEpochs): the
+            ones outside the admitted set (the network's admission, not missed heartbeats), when any. */}
         {epochs && epochs.notAdmitted > 0 ? <InfoRow label={t('node_not_admitted')} value={String(epochs.notAdmitted)} /> : null}
         {(height || status.currentBlockHeight) > 0 && (
           <InfoRow label={t('node_epoch_ends')} value={epochEndsText(t, height || status.currentBlockHeight)} />

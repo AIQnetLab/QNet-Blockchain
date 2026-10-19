@@ -14,13 +14,13 @@ import {
 } from './PushService';
 import { checkDevice } from './NodeDeviceKey';
 import { readNodeRecordState } from './NodeRecordRead';
-import { acceptedBalance } from './ClaimTransit';
+import { acceptedBalance, claimedNano } from './ClaimTransit';
 import { ownNodeType } from '../crypto/NodePreimages';
 
 const TX_HASH_RE = /^[0-9a-f]{64}$/;
 
 // The node balance (nanoQNC) from three genesis answers, as the Node tab reads it: the largest of those not behind the
-// wallet's last certified claim watermark `floor` (ClaimTransit.acceptedBalance: a node behind it still holds a moved
+// wallet's claim watermark `floor` (ClaimTransit.answerFloor, acceptedBalance: a node behind it still holds a moved
 // amount). null when none counts.
 async function quorumBalance(nodeId, floor = null) {
   const answers = await Promise.all(
@@ -35,11 +35,9 @@ function claimAnswer(result) {
     return result && (result.code === 'NO_REWARDS' || result.code === 'MIN_CLAIM')
       ? { status: 'empty' } : { status: 'error', error: 'CLAIM_REFUSED' };
   }
-  const nano = typeof result.amountNano === 'string' && /^[0-9]+$/.test(result.amountNano)
-    ? result.amountNano : BigInt(Math.round(Number(result.amount || 0) * 1e9)).toString();
   return {
     status: 'ok',
-    amountNano: nano,
+    amountNano: claimedNano(result) || '0',
     txHash: typeof result.txHash === 'string' && TX_HASH_RE.test(result.txHash) ? result.txHash : null,
     stoppedAtEpoch: Number.isSafeInteger(result.stoppedAtEpoch) ? result.stoppedAtEpoch : null,
   };
@@ -51,7 +49,8 @@ function claimAnswer(result) {
  * balance is running on the Node tab or in transit; `onUnlinked()` runs once this device's binding ended (the Node tab
  * reads again); `onClaimed(nodeId, result, balanceNano)` once the network took a move (claimRewards' `result`, from the
  * node balance the sheet showed): the move is in transit from then on, as one from the Node tab (services/ClaimTransit);
- * `claimFloor()` the wallet's last certified claim watermark (null: none known), which the balance read is judged by.
+ * `claimFloor()` the wallet's claim watermark (ClaimTransit.answerFloor; null: none known), which the balance read is
+ * judged by.
  * The node balance, a move running and a move in transit are the wallet's, whichever of its node ids a move names: one
  * started for the super node holds a move of the light node's balance too, and the reverse.
  */

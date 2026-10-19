@@ -8,14 +8,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { GUIDE_HREF, JOURNEY, MOVED_PAGES, MOVED_TABS, TABS, TAB_HREF, isNodePath, journey, landingTab, tabRoute, visibleTabs } from '../cabinet/tabs.ts';
 import { TEXTS } from '../texts.ts';
 import { VIEW_STATES } from '../cabinet/wallet-activation.ts';
+import { SRC, read, code } from './source.mjs';
 
-const SRC = new URL('../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 const CSS = read('app/globals.css');
 
 test('every section is a page of its own, and /node?tab= opens it', () => {
@@ -307,6 +305,77 @@ test('My node keeps the site\'s rain, with its panels drawn opaque over it', () 
   assert.match(CSS, /\.cabinet \.cabinet-progress,\n\.cabinet \.cabinet-nav,\n\.cabinet > p,\n\.cabinet > div\[role='alert'\] \{\n {2}border-radius: 12px;\n {2}background: rgba\(0, 8, 16, 0\.9\);\n {2}-webkit-backdrop-filter: blur\(15px\);\n {2}backdrop-filter: blur\(15px\);/);
 });
 
+// Review, 18.10: the rain redrew at the display's full rate forever, on a hidden page and against reduced motion too.
+test('the rain draws at most 30 frames a second, and none while the page is hidden or motion is reduced', async () => {
+  const { frameLoop } = await import('../frame-loop.ts');
+  const clock = () => {
+    let next = 1;
+    const queued = new Map();
+    return {
+      queued,
+      requestAnimationFrame: (cb) => { queued.set(next, cb); return next++; },
+      cancelAnimationFrame: (id) => { queued.delete(id); },
+      // Runs the display at `hz` for `ms` from `from`, as a browser calls the frame callbacks.
+      run(hz, ms, from = 0) {
+        for (let t = from; t <= from + ms; t += 1000 / hz) {
+          const due = [...queued.values()];
+          queued.clear();
+          for (const cb of due) cb(t + (Math.random() - 0.5) * 0.4);
+        }
+      },
+    };
+  };
+  for (const hz of [60, 90, 120, 144]) {
+    const c = clock();
+    let steps = 0;
+    frameLoop(() => steps++, 30, () => true, c).sync();
+    c.run(hz, 10_000);
+    assert.ok(steps >= 299 && steps <= 302, `${hz} Hz: ${steps} frames in 10 s`);
+  }
+  // Hidden or reduced motion: no frame is even asked for; shown again, it goes on; stopped, nothing is left queued.
+  const c = clock();
+  let on = false;
+  let steps = 0;
+  const loop = frameLoop(() => steps++, 30, () => on, c);
+  loop.sync();
+  c.run(60, 1000);
+  assert.equal(steps, 0);
+  assert.equal(c.queued.size, 0);
+  on = true;
+  loop.sync();
+  loop.sync();
+  assert.equal(c.queued.size, 1, 'one loop, however often it is synced');
+  c.run(60, 1000, 5000);
+  assert.ok(steps >= 30 && steps <= 31, String(steps));
+  on = false;
+  loop.sync();
+  assert.equal(c.queued.size, 0);
+  const before = steps;
+  c.run(60, 1000, 7000);
+  assert.equal(steps, before);
+  on = true;
+  loop.sync();
+  loop.stop();
+  assert.equal(c.queued.size, 0);
+  // The component runs its drawing through that loop, at 30, and syncs it on the page's visibility and the motion setting.
+  const rain = code('components/MatrixRain.tsx');
+  assert.match(rain, /const RAIN_FPS = 30;/);
+  assert.match(rain, /const motion = window\.matchMedia\('\(prefers-reduced-motion: reduce\)'\);/);
+  assert.match(rain, /frameLoop\(\(\) => draw\(ctx, drops, fontSize, matrix, speeds\), RAIN_FPS, \(\) => !document\.hidden && !motion\.matches, window\);/);
+  assert.match(rain, /document\.addEventListener\('visibilitychange', loop\.sync\);\s*motion\.addEventListener\('change', loop\.sync\);/);
+  assert.match(rain, /loop\.stop\(\);[\s\S]*document\.removeEventListener\('visibilitychange', loop\.sync\);\s*motion\.removeEventListener\('change', loop\.sync\);/);
+  assert.doesNotMatch(rain, /requestAnimationFrame/);
+  // At 30 the rain looks as it did at 60: a frame moves a drop two steps, fades the trail as two 5% fades do and
+  // restarts a drop below the screen with the chance of two 2.5% tries.
+  const value = (name) => new Function([...new Set(['RAIN_FPS', 'STEPS', name])].map((n) => rain.match(new RegExp(`const ${n} = [^;]+;`))[0]).join(' ') + ` return ${name};`)();
+  assert.equal(value('STEPS'), 2);
+  assert.equal(value('FADE'), '0.0975');
+  assert.ok(Math.abs(value('RESTART') - (1 - 0.975 ** 2)) < 1e-12);
+  assert.match(rain, /ctx\.fillStyle = `rgba\(0, 0, 0, \$\{FADE\}\)`;/);
+  assert.match(rain, /drops\[i\] \+= speeds\[i\] \* STEPS;/);
+  assert.match(rain, /if \(drops\[i\] \* fontSize > ctx\.canvas\.height && Math\.random\(\) < RESTART\) \{/);
+});
+
 // The rules of one selector block, in `within` (a media query's text, or the whole sheet).
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 function block(selector, within = CSS) {
@@ -391,9 +460,10 @@ test('the epochs: one list on History, a page at a time with Show more, the newe
   assert.match(history, /<td>\{span\(row\)\}<\/td>/);
   assert.equal(TEXTS.history_span, '{start} – {end}');
   assert.match(history, /\{row\.claimTx \? <Link href=\{`\/explorer\/tx\/\$\{row\.claimTx\}`\}>\{t\(RESULT_TEXT\[row\.result\]\)\}<\/Link> : t\(RESULT_TEXT\[row\.result\]\)\}/);
-  // One table on History: the first page (the Overview's shared read), then the older pages on Show more, joined.
-  assert.equal(history.match(/<Table rows=\{[^}]+\} \/>/g)?.length, 2);
-  assert.match(history, /const list = useEpochList\(nodeId, first\);/);
+  // One table on History: the first page (the Overview's shared read), then the older pages on Show more, joined; why
+  // each epoch not counted was missed only there (cabinet-last-miss.test.mjs).
+  assert.equal(history.match(/<Table rows=\{[^}]+\}(?: reasons)? \/>/g)?.length, 2);
+  assert.match(history, /const list = useEpochList\(nodeId, first, viewOnly\);/);
   assert.match(history, /if \(!list\.more\) return null;/);
   assert.match(history, /<button type="button" className="qnet-button secondary" onClick=\{list\.showMore\} disabled=\{list\.phase === 'reading'\}>\{t\(label\)\}<\/button>/);
   assert.match(history, /list\.phase === 'reading' \? 'history_more_loading' : list\.phase === 'failed' \? 'try_again' : 'history_more'/);

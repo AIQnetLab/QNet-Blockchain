@@ -40,6 +40,8 @@ mod registration_door;
 pub(crate) use registration_door::*;
 mod contracts_api;
 pub(crate) use contracts_api::*;
+mod ws_accounts;
+pub(crate) use ws_accounts::*;
 mod benchmark;
 use benchmark::*;
 
@@ -140,12 +142,11 @@ pub enum WsEvent {
         tx_count: usize,
         producer: String,
     },
-    /// Account balance changed
+    /// A committed block touched this address (a native balance, the fee wallet, a token transfer): a hint to read
+    /// again, so it carries no amount. Delivered only by the account hub (`ws_accounts`), never broadcast.
     BalanceUpdate {
         address: String,
-        new_balance: u64,
-        change: i64,
-        tx_hash: String,
+        block_height: u64,
     },
     /// Smart contract event emitted
     ContractEvent {
@@ -258,8 +259,8 @@ static SNAPSHOT_SERVE_SEM: Lazy<tokio::sync::Semaphore> = Lazy::new(|| tokio::sy
 // SECURITY: WebSocket Connection Rate Limiting
 // ============================================================================
 
-/// WebSocket rate limiter to prevent connection flood attacks
-/// Limits: max 5 connections per IP, max 10,000 total connections
+/// WebSocket connection limits: 64 per IP, so the phones a carrier NAT puts behind one public address each get a
+/// socket, and 10,000 per node, which bounds the node's memory whatever the number of addresses.
 struct WsRateLimiter {
     /// Active connections per IP address
     connections_per_ip: DashMap<IpAddr, u32>,
@@ -276,8 +277,8 @@ impl WsRateLimiter {
         Self {
             connections_per_ip: DashMap::new(),
             total_connections: std::sync::atomic::AtomicU32::new(0),
-            max_per_ip: 5,      // Max 5 WS connections per IP
-            max_total: 10_000,  // Max 10K total WS connections
+            max_per_ip: 64,
+            max_total: 10_000,
         }
     }
     
@@ -2410,6 +2411,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_status);
 
+    // A light node's misses, epoch by epoch, in the status's public form, under the same read-only limit; no proxy hop.
+    let light_node_misses = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("misses"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_misses);
+
     // The signed status: the public fields plus what only the node's ping key or wallet key may read
     // (binding sequence, registration record, device state). One ML-DSA-65 signature and an optional
     // wallet key in hex, so 16 KB is ample.
@@ -3297,6 +3309,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(light_node_ping_response_get)
         .or(light_node_ping_response_post)
         .or(light_node_status)
+        .or(light_node_misses)
         .or(light_node_status_signed)
         .or(server_node_status)
         .or(light_node_next_ping)
@@ -3364,7 +3377,20 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .map(|ws: warp::ws::Ws, query: WsSubscribeQuery, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| {
             // Extract IP for rate limiting
             let ip = remote_addr.map(|addr| addr.ip());
-            
+            let channels = query.channels.as_deref().map(parse_ws_channels)
+                .unwrap_or_else(|| vec![WsChannel::Blocks]); // Default: subscribe to blocks
+            // Account channels are checked before a slot is taken, so a refused request holds nothing.
+            let accounts = match account_channel_addresses(&channels) {
+                Ok(a) => a,
+                Err(reason) => {
+                    if is_info() {
+                        println!("[INFO][WS] subscription_refused ip={} reason=\"{}\"",
+                                 ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".to_string()), reason);
+                    }
+                    return warp::reply::with_status(reason, warp::http::StatusCode::BAD_REQUEST).into_response();
+                }
+            };
+
             // The slot is taken before the upgrade, so a refusal is a 429, and it rides in the upgrade
             // callback: released when the connection ends, or with the callback if the upgrade never completes.
             let slot = match WS_RATE_LIMITER.try_acquire(ip) {
@@ -3374,7 +3400,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                     warp::http::StatusCode::TOO_MANY_REQUESTS
                 ).into_response(),
             };
-            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, query, blockchain, slot))
+            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, channels, accounts, blockchain, slot))
                 .into_response()
         });
     
@@ -5482,9 +5508,10 @@ async fn handle_rpc(").expect("the next function")]
     /// only the bundle cancel (gated too) uses.
     #[test]
     fn the_ip_gated_routes_are_served_outside_the_cors_filter() {
-        let src = include_str!("mod.rs");
-        let gated = gate_routes(src);
-        let body = server(src);
+        // The checkout may be CRLF; the line-end patterns below are written for LF.
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let gated = gate_routes(&src);
+        let body = server(&src);
         let names: Vec<&str> = gated.iter().map(|(n, _)| n.as_str()).collect();
         for want in ["internal_fcm_sync", "internal_fcm_get", "internal_light_keys_get", "internal_light_reach_get", "internal_light_unbind_sync",
                      "internal_device_attest", "internal_device_sync", "internal_device_get", "p2p_message",

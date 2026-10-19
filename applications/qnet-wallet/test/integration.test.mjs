@@ -151,7 +151,7 @@ describe('integration: one wallet from setup to delete', () => {
     await popup.click('.network-switch [data-value="solana"]');
     await popup.click('[data-tab="assets"]');
     await popup.until(() => popup.$$('.token-amount').length === 2, 'the Solana balances');
-    assert.deepEqual(popup.$$('.token-amount').map((n) => n.textContent), ['2 SOL', '3000 1DEV']);
+    assert.deepEqual(popup.$$('.token-amount').map((n) => n.textContent), ['2 SOL', '3,000 1DEV']);
     await popup.click('[data-tab="send"]');
     type(popup.$('input[name="to"]'), PEER.solana);
     type(popup.$('input[name="amount"]'), '0.5');
@@ -172,7 +172,7 @@ describe('integration: one wallet from setup to delete', () => {
   it('Activate: Light burns the node price once and the code, in Settings, is the one the node derives from the burn', async () => {
     await popup.click('[data-tab="activate"]');
     await popup.until(() => popup.$('[data-action="choose-light"]') !== null, 'the price cards');
-    assert.match(popup.text(), /1500 1DEV/);
+    assert.match(popup.text(), /1,500 1DEV/);
     // the node's first two answers to the registration are retries; then it admits it
     network.registration.answers.push({ success: false, error: 'burn-attestation quorum not yet reached; retry shortly' },
       { success: false, error: 'node is behind the chain; retry shortly' });

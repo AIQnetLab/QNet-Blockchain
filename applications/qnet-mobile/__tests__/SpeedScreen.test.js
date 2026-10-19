@@ -45,7 +45,6 @@ jest.mock('../src/components/WalletManager', () => {
     async agreedGenesisBalance() { return null; }
     async keptTransactions() { return []; }
     async sentRecipients() { return []; }
-    async recentSettledTransactions() { return []; }
     async loadBalanceSnapshot() { return null; }
     async saveBalanceSnapshot() { return true; }
     generateQNetAddressFromSolana() { return mockQNET; }
@@ -61,7 +60,7 @@ jest.mock('../src/components/WalletManager', () => {
     }
     liveQncFigure() { return Promise.resolve(mockState.live || null); }
     // The send's checks, each counted and answered when the test says.
-    certifiedQncForSend() { return mockState.check('balance', { ok: true, verified: true, balanceNano: '20000000000', nonce: '3' }); }
+    qncForSend() { return mockState.check('balance', { ok: true, balanceNano: '20000000000', nonce: '3', pending: [] }); }
     payableRecipientProblem() { return mockState.check('recipient', null); }
     pendingTransactions() { return mockState.check('kept', []); }
   }
@@ -317,6 +316,42 @@ describe('the QNC figure at the live tip (owner, 14.10)', () => {
     await flush(6);
     expect(texts(tree).split(String.fromCharCode(10))).toContain('20');
     expect(texts(tree).split(String.fromCharCode(10))).not.toContain('25');
+  });
+
+  // Before, one answer naming a block far ahead was the floor for the whole session: every later live figure counted as
+  // older, and so did every certified one.
+  it('a live figure of a block the chain has not reached is not shown; one taken before a height was read gives way', async () => {
+    const lines = (tree) => texts(tree).split(String.fromCharCode(10));
+    const pull = async (tree) => {
+      const view = tree.root.findAll((n) => n.props.refreshControl && n.props.refreshControl.props
+        && typeof n.props.refreshControl.props.onRefresh === 'function')[0];
+      await act(async () => { await view.props.refreshControl.props.onRefresh(); });
+      await flush(12);
+    };
+    const live = (balance, blockHeight) => ({
+      balance, balanceNano: String(balance * 1e9), nonce: '3', blockHeight, figureClaimedEpoch: 0,
+    });
+    // No height read yet (offline but for the figures): a figure of block 900,000,000 is taken.
+    mockState.live = live(50, 900_000_000);
+    const tree = await unlocked();
+    expect(lines(tree)).toContain('50');
+    // The chain's height read as 9100: the honest figure of block 9105 shows, the far one dropped.
+    global.fetch = jest.fn(async (url) => {
+      if (String(url).endsWith('/api/v1/height')) return { ok: true, json: async () => ({ height: 9100 }) };
+      throw new Error('offline in tests');
+    });
+    mockState.live = live(30, 9105);
+    await pull(tree);
+    await pull(tree);
+    expect(lines(tree)).toContain('30');
+    expect(lines(tree)).not.toContain('50');
+    // With the height known, a far one is not shown at all, and the next honest one is.
+    mockState.live = live(77, 500_000_000);
+    await pull(tree);
+    expect([lines(tree).includes('30'), lines(tree).includes('77')]).toEqual([true, false]);
+    mockState.live = live(31, 9110);
+    await pull(tree);
+    expect(lines(tree)).toContain('31');
   });
 });
 

@@ -1,10 +1,10 @@
-// qnet.js, offline: raw-JSON reading of u64 fields, the pinned and hedged node client, balance and nonce verified against
-// the committee's certificate (a certified proof folded to the state root of a macroblock the light client verifies, the
-// older node's live-root proof only when its root is a recent certified one, never what nodes agree on, never a default),
-// the send rule over a certified state, the signed transfer (preimage, signature, submit body, pending record before the
-// POST), resubmission of identical bytes, and the explorer history. The network certifies its state for real
-// (helpers/certified-net.mjs).
-import { describe, it, beforeEach } from 'node:test';
+// qnet.js, offline: raw-JSON reading of u64 fields, the pinned and hedged node client, the balance at a pinned node's live
+// tip and the same balance verified against the committee's certificate in the background (a certified proof folded to
+// the state root of a macroblock the light client verifies, the older node's live-root proof only when its root is a
+// recent certified one, never what nodes agree on, never a default), the send rule at the live tip, the signed transfer
+// (preimage, signature, submit body, pending record before the POST), resubmission of identical bytes, a sent
+// transaction's status, and the explorer history. The network certifies its state for real (helpers/certified-net.mjs).
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { register } from 'node:module';
@@ -23,12 +23,23 @@ const {
 } = await import('./helpers/chains-activation-env.mjs');
 const { FIRST_INDEX, NOBLE_INSTALLED, certifiedNet, accountAnswer } = await import('./helpers/certified-net.mjs');
 
-// Every test runs on a fresh worker: the proofs, nonces and heads one test read never stand in another's.
+// Every test runs on a fresh worker: the proofs, nonces and heads one test read never stand in another's. What a worker
+// left running (a certified check beside a live figure, a run of resubmitPending) ends before the next test replaces the
+// network (qnet.backgroundReads), so none of its requests lands there.
 let qnet;
 let workers = 0;
+const loaded = [];
+const worker = async (tag) => {
+  const instance = await import(`../dist/background/qnet.js?${tag}`);
+  loaded.push(instance);
+  return instance;
+};
 beforeEach(async () => {
   workers += 1;
-  qnet = await import(`../dist/background/qnet.js?worker=${workers}`);
+  qnet = await worker(`worker=${workers}`);
+});
+afterEach(async () => {
+  await Promise.all(loaded.splice(0).map((instance) => instance.backgroundReads()));
 });
 
 const ME = WALLET.qnetAddress;
@@ -225,7 +236,7 @@ describe('chains-activation qnet: verified balance and nonce', () => {
       balanceNano: '0', nonce: '0', verified: true, verification: 'proof', blockHeight: FIRST_INDEX * 90, index: FIRST_INDEX,
     });
     net.headless = true;
-    const fresh = await import(`../dist/background/qnet.js?absent=${Date.now()}`);
+    const fresh = await worker(`absent=${Date.now()}`);
     core.clearQcCache();
     net.install();
     await rejectsWith(fresh.readAccount(G1), 'BALANCE_UNCONFIRMED');
@@ -255,7 +266,7 @@ describe('chains-activation qnet: verified balance and nonce', () => {
           merkle_proof: moved.tree.prove(core.accountKeyHash(ME)).steps } } : undefined)), route));
       core.clearQcCache();
       net.install();
-      const again = await import(`../dist/background/qnet.js?oldRoot=${Date.now()}`);
+      const again = await worker(`oldRoot=${Date.now()}`);
       assert.equal((await again.readAccount(ME)).balanceNano, '5000000000');
     } finally {
       Math.random = realRandom;
@@ -312,37 +323,61 @@ describe('chains-activation qnet: verified balance and nonce', () => {
     // the nodes report a frontier ten macroblocks on, but serve the old state
     const stale = await qnet.readAccount(ME);
     assert.deepEqual([stale.verified, stale.verification], [false, 'none']);
-    await rejectsWith(qnet.prepareTransfer({ to: TO, amountNano: '1' }), 'BALANCE_UNCONFIRMED');
+    // a send stands on the live tip, which no replayed certified state touches
+    assert.deepEqual((await qnet.prepareTransfer({ to: ME, amountNano: '1' })).verification, 'live');
   });
 
   it('a u64 balance above 2^53 is reported exactly', async () => {
     installFetch(chain({ balance: '18446744073709551615', nonce: '7' }).route);
     assert.deepEqual(await qnet.getBalance(), {
-      balanceNano: '18446744073709551615', spendableNano: '18446744073709551615', nonce: '7', verified: true,
-      verification: 'proof', blockHeight: FIRST_INDEX * 90,
+      balanceNano: '18446744073709551615', spendableNano: '18446744073709551615', nonce: '7', verified: false,
+      verification: 'live', blockHeight: FIRST_INDEX * 90 + 45,
     });
   });
 
-  it('the nodes\' account never moves a balance: the certified figure decides, whatever two nodes report', async () => {
+  it('the nodes\' account never moves a balance: the figure a proof covers decides, whatever two nodes report', async () => {
     installFetch(chain({ balance: '100', nonce: '9', perNode: () => ({ balance: '99999999999', nonce: '9', pk: true }) }).route);
     const balance = await qnet.getBalance();
-    assert.deepEqual([balance.balanceNano, balance.spendableNano, balance.verification], ['100', '100', 'proof']);
-    assert.deepEqual(await qnet.resolveNonce(ME), { nextNonce: '10', pkBound: true, verified: true });
+    assert.deepEqual([balance.balanceNano, balance.spendableNano, balance.verification], ['100', '100', 'live']);
+    assert.deepEqual(await qnet.resolveNonce(ME), { nextNonce: '10', pkBound: true });
   });
 
-  it('no certified state: the figure shows as not verified, every send is refused saying why, and nothing is defaulted', async () => {
+  it('no certified state: the live figure shows and sends go from it; without one either, the certified answer shows as not verified, a send says why, nothing is defaulted', async () => {
     const { route, net } = chain({ balance: '100', nonce: '1' });
     net.headless = true;
     installFetch(route);
+    const live = await qnet.getBalance();
+    assert.deepEqual([live.balanceNano, live.verified, live.verification, live.spendableNano], ['100', false, 'live', '100']);
+    assert.deepEqual(await qnet.resolveNonce(ME), { nextNonce: '2', pkBound: false });
+    net.live = false;
     const balance = await qnet.getBalance();
-    assert.deepEqual([balance.balanceNano, balance.verified, balance.verification], ['100', false, 'none']);
+    assert.deepEqual([balance.balanceNano, balance.verified, balance.verification, balance.spendableNano], ['100', false, 'none', null]);
     await rejectsWith(qnet.resolveNonce(ME), 'BALANCE_UNCONFIRMED');
-    await rejectsWith(qnet.prepareTransfer({ to: TO, amountNano: '1' }), 'BALANCE_UNCONFIRMED');
+    await rejectsWith(qnet.prepareTransfer({ to: ME, amountNano: '1' }), 'BALANCE_UNCONFIRMED');
     installFetch(() => {
       throw new TypeError('offline');
     });
     await rejectsWith(qnet.getBalance(), 'NETWORK');
     await rejectsWith(qnet.resolveNonce(ME), 'NETWORK');
+  });
+
+  it('a live figure of the tip shows over an older certified one; a verified state of its height or newer shows verified', async () => {
+    installEnv();
+    const { route, net } = chain({ balance: '5000000000', nonce: '0' });
+    net.setTip({ [ME]: { balance: '7000000000', nonce: '0' } });
+    installFetch(route);
+    const tip = await qnet.getBalance();
+    assert.deepEqual([tip.balanceNano, tip.verified, tip.verification, tip.blockHeight], ['7000000000', false, 'live', FIRST_INDEX * 90 + 60]);
+    // a live answer of a state older than the certified one: the verified one shows (once its read came)
+    net.setTip({ [ME]: { balance: '1', nonce: '0' } }, {}, FIRST_INDEX * 90 - 10);
+    const fresh = await worker(`olderTip=${Date.now()}`);
+    net.install();
+    assert.deepEqual(await fresh.readAccount(ME).then((a) => a.verification), 'proof');
+    // the certified read is not waited for beside a live figure: a read after it came shows it
+    let shown = await fresh.getBalance();
+    for (let i = 0; i < 20 && shown.verification !== 'proof'; i++) shown = await fresh.getBalance();
+    assert.deepEqual([shown.balanceNano, shown.verified, shown.verification], ['5000000000', true, 'proof']);
+    assert.equal(shown.spendableNano, '1', 'what is left to spend is the live figure\'s');
   });
 
   it('answers about another address are ignored', async () => {
@@ -359,7 +394,7 @@ describe('chains-activation qnet: verified balance and nonce', () => {
     });
     installEnv({ state: { ...emptyState(), pendingTransfers: [pending('1'), pending('2'), pending('3')] } });
     installFetch(chain({ nonce: '1' }).route);
-    assert.deepEqual(await qnet.resolveNonce(ME), { nextNonce: '4', pkBound: false, verified: true });
+    assert.deepEqual(await qnet.resolveNonce(ME), { nextNonce: '4', pkBound: false });
     const preview = await qnet.preview({ to: TO, amount: '1.5' });
     assert.deepEqual(preview, {
       from: ME,
@@ -369,16 +404,15 @@ describe('chains-activation qnet: verified balance and nonce', () => {
       totalNano: String(1500000000 + Number(FEE)),
       nonce: '4',
       balanceNano: String(5000000000000n - 2n * (1000n + BigInt(FEE))),
-      verified: true,
-      verification: 'proof',
+      verified: false,
+      verification: 'live',
       // the earlier sends the chain has not taken yet: this one goes in addition to them (R2-EXTQ-03)
       outstanding: ['2', '3'].map((nonce) => ({ nonce, to: TO, amountNano: '1000', feeNano: FEE, createdAt, stale: false, refused: false, kind: 'transfer' })),
-      duplicate: false,
       replacesNonce: null,
       // nonces 2 and 3 are not in a block yet: the node admits only nonce 2 now, so a dApp's request waits
       inFlight: true,
       // a pending send makes TO a known recipient; the archive is not reachable here
-      recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false, recentSame: false },
+      recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: false },
     });
   });
 
@@ -392,88 +426,167 @@ describe('chains-activation qnet: verified balance and nonce', () => {
   });
 });
 
-// The owner's rule, as the app: a send is decided only by a balance the committee certified. That state lags the chain by
-// minutes, so what the wallet's own transactions from its nonce on take is counted against it, a nonce in between that
-// is none of the wallet's own refuses the send, and anything received since never counts.
-describe('chains-activation qnet: the send rule over a certified state', () => {
-  const HOUR = 60 * 60 * 1000;
+// The owner's rule (18.10), as the app: a send is decided at a pinned node's live tip, in one read. Every transaction of
+// this wallet at or below the tip's nonce is in its balance already, those above it stay reserved, what arrived counts at
+// once, and the network itself refuses what that figure does not cover.
+describe('chains-activation qnet: the send rule at the live tip', () => {
   const sentRecord = (nonce, amountNano, extra = {}) => ({
     nonce, to: TO, amountNano, feeNano: FEE, body: `{"n":${nonce}}`, txHash: TX_HASH, createdAt: Date.now() - 60_000,
     lastSubmitAt: Date.now() - 60_000, outcome: 'pending', kind: 'transfer', call: null, ...extra,
   });
 
-  it('right after the wallet\'s own send: the certified base less its own transactions since; what arrived since never counts', async () => {
-    // certified at nonce 0 with 10 QNC; the chain took the wallet's 2 QNC send at nonce 1, and 50 QNC arrived since
-    installEnv({ state: { ...emptyState(), pendingTransfers: [sentRecord('1', '2000000000')] } });
-    installFetch(chain({ balance: '10000000000', nonce: '0', perNode: () => ({ balance: '57999850000', nonce: '1', pk: false }) }).route);
-    const settled = 10000000000n - 2000000000n - BigInt(FEE);
+  it('right after the wallet\'s own send: the live balance less its own transactions above the live nonce; what arrived counts', async () => {
+    // certified at nonce 0 with 10 QNC; the tip took the wallet's 2 QNC send at nonce 1, and 50 QNC arrived since; nonce 2
+    // is still on its way
+    installEnv({ state: { ...emptyState(), pendingTransfers: [sentRecord('1', '2000000000'), sentRecord('2', '1000000000')] } });
+    const { route, net } = chain({ balance: '10000000000', nonce: '0' });
+    net.setTip({ [ME]: { balance: '57999850000', nonce: '1' } });
+    installFetch(route);
+    const left = (57999850000n - 1000000000n - BigInt(FEE)).toString();
     const preview = await qnet.preview({ to: TO, amount: '1' });
-    assert.deepEqual([preview.nonce, preview.balanceNano, preview.outstanding], ['2', settled.toString(), []]);
-    assert.equal((await qnet.getBalance()).spendableNano, settled.toString());
-    await rejectsWith(qnet.send({ to: TO, amount: '8', expectedFeeNano: FEE }), 'INSUFFICIENT_FUNDS');
-    const sent = await qnet.send({ to: TO, amount: '7', expectedFeeNano: FEE, expectedNonce: '2' });
-    assert.equal(sent.nonce, '2');
+    assert.deepEqual([preview.nonce, preview.balanceNano, preview.outstanding.map((p) => p.nonce), preview.verification],
+      ['3', left, ['2'], 'live']);
+    const balance = await qnet.getBalance();
+    assert.deepEqual([balance.balanceNano, balance.spendableNano, balance.nonce, balance.verification], ['57999850000', left, '1', 'live']);
+    await rejectsWith(qnet.send({ to: TO, amount: '57', expectedFeeNano: FEE }), 'INSUFFICIENT_FUNDS');
+    assert.equal((await qnet.send({ to: TO, amount: '50', expectedFeeNano: FEE, expectedNonce: '3' })).nonce, '3');
   });
 
-  it('a nonce in the range that is none of the wallet\'s own refuses the send: a transaction from another device', async () => {
+  it('a transaction from another device is in the live balance: the next nonce follows it, and nothing is refused for it', async () => {
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [sentRecord('1', '2000000000')] } });
-    installFetch(chain({ balance: '10000000000', nonce: '0', perNode: () => ({ balance: '1', nonce: '2', pk: false }) }).route);
-    await rejectsWith(qnet.preview({ to: TO, amount: '1' }), 'BALANCE_FOREIGN_PENDING');
-    await rejectsWith(qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE }), 'BALANCE_FOREIGN_PENDING');
-    await rejectsWith(qnet.prepareCall({ kind: 'contractCall', contract: core.deriveContractAddress(ME, 3), method: 'run', args: '', gasLimit: null }),
-      'BALANCE_FOREIGN_PENDING');
-    assert.equal((await qnet.getBalance()).spendableNano, '0', 'nothing is available until the certified state takes it in');
-    assert.equal(env.calls.signQnetTransfer, 0);
-    // the nodes' nonce agrees by itself, whatever balances they report (they may be a block apart)
-    qnet = await import(`../dist/background/qnet.js?nonceOnly=${Date.now()}`);
-    installFetch(chain({
-      balance: '10000000000', nonce: '0', perNode: (node) => ({ balance: String(QNET.NODES.indexOf(node) + 1), nonce: '2', pk: false }),
-    }).route);
-    await rejectsWith(qnet.preview({ to: TO, amount: '1' }), 'BALANCE_FOREIGN_PENDING');
-    // once certified past it, the send goes again
-    installFetch(chain({ balance: '1', nonce: '2' }).route);
+    const { route, net } = chain({ balance: '10000000000', nonce: '0' });
+    // the tip holds nonce 2: this wallet's transfer at 1 and another device's at 2
+    net.setTip({ [ME]: { balance: '5000000000', nonce: '2' } });
+    installFetch(route);
     const preview = await qnet.preview({ to: TO, amount: '1' });
-    assert.deepEqual([preview.nonce, preview.balanceNano], ['3', '1']);
+    assert.deepEqual([preview.nonce, preview.balanceNano, preview.outstanding], ['3', '5000000000', []]);
+    const call = await qnet.prepareCall({ kind: 'contractCall', contract: core.deriveContractAddress(ME, 3), method: 'run', args: '', gasLimit: null });
+    assert.equal(call.nonce, '3');
+    assert.equal((await qnet.getBalance()).spendableNano, '5000000000');
+    assert.equal((await qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '3' })).nonce, '3');
+    assert.equal(env.calls.signQnetTransfer, 1);
   });
 
-  it('a confirmed send\'s record goes, its spend record stays: an older certified state a node still serves counts it', async () => {
-    const env = installEnv();
-    installFetch(chain({ balance: '10000000000' }).route);
-    await qnet.send({ to: TO, amount: '2', expectedFeeNano: FEE, expectedNonce: '1' });
-    assert.deepEqual(env.state().spends.map((r) => [r.nonce, r.qncNano, r.token, r.tokenUnknown, r.settledAt]),
-      [['1', String(2000000000n + BigInt(FEE)), null, false, null]], 'kept by nonce from its signing');
-    // certified past it: the record goes once two nodes list its row; the spend record is settled, and stays
-    const row = { from: ME, to: TO, amount: 2000000000, nonce: 1, type: 'transfer', hash: 'ff'.repeat(32) };
-    installFetch(chain({ balance: String(8000000000n - BigInt(FEE)), nonce: '1', sent: [row] }).route);
-    assert.equal((await qnet.resubmitPending()).confirmed, 1);
-    assert.deepEqual(env.state().pendingTransfers, []);
-    const [spend] = env.state().spends;
-    assert.equal(typeof spend.settledAt, 'number');
-    // a node still serves the certified state from before it (nonce 0): the send is counted, never taken for another device's
-    const later = await import(`../dist/background/qnet.js?older=${Date.now()}`);
-    installFetch(chain({ balance: '10000000000', nonce: '0', perNode: () => ({ balance: '1', nonce: '1', pk: false }) }).route);
-    const preview = await later.preview({ to: TO, amount: '1' });
-    assert.deepEqual([preview.nonce, preview.balanceNano], ['2', String(8000000000n - BigInt(FEE))]);
-    // an hour after it settled the spend record goes (with the next write)
-    env.setState({ ...env.state(), spends: [{ ...spend, settledAt: Date.now() - HOUR - 1000 }] });
-    installFetch(chain({ balance: String(8000000000n - BigInt(FEE)), nonce: '1' }).route);
-    await later.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '2' });
-    assert.deepEqual(env.state().spends.map((r) => r.nonce), ['2']);
+  // A node a block or more behind may answer first: the chain's nonce this wallet knows it reached (the agreed nonce, the
+  // kept transactions decided there, the spend records settled since) is the floor, and what its own transactions took
+  // after the lagging state comes off that state's balance (the mobile spendableFrom).
+  it('after a confirmed send, a node behind never makes the next send reuse its nonce or count its amount again', async () => {
+    const realRandom = Math.random;
+    Math.random = () => 0.999999; // the pinned nodes in their own order: the lagging one is asked first
+    try {
+      const [lagging] = QNET.NODES;
+      const sentAmount = 2_000_000_000n;
+      const left = (10_000_000_000n - sentAmount - BigInt(FEE)).toString();
+      installEnv({ state: { ...emptyState(), pendingTransfers: [sentRecord('5', String(sentAmount))] } });
+      const { route, net } = chain({
+        balance: '10000000000', nonce: '4', perNode: () => ({ balance: left, nonce: '5', pk: false }),
+        sent: [{ from: ME, to: TO, amount: Number(sentAmount), nonce: 5, type: 'transfer', hash: 'ff'.repeat(32) }],
+      });
+      // the tip took the send at nonce 5; one node still serves the state before it
+      net.setTip({ [ME]: { balance: left, nonce: '5' } }, {}, FIRST_INDEX * 90 + 70);
+      net.setTip({ [ME]: { balance: '10000000000', nonce: '4' } }, {}, FIRST_INDEX * 90 + 65, lagging);
+      installFetch(route);
+      assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 1, replaced: 0, passed: 0 });
+      // a woken worker knows the floor from the vault alone: the lagging answer does not end the read, the next node's does
+      let woken = await worker(`floor=${Date.now()}`);
+      net.requests.length = 0;
+      const preview = await woken.preview({ to: TO, amount: '1' });
+      assert.deepEqual([preview.nonce, preview.balanceNano], ['6', left]);
+      const asked = net.requests.filter((r) => r.endsWith(`/api/v1/account/${ME}/balance/proof`)).map((r) => new URL(r).origin);
+      assert.deepEqual(asked.slice(0, 2), [lagging, QNET.NODES[1]], 'the lagging node first, then the next');
+      const shown = await woken.getBalance();
+      assert.deepEqual([shown.balanceNano, shown.spendableNano, shown.blockHeight], [left, left, FIRST_INDEX * 90 + 70]);
+      // only the lagging node answers: the shown figure does not go back to it, and a send counts the confirmed one off it
+      const laggingOnly = routes(nodeRoute(({ node, path: p }) => (p === `/api/v1/account/${ME}/balance/proof` && node !== lagging
+        ? { status: 503, body: '{}' } : undefined)), route);
+      installFetch(laggingOnly);
+      assert.deepEqual(await woken.getBalance().then((b) => [b.balanceNano, b.blockHeight]), [left, FIRST_INDEX * 90 + 70]);
+      woken = await worker(`floorLagging=${Date.now()}`);
+      const behind = await woken.preview({ to: TO, amount: '1' });
+      assert.deepEqual([behind.nonce, behind.balanceNano], ['6', left], 'never nonce 5 again, never the amount sent counted as there');
+      assert.deepEqual((await woken.getBalance()).spendableNano, left);
+      // the confirmed record gone (the archive listed it): its settled spend record still holds the floor and the amount
+      installEnv({ state: { ...emptyState(), spends: [{ nonce: '5', qncNano: (sentAmount + BigInt(FEE)).toString(), token: null, tokenAmount: null,
+        tokenUnknown: false, settledAt: Date.now() }] } });
+      woken = await worker(`floorSpends=${Date.now()}`);
+      const settled = await woken.preview({ to: TO, amount: '1' });
+      assert.deepEqual([settled.nonce, settled.balanceNano], ['6', left]);
+      // a refused send the chain took, not decided yet: the agreed nonce this worker read keeps the next send off its
+      // nonce (no default replace at a nonce the chain used)
+      installEnv({ state: { ...emptyState(), pendingTransfers: [sentRecord('5', String(sentAmount), { outcome: 'refused' })] } });
+      installFetch(routes(nodeRoute(({ path: p }) => (p.startsWith('/api/v1/transactions/history?') ? { body: { transactions: [] } } : undefined)),
+        laggingOnly));
+      woken = await worker(`floorRefused=${Date.now()}`);
+      assert.deepEqual(await woken.sentStatus({ nonce: '5' }), { status: 'unknown' });
+      const taken = await woken.preview({ to: TO, amount: '1' });
+      assert.deepEqual([taken.nonce, taken.replacesNonce, taken.balanceNano], ['6', null, left]);
+    } finally {
+      Math.random = realRandom;
+    }
   });
 
-  it('a spend record whose transaction is gone with its nonce unused goes with it', async () => {
-    const env = installEnv({
-      state: {
-        ...emptyState(),
-        pendingTransfers: [sentRecord('1', '5', { outcome: 'refused', createdAt: Date.now() - 26 * HOUR, lastSubmitAt: Date.now() - 26 * HOUR })],
-        spends: [{ nonce: '1', qncNano: String(5n + BigInt(FEE)), token: null, tokenAmount: null, tokenUnknown: false, settledAt: null }],
-      },
-    });
-    installFetch(chain({ balance: '10000000000', nonce: '0' }).route);
-    // a day past the node's lifetime, its nonce still free: dropped and gone from the list
-    await qnet.resubmitPending();
-    assert.deepEqual(env.state().pendingTransfers, []);
-    assert.deepEqual(env.state().spends, [], 'it took nothing: its nonce was never used');
+  it('a send check is one read at the live tip: no certified proof, no committee walk, no certified head', async () => {
+    installEnv();
+    const { route, net } = chain({ balance: '10000000000' });
+    installFetch(route);
+    const preview = await qnet.prepareTransfer({ to: ME, amountNano: '1' });
+    assert.deepEqual([preview.nonce, preview.verification, preview.verified], ['1', 'live', false]);
+    assert.ok(!net.requests.some((r) => r.includes('?mb=') || r.includes('/macroblock/') || r.endsWith('/api/v1/state/certified')),
+      net.requests.join(' '));
+    assert.deepEqual(net.requests.filter((r) => r.includes('/balance/proof')).map((r) => r.slice(r.indexOf('/api/'))),
+      [`/api/v1/account/${ME}/balance/proof`]);
+  });
+
+  it('the live read marks no node old and stands for no certified figure', async () => {
+    installEnv();
+    const { route } = chain({ balance: '7', nonce: '4' });
+    installFetch(route);
+    const before = QNET.NODES.map((node) => core.nodeMarkedOld(node));
+    assert.deepEqual(await qnet.liveAccountFigure(ME), { balanceNano: '7', nonce: '4', blockHeight: FIRST_INDEX * 90 + 45 });
+    assert.deepEqual(QNET.NODES.map((node) => core.nodeMarkedOld(node)), before, 'its body is the live route\'s, no older node\'s');
+    await rejectsWith(qnet.liveAccountFigure('x'), 'INVALID_ADDRESS');
+    // a certified read afterwards is judged on its own: nothing of the live read stands as certified
+    assert.equal((await qnet.readAccount(ME)).verification, 'proof');
+  });
+
+  it('a new wallet shows 0 at once: two nodes answering that they hold no such account, never one, never a body of another address', async () => {
+    installEnv();
+    // this wallet's account is in no state yet: every node answers the live route's absent body for it
+    const { route } = chain({ accounts: {} });
+    const unborn = certifiedNet({ accounts: {} });
+    unborn.install();
+    const fresh = routes(unborn.route, route);
+    installFetch(fresh);
+    assert.deepEqual(await qnet.liveAccountFigure(ME), { balanceNano: '0', nonce: '0', blockHeight: null });
+    // the popup's balance does not wait for the certified absence proof: 0 at once, nothing to spend, nonce 1 next
+    installFetch((request) => (new URL(request.url).search.includes('mb=')
+      ? new Promise((resolve) => setTimeout(() => resolve(fresh(request)), 3000)) : fresh(request)));
+    const started = Date.now();
+    const balance = await qnet.getBalance();
+    assert.ok(Date.now() - started < 1500, `answered after ${Date.now() - started} ms`);
+    assert.deepEqual(balance, { balanceNano: '0', spendableNano: '0', nonce: '0', verified: false, verification: 'live', blockHeight: null });
+    assert.deepEqual(await qnet.resolveNonce(ME), { nextNonce: '1', pkBound: false });
+    // one node's word, or bodies of another address, are no absence
+    const [only] = QNET.NODES;
+    installFetch(routes(nodeRoute(({ node, path: p }) => (p === `/api/v1/account/${ME}/balance/proof` && node !== only
+      ? { status: 503, body: '{}' } : undefined)), fresh));
+    assert.equal(await qnet.liveAccountFigure(ME), null);
+    installFetch(routes(nodeRoute(({ path: p }) => (p === `/api/v1/account/${ME}/balance/proof`
+      ? { body: { address: TO, balance: 0, nonce: 0, merkle_proof: [], state_root: '', block_height: 0, error: 'account not found', proof_valid: false } }
+      : undefined)), fresh));
+    assert.equal(await qnet.liveAccountFigure(ME), null);
+  });
+
+  it('an account the chain took a nonce of never shows the absent body\'s 0: a node gives that body for an error too', async () => {
+    // the vault holds a transaction the chain took at nonce 3, so the account exists whatever the live route says
+    installEnv({ state: { ...emptyState(), pendingTransfers: [sentRecord('3', '1000000000', { outcome: 'confirmed' })] } });
+    const { route } = chain({ balance: '5000000000', nonce: '3' });
+    installFetch(routes(nodeRoute(({ path: p }) => (p === `/api/v1/account/${ME}/balance/proof`
+      ? { body: { address: ME, balance: 0, nonce: 0, merkle_proof: [], state_root: '', block_height: 0, error: 'account not found', proof_valid: false } }
+      : undefined)), route));
+    const balance = await qnet.getBalance();
+    assert.deepEqual([balance.balanceNano, balance.verification], ['5000000000', 'proof'], 'the certified read stands in');
+    await rejectsWith(qnet.preview({ to: TO, amount: '1' }), 'BALANCE_UNCONFIRMED');
   });
 });
 
@@ -688,7 +801,7 @@ describe('chains-activation qnet: signed transfer', () => {
     // node1 passed the body on: it applied at nonce 1
     installFetch(chain({ nonce: '1', sent: [{ from: ME, to: TO, amount: 2000000000, nonce: 1, type: 'transfer', hash: 'ff'.repeat(32) }] }).route);
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 1, replaced: 0, passed: 0 });
-    assert.deepEqual(env.state().pendingTransfers, []);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.nonce, p.outcome, p.txHash]), [['1', 'confirmed', 'ff'.repeat(32)]]);
   });
 
   it('a refusal while a hedged second node also got the body is unknown, not a failure', async () => {
@@ -744,9 +857,11 @@ describe('chains-activation qnet: resubmission', () => {
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 1, confirmed: 1, replaced: 0, passed: 0 });
     assert.deepEqual(log.posts.map((r) => r.body), ['{"n":4}'], 'a stale transfer (no longer resent) is not posted');
     const state = env.state().pendingTransfers;
-    assert.deepEqual(state.map((p) => p.nonce), ['4', '5', '6'], 'the stale one is still listed and reserved (R2-EXTQ-02)');
-    assert.equal(state[0].txHash, TX_HASH);
-    assert.ok(Date.now() - state[0].lastSubmitAt < 5000);
+    // the one the chain took stays listed as confirmed until the archive lists it
+    assert.deepEqual(state.map((p) => [p.nonce, p.outcome]), [['3', 'confirmed'], ['4', 'pending'], ['5', 'pending'], ['6', 'pending']],
+      'the stale one is still listed and reserved (R2-EXTQ-02)');
+    assert.equal(state[1].txHash, TX_HASH);
+    assert.ok(Date.now() - state[1].lastSubmitAt < 5000);
   });
 
   it('another transaction at its nonce marks a transfer replaced; no row yet, or no history, keeps it (R2-EXTQ-02)', async () => {
@@ -763,7 +878,7 @@ describe('chains-activation qnet: resubmission', () => {
     assert.deepEqual(listed.map((i) => [i.status, i.hash, i.nonce]), [['replaced', '', '4'], ['replaced', '', '3']]);
 
     // another wallet's scenario on a fresh worker: the chain's nonce it saw above never goes back
-    qnet = await import(`../dist/background/qnet.js?passed=${Date.now()}`);
+    qnet = await worker(`passed=${Date.now()}`);
     env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('3')] } });
     installFetch(routes(archiveRoute([]), chain({ nonce: '3', sent: [] }).route));
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 0, replaced: 0, passed: 1 });
@@ -776,7 +891,7 @@ describe('chains-activation qnet: resubmission', () => {
     assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['passed'], 'no history: kept as it is');
     installFetch(chain({ nonce: '3', sent: [row('3')] }).route);
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 1, replaced: 0, passed: 0 });
-    assert.deepEqual(env.state().pendingTransfers, [], 'decided later, once two nodes list its row');
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['confirmed'], 'decided later, once two nodes list its row');
 
     // a replaced transfer is listed for a day after it was seen replaced, then dropped
     env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('2', { outcome: 'replaced', sinceSubmit: 25 * 60 * 60 * 1000 })] } });
@@ -843,7 +958,7 @@ describe('chains-activation qnet: resubmission', () => {
     env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('3')] } });
     installFetch(chain({ nonce: '3', sent: (node) => (node === first ? [row('3', { amount: '999' })] : [row('3')]) }).route);
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 1, replaced: 0, passed: 0 });
-    assert.deepEqual(env.state().pendingTransfers, []);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['confirmed']);
   });
 
   // R5-EXTQ-01: a block may carry a transfer at a nonce already used, skipped at apply as a no-op, and every node lists
@@ -863,6 +978,157 @@ describe('chains-activation qnet: resubmission', () => {
     installFetch(chain({ nonce: '3', sent: (node) => (node === QNET.NODES[0] ? [y, x] : [y]) }).route);
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 0, replaced: 0, passed: 1 });
     assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['passed']);
+  });
+});
+
+// Owner, 18.10: the pending list and a sent transaction's status follow the nonce the pinned nodes report live; nothing
+// of it waits for a certified state, and the send queue never waits behind these reads.
+describe('chains-activation qnet: transactions decided at the live tip', () => {
+  const at = Date.now() - 60_000;
+  const kept = (nonce, extra = {}) => ({
+    nonce, to: TO, amountNano: '10', feeNano: FEE, body: `{"n":${nonce}}`, txHash: TX_HASH, createdAt: at, lastSubmitAt: at, outcome: 'pending',
+    kind: 'transfer', call: null, ...extra,
+  });
+  const sentRow = (nonce, amount = 10) => ({ from: ME, to: TO, amount, nonce: Number(nonce), type: 'transfer', hash: 'ff'.repeat(32) });
+
+  it('resubmitPending decides by the nonce two nodes report live while the certified state lags: no proof read, no walk', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [kept('1')] } });
+    const { route, net } = chain({ nonce: '0', perNode: () => ({ balance: '1', nonce: '1', pk: false }), sent: [sentRow('1')] });
+    installFetch(route);
+    assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 0, confirmed: 1, replaced: 0, passed: 0 });
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['confirmed']);
+    assert.ok(!net.requests.some((r) => r.includes('/balance/proof') || r.includes('/macroblock/')), net.requests.join(' '));
+  });
+
+  it('a send is never held behind a run of resubmitPending: its node reads come before the send queue', async () => {
+    installEnv({ state: { ...emptyState(), pendingTransfers: [kept('1', { lastSubmitAt: Date.now() })] } });
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const base = chain({ nonce: '0', balance: '100000000000' });
+    installFetch(async (request) => {
+      const { pathname, search } = new URL(request.url);
+      // every read of this wallet's own account but the live proof hangs until released
+      if (pathname.startsWith(`/api/v1/account/${ME}`) && (!pathname.endsWith('/balance/proof') || search.includes('mb='))) await gate;
+      return base.route(request);
+    });
+    const run = qnet.resubmitPending();
+    const timeout = new Promise((resolve) => setTimeout(() => resolve('held'), 5000));
+    const sent = await Promise.race([qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '2' }), timeout]);
+    release();
+    await run;
+    assert.notEqual(sent, 'held', 'the send waited behind the run');
+    assert.equal(sent.nonce, '2');
+  });
+
+  it('History reads the pending list after the run it starts: a transfer the chain took shows once, as the archive\'s row', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [kept('3')] } });
+    const archived = { source: 'tx', hash: 'ff'.repeat(32), from: ME, to: TO, amount: '10', fee: FEE, timestamp: at, tx_type: 'transfer' };
+    installFetch(routes(archiveRoute([archived]), chain({ nonce: '3', sent: [sentRow('3')] }).route));
+    const page = await qnet.getHistory({});
+    assert.deepEqual(page.pending, [], 'decided before the page was drawn');
+    assert.deepEqual(page.items.map((item) => [item.hash, item.amountNano]), [['ff'.repeat(32), '10']]);
+    assert.deepEqual(env.state().pendingTransfers, []);
+  });
+
+  it('a transaction the chain took stays in History, confirmed, until the archive lists it, then shows once as the archive\'s row', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [kept('3'), kept('4', { to: G1, txHash: null })] } });
+    const archive = [];
+    // the nodes list the transfer at nonce 4 under two hashes (each node that took the body stamps its own copy)
+    const atFour = (node) => ({ ...sentRow('4'), to: G1, hash: node === QNET.NODES[0] ? 'ee'.repeat(32) : 'e1'.repeat(32) });
+    installFetch(routes(archiveRoute(archive), chain({ nonce: '4', sent: (node) => [sentRow('3'), atFour(node)] }).route));
+    assert.deepEqual(await qnet.sentStatus({ nonce: '4' }), { status: 'in_block' });
+    // the sent screen's Done opens History at once, before the archive has indexed either: both stay listed
+    assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.nonce), ['4', '3']);
+    await qnet.backgroundReads();
+    const first = await qnet.getHistory({});
+    assert.deepEqual(first.items, []);
+    assert.deepEqual(first.pending.map((i) => [i.status, i.hash, i.nonce]), [['included', '', '4'], ['included', 'ff'.repeat(32), '3']]);
+    // the archive lists them, one by the hash two nodes listed, the other (no hash of its own) by its recipient and amount
+    // (a row from before it was signed is not it): one row each, the archive's, and the records leave the vault
+    archive.push({ source: 'tx', hash: 'ff'.repeat(32), from: ME, to: TO, amount: '10', fee: FEE, timestamp: at, tx_type: 'transfer' });
+    archive.push({ source: 'tx', hash: 'dd'.repeat(32), from: ME, to: G1, amount: '10', fee: FEE, timestamp: at - 60 * 60 * 1000, tx_type: 'transfer' });
+    const second = await qnet.getHistory({});
+    assert.deepEqual(second.pending.map((i) => i.nonce), ['4'], 'an older payment of the same amount is another row');
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['4']);
+    archive.push({ source: 'tx', hash: 'e1'.repeat(32), from: ME, to: G1, amount: '10', fee: FEE, timestamp: Math.floor(Date.now() / 1000), tx_type: 'transfer' });
+    const third = await qnet.getHistory({});
+    assert.deepEqual(third.pending, []);
+    assert.deepEqual(third.items.map((i) => [i.hash, i.status]), [['ff'.repeat(32), 'included'], ['dd'.repeat(32), 'unverified'],
+      ['e1'.repeat(32), 'included']]);
+    assert.deepEqual(env.state().pendingTransfers, []);
+  });
+
+  it('two equal payments a minute apart stay two rows while the archive lists only the first: a row is one transaction\'s', async () => {
+    const first = kept('3', { txHash: 'a1'.repeat(32), outcome: 'confirmed', createdAt: Date.now() - 2 * 60_000 });
+    const second = kept('4', { txHash: 'b2'.repeat(32), outcome: 'confirmed', createdAt: Date.now() - 60_000 });
+    let env = installEnv({ state: { ...emptyState(), pendingTransfers: [first, second] } });
+    const row = (hash, timestamp) => ({ source: 'tx', hash, from: ME, to: TO, amount: '10', fee: FEE, timestamp, tx_type: 'transfer' });
+    const listed = [{ ...sentRow('3'), hash: 'a1'.repeat(32) }, { ...sentRow('4'), hash: 'b2'.repeat(32) }];
+    installFetch(routes(archiveRoute([row('a1'.repeat(32), first.createdAt)]), chain({ nonce: '4', sent: listed }).route));
+    const page = await qnet.getHistory({});
+    assert.deepEqual(page.items.map((i) => [i.hash, i.status]), [['a1'.repeat(32), 'included']]);
+    assert.deepEqual(page.pending.map((i) => [i.nonce, i.status, i.hash]), [['4', 'included', 'b2'.repeat(32)]]);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['4']);
+    // with the first record gone, its row is still not the second's
+    assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.nonce), ['4']);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['4']);
+
+    // two the nodes listed under different hashes, and one still sent whose hash a node gave: the first takes the one row
+    // of its recipient and amount, the second no row, and the row of the one still sent stays its own; a row no two nodes
+    // list reads Confirmed by the record that took it, which stays in the vault until the nodes list that row too
+    const hashless = (nonce, ago) => kept(nonce, { txHash: null, outcome: 'confirmed', createdAt: Date.now() - ago });
+    const sending = kept('7', { txHash: 'd4'.repeat(32), createdAt: Date.now() - 30_000, lastSubmitAt: Date.now() });
+    env = installEnv({ state: { ...emptyState(), pendingTransfers: [hashless('5', 2 * 60_000), hashless('6', 60_000), sending] } });
+    installFetch(routes(archiveRoute([row('c3'.repeat(32), Date.now() - 2 * 60_000), row('d4'.repeat(32), Date.now() - 30_000)]),
+      chain({ nonce: '6', sent: [] }).route));
+    const fresh = await worker(`hashless=${Date.now()}`);
+    const both = await fresh.getHistory({});
+    assert.deepEqual(both.items.map((i) => [i.hash, i.status]), [['c3'.repeat(32), 'included'], ['d4'.repeat(32), 'unverified']]);
+    assert.deepEqual(both.pending.map((i) => i.nonce), ['7', '6']);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['5', '6', '7']);
+  });
+
+  it('a confirmed record the archive never lists leaves the list an hour after it was seen confirmed', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [kept('3', { outcome: 'confirmed', lastSubmitAt: Date.now() - 61 * 60 * 1000 }),
+      kept('4', { outcome: 'confirmed', lastSubmitAt: Date.now() - 59 * 60 * 1000 })] } });
+    installFetch(chain({ nonce: '4', sent: [] }).route);
+    await qnet.resubmitPending();
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['4']);
+  });
+
+  it('sentStatus: pending while the nonce is free, in a block once two nodes list this wallet\'s transaction there, replaced when another', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [kept('3')] } });
+    installFetch(chain({ nonce: '2' }).route);
+    assert.deepEqual(await qnet.sentStatus({ nonce: '3' }), { status: 'pending' });
+    // the tip took it: in a block, and the pending list is decided at once by the run sentStatus starts, from the rows it
+    // read (no history read of its own): confirmed, with the hash two nodes list, until the archive lists it
+    const decided = chain({ nonce: '3', sent: [sentRow('3')] });
+    installFetch(decided.route);
+    assert.deepEqual(await qnet.sentStatus({ nonce: '3' }), { status: 'in_block' });
+    const reads = decided.log.sentReads;
+    await qnet.backgroundReads();
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.outcome, p.txHash]), [['confirmed', 'ff'.repeat(32)]]);
+    assert.equal(decided.log.sentReads, reads, 'the rows sentStatus read decided the run');
+    assert.deepEqual(await qnet.sentStatus({ nonce: '3' }), { status: 'in_block' });
+    installEnv();
+    assert.deepEqual(await qnet.sentStatus({ nonce: '3' }), { status: 'in_block' }, 'with its record gone, its row still says so');
+    // another transaction of this wallet took the nonce
+    installEnv({ state: { ...emptyState(), pendingTransfers: [kept('3')] } });
+    installFetch(chain({ nonce: '3', sent: [sentRow('3', 11)] }).route);
+    assert.deepEqual(await qnet.sentStatus({ nonce: '3' }), { status: 'replaced' });
+    await qnet.resubmitPending();
+    // a used nonce no two nodes list, and an account nonce no two nodes report alike: unknown, never guessed
+    installEnv({ state: { ...emptyState(), pendingTransfers: [kept('3')] } });
+    installFetch(chain({ nonce: '3', sent: [] }).route);
+    assert.deepEqual(await qnet.sentStatus({ nonce: '3' }), { status: 'unknown' });
+    installFetch(chain({ perNode: (node) => ({ balance: '1', nonce: String(QNET.NODES.indexOf(node) + 5), pk: false }) }).route);
+    const fresh = await worker(`sentStatus=${Date.now()}`);
+    assert.deepEqual(await fresh.sentStatus({ nonce: '3' }), { status: 'unknown' });
+    await rejectsWith(qnet.sentStatus({ nonce: '0' }), 'INVALID_PARAMS');
+    installEnv({ locked: true });
+    await rejectsWith(qnet.sentStatus({ nonce: '3' }), 'LOCKED');
   });
 });
 
@@ -1016,15 +1282,15 @@ describe('chains-activation qnet: recipient check (ES-01)', () => {
     // the newest page: the look-alike's dust first, then 49 more incoming dust rows; the payee is gone from it
     const flood = [historyRow(0, poison, ME), ...Array.from({ length: 49 }, (_, i) => historyRow(i + 1, eonOf(40 + (i % 50)), ME))];
     installFetch(routes(archiveRoute(flood), chain().route));
-    assert.deepEqual(await qnet.recipientCheck(poison), { known: false, lookalike: true, incomingOnly: true, historyRead: true, recentSame: false });
-    assert.deepEqual(await qnet.recipientCheck(PAYEE), { known: true, lookalike: false, incomingOnly: false, historyRead: true, recentSame: false });
+    assert.deepEqual(await qnet.recipientCheck(poison), { known: false, lookalike: true, incomingOnly: true, historyRead: true });
+    assert.deepEqual(await qnet.recipientCheck(PAYEE), { known: true, lookalike: false, incomingOnly: false, historyRead: true });
   });
 
   it('an incoming sender is never "known": a 1-nano transfer does not silence the first-time warning', async () => {
     installEnv();
     const scammer = eonOf(21);
     installFetch(routes(archiveRoute([historyRow(1, scammer, ME)]), chain().route));
-    assert.deepEqual(await qnet.recipientCheck(scammer), { known: false, lookalike: false, incomingOnly: true, historyRead: true, recentSame: false });
+    assert.deepEqual(await qnet.recipientCheck(scammer), { known: false, lookalike: false, incomingOnly: true, historyRead: true });
   });
 
   it('the archive (the site host) can only add warnings: a row claiming this wallet paid X does not make X known', async () => {
@@ -1035,11 +1301,10 @@ describe('chains-activation qnet: recipient check (ES-01)', () => {
     // ...but what it lists as paid still widens the look-alike search
     assert.equal((await qnet.recipientCheck(lookalikeOf(PAYEE))).lookalike, true);
     // without the archive the vault still decides (a fresh worker: a page read a moment ago is used again for 30 s)
-    qnet = await import(`../dist/background/qnet.js?noArchive=${Date.now()}`);
+    qnet = await worker(`noArchive=${Date.now()}`);
     installFetch(chain().route);
-    assert.deepEqual(await qnet.recipientCheck(lookalikeOf(PAYEE)),
-      { known: false, lookalike: true, incomingOnly: false, historyRead: false, recentSame: false });
-    assert.deepEqual(await qnet.recipientCheck(ME), { known: false, lookalike: false, incomingOnly: false, historyRead: false, recentSame: false });
+    assert.deepEqual(await qnet.recipientCheck(lookalikeOf(PAYEE)), { known: false, lookalike: true, incomingOnly: false, historyRead: false });
+    assert.deepEqual(await qnet.recipientCheck(ME), { known: false, lookalike: false, incomingOnly: false, historyRead: false });
   });
 
   it('a signed send makes its recipient known, never the wallet itself', async () => {
@@ -1052,39 +1317,18 @@ describe('chains-activation qnet: recipient check (ES-01)', () => {
     assert.equal((await qnet.recipientCheck(TO)).known, true);
   });
 
-  it('names a payment of the same amount to the same address in the last 30 minutes (R2-EXTQ-03)', async () => {
-    installEnv();
-    const recent = { ...historyRow(1, ME, TO, '1500000000'), timestamp: Date.now() - 60_000 };
-    const old = { ...historyRow(2, ME, TO, '2500000000'), timestamp: Date.now() - 2 * 60 * 60 * 1000 };
-    installFetch(routes(archiveRoute([recent, old]), chain().route));
-    assert.equal((await qnet.recipientCheck(TO, '1500000000')).recentSame, true);
-    assert.equal((await qnet.recipientCheck(TO, '2500000000')).recentSame, false, 'older than 30 minutes');
-    assert.equal((await qnet.recipientCheck(TO, '1')).recentSame, false);
-    assert.equal((await qnet.recipientCheck(TO)).recentSame, false, 'no amount, no comparison');
-  });
-
-  // R3-EXTQ-01: the payment applied, its pending record went, and the archive is down, behind or flooded past
-  // its first page: the vault's own record of what this wallet signed still names the second payment.
-  it('names a second payment from the vault\'s own records when the archive cannot (R3-EXTQ-01)', async () => {
+  // Owner, 18.10: a payment of the same amount to the same address again is a send like any other; the outstanding
+  // ones are still named and offered to replace.
+  it('a second payment of the same amount is reviewed like any other: no repeat notice, and nothing kept to make one', async () => {
     const env = installEnv();
-    installFetch(chain({ balance: '9000000000000' }).route);
+    const recent = { ...historyRow(1, ME, TO, '500000000000'), timestamp: Date.now() - 60_000 };
+    installFetch(routes(archiveRoute([recent]), chain({ balance: '9000000000000' }).route));
     await qnet.send({ to: TO, amount: '500', expectedFeeNano: FEE, expectedNonce: '1' });
-    assert.deepEqual(env.state().recentTransfers.map((r) => [r.to, r.amountNano]), [[TO, '500000000000']]);
-    // the chain took it: the pending record goes once two nodes list its row
-    installFetch(chain({ balance: '9000000000000', nonce: '1', sent: [{ from: ME, to: TO, amount: 500000000000, nonce: 1, type: 'transfer' }] }).route);
-    await qnet.resubmitPending();
-    assert.deepEqual(env.state().pendingTransfers, []);
-    // no archive at all (every request fails): the preview still says it is a second payment
+    assert.deepEqual(env.state().recentTransfers, [], 'no record of it is kept for a warning');
     const preview = await qnet.preview({ to: TO, amount: '500' });
-    assert.deepEqual(preview.outstanding, []);
-    assert.equal(preview.recipient.historyRead, false);
-    assert.equal(preview.duplicate, true);
-    assert.equal((await qnet.preview({ to: TO, amount: '501' })).duplicate, false, 'another amount');
-    // 30 minutes later it is no longer named
-    const later = env.state();
-    later.recentTransfers = later.recentTransfers.map((r) => ({ ...r, createdAt: r.createdAt - 31 * 60 * 1000 }));
-    env.setState(later);
-    assert.equal((await qnet.preview({ to: TO, amount: '500' })).duplicate, false);
+    assert.equal(Object.hasOwn(preview, 'duplicate'), false);
+    assert.deepEqual(preview.recipient, { known: true, lookalike: false, incomingOnly: false, historyRead: true });
+    assert.deepEqual(preview.outstanding.map((p) => [p.nonce, p.amountNano]), [['1', '500000000000']], 'the one on its way is named');
   });
 
   it('replaces an outstanding transfer at its nonce: its record goes, its amount is free again (R2-EXTQ-03)', async () => {
@@ -1195,7 +1439,7 @@ describe('chains-activation qnet: verified anchors (EXT-CHAINS-04)', () => {
     requested.length = 0;
     env.anchors = { [index - 2]: { eligible_ids: ['node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) } };
     core.clearQcCache();
-    const fresh = await import(`../dist/background/qnet.js?anchors=${index}`);
+    const fresh = await worker(`anchors=${index}`);
     assert.equal((await fresh.readAccount(G1)).verification, 'none', 'the walk failed here (404): not verified');
     assert.equal(requested[0], index, 'the walk from the kept anchor starts with one step, to the index');
     assert.equal(env.anchorWrites, 0, 'nothing new was verified, nothing is written');
@@ -1231,6 +1475,10 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
   const GAME = core.deriveContractAddress(ME, 3);
   // GAME's account in a certified state: a contract that is no token
   const GAME_ACCOUNT = { is_contract: true, contract_code_hash: 'ab'.repeat(32), storage_root: 'cd'.repeat(32) };
+  // What GET /api/v1/token/{a} answers for a contract that is no token (GAME's: notToken) and for an address holding none
+  const notTokenOf = (address) => ({ success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: address });
+  const noContractOf = (address) => ({ success: false, error: 'Token not found', contract_address: address });
+  const notToken = notTokenOf(GAME);
   const tokenInfo = (decimals = 6, name = 'Gold Coin', symbol = 'GOLD') => ({
     success: true, source: 'blockchain_state',
     token: { contract_address: TOKEN, standard: 'qrc20', name, symbol, decimals, logo: '', total_supply: '100000000000000' },
@@ -1247,7 +1495,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       if (info) {
         log.tokenReads++;
         const answer = typeof contracts[info[1]] === 'function' ? contracts[info[1]](node) : contracts[info[1]];
-        return { body: answer ?? { success: false, error: 'Token not found', contract_address: info[1] } };
+        return { body: answer ?? noContractOf(info[1]) };
       }
       if (p === '/api/v1/contract/call' && request.method === 'POST') {
         log.calls.push(request);
@@ -1260,7 +1508,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     return { route, log, net: base.net };
   }
 
-  it('a silent node never holds a token read (its details, its certified balance): the next node joins after 700 ms', async () => {
+  it('a silent node never holds a token read (its details, its balance): the next node joins after 700 ms', async () => {
     installEnv();
     const realRandom = Math.random;
     Math.random = () => 0.999999; // the pinned nodes in their own order: the first one is the silent one
@@ -1274,7 +1522,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
         }
         return route(request);
       });
-      const fresh = await import(`../dist/background/qnet.js?silentToken=${Date.now()}`);
+      const fresh = await worker(`silentToken=${Date.now()}`);
       const started = Date.now();
       const [info, balance] = await Promise.all([fresh.readContract(TOKEN), fresh.readTokenBalance(TOKEN, ME)]);
       const took = Date.now() - started;
@@ -1291,7 +1539,6 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
   // (reserved); so does any spelling a reader takes for QNC or QNet.
   it('readContract: a token as two nodes read it, another contract, none; a hidden character is shown as U+FFFD and marks the token', async () => {
     installEnv();
-    const notToken = { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: GAME };
     const { route, log } = callChain({ contracts: { [TOKEN]: tokenInfo(6, 'Gold\u202eCoin'), [GAME]: notToken } });
     installFetch(route);
     const shown = { kind: 'token', standard: 'qrc20', name: 'Gold\ufffdCoin', symbol: 'GOLD', decimals: 6, reserved: true };
@@ -1335,8 +1582,8 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     assert.deepEqual(preview, {
       kind: 'tokenTransfer', from: ME, contract: TOKEN, method: 'transfer', gasLimit: tx.gasLimit, feeNano: tx.maxFeeNano,
       depositNano: String(core.fees.STORAGE_DEPOSIT_NANO), totalNano: String(BigInt(tx.maxFeeNano) + BigInt(core.fees.STORAGE_DEPOSIT_NANO)),
-      nonce: '5', balanceNano: '1000000000000', verified: true, verification: 'proof', outstanding: [], replacesNonce: null, inFlight: false,
-      to: payee, amountBase: '2500000', tokenBalance: '7000000', tokenProblem: null, duplicate: false,
+      nonce: '5', balanceNano: '1000000000000', verified: false, verification: 'live', outstanding: [], replacesNonce: null, inFlight: false,
+      to: payee, amountBase: '2500000', tokenBalance: '7000000', tokenProblem: null,
     });
     assert.equal(tx.gasLimit, tx.intrinsicGas, 'a token transfer runs no code: its gas limit is its intrinsic gas');
     // a recipient who holds the token already: no deposit; one proven absent, or unreadable, counts as new
@@ -1394,12 +1641,11 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     installFetch(callChain({ balance: '1000000000000', balances: { [ME]: '2499999', [payee]: '1' } }).route);
     await rejectsWith(send(), 'INSUFFICIENT_FUNDS', 'the token balance does not cover the amount');
     installFetch(callChain({ balance: '1000000000000', balances: { [payee]: '1' } }).route);
-    await rejectsWith(send(), 'INSUFFICIENT_FUNDS', 'a certified balance of none');
+    await rejectsWith(send(), 'INSUFFICIENT_FUNDS', 'a live balance of none');
     installFetch(callChain({ balance: '1000000000000', balances: { [ME]: '7000000', [payee]: '1' }, unreadable: [TOKEN] }).route);
     await rejectsWith(send({ expectedDepositNano: String(core.fees.STORAGE_DEPOSIT_NANO) }), 'NETWORK', 'no node answered the token proof');
-    // a fresh worker: a proof verified a moment ago stands in only while the account's nonce did not move (the chain lowers a
-    // balance only by the wallet's own transactions), and this scenario lowers it without one
-    qnet = await import(`../dist/background/qnet.js?poor=${Date.now()}`);
+    // a fresh worker: nothing an earlier read of this test kept stands in
+    qnet = await worker(`poor=${Date.now()}`);
     installFetch(callChain({ balance: String(BigInt(tx.maxFeeNano) - 1n), balances: { [ME]: '7000000', [payee]: '1' } }).route);
     await rejectsWith(send(), 'INSUFFICIENT_FUNDS', 'the QNC balance does not cover the fee');
     assert.equal(env.calls.signQnetCall, 0);
@@ -1453,7 +1699,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     assert.deepEqual(await qnet.resubmitPending(), { resubmitted: 1, confirmed: 1, replaced: 0, passed: 0 });
     assert.deepEqual(log.calls.map((r) => r.body), ['{"call":2}'], 'the call route, the same bytes');
     assert.equal(log.posts.length, 0);
-    assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['2']);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.nonce, p.outcome]), [['1', 'confirmed'], ['2', 'pending']]);
     // a transfer at its nonce: another transaction took it
     env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('1')] } });
     installFetch(callChain({ nonce: '1', sent: [{ ...row('1', 'transfer', eonOf(55)), amount: 5 }] }).route);
@@ -1467,22 +1713,22 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
 
   it('a recipient that is a contract is never previewed or signed for: QNC or token, the token itself included (EXT-R2A-01)', async () => {
     const env = installEnv();
-    const notToken = { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: GAME };
     const { route, log, net } = callChain({
       balance: '1000000000000', contracts: { [TOKEN]: tokenInfo(), [GAME]: notToken }, balances: { [ME]: '7000000' },
       accounts: { [GAME]: GAME_ACCOUNT },
     });
     installFetch(route);
     const payee = eonOf(56);
-    // what a recipient is comes from its certified account leaf (is_contract), never from what nodes say of it
+    // what a recipient is comes at once from what two pinned nodes report of it: a token, another contract, none
     await qnet.assertPayableRecipient(payee);
     await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
     await rejectsWith(qnet.assertPayableRecipient(TOKEN), 'RECIPIENT_IS_CONTRACT');
-    assert.equal(log.tokenReads, 0, 'no node is asked what the recipient is');
+    await qnet.backgroundReads();
     const proofReads = () => net.requests.filter((r) => r.includes(`/api/v1/account/${ME}/balance/proof`)).length;
-    const own = proofReads();
+    const own = [proofReads(), log.tokenReads];
     await qnet.assertPayableRecipient(ME, ME);
-    assert.equal(proofReads(), own, "the wallet's own address is no contract and is not read");
+    await qnet.backgroundReads();
+    assert.deepEqual([proofReads(), log.tokenReads], own, "the wallet's own address is no contract and is not read");
     // the popup's review and send, and a dApp's transfer
     await rejectsWith(qnet.preview({ to: GAME, amount: '100' }), 'RECIPIENT_IS_CONTRACT');
     await rejectsWith(qnet.prepareTransfer({ to: TOKEN, amountNano: '1' }), 'RECIPIENT_IS_CONTRACT');
@@ -1504,41 +1750,87 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     assert.equal(call.contract, GAME);
   });
 
-  it('a recipient whose certified leaf cannot be had is not signed for: RECIPIENT_UNCHECKED, whatever nodes say (EXT-R2A-01)', async () => {
+  it('a recipient no two nodes agree on is not signed for: RECIPIENT_UNCHECKED, whatever its certified leaf says (EXT-R2A-01)', async () => {
     const env = installEnv();
     const payee = eonOf(57);
-    const none = { success: false, error: 'Token not found', contract_address: payee };
-    // every node says the address holds no contract, and none serves its account proof
-    const { route } = callChain({ balance: '1000000000000', contracts: { [payee]: none } });
-    installFetch(async (request) => (request.url.includes(`/api/v1/account/${payee}/balance/proof`)
-      ? { status: 503, body: '{"error":"busy"}' } : route(request)));
-    await rejectsWith(qnet.assertPayableRecipient(payee), 'RECIPIENT_UNCHECKED');
-    await rejectsWith(qnet.preview({ to: payee, amount: '1' }), 'RECIPIENT_UNCHECKED');
-    await rejectsWith(qnet.send({ to: payee, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }), 'RECIPIENT_UNCHECKED');
+    const none = noContractOf(payee);
+    const refused = async () => {
+      await rejectsWith(qnet.assertPayableRecipient(payee), 'RECIPIENT_UNCHECKED');
+      await rejectsWith(qnet.preview({ to: payee, amount: '1' }), 'RECIPIENT_UNCHECKED');
+      await rejectsWith(qnet.send({ to: payee, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }), 'RECIPIENT_UNCHECKED');
+      await qnet.backgroundReads();
+    };
+    // no node answers what the address is, while its certified leaf proves no contract
+    const { route } = callChain({ balance: '1000000000000' });
+    installFetch(async (request) => (request.url.includes(`/api/v1/token/${payee}`) ? { status: 503, body: '{"error":"busy"}' } : route(request)));
+    await refused();
+    // one node's word is not enough
+    installFetch(callChain({ balance: '1000000000000', contracts: { [payee]: (node) => (node === QNET.NODES[0] ? none : { success: false, error: 'busy' }) } }).route);
+    await refused();
+    // two nodes that answer differently, the others nothing usable: no answer stands
+    const split = [none, notTokenOf(payee)];
+    installFetch(callChain({ balance: '1000000000000', contracts: { [payee]: (node) => split[QNET.NODES.indexOf(node)] ?? { success: false, error: 'busy' } } }).route);
+    await refused();
     assert.equal(env.calls.signQnetTransfer, 0);
     assert.deepEqual(env.state().pendingTransfers, []);
-    // every node says a certified contract holds none: still a contract
-    const game = callChain({ balance: '1000000000000', contracts: { [GAME]: { ...none, contract_address: GAME } }, accounts: { [GAME]: GAME_ACCOUNT } });
-    installFetch(game.route);
+  });
+
+  it('a recipient\'s certified leaf is read in the background only: it never holds the check, one read at a time, and a contract it proves is refused from then on', async () => {
+    const env = installEnv();
+    const payee = eonOf(59);
+    const { route, log, net } = callChain({ balance: '1000000000000', accounts: { [GAME]: GAME_ACCOUNT } });
+    const reads = (address) => net.requests.filter((r) => r.includes(`/api/v1/account/${address}/balance/proof`)).length;
+    // the read ahead of the Send tab and the review share one leaf read
+    installFetch(route);
+    await qnet.sendWarm({ to: payee });
+    await Promise.all([qnet.assertPayableRecipient(payee), qnet.prepareTransfer({ to: payee, amountNano: '1' })]);
+    await qnet.backgroundReads();
+    assert.equal(reads(payee), 1, 'one certified leaf read for the read ahead and the two checks');
+    // a slow committee walk: every certified read waits 3 s, and the checks answer at once on the nodes' word
+    installFetch(async (request) => {
+      const { pathname, search } = new URL(request.url);
+      if (pathname.startsWith('/api/v1/macroblock/') || search.includes('mb=')) await new Promise((resolve) => setTimeout(resolve, 3000));
+      return route(request);
+    });
+    const started = Date.now();
+    await qnet.assertPayableRecipient(GAME); // every node says GAME holds no contract
+    const preview = await qnet.preview({ to: eonOf(60), amount: '1' });
+    const took = Date.now() - started;
+    assert.equal(preview.to, eonOf(60));
+    assert.ok(took < 1500, `the recipient checks took ${took} ms, not the committee walk`);
+    // its certified leaf, read beside the check, proves a contract: refused from then on, with no node asked again
+    await qnet.backgroundReads();
+    const asked = log.tokenReads;
+    await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
     await rejectsWith(qnet.preview({ to: GAME, amount: '1' }), 'RECIPIENT_IS_CONTRACT');
+    await rejectsWith(qnet.send({ to: GAME, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }), 'RECIPIENT_IS_CONTRACT');
+    assert.equal(log.tokenReads, asked, 'a contract the leaf proved is refused without asking the nodes');
+    assert.equal(env.calls.signQnetTransfer, 0);
   });
 
   it('a recipient\'s certified leaf stands while its macroblock does, and a contract stays one', async () => {
     installEnv();
     const payee = eonOf(58);
-    const { route, net } = callChain({ balance: '1000000000000', accounts: { [GAME]: GAME_ACCOUNT } });
+    const { route, net } = callChain({ balance: '1000000000000', contracts: { [GAME]: notToken }, accounts: { [GAME]: GAME_ACCOUNT } });
     installFetch(route);
     const reads = (address) => net.requests.filter((r) => r.includes(`/api/v1/account/${address}/balance/proof`)).length;
-    await qnet.assertPayableRecipient(payee);
-    await qnet.assertPayableRecipient(payee);
+    // a check, then the leaf read it started in the background
+    const check = async (address) => {
+      const refusal = qnet.assertPayableRecipient(address).then(() => null, (error) => error);
+      await qnet.backgroundReads();
+      const error = await refusal;
+      if (error !== null) throw error;
+    };
+    await check(payee);
+    await check(payee);
     assert.equal(reads(payee), 1, 'read once while its macroblock stands');
-    await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
+    await rejectsWith(check(GAME), 'RECIPIENT_IS_CONTRACT');
     // three macroblocks on, the leaf read before no longer stands; a contract still is one
     for (let i = 0; i < 3; i++) net.certify({ [ME]: { balance: '1000000000000', nonce: '0' }, [GAME]: GAME_ACCOUNT });
     net.install();
-    await qnet.assertPayableRecipient(payee);
+    await check(payee);
     assert.equal(reads(payee), 2, 'read again at a macroblock that stands');
-    await rejectsWith(qnet.assertPayableRecipient(GAME), 'RECIPIENT_IS_CONTRACT');
+    await rejectsWith(check(GAME), 'RECIPIENT_IS_CONTRACT');
     assert.equal(reads(GAME), 1, 'a contract is not read again');
   });
 
@@ -1562,20 +1854,24 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       tx: { [hash]: (node) => found(QNET.NODES.indexOf(node))() },
     }).route);
     assert.deepEqual(await qnet.transactionStatus({ from: ME, nonce: '2' }), { status: 'in_block', from: ME, nonce: '2', txHash: hash, blockHeight: null });
-    // a used nonce no two nodes list: unknown; an account no certified state gives: unknown
+    // a used nonce no two nodes list: unknown; an account nonce no two nodes report alike: unknown
     installFetch(callChain({ nonce: '2', sent: [] }).route);
     assert.equal((await qnet.transactionStatus({ from: ME, nonce: '1' })).status, 'unknown');
-    const headless = callChain({ nonce: '2' });
-    headless.net.headless = true;
-    installFetch(headless.route);
-    qnet = await import(`../dist/background/qnet.js?status=${Date.now()}`);
-    assert.equal((await qnet.transactionStatus({ from: ME, nonce: '3' })).status, 'unknown', 'no certified account: unknown');
+    installFetch(callChain({ nonce: '2', perNode: (node) => ({ balance: '1', nonce: String(QNET.NODES.indexOf(node) + 5), pk: false }) }).route);
+    qnet = await worker(`status=${Date.now()}`);
+    assert.equal((await qnet.transactionStatus({ from: ME, nonce: '3' })).status, 'unknown', 'no agreed account nonce: unknown');
+    // the nonce two nodes report live decides, never a certified state that lags it: in a block at once
+    installFetch(callChain({
+      nonce: '0', perNode: () => ({ balance: '1', nonce: '2', pk: false }),
+      sent: [{ from: ME, to: GAME, amount: 0, nonce: 2, type: 'contract_call', hash }], tx: { [hash]: found(2212409) },
+    }).route);
+    assert.deepEqual(await qnet.transactionStatus({ from: ME, nonce: '2' }), { status: 'in_block', from: ME, nonce: '2', txHash: hash, blockHeight: 2212409 });
     await rejectsWith(qnet.transactionStatus({ from: GAME, nonce: '1' }), 'UNAUTHORIZED');
     await rejectsWith(qnet.transactionStatus({ from: ME, nonce: '0' }), 'INVALID_PARAMS');
   });
   // Owner, 06.10: any token of the QNet network can be sent from the popup, by the path and checks of a dApp's token
   // transfer; the wallet lists the built-in tokens it holds, each named by two nodes, each balance certified.
-  it('listTokens: the contracts two nodes list as held, each a QRC-20 token two nodes name, with its certified balance', async () => {
+  it('listTokens: the contracts two nodes list as held, each a QRC-20 token two nodes name, with its live balance', async () => {
     installEnv();
     const realRandom = Math.random;
     Math.random = () => 0.999999; // the pinned nodes in their own order: the first two are asked
@@ -1584,7 +1880,6 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       const SILVER = core.deriveContractAddress(ME, 2);
       const EMPTY = core.deriveContractAddress(ME, 4);
       const lists = { [QNET.NODES[0]]: [GOLD, GAME], [QNET.NODES[1]]: [GOLD, SILVER, EMPTY] };
-      const notToken = { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: GAME };
       const silver = { success: true, token: { contract_address: SILVER, standard: 'qrc20', name: 'Silver', symbol: 'SLV', decimals: 2 } };
       const empty = { success: true, token: { contract_address: EMPTY, standard: 'qrc20', name: 'Empty', symbol: 'EMP', decimals: 0 } };
       // SILVER's balance proof is unreadable on every node, EMPTY's holder entry is proven absent (a balance of 0)
@@ -1600,7 +1895,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       });
       const requests = installFetch(routes(held, base.route));
       // a fresh worker: no token read by an earlier test is kept
-      const qnet = await import(`../dist/background/qnet.js?held=${Date.now()}`);
+      const qnet = await worker(`held=${Date.now()}`);
       // a token whose balance is unread is listed, with a dash for its balance: the list leaves nothing out (L-13)
       assert.deepEqual(await qnet.listTokens(), {
         tokens: [
@@ -1623,15 +1918,15 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       });
       installEnv({ state: { ...emptyState(), pendingTransfers: [sendingCall('pending')] } });
       installFetch(routes(held, base.route));
-      const sending = await import(`../dist/background/qnet.js?sending=${Date.now()}`);
+      const sending = await worker(`sending=${Date.now()}`);
       assert.deepEqual((await sending.listTokens()).tokens.map((token) => [token.symbol, token.balanceBase]),
         [['EMP', '0'], ['GOLD', '1500000'], ['SLV', null]]);
       installEnv({ state: { ...emptyState(), pendingTransfers: [sendingCall('replaced')] } });
       installFetch(routes(held, base.route));
-      const replaced = await import(`../dist/background/qnet.js?replaced=${Date.now()}`);
+      const replaced = await worker(`replaced=${Date.now()}`);
       assert.deepEqual((await replaced.listTokens()).tokens.map((token) => token.symbol), ['GOLD', 'SLV']);
       // no node lists anything: NETWORK
-      const fresh = await import(`../dist/background/qnet.js?tokens=${Date.now()}`);
+      const fresh = await worker(`tokens=${Date.now()}`);
       installFetch(nodeRoute(() => ({ status: 503, body: '{}' })));
       await rejectsWith(fresh.listTokens(), 'NETWORK');
     } finally {
@@ -1664,7 +1959,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       };
       installEnv({ state: { ...emptyState(), pendingTransfers: [sendingCall] } });
       installFetch(routes(list, base.route));
-      const fresh = await import(`../dist/background/qnet.js?many=${Date.now()}`);
+      const fresh = await worker(`many=${Date.now()}`);
       const { tokens, complete } = await fresh.listTokens();
       assert.equal(complete, false, '23 tokens, 20 listed');
       assert.equal(tokens.length, 20);
@@ -1676,7 +1971,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       installFetch(routes(nodeRoute(({ path: p }) => (p === `/api/v1/account/${ME}/tokens`
         ? { body: { success: true, address: ME, tokens: held.slice(0, 3).map((contract) => ({ contract_address: contract, balance: '700' })) } }
         : undefined)), base.route));
-      const few = await import(`../dist/background/qnet.js?few=${Date.now()}`);
+      const few = await worker(`few=${Date.now()}`);
       assert.deepEqual(await few.listTokens().then((r) => [r.tokens.length, r.complete]), [3, true]);
       // a held contract no two nodes say what it is: left out, so not complete
       const unread = held[1];
@@ -1686,7 +1981,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
         contracts: { ...contracts, [unread]: (node) => info(unread, `N${QNET.NODES.indexOf(node)}`) },
         tokens: Object.fromEntries(held.map((contract) => [contract, { holders: { [ME]: '700' } }])),
       }).route));
-      const partial = await import(`../dist/background/qnet.js?partial=${Date.now()}`);
+      const partial = await worker(`partial=${Date.now()}`);
       const read = await partial.listTokens();
       assert.equal(read.complete, false);
       assert.deepEqual(read.tokens.map((token) => token.contract), [held[0], held[2]]);
@@ -1703,7 +1998,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     });
     installFetch(route);
     // a fresh worker: no token read by an earlier test is kept
-    const qnet = await import(`../dist/background/qnet.js?send=${Date.now()}`);
+    const qnet = await worker(`send=${Date.now()}`);
     const preview = await qnet.tokenPreview({ token: TOKEN, to: payee, amount: '2.5' });
     const tx = core.buildTokenTransfer({ from: ME, token: TOKEN, to: payee, amount: '2500000', nonce: '1' });
     assert.equal(preview.kind, 'tokenTransfer');
@@ -1727,15 +2022,13 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       token: TOKEN, to: payee, amount: '2.5', expectedFeeNano: '1', expectedDepositNano: '0', expectedNonce: '2',
     }), 'FEE_CHANGED');
     // a contract that is no QRC-20 token is no token to send
-    const notToken = { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token', contract_address: GAME };
     installFetch(callChain({ balance: '1000000000000', contracts: { [GAME]: notToken } }).route);
     await rejectsWith(qnet.tokenPreview({ token: GAME, to: payee, amount: '1' }), 'INVALID_PARAMS');
   });
 
-  // The send rule for a token, as the app: the certified token balance at the macroblock of the QNC proof (one certified
-  // state, so the nonce its own transactions are counted from is that proof's), less what its own token transfers since took
-  // and may still move.
-  it('a token balance is the certified one at the QNC proof\'s macroblock, less this wallet\'s own token transfers since', async () => {
+  // The send rule for a token, as the app: the token balance at a pinned node's live tip, less what this wallet's own token
+  // transfers not in a block yet may still move.
+  it('a token balance a send is decided by is the live one, less this wallet\'s own token transfers above the live nonce', async () => {
     const payee = eonOf(58);
     const at = Date.now() - 60_000;
     const transferRecord = (nonce, amount) => ({
@@ -1743,21 +2036,48 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
       outcome: 'pending', kind: 'call', call: { method: 'transfer', recipient: payee, amount },
     });
     installEnv({ state: { ...emptyState(), pendingTransfers: [transferRecord('1', '2000000'), transferRecord('2', '1000000')] } });
-    // certified at nonce 0; the chain took nonce 1 since, and nonce 2 is still pending
-    const { route, net } = callChain({ balance: '1000000000000', balances: { [ME]: '7000000', [payee]: '9' },
-      perNode: () => ({ balance: '1', nonce: '1', pk: false }) });
+    // certified at nonce 0 with 7 GOLD; the tip took nonce 1 (5 GOLD left), and nonce 2 is still on its way
+    const { route, net } = callChain({ balance: '1000000000000', balances: { [ME]: '7000000', [payee]: '9' } });
+    net.setTip({ [ME]: { balance: '999990000000', nonce: '1' } }, { [TOKEN]: { holders: { [ME]: '5000000', [payee]: '2000009' } } });
     installFetch(route);
     const preview = await qnet.prepareCall({ kind: 'tokenTransfer', token: TOKEN, to: payee, amountBase: '1000' });
     assert.deepEqual([preview.nonce, preview.tokenBalance, preview.tokenProblem, preview.outstanding.map((p) => p.nonce)],
       ['3', '4000000', null, ['2']]);
-    assert.ok(net.requests.some((r) => r.endsWith(`/token/${TOKEN}/${ME}/balance/proof?mb=${FIRST_INDEX}`)), 'at the QNC proof\'s macroblock');
+    assert.ok(net.requests.some((r) => r.endsWith(`/token/${TOKEN}/${ME}/balance/proof`)), 'at the live tip');
+    assert.ok(!net.requests.some((r) => r.includes(`/token/${TOKEN}/${ME}/balance/proof?mb=`)), 'no certified token read');
     const tx = core.buildTokenTransfer({ from: ME, token: TOKEN, to: payee, amount: '4000001', nonce: '3' });
     await rejectsWith(qnet.sendCall({
       request: { kind: 'tokenTransfer', token: TOKEN, to: payee, amountBase: '4000001' }, expectedFeeNano: tx.maxFeeNano, expectedDepositNano: '0',
     }), 'INSUFFICIENT_FUNDS');
   });
 
-  it('a token send after this wallet\'s own contract call waits for the certified state: what the call moved is not known', async () => {
+  it('a token figure of a node behind the QNC base is passed over for the next node\'s: a token transfer the base holds is not counted twice', async () => {
+    const realRandom = Math.random;
+    Math.random = () => 0.999999; // the pinned nodes in their own order: the lagging one is asked first
+    try {
+      const [lagging] = QNET.NODES;
+      const payee = eonOf(57);
+      const at = Date.now() - 60_000;
+      installEnv({ state: { ...emptyState(), pendingTransfers: [{
+        nonce: '1', to: TOKEN, amountNano: '0', feeNano: '1511025', body: '{"t":1}', txHash: TX_HASH, createdAt: at, lastSubmitAt: at,
+        outcome: 'pending', kind: 'call', call: { method: 'transfer', recipient: payee, amount: '2000000' },
+      }] } });
+      const { route, net } = callChain({ balance: '1000000000000', balances: { [ME]: '7000000', [payee]: '9' } });
+      // the tip took the 2 GOLD transfer at nonce 1; the lagging node's token state is from before it, and its QNC proof fails
+      net.setTip({ [ME]: { balance: '999990000000', nonce: '1' } }, { [TOKEN]: { holders: { [ME]: '5000000', [payee]: '2000009' } } }, FIRST_INDEX * 90 + 70);
+      net.setTip({ [ME]: { balance: '1000000000000', nonce: '0' } }, { [TOKEN]: { holders: { [ME]: '7000000', [payee]: '9' } } }, FIRST_INDEX * 90 + 65, lagging);
+      installFetch(routes(nodeRoute(({ node, path: p }) => (node === lagging && p === `/api/v1/account/${ME}/balance/proof`
+        ? { status: 503, body: '{}' } : undefined)), route));
+      const preview = await qnet.prepareCall({ kind: 'tokenTransfer', token: TOKEN, to: payee, amountBase: '1000' });
+      assert.deepEqual([preview.nonce, preview.tokenBalance, preview.outstanding], ['2', '5000000', []]);
+      const asked = net.requests.filter((r) => r.endsWith(`/token/${TOKEN}/${ME}/balance/proof`)).map((r) => new URL(r).origin);
+      assert.deepEqual(asked.slice(0, 2), [lagging, QNET.NODES[1]]);
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  it('a token send after this wallet\'s own contract call waits for the call\'s block: what the call moved is not known', async () => {
     const payee = eonOf(59);
     const call = {
       nonce: '1', to: GAME, amountNano: '0', feeNano: '4507800', body: '{"c":1}', txHash: TX_HASH, createdAt: Date.now() - 60_000,
@@ -1771,7 +2091,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     const tx = core.buildTokenTransfer({ from: ME, token: TOKEN, to: payee, amount: '1000', nonce: '2' });
     await rejectsWith(qnet.sendCall({ request, expectedFeeNano: tx.maxFeeNano, expectedDepositNano: '0' }), 'BALANCE_UNCONFIRMED');
     assert.equal(env.calls.signQnetCall, 0);
-    // certified past the call: the token balance decides again
+    // the tip took the call: the token balance decides again
     installFetch(callChain({ balance: '1000000000000', nonce: '1', balances: { [ME]: '7000000', [payee]: '9' } }).route);
     assert.equal((await qnet.prepareCall(request)).tokenBalance, '7000000');
   });
@@ -1779,14 +2099,67 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
   it('an older node\'s token proof counts when its root is a recent certified one; a proven absence is a balance of 0', async () => {
     const { route, net } = callChain({ balances: { [ME]: '42' } });
     for (const node of QNET.NODES) net.old.add(node);
+    net.live = false;
     installFetch(route);
     assert.equal(await qnet.readTokenBalance(TOKEN, ME), '42');
     assert.ok(QNET.NODES.some((node) => core.nodeMarkedOld(node)));
-    const fresh = await import(`../dist/background/qnet.js?absentToken=${Date.now()}`);
+    const fresh = await worker(`absentToken=${Date.now()}`);
     const certified = callChain({ balances: {} });
+    certified.net.live = false;
     installFetch(certified.route);
     assert.equal(await fresh.readTokenBalance(TOKEN, ME), '0', 'the holder\'s entry proven absent');
     assert.equal(await fresh.readTokenBalance(core.deriveContractAddress(ME, 9), ME), '0', 'the contract proven absent');
+  });
+
+  it('a token balance Assets shows is the live one; the certified one stands in without it, and never goes over a newer live one', async () => {
+    const { route, net } = callChain({ balances: { [ME]: '42' } });
+    net.setTip({ [ME]: { balance: '5000000000000', nonce: '0' } }, { [TOKEN]: { holders: { [ME]: '50' } } });
+    installFetch(route);
+    assert.equal(await qnet.readTokenBalance(TOKEN, ME), '50', 'the tip took 8 more');
+    assert.ok(net.requests.some((r) => r.endsWith(`/token/${TOKEN}/${ME}/balance/proof`)));
+    net.live = false;
+    const fresh = await worker(`certifiedToken=${Date.now()}`);
+    assert.equal(await fresh.readTokenBalance(TOKEN, ME), '42', 'no live figure: the certified one');
+    net.live = true;
+    net.unreadable.add(TOKEN);
+    const none = await worker(`noToken=${Date.now()}`);
+    assert.equal(await none.readTokenBalance(TOKEN, ME), null, 'neither: no figure is made up');
+  });
+
+  it('a refresh joins the certified token read still running: one per token and holder at a time', async () => {
+    const { route } = callChain({ balances: { [ME]: '42' } });
+    const certified = `/token/${TOKEN}/${ME}/balance/proof?`;
+    let release;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    let asked = 0;
+    let firstAsked;
+    const seen = new Promise((resolve) => {
+      firstAsked = resolve;
+    });
+    installFetch(async (request) => {
+      if (request.url.includes(certified)) {
+        asked += 1;
+        firstAsked();
+        await held;
+      }
+      return route(request);
+    });
+    try {
+      assert.equal(await qnet.readTokenBalance(TOKEN, ME), '42');
+      await seen;
+      assert.equal(await qnet.readTokenBalance(TOKEN, ME), '42', 'the live figure, at once');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(asked, 1, 'the second read joined the first one\'s certified read');
+    } finally {
+      release();
+    }
+    await qnet.backgroundReads();
+    const before = asked;
+    await qnet.readTokenBalance(TOKEN, ME);
+    await qnet.backgroundReads();
+    assert.ok(asked > before, 'once it ended, the next refresh reads again');
   });
 
   it('txLookup: in a block at the height two nodes report alike, else unknown', async () => {
@@ -1825,23 +2198,41 @@ describe('chains-activation qnet: fast balance reads (owner, 06.10)', () => {
     assert.ok(took < 3000, `answered in ${took} ms, not after the node's ${8000} ms timeout`);
   });
 
-  it('the popup\'s balance waits for the committee check at most 1.5 s once a figure is read; a send waits for the check', async () => {
+  it('the popup\'s balance and a send never wait for the committee check; the certified read waits at most 1.5 s once a figure is read', async () => {
     installEnv();
     const base = chain({ balance: '5000000000000', nonce: '2' });
     installFetch(async (request) => {
       if (new URL(request.url).pathname.startsWith('/api/v1/macroblock/')) await new Promise((resolve) => setTimeout(resolve, 1600));
       return base.route(request);
     });
-    const started = Date.now();
+    let started = Date.now();
     const shown = await qnet.readAccount(ME, { display: true });
     const took = Date.now() - started;
     assert.deepEqual([shown.balanceNano, shown.verified, shown.verification], ['5000000000000', false, 'none'],
       'the figure shows as not verified while the walk goes on');
     assert.ok(took >= 1400 && took < 2500, `waited ${took} ms for the check, then answered`);
-    // a send decides only on the certified balance: it waits for the check
-    const preview = await qnet.prepareTransfer({ to: TO, amountNano: '1' });
-    assert.deepEqual([preview.verification, preview.balanceNano], ['proof', '5000000000000']);
-    assert.deepEqual(await qnet.readAccount(ME, { display: true }).then((a) => a.verification), 'proof', 'the next read takes what the walk verified');
+    started = Date.now();
+    const balance = await qnet.getBalance();
+    assert.deepEqual([balance.balanceNano, balance.verification], ['5000000000000', 'live']);
+    started = Date.now();
+    const preview = await qnet.prepareTransfer({ to: ME, amountNano: '1' });
+    assert.deepEqual([preview.verification, preview.balanceNano], ['live', '5000000000000']);
+    assert.ok(Date.now() - started < 1000, `a send's check took ${Date.now() - started} ms`);
+  });
+
+  it('a slow committee check never holds the popup\'s balance: the live figure comes at once', async () => {
+    installEnv();
+    const base = chain({ balance: '5000000000000', nonce: '2' });
+    installFetch(async (request) => {
+      const { pathname, search } = new URL(request.url);
+      if (pathname.startsWith('/api/v1/macroblock/') || search.includes('mb=')) await new Promise((resolve) => setTimeout(resolve, 3000));
+      return base.route(request);
+    });
+    const started = Date.now();
+    const balance = await qnet.getBalance();
+    const took = Date.now() - started;
+    assert.deepEqual([balance.balanceNano, balance.verification, balance.spendableNano], ['5000000000000', 'live', '5000000000000']);
+    assert.ok(took < 1500, `answered in ${took} ms, not after the committee check`);
   });
 });
 
@@ -1856,13 +2247,11 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [pendingRecord('7'), pendingRecord('8')] } });
     env.chainCache = { headIndex: 50_000, views: { qnetBalance: { balanceNano: '1' } } };
     env.anchors = { 49_998: { eligible_ids: ['node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) } };
-    env.sendProofs = { [ME]: { balanceNano: '1', nonce: '0', index: 49_998 } };
     installFetch(heightRoute(1000 * 90 + 5));
-    const fresh = await import(`../dist/background/qnet.js?chain=${Date.now()}`);
+    const fresh = await worker(`chain=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'changed');
     assert.deepEqual(env.state().pendingTransfers, [], 'the old chain\'s sends can be decided on no chain the nodes serve');
     assert.deepEqual(env.anchors, {}, 'the kept anchors are dropped');
-    assert.deepEqual(env.sendProofs, {}, 'and the proofs kept for a send');
     assert.equal(env.capsule, null, 'and the capsule');
     assert.equal(env.capsuleWrites, 1);
     assert.deepEqual(env.forgotten, ['qnetBalance', 'qnetTokens', 'qnetHistory']);
@@ -1875,12 +2264,12 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [pendingRecord('7')] } });
     env.chainCache = { headIndex: 1000 };
     installFetch(heightRoute(1004 * 90));
-    let fresh = await import(`../dist/background/qnet.js?same=${Date.now()}`);
+    let fresh = await worker(`same=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'same');
     assert.equal(env.state().pendingTransfers.length, 1);
     assert.equal(env.chainCache.headIndex, 1000, 'four macroblocks on: nothing written');
     installFetch(heightRoute(1012 * 90));
-    fresh = await import(`../dist/background/qnet.js?same2=${Date.now()}`);
+    fresh = await worker(`same2=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'same');
     assert.equal(env.chainCache.headIndex, 1012);
     assert.equal(env.anchorWrites, 0);
@@ -1889,7 +2278,7 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     env.chainCache = { headIndex: pin + 100 };
     env.anchors = { [pin + 5000]: { eligible_ids: ['node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) } };
     installFetch(heightRoute((pin + 100) * 90));
-    fresh = await import(`../dist/background/qnet.js?ahead=${Date.now()}`);
+    fresh = await worker(`ahead=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'same');
     assert.deepEqual(env.anchors, {});
     assert.equal(env.state().pendingTransfers.length, 1, 'only the anchors go');
@@ -1904,14 +2293,14 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     assert.notEqual(legacy, core.chainIdentity(), 'the identity now folds the network identity');
     env.chainCache = { chain: legacy, headIndex: 1000 };
     installFetch(heightRoute(1004 * 90));
-    const fresh = await import(`../dist/background/qnet.js?renamed=${Date.now()}`);
+    const fresh = await worker(`renamed=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'same');
     assert.equal(env.state().pendingTransfers.length, 1);
     assert.deepEqual(env.forgotten, []);
     assert.deepEqual(env.chainCache, { chain: core.chainIdentity(), headIndex: 1004 });
     // another identity is another chain's
     env.chainCache = { chain: 'ff'.repeat(16), headIndex: 1000 };
-    const other = await import(`../dist/background/qnet.js?otherChain=${Date.now()}`);
+    const other = await worker(`otherChain=${Date.now()}`);
     assert.equal(await other.followChain(), 'changed');
     assert.deepEqual(env.state().pendingTransfers, []);
     core.clearQcCache();
@@ -1928,7 +2317,7 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
       await new Promise((resolve) => setTimeout(resolve, 900));
       return { body: `{"height":${50_002 * 90}}` };
     }));
-    const fresh = await import(`../dist/background/qnet.js?lagging=${Date.now()}`);
+    const fresh = await worker(`lagging=${Date.now()}`);
     assert.equal(await fresh.followChain(), 'same');
     assert.equal(env.state().pendingTransfers.length, 1, 'nothing of the chain this wallet follows is dropped');
     assert.deepEqual(env.forgotten, []);
@@ -1946,9 +2335,10 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     await rejectsWith(qnet.readAccount(G1, { display: true }), 'BALANCE_UNCONFIRMED');
   });
 
-  // the light client's own rule (QcLightClient onLineageReset): the first step above an anchor kept from an earlier session
-  // refused by two nodes for what ties it to that anchor drops the kept anchors; the wallet drops its stored copy with them
-  it('kept anchors the light client finds to be of another lineage are dropped from the vault too', async () => {
+  // the light client's own rule (QcLightClient onLineageReset): the first step above an anchor kept from an earlier session,
+  // refused by two nodes for what ties it to that anchor, roots the walk lower at once; the anchor goes (and the wallet's
+  // stored copy with it) only when a step of that lower walk verifies, so a device that verifies no step keeps what it has
+  it('a kept anchor whose step nodes refuse stays while no lower step verifies either: the walk goes on from the pin', async () => {
     const env = installEnv();
     const proofText = raw('chains-activation-proof-g1.json');
     const proof = JSON.parse(proofText);
@@ -1972,15 +2362,38 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
       if (p === `/api/v1/account/${G1}`) return { body: raw('chains-activation-account-g1.json') };
       return undefined;
     }));
-    env.anchors = { [index - 2]: { eligible_ids: ['genesis_node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) } };
+    const kept = { [index - 2]: { eligible_ids: ['genesis_node_001'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) } };
+    env.anchors = kept;
     // a light client with nothing of an earlier test (a head read that found too few answers is not repeated for 10 s)
     core.clearQcCache();
-    const fresh = await import(`../dist/background/qnet.js?lineage=${Date.now()}`);
+    const fresh = await worker(`lineage=${Date.now()}`);
     assert.equal((await fresh.readAccount(G1)).verification, 'none');
     await flush(20);
     assert.equal(steps[0], index, 'the walk started above the kept anchor');
     assert.ok(steps.some((j) => j < index - 2), 'then from the pin, at once');
-    assert.deepEqual(env.anchors, {}, 'the stored copy of the kept anchor is gone');
+    assert.deepEqual(env.anchors, kept, 'no step from the pin verified either: the kept anchor stays');
+    core.clearQcCache();
+  });
+
+  it('a kept anchor of another lineage goes, from the vault too, once a step of the walk rooted below it verifies', async () => {
+    // a send of this wallet a moment ago: its proofs ask for the newest certified state
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [pendingRecord('1')] } });
+    const { route, net } = chain({ balance: '5' });
+    installFetch(route);
+    // this session verified FIRST_INDEX; the vault also holds an anchor two above it that no committee of this chain made
+    const bogus = { eligible_ids: ['node_x'], beacon: 'ab'.repeat(32), registry_root: 'cd'.repeat(32) };
+    env.anchors = { [FIRST_INDEX + 2]: bogus };
+    assert.equal((await qnet.readAccount(ME)).index, FIRST_INDEX);
+    for (let i = 0; i < 4; i++) net.certify({ [ME]: { balance: '5' } });
+    net.requests.length = 0;
+    await qnet.getBalance();
+    const account = await qnet.readAccount(ME);
+    await flush(20);
+    // the walk to FIRST_INDEX + 4 rooted at the bogus anchor, its step was refused, and the walk from FIRST_INDEX verified
+    const walked = net.requests.filter((r) => r.includes('/macroblock/')).map((r) => Number(r.split('/macroblock/')[1].split('/')[0]) - FIRST_INDEX);
+    assert.deepEqual([walked[0], walked.includes(2)], [4, true], `steps asked: ${walked}`);
+    assert.deepEqual([account.index, account.verification], [FIRST_INDEX + 4, 'proof']);
+    assert.equal(Object.values(env.anchors).some((a) => a.registry_root === bogus.registry_root), false, 'the bogus anchor is gone');
     core.clearQcCache();
   });
 });
@@ -1997,7 +2410,7 @@ describe('chains-activation qnet: a pending row resolves (owner, 06.10)', () => 
   it('a send no node can hold any more, its nonce free, reads as dropped; the next send takes its nonce', async () => {
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('5', 2 * HOUR), record('6', 10 * 60 * 1000)] } });
     installFetch(routes(historyRoute, chain({ balance: '5000000000000', nonce: '4', sent: [] }).route));
-    const fresh = await import(`../dist/background/qnet.js?dropped=${Date.now()}`);
+    const fresh = await worker(`dropped=${Date.now()}`);
     const balance = await fresh.getBalance();
     // the dropped send's amount is no longer kept back: the next send takes its place
     assert.equal(balance.spendableNano, String(5_000_000_000_000n - 1_000_000_000n - BigInt(FEE)));
@@ -2012,7 +2425,7 @@ describe('chains-activation qnet: a pending row resolves (owner, 06.10)', () => 
   it('a dropped send leaves the list a day after it was dropped; one sent recently never reads as dropped', async () => {
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('5', 26 * HOUR), record('6', 50 * 60 * 1000)] } });
     installFetch(routes(historyRoute, chain({ balance: '5000000000000', nonce: '4', sent: [] }).route));
-    const fresh = await import(`../dist/background/qnet.js?expired=${Date.now()}`);
+    const fresh = await worker(`expired=${Date.now()}`);
     await fresh.resubmitPending();
     assert.deepEqual(env.state().pendingTransfers.map((p) => p.nonce), ['6']);
     const history = await fresh.getHistory({});
@@ -2049,6 +2462,9 @@ describe('chains-activation qnet: token rows and blocks in the history (owner, 0
       return { body: served };
     };
     installFetch(routes(archive, logs, chain({ sent, logsRoot }).route));
+    // a received row: no read waits for its logs proof, which runs in the background; a later read shows the verdict
+    assert.deepEqual((await qnet.getHistory({})).items.map((item) => item.status), ['unverified']);
+    await qnet.backgroundReads();
     const { items } = await qnet.getHistory({});
     assert.deepEqual(items, [{
       hash: 'cd'.repeat(32), direction: 'in', from: TO, to: ME, amountNano: '0', feeNano: '0', timestamp: 1790219000000, status: 'included',
@@ -2059,8 +2475,8 @@ describe('chains-activation qnet: token rows and blocks in the history (owner, 0
     await qnet.getHistory({});
     assert.equal(logProofs.length, 1, 'a proven row is not asked for again');
 
-    // two nodes listing the call is no proof of the token row: another row's leaf, a proof that does not fold, or a root
-    // that folds but is not the one the committee certified leaves it unverified
+    // two nodes listing a call another address made is no proof of the token row it received: another row's leaf, a proof
+    // that does not fold, or a root that folds but is not the one the committee certified leaves it unverified
     const otherLeaf = '11'.repeat(32);
     const cases = [
       [{ ...proof, leaf: otherLeaf, block_root: tagged('log-leaf', otherLeaf), logs_root: tagged('logw-leaf', tagged('log-leaf', otherLeaf)) }, logsRoot],
@@ -2068,11 +2484,76 @@ describe('chains-activation qnet: token rows and blocks in the history (owner, 0
       [proof, '44'.repeat(32)],
     ];
     for (const [forged, certifiedRoot] of cases) {
-      qnet = await import(`../dist/background/qnet.js?forgedRow=${Math.random()}`);
+      qnet = await worker(`forgedRow=${Math.random()}`);
       served = forged;
       installFetch(routes(archive, logs, chain({ sent, logsRoot: certifiedRoot }).route));
+      await qnet.getHistory({});
+      await qnet.backgroundReads();
       assert.deepEqual((await qnet.getHistory({})).items.map((item) => item.status), ['unverified']);
     }
+  });
+
+  // Owner, 18.10: the status of every transaction shows at once on the nodes' word. A token row this wallet sent is in a
+  // block once two pinned nodes list its call (a node lists a call only under its caller); its logs proof only runs in the
+  // background, and a proof that contradicts the archive's row takes the row back to unverified.
+  it('a token send of this wallet stays Confirmed once the archive lists its row, while its logs proof is still pending', async () => {
+    const TOKEN = core.deriveContractAddress(ME, 1);
+    const hash = 'c1'.repeat(32);
+    const at = Date.now() - 60_000;
+    const block = FIRST_INDEX * 90 - 5;
+    const sentCall = { nonce: '3', to: TOKEN, amountNano: '0', feeNano: FEE, body: '{"n":3}', txHash: hash, createdAt: at, lastSubmitAt: at,
+      outcome: 'confirmed', kind: 'call', call: { method: 'transfer', recipient: TO, amount: '5' } };
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [sentCall] } });
+    const tokenRow = (amount) => ({ source: 'token', hash, idx: 0, block, timestamp: at, from: ME, to: TO, amount, fee: '0',
+      contract: TOKEN, kind: 'transfer', std: 'qrc20', token_id: null, symbol: 'GOLD', decimals: 6, logo: '' });
+    // the archive lists the call too, as its own row
+    const callRow = { source: 'tx', hash, idx: 0, block, timestamp: at, from: ME, to: TOKEN, amount: '0', fee: FEE, tx_type: 'ContractCall' };
+    const archive = [];
+    // the window of its block is not certified yet: the node has no proof for it, and answers only when released
+    let release;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    const proofs = [];
+    let served = null;
+    const logs = async (request) => {
+      if (!request.url.includes('/api/v1/logs/proof')) return undefined;
+      proofs.push(request.url);
+      await held;
+      return served === null ? { status: 404, body: { error: 'proof not found' } } : { body: served };
+    };
+    const sent = [{ hash, from: ME, to: TOKEN, amount: 0, type: 'contract_call', nonce: 3 }];
+    installFetch(routes(archiveRoute(archive), logs, chain({ nonce: '3', sent }).route));
+    try {
+      assert.deepEqual((await qnet.getHistory({})).pending.map((i) => [i.status, i.hash, i.kind]), [['included', hash, 'call']]);
+      archive.push(tokenRow('5'), callRow);
+      const started = Date.now();
+      const page = await qnet.getHistory({});
+      assert.ok(Date.now() - started < 1500, `History waited ${Date.now() - started} ms for the proof`);
+      assert.deepEqual(page.items.map((i) => [i.kind, i.status]), [['token', 'included'], ['call', 'included']], 'Confirmed, never Unverified');
+      assert.deepEqual(page.pending, []);
+      assert.deepEqual(env.state().pendingTransfers, [], 'its row reads Confirmed on the nodes\' word: the record leaves');
+    } finally {
+      release();
+    }
+    await qnet.backgroundReads();
+    assert.deepEqual((await qnet.getHistory({})).items.map((i) => i.status), ['included', 'included'], 'a pending proof takes nothing back');
+    assert.equal(proofs.length, 1, 'a pending proof is asked again only after a minute');
+    // one the chain skipped at apply wrote no event: the archive's row of its call alone stands for it
+    const skippedEnv = installEnv({ state: { ...emptyState(), pendingTransfers: [sentCall] } });
+    archive.splice(0, archive.length, callRow);
+    const skipped = await qnet.getHistory({});
+    assert.deepEqual([skipped.items.map((i) => [i.kind, i.status]), skipped.pending], [[['call', 'included']], []]);
+    assert.deepEqual(skippedEnv.state().pendingTransfers, []);
+
+    // the archive names another amount for the call: the node's proof of the call's own event contradicts the row
+    qnet = await worker(`contradicted=${Date.now()}`);
+    archive.splice(0, archive.length, tokenRow('500'));
+    served = { leaf: core.transferLogLeaf({ tx_hash: hash, log_index: 0, contract: TOKEN, from: ME, to: TO, amount: '5', kind: 'transfer',
+      std: 'qrc20', token_id: null }), proof: [], block_root: '22'.repeat(32), window_proof: [], logs_root: '33'.repeat(32), window_end: FIRST_INDEX * 90 };
+    assert.deepEqual((await qnet.getHistory({})).items.map((i) => i.status), ['included']);
+    await qnet.backgroundReads();
+    assert.deepEqual((await qnet.getHistory({})).items.map((i) => i.status), ['unverified'], 'the proof contradicts it');
   });
 
   it('a token row whose macroblock is far below what the wallet verified is left unverified, with no proof asked', async () => {
@@ -2159,44 +2640,13 @@ describe('chains-activation qnet: token rows and blocks in the history (owner, 0
 // follow alarm keeps a verified checkpoint at the head while unlocked, and the genesis capsule is loaded, refused and
 // forgotten as docs/protocols/galc-capsule-v2.md says. Today's nodes serve no capsule (405): every read goes on from the
 // pin and the anchors exactly as before, each node asked for one at most once per TTL.
-describe('chains-activation qnet: kept send proofs, the follow and the capsule (GALC v2)', () => {
+describe('chains-activation qnet: the follow and the capsule (GALC v2)', () => {
   const ownProofReads = (net) => net.requests.filter((r) => r.includes(`/api/v1/account/${ME}/balance/proof`)).length;
   const waitFor = async (ready) => {
     for (let i = 0; i < 200 && !ready(); i++) await new Promise((resolve) => setTimeout(resolve, 20));
   };
 
-  it('a kept QNC proof stands by its macroblock, also in a fresh worker of the same session; three behind, it is read again', async () => {
-    const env = installEnv();
-    const { route, net } = chain({ balance: '100000000000' });
-    installFetch(route);
-    assert.equal((await qnet.readAccount(ME)).verified, true);
-    assert.deepEqual(env.sendProofs[ME], { balanceNano: '100000000000', nonce: '0', index: FIRST_INDEX }, 'kept in the session');
-    const read = ownProofReads(net);
-    const woken = await import(`../dist/background/qnet.js?woken=${Date.now()}`);
-    const preview = await woken.prepareTransfer({ to: TO, amountNano: '1' });
-    assert.deepEqual([preview.verification, preview.balanceNano], ['proof', '100000000000']);
-    assert.equal(ownProofReads(net), read, 'the kept proof stood: no proof read');
-    // three macroblocks on, the kept proof's macroblock no longer stands: the send reads again
-    for (let i = 0; i < 3; i++) net.certify({ [ME]: { balance: '90000000000', nonce: '0' } });
-    const kept = env.sendProofs;
-    net.install();
-    env.sendProofs = kept;
-    const later = await import(`../dist/background/qnet.js?later=${Date.now()}`);
-    assert.equal((await later.prepareTransfer({ to: TO, amountNano: '1' })).balanceNano, '90000000000');
-    assert.ok(ownProofReads(net) > read);
-    assert.equal(env.sendProofs[ME].index, FIRST_INDEX + 3);
-  });
-
-  it('a kept proof never stands for a nonce the nodes moved past, whatever its macroblock', async () => {
-    const env = installEnv();
-    const { route, net } = chain({ balance: '100000000000', perNode: () => ({ balance: '1', nonce: '1', pk: false }) });
-    env.sendProofs = { [ME]: { balanceNano: '999999999999', nonce: '0', index: FIRST_INDEX } };
-    installFetch(route);
-    await rejectsWith(qnet.prepareTransfer({ to: TO, amountNano: '1' }), 'BALANCE_FOREIGN_PENDING');
-    assert.ok(ownProofReads(net) >= 1, 'read again');
-  });
-
-  it('a follow tick walks toward the certified head and keeps the wallet\'s own proof; the alarm runs only while unlocked', async () => {
+  it('a follow tick walks toward the certified head and keeps what it verified, reading no balance; the alarm runs only while unlocked', async () => {
     const env = installEnv();
     const alarms = new Map();
     const cleared = [];
@@ -2220,12 +2670,12 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
       await qnet.startFollow();
       assert.deepEqual([...alarms.values()], [{ name: 'qnet-follow', periodInMinutes: 0.5 }]);
       const tick = await qnet.followTick();
-      assert.deepEqual(tick, { ok: true, head: FIRST_INDEX + 1, verified: true, proof: true });
-      assert.deepEqual(env.sendProofs[ME], { balanceNano: '100000000000', nonce: '0', index: FIRST_INDEX + 1 });
+      assert.deepEqual(tick, { ok: true, head: FIRST_INDEX + 1, verified: true });
       assert.ok(env.anchorWrites >= 1, 'what the tick verified is kept');
+      assert.equal(ownProofReads(net), 0, 'no balance read: the popup reads its own');
       const reads = net.requests.length;
-      assert.deepEqual(await qnet.followTick(), { ok: true, head: FIRST_INDEX + 1, verified: true, proof: false });
-      assert.equal(net.requests.length, reads, 'nothing new: no walk, no proof read');
+      assert.deepEqual(await qnet.followTick(), { ok: true, head: FIRST_INDEX + 1, verified: true });
+      assert.equal(net.requests.length, reads, 'nothing new: no walk');
       await qnet.onAlarm({ name: 'qnet-register' });
       assert.deepEqual(cleared, [], 'another module\'s alarm');
       env.locked = true;
@@ -2275,7 +2725,7 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
       return undefined;
     }));
     for (let i = 0; i < 3; i++) {
-      const fresh = await import(`../dist/background/qnet.js?noCapsule=${i}-${Date.now()}`);
+      const fresh = await worker(`noCapsule=${i}-${Date.now()}`);
       assert.equal((await fresh.readAccount(G1)).verification, 'none', 'the walk failed here (404): not verified');
     }
     assert.ok(capsuleAsks.size >= 1, 'a long walk asks for a capsule first');
@@ -2313,7 +2763,7 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
       net.install();
       env.anchors = anchors;
       net.requests.length = 0;
-      const woken = await import(`../dist/background/qnet.js?wokenHead=${Date.now()}`);
+      const woken = await worker(`wokenHead=${Date.now()}`);
       const account = await woken.readAccount(ME);
       assert.deepEqual([account.index, account.verification], [FIRST_INDEX, 'proof']);
       const asked = net.requests.filter((r) => r.includes('/balance/proof'));
@@ -2347,7 +2797,7 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
     try {
       for (let i = 0; i < 3; i++) {
         core.clearCapsule(); // a new worker's light client: which nodes had none is forgotten with it
-        const fresh = await import(`../dist/background/qnet.js?quietCapsule=${i}-${Date.now()}`);
+        const fresh = await worker(`quietCapsule=${i}-${Date.now()}`);
         const view = await fresh.readAccount(G1);
         assert.equal(view.verification, 'none');
         // a long walk is why: the view says how far it is
@@ -2378,8 +2828,8 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
     assert.ok(ownProofReads(net) >= 1);
   });
 
-  it('sendWarm starts the wallet\'s own certified read and a typed recipient\'s checks, and the review finds them done', async () => {
-    const env = installEnv();
+  it('sendWarm starts the certified head read and a typed recipient\'s checks, and the review finds them done beside its live read', async () => {
+    installEnv();
     const { route, net } = chain({ balance: '100000000000' });
     const archiveReads = [];
     installFetch(routes(async (request) => {
@@ -2391,12 +2841,13 @@ describe('chains-activation qnet: kept send proofs, the follow and the capsule (
     assert.deepEqual(await qnet.sendWarm({}), { started: true });
     assert.deepEqual(await qnet.sendWarm({ to: TO }), { started: true });
     await rejectsWith(qnet.sendWarm({ to: 'x' }), 'INVALID_ADDRESS');
-    await waitFor(() => env.sendProofs[ME] !== undefined && archiveReads.length > 0 && recipientReads() > 0);
+    await waitFor(() => archiveReads.length > 0 && recipientReads() > 0);
     await flush(20);
-    assert.equal(env.sendProofs[ME].index, FIRST_INDEX);
+    assert.ok(net.requests.some((r) => r.endsWith('/api/v1/state/certified')), 'the certified head');
     const before = [ownProofReads(net), recipientReads(), archiveReads.length];
     const preview = await qnet.preview({ to: TO, amount: '1' });
     assert.equal(preview.recipient.historyRead, true);
-    assert.deepEqual([ownProofReads(net), recipientReads(), archiveReads.length], before, 'nothing read again');
+    assert.deepEqual([ownProofReads(net), recipientReads(), archiveReads.length], [before[0] + 1, before[1], before[2]],
+      'the wallet\'s own live read only');
   });
 });

@@ -28,9 +28,9 @@ const { lightShardOwnerUrls } = require('../src/config/nodes');
 const Receipts = require('../src/services/PushReceipts');
 const Bg = require('../src/services/BackgroundPriority');
 const Pace = require('../src/utils/requestPace');
-const { readNodeStatus, latestMiss, MISS_REASONS, NETWORK_MISSES } = require('../src/services/LightNode');
+const { readNodeStatus, latestMiss, MISS_REASONS } = require('../src/services/LightNode');
 const NodeTab = require('../src/screens/NodeTab').default;
-const { missText, nodeView, backgroundView } = require('../src/screens/NodeTab');
+const { nodeView, backgroundView } = require('../src/screens/NodeTab');
 const { makeT } = require('../src/i18n');
 const translations = require('../src/i18n/translations').default;
 
@@ -414,7 +414,7 @@ describe('F13: any owner that sees the node on the chain counts', () => {
   });
 });
 
-describe('the network\'s own misses: said as such, nothing asked of the device', () => {
+describe('the network\'s own misses: nothing asked of the device', () => {
   const status = (lastMiss) => ({
     reachable: true, onChain: true, deviceBound: true, deviceBoundAgreed: true, answered: false, needsReactivation: false,
     counted: { since: 20, counted: 18, last: 205 }, device: { platform: 'ios', linkedSince: null, lastAnswerEpoch: 205, state: 'online' },
@@ -422,10 +422,7 @@ describe('the network\'s own misses: said as such, nothing asked of the device',
   });
   const miss = (reason, epoch = 210) => ({ epoch, reason, wokenAt: null, answeredAt: null, deliveryDelaySecs: null, refused: null });
 
-  it('not_sent and not_committed read as the network\'s, with nothing to do here and no button', () => {
-    expect([...NETWORK_MISSES].sort()).toEqual(['not_committed', 'not_sent']);
-    expect(missText(t, status(miss('not_sent')))).toBe(`${t('node_miss_not_sent')} ${t('node_miss_do_nothing')}`);
-    expect(missText(t, status(miss('not_committed')))).toBe(`${t('node_miss_not_committed')} ${t('node_miss_do_nothing')}`);
+  it('not_sent and not_committed offer no button', () => {
     const L = { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: false };
     for (const reason of ['not_sent', 'not_committed']) {
       expect(nodeView({ status: status(miss(reason)), local: L, height: at(3000, 211) })).toMatchObject({ state: 'here', offerUse: false });
@@ -452,17 +449,12 @@ describe('the network\'s own misses: said as such, nothing asked of the device',
     }
   });
 
-  it('every language says them, with no word of a price, a payout, a fault or a phone', () => {
-    const keys = ['node_miss_not_sent', 'node_miss_not_committed', 'node_miss_do_nothing', 'node_background',
-      'node_background_unrestricted', 'node_background_restricted', 'node_background_open'];
+  it('every language says the Background row, with no word of a price, a payout, a fault or a phone', () => {
+    const keys = ['node_background', 'node_background_unrestricted', 'node_background_restricted', 'node_background_open'];
     expect(Object.keys(translations)).toHaveLength(11);
     for (const [lang, table] of Object.entries(translations)) {
       for (const k of keys) expect([lang, k, typeof table[k] === 'string' && table[k].length > 0]).toEqual([lang, k, true]);
-      if (lang !== 'en') {
-        for (const k of ['node_miss_not_sent', 'node_miss_not_committed', 'node_miss_do_nothing', 'node_background_open']) {
-          expect([lang, k, table[k] !== translations.en[k]]).toEqual([lang, k, true]);
-        }
-      }
+      if (lang !== 'en') expect([lang, table.node_background_open !== translations.en.node_background_open]).toEqual([lang, true]);
     }
     expect(keys.map((k) => translations.en[k]).join(' ')).not.toMatch(/reward|burn|price|mining|\bcode\b|support|fault|blame|\bphone/i);
     expect(translations.en.node_bg_refresh_off).toBeUndefined();
@@ -529,10 +521,23 @@ describe('the pace of the open app\'s requests', () => {
     expect(Math.max(...waits) - Math.min(...waits)).toBeGreaterThan(200000);
   });
 
-  it('Assets and History ask less often while the socket is open; the Node tab every 5 minutes', () => {
-    expect([Pace.assetsPollMs(true), Pace.assetsPollMs(false)]).toEqual([60000, 30000]);
-    expect([Pace.historyPollMs(true), Pace.historyPollMs(false)]).toEqual([60000, 30000]);
+  // Before, a socket that was merely open slowed Assets and History to 60 s while the node sent no event on it; now only
+  // one that delivered an account event does (owner, 18.10).
+  it('Assets and History every 30 s, every 60 s on a live socket; the live figure every 15 s; the Node tab every 5 minutes', () => {
+    expect([Pace.ASSETS_POLL_MS, Pace.HISTORY_POLL_MS, Pace.SOCKET_LIVE_POLL_MS, Pace.LIVE_READ_MS]).toEqual([30000, 30000, 60000, 15000]);
+    expect([Pace.pollMs(30000, false), Pace.pollMs(30000, true)]).toEqual([30000, 60000]);
+    expect([Pace.ACCOUNT_EVENT_MS, Pace.ACCOUNT_EVENT_READS]).toEqual([1000, 3]);
     expect(Pace.NODE_STATUS_MS).toBe(300000);
+    const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    expect(src).toMatch(/\}, pollMs\(ASSETS_POLL_MS, wsLiveRef\.current\)\);/);
+    expect(src).toMatch(/\}, pollMs\(HISTORY_POLL_MS, wsLiveRef\.current\)\);/);
+    expect(src).not.toMatch(/wsOpenRef/);
+  });
+
+  // Before, a node being linked was read again only every NODE_STATUS_MS (5 minutes) while the tab said "linking".
+  it('a light node being linked: every 10 s for the first two minutes, then every minute', () => {
+    expect([0, 60_000, 119_999].map(Pace.linkingReadMs)).toEqual([10000, 10000, 10000]);
+    expect([120_000, 3_600_000].map(Pace.linkingReadMs)).toEqual([60000, 60000]);
   });
 
   it('the epoch clock counts on from one read, at most 10 minutes past it', () => {
@@ -541,6 +546,16 @@ describe('the pace of the open app\'s requests', () => {
     expect(Pace.estimatedHeight({ height: 1000, at: 5000 }, 0)).toBe(1000);
     expect(Pace.estimatedHeight({ height: 0, at: 0 }, 1)).toBe(0);
     expect(Pace.estimatedHeight(null)).toBe(0);
+  });
+
+  it('a live figure fits the chain\'s height read within two minutes, counted on, plus 30 blocks; any while none is that fresh', () => {
+    expect([Pace.LIVE_TIP_MARGIN, Pace.TIP_FRESH_MS, Pace.TIP_READ_MS]).toEqual([30, 120000, 60000]);
+    const read = { height: 1000, at: 0 };
+    expect([1030, 1031].map((h) => Pace.liveHeightFits(h, read, 0))).toEqual([true, false]);
+    expect([1050, 1051].map((h) => Pace.liveHeightFits(h, read, 20_000))).toEqual([true, false]);
+    expect(Pace.liveHeightFits(900_000_000, read, 120_001)).toBe(true);
+    expect(Pace.liveHeightFits(900_000_000, { height: 0, at: 0 }, 0)).toBe(true);
+    expect(Pace.liveHeightFits(900_000_000, null)).toBe(true);
   });
 
   it('a node balance once per epoch and node, and every 5 minutes while the epoch is not known', () => {

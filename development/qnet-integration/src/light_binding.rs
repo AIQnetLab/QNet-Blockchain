@@ -197,7 +197,8 @@ pub fn record_writer(identity_pk_hex: &str) -> String {
 
 /// The device's platform as a bind names it (`Platform.OS` of the app; an iPad is "ios"): "android" or
 /// "ios", and "" for anything else or nothing. Unsigned and never a reason to refuse: the public status shows
-/// it, nothing decides on it.
+/// it and the pinger spaces an iOS device's pushes by it (`rpc::PushReach::ios`), a device record's proven
+/// platform taking its place.
 pub fn platform_hint(platform: Option<&str>) -> &'static str {
     match platform {
         Some("android") => "android",

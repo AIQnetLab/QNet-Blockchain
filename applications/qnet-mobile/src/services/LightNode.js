@@ -81,9 +81,6 @@ export const MISS_REASONS = [
   'not_woken_inactive',
 ];
 
-/** The reasons that are the network's misses, not this device's: nothing is needed on the device for them. */
-export const NETWORK_MISSES = new Set(['not_committed', 'not_sent']);
-
 // What the app did with a wake that reached the device, as its answer later reported it (section 7
 // `device.last_miss.app_outcome`; services/PushReceipts keeps this device's record).
 export const APP_OUTCOMES = ['answered', 'not_opened_since_boot', 'swiped', 'after_commit', 'answer_failed', 'already_counted', 'no_key'];
@@ -150,12 +147,6 @@ export function latestMiss(misses) {
   return best;
 }
 
-// Whether a record carries the device's own account of the wake: that it never arrived, or when it arrived and what the
-// app did with it. That account reaches the network only with a later answer, which counts the node again.
-export function hasDeviceAccount(m) {
-  return !!m && (m.reason === 'not_delivered' || (m.reason === 'woken_no_answer' && (m.deliveredAt != null || m.appOutcome != null)));
-}
-
 /**
  * The status's latest missed epoch (`lastMiss`) while nothing counted the node since: not when the last counted epoch
  * (`counted.last`) or the epoch the device view last counted it in (`device.lastAnswerEpoch`) is that epoch or later.
@@ -165,18 +156,6 @@ export function freshMiss(status) {
   if (!m) return null;
   const counted = [status.counted && status.counted.last, status.device && status.device.lastAnswerEpoch];
   return counted.some((e) => Number.isSafeInteger(e) && e >= m.epoch) ? null : m;
-}
-
-/**
- * The miss the Node tab names, as the site's Device tab does: the fresh one (freshMiss), else the latest one when it
- * carries the device's own account of the wake (hasDeviceAccount), which the network has only once a later answer
- * counted the node again (`past`). { miss, past } or null.
- */
-export function shownMiss(status) {
-  const fresh = freshMiss(status);
-  if (fresh) return { miss: fresh, past: false };
-  const m = status ? status.lastMiss : null;
-  return hasDeviceAccount(m) ? { miss: m, past: true } : null;
 }
 
 // One node's public answer, or null when it gives no verdict on the chain (a refusal, a rate limit).

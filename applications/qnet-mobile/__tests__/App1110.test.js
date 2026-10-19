@@ -1,9 +1,10 @@
 /**
- * The owner's decisions of 11.10 on the real wallet screen: a move of a node balance is in transit until a certified read
- * shows it in the wallet ("+X in transit" under QNC on Assets, "Moving X" with the button off on the Node tab, "Moving"
- * on its History row, never the amount in two places nor in none), whichever tab the user stays on, however long it
- * takes: no clock and no node's live answer ends it (owner, 12.10); the node balance after it only from nodes not
- * behind the wallet's certified watermark, for good; a super node registered and not admitted yet waits for admission
+ * The owner's decisions of 11.10 on the real wallet screen: a move of a node balance is in transit until the wallet's
+ * live figure (a genesis node's live tip, its proof folded) shows it in the wallet (owner, 18.10; "Moving X" with the
+ * button off on the Node tab, "Moving" on its History row, never the amount in two places nor in none), whichever tab
+ * the user stays on, however long it takes: no clock and no node's answer of the node balance ends it (owner, 12.10);
+ * the certified read settles its record later, in the background; the node balance after it only from nodes not behind
+ * the wallet's watermark, for good; a super node registered and not admitted yet waits for admission
  * rather than reading Offline; deleting or erasing the wallet says first that its node stops on this device. The unit
  * rules are ClaimTransit.test.js, NodeTab.test.js and BalanceFirstPaint.test.js.
  */
@@ -41,7 +42,7 @@ jest.mock('../src/components/WalletManager', () => {
     async checkPassword() { return { ok: true }; }
     async loadWallet() { return { address: mockSOL, solanaAddress: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
     getBIP39WordList() { return words; }
-    getTrustedNodes() { return []; }
+    getTrustedNodes() { return mockState.nodes || []; }
     trustedNodeUrl() { return 'https://node.invalid'; }
     async getBalance() { return 0.5; }
     async getTokenBalance() { return 4; }
@@ -52,12 +53,19 @@ jest.mock('../src/components/WalletManager', () => {
       if (r && r.ok && opts && opts.onFigure) opts.onFigure({ ...r, folded: true });
       return r;
     }
+    // What two genesis nodes list alike of the wallet's history (listing keys), or nothing read.
+    async agreedHistoryRows() { return mockState.listed || null; }
+    // The wallet's figure at a genesis node's live tip: what the test says (none by default).
+    async liveQncFigure() { mockState.liveReads += 1; return mockState.live || null; }
     async networkPause() { return null; }
     async claimRewards(nodeType, wallet, credential, balanceNano, nodeId) {
       mockState.claims.push({ nodeType, wallet, balanceNano, nodeId });
       return mockState.claimResult;
     }
-    async getTokenHoldings() { return []; }
+    // One node's holdings answer and an added token's figure at a genesis node's live tip: what the test says.
+    async getTokenHoldings() { return mockState.holdings || []; }
+    async liveTokenFigure() { return mockState.liveToken || null; }
+    _formatBaseUnits(base, decimals) { return require('../src/browser/dappRequests').formatUnits(base, decimals); }
     // An added token's balance read: what the test says (balance null: the read failed).
     async getTokenBalanceOf() { return mockState.tokenBalance || { balance: null }; }
     async loadNodeRecord() { return mockState.node; }
@@ -195,12 +203,25 @@ const certified = (qnc, lastClaimedEpoch) => ({
 // applied the whole move has nothing left to claim, and says so as the node does: 0 with no first unclaimed epoch.
 const BEFORE = () => ({ success: true, pendingRewards: 4e9, firstUnclaimedEpoch: 101 });
 const APPLIED = () => ({ success: true, pendingRewards: 0, firstUnclaimedEpoch: null });
-// The transit read the screen runs every minute on any tab but Assets (WalletScreen TRANSIT_READ_MS), run now.
+// The live read the screen runs every 15 seconds while a move is in transit (requestPace LIVE_READ_MS), run now; not the
+// kept-transaction sweep of the same pace.
 const transitTick = async () => {
-  const timer = global.setInterval.mock.calls.filter((c) => c[1] === 60_000).pop();
-  if (!timer) throw new Error('no transit read is scheduled');
+  const timer = global.setInterval.mock.calls.filter((c) => c[1] === 15_000 && c[0].name !== 'sweep').pop();
+  if (!timer) throw new Error('no live read is scheduled');
   await act(async () => { timer[0](); });
   await flush(12);
+};
+// A scheduled call run now, its timer cleared first (no copy of it runs later, after the test).
+const fireTimeout = async (call) => {
+  clearTimeout(global.setTimeout.mock.results[global.setTimeout.mock.calls.indexOf(call)].value);
+  await act(async () => { await call[0](); });
+  await flush(12);
+};
+// The result card's next look at the claim by its hash (WalletScreen followMove: first after 2 s), run now.
+const followTick = async () => {
+  const timer = global.setTimeout.mock.calls.filter((c) => c[1] === 2000).pop();
+  if (!timer) throw new Error('no claim follow is scheduled');
+  await fireTimeout(timer);
 };
 // The app comes back to the front: every listener of the app's state hears it (from call `from` on: only those added
 // since then, so a screen an earlier test left behind does not answer too).
@@ -218,6 +239,15 @@ beforeAll(() => {
     if (mockState.claimListed && /\/api\/v1\/account\/[^/]+\/transactions/.test(String(url))) {
       return { ok: true, json: async () => ({ transactions: [mockClaimRow] }) };
     }
+    if (mockState.received && /\/api\/v1\/account\/[^/]+\/transactions/.test(String(url))) {
+      return { ok: true, json: async () => ({ transactions: [mockState.received] }) };
+    }
+    // The chain's height, once the test names one.
+    if (mockState.tip && String(url).endsWith('/api/v1/height')) return { ok: true, json: async () => ({ height: mockState.tip }) };
+    // A genesis node's lookup of the claim, once the test puts it in a block.
+    if (mockState.claimInBlock && String(url).endsWith(`/api/v1/transaction/${mockHASH}`)) {
+      return { ok: true, json: async () => ({ status: 'found', transaction: { hash: mockHASH, status: 'confirmed', block_height: mockState.claimInBlock } }) };
+    }
     throw new Error('offline in tests');
   });
 });
@@ -229,10 +259,12 @@ beforeEach(async () => {
   const real = Date.now.bind(Date);
   nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => real() + clock.offset);
   jest.spyOn(global, 'setInterval');
+  jest.spyOn(global, 'setTimeout');
   AppState.currentState = 'active';
   Object.assign(mockState, {
     node: { nodeType: 'super', pseudonym: mockSUPER }, online: true, admitted: undefined, bound: false,
     qnc: certified(1, 100), qncReads: 0, claims: [], pendingCalls: 0, pending: BEFORE, claimListed: false, tokenBalance: null,
+    live: null, liveReads: 0, nodes: [], claimInBlock: null, received: null, listed: null, holdings: null, liveToken: null, tip: null,
     claimResult: { success: true, amount: 4, amountNano: '4000000000', prevWatermark: 100, lastEpoch: 103, txHash: mockHASH, pending: true },
   });
 });
@@ -240,6 +272,7 @@ afterEach(async () => {
   await act(async () => { while (mounted.length) mounted.pop().unmount(); });
   nowSpy.mockRestore();
   global.setInterval.mockRestore();
+  global.setTimeout.mockRestore();
 });
 
 // Move the super node's 4 QNC from the Node tab, and close the result card.
@@ -253,11 +286,16 @@ async function moved(tree) {
   await pressText(tree, t('common_done'));
 }
 
-describe('a move of a node balance in transit (owner, 11.10)', () => {
-  // Before, nothing was held: the node balance kept its old figure (read once, the largest of three answers, then locked
-  // for the epoch) with Move on, and Assets showed nothing of the move until a certified read: the amount was in two
-  // places or in none. This test fails on that behaviour at its first look at Assets.
-  it('is "Moving X" on the Node tab until a certified read shows it, never a line under QNC, then the node balance of the nodes that applied it', async () => {
+// The wallet's live figure (a genesis node's live tip, its proof folded) with its claim watermark.
+const liveAt = (qnc, figureClaimedEpoch, blockHeight = 9100) => ({
+  balance: qnc, balanceNano: String(Math.round(qnc * 1e9)), nonce: '3', blockHeight, figureClaimedEpoch,
+});
+
+describe('a move of a node balance in transit (owner, 11.10 and 18.10)', () => {
+  // Before 11.10 nothing was held: the node balance kept its old figure with Move on, and Assets showed nothing of the
+  // move: the amount was in two places or in none. Before 18.10 only a certified read ended it, minutes after Assets
+  // already showed the QNC (the live figure). This test fails on either.
+  it('is "Moving X" on the Node tab until the live figure shows it, never a line under QNC, then the node balance of the nodes that applied it', async () => {
     const tree = await unlocked();
     expect(qncFigure(tree)).toBe('1');
     expect(transitLine(tree)).toBe(null);
@@ -270,12 +308,10 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
     await tab(tree, 'assets');
     expect(transitLine(tree)).toBe(null);
     expect(qncFigure(tree)).toBe('1');
-    await pull(tree);
-    expect(transitLine(tree)).toBe(null);
-    // The certified read with the watermark at the batch's last epoch holds the amount: the line goes in the same update.
-    // One genesis node still lags behind the move (the old 4 QNC unclaimed): its answer no longer counts; the others
-    // applied the whole move and answer as the node does (nothing left: 0, no first unclaimed epoch).
-    mockState.qnc = certified(5, 103);
+    // The live figure with the watermark at the batch's last epoch holds the amount: the move ends in the same update,
+    // while the certified read still shows the state before it. One genesis node still lags behind the move (the old
+    // 4 QNC unclaimed): its answer no longer counts; the others applied the whole move and answer as the node does.
+    mockState.live = liveAt(5, 103);
     mockState.pending = (n) => (n % 3 === 1 ? BEFORE() : APPLIED());
     await pull(tree);
     expect(qncFigure(tree)).toBe('5');
@@ -284,27 +320,39 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
     expect(texts(tree)).toContain(`${t('node_balance')}\n0 QNC`);
     expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
     expect(textOf(moveButton(tree).findByType(Text))).toBe(t('node_move'));
-    // Every later read keeps judging by the wallet's certified watermark (103): a pull while that node still lags never
-    // brings the moved amount back, not even when it is the only one to answer.
+    // Every later read keeps judging by the wallet's watermark (103, the live one): a pull while that node still lags
+    // never brings the moved amount back, not even when it is the only one to answer.
     mockState.pending = () => BEFORE();
     await pull(tree);
     expect(texts(tree)).toContain(`${t('node_balance')}\n0 QNC`);
     expect(texts(tree)).not.toContain(`${t('node_balance')}\n4 QNC`);
+    // The record stays for the certified read, which settles it later in the background and changes nothing on screen.
+    expect(JSON.parse(await AsyncStorage.getItem('qnet_claim_transit_v1')).wallets[mockQNET].moves).toHaveLength(1);
+    mockState.qnc = certified(5, 103);
+    await tab(tree, 'assets');
+    await pull(tree);
+    const kept = JSON.parse(await AsyncStorage.getItem('qnet_claim_transit_v1')).wallets[mockQNET];
+    expect([kept.moves, kept.floor, 'liveLce' in kept]).toEqual([[], 103, false]); // the live watermark is never written
+    await tab(tree, 'node');
+    expect(texts(tree)).toContain(`${t('node_balance')}\n0 QNC`);
+    expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
   });
 
   // Before, a move ended only by a certified read the Assets tab ran: a user who stayed on the Node tab never saw it end.
-  it('ends by the certified read wherever the user stays: the Node tab reads the wallet while a move is in transit', async () => {
+  it('ends by the live figure wherever the user stays: it is read every 15 seconds while a move is in transit', async () => {
     const tree = await unlocked();
     await moved(tree);
     expect(texts(tree)).toContain(t('node_moving', { amount: '4 QNC' }));
-    mockState.qnc = certified(5, 103);
+    mockState.live = liveAt(5, 103);
     mockState.pending = () => APPLIED();
-    const reads = mockState.qncReads;
+    const reads = mockState.liveReads;
+    const qncReads = mockState.qncReads;
     await transitTick();
-    expect(mockState.qncReads).toBeGreaterThan(reads);
+    expect(mockState.liveReads).toBeGreaterThan(reads);
+    expect(mockState.qncReads).toBe(qncReads); // a light read: no certified read for it
     expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
     expect(texts(tree)).toContain(`${t('node_balance')}\n0 QNC`);
-    // Long after, back in the app: still the balance the certified read left.
+    // Long after, back in the app: still the balance the move left.
     clock.offset = 70 * 60_000;
     await resume();
     expect(texts(tree)).toContain(`${t('node_balance')}\n0 QNC`);
@@ -313,7 +361,7 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
   it('back in the app with the Node tab open, the wallet is read for the move', async () => {
     const tree = await unlocked();
     await moved(tree);
-    mockState.qnc = certified(5, 103);
+    mockState.live = liveAt(5, 103);
     mockState.pending = () => APPLIED();
     await resume();
     expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
@@ -322,32 +370,45 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
     expect(transitLine(tree)).toBe(null);
   });
 
-  it('its History row says Moving while it is in transit', async () => {
+  it('its History row says Moving while it is in transit, and Confirmed once the live figure shows it', async () => {
     const tree = await unlocked();
     await moved(tree);
     mockState.claimListed = true;
     await tab(tree, 'history');
     expect(historyMoving(tree)).toBe(1);
-    mockState.qnc = certified(5, 103);
+    mockState.live = liveAt(5, 103);
     mockState.pending = () => APPLIED();
     await transitTick();
     expect(historyMoving(tree)).toBe(0);
   });
 
-  // A figure whose root the walk has not certified yet may already hold the move (its leaf's watermark at the batch's
-  // last epoch): Assets' line leaves out what it holds, so the amount is not shown twice, and the move itself waits for
-  // a certified read; it never ends on that figure's word.
-  it('a figure not verified yet that holds the move: the line leaves it out, the move still waits for a certified read', async () => {
+  // Before, the card said "Credited once confirmed." whatever happened after; nothing followed the claim's hash.
+  it('the card follows the claim by its hash and says the amount is in the wallet once the live figure shows it', async () => {
+    mockState.nodes = ['https://node.invalid'];
     const tree = await unlocked();
-    await moved(tree);
-    mockState.qnc = { ok: true, verified: false, balance: 5, balanceNano: '5000000000', blockHeight: 9000, figureClaimedEpoch: 103, reason: 'unconfirmed' };
-    await tab(tree, 'assets');
-    await pull(tree);
-    expect(qncFigure(tree)).toBe('5');
-    expect(transitLine(tree)).toBe(null);
     await tab(tree, 'node');
-    expect(texts(tree)).toContain(t('node_moving', { amount: '4 QNC' }));
-    expect(moveButton(tree).props.disabled).toBe(true);
+    await act(async () => { await moveButton(tree).props.onPress(); });
+    await flush(8);
+    expect(texts(tree)).toContain(t('claim_credited_on_block'));
+    // A genesis node has the claim in a block, and the live figure read at once holds it.
+    mockState.claimInBlock = 9099;
+    mockState.live = liveAt(5, 103);
+    mockState.pending = () => APPLIED();
+    await followTick();
+    expect(texts(tree)).toContain(t('claim_note_done'));
+    expect(texts(tree)).not.toContain(t('claim_credited_on_block'));
+  });
+
+  // Before, the Node tab's card wrote the amount moved to four decimals, while the QNet Link sheet wrote it exact.
+  it('the card writes the amount moved exact to the nano, as the QNet Link sheet does', async () => {
+    mockState.claimResult = { ...mockState.claimResult, amount: 1.234567891, amountNano: '1234567891' };
+    const tree = await unlocked();
+    await tab(tree, 'node');
+    await act(async () => { await moveButton(tree).props.onPress(); });
+    await flush(8);
+    const amount = tree.root.findAll((n) => n.type === Text && [].concat(n.props.style).includes(styles.txResultAmount));
+    expect(amount.map(textOf)).toEqual(['1.234567891 QNC']);
+    expect(texts(tree)).toContain(t('node_moving', { amount: '1.234567891 QNC' }));
   });
 
   it('kept across a restart of the app: the next session still shows it in transit', async () => {
@@ -360,12 +421,13 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
   });
 
   // Before, 35 minutes on, the wallet asked three genesis nodes' live state and said the move did not go through when
-  // most still held the batch: a verdict no certified data gave, on a transaction with no consensus expiry that can still
-  // be included later. Now only a certified watermark ends it, however long that takes.
-  it('however long no certified read shows it, and whatever the nodes say of their live state, it stays in transit', async () => {
+  // most still held the batch: a verdict nothing on chain gave, on a transaction with no consensus expiry that can still
+  // be included later. Only a watermark that shows it ends it, however long that takes.
+  it('however long no figure shows it, and whatever the nodes say of the node balance, it stays in transit', async () => {
     const since = AppState.addEventListener.mock.calls.length; // this screen's listeners, not an earlier test's
     const tree = await unlocked();
     await moved(tree);
+    mockState.live = liveAt(1, 100); // the live tip before the claim is in a block
     for (const [offset, pending] of [[36 * 60_000, BEFORE], [6 * 3600_000, APPLIED], [26 * 3600_000, BEFORE]]) {
       mockState.pending = pending;
       clock.offset = offset;
@@ -383,8 +445,8 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
       // No node is asked of the move's fate: the node balance is not even read while it is in transit.
       expect(mockState.pendingCalls).toBe(asked);
     }
-    // The certified read that shows it, however late: it went through.
-    mockState.qnc = certified(5, 103);
+    // The figure that shows it, however late: it went through.
+    mockState.live = liveAt(5, 103, 9200);
     mockState.pending = () => APPLIED();
     await transitTick();
     expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
@@ -394,12 +456,112 @@ describe('a move of a node balance in transit (owner, 11.10)', () => {
     expect(transitLine(tree)).toBe(null);
   });
 
+  // Before, the live watermark was written to the device and only ever raised: one genesis node's live answer of a
+  // branch the chain left ended the move for good, and judged every node balance answer after it.
+  it('a certified read of the live figure\'s height or later that shows less puts the move back in transit', async () => {
+    const tree = await unlocked();
+    await moved(tree);
+    mockState.live = liveAt(5, 103, 9100);
+    mockState.pending = () => APPLIED();
+    await transitTick();
+    expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
+    expect(JSON.parse(await AsyncStorage.getItem('qnet_claim_transit_v1')).wallets[mockQNET]).not.toHaveProperty('liveLce');
+    // A certified state older than that figure only lags: the move stays ended.
+    mockState.qnc = certified(1, 100);
+    await tab(tree, 'assets');
+    await pull(tree);
+    await tab(tree, 'node');
+    expect(texts(tree)).not.toContain(t('node_moving', { amount: '4 QNC' }));
+    // One of that figure's height or later still at 100: that figure was of a branch the chain left.
+    mockState.qnc = { ...certified(1, 100), blockHeight: 9180 };
+    mockState.live = liveAt(1, 100, 9180);
+    await tab(tree, 'assets');
+    await pull(tree);
+    await tab(tree, 'node');
+    expect(texts(tree)).toContain(t('node_moving', { amount: '4 QNC' }));
+    expect(moveButton(tree).props.disabled).toBe(true);
+  });
+
   it('a second move of the node waits for the one in transit', async () => {
     const tree = await unlocked();
     await moved(tree);
     await act(async () => { await moveButton(tree).props.onPress(); });
     await flush(4);
     expect(mockState.claims).toHaveLength(1);
+  });
+});
+
+// Before, received QNC said "Not credited yet" until the certified read covered its block, while Assets already showed
+// the money (the live figure).
+describe('received QNC in History (owner, 18.10)', () => {
+  const badges = (tree, status) => tree.root.findAll((n) => n.type === Text && n.props.testID === `history-badge-${status}`).length;
+  // A transfer to the wallet in block 9150, listed alike by two genesis nodes.
+  const receivedIn9150 = () => {
+    const { listingKeysOfNodeRow } = require('../src/utils/txHistory');
+    mockState.received = { hash: 'cd'.repeat(32), tx_type: 'Transfer', from: 'e'.repeat(45), to: mockQNET, amount: 2e9,
+      timestamp: 1791000000, fee: 0, block_height: 9150 };
+    mockState.listed = new Set(listingKeysOfNodeRow({ ...mockState.received, type: 'transfer' }));
+  };
+
+  it('is in the balance once the wallet\'s live figure covers its block; the History read asks for that figure', async () => {
+    receivedIn9150();
+    const tree = await unlocked();
+    await tab(tree, 'history');
+    // In a block as two genesis nodes list it; the certified read covers 9000 only.
+    expect(badges(tree, 'included')).toBe(1);
+    mockState.live = liveAt(3, 100, 9160);
+    const reads = mockState.liveReads;
+    await pull(tree);
+    expect(mockState.liveReads).toBeGreaterThan(reads);
+    expect([badges(tree, 'included'), badges(tree, 'pending'), badges(tree, 'unverified')]).toEqual([0, 0, 0]);
+  });
+
+  // Before, one live answer naming a block far ahead counted every received transfer in the balance for the session.
+  it('a live figure of a block the chain has not reached counts nothing in the balance', async () => {
+    receivedIn9150();
+    mockState.tip = 9200;
+    const tree = await unlocked();
+    await tab(tree, 'history');
+    expect(badges(tree, 'included')).toBe(1);
+    mockState.live = liveAt(3, 100, 900_000_000);
+    await pull(tree);
+    expect(badges(tree, 'included')).toBe(1);
+    mockState.live = liveAt(3, 100, 9160);
+    await pull(tree);
+    expect(badges(tree, 'included')).toBe(0);
+  });
+});
+
+// Before, a node being linked was read again only every 5 minutes (NODE_STATUS_MS) while the tab said "linking", and
+// the registration in the pool went unsaid.
+describe('a light node being linked (owner, 18.10)', () => {
+  it('its status is read every 10 s for two minutes after the link, then every minute, and the pool is named', async () => {
+    const LightNode = require('../src/services/LightNode');
+    const linkedAt = Date.now();
+    mockState.node = { nodeType: 'light', pseudonym: mockLIGHT };
+    LightNode.readLinkPending.mockImplementation(async () => ({ nodeId: mockLIGHT, T: Math.floor(linkedAt / 1000), createdAt: linkedAt, expired: false }));
+    LightNode.readNodeStatus.mockImplementation(async () => ({
+      reachable: true, onChain: false, registrationPending: true, deviceBound: null, deviceBoundAgreed: null, answered: null,
+      needsReactivation: false, counted: null, device: null, deviceTags: [], features: [], signed: null, keyOurs: null, bindingSeqAgreed: null,
+    }));
+    try {
+      const tree = await unlocked();
+      await tab(tree, 'node');
+      expect(texts(tree)).toContain(t('node_linking_pool'));
+      const soon = global.setTimeout.mock.calls.filter((c) => c[1] === 10_000).pop();
+      expect(soon).toBeDefined();
+      const reads = LightNode.readNodeStatus.mock.calls.length;
+      clock.offset = 3 * 60_000; // past the first two minutes
+      await fireTimeout(soon);
+      expect(LightNode.readNodeStatus.mock.calls.length).toBeGreaterThan(reads);
+      expect(global.setTimeout.mock.calls.filter((c) => c[1] === 60_000).length).toBeGreaterThan(0);
+    } finally {
+      LightNode.readLinkPending.mockImplementation(async () => null);
+      LightNode.readNodeStatus.mockImplementation(async () => ({
+        reachable: true, onChain: false, registrationPending: false, deviceBound: null, deviceBoundAgreed: null, answered: null,
+        needsReactivation: false, counted: null, device: null, deviceTags: [], features: [], signed: null, keyOurs: null, bindingSeqAgreed: null,
+      }));
+    }
   });
 });
 
@@ -460,6 +622,24 @@ describe('an added token whose read failed is never a 0 nobody read (owner, 11.1
     mockState.tokenBalance = { balance: '0' };
     await pull(tree);
     expect(amounts(tree)).toEqual(['1', '0']);
+  });
+
+  // Before, every token load rebuilt the row from one node's holdings answer: the figure after a send, proven for block
+  // 9200, went back to the holdings figure of before it, and a live figure a block behind could not correct it.
+  it('a figure proven for a state stays through a holdings answer from before it and a live figure a block behind', async () => {
+    const contract = 'c'.repeat(64);
+    await AsyncStorage.setItem('qnet_custom_tokens', JSON.stringify([{ contract_address: contract, symbol: 'TKN', name: 'Token', decimals: 2 }]));
+    mockState.holdings = [{ contract, name: 'Token', symbol: 'TKN', decimals: 2, logo: '', balance: '10', balanceBase: '1000' }];
+    mockState.liveToken = { balanceBase: '750', balance: '7.5', blockHeight: 9200 };
+    const tree = await unlocked();
+    expect(amounts(tree)).toEqual(['1', '7.5']);
+    mockState.liveToken = { balanceBase: '1000', balance: '10', blockHeight: 9199 };
+    await pull(tree);
+    expect(amounts(tree)).toEqual(['1', '7.5']);
+    // A figure of a newer state replaces it.
+    mockState.liveToken = { balanceBase: '700', balance: '7', blockHeight: 9201 };
+    await pull(tree);
+    expect(amounts(tree)).toEqual(['1', '7']);
   });
 });
 

@@ -527,8 +527,8 @@ describe('the wallet reads certified proofs', () => {
     await AsyncStorage.clear();
     wlc.clearQcCache();
     WalletManager.nodeHealth = {};
-    WalletManager.sendProofs.clear();
-    WalletManager.sendReads.clear();
+    WalletManager.liveFigures.clear();
+    WalletManager.liveReads.clear();
     WalletManager.retryAfterUntil.clear();
     WalletManager.lastOwnSendAt.clear();
   });
@@ -545,8 +545,8 @@ describe('the wallet reads certified proofs', () => {
     expect(r).toMatchObject({ ok: true, verified: true, balanceNano: '5000000000', nonce: '3', index: 7, stateRoot: state.root });
     expect(urls[0]).toMatch(/\/api\/v1\/account\/eon_golden_plain\/balance\/proof\?mb=latest$/);
     expect(wm._certifiedRootFresh).toHaveBeenCalledWith(7);
-    // Kept for the next send check, with its index.
-    expect(WalletManager.sendProofs.get(`qnc|${ME}`)).toMatchObject({ index: 7, stateRoot: state.root });
+    // A certified read keeps nothing for a send: a send is checked against the live tip (qncForSend).
+    expect(WalletManager.liveFigures.has(ME)).toBe(false);
   });
 
   it('a proof that folds only to the root its node served is not verified, and the next node is asked', async () => {
@@ -573,14 +573,11 @@ describe('the wallet reads certified proofs', () => {
     await expect(wm.getQNCBalanceWithProof('eon_golden_absent')).resolves.toMatchObject({ ok: true, verified: true, balanceNano: '0', exists: false });
     // The same absence, not certified: shown as not verified, early and at the end.
     wm._certifiedRootFresh = jest.fn(async () => ({ ok: false, reason: 'unconfirmed' }));
-    WalletManager.sendProofs.clear();
     const early = [];
     await expect(wm.getQNCBalanceWithProof('eon_golden_absent', true, { onFigure: (f) => early.push(f) })).resolves
       .toMatchObject({ ok: true, verified: false, balance: 0, balanceNano: '0', exists: false, reason: 'unconfirmed' });
     expect(early).toEqual([expect.objectContaining({ balance: 0, balanceNano: '0', folded: true, figureClaimedEpoch: 0 })]);
     expect(early[0].lastClaimedEpoch).toBeUndefined(); // no certified watermark before the walk certified the root
-    // Nothing of it is kept for a send: a send checks its own certified figure.
-    expect(WalletManager.sendProofs.get('qnc|eon_golden_absent')).toBeUndefined();
     // A node's word without a proof: no figure.
     global.fetch = jest.fn(async () => reply(200, { balance: 0, nonce: 0 }));
     await expect(wm.getQNCBalanceWithProof('eon_golden_absent')).resolves.toMatchObject({ ok: false, balance: null });

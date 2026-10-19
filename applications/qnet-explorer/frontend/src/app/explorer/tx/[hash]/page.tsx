@@ -4,7 +4,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { setCache } from '@/lib/explorer-cache';
-import { formatTokenAmount } from '@/lib/token-format';
+import { formatQnc, formatTokenAmount } from '@/lib/token-format';
 import TokenIcon from '@/components/TokenIcon';
 import { useActivationContent } from '@/contexts/AppContext';
 import { txDataEntries, txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
@@ -392,7 +392,7 @@ export default function TransactionPage() {
                     <span className="detail-label">#{i + 1}</span>
                     <span className="detail-value">
                       <Link href={`/explorer/address/${r.to}`} className="addr">{r.to}</Link>
-                      {' — '}{(Number(r.amount) / 1e9).toFixed(9)} QNC
+                      {' — '}{formatQnc(r.amount)} QNC
                     </span>
                   </div>
                 ))}

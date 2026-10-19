@@ -172,8 +172,8 @@ describe('MBR2-02: a token transfer or a call is signed only on balances read ag
       tokenInfo: jest.fn(async () => ({ standard: 'qrc20', name: 'Game Gold', symbol: 'GOLD', decimals: 6 })),
       contractKind: jest.fn(async (a) => (a === WASM ? 'contract' : a === TOKEN ? 'token' : 'none')),
       prepareSend: jest.fn(async () => ({
-        nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [TO],
-        tokenBalanceBase: '9000000', tokenVerified: true, depositNano: '10000000', listed: true,
+        nonce: 5, balanceNano: '10000000000', counterparties: [TO],
+        tokenBalanceBase: '9000000', depositNano: '10000000', listed: true,
       })),
       recheckSend: jest.fn(async () => ({ balanceNano: '10000000000', tokenBalanceBase: '9000000', depositNano: '10000000' })),
       send: jest.fn(async () => ({ txHash: 'a'.repeat(64), status: 'submitted', nonce: 5 })),
@@ -244,7 +244,7 @@ describe('MBR2-02: a token transfer or a call is signed only on balances read ag
     // A QNC transfer too (MB-R1-01): never signed and kept on a balance nobody read.
     expect(sendShort('transfer', { amountNano: '1', feeNano: '1' }, { balanceNano: null })).toBe(true);
     const s = setup();
-    s.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano: '10000000000', verified: true, counterparties: [TO], tokenBalanceBase: null, depositNano: '0' });
+    s.deps.prepareSend.mockResolvedValue({ nonce: 5, balanceNano: '10000000000', counterparties: [TO], tokenBalanceBase: null, depositNano: '0' });
     tokenAsk(s).catch(() => {});
     await tick();
     await s.p.loadPreview(s.shown().id);
@@ -264,14 +264,14 @@ describe('MBR2-02: a token transfer or a call is signed only on balances read ag
       return new WalletManager();
     };
 
-    // The owner's rule: a send is decided only by a balance the committee certified. An answer no proof certifies never
-    // counts, however many genesis nodes give it alike.
-    it('an unverified answer never counts, not even when every genesis node gives the same balance', async () => {
-      WalletManager.sendProofs.clear();
+    // The owner's rule (18.10): a send is checked against a genesis node's live tip with its proof folded. An answer whose
+    // proof does not fold never counts, however many genesis nodes give it alike.
+    it('an answer whose proof does not fold never counts, not even when every genesis node gives the same balance', async () => {
+      WalletManager.liveFigures.clear();
       expect(await wallet(['9000000', '1', '2', '3', '4']).checkedTokenBalance(TOKEN, QNET, 6))
         .toMatchObject({ ok: false });
       expect(await wallet(['9000000', '9000000', '9000000', '9000000', '9000000']).checkedTokenBalance(TOKEN, QNET, 6))
-        .toMatchObject({ ok: false, balanceBase: null, verified: false });
+        .toMatchObject({ ok: false, balanceBase: null });
       expect(await wallet([null, null, null, null, '5']).checkedTokenBalance(TOKEN, QNET, 6)).toMatchObject({ ok: false });
     });
 

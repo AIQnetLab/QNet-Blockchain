@@ -1,6 +1,7 @@
 import HomeClient from './HomeClient';
 import InAppGuard from '@/components/InAppGuard';
 import { headHub } from '@/server/head-hub';
+import { formatQncTruncated } from '@/lib/token-format';
 
 // Home statistics come from the process head snapshot (no per-request queries).
 export const dynamic = 'force-dynamic';
@@ -13,8 +14,6 @@ export default async function HomePage() {
     const s = await headHub.snapshot();
     const height = Math.max(s.height, 0);
     const emissionNano = BigInt(s.stats.emission_total || '0');
-    const whole = emissionNano / 1_000_000_000n;
-    const frac = (emissionNano % 1_000_000_000n).toString().padStart(9, '0').slice(0, 2);
     const blocksUntilReward = EPOCH - (height % EPOCH);
     initialStats = {
       activeNodes: 0,
@@ -22,8 +21,8 @@ export default async function HomePage() {
       height,
       blocksUntilReward,
       secondsUntilReward: blocksUntilReward,
-      circulatingSupply: Number(whole),
-      circulatingFormatted: `${whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`,
+      circulatingSupply: Number(emissionNano / 1_000_000_000n),
+      circulatingFormatted: formatQncTruncated(emissionNano, 2),
     };
   } catch (error) {
     console.error(`[ERR][WEB] home_ssr_failed err=${error instanceof Error ? error.message : String(error)}`);

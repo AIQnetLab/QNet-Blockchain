@@ -1575,7 +1575,7 @@ async fn answer_light_node_ping(
 
     // The node's last answer as its shard owner took it, with how long the push took to reach the device
     // (`device.last_answer`); nothing of this epoch is left to record as a miss. The push receipts the answer
-    // carries refine the node's last miss here (light-node-messages 5.10), never its crediting.
+    // carries refine the node's misses here (light-node-messages 5.10), never its crediting.
     PUSH_LEDGER.answered(&node_id);
     if owns_light_shard(&node_id) {
         let receipts = PushReceipts::from_params(&params);
@@ -2774,8 +2774,8 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     SimplifiedP2P::arm_push_schedule(first_push_draw_from(&storage, live), spaced_rounds_from(&storage, live));
                 }
                 // The misses of the epoch whose commit opened (after a stalled loop, of the one before): what each
-                // node that gave no answer got from here, merged into its row (`device.last_miss`). Before any push
-                // of a new epoch, which would reuse the ledger's entries.
+                // node that gave no answer got from here, merged into its row's misses (`device.last_miss`). Before
+                // any push of a new epoch, which would reuse the ledger's entries.
                 let decided = if in_commit_gap(tip) { Some(epoch) } else { epoch.checked_sub(1) };
                 if let Some(d) = decided.filter(|d| misses_done.map_or(true, |m| m < *d)) {
                     misses_done = Some(d);

@@ -7,25 +7,12 @@ import type { Block, BlockTransaction, HeartbeatEntry } from '@/lib/types';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 import { useActivationContent } from '@/contexts/AppContext';
 import { txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
+import { formatQnc } from '@/lib/token-format';
 
 // Helper to truncate
 const truncate = (str: string, start = 8, end = 6): string => {
   if (!str || str.length <= start + end + 3) return str || '';
   return `${str.slice(0, start)}...${str.slice(-end)}`;
-};
-
-// Format amount from nanoQNC to QNC
-// v3.52: Full precision, no zero-padding
-const formatAmount = (nanoQNC: string): string => {
-  const num = BigInt(nanoQNC);
-  const qnc = Number(num) / 1e9;
-  
-  const fixed = qnc.toFixed(9);
-  const trimmed = fixed.replace(/\.?0+$/, '');
-  
-  const [intPart, decPart] = trimmed.split('.');
-  const intFormatted = Number(intPart).toLocaleString('en-US');
-  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
 };
 
 // Format timestamp → dd.mm.yyyy, HH:MM:SS
@@ -46,7 +33,7 @@ const formatTime = (ts: number | string | undefined): string => {
   return `${dd}.${mm}.${yyyy}, ${hh}:${min}:${ss}`;
 };
 
-// Copy button (Keeta style)
+// Copy button
 const CopyBtn = ({ text }: { text: string }) => {
   const [copied, setCopied] = useState(false);
   
@@ -284,13 +271,13 @@ export default function BlockPage() {
             {block.consensus_data.fees_collected !== undefined && (
               <div className="detail-row highlight">
                 <span className="detail-label">Fees Collected</span>
-                <span className="detail-value">{formatAmount(block.consensus_data.fees_collected.toString())}</span>
+                <span className="detail-value">{formatQnc(block.consensus_data.fees_collected)} QNC</span>
               </div>
             )}
             {block.consensus_data.pool3_total_activations !== undefined && (
               <div className="detail-row highlight">
                 <span className="detail-label">{full ? 'Pool 3 Activations' : 'Pool 3 total'}</span>
-                <span className="detail-value">{formatAmount(block.consensus_data.pool3_total_activations.toString())}</span>
+                <span className="detail-value">{formatQnc(block.consensus_data.pool3_total_activations)} QNC</span>
               </div>
             )}
           </div>
@@ -300,52 +287,54 @@ export default function BlockPage() {
       {/* Transactions */}
       <div className="block-card">
         <h2 className="card-title">Transactions ({block.transactions.length})</h2>
-        <table className="block-table">
-          <thead>
-            <tr>
-              <th>Hash</th>
-              <th>Type</th>
-              <th>From → To</th>
-              <th>Amount</th>
-            </tr>
-          </thead>
-          <tbody>
-            {block.transactions.map((tx, idx) => (
-              <tr key={idx}>
-                <td>
-                  {tx.hash ? (
-                    <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
-                      {truncate(tx.hash, 6, 4)}
-                    </Link>
-                  ) : (
-                    <span className="mono">{idx + 1}</span>
-                  )}
-                </td>
-                <td>
-                  <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
-                </td>
-                <td>
-                  {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
-                    <Link href={`/explorer/address/${tx.from}`} className="address-link">
-                      {truncate(tx.from, 6, 4)}
-                    </Link>
-                  ) : (
-                    <span className="address-link">{txPartyLabel(tx.from || 'N/A', full)}</span>
-                  )}
-                  <span className="tx-arrow">→</span>
-                  {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
-                    <Link href={`/explorer/address/${tx.to}`} className="address-link">
-                      {truncate(tx.to, 6, 4)}
-                    </Link>
-                  ) : (
-                    <span className="address-link">{txPartyLabel(tx.to || 'N/A', full)}</span>
-                  )}
-                </td>
-                <td>{formatAmount(tx.amount)}</td>
+        <div className="table-wrapper">
+          <table className="block-table">
+            <thead>
+              <tr>
+                <th>Hash</th>
+                <th>Type</th>
+                <th>From → To</th>
+                <th>Amount</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {block.transactions.map((tx, idx) => (
+                <tr key={idx}>
+                  <td>
+                    {tx.hash ? (
+                      <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
+                        {truncate(tx.hash, 6, 4)}
+                      </Link>
+                    ) : (
+                      <span className="mono">{idx + 1}</span>
+                    )}
+                  </td>
+                  <td>
+                    <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
+                  </td>
+                  <td>
+                    {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
+                      <Link href={`/explorer/address/${tx.from}`} className="address-link">
+                        {truncate(tx.from, 6, 4)}
+                      </Link>
+                    ) : (
+                      <span className="address-link">{txPartyLabel(tx.from || 'N/A', full)}</span>
+                    )}
+                    <span className="tx-arrow">→</span>
+                    {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
+                      <Link href={`/explorer/address/${tx.to}`} className="address-link">
+                        {truncate(tx.to, 6, 4)}
+                      </Link>
+                    ) : (
+                      <span className="address-link">{txPartyLabel(tx.to || 'N/A', full)}</span>
+                    )}
+                  </td>
+                  <td>{formatQnc(tx.amount)} QNC</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       {/* Validators (MacroBlock) */}
@@ -356,36 +345,38 @@ export default function BlockPage() {
             <span className={`collapse-icon ${showValidators ? 'open' : ''}`}>▼</span>
           </div>
           {showValidators && (
-            <table className="block-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Node</th>
-                  <th>Address</th>
-                  <th>Type</th>
-                  <th>Reputation</th>
-                </tr>
-              </thead>
-              <tbody>
-                {block.consensus_data.heartbeat_entries.map((entry, idx) => (
-                  <tr key={idx}>
-                    <td>{formatTime(entry.timestamp)}</td>
-                    <td>{entry.node_id}</td>
-                    <td>
-                      <Link href={`/explorer/address/${entry.node_address}`} className="address-link">
-                        {truncate(entry.node_address, 6, 4)}
-                      </Link>
-                    </td>
-                    <td>
-                      <span className={`node-type-badge ${entry.node_type.toLowerCase()}`}>
-                        {entry.node_type}
-                      </span>
-                    </td>
-                    <td>{entry.reputation}</td>
+            <div className="table-wrapper">
+              <table className="block-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Node</th>
+                    <th>Address</th>
+                    <th>Type</th>
+                    <th>Reputation</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {block.consensus_data.heartbeat_entries.map((entry, idx) => (
+                    <tr key={idx}>
+                      <td>{formatTime(entry.timestamp)}</td>
+                      <td>{entry.node_id}</td>
+                      <td>
+                        <Link href={`/explorer/address/${entry.node_address}`} className="address-link">
+                          {truncate(entry.node_address, 6, 4)}
+                        </Link>
+                      </td>
+                      <td>
+                        <span className={`node-type-badge ${entry.node_type.toLowerCase()}`}>
+                          {entry.node_type}
+                        </span>
+                      </td>
+                      <td>{entry.reputation}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}

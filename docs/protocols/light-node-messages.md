@@ -114,14 +114,14 @@ so that the wallet key stays locked. `pp` is its public key.
   takes `seq = ts = T`. `ts` of the attach, token refresh, unbind and signed status lies within ±300 s of the
   node's clock (the attach of a first binding within `[now − 86400 − 600, now + 300]` when `seq = ts`: the span in
   which the app re-sends a pre-signed binding and the node keeps it pending).
-- Beside the signed fields, a `/light-node/bind` body may carry two unsigned display hints of the device it binds:
+- Beside the signed fields, a `/light-node/bind` body may carry two unsigned hints of the device it binds:
   `platform` (`"android"` or `"ios"`) and `model`, a short marketing name of the device the app builds on it (never a
   serial number, IMEI, user name or other identifier): 1 to 40 ASCII letters, digits, spaces and `. , + ( ) / -` once
   trimmed. Anything else is no platform or no model, never a reason to refuse, and a node of an earlier version
   ignores both. The node keeps them with the binding's push record: the token sync carries them to the other genesis
   nodes (as `platform` and `model`), a pending binding keeps them until it is promoted, a re-send that names none
   keeps the ones its binding holds, the next binding replaces them, and the unbind deletes them. No block rule reads
-  them; the public status shows them (section 7).
+  them; the public status shows them (section 7), and an iOS platform spaces the device's pushes (section 5.10).
 - The unbind ends the binding stored now, at its sequence (`binding_seq` of the signed status while `device_bound` is
   true). The bound device signs it with its ping key (`"signer": "ping"`): the app sends it when the user confirms the
   cabinet's `unlink` request on that device ([QNet Link v1](qnet-link-v1.md) section 14), or when the wallet is
@@ -386,7 +386,14 @@ these six due points and six times an epoch at one owner rank: a node that answe
 push that finds no instant in its slot, or whose tick a short stall missed, goes out in the next slot of its due point
 (up to two slots later, or at the tick that catches up after the stall), still once; a push a catch-up made late
 stands in for the next due point when that one is less than 13 slots on, so no two pushes a genesis records for a node
-go out closer than that. The round's first push and the retry round's are read from the node's drawn slot and are due
+go out closer than that. A device whose platform is iOS (the platform the status shows: the one its device record
+proved, else the one its bind named) is pushed only at four of these due points, 0, 30, 60 and 90 slots after the drawn
+slot: four pushes an epoch, half an hour apart within the 90 slots from the drawn slot, as iOS holds back background
+pushes that come close together. None goes out after the epoch's slot 220, so a node drawn after slot 130 gets three
+and the next epoch's first push comes at least 20 slots after the last. A push to it a catch-up made late stands in for
+its next due point when that one is less than 20 slots on, and so does a wake (the wake route below) in its epoch, so a genesis
+never sends it more than three scheduled pushes within an hour, nor two closer than 20 slots within one run (a restart
+forgets the pushes it sent); a wake on request goes out at once. Every other device, and one whose platform is not known, keeps the six. The round's first push and the retry round's are read from the node's drawn slot and are due
 to every node not counted. A repeat is due to a node the genesis offered a push in the epoch (sent, or shed by the
 pacing), not to one it only woke, held by the dormant rule or refused an answer of; and to every node not counted
 when its round began before the genesis held the shard's record of the epoch, after a restart or a takeover, so
@@ -494,7 +501,8 @@ at its next wake, are still pushed is an open decision of the owner before the d
 **The wake route** is `POST /api/v1/light-node/wake` with `{"node_id": N}` (the site no longer calls it: a phone that
 holds the node answers once QNet Wallet is open on it, and one whose push address is gone is linked again): one silent push (`"action": "wake"`) to the
 bound device, or, for a device without a push channel, a challenge for its next poll; it is unsigned and the dormant
-rule does not apply to it. Every answer is
+rule does not apply to it. A wake pushed to an iOS device goes out at once, and in its epoch the device's scheduled
+pushes due less than 20 slots after it are skipped (**Timing** above). Every answer is
 
 ```
 {"success": b, "reason": "sent" | "already_answered" | "no_device" | "not_registered" | "cooldown", "node_id": N,
@@ -542,7 +550,7 @@ phone started and not swiped away since), `after_commit` (the push arrived after
 (no genesis took the answer), `already_counted` (the epoch was counted already), `no_key` (nothing to sign with here);
 an entry may also say `answered`. `E0` is the first epoch from which the record holds every push the app received:
 the epoch the record began, or once it is full the epoch of its oldest entry. A report covers the epochs from `E0` to
-the one before its answer's own. The app sends the field with its answers, an empty list included, so that an epoch it
+the one before its answer's own, at most six: a genesis refines no older epoch, whatever `E0` says. The app sends the field with its answers, an empty list included, so that an epoch it
 lists nothing for reads as "no push received"; it leaves the field out when its record covers none of those epochs or
 its answer of each of them was taken, as there is nothing to refine. Numbers may also be decimal strings. A report longer than the bound, with more entries, or malformed is ignored whole.
 It is unsigned display data read only once the answer verified and counted: it never changes crediting.
@@ -584,7 +592,7 @@ answer during it. A reply whose anchor is not a canonical block of the current e
 shard owner records that epoch's answer as late.
 
 **Misses.** When the commit window opens, each shard owner records, for every node it pushed that epoch and that was
-not counted, why (`device.last_miss`, section 7): a reply refused in time for a reason only the node itself causes
+not counted, why (`device.last_miss` and the misses route, section 7): a reply refused in time for a reason only the node itself causes
 (`answer_refused`: a replaced device, a device record that does not count, a device counter not above the last, a
 reply without the device signature after enforcement; the record and enforcement refusals, decided before any
 signature is checked, only once the reply's `σ` verifies under the node's ping key and delegation, and none of the
@@ -595,10 +603,10 @@ miss, never the device's). A late reply turns that epoch's record into `answered
 (answered_at − received_at)` when the reply told both. A node the dormant rule held records nothing: the status
 derives `not_woken_inactive` when read. Before the misses, the owner stores its reach records of the epoch.
 
-The push receipts of the node's next counted answer, taken by a shard owner at its clock `t`, refine that owner's
-record when it is a `woken_no_answer` not refined before, of an epoch before the answer's own (the epoch of its anchor;
-a record of that epoch or a later one, and a reply to a server stamp, are left as they are), by the epoch the record
-names:
+The push receipts of the node's next counted answer, taken by a shard owner at its clock `t`, refine each of that
+owner's records that is a `woken_no_answer` not refined before, of the six epochs before the answer's own (the epoch of
+its anchor; a record of that epoch or a later one, an older one, and a reply to a server stamp are left as they are),
+by the epoch the record names, all in one write:
 
 - an entry of that epoch: the first one received gives `delivered_at` = `t − (answered_at − received_at)`, the answer's
   own `answered_at`, so the device's clock cancels out (nothing when `answered_at` is absent, before `received_at`, more
@@ -608,7 +616,12 @@ names:
 - no entry of that epoch, `E0` at most that epoch, and only a push the provider took woke the node (no challenge
   fetched): the reason becomes `not_delivered`, the push service or the phone held it.
 
-The record is node-local, one row per node overwritten by the next, and no block rule reads it.
+The records are node-local, one row per node: one record per epoch, of the 64 epochs up to the newest (a newer record
+drops those that fall out of that window, a record older than it is not kept, and a counted answer drops those older
+than the 64 epochs up to its own), beside the node's last answer. A run of consecutive epochs whose records differ only
+in the values of their times, each recorded no earlier than the epoch before it, is stored once, with the newest epoch's times, so a node missed the same way every epoch keeps one
+record; of a run that began before the binding the genesis holds, only the newest epoch is shown. No block rule reads
+them.
 
 ## 6. Statements
 
@@ -760,6 +773,20 @@ reason the one with `delivered_at`, else with `app_outcome` (in the public form,
 does not know is ignored, never shown, and an outcome it does not know reads as `null`; a node of an earlier release
 sends no `last_miss`, one before push receipts sends neither `delivered_at` nor `app_outcome`, and one before this form
 carries the whole record in the public form too.
+
+**Misses:** `GET /api/v1/light-node/misses?node_id={N}&limit={n}` returns
+
+```
+{"success": b, "node_id": N, "misses": [{"epoch": n, "reason": "<reason>", "delivered": b | null}, ...]}
+```
+
+every epoch the node was not counted in as the answering genesis saw it, newest first, one entry per epoch, each in
+the public form of `last_miss`, whose value is the first entry: the genesis's own records (section 5.10) of the 64
+epochs up to the newest, with the derived `not_woken_inactive` or `not_committed` of the last finished epoch merged in
+at its epoch as for `last_miss`. `limit` is 1 to 64, 64 when absent or not a number. `misses` is empty while no device
+is bound and leaves out anything from before the binding the answering genesis holds; `success` is false for a node
+the genesis does not know. The answering genesis asks no other owner: a reader asks the owners of the node's light
+shard and merges their entries per epoch by the rule for `last_miss`. Under the read-only per-address limit.
 
 `authoritative` is true when the answering node's height is at least the network height it has cached (the rule of
 `verify-activation`); while it is false the node is behind, and its `onchain_registered: false` or

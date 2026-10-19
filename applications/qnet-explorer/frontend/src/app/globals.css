@@ -2,11 +2,19 @@
   box-sizing: border-box;
 }
 
+/* The site ships no web font: every monospace text takes the platform's own. */
+:root {
+  --font-mono: ui-monospace, Menlo, Consolas, monospace;
+}
+
 html {
   width: 100%;
   margin: 0;
   padding: 0;
   overflow-x: hidden; /* Prevent horizontal scroll */
+  /* Text keeps its size when a phone turns to landscape. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 /* Base and Layout */
@@ -370,7 +378,7 @@ main.qnet-container {
   border-radius: 4px;
   font-size: 0.75rem;
   color: rgba(0, 255, 255, 0.8);
-  font-family: 'Courier New', monospace;
+  font-family: var(--font-mono);
 }
 
 .github-link, .verify-link {
@@ -710,14 +718,14 @@ main.qnet-container {
 
 .block-number {
   font-weight: bold;
-  font-family: 'Courier New', monospace;
+  font-family: var(--font-mono);
   font-size: 1.1rem;
 }
 
 .block-hash {
   color: #d8d8d8;
   font-size: 0.9rem;
-  font-family: 'Courier New', monospace;
+  font-family: var(--font-mono);
 }
 
 .block-meta {
@@ -1416,7 +1424,7 @@ main.qnet-container {
   border-radius: 4px;
   font-size: 0.75rem;
   color: rgba(0, 255, 255, 0.8);
-  font-family: 'Courier New', monospace;
+  font-family: var(--font-mono);
 }
 
 .verification-links {
@@ -2087,7 +2095,7 @@ main.qnet-container {
 }
 
 /* ================================================
-   NEW EXPLORER STYLES (Keeta-inspired)
+   EXPLORER STYLES
    ================================================ */
 
 .explorer-section-new {
@@ -2109,66 +2117,6 @@ main.qnet-container {
   font-weight: 600;
 }
 
-/* Search Bar */
-.explorer-search {
-  display: flex;
-  gap: 0;
-  max-width: 700px;
-}
-
-.explorer-search .search-input {
-  flex: 1;
-  padding: 1rem 1.25rem;
-  background: #1a1a2e;
-  border: 1px solid #333;
-  border-right: none;
-  border-radius: 8px 0 0 8px;
-  color: #fff;
-  font-size: 1rem;
-}
-
-.explorer-search .search-input::placeholder {
-  color: #666;
-}
-
-.explorer-search .search-btn {
-  padding: 1rem 1.5rem;
-  background: #ff6b6b;
-  color: white;
-  border: none;
-  border-radius: 0 8px 8px 0;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.explorer-search .search-btn:hover {
-  background: #ff5252;
-}
-
-/* Activity Card */
-.activity-card {
-  background: #ffffff;
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
-}
-
-.activity-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 1.25rem 1.5rem;
-  border-bottom: 1px solid #eee;
-}
-
-.activity-header h2 {
-  font-size: 1.1rem;
-  color: #1a1a2e;
-  font-weight: 600;
-  margin: 0;
-}
-
 /* Loading Spinner */
 .loading-spinner svg {
   animation: spin 1s linear infinite;
@@ -2177,37 +2125,6 @@ main.qnet-container {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
-}
-
-/* Activity Table */
-.activity-table-wrapper {
-  overflow-x: auto;
-}
-
-.activity-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.activity-table th {
-  text-align: left;
-  padding: 1rem 1.25rem;
-  background: #f8f9fa;
-  color: #666;
-  font-weight: 500;
-  font-size: 0.9rem;
-  border-bottom: 1px solid #eee;
-}
-
-.activity-table td {
-  padding: 1rem 1.25rem;
-  border-bottom: 1px solid #f0f0f0;
-  color: #333;
-  font-size: 0.95rem;
-}
-
-.activity-table tr:hover {
-  background: #f8f9fa;
 }
 
 /* Cell styles */
@@ -2220,7 +2137,7 @@ main.qnet-container {
 .block-link, .address-link {
   color: #4169e1;
   text-decoration: none;
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-size: 0.9rem;
 }
 
@@ -2350,7 +2267,7 @@ main.qnet-container {
 
 /* Amount cell */
 .amount-cell {
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-size: 0.9rem;
   white-space: nowrap;
 }
@@ -2366,14 +2283,6 @@ main.qnet-container {
 
 .amount-cell.sent {
   color: #c62828;
-}
-
-/* Activity Footer */
-.activity-footer {
-  padding: 1rem 1.5rem;
-  border-top: 1px solid #eee;
-  color: #666;
-  font-size: 0.9rem;
 }
 
 /* ================================================
@@ -2423,7 +2332,7 @@ main.qnet-container {
   vertical-align: middle;
   color: #8b9caa;
   font-size: 0.82rem;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
 }
 
 .block-table .address-link {
@@ -2589,7 +2498,7 @@ main.qnet-container {
 .block-link {
   color: #8b9caa !important;
   text-decoration: none;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.82rem;
   transition: color 0.12s;
 }
@@ -2717,7 +2626,7 @@ main.qnet-container {
 }
 
 .verification-details .detail-value.mono {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.8rem;
 }
 
@@ -2764,7 +2673,7 @@ main.qnet-container {
 
 .token-balance {
   color: #8b9caa;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.85rem;
 }
 
@@ -2784,7 +2693,7 @@ main.qnet-container {
   border-radius: 6px;
   padding: 0.6rem 0.8rem;
   color: #cfe0ea;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.85rem;
   margin-right: 0.75rem;
 }
@@ -2831,7 +2740,7 @@ main.qnet-container {
   color: #8b9caa !important;
 }
 
-/* Copy button (Keeta style) */
+/* Copy button */
 .copy-btn {
   display: inline-flex;
   align-items: center;
@@ -2898,7 +2807,7 @@ main.qnet-container {
 
 .block-hash-display h1, .address-display h1 {
   font-size: 1rem;
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   color: #fff;
   word-break: break-all;
   margin: 0;
@@ -3013,29 +2922,8 @@ main.qnet-container {
   color: #1a1a2e;
 }
 
-/* Operations Table */
-.operations-table, .validators-table, .transactions-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.operations-table th, .validators-table th, .transactions-table th {
-  text-align: left;
-  padding: 1rem 1.5rem;
-  background: #f8f9fa;
-  color: #666;
-  font-weight: 500;
-  font-size: 0.9rem;
-}
-
-.operations-table td, .validators-table td, .transactions-table td {
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid #f0f0f0;
-  color: #333;
-}
-
 .amount-value {
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-weight: 500;
   text-align: right;
 }
@@ -3109,7 +2997,7 @@ main.qnet-container {
 
 .raw-content pre {
   margin: 0;
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-size: 0.85rem;
   color: #333;
   white-space: pre-wrap;
@@ -3121,25 +3009,6 @@ main.qnet-container {
   .explorer-section-new {
     padding: 1rem;
     padding-top: 90px;
-  }
-
-  .explorer-search {
-    flex-direction: column;
-  }
-
-  .explorer-search .search-input {
-    border-radius: 8px;
-    border-right: 1px solid #333;
-  }
-
-  .explorer-search .search-btn {
-    border-radius: 8px;
-    margin-top: 0.5rem;
-  }
-
-  .activity-table th, .activity-table td {
-    padding: 0.75rem;
-    font-size: 0.85rem;
   }
 
   .block-page, .address-page {
@@ -3222,7 +3091,7 @@ main.qnet-container {
 }
 
 .token-balance {
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-weight: 500;
   color: #333;
 }
@@ -3241,13 +3110,13 @@ main.qnet-container {
 
 /* Mono text for hashes */
 .detail-value.mono {
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-size: 0.85rem;
 }
 
 /* Address link truncation fix */
 .address-link {
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
   font-size: 0.9rem;
 }
 
@@ -3260,7 +3129,7 @@ main.qnet-container {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  font-family: 'Monaco', 'Consolas', monospace;
+  font-family: var(--font-mono);
 }
 
 .swap-in {
@@ -3491,7 +3360,7 @@ main.qnet-container {
 
 .col-hash a {
   display: block;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.82rem;
   color: #8b9caa !important;
   text-decoration: none !important;
@@ -3729,7 +3598,7 @@ main.qnet-container {
 
 .col-hash .hash-text {
   display: block;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.82rem;
   color: #8b9caa;
   margin-bottom: 0.25rem;
@@ -3760,10 +3629,11 @@ main.qnet-container {
   text-align: center;
 }
 
+/* One line whatever a party's name; the column takes its content's width and the table scrolls in its wrapper. */
 .col-addresses {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.82rem;
-  max-width: 280px;  /* v3.0: Narrower FROM→TO column */
+  white-space: nowrap;
 }
 
 .col-addresses .addr {
@@ -3778,14 +3648,13 @@ main.qnet-container {
 
 .col-addresses .arr {
   color: #8b9caa !important;
-  margin: 0 0.4rem;
 }
 
 .col-amount {
   color: #8b9caa !important;
   white-space: nowrap;
   font-size: 0.82rem;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   min-width: 100px;
   text-align: right;
 }
@@ -3794,12 +3663,12 @@ main.qnet-container {
   color: #8b9caa !important;
   white-space: nowrap;
   font-size: 0.82rem;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
 }
 
 .col-block {
   font-size: 0.82rem;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
 }
 
 .col-block a {
@@ -4007,7 +3876,7 @@ main.qnet-container {
   border-radius: 6px;
   color: #e8ffff;
   padding: 0.4rem 0.75rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 0.8rem;
   cursor: pointer;
 }
@@ -4039,7 +3908,7 @@ main.qnet-container {
   margin-bottom: 0.35rem;
 }
 .wallet-menu-address {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 0.8rem;
   color: #e8ffff;
   word-break: break-all;
@@ -4273,7 +4142,7 @@ main.qnet-container {
 .activate-mono,
 .activate-code,
 .activate-env {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   overflow-wrap: anywhere;
 }
 .activate-mono,
@@ -4756,7 +4625,7 @@ main.qnet-container {
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.45);
   color: #e8ffff;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 1rem;
   line-height: 1.5;
   text-align: start;
@@ -4879,6 +4748,13 @@ main.qnet-container {
 }
 .cabinet-epoch.missed td:nth-child(3) {
   color: #ffd29a;
+}
+/* Why an epoch was not counted, under its row with no rule between them. */
+.cabinet-table .cabinet-epoch-why td {
+  padding-block-start: 0;
+  border-block-start: none;
+  color: #aaaaaa;
+  font-size: 0.9rem;
 }
 .cabinet-options {
   display: flex;
@@ -5080,7 +4956,7 @@ main.qnet-container {
 /* The header's link to the remembered wallet shows its address as written. */
 .wallet-held {
   display: inline-block;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   text-transform: none;
   letter-spacing: 0;
 }

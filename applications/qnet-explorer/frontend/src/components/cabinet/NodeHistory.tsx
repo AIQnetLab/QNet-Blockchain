@@ -3,14 +3,17 @@
 // /node/history: the node's epochs one by one, newest first, from the wallet's first registration on (owner, 29.09 and
 // 11.10): when each began and ended, counted or not (a super node outside the network's admission: not admitted, never
 // not counted), the node balance it added and the transaction that moved it to the
-// wallet (src/server/cabinet/node-proxy.ts history, with the explorer's archive), a page at a time with Show more. A
-// light and a super node alike; a wallet with both has one list, since the network keeps the epochs per wallet. A
-// wallet without a node gets the state its sources agree on, with the way on. The Overview shows the newest rows of the
-// same table (Epochs). Above them, here and with the Overview's node balance, the total earned (Earned).
+// wallet (src/server/cabinet/node-proxy.ts history, with the explorer's archive), a page at a time with Show more. Under
+// each epoch not counted, why, as the light node's shard owners keep it, in the Device tab's words (last-miss.ts
+// missText); none for an address only viewed. A light and a super node alike; a wallet with both has one list, since
+// the network keeps the epochs per wallet. A wallet without a node gets the state its sources agree on, with the way
+// on. The Overview shows the newest rows of the same table (Epochs). Above them, here and with the Overview's node
+// balance, the total earned (Earned).
 
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { number, t, type MessageKey } from '@/lib/texts';
+import { missText } from '@/lib/cabinet/last-miss';
 import { TAB_HREF } from '@/lib/cabinet/tabs';
 import { useEpochList, useNodeHistory, type EpochList } from '@/hooks/useNodeStatus';
 import {
@@ -42,7 +45,10 @@ function span({ startedAt: start, endedAt: end }: HistoryRow): string {
   return t('history_span', { start: start === null ? '—' : WHEN.format(start), end: end === null ? '—' : (sameDay ? TIME : WHEN).format(end) });
 }
 
-function Table({ rows }: { rows: HistoryRow[] }) {
+// `reasons` (History): under each epoch not counted whose miss an owner keeps, why, as one line across the row. The
+// Overview names the latest miss beside the device's state instead.
+function Table({ rows, reasons = false }: { rows: HistoryRow[]; reasons?: boolean }) {
+  const { devicePlatform } = useCabinet();
   return (
     <div className="cabinet-table-wrap">
       <table className="cabinet-table">
@@ -56,12 +62,15 @@ function Table({ rows }: { rows: HistoryRow[] }) {
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={row.epoch} className={`cabinet-epoch ${row.result}`}>
-              <td>{number(row.epoch)}</td>
-              <td>{span(row)}</td>
-              <td>{row.claimTx ? <Link href={`/explorer/tx/${row.claimTx}`}>{t(RESULT_TEXT[row.result])}</Link> : t(RESULT_TEXT[row.result])}</td>
-              <td>{row.amountQnc === null ? '—' : `${AMOUNT.format(row.amountQnc)} QNC`}</td>
-            </tr>
+            <Fragment key={row.epoch}>
+              <tr className={`cabinet-epoch ${row.result}`}>
+                <td>{number(row.epoch)}</td>
+                <td>{span(row)}</td>
+                <td>{row.claimTx ? <Link href={`/explorer/tx/${row.claimTx}`}>{t(RESULT_TEXT[row.result])}</Link> : t(RESULT_TEXT[row.result])}</td>
+                <td>{row.amountQnc === null ? '—' : `${AMOUNT.format(row.amountQnc)} QNC`}</td>
+              </tr>
+              {reasons && row.miss && <tr className="cabinet-epoch-why"><td colSpan={4}>{missText(row.miss, devicePlatform)}</td></tr>}
+            </Fragment>
           ))}
         </tbody>
       </table>
@@ -84,13 +93,14 @@ function More({ list }: { list: EpochList }) {
 // Every epoch, a page at a time, with the notes its rows call for: an unreadable epoch the nodes no longer keep (as old
 // as EPOCHS_KEPT behind the newest listed) is told apart from one they did not give now.
 function AllEpochs({ nodeId, first }: { nodeId: string; first: HistoryView }) {
-  const list = useEpochList(nodeId, first);
+  const { viewOnly } = useCabinet();
+  const list = useEpochList(nodeId, first, viewOnly);
   const has = (result: HistoryResult) => list.rows.some((r) => r.result === result);
   const newest = list.rows.length > 0 ? list.rows[0].epoch : 0;
   const unknown = list.rows.filter((r) => r.result === 'unknown');
   return (
     <>
-      <Table rows={list.rows} />
+      <Table rows={list.rows} reasons />
       <More list={list} />
       <p className="activate-note">{t('history_settled_note')}</p>
       {has('unchecked') && <p className="activate-note">{t('history_unchecked_note')}</p>}
@@ -105,7 +115,8 @@ function AllEpochs({ nodeId, first }: { nodeId: string; first: HistoryView }) {
 
 // The node's epochs as the network reports them: every one (History) or the newest few (the Overview).
 export function Epochs({ nodeId, show }: { nodeId: string; show: 'all' | 'recent' }) {
-  const { state, retry } = useNodeHistory(nodeId);
+  const { viewOnly } = useCabinet();
+  const { state, retry } = useNodeHistory(nodeId, viewOnly);
   if (state.phase === 'loading') return <p className="activate-status" aria-live="polite">{t('checking')}</p>;
   if (state.phase === 'unavailable') {
     return (
@@ -137,7 +148,8 @@ export const EARNED_RETRIES = 3;
 // names the history's own). Public chain data, the same for a connected wallet and an address only viewed. Nothing while
 // the history is read the first time.
 export function Earned({ nodeId, balanceNano }: { nodeId: string; balanceNano: string | null }) {
-  const { state, refresh } = useNodeHistory(nodeId);
+  const { viewOnly } = useCabinet();
+  const { state, refresh } = useNodeHistory(nodeId, viewOnly);
   const [tries, setTries] = useState(0);
   const earned = state.phase === 'ok' ? state.value.earned : null;
   const differs = earned !== null && balanceNano !== null && earned.balanceNano !== balanceNano;

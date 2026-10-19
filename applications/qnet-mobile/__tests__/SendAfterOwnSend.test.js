@@ -1,10 +1,10 @@
 /**
- * Sending right after the wallet's own send (owner, 07.10). The certified state a send is decided by lags the chain by
- * minutes, so the next send's nonce is above the certified nonce. The decision stays on the certified base only:
- * available = the certified balance less the amount and fee of each of this wallet's OWN transactions from the
- * certified nonce up to the next nonce (kept records, settled or not); anything received after the checkpoint never
- * counts; a nonce in that range that is none of this wallet's own transactions (spent from another device) refuses the
- * send with its own message. The same for token sends (the token amounts of own transfers) and the in-app browser.
+ * Sending right after the wallet's own send (owner, 07.10 and 18.10). A send is checked against the wallet's figure at
+ * a genesis node's live tip, its proof folded, which may not hold this wallet's newest transactions yet: available =
+ * that figure less the amount and fee of each of this wallet's OWN transactions above the figure's nonce (kept records,
+ * settled or not); what came in counts as the figure holds it; a nonce in between that is none of this wallet's own
+ * transactions (spent from another device) refuses nothing, the network decides. The same for token sends (the token
+ * amounts of own transfers) and the in-app browser.
  */
 jest.mock('../src/crypto/DilithiumCrypto', () => ({
   verifyDilithium: jest.fn(), isDilithiumAvailable: () => true, signDetached: jest.fn(async () => 'ab'.repeat(3309)),
@@ -16,7 +16,7 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const { WalletManager } = require('../src/components/WalletManager');
 const Pending = require('../src/services/PendingTx');
 const { spendableNano, spendableTokenBase, previewShort } = require('../src/browser/dappProvider');
-const { unreadKey, unreadText } = require('../src/browser/DappSheet');
+const { unreadKey } = require('../src/browser/DappSheet');
 const { TRANSFER_FEE_NANO, STORAGE_DEPOSIT_NANO } = require('../src/config/fees');
 const lc = require('../src/crypto/QcLightClient');
 const { translate } = require('../src/i18n');
@@ -25,12 +25,11 @@ const ME = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const TO = 'dc6e4f045e96c0bf43deon546e9f27ad8f91464e6a4f6';
 const TOKEN = 'c'.repeat(64);
 const QNC = 1_000_000_000;
-const ROOT = 'ab'.repeat(32);
 
 beforeEach(async () => {
   await AsyncStorage.clear();
-  WalletManager.sendProofs.clear();
-  WalletManager.sendReads.clear();
+  WalletManager.liveFigures.clear();
+  WalletManager.liveReads.clear();
   WalletManager.nonceReads.clear();
   WalletManager.lastOwnSendAt.clear();
   lc.clearQcCache();
@@ -51,11 +50,10 @@ function sender(nonces) {
   return wm;
 }
 
-// The certified QNC proof the next send check reads: `nonce` the account nonce in the certified state.
-function certified(wm, balanceNano, nonce, index = 40) {
-  wm.getQNCBalanceWithProof = jest.fn(async () => ({
-    ok: true, verified: true, balanceNano: String(balanceNano), nonce: String(nonce), balance: Number(balanceNano) / QNC,
-    index, stateRoot: ROOT,
+// The live figure the next send check reads: `nonce` the account nonce in that state.
+function live(wm, balanceNano, nonce, blockHeight = 9000) {
+  wm.liveQncFigure = jest.fn(async () => ({
+    balance: Number(balanceNano) / QNC, balanceNano: String(balanceNano), nonce: String(nonce), blockHeight, figureClaimedEpoch: 0,
   }));
 }
 
@@ -122,45 +120,54 @@ describe('what this wallet signed is remembered by nonce with the most it can ta
 describe('the rule (services/PendingTx spendableFrom)', () => {
   const s = (entries) => new Map(entries.map(([n, q, tokens = {}, tokenUnknown = false]) => [n, { qncNano: q, tokens, tokenUnknown }]));
 
-  it('own transactions from the certified nonce on are counted: settled ones from the balance, unsettled ones apart', () => {
+  it('own transactions above the figure\'s nonce come off it: applied after it, or still unsettled apart', () => {
     const r = Pending.spendableFrom({
-      certified: String(10 * QNC), certifiedNonce: 5, accountNonce: 6,
+      base: String(10 * QNC), baseNonce: 5, accountNonce: 6,
       spends: s([[5, '999'], [6, String(2 * QNC)], [7, String(QNC)]]),
     });
     expect(r).toEqual({ ok: true, balance: String(8 * QNC), pending: [{ nonce: 7, amount: String(QNC) }] });
   });
 
-  it('a nonce between the certified one and the account\'s that is none of this wallet\'s: another device, refused', () => {
-    expect(Pending.spendableFrom({ certified: '100', certifiedNonce: 5, accountNonce: 7, spends: s([[6, '1']]) }))
-      .toEqual({ ok: false, reason: 'foreign', nonce: 7 });
+  // Before, a nonce between the certified one and the account's that was none of this wallet's refused the send ("a
+  // transaction from another device is not confirmed yet"); with a live figure it is applied, and the network decides.
+  it('a nonce in between that is none of this wallet\'s (another device) refuses nothing: the network decides', () => {
+    expect(Pending.spendableFrom({ base: '100', baseNonce: 5, accountNonce: 7, spends: s([[6, '1']]) }))
+      .toEqual({ ok: true, balance: '99', pending: [] });
   });
 
-  it('nothing received after the checkpoint is counted: the certified figure is the most there is', () => {
-    const r = Pending.spendableFrom({ certified: String(QNC), certifiedNonce: 5, accountNonce: 6, spends: s([[6, String(3 * QNC)]]) });
+  it('the figure is the most there is: it never goes below 0', () => {
+    const r = Pending.spendableFrom({ base: String(QNC), baseNonce: 5, accountNonce: 6, spends: s([[6, String(3 * QNC)]]) });
     expect(r).toEqual({ ok: true, balance: '0', pending: [] });
   });
 
   it('a transaction whose cost is not known leaves the balance unconfirmed; tokens count only token amounts', () => {
-    expect(Pending.spendableFrom({ certified: '100', certifiedNonce: 5, accountNonce: 6, spends: s([[6, null]]) }))
+    expect(Pending.spendableFrom({ base: '100', baseNonce: 5, accountNonce: 6, spends: s([[6, null]]) }))
       .toEqual({ ok: false, reason: 'unconfirmed' });
     const spends = s([[6, String(QNC)], [7, '50', { [TOKEN]: '30' }], [8, '50', { ['d'.repeat(64)]: '9' }]]);
-    expect(Pending.spendableFrom({ certified: '100', certifiedNonce: 5, accountNonce: 7, spends, token: TOKEN }))
+    expect(Pending.spendableFrom({ base: '100', baseNonce: 5, accountNonce: 7, spends, token: TOKEN }))
       .toEqual({ ok: true, balance: '70', pending: [{ nonce: 8, amount: '0' }] });
-    expect(Pending.spendableFrom({ certified: '100', certifiedNonce: 5, accountNonce: 6, spends: s([[6, '1', {}, true]]), token: TOKEN }))
+    expect(Pending.spendableFrom({ base: '100', baseNonce: 5, accountNonce: 6, spends: s([[6, '1', {}, true]]), token: TOKEN }))
       .toEqual({ ok: false, reason: 'unconfirmed' });
   });
 });
 
 describe('the send check after the wallet\'s own send', () => {
-  it('the next send right after one: allowed on the certified base less that send', async () => {
+  it('the live figure holds the send already: spent from as it is', async () => {
     const wm = sender([6]);
     await wm.sendQNC(TO, 2, 'pw');
-    // The chain confirms nonce 6; the certified state is still at 5 with 10 QNC.
-    certified(wm, 10 * QNC, 5);
-    const r = await wm.certifiedQncForSend(ME, { nonce: 6 });
-    expect(r).toMatchObject({
-      ok: true, verified: true, certifiedNano: String(10 * QNC), nonce: '5', accountNonce: 6, pending: [],
-      balanceNano: String(10 * QNC - 2 * QNC - TRANSFER_FEE_NANO),
+    live(wm, 8 * QNC - TRANSFER_FEE_NANO, 6);
+    await expect(wm.qncForSend(ME, { nonce: 6 })).resolves.toEqual({
+      ok: true, balanceNano: String(8 * QNC - TRANSFER_FEE_NANO), nonce: '6', accountNonce: 6, pending: [],
+      balance: (8 * QNC - TRANSFER_FEE_NANO) / QNC, blockHeight: 9000,
+    });
+  });
+
+  it('a node a block behind (its figure at nonce 5): the send the chain applied at 6 comes off it', async () => {
+    const wm = sender([6]);
+    await wm.sendQNC(TO, 2, 'pw');
+    live(wm, 10 * QNC, 5);
+    await expect(wm.qncForSend(ME, { nonce: 6 })).resolves.toMatchObject({
+      ok: true, nonce: '5', accountNonce: 6, pending: [], balanceNano: String(10 * QNC - 2 * QNC - TRANSFER_FEE_NANO),
     });
   });
 
@@ -168,8 +175,8 @@ describe('the send check after the wallet\'s own send', () => {
     const wm = sender([6, 7]);
     await wm.sendQNC(TO, 2, 'pw');
     await wm.sendQNC(TO, 3, 'pw');
-    certified(wm, 10 * QNC, 5);
-    const r = await wm.certifiedQncForSend(ME, { nonce: 6 });
+    live(wm, 10 * QNC, 5);
+    const r = await wm.qncForSend(ME, { nonce: 6 });
     expect(r.balanceNano).toBe(String(8 * QNC - TRANSFER_FEE_NANO));
     expect(r.pending).toEqual([{ nonce: 7, amount: String(3 * QNC + TRANSFER_FEE_NANO) }]);
     // In addition: both count; replacing nonce 7: only the settled one does (the sheet's rule, dappProvider spendableNano).
@@ -178,66 +185,107 @@ describe('the send check after the wallet\'s own send', () => {
     expect(spendableNano(preview, 'replace')).toBe(BigInt(8 * QNC - TRANSFER_FEE_NANO));
   });
 
-  it('a nonce no transaction of this wallet holds (sent from another device) refuses the send, said as such', async () => {
+  it('another device spent at a nonce in between: no refusal, the figure less this wallet\'s own sends', async () => {
     const wm = sender([6]);
     await wm.sendQNC(TO, 2, 'pw');
-    certified(wm, 10 * QNC, 5);
-    await expect(wm.certifiedQncForSend(ME, { nonce: 7 })).resolves.toMatchObject({ ok: false, balanceNano: null, error: 'foreign', foreignNonce: 7 });
-    // With nothing of its own since the checkpoint, any newer nonce is another device's.
-    await AsyncStorage.clear();
-    const other = sender([]);
-    certified(other, 10 * QNC, 5);
-    await expect(other.certifiedQncForSend(ME, { nonce: 6 })).resolves.toMatchObject({ ok: false, error: 'foreign' });
+    live(wm, 10 * QNC, 5);
+    await expect(wm.qncForSend(ME, { nonce: 7 })).resolves.toMatchObject({
+      ok: true, accountNonce: 7, balanceNano: String(8 * QNC - TRANSFER_FEE_NANO),
+    });
   });
 
-  it('incoming funds after the checkpoint never count: only the certified figure is spent from', async () => {
+  // Before, money that came in after the last certified checkpoint was never spendable until certification caught up.
+  it('money that came in counts at once: the live figure holds it', async () => {
     const wm = sender([6]);
     await wm.sendQNC(TO, 2, 'pw');
-    // The certified state holds 1 QNC; whatever arrived since (the send could only pay from it) is not counted.
-    certified(wm, 1 * QNC, 5);
-    await expect(wm.certifiedQncForSend(ME, { nonce: 6 })).resolves.toMatchObject({ ok: true, balanceNano: '0' });
-  });
-
-  it('a certified proof newer than the account nonce needs nothing of the wallet\'s records', async () => {
-    const wm = sender([]);
-    certified(wm, 4 * QNC, 9);
-    await expect(wm.certifiedQncForSend(ME, { nonce: 8 })).resolves.toMatchObject({ ok: true, balanceNano: String(4 * QNC), accountNonce: 9 });
+    live(wm, 12 * QNC, 6); // 1 QNC left after the send, then 11 QNC received
+    await expect(wm.qncForSend(ME, { nonce: 6 })).resolves.toMatchObject({ ok: true, balanceNano: String(12 * QNC) });
   });
 
   it('the nonce counted up to never falls below the highest this device confirmed', async () => {
     const wm = sender([6]);
     await wm.sendQNC(TO, 2, 'pw');
     await wm._setNonceHighWater(ME, 6);
-    certified(wm, 10 * QNC, 5);
+    live(wm, 10 * QNC, 5);
     // A lagging read of the account nonce (5) still counts the settled send at 6.
-    await expect(wm.certifiedQncForSend(ME, { nonce: 5 })).resolves.toMatchObject({ ok: true, accountNonce: 6, balanceNano: String(8 * QNC - TRANSFER_FEE_NANO) });
+    await expect(wm.qncForSend(ME, { nonce: 5 })).resolves.toMatchObject({ ok: true, accountNonce: 6, balanceNano: String(8 * QNC - TRANSFER_FEE_NANO) });
   });
 
-  it('token sends: the certified token balance of the same state, less the tokens own transfers moved', async () => {
+  it('the check never waits for a certified read, and no figure is a refusal said as no answer', async () => {
+    const wm = sender([]);
+    wm.getQNCBalanceWithProof = jest.fn(() => new Promise(() => {}));
+    live(wm, 4 * QNC, 9);
+    await expect(wm.qncForSend(ME, { nonce: 8 })).resolves.toMatchObject({ ok: true, balanceNano: String(4 * QNC), accountNonce: 9 });
+    expect(wm.getQNCBalanceWithProof).not.toHaveBeenCalled();
+    wm.liveQncFigure = jest.fn(async () => null);
+    await expect(wm.qncForSend(ME, { nonce: 8 })).resolves.toEqual({ ok: false, balanceNano: null, nonce: null, error: 'unanswered' });
+  });
+
+  it('token sends: the live token figure less the tokens own transfers it does not hold yet', async () => {
     const wm = sender([6, 7]);
     await wm.qrc20Transfer(TOKEN, TO, '300', 'pw');
     await wm.qrc20Transfer(TOKEN, TO, '100', 'pw');
-    certified(wm, 10 * QNC, 5, 40);
-    wm.getTokenBalanceWithProof = jest.fn(async (contract, holder, decimals, verify, opts) => ({
-      ok: true, verified: true, balanceBase: '1000', stateRoot: ROOT, index: opts && opts.index,
-    }));
+    live(wm, 10 * QNC, 5);
+    wm.liveTokenFigure = jest.fn(async () => ({ balanceBase: '1000', balance: '1000', blockHeight: 9000 }));
     const r = await wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 6 });
-    expect(r).toMatchObject({ ok: true, verified: true, certifiedBase: '1000', balanceBase: '700', pending: [{ nonce: 7, amount: '100' }] });
-    expect(wm.getTokenBalanceWithProof.mock.calls[0][4]).toEqual({ index: 40 }); // paired with the QNC proof's macroblock
+    expect(r).toEqual({ ok: true, balanceBase: '700', pending: [{ nonce: 7, amount: '100' }], balance: '700' });
     expect(spendableTokenBase({ tokenBalanceBase: r.balanceBase, tokenSpends: r.pending, replaceNonce: 7 })).toBe(600n);
     expect(spendableTokenBase({ tokenBalanceBase: r.balanceBase, tokenSpends: r.pending, replaceNonce: 7 }, 'replace')).toBe(700n);
-    // Another device's transaction in between refuses the token send too.
-    await expect(wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 8 })).resolves.toMatchObject({ ok: false, error: 'foreign' });
+    // Another device's transaction in between refuses nothing: both own transfers applied, nothing pending.
+    await expect(wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 8 })).resolves.toMatchObject({ ok: true, balanceBase: '600', pending: [] });
   });
 
-  it('a contract call of this wallet since the checkpoint leaves a token balance unconfirmed (its effect is not known)', async () => {
+  // Before, the token figure (read now) was paired with a QNC figure kept up to 15 s, of another block: a second token
+  // send within 15 s of the first counted the first twice and was refused for want of tokens the wallet held.
+  describe('the token figure and the holder\'s QNC figure of one block', () => {
+    const PROOF = [{ sibling: '00'.repeat(32), is_right: true }];
+    // The genesis nodes' live proof routes: the token's at `tokenAt()`, the account's at `qncAt()` (heights), both folding.
+    const answering = (wm, { tokenAt, qncAt, tokenBase, qnc }) => {
+      wm.verifyMerkleProof = jest.fn(async () => true);
+      wm.verifyTokenBalanceProof = jest.fn(async () => true);
+      wm._hedged = jest.fn(async (p, opts) => {
+        const base = opts.nodes[0];
+        const body = p.startsWith('/api/v1/token/')
+          ? { token_balance: tokenBase, storage_proof: PROOF, account_proof: PROOF, state_root: 'ab', block_height: tokenAt() }
+          : { balance: qnc.balanceNano, nonce: qnc.nonce, merkle_proof: PROOF, state_root: 'ab', block_height: qncAt() };
+        return { ok: true, status: 200, base, data: JSON.stringify(body) };
+      });
+    };
+
+    it('a figure kept from before the wallet\'s own token send is not paired with a token figure after it', async () => {
+      const wm = sender([5]);
+      await wm.qrc20Transfer(TOKEN, TO, '60', 'pw');
+      // The Send screen's read a moment before that send: nonce 4, 100 tokens then.
+      WalletManager.liveFigures.set(ME, { at: Date.now(), figure: { balance: 10, balanceNano: String(10 * QNC), nonce: '4', blockHeight: 9000, figureClaimedEpoch: 0 } });
+      // Now the send is in a block: 40 tokens left, and the account at nonce 5 in that same block.
+      answering(wm, { tokenAt: () => 9001, qncAt: () => 9001, tokenBase: '40', qnc: { balanceNano: 10 * QNC - 1000, nonce: 5 } });
+      await expect(wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 5 })).resolves.toEqual({ ok: true, balanceBase: '40', pending: [], balance: '40' });
+    });
+
+    it('figures of two blocks are read again once, both from the node that gave the token figure; never of one: unanswered', async () => {
+      const wm = sender([]);
+      let qncHeight = 9000;
+      answering(wm, {
+        tokenAt: () => 9001, qncAt: () => { const h = qncHeight; qncHeight = 9001; return h; }, tokenBase: '40', qnc: { balanceNano: QNC, nonce: 5 },
+      });
+      await expect(wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 5 })).resolves.toMatchObject({ ok: true, balanceBase: '40' });
+      const asked = wm._hedged.mock.calls.map(([p, o]) => [p.startsWith('/api/v1/token/') ? 'token' : 'qnc', o.nodes]);
+      const first = asked[0][1][0];
+      expect(asked.slice(2)).toEqual([['token', [first]], ['qnc', [first]]]);
+      answering(wm, { tokenAt: () => 9001, qncAt: () => 9000, tokenBase: '40', qnc: { balanceNano: QNC, nonce: 5 } });
+      await expect(wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 5 })).resolves.toMatchObject({ ok: false, balanceBase: null, error: 'unanswered' });
+      expect(wm._hedged).toHaveBeenCalledTimes(4);
+    });
+  });
+
+  it('a contract call of this wallet the figure does not hold leaves a token balance unconfirmed (its effect is not known)', async () => {
     const wm = sender([6]);
     await wm.callWasmContract({ contract: TO, method: 'run' }, 'pw');
-    certified(wm, 10 * QNC, 5, 40);
-    wm.getTokenBalanceWithProof = jest.fn(async (c, h, d, v, opts) => ({ ok: true, verified: true, balanceBase: '1000', stateRoot: ROOT, index: opts.index }));
+    live(wm, 10 * QNC, 5);
+    wm.liveTokenFigure = jest.fn(async () => ({ balanceBase: '1000', balance: '1000', blockHeight: 9000 }));
     await expect(wm.checkedTokenBalance(TOKEN, ME, 0, { nonce: 6 })).resolves.toMatchObject({ ok: false, error: 'unconfirmed' });
-    // QNC is still decided: the call's most fee is known.
-    await expect(wm.certifiedQncForSend(ME, { nonce: 6 })).resolves.toMatchObject({ ok: true });
+    // QNC is still checked: the call's most fee is known.
+    await expect(wm.qncForSend(ME, { nonce: 6 })).resolves.toMatchObject({ ok: true });
   });
 
   it('the in-app browser\'s token check refuses a transfer the own unconfirmed ones would leave unpaid', () => {
@@ -248,36 +296,31 @@ describe('the send check after the wallet\'s own send', () => {
   });
 });
 
-describe('the two messages: no answer, or not confirmed yet', () => {
+describe('the two messages: no answer, or what a transaction takes not known yet', () => {
   it('the sheet and the Send form say which, in every language', () => {
-    expect(unreadKey('transfer', { balanceProblem: 'foreign' })).toBe('balance_foreign_pending');
     expect(unreadKey('transfer', { balanceProblem: 'unconfirmed' })).toBe('balance_unconfirmed');
     expect(unreadKey('transfer', { balanceProblem: 'unanswered' })).toBe('dapp_send_preview_failed');
-    expect(unreadKey('tokenTransfer', { balanceProblem: null, tokenProblem: 'foreign' })).toBe('balance_foreign_pending');
-    // While a long lineage walk is why the balance is not confirmed, the sheet says how far it is.
-    const en = (k, p) => translate('en', k, p);
-    expect(unreadText(en, 'transfer', { balanceProblem: 'unconfirmed', walkSteps: 57 }))
-      .toBe('Checking the balance against QNet Blockchain: 57 steps left.');
-    expect(unreadText(en, 'transfer', { balanceProblem: 'unconfirmed', walkSteps: null })).toBe(translate('en', 'balance_unconfirmed'));
-    expect(unreadText(en, 'transfer', { balanceProblem: 'unanswered', walkSteps: 57 })).toBe(translate('en', 'dapp_send_preview_failed'));
+    expect(unreadKey('tokenTransfer', { balanceProblem: null, tokenProblem: 'unconfirmed' })).toBe('balance_unconfirmed');
     for (const lang of ['en', 'zh-CN', 'ru', 'es', 'ko', 'ja', 'pt', 'fr', 'de', 'ar', 'it']) {
-      for (const key of ['balance_unconfirmed', 'balance_foreign_pending', 'send_balance_unreadable']) {
-        expect(translate(lang, key)).not.toBe(key);
-      }
+      for (const key of ['balance_unconfirmed', 'send_balance_unreadable']) expect(translate(lang, key)).not.toBe(key);
       expect(translate(lang, 'balance_unconfirmed')).not.toBe(translate(lang, 'send_balance_unreadable'));
+      // The certified send check's texts are gone with it.
+      for (const key of ['balance_foreign_pending', 'balance_verifying_steps']) expect(translate(lang, key)).toBe(key);
     }
-    expect(translate('en', 'balance_foreign_pending')).toMatch(/another device is not confirmed yet/);
-    expect(translate('en', 'balance_unconfirmed')).toMatch(/not confirmed yet\. Try again in a minute/);
+    // The one cause left: what one of this wallet's own transactions takes is not known here (owner, 18.10).
+    expect(translate('en', 'balance_unconfirmed')).toBe('What an earlier transaction from this wallet takes is not known yet. Try again in a minute.');
+    for (const lang of ['ru', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'ko', 'zh-CN', 'ar']) {
+      expect(translate(lang, 'balance_unconfirmed')).not.toMatch(/подтвержд|confirmad|confirmé|bestätigt|confermato|確認され|확인되지|确认|يُؤكَّد/);
+    }
   });
 
   it('the Send form refuses with the reason the check gave, for QNC and for a token, and counts own unconfirmed sends', () => {
     const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     const send = ws.slice(ws.indexOf('const handleSendTransaction = async () => {'), ws.indexOf('const pressSend = async'));
-    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error, qncCheck\.walkSteps\) \}\);/);
-    expect(send).toMatch(/error: sendCheckError\(held && held\.error, held && held\.walkSteps\)/);
+    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error\) \}\);/);
+    expect(send).toMatch(/error: sendCheckError\(held && held\.error\)/);
     expect(send).toMatch(/spendable = afterPending\(qncNano, qncCheck\.pending, replaceNonce\);/);
     expect(send).toMatch(/const tokenLeft = afterPending\(held\.balanceBase, held\.pending, replaceNonce\);/);
-    // Not confirmed while a long lineage walk runs says how far it is instead (plan Part 3, item 6).
-    expect(ws).toMatch(/const sendCheckError = \(error, walkSteps\) => \{\s*return t\(error === 'foreign' \? 'balance_foreign_pending' : error === 'unconfirmed' \? 'balance_unconfirmed' : 'send_balance_unreadable'\);/);
+    expect(ws).toMatch(/const sendCheckError = \(error\) => t\(error === 'unconfirmed' \? 'balance_unconfirmed' : 'send_balance_unreadable'\);/);
   });
 });

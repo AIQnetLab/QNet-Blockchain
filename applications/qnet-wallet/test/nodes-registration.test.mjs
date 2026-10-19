@@ -225,6 +225,31 @@ describe('nodes: recording the light node', () => {
     assert.equal(env.calls.signNodeRegistration, 1);
   });
 
+  // Owner, 18.10: a page that shows the record being made (the popup, the activation window: every REGISTRATION_POLL_MS)
+  // finds it on chain at its next read after the block, never up to REGISTRATION_ADMIT_CHECK_MS later.
+  it('an admitted registration is looked up on chain at every read of a page that shows it, with nothing written or sent', async () => {
+    const env = installEnv({ state: queuedState() });
+    let listed = false;
+    const net = network({ status: () => listed });
+    assert.equal((await nodes.resumeRegistration()).state, 'admitted');
+    const reads = net.seen.status.length;
+    const writes = env.calls.updateState;
+    // the background resume within the wait reads nothing; a page's read reads the chain at once
+    await nodes.resumeRegistration();
+    assert.equal(net.seen.status.length, reads);
+    mock.timers.tick(TIMINGS.REGISTRATION_POLL_MS);
+    assert.equal((await nodes.getRegistration()).registration.state, 'admitted');
+    await nodes.resumeRegistration({ watch: true });
+    assert.ok(net.seen.status.length > reads, 'read at the page\'s poll, before the next check is due');
+    assert.equal(env.calls.updateState, writes, 'a read that finds it not listed yet writes nothing');
+    listed = true;
+    mock.timers.tick(TIMINGS.REGISTRATION_POLL_MS);
+    await nodes.getRegistration();
+    const after = await nodes.resumeRegistration({ watch: true });
+    assert.equal(after.state, 'onchain');
+    assert.equal(net.seen.submits.length, 1, 'nothing sent again');
+  });
+
   // EXT-R1-02: one node's word never records the node; two nodes listing it do
   it('asks the chain first: two nodes listing it alike record it without a submit, one alone does not', async () => {
     let env = installEnv({ state: queuedState() });

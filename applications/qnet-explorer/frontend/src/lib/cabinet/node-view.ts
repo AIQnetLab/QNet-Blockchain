@@ -70,6 +70,10 @@ export interface HistoryRow {
   endedAt: number | null;
   // The transaction that moved it to the wallet, from the explorer's archive; null when not moved or not known.
   claimTx: string | null;
+  // Why a light node's epoch not counted was missed, as its shard's owners keep it (last-miss.ts missesByEpoch); null for
+  // any other result, for one not counted only because the wallet's super node earned nothing (node-proxy.ts
+  // historyView), when no owner keeps that epoch's miss, and for an address only viewed (publicHistory).
+  miss: LastMiss | null;
 }
 
 // What the wallet's node earned, as of one moment (node-proxy.ts historyView): the QNC every move took to the wallet
@@ -109,7 +113,6 @@ export const EPOCHS_KEPT = 256;
 export type NodeState = 'none' | 'pending' | 'no_device' | 'device_pending' | 'online' | 'offline';
 
 export const MOVE_MIN_NANO = 1_000_000_000n;
-const NANO_DIGITS = 9;
 const FEATURE_RE = /^[a-z0-9_]{1,32}$/;
 const NANO_RE = /^(?:0|[1-9][0-9]{0,19})$/;
 
@@ -240,18 +243,33 @@ export function superState(s: SuperStatusView): SuperState {
 const TX_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
 function isHistoryRow(r: unknown): boolean {
-  if (!isObject(r) || !hasKeys(r, ['epoch', 'result', 'amountQnc', 'startedAt', 'endedAt', 'claimTx']) || !isCount(r.epoch)) return false;
+  if (!isObject(r) || !hasKeys(r, ['epoch', 'result', 'amountQnc', 'startedAt', 'endedAt', 'claimTx', 'miss']) || !isCount(r.epoch)) return false;
   if (!(HISTORY_RESULTS as readonly unknown[]).includes(r.result)) return false;
   if (r.amountQnc !== null && (typeof r.amountQnc !== 'number' || !Number.isFinite(r.amountQnc) || r.amountQnc < 0)) return false;
   if (r.startedAt !== null && !isCount(r.startedAt)) return false;
   if (r.endedAt !== null && !isCount(r.endedAt)) return false;
+  // A miss only on an epoch not counted, and of that epoch.
+  if (!isLastMiss(r.miss) || (r.miss !== null && (r.result !== 'missed' || r.miss.epoch !== r.epoch))) return false;
   return r.claimTx === null || (typeof r.claimTx === 'string' && TX_RE.test(r.claimTx));
 }
 
 const isNano = (v: unknown): v is string => typeof v === 'string' && NANO_RE.test(v);
 const isEarned = (v: unknown): boolean => v === null || (isObject(v) && hasKeys(v, ['movedNano', 'balanceNano']) && isNano(v.movedNano) && isNano(v.balanceNano));
 
-// GET /api/cabinet/node/:id/history[?page=N], exactly.
+// The history route's page N, and its read for an address only viewed (`view`: publicHistory), whose address no
+// connected wallet's read shares.
+export function historyPagePath(nodeId: string, page: number, view: boolean): string {
+  const query = [page > 0 ? `page=${page}` : '', view ? 'view=1' : ''].filter((q) => q !== '').join('&');
+  return `/api/cabinet/node/${encodeURIComponent(nodeId)}/history${query === '' ? '' : `?${query}`}`;
+}
+
+// A page for a viewed address: why an epoch was missed is the owner's account of the device (publicStatus), so none is
+// passed on.
+export function publicHistory(h: HistoryView): HistoryView {
+  return h.rows.some((r) => r.miss !== null) ? { ...h, rows: h.rows.map((r) => ({ ...r, miss: null })) } : h;
+}
+
+// GET /api/cabinet/node/:id/history[?page=N][&view=1], exactly.
 export function parseHistoryView(body: unknown): HistoryView | null {
   if (!isObject(body) || !hasKeys(body, ['registeredEpoch', 'archived', 'rows', 'more', 'earned'])) return null;
   if (body.registeredEpoch !== null && !isCount(body.registeredEpoch)) return null;
@@ -329,18 +347,5 @@ export function canMove(balanceNano: string | null): boolean {
   return balanceNano !== null && BigInt(balanceNano) >= MOVE_MIN_NANO;
 }
 
-const GROUPED = new Intl.NumberFormat('en');
-
-// Base units of a token with `decimals` places, exact: the whole part grouped as English writes it, the fraction
-// without trailing zeros.
-export function formatUnits(raw: bigint, decimals: number): string {
-  const unit = 10n ** BigInt(decimals);
-  const whole = GROUPED.format(raw / unit);
-  const fraction = (raw % unit).toString().padStart(decimals, '0').replace(/0+$/, '');
-  return fraction === '' ? whole : `${whole}.${fraction}`;
-}
-
-// Nano QNC as QNC.
-export function formatQnc(balanceNano: string): string {
-  return formatUnits(BigInt(balanceNano), NANO_DIGITS);
-}
+// Amounts as the explorer writes them: exact, the whole part grouped as English writes it, no trailing zeros.
+export { formatQnc, formatTokenAmount as formatUnits } from '../token-format.ts';

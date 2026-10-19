@@ -92,10 +92,12 @@ describe('iOS', () => {
     expect(plist).toMatch(/<key>NSAllowsArbitraryLoads<\/key>\s*<false\/>/);
     expect(plist).not.toMatch(/NSAllowsLocalNetworking|NSExceptionDomains|NSAllowsArbitraryLoadsInWebContent/);
     const security = read('ios/QNetMobile/QNetSecurityModule.m');
-    for (const marker of ['UIScreenCapturedDidChangeNotification', 'UIApplicationUserDidTakeScreenshotNotification',
-      'clearPasteboardIfChanged', 'LAPolicyDeviceOwnerAuthentication']) {
+    for (const marker of ['UIScreenCapturedDidChangeNotification', 'clearPasteboardIfChanged', 'LAPolicyDeviceOwnerAuthentication']) {
       expect(security).toContain(marker);
     }
+    // A screenshot raises no alert of the app's own: the recording cover stays, the system's own notices are the system's.
+    expect(security).not.toMatch(/UserDidTakeScreenshot|UIAlertController|screenshot/i);
+    expect(read('src/screens/WalletScreen.js')).not.toMatch(/screenshotTitle|screenshotBody|native_screenshot/);
     const dil = read('ios/QNetMobile/DilithiumModule/DilithiumModule.m');
     expect(dil).toMatch(/#if DEBUG/);
     expect(dil).not.toMatch(/NSLog\(@"PQCLEAN_(PK|SIG)/);

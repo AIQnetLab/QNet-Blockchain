@@ -1,6 +1,7 @@
 // Building blocks of the popup and the setup page: controls, messages, amounts, addresses and links.
 // Everything goes through common.el(), so no HTML is ever parsed. Every text field is hardened: even an
 // address or an amount is nobody's business but the user's.
+import * as core from '../lib/qnet-core.js';
 import { PAYMENT_REQUEST, QNET, SOLANA, isPaymentRequestMemo } from '../background/config.js';
 import { UiError, call, copyText, currentLanguage, el, formatUnits, hardenSecretInput, parseUnits, t } from './common.js';
 
@@ -390,8 +391,9 @@ export function parseSolanaRecipient(text, isAddress) {
 }
 
 /**
- * The canonical decimal string of a typed amount ("01.50" → "1.5"), or null when it is not a positive
- * number with at most `decimals` fraction digits. No grouping, sign or exponent is accepted.
+ * The canonical decimal string of an amount field's text ("01.50" → "1.5"), or null when it is not a positive
+ * number with at most `decimals` fraction digits. No grouping, sign or exponent is accepted: the field holds canonical
+ * text already (keepAmountCanonical).
  * @param {string} text
  * @param {number} decimals
  * @returns {string|null}
@@ -410,7 +412,39 @@ export function canonicalAmount(text, decimals) {
 }
 
 /**
- * Base units as "<amount> <symbol>"; a dash when the value is not a u64 decimal string.
+ * Keeps an amount field's text as both wallets' Send forms keep it (core.amountInput, the mobile app's rule): digits and
+ * at most one '.', no more than the asset's decimals; a figure pasted in the UI language's format is read as written
+ * ("1,000" pasted in English or "1.000" in German is 1000), while typed text keeps the decimal comma ("1,5" is 1.5); a text
+ * the rule refuses leaves the field as it was.
+ * @param {HTMLInputElement} input
+ * @param {() => number} decimalsOf the decimals of the asset the field is for now
+ * @returns {void}
+ */
+export function keepAmountCanonical(input, decimalsOf) {
+  let before = input.value;
+  input.addEventListener('beforeinput', () => {
+    before = input.value;
+  });
+  input.addEventListener('input', () => {
+    const next = core.amountInput(input.value, decimalsOf(), { previous: before, lang: currentLanguage() }) ?? before;
+    if (next !== input.value) input.value = next;
+    before = input.value;
+  });
+}
+
+/**
+ * A figure as the UI language writes it (core.amountText, the mobile app's rule: the whole part grouped, the language's
+ * decimal mark, every digit kept): a canonical decimal or a whole number; any other value as its text.
+ * @param {string|number} value
+ * @returns {string}
+ */
+export function figureText(value) {
+  return core.amountText(value === null || value === undefined ? '' : String(value), currentLanguage());
+}
+
+/**
+ * Base units as "<amount> <symbol>", the amount as the UI language writes it (figureText); a dash when the value is not a
+ * u64 decimal string.
  * @param {string|bigint} units
  * @param {number} decimals
  * @param {string} symbol
@@ -418,7 +452,7 @@ export function canonicalAmount(text, decimals) {
  */
 export function formatAmount(units, decimals, symbol) {
   try {
-    return `${formatUnits(units, decimals)} ${symbol}`;
+    return `${figureText(formatUnits(units, decimals))} ${symbol}`;
   } catch {
     return `— ${symbol}`;
   }

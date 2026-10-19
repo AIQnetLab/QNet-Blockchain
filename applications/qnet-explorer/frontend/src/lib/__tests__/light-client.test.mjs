@@ -734,7 +734,10 @@ test('the route, the page and explorer.md describe the committee check, and noth
   const page = readFileSync(new URL('app/explorer/address/[address]/page.tsx', SRC), 'utf8');
   assert.doesNotMatch(page, /Multi-Node Consensus|Nodes Agreed|Multi-node consensus|Cryptographically Verified/);
   assert.match(page, /Verified by the committee certificate/);
-  assert.match(page, /if \(data\.success && data\.verified === true && typeof data\.stateRoot === 'string' && typeof data\.balance === 'string'\) \{/);
+  assert.match(page, /if \(data\.success && data\.verified === true && typeof data\.stateRoot === 'string' && typeof data\.balanceNano === 'string' && \/\^\\d\+\$\/\.test\(data\.balanceNano\)\) \{/);
+  // The answer's `balance` stays the canonical decimal; the page groups the exact nano QNC as English writes it.
+  assert.match(route, /balance: qncText\(r\.balanceNano\),\s*balanceNano: r\.balanceNano,/);
+  assert.match(page, /<span className="detail-value">\{formatQnc\(result\.balanceNano\)\} QNC\{result\.exists \? '' : ' \(no account yet\)'\}<\/span>/);
   // A second request for an address under check shares that check; the page's block stays hidden, and the doc says so.
   assert.match(route, /let running = inflight\.get\(address\);\s*if \(!running\) \{\s*running = sharedBalanceProver\(\)\.provenBalance\(address\)\.then\(/);
   assert.match(route, /\}\)\.finally\(\(\) => inflight\.delete\(address\)\);\s*inflight\.set\(address, running\);/);

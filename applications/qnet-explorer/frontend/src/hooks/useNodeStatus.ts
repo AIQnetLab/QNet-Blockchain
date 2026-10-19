@@ -8,7 +8,8 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  joinPages, parseHistoryView, parseStatusView, parseSuperStatus, statusPath, type HistoryRow, type HistoryView, type NodeStatusView, type SuperStatusView,
+  historyPagePath, joinPages, parseHistoryView, parseStatusView, parseSuperStatus, statusPath, type HistoryRow, type HistoryView, type NodeStatusView,
+  type SuperStatusView,
 } from '@/lib/cabinet/node-view';
 import { parseWalletNode, type WalletNodeView } from '@/lib/cabinet/wallet-activation';
 
@@ -118,17 +119,15 @@ export function useSharedRead<T>(url: string | null, parse: (body: unknown) => T
   return { state, retry, refresh: again };
 }
 
-const nodeUrl = (nodeId: string | null, path = '') => (nodeId ? `/api/cabinet/node/${encodeURIComponent(nodeId)}${path}` : null);
-
 // `view`: an address only viewed, whose status comes without the device's details (node-view.ts publicStatus); its
 // own shared read, so a connected wallet's details never reach a view.
 export function useNodeStatus(nodeId: string | null, view: boolean) {
   return useSharedRead<NodeStatusView>(nodeId ? statusPath(nodeId, view) : null, parseStatusView, true);
 }
 
-// A light or a super node's newest epochs, the first page.
-export function useNodeHistory(nodeId: string | null) {
-  return useSharedRead<HistoryView>(nodeUrl(nodeId, '/history'), parseHistoryView, false);
+// A light or a super node's newest epochs, the first page; for a view without why an epoch was missed (publicHistory).
+export function useNodeHistory(nodeId: string | null, view: boolean) {
+  return useSharedRead<HistoryView>(nodeId ? historyPagePath(nodeId, 0, view) : null, parseHistoryView, false);
 }
 
 export interface EpochList {
@@ -140,8 +139,8 @@ export interface EpochList {
 }
 
 // The first page (`first`, the shared read) and the older pages read on showMore, one at a time, joined; a page that
-// fails keeps the rows and lets showMore ask for it again.
-export function useEpochList(nodeId: string, first: HistoryView): EpochList {
+// fails keeps the rows and lets showMore ask for it again. `view` as for useNodeHistory.
+export function useEpochList(nodeId: string, first: HistoryView, view: boolean): EpochList {
   const [older, setOlder] = useState<HistoryView[]>([]);
   const [phase, setPhase] = useState<EpochList['phase']>('idle');
   const reading = useRef(false);
@@ -150,7 +149,7 @@ export function useEpochList(nodeId: string, first: HistoryView): EpochList {
     if (reading.current || !last.more) return;
     reading.current = true;
     setPhase('reading');
-    void load(`${nodeUrl(nodeId, '/history')}?page=${older.length + 1}`, parseHistoryView).then((page) => {
+    void load(historyPagePath(nodeId, older.length + 1, view), parseHistoryView).then((page) => {
       reading.current = false;
       if (page === null) {
         setPhase('failed');
@@ -159,7 +158,7 @@ export function useEpochList(nodeId: string, first: HistoryView): EpochList {
       setOlder((pages) => [...pages, page]);
       setPhase('idle');
     });
-  }, [nodeId, older.length, last.more]);
+  }, [nodeId, older.length, last.more, view]);
   return { rows: joinPages([first, ...older]), more: last.more, phase, showMore };
 }
 

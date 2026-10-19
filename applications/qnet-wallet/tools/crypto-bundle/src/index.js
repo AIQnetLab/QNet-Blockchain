@@ -1,6 +1,7 @@
 // qnet-core: the one crypto module of the QNet wallet extension. Named exports and the default export
 // are the same deep-frozen values; nothing a caller does can replace a primitive another caller uses.
 import * as activation from './activation.js';
+import * as amounts from './amounts.js';
 import * as bytes from './bytes.js';
 import * as config from './config.js';
 import { CoreError } from './errors.js';
@@ -44,13 +45,14 @@ function assemble(...modules) {
 
 const QNetCore = assemble(
   { CORE_VERSION, CoreError },
-  activation, bytes, config, hashes, http, lightclient, message, mnemonic, node, password, selftest, solana, token, tx,
-  wallet,
+  activation, amounts, bytes, config, hashes, http, lightclient, message, mnemonic, node, password, selftest, solana, token,
+  tx, wallet,
 );
 
 export default QNetCore;
 export { CoreError };
 export * from './activation.js';
+export * from './amounts.js';
 export * from './bytes.js';
 export * from './config.js';
 export * from './hashes.js';

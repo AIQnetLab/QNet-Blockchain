@@ -235,8 +235,8 @@ export function createNetwork(core, config, wallet, peer) {
     }],
   };
   // The certified state of the wallet's account, as net.qnc starts: the light client verifies its macroblock under the
-  // committee's real signature, and a send is decided by it. GET /api/v1/account follows net.qnc: the chain's nonce now,
-  // which only tells the wallet's own transactions taken from those still pending.
+  // committee's real signature. The live tip (a proof asked without `mb`, what a send is decided by) and GET
+  // /api/v1/account follow net.qnc.
   net.certified = certifiedNet({ accounts: { [wallet.qnet]: { balance: String(net.qnc.balance), nonce: String(net.qnc.nonce) } } }).install();
   // aiqnet.io's record of the wallet's burns: a burn that landed here is final there
   net.cabinet = createCabinet({ landed: (burnTx) => (net.solanaTxs.some((tx) => tx.signature === burnTx) ? 'final' : 'unknown') });
@@ -447,6 +447,10 @@ export function createNetwork(core, config, wallet, peer) {
         direction: row.from === wallet.qnet ? 'sent' : 'received',
       }));
       return json({ success: true, address: wallet.qnet, transactions: rows });
+    }
+    // the live tip a proof asked without `mb` holds follows net.qnc, as GET /api/v1/account does
+    if (pathname.endsWith('/balance/proof') && !searchParams.has('mb')) {
+      net.certified.setTip({ [wallet.qnet]: { balance: String(net.qnc.balance), nonce: String(net.qnc.nonce) } });
     }
     // the certified state: proofs, the certified head, macroblocks and registry snapshots
     const certified = net.certified.answer(url.origin, pathname, searchParams, { method: init.method ?? 'GET' });
