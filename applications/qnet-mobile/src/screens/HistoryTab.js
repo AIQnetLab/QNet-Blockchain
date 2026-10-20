@@ -1,23 +1,26 @@
 /**
- * History (owner, 04.10; rows redrawn 06.10): the wallet's transactions split by network exactly as Assets is (QNet ·
- * Solana), one row per transaction under a header for its day (Today, Yesterday, then the date), and a detail screen for
- * the row tapped. A row reads from the start: the asset's icon with a small badge for what happened (sent, received,
- * swap, a node action, a contract call, burn, failed), what happened over whom it was with (and its status after it
- * while it is not final), and the amount with its sign and colour: one line, two for a transaction with two legs (a swap), none
- * for one that moves nothing (a node registration). A row holds at 320 dp whatever the amount: the amount is written
- * compactly (K, M, B, T past 100,000; at most a few decimals) and never cut, and only names (a token's symbol) may end in
- * an ellipsis. The detail screen opens with the same icon and badge, shows every field the app holds for the
- * transaction with its exact amount, and opens the explorer for a transaction the network ran: the QNet explorer for a
- * QNet one, the cluster's public explorer for a Solana one; one still pending or not found has no page there, so its
- * hash is copied.
+ * History: the wallet's transactions split by network exactly as Assets is (QNet · Solana), one row per transaction
+ * under a header for its day (Today, Yesterday, then the date), and a detail screen for the row tapped. A row reads from
+ * the start: what happened over whom it was with (and its status after it while it is not final), and at its end the
+ * amount with its sign and tone: one line, two for a transaction with two legs (a swap), none for one that moves nothing
+ * (a node registration). No icon and no badge: the title, the sign and the tone say what happened. A row holds at 320 dp
+ * whatever the amount: the amount is written in the one amount format with few decimals and never cut; one too long to
+ * sit beside the title takes a line of its own under it; only names (a token's symbol) may end in an ellipsis. The
+ * detail screen shows every field the app holds for the transaction with its exact amount, and opens the explorer for a
+ * transaction the network ran: the QNet explorer for a QNet one, the cluster's public explorer for a Solana one; one
+ * still pending or not found has no page there, so its hash is copied.
  * Pure views: the wallet screen hands over the entries (utils/txHistory historyEntries and historySections), the
  * hidden-amounts flag and what a tap does.
  */
 import React from 'react';
-import { Image, Text, TouchableOpacity, View } from 'react-native';
-import Svg, { Circle, Path } from 'react-native-svg';
-import { InfoField, InfoRow } from '../components/InfoRow';
-import { tokenIconSource } from '../components/TokenIcons';
+import { Pressable, Text, View } from 'react-native';
+import { FIGURE_LINE, InfoField, InfoRow, ROW_FONT_CAP } from '../components/InfoRow';
+import Action from '../components/ui/Action';
+import Head from '../components/ui/Head';
+import Status from '../components/ui/Status';
+import TokenIcon from '../components/TokenIcons';
+import { MONO_ADVANCE, color } from '../theme';
+import { shortAddress } from '../utils/addressDisplay';
 import { amountText, formatNano } from '../utils/amountFormat';
 import { pad } from '../utils/timeText';
 import { historyBadge, txNodeId, txTypeName } from '../utils/txHistory';
@@ -30,7 +33,10 @@ const BADGE_KEY = {
   pending: 'hist_status_pending', confirmed: 'hist_status_confirmed', failed: 'hist_status_failed', dropped: 'hist_status_dropped',
   moving: 'hist_status_moving', unverified: 'hist_status_unverified', included: 'hist_status_included',
 };
-const SUFFIXES = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+// How a status word is toned (components/ui/Status): settled, on its way, or nothing moved.
+const STATUS_TONE = {
+  confirmed: 'done', pending: 'quiet', moving: 'quiet', unverified: 'quiet', included: 'quiet', failed: 'needs', dropped: 'needs',
+};
 
 // The sender of a node balance moved into the wallet (core is_merkle_reward_claim).
 export const NODE_BALANCE_SENDER = 'system_rewards_pool';
@@ -48,37 +54,39 @@ export function systemSenderKey(tx, kind = txKind(tx)) {
   return null;
 }
 
-// The amount's colour: incoming green, a transfer to this same wallet the app's blue, outgoing plain white, and grey for
-// one that did not go through (nothing moved).
-const TONE = { in: '#00ff88', self: '#00d4ff', out: '#ffffff', void: '#8a8fa3' };
+// The amount's tone: incoming in Mint, outgoing and a transfer to this same wallet in Paper, Fog for one that did not
+// go through (nothing moved).
+const TONE = { in: color.mint, self: color.paper, out: color.paper, void: color.fog };
 
 const trimZeros = (s) => s.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 
+// A plain decimal string of a non-negative amount: a decimal text as it is, a number as its shortest digits (the way it
+// prints), its exponent written out ("3.4e+32" is 34 and 31 zeros).
+function decimalOf(value) {
+  if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value)) return value;
+  const text = String(Math.abs(Number(value) || 0));
+  const m = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/.exec(text);
+  if (!m) return text;
+  const digits = m[1] + (m[2] || '');
+  const point = m[1].length + Number(m[3]);
+  if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+  return point > 0 ? `${digits.slice(0, point)}.${digits.slice(point)}` : `0.${'0'.repeat(-point)}${digits}`;
+}
+
 /**
- * An amount as a row shows it (utils/amountFormat): below 100,000 grouped, with at most 8
- * decimals below 1 (a dust amount reads "<0.00000001"), 4 from 1 and 2 from 1,000 (98,765.43); from 100,000 with a
- * suffix and at most 2 decimals (123.46K, 1.5M, 4200T); from 10^18 (a token of 128-bit supply) in powers of ten
- * (3.4e32). Never longer than 11 characters before its sign, so a short symbol after it stays whole at 320 dp; the
- * detail screen shows the exact figure. The extension's History writes its rows by the same rule (popup.js
- * compactAmount).
+ * An amount as a row shows it, in the one amount format (utils/amountFormat), never with a suffix or an exponent: below
+ * 100,000 with at most 8 decimals below 1 (a dust amount reads "<0.00000001"), 4 from 1 and 2 from 1,000 (98,765.43);
+ * up to a million with at most 2 decimals (123,456.78); from a million the whole number, rounded (12,345,679). The
+ * detail screen shows the exact figure.
  */
 export function compactAmount(value) {
-  const n = Math.abs(Number(value) || 0);
+  const text = decimalOf(value);
+  const n = Number(text);
   if (n === 0) return '0';
   if (n < 1e-8) return `<${amountText('0.00000001')}`;
-  if (n >= 1e18) {
-    const [mantissa, exponent] = n.toExponential(2).split('e');
-    return `${amountText(trimZeros(mantissa))}e${Number(exponent)}`;
-  }
-  if (n >= 1e5) {
-    for (const [unit, suffix] of SUFFIXES) {
-      if (n >= unit) {
-        const scaled = n / unit;
-        return `${scaled >= 1000 ? scaled.toFixed(0) : amountText(trimZeros(scaled.toFixed(2)))}${suffix}`;
-      }
-    }
-  }
-  return amountText(trimZeros(n.toFixed(n >= 1000 ? 2 : (n >= 1 ? 4 : 8))));
+  if (n < 1e6) return amountText(trimZeros(n.toFixed(n >= 1000 ? 2 : (n >= 1 ? 4 : 8))));
+  const [whole, fraction = ''] = text.split('.');
+  return amountText((BigInt(whole) + (fraction[0] >= '5' ? 1n : 0n)).toString());
 }
 
 // A token amount as the history keeps it (utils/txHistory tokenAmountDisplay: grouped with ',') as a canonical decimal.
@@ -86,8 +94,8 @@ const keptDecimal = (text) => String(text == null ? '0' : text).replace(/,/g, ''
 
 /** A decimal string (a token amount as the history keeps it, any precision) written as compactAmount writes it. */
 export function compactDecimalText(text) {
-  const n = Number(keptDecimal(text));
-  return Number.isFinite(n) ? compactAmount(n) : String(text);
+  const kept = keptDecimal(text);
+  return /^\d+(\.\d+)?$/.test(kept) ? compactAmount(kept) : String(text);
 }
 
 /** An NFT's token id on a row: whole when short, else its start and end. */
@@ -96,11 +104,6 @@ const tokenIdShort = (id) => {
   return s.length > 10 ? `${s.slice(0, 4)}…${s.slice(-4)}` : s;
 };
 
-/** An address on a row: its first and last four characters ("02dc…23e"), whole when that is no shorter. */
-export const shortAddress = (a) => {
-  const s = typeof a === 'string' ? a : '';
-  return s.length > 12 ? `${s.slice(0, 4)}…${s.slice(-4)}` : s;
-};
 /** A node's name on a row: whole up to 20 characters (light_9f3a2c1d0e7b), else its start and end. */
 const shortNodeId = (id) => {
   const s = typeof id === 'string' ? id : '';
@@ -159,20 +162,20 @@ export function txKind(tx) {
   return tx.type === 'send' ? 'send' : 'receive';
 }
 
-// What each kind is called, the badge its icon carries, and whether it moves value (a transfer shows its amount even at
-// 0; a node or contract action shows one only when it carried value).
+// What each kind is called, its group (a node or a contract action), and whether it moves value (a transfer shows its
+// amount even at 0; a node or contract action shows one only when it carried value).
 const KINDS = {
-  send: { title: 'hist_sent', badge: 'sent', transfer: true },
-  receive: { title: 'hist_received', badge: 'received', transfer: true },
-  self: { title: 'hist_sent_self', badge: 'self', transfer: true },
-  burn: { title: 'hist_burn', badge: 'burn', transfer: true },
-  swap: { title: 'hist_swap', badge: 'swap', transfer: true },
-  node_registered: { title: 'hist_node_registered', badge: 'node' },
-  node_back_online: { title: 'hist_node_back_online', badge: 'node' },
-  node_checkin: { title: 'hist_node_checkin', badge: 'node' },
-  node_claim: { title: 'hist_node_claim', badge: 'node', transfer: true },
-  contract_call: { title: 'hist_contract_call', badge: 'contract' },
-  contract_deploy: { title: 'hist_contract_deploy', badge: 'contract' },
+  send: { title: 'hist_sent', transfer: true },
+  receive: { title: 'hist_received', transfer: true },
+  self: { title: 'hist_sent_self', transfer: true },
+  burn: { title: 'hist_burn', transfer: true },
+  swap: { title: 'hist_swap', transfer: true },
+  node_registered: { title: 'hist_node_registered', group: 'node' },
+  node_back_online: { title: 'hist_node_back_online', group: 'node' },
+  node_checkin: { title: 'hist_node_checkin', group: 'node' },
+  node_claim: { title: 'hist_node_claim', group: 'node', transfer: true },
+  contract_call: { title: 'hist_contract_call', group: 'contract' },
+  contract_deploy: { title: 'hist_contract_deploy', group: 'contract' },
 };
 
 /**
@@ -216,27 +219,19 @@ function legOf(tx, settled) {
     exact = amountText(nano ? formatNano(nano) : trimZeros((Number(tx.amount) || 0).toFixed(9)));
   }
   const zero = !isNft && Number(keptDecimal(isSolana ? tx.solAmount : (isToken ? tx.tokenAmountDisplay : tx.amount))) === 0;
+  // A symbol named after QNet is written in Ember (the detail screen says why).
+  // The icon the row wears: a known one only for a network's own asset (components/TokenIcons knownIcon).
+  const icon = { network: isSolana ? 'solana' : 'qnet', symbol: isSolana ? tx.solSymbol : (isToken ? tokenSymbol : 'QNC'), contract: isToken ? tx.tokenContract : null };
   return {
-    tone, reserved, zero, incoming: !isSend && !isSelf,
-    symbol: reserved ? `⚠ ${symbol}` : symbol,
+    icon, tone, reserved, zero, incoming: !isSend && !isSelf, symbol, symbolTone: reserved ? color.ember : tone,
     number: zero ? '0' : `${sign}${number}`, exact: zero ? '0' : `${sign}${exact}`,
   };
 }
 
-// The icon of the asset a row moved: its own image (QNC, SOL, 1DEV, the icons Assets draws), else a token's letter. The
-// app's mark sits inside a clear margin of its image (its disc is 70% of it), so a row draws it enlarged to fill the
-// same round as every other asset's icon.
-const QNC_ZOOM = 1.4;
-const iconOf = (tx) => {
-  if (tx.chain === 'solana') return { source: tokenIconSource(tx.solSymbol), letter: String(tx.solSymbol || 'S').slice(0, 1) };
-  if (tx.tokenContract) return { source: null, letter: (tokenLabel(tx.tokenSymbol) || 'T').slice(0, 1).toUpperCase(), seed: tx.tokenContract, logo: tx.tokenLogo };
-  return { source: tokenIconSource('QNC'), letter: 'Q', zoom: QNC_ZOOM };
-};
-
 /**
  * What a row and its detail say about one history entry (a row of utils/txHistory historyEntries): its kind, title,
- * badge, status, the line of whom it was with (`sub`, a key and its params, or plain text), its amounts (`legs`: none,
- * one, or a swap's two, incoming first), the icon, the fee and the token warning.
+ * status, the line of whom it was with (`sub`, a key and its params), its amounts (`legs`: none, one, or a swap's two,
+ * incoming first), the fee and the token warning.
  */
 export function describeTx(tx) {
   const kind = txKind(tx);
@@ -251,10 +246,11 @@ export function describeTx(tx) {
     .sort((a, b) => Number(b.incoming) - Number(a.incoming));
   let sub = null;
   const nodeId = tx.nodeId || txNodeId(tx.txType);
-  if (kind === 'swap' && legs.length > 1) sub = { text: `${legs[legs.length - 1].symbol} → ${legs[0].symbol}` };
+  // A swap names no one: its two legs say what went and what came.
+  if (kind === 'swap') sub = null;
   else if (kind === 'node_claim') sub = { key: 'hist_sub_node_balance' };
-  else if (spec.badge === 'node') sub = nodeId ? { key: 'hist_sub_node', params: { id: shortNodeId(nodeId) } } : null;
-  else if (spec.badge === 'contract') sub = tx.to ? { key: 'tok_contract_id', params: { id: contractShortId(tx.to) } } : null;
+  else if (spec.group === 'node') sub = nodeId ? { key: 'hist_sub_node', params: { id: shortNodeId(nodeId) } } : null;
+  else if (spec.group === 'contract') sub = tx.to ? { key: 'tok_contract_id', params: { id: contractShortId(tx.to) } } : null;
   // A transfer to this same wallet names no one (its title says it), as the extension's row.
   else if (kind === 'self') sub = null;
   else if (tx.type === 'send' || tx.type === 'self') sub = tx.to ? { key: 'hist_to', params: { who: shortAddress(tx.to) } } : null;
@@ -262,98 +258,23 @@ export function describeTx(tx) {
   else if (systemSenderKey(tx, kind)) sub = { key: systemSenderKey(tx, kind) };
   else sub = tx.from ? { key: 'hist_from', params: { who: shortAddress(tx.from) } } : null;
   const height = Number.isSafeInteger(tx.block) ? tx.block : (Number.isSafeInteger(tx.height) ? tx.height : null);
-  if (!sub && kind !== 'self' && height !== null) sub = { key: 'hist_block', params: { height } };
+  if (!sub && kind !== 'self' && kind !== 'swap' && height !== null) sub = { key: 'hist_block', params: { height } };
   const fee = tx.chain === 'solana' ? (tx.solFee != null ? `${amountText(String(tx.solFee))} SOL` : null)
     : (tx.fee > 0 ? `${amountText(trimZeros((Number(tx.fee) || 0).toFixed(9)))} QNC` : null);
-  const iconRow = kind === 'swap' && Array.isArray(tx.legs) ? (tx.legs.find((l) => l.type === 'receive') || tx) : tx;
   return {
-    // Nothing moved (failed, or not found): the red mark, as the extension's row.
-    kind, title: spec.title, badge: settled ? spec.badge : 'failed', status, legs, sub, fee,
-    node: spec.badge === 'node', isSolana: tx.chain === 'solana', reserved: legs.some((l) => l.reserved), icon: iconOf(iconRow),
+    kind, title: spec.title, status, legs, sub, fee,
+    node: spec.group === 'node', isSolana: tx.chain === 'solana', reserved: legs.some((l) => l.reserved),
   };
 }
 
 /** The line of whom a row was with, in words. */
-const subText = (sub, t) => (!sub ? '' : sub.text != null ? sub.text : t(sub.key, sub.params));
+const subText = (sub, t) => (!sub ? '' : t(sub.key, sub.params));
 
-// A logo is drawn as-is only when it is a short emoji; text gets the one-letter avatar (as on the Assets list).
-const glyphLogo = (logo) => {
-  const s = typeof logo === 'string' ? logo.trim() : '';
-  return s.length > 0 && s.length <= 8 && !/[A-Za-z0-9]/.test(s) ? s : null;
-};
-
-/**
- * The asset's icon: its own image (QNC, SOL, 1DEV, the icons Assets draws), an emoji logo, or a letter on a colour taken
- * from the contract, the same colour the Assets list gives that token. A token's logo is never loaded from a URL a node or a deployer named (that would tell its host the
- * device's address and when the list was opened): only an inert emoji is drawn as it is.
- */
-export function AssetIcon({ icon, size = 40 }) {
-  const round = { width: size, height: size, borderRadius: size / 2 };
-  if (icon && icon.source && icon.zoom) {
-    const inner = Math.round(size * icon.zoom);
-    return (
-      <View style={[round, styles.histIconZoom]}>
-        <Image source={icon.source} style={{ width: inner, height: inner }} resizeMode="contain" />
-      </View>
-    );
-  }
-  if (icon && icon.source) return <Image source={icon.source} style={round} resizeMode="contain" />;
-  const logo = icon ? glyphLogo(icon.logo) : null;
-  let h = 0;
-  const seed = String((icon && (icon.seed || icon.letter)) || '?');
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-  return (
-    <View style={[round, { backgroundColor: logo ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`, alignItems: 'center', justifyContent: 'center' }]}>
-      <Text style={{ color: '#ffffff', fontSize: size * 0.42, fontWeight: '700' }}>{logo || (icon && icon.letter) || '?'}</Text>
-    </View>
-  );
-}
-
-// The badge glyphs, drawn as the app's other icons are (react-native-svg, a 24 box, round strokes): a disc in the
-// action's colour with a dark glyph. The colours are the amounts' (outgoing white, incoming green, the app's blue for a
-// transfer to itself, a swap and a node action), grey for a contract, amber for a burn and red for a failure.
-const INK = '#11131f';
-export const BADGES = {
-  sent: { fill: '#ffffff', d: 'M8 16L16 8M10 8h6v6' },
-  received: { fill: '#00ff88', d: 'M12 6v12M7 13l5 5 5-5' },
-  self: { fill: '#00d4ff', d: 'M17 12a5 5 0 1 1-1.8-3.85M17 5.5v3.2h-3.2' },
-  swap: { fill: '#00d4ff', d: 'M6 9.5h11.5L14.5 6.5M18 14.5H6.5l3 3' },
-  node: { fill: '#00d4ff', d: 'M12 5.5l5.6 3.25v6.5L12 18.5l-5.6-3.25v-6.5z', dot: true },
-  contract: { fill: '#b0b0b0', d: 'M9.5 8l-4 4 4 4M14.5 8l4 4-4 4' },
-  burn: { fill: '#ffaa00', d: 'M12 4.5c.5 2.4 2.2 3.6 3.3 5.2.9 1.3 1.2 2.4 1.2 3.6a4.5 4.5 0 0 1-9 0c0-1.7.8-3 1.8-4 .1 1.2.6 2.1 1.5 2.5-.2-2.6.4-5 1.2-7.3z', solid: true },
-  failed: { fill: '#ff4444', d: 'M8.5 8.5l7 7M15.5 8.5l-7 7', ink: '#ffffff' },
-};
-
-// A screen laid out right to left points the sent arrow the way that screen reads (the extension does the same).
-const MIRRORED = new Set(['sent']);
 // The most characters a row's number and symbol share one line with (−98,765.43 QNC); a longer pair is stacked.
 const STACK_CHARS = 13;
-
-/** A badge: the disc and glyph of `name` (BADGES), `size` across, its arrow turned for a right-to-left screen (`rtl`). */
-export function BadgeGlyph({ name, size, rtl = false }) {
-  const b = BADGES[name] || BADGES.sent;
-  const ink = b.ink || INK;
-  return (
-    <Svg width={size} height={size} viewBox="0 0 24 24" style={rtl && MIRRORED.has(name) ? styles.histBadgeMirrored : undefined}>
-      <Circle cx={12} cy={12} r={12} fill={b.fill} />
-      <Path d={b.d} stroke={b.solid ? 'none' : ink} strokeWidth={2.6} fill={b.solid ? ink : 'none'} strokeLinecap="round" strokeLinejoin="round" />
-      {b.dot ? <Circle cx={12} cy={12} r={1.9} fill={ink} /> : null}
-    </Svg>
-  );
-}
-
-/** The asset's icon with the action's badge at its lower end corner, ringed in the card's colour. */
-export function TxIcon({ icon, badge, size = 40, rtl = false }) {
-  const b = Math.round(size * 0.45);
-  return (
-    <View style={{ width: size, height: size }} testID={`history-icon-${badge}`}>
-      <AssetIcon icon={icon} size={size} />
-      <View style={[styles.histBadge, { width: b + 4, height: b + 4, borderRadius: (b + 4) / 2 }]} testID={`history-badge-glyph-${badge}`}>
-        <BadgeGlyph name={badge} size={b} rtl={rtl} />
-      </View>
-    </View>
-  );
-}
+// The longest number that sits beside the title: 45% of the narrowest row (288 dp) holds this many mono characters at
+// the largest text size a row follows; a longer one takes a line of its own under the title.
+export const BESIDE_CHARS = Math.floor((0.45 * 288) / (MONO_ADVANCE.data * 15 * ROW_FONT_CAP));
 
 /**
  * What a screen reader says for a row, in the extension's order: what happened, the amounts (unless hidden), whom with,
@@ -379,65 +300,74 @@ export function DayHeader({ item, t }) {
 }
 
 /**
- * One transaction: its icon and badge, what happened over whom it was with (and its status after it while it is not
- * final), and its amounts. The amount's number never shrinks or ends in an ellipsis; its symbol, a name, may. Tapping opens the
- * detail screen.
+ * One transaction: what happened over whom it was with (and its status after it while it is not final), and its
+ * amounts at the row's end, or on a line of their own under it when a number is too long to sit beside. The amount's
+ * number never ends in an ellipsis; its symbol, a name, may. Tapping opens the detail screen.
  */
 export const HistoryRow = React.memo(function HistoryRow({ tx, t, hideAmounts, onOpen }) {
   const d = describeTx(tx);
   const sub = subText(d.sub, t);
   const showStatus = d.status !== 'confirmed';
+  const wide = !hideAmounts && d.legs.some((l) => l.number.length > BESIDE_CHARS);
+  const amounts = d.legs.length ? (
+    <View style={wide ? styles.histWide : styles.histRight}>
+      {d.legs.slice(0, 2).map((leg, i) => {
+        // A single amount too long to share its line with its symbol (a long symbol, a dust amount) puts the symbol
+        // under the number, so the amount never takes the room of whom it was with.
+        const stacked = !wide && d.legs.length === 1 && !hideAmounts && leg.number.length + leg.symbol.length > STACK_CHARS;
+        return (
+          <View key={i} style={[stacked ? styles.histAmountStack : styles.histAmountLine, i > 0 && styles.histAmountLineNext]}>
+            <Text
+              style={[styles.histAmount, wide && styles.histAmountWide, { color: leg.tone }]}
+              {...(wide ? FIGURE_LINE : { numberOfLines: 1, maxFontSizeMultiplier: ROW_FONT_CAP })}
+            >
+              {hideAmounts ? '••••' : leg.number}
+            </Text>
+            {hideAmounts ? null : (
+              <Text style={[stacked ? styles.histSymbolStacked : styles.histSymbol, { color: leg.symbolTone }]} numberOfLines={1} ellipsizeMode="tail">
+                {stacked ? leg.symbol : ` ${leg.symbol}`}
+              </Text>
+            )}
+          </View>
+        );
+      })}
+    </View>
+  ) : null;
   return (
-    <TouchableOpacity
-      style={styles.histRow}
+    <Pressable
+      style={({ pressed }) => [styles.histRow, pressed && styles.histRowPressed]}
       onPress={() => onOpen(tx)}
       accessibilityRole="button"
       accessibilityLabel={rowA11yLabel(d, tx, t, hideAmounts)}
       testID="history-row"
     >
-      <TxIcon icon={d.icon} badge={d.badge} rtl={!!t.rtl} />
-      <View style={styles.histMiddle}>
-        {/* What happened shrinks a little to fit beside the amount rather than wrap, never below 80% of its size; the
-            amount itself never shrinks and takes at most 45% of the row (styles.histRight). */}
-        <Text style={styles.histTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{t(d.title)}</Text>
-        {/* Whom it was with on one line (shrinking a little rather than end in an ellipsis), and after it the status of
-            a row not final, as the extension writes it: the status goes under it when both do not fit, never over it. */}
-        {sub || showStatus ? (
-          <View style={styles.histSubLine}>
-            {sub ? <Text style={[styles.histSub, styles.histParty]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{sub}</Text> : null}
-            {showStatus ? (
-              <Text style={[styles.histSub, styles.histStatus, styles[`histStatus_${d.status}`]]} numberOfLines={1} testID={`history-badge-${d.status}`}>
-                {t(BADGE_KEY[d.status])}
-              </Text>
-            ) : null}
-          </View>
-        ) : null}
-      </View>
-      {d.legs.length ? (
-        <View style={styles.histRight}>
-          {d.legs.slice(0, 2).map((leg, i) => {
-            // A single amount too long to share its line with its symbol (a long symbol, a dust amount) puts the symbol
-            // under the number, as the extension does, so the amount never takes the room of whom it was with.
-            const stacked = d.legs.length === 1 && !hideAmounts && leg.number.length + leg.symbol.length > STACK_CHARS;
-            return (
-              <View key={i} style={[stacked ? styles.histAmountStack : styles.histAmountLine, i > 0 && styles.histAmountLineNext]}>
-                <Text style={[styles.histAmount, { color: leg.tone }]} numberOfLines={1}>{hideAmounts ? '••••' : leg.number}</Text>
-                {hideAmounts ? null : (
-                  <Text style={[stacked ? styles.histSymbolStacked : styles.histSymbol, { color: leg.tone }]} numberOfLines={1} ellipsizeMode="tail">
-                    {stacked ? leg.symbol : ` ${leg.symbol}`}
-                  </Text>
-                )}
-              </View>
-            );
-          })}
+      <View style={styles.histLine}>
+        {d.legs.length ? <TokenIcon {...d.legs[0].icon} size={30} style={styles.histIcon} /> : <View style={styles.histIconBlank} />}
+        <View style={styles.histMiddle}>
+          {/* What happened shrinks a little to fit beside the amount rather than wrap, never below 80% of its size. */}
+          <Text style={styles.histTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{t(d.title)}</Text>
+          {/* Whom it was with on one line, and after it the status of a row not final; the status goes under it when
+              both do not fit, never over it. */}
+          {sub || showStatus ? (
+            <View style={styles.histSubLine}>
+              {sub ? <Text style={[styles.histSub, styles.histParty]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{sub}</Text> : null}
+              {showStatus ? (
+                <Text style={[styles.histSub, styles.histStatus, styles[`histStatus_${d.status}`]]} numberOfLines={1} testID={`history-badge-${d.status}`}>
+                  {t(BADGE_KEY[d.status])}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
         </View>
-      ) : null}
-    </TouchableOpacity>
+        {wide ? null : amounts}
+      </View>
+      {wide ? amounts : null}
+    </Pressable>
   );
 });
 
 /**
- * The detail screen of one row: the icon and badge, what happened, the exact amounts, the status, the fee, both parties
+ * The detail screen of one row: what happened, the exact amounts, the status in a word, the fee, both parties
  * (a sender that is the network itself in words: systemSenderKey), the node (a node row), the time, the hash, the
  * block, the memo when the app holds one, and one action: the explorer's
  * page of a transaction the network ran (QNet's for a QNet one in a block, the Solana cluster's for a Solana one that
@@ -445,7 +375,7 @@ export const HistoryRow = React.memo(function HistoryRow({ tx, t, hideAmounts, o
  * registry alone reports has no transaction hash, so neither. `onBack` closes it; `onCopy(text, key)` copies;
  * `onExplorer(hash, chain)` opens the explorer of 'qnet' or 'solana'; `copied` names the field copied last.
  */
-export function TxDetail({ tx, t, hideAmounts = false, onBack, onCopy, onExplorer, copied = '', backArrow = '←' }) {
+export function TxDetail({ tx, t, hideAmounts = false, onBack, onCopy, onExplorer, copied = '' }) {
   const d = describeTx(tx);
   const badge = d.status;
   // Each field as every screen draws one (components/InfoRow): a figure, a time or a word beside its label; an id or an
@@ -481,32 +411,21 @@ export function TxDetail({ tx, t, hideAmounts = false, onBack, onCopy, onExplore
   const explorer = ran && badge !== 'pending' && badge !== 'dropped' && !!hash;
   return (
     <View>
-      <View style={styles.txDetailHeader}>
-        <TouchableOpacity onPress={onBack} accessibilityRole="button" accessibilityLabel={t('common_back')} style={styles.txDetailBack} testID="tx-detail-back">
-          <Text style={styles.txDetailBackText} numberOfLines={1}>{`${backArrow} ${t('common_back')}`}</Text>
-        </TouchableOpacity>
-      </View>
-      <View style={styles.txDetailCard}>
-        <View style={styles.txDetailIcon}><TxIcon icon={d.icon} badge={d.badge} size={56} rtl={!!t.rtl} /></View>
-        <Text style={styles.txDetailHeading} numberOfLines={2}>{t(d.title)}</Text>
-        {d.legs.map((leg, i) => (
-          <Text key={i} style={[styles.txDetailAmount, { color: leg.tone }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.3}>
+      <Head onBack={onBack} backLabel={t('common_back')} backTestID="tx-detail-back" title={t(d.title)} />
+      {d.legs.map((leg, i) => (
+        <View key={i} style={styles.txDetailLeg}>
+          <TokenIcon {...leg.icon} size={32} />
+          <Text style={[styles.txDetailAmount, styles.txDetailLegText, { color: leg.tone }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.3}>
             {hideAmounts ? '••••' : `${leg.exact} ${leg.symbol}`}
           </Text>
-        ))}
-        <View style={[styles.historyBadge, styles[`historyBadge_${badge}`], styles.txDetailBadge]} testID={`tx-detail-badge-${badge}`}>
-          <Text style={[styles.historyBadgeText, styles[`historyBadgeText_${badge}`]]} numberOfLines={1}>{t(BADGE_KEY[badge])}</Text>
         </View>
-        {fields}
-      </View>
+      ))}
+      <Status tone={STATUS_TONE[badge] || 'quiet'} label={t(BADGE_KEY[badge])} testID={`tx-detail-badge-${badge}`} textStyle={styles.txDetailBadge} />
+      <View style={styles.txDetailCard}>{fields}</View>
       {explorer ? (
-        <TouchableOpacity style={styles.button} onPress={() => onExplorer(hash, chain)} accessibilityRole="button" testID="tx-detail-explorer">
-          <Text style={styles.buttonText}>{t('tx_detail_explorer')}</Text>
-        </TouchableOpacity>
+        <Action kind="text" label={t('tx_detail_explorer')} onPress={() => onExplorer(hash, chain)} testID="tx-detail-explorer" />
       ) : hash ? (
-        <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={() => onCopy(hash, 'detail-hash')} accessibilityRole="button" testID="tx-detail-copy">
-          <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('tx_detail_copy_hash')}</Text>
-        </TouchableOpacity>
+        <Action kind="text" label={t('tx_detail_copy_hash')} onPress={() => onCopy(hash, 'detail-hash')} testID="tx-detail-copy" />
       ) : null}
     </View>
   );

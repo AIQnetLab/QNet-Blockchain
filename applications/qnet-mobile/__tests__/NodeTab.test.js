@@ -7,10 +7,12 @@ import fs from 'fs';
 import path from 'path';
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
+import Status from '../src/components/ui/Status';
 import NodeTab, {
   nodeView, linkedHere, bindingVerdict, refusalText, deviceText, agoText, checkState, CHECK_RUNNING_MS, lightShownHere,
-  waitingAdmission, keptServerStatus, rewardAdmission,
+  waitingAdmission, keptServerStatus, rewardAdmission, nodeLive,
 } from '../src/screens/NodeTab';
 import {
   readNodeStatus, agreedFeatures, readLinkPending, BIND_SETTLE_MS, LINK_PENDING_KEY,
@@ -33,6 +35,33 @@ const status = (over = {}) => {
   return s;
 };
 const LOCAL = { nodeId: NODE, seq: 1790000000, pushType: 'fcm' };
+
+// The tab bar's live dot says what the Node tab says, from the same verdicts: no read of its own.
+describe('the tab bar\'s live dot', () => {
+  const server = (over = {}) => ({ status: { success: true, registered: true, isOnline: true, ...over } });
+  const light = (over = {}) => ({ status: status(over), local: LOCAL });
+
+  it('lights for a server node online and admitted, not for one offline or waiting for admission', () => {
+    expect(nodeLive({ server: server() })).toBe(true);
+    expect(nodeLive({ server: server({ isOnline: false }) })).toBe(false);
+    expect(nodeLive({ server: server({ admission: 'waiting' }) })).toBe(false);
+    expect(nodeLive({ server: server({ admission: 'admitted' }) })).toBe(true);
+  });
+
+  it('lights for this wallet\'s light node online on this device only', () => {
+    expect(nodeView(light()).state).toBe('here');
+    expect(nodeLive({ light: light() })).toBe(true);
+    // Offline in the network's own verdict.
+    expect(nodeLive({ light: light({ needsReactivation: true }) })).toBe(false);
+    // Bound to another device, to none, or not on the chain: not this device's to show.
+    expect(nodeLive({ light: { status: status() } })).toBe(false);
+    expect(nodeLive({ light: light({ bindingSeqAgreed: LOCAL.seq + 5 }) })).toBe(false);
+    expect(nodeLive({ light: light({ onChain: false }) })).toBe(false);
+    expect(nodeLive({ light: null, server: null })).toBe(false);
+    // Either node running is enough.
+    expect(nodeLive({ server: server({ isOnline: false }), light: light() })).toBe(true);
+  });
+});
 
 describe('the state, from the status alone', () => {
   it('checks first, and says "unknown" rather than "no node" when the network gives no verdict', () => {
@@ -170,8 +199,12 @@ describe('what each state shows', () => {
     return tree;
   };
   const shown = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-  const buttons = (tree) => tree.root.findAllByType(TouchableOpacity)
-    .filter((n) => typeof n.props.onPress === 'function' && n.props.testID !== 'node-id').map((n) => n.props.testID);
+  // The tab's actions by their ids (the node id's Copy act has none).
+  const buttons = (tree) => tree.root.findAllByType(Action)
+    .filter((n) => typeof n.props.onPress === 'function' && n.props.testID).map((n) => n.props.testID);
+  const moveButton = (tree) => tree.root.findAllByType(Action).find((n) => n.props.testID === 'node-move');
+  // The node's status in a word under its identity: its tone (live, needs) and the word.
+  const statusOf = (tree) => tree.root.findAllByType(Status).map((n) => [n.props.tone, n.props.label]);
   const light = (over) => ({ nodeId: NODE, status: status(), local: null, pending: null, answeredAt: null, balanceNano: 0, ...over });
 
   it('no node: the one sentence, no button and no link', () => {
@@ -225,7 +258,7 @@ describe('what each state shows', () => {
       expect(shown(tree)).toContain(t(key));
       expect(shown(tree)).toContain('4,714.356375 QNC');
       expect(buttons(tree)).toEqual(['node-move']);
-      expect(tree.root.find((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function').props.disabled).toBe(false);
+      expect(moveButton(tree).props.disabled).toBe(false);
     }
   });
 
@@ -263,7 +296,7 @@ describe('what each state shows', () => {
       const tree = render({ light: l });
       expect(shown(tree)).toContain('—');
       expect(shown(tree)).not.toContain('0 QNC');
-      expect(tree.root.find((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function').props.disabled).toBe(true);
+      expect(moveButton(tree).props.disabled).toBe(true);
     }
   });
 
@@ -294,7 +327,7 @@ describe('what each state shows', () => {
       }),
     });
     const text = shown(tree);
-    expect(text).toContain(t('node_badge_online'));
+    expect(statusOf(tree)).toEqual([['live', t('node_status_online')]]);
     expect(text).toContain(t('node_answered_yes', { time: '14:05' }));
     // No count of epochs and no device model: the site's node cabinet shows both (owner, 11.10).
     expect(text).not.toMatch(/Counted epochs|5 of 6|Acme Phone 7|Device/);
@@ -302,17 +335,42 @@ describe('what each state shows', () => {
     // No line on how the node works: status rows, the balance and Move to wallet only.
     expect(text).not.toMatch(/app switcher|status requests|until you move it|reaches 1 QNC/);
     expect(buttons(tree)).toEqual(['node-move']);
-    expect(tree.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.disabled).toBe(false);
+    expect(moveButton(tree).props.disabled).toBe(false);
+  });
+
+  it('the node tile: its status chip before its type, its whole name under them on one line with no Copy, the epoch mark', () => {
+    const epoch = Math.floor(2241840 / 14400);
+    const mark = (tree) => tree.root.findAll((n) => typeof n.type === 'string' && /^node-epoch-(answered|waiting)$/.test(n.props.testID || ''))
+      .map((n) => n.props.testID);
+    let tree = render({ light: light({ local: LOCAL, answeredAt: { epoch, at: Date.now() }, status: status({ answered: true }) }) });
+    expect(mark(tree)).toEqual(['node-epoch-answered']);
+    // No round mark at the head; the chip comes first on the type's row.
+    expect(tree.root.findAll((n) => /^node-pulse-/.test(n.props.testID || '')).length).toBe(0);
+    const row = tree.root.find((n) => typeof n.type === 'string' && n.props.testID === 'node-head-row');
+    const [first, last] = [row.children[0], row.children[row.children.length - 1]];
+    expect([first.findAll((n) => n.props.testID === 'node-status').length > 0, last.type]).toEqual([true, Text]);
+    // The whole name on one line, shrunk to fit and never cut, and nothing copies it.
+    const name = tree.root.find((n) => n.type === Text && n.props.testID === 'node-id');
+    expect([[].concat(name.props.children).join(''), name.props.numberOfLines, name.props.adjustsFontSizeToFit, name.props.ellipsizeMode, name.props.onPress])
+      .toEqual([NODE, 1, true, undefined, undefined]);
+    expect(tree.root.findAll((n) => n.props.testID === 'node-id' && typeof n.props.onPress === 'function').length).toBe(0);
+    expect(shown(tree)).not.toContain(t('common_copy'));
+    tree = render({ light: light({ local: LOCAL, status: status({ answered: false }) }) });
+    expect(mark(tree)).toEqual(['node-epoch-waiting']);
+    // The title stays with the tab unless the screen pins it above its scroll.
+    const heads = (tr) => tr.root.findAll((n) => n.type === Text && n.props.accessibilityRole === 'header').map((n) => n.props.children);
+    expect(heads(render({ light: light({ local: LOCAL }) }))).toEqual([t('node_title')]);
+    expect(heads(render({ light: light({ local: LOCAL }), showHead: false }))).toEqual([]);
   });
 
   it('this device, Offline: the hint, nothing to press for it; below 1 QNC nothing moves, with no note about it', () => {
     const tree = render({ light: light({ local: LOCAL, balanceNano: 0.4e9, status: status({ needsReactivation: true, answered: false }) }) });
     const text = shown(tree);
-    expect(text).toContain(t('node_badge_offline'));
+    expect(statusOf(tree)).toEqual([['needs', t('node_status_offline')]]);
     expect(text).not.toMatch(/answers again when the app is opened|reaches 1 QNC/);
     expect(text).toContain(t('node_answered_no'));
     expect(buttons(tree)).toEqual(['node-move']);
-    expect(tree.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.disabled).toBe(true);
+    expect(moveButton(tree).props.disabled).toBe(true);
     // The text that named the 1 QNC floor is gone from every language (owner, 04.10).
     expect(hasKey('node_move_min')).toBe(false);
   });
@@ -374,7 +432,7 @@ describe('what each state shows', () => {
     });
     const text = shown(tree);
     expect(text).toContain(SUPER);
-    expect(text).toContain(t('node_badge_online'));
+    expect(statusOf(tree)).toEqual([['live', t('node_active')]]);
     expect(text).toContain(`${t('node_last_seen')}\n${t('node_last_seen_ago', { time: t('node_ago_m', { m: 2 }) })}`);
     expect(text).toContain(`${t('node_heartbeats')}\n${t('node_heartbeats_of', { n: 4, m: 9 })}`);
     expect(text).not.toMatch(/Counted epochs|5 of 6/); // the site's node cabinet counts epochs (owner, 11.10)
@@ -383,11 +441,12 @@ describe('what each state shows', () => {
     expect(text).toContain('2 QNC');
     expect(buttons(tree)).toEqual(['node-move']);
     // Offline, as a node that has it offline answers: no time seen, no epochs yet (unknown until read).
-    const off = shown(render({
+    const offTree = render({
       server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ isOnline: false, lastSeen: 0, lastSeenAgoSeconds: undefined }), epochs: null },
       light: null,
-    }));
-    expect(off).toContain(t('node_badge_offline'));
+    });
+    const off = shown(offTree);
+    expect(statusOf(offTree)).toEqual([['needs', t('node_server_offline')]]);
     expect(off).toContain(t('node_server_offline'));
     expect(off).not.toContain(t('node_last_seen'));
   });
@@ -399,12 +458,10 @@ describe('what each state shows', () => {
     const waiting = serverStatus({ isOnline: false, lastSeen: 0, lastSeenAgoSeconds: undefined, admission: 'waiting' });
     const tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: waiting, epochs: null }, light: null });
     const text = shown(tree);
-    expect(text).toContain(`${t('node_status_node')}\n${t('node_waiting_admission')}`);
-    expect(text).toContain(t('node_badge_waiting'));
-    expect(text).not.toContain(t('node_badge_offline'));
+    expect(statusOf(tree)).toEqual([['needs', t('node_waiting_admission')]]);
     expect(text).not.toContain(t('node_server_offline'));
     expect(text).toContain('2 QNC');
-    expect(tree.root.find((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function').props.disabled).toBe(false);
+    expect(moveButton(tree).props.disabled).toBe(false);
     expect(t('node_waiting_admission')).toBe('Registered, not admitted to consensus yet');
     expect(waitingAdmission(waiting)).toBe(true);
     for (const s of [serverStatus({ isOnline: false }), serverStatus({ admission: 'admitted' }),
@@ -413,14 +470,12 @@ describe('what each state shows', () => {
     }
     // The node's admission 'waiting' (what live nodes report) is the same state, as the site shows it: online or not.
     expect(waitingAdmission(serverStatus({ admission: 'waiting' }))).toBe(true);
-    const reported = shown(render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ admission: 'waiting' }), epochs: null }, light: null }));
-    expect(reported).toContain(`${t('node_status_node')}\n${t('node_waiting_admission')}`);
-    expect(reported).toContain(t('node_badge_waiting'));
-    expect(reported).not.toContain(t('node_badge_online'));
-    expect(reported).not.toContain(t('node_active'));
+    const reportedTree = render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ admission: 'waiting' }), epochs: null }, light: null });
+    expect(statusOf(reportedTree)).toEqual([['needs', t('node_waiting_admission')]]);
+    expect(shown(reportedTree)).not.toContain(t('node_active'));
     // Online, as before, while the node names no admission rule.
-    expect(shown(render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: null }, light: null })))
-      .toContain(t('node_badge_online'));
+    expect(statusOf(render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: null }, light: null })))
+      .toEqual([['live', t('node_active')]]);
   });
 
   // Plan P1: the node's own admission field, when it reports it admitted, is a row of the card ("Admitted"); waiting is
@@ -458,17 +513,17 @@ describe('what each state shows', () => {
     expect(text).toContain(`${t('node_balance')}\n0.5 QNC`);
     expect(text).not.toContain('13 QNC');
     expect(text.split(t('node_balance')).length - 1).toBe(1);
-    const moves = tree.root.findAllByType(TouchableOpacity).filter((n) => n.props.testID === 'node-move');
+    const moves = tree.root.findAllByType(Action).filter((n) => n.props.testID === 'node-move');
     expect(moves.map((n) => n.props.disabled)).toEqual([true]);
     // The light card alone holds the same move whichever id made it.
     const alone = render({ light: light({ local: LOCAL, balanceNano: 13e9, status: status({ answered: true }) }),
       transit: { ...transit, moves: [move(SUPER, '12500000000', 500_000_000)] } });
     expect(shown(alone)).toContain(t('node_moving', { amount: '12.5 QNC' }));
-    expect(alone.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.disabled).toBe(true);
+    expect(moveButton(alone).props.disabled).toBe(true);
     // A settled move leaves no sentence on the card (owner, 12.10: no "did not go through"): the balance, the button on.
     const settled = { owner: 'w', moves: [], outcomes: [{ nodeId: SUPER, txHash: null, amountNano: '12500000000', result: 'done', at: Date.now() }], floor: 103 };
     const after = render({ light: light({ local: LOCAL, balanceNano: 13e9, status: status({ answered: true }) }), transit: settled });
-    expect(after.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.disabled).toBe(false);
+    expect(moveButton(after).props.disabled).toBe(false);
     expect(shown(after)).toContain(`${t('node_balance')}\n13 QNC`);
     expect(after.root.findAll((n) => n.props.testID === 'node-move-failed')).toEqual([]);
   });
@@ -497,7 +552,7 @@ describe('what each state shows', () => {
     expect(text.indexOf(SUPER)).toBeLessThan(text.indexOf(NODE));
     expect(buttons(tree)).toEqual(['node-move']);
     expect(text.split('3 QNC').length - 1).toBe(1);
-    act(() => { tree.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === 'node-move').props.onPress(); });
+    act(() => { moveButton(tree).props.onPress(); });
     expect(moved).toEqual(['server']);
     // A server card that shows no balance (not registered): the light card keeps its own.
     const unregistered = render({
@@ -529,7 +584,7 @@ describe('what each state shows', () => {
     expect(kept).toEqual({ ...good, stale: true });
     const text = shown(card(kept));
     expect(text).toContain(t('node_unreachable'));
-    expect(text).toContain(t('node_badge_online'));
+    expect(statusOf(card(kept))).toEqual([['live', t('node_active')]]);
     expect(text).toContain('2 QNC');
     expect(buttons(card(kept))).toEqual(['node-move']);
     expect(text).not.toContain(t('node_super_server'));

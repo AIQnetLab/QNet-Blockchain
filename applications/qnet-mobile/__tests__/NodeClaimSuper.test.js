@@ -5,7 +5,8 @@
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 jest.mock('../src/crypto/DilithiumCrypto', () => ({
   isDilithiumAvailable: () => true,
@@ -33,8 +34,7 @@ const SOLANA = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
 const CLAIMS = JSON.stringify({ claims: [{ epoch: 5, amount: 20000000000 }, { epoch: 6, amount: 28000000000 }] });
 
 const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-const button = (tree, label) => tree.root.findAllByType(TouchableOpacity)
-  .find((b) => b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('') === label);
+const button = (tree, label) => tree.root.findAllByType(Action).find((b) => b.props.label === label);
 const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
 
 let posted;

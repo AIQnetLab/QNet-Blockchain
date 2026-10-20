@@ -133,8 +133,10 @@ test('the Overview offers Move to wallet for a light and a super node, naming th
     // An address only viewed is offered no move, nor a way to it (CabinetFrame's viewing line has Stop viewing).
     assert.match(part, /\{\(movable \|\| moved\) && !viewOnly && choice && \(/);
     assert.doesNotMatch(part, /ConnectFirst/);
-    assert.match(part, /<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/);
+    // The ways sit in the one node balance group, which says what moving means (Balance, beside them).
+    assert.match(part, /<Balance nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\}>/);
   }
+  assert.match(home, /<p className="body">\{t\('balance_lead'\)\}<\/p>\s*\{children\}/);
   assert.match(sup, /const movable = isClaimNodeId\(nodeId\) && canMove\(status\.balanceNano\);/);
   assert.doesNotMatch(home, /balance_move|super_move/);
   const claim = code('components/cabinet/NodeClaim.tsx');
@@ -144,4 +146,5 @@ test('the Overview offers Move to wallet for a light and a super node, naming th
   assert.match(claim, /useLinkSession\(\{ slot: `claim\.\$\{nodeId\}` \}\)/);
   assert.match(claim, /useLinkSession\(\{ slot: `claim-qr\.\$\{nodeId\}` \}\)/);
   assert.match(claim, /&& \(choice\?\.source === 'extension' \|\| accounts\?\.qnet === qnet\)/);
+  assert.match(claim, /const \{ extension \} = useMoveWays\(qnet\);/);
 });

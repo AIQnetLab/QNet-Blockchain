@@ -1,19 +1,22 @@
 /**
- * History rows (owner, 06.10): each row is the asset's icon with a badge for what happened, a title in plain words over
- * whom it was with (and its status after it while it is not final), and the amount with its sign and colour; one row per
- * transaction (a node registration the registry and a transaction feed both report is one row, never a "Sent 0 QNC"
- * beside "Node registered"); a header per day; and a screen-reader label naming what, the amount and when.
+ * History rows: a title in plain words over whom it was with (and its status after it while it is not final), and the
+ * amount with its sign and tone, no icon and no badge; amounts in the one amount format, never with a suffix or an
+ * exponent; one row per transaction (a node registration the registry and a transaction feed both report is one row,
+ * never a "Sent 0 QNC" beside "Node registered"); a header per day; and a screen-reader label naming what, the amount
+ * and when.
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
 import { StyleSheet, Text, View } from 'react-native';
 import {
-  BADGES, BadgeGlyph, HistoryRow, TxDetail, dayLabel, describeTx, rowA11yLabel, shortAddress, txKind,
+  BESIDE_CHARS, HistoryRow, TxDetail, compactAmount, compactDecimalText, dayLabel, describeTx, rowA11yLabel, txKind,
 } from '../src/screens/HistoryTab';
+import { shortAddress } from '../src/utils/addressDisplay';
+import { FIGURE_LINE } from '../src/components/InfoRow';
+import { color } from '../src/theme';
 import {
   historyEntries, historySections, mergeHistory, splitExplorerItems, txNodeId, txTypeName, nodeNativeRow,
 } from '../src/utils/txHistory';
-import { tokenIconSource, tokenIconUri } from '../src/components/TokenIcons';
 
 const { makeT } = require('../src/i18n');
 
@@ -42,49 +45,50 @@ const nodeEvent = (extra = {}) => ({
 const registrationItem = { source: 'tx', hash: 'f'.repeat(64), idx: 3, block: 2851100, timestamp: AT, from: ME, to: null, amount: '0', tx_type: 'NodeRegistration', fee: '0' };
 
 const shown = (d) => ({
-  kind: d.kind, badge: d.badge, title: t(d.title), status: d.status,
-  sub: d.sub ? (d.sub.text != null ? d.sub.text : t(d.sub.key, d.sub.params)) : null,
+  kind: d.kind, title: t(d.title), status: d.status,
+  sub: d.sub ? t(d.sub.key, d.sub.params) : null,
   amounts: d.legs.map((l) => `${l.number} ${l.symbol}`), tones: d.legs.map((l) => l.tone),
 });
+const flatStyle = (n) => StyleSheet.flatten(n.props.style) || {};
 const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string').join(''));
 
-describe('each kind of row: icon, badge, title, whom with, amount, sign and colour', () => {
+describe('each kind of row: title, whom with, amount, sign and tone', () => {
   it('QNC sent, received, to itself and burnt', () => {
     expect(shown(describeTx(native()))).toEqual({
-      kind: 'send', badge: 'sent', title: 'Sent', status: 'confirmed', sub: `To: ${OTHER.slice(0, 4)}…${OTHER.slice(-4)}`,
-      amounts: ['−12.5 QNC'], tones: ['#ffffff'],
+      kind: 'send', title: 'Sent', status: 'confirmed', sub: `To: ${OTHER.slice(0, 6)}…${OTHER.slice(-6)}`,
+      amounts: ['−12.5 QNC'], tones: [color.paper],
     });
-    expect(describeTx(native()).icon.source).toBe(tokenIconSource('QNC'));
     expect(shown(describeTx(native({ from: OTHER, to: ME, type: 'receive' })))).toMatchObject({
-      kind: 'receive', badge: 'received', title: 'Received', sub: 'From: eeee…eeee', amounts: ['+12.5 QNC'], tones: ['#00ff88'],
+      kind: 'receive', title: 'Received', sub: 'From: eeeeee…eeeeee', amounts: ['+12.5 QNC'], tones: [color.mint],
     });
     expect(shown(describeTx(native({ to: ME, type: 'self' })))).toMatchObject({
-      kind: 'self', badge: 'self', title: 'Sent to self', sub: null, amounts: ['12.5 QNC'], tones: ['#00d4ff'],
+      kind: 'self', title: 'Sent to self', sub: null, amounts: ['12.5 QNC'], tones: [color.paper],
     });
-    expect(shown(describeTx(native({ to: BURN })))).toMatchObject({ kind: 'burn', badge: 'burn', title: 'Burned', amounts: ['−12.5 QNC'] });
+    expect(shown(describeTx(native({ to: BURN })))).toMatchObject({ kind: 'burn', title: 'Burned', amounts: ['−12.5 QNC'] });
   });
 
-  it('a token: its letter and symbol, its contract id when not added, an NFT by its id', () => {
+  it('a token: its symbol, its contract id when not added, an NFT by its id; one named after QNet in Ember', () => {
     const d = describeTx(token());
-    expect(shown(d)).toMatchObject({ kind: 'receive', badge: 'received', amounts: ['+1,500 GLD'], tones: ['#00ff88'] });
-    expect(d.icon).toMatchObject({ source: null, letter: 'G', seed: CONTRACT });
+    expect(shown(d)).toMatchObject({ kind: 'receive', amounts: ['+1,500 GLD'], tones: [color.mint] });
+    expect(d.legs[0].symbolTone).toBe(color.mint);
     expect(shown(describeTx(token({ tokenMetaTrusted: false }))).amounts).toEqual(['+1,500 GLD (c0ffee…78aa)']);
     expect(shown(describeTx(token({ tokenStd: 'qrc721', tokenId: '123456789012', type: 'send', from: ME, to: OTHER }))).amounts)
       .toEqual(['−#1234…9012 GLD']);
-    expect(shown(describeTx(token({ tokenSymbol: 'QNC', tokenMetaTrusted: false }))).amounts[0]).toMatch(/^\+1,500 ⚠ QNC \(/);
+    const reserved = describeTx(token({ tokenSymbol: 'QNC', tokenMetaTrusted: false }));
+    expect(shown(reserved).amounts[0]).toMatch(/^\+1,500 QNC \(/);
+    expect([reserved.reserved, reserved.legs[0].symbolTone]).toEqual([true, color.ember]);
   });
 
-  it('a Solana send: the asset\'s own icon; a failed one carries the red mark, says Failed and greys its amount', () => {
+  it('a Solana send; a failed one says Failed and its amount is in Fog', () => {
     const d = describeTx(sol());
-    expect(d.icon.source).toEqual({ uri: tokenIconUri('SOL') });
-    expect(shown(d)).toMatchObject({ kind: 'send', badge: 'sent', amounts: ['−0.5 SOL'], sub: 'To: So1R…1111' });
-    expect(describeTx(sol({ solSymbol: '1DEV' })).icon.source).toEqual({ uri: tokenIconUri('1DEV') });
-    expect(shown(describeTx(sol({ status: 'failed' })))).toMatchObject({ badge: 'failed', status: 'failed', tones: ['#8a8fa3'] });
+    expect(shown(d)).toMatchObject({ kind: 'send', amounts: ['−0.5 SOL'], sub: 'To: So1Rec…111111' });
+    expect(shown(describeTx(sol({ solSymbol: '1DEV' }))).amounts).toEqual(['−0.5 1DEV']);
+    expect(shown(describeTx(sol({ status: 'failed' })))).toMatchObject({ status: 'failed', tones: [color.fog] });
   });
 
-  it('a node registration moves nothing: the node badge, the node, no amount', () => {
+  it('a node registration moves nothing: the node, no amount', () => {
     expect(shown(describeTx(nodeEvent()))).toEqual({
-      kind: 'node_registered', badge: 'node', title: 'Node registered', status: 'confirmed', sub: 'Node light_9f3a2c1d0e7b', amounts: [], tones: [],
+      kind: 'node_registered', title: 'Node registered', status: 'confirmed', sub: 'Node light_9f3a2c1d0e7b', amounts: [], tones: [],
     });
     // The explorer's registration row alone (the registry's feed down): never "Sent 0 QNC".
     const [row] = splitExplorerItems([registrationItem], ME).native;
@@ -99,33 +103,32 @@ describe('each kind of row: icon, badge, title, whom with, amount, sign and colo
   it('the node balance moved into the wallet, a node check-in, a node back online, an older activation', () => {
     const claim = native({ from: 'system_rewards_pool', to: ME, type: 'receive', amount: 5, txType: 'RewardDistribution', fee: 0 });
     expect(shown(describeTx(claim))).toMatchObject({
-      kind: 'node_claim', badge: 'node', title: 'Moved from node', sub: 'From: node balance', amounts: ['+5 QNC'], tones: ['#00ff88'],
+      kind: 'node_claim', title: 'Moved from node', sub: 'From: node balance', amounts: ['+5 QNC'], tones: [color.mint],
     });
     const checkin = native({ amount: 0, to: null, txType: 'Heartbeat { node_id: "super_ab12", anchor_height: 10, anchor_hash: "x" }' });
-    expect(shown(describeTx(checkin))).toMatchObject({ kind: 'node_checkin', badge: 'node', title: 'Node check-in', sub: 'Node super_ab12', amounts: [] });
+    expect(shown(describeTx(checkin))).toMatchObject({ kind: 'node_checkin', title: 'Node check-in', sub: 'Node super_ab12', amounts: [] });
     // The activation transaction of older blocks brought a node in as a registration does, and is called so.
     expect(shown(describeTx(native({ amount: 0, to: null, txType: 'NodeActivation' })))).toMatchObject({ kind: 'node_registered', title: 'Node registered', amounts: [] });
     expect(shown(describeTx(native({ amount: 0, to: null, txType: 'NodeReactivation' })))).toMatchObject({ kind: 'node_back_online', title: 'Node back online' });
   });
 
-  it('a contract call: the code badge and the contract id; an amount only when it carried value', () => {
+  it('a contract call: the contract id; an amount only when it carried value', () => {
     expect(shown(describeTx(native({ to: CONTRACT, amount: 0, txType: 'ContractCall' })))).toEqual({
-      kind: 'contract_call', badge: 'contract', title: 'Contract call', status: 'confirmed', sub: 'Contract c0ffee…78aa', amounts: [], tones: [],
+      kind: 'contract_call', title: 'Contract call', status: 'confirmed', sub: 'Contract c0ffee…78aa', amounts: [], tones: [],
     });
     expect(shown(describeTx(native({ to: CONTRACT, amount: 2, txType: 'ContractCall' }))).amounts).toEqual(['−2 QNC']);
     expect(shown(describeTx(native({ to: CONTRACT, amount: 0, txType: 'ContractDeploy' })))).toMatchObject({ kind: 'contract_deploy', title: 'Contract deployed' });
   });
 
-  it('a swap: two legs of one transaction, the one received first, its asset\'s icon', () => {
+  it('a swap: two legs of one transaction, the one received first; the legs say what went and what came', () => {
     const out = token({ tokenLogIndex: 0, type: 'send', from: ME, to: CONTRACT, tokenSymbol: 'GLD', tokenAmountDisplay: '10' });
     const got = token({ tokenLogIndex: 1, tokenContract: 'd'.repeat(64), tokenSymbol: 'SLV', tokenAmountDisplay: '250', from: CONTRACT });
     const entries = historyEntries([out, got]);
     expect(entries).toHaveLength(1);
     const d = describeTx(entries[0]);
     expect(shown(d)).toEqual({
-      kind: 'swap', badge: 'swap', title: 'Swap', status: 'confirmed', sub: 'GLD → SLV', amounts: ['+250 SLV', '−10 GLD'], tones: ['#00ff88', '#ffffff'],
+      kind: 'swap', title: 'Swap', status: 'confirmed', sub: null, amounts: ['+250 SLV', '−10 GLD'], tones: [color.mint, color.paper],
     });
-    expect(d.icon.letter).toBe('S');
     expect(txKind(native({ txType: 'Swap' }))).toBe('swap');
     // A contract call's own 0 QNC row beside the token it brought in is no swap, and no "0 QNC" line.
     const call = native({ hash: 'b'.repeat(64), to: CONTRACT, amount: 0, txType: 'ContractCall' });
@@ -136,22 +139,23 @@ describe('each kind of row: icon, badge, title, whom with, amount, sign and colo
   it('a row not final says its status after whom it was with, wrapping rather than cutting either', async () => {
     let tree;
     await act(async () => { tree = renderer.create(<HistoryRow tx={native({ status: 'pending' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree)).toEqual(['Sent', 'To: eeee…eeee', 'Pending', '−12.5', ' QNC']);
+    expect(texts(tree)).toEqual(['Sent', 'To: eeeeee…eeeeee', 'Pending', '−12.5', ' QNC']);
     // Whom with keeps one line; the status is its own run beside it, which wraps under it when both do not fit.
-    const party = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).includes('To: eeee…eeee'));
+    const party = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).includes('To: eeeeee…eeeeee'));
     expect([party.props.numberOfLines, party.props.adjustsFontSizeToFit, party.props.minimumFontScale]).toEqual([1, true, 0.8]);
     const line = tree.root.findAll((n) => n.type === View && n.findAllByType(Text).includes(party)).pop();
     expect(StyleSheet.flatten(line.props.style)).toMatchObject({ flexDirection: 'row', flexWrap: 'wrap' });
-    expect(line.findAllByType(Text).map((n) => [].concat(n.props.children).join(''))).toEqual(['To: eeee…eeee', 'Pending']);
+    expect(line.findAllByType(Text).map((n) => [].concat(n.props.children).join(''))).toEqual(['To: eeeeee…eeeeee', 'Pending']);
     await act(async () => { tree.update(<HistoryRow tx={native()} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree)).toEqual(['Sent', 'To: eeee…eeee', '−12.5', ' QNC']);
+    expect(texts(tree)).toEqual(['Sent', 'To: eeeeee…eeeeee', '−12.5', ' QNC']);
     // A row that names no one says its status alone.
     await act(async () => { tree.update(<HistoryRow tx={native({ status: 'pending', to: null, amount: 0, txType: 'ContractCall' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree)).toEqual(['Contract call', 'Pending']);
     await act(async () => { tree.update(<HistoryRow tx={native({ status: 'dropped' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree)).toContain('Not found');
-    // Nothing moved: the red mark, as for a failed one (and as the extension draws a dropped row).
-    expect(tree.root.findAll((n) => n.props.testID === 'history-badge-glyph-failed')).not.toHaveLength(0);
+    // Nothing moved: its status in Ember, its amount in Fog.
+    expect(flatStyle(tree.root.find((n) => n.type === Text && n.props.testID === 'history-badge-dropped')).color).toBe(color.ember);
+    expect(flatStyle(tree.root.findAllByType(Text).find((n) => n.props.children === '−12.5')).color).toBe(color.fog);
     // A confirmed row says no status.
     await act(async () => { tree.update(<HistoryRow tx={native()} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree)).not.toContain('Confirmed');
@@ -169,21 +173,61 @@ describe('each kind of row: icon, badge, title, whom with, amount, sign and colo
     expect(StyleSheet.flatten(inline.parent.props.style).flexDirection).toBe('row');
   });
 
-  it('every badge is a disc in the app\'s colours with its glyph; a failed row carries the red one', async () => {
-    const Svg = require('react-native-svg');
-    for (const name of Object.keys(BADGES)) {
-      let glyph;
-      await act(async () => { glyph = renderer.create(<BadgeGlyph name={name} size={18} />); });
-      expect([name, glyph.root.findAllByType(Svg.Circle).find((n) => n.props.r === 12).props.fill]).toEqual([name, BADGES[name].fill]);
-      expect([name, glyph.root.findAllByType(Svg.Path)[0].props.d]).toEqual([name, BADGES[name].d]);
-      expect([name, BADGES[name].fill]).toEqual([name, expect.stringMatching(/^#(ffffff|00ff88|00d4ff|b0b0b0|ffaa00|ff4444)$/)]);
-      await act(async () => { glyph.unmount(); });
+  it('a row wears its token\'s icon (a token with a contract its letter), no badge; a row that moves nothing wears none', async () => {
+    const icon = (tree) => tree.root.findAll((n) => typeof n.props.testID === 'string' && n.props.testID.startsWith('token-icon-')
+      && typeof n.type !== 'string').map((n) => n.props.testID);
+    for (const [tx, want] of [[native(), ['token-icon-QNC']], [token(), ['token-icon-letter']], [sol({ status: 'failed' }), ['token-icon-SOL']],
+      [nodeEvent(), []]]) {
+      let tree;
+      await act(async () => { tree = renderer.create(<HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={() => {}} />); });
+      expect([tx.hash, [...new Set(icon(tree))]]).toEqual([tx.hash, want]);
+      await act(async () => { tree.unmount(); });
     }
+  });
+
+  it('a number too long to sit beside the title takes the line under it, the whole width, shrinking to fit', async () => {
     let tree;
-    await act(async () => { tree = renderer.create(<HistoryRow tx={sol({ status: 'failed' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(tree.root.findAll((n) => n.props.testID === 'history-badge-glyph-failed')).not.toHaveLength(0);
-    const disc = tree.root.findAllByType(Svg.Circle).find((n) => n.props.r === 12);
-    expect(disc.props.fill).toBe('#ff4444');
+    const big = native({ from: OTHER, to: ME, type: 'receive', amount: 123456789012 });
+    await act(async () => { tree = renderer.create(<HistoryRow tx={big} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    const number = tree.root.findAllByType(Text).find((n) => n.props.children === '+123,456,789,012');
+    expect(number.props.children.length).toBeGreaterThan(BESIDE_CHARS);
+    expect(number.props).toMatchObject(FIGURE_LINE);
+    // The title's line holds the title alone; the amounts are the row's second child.
+    const row = tree.root.find((n) => n.props.testID === 'history-row' && typeof n.type === 'string');
+    const [line, amounts] = row.children.filter((c) => typeof c === 'object');
+    expect(line.findAllByType(Text).map((n) => n.props.children)).not.toContain('+123,456,789,012');
+    expect(amounts.findAllByType(Text).map((n) => n.props.children)).toContain('+123,456,789,012');
+    // A number that fits stays beside the title, one line at full size.
+    await act(async () => { tree.update(<HistoryRow tx={native({ amount: 98765.4321 })} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    const short = tree.root.findAllByType(Text).find((n) => n.props.children === '−98,765.43');
+    expect(short.props.numberOfLines).toBe(1);
+    expect(short.props.adjustsFontSizeToFit).toBeUndefined();
+  });
+});
+
+describe('a row\'s amount: the one amount format, never a suffix or an exponent', () => {
+  it('below 100,000 with few decimals, up to a million with at most two, from a million the whole number', () => {
+    expect(compactAmount(0)).toBe('0');
+    expect(compactAmount(0.000000001)).toBe('<0.00000001');
+    expect(compactAmount(0.12345678912)).toBe('0.12345679');
+    expect(compactAmount(12.5)).toBe('12.5');
+    expect(compactAmount(1234.5678)).toBe('1,234.57');
+    expect(compactAmount(98765.4321)).toBe('98,765.43');
+    expect(compactAmount(123456.789)).toBe('123,456.79');
+    expect(compactAmount(1234567.5)).toBe('1,234,568');
+    expect(compactAmount(4200000000000)).toBe('4,200,000,000,000');
+    expect(compactDecimalText('340282366920938463463374607431768211455')).toBe('340,282,366,920,938,463,463,374,607,431,768,211,455');
+    expect(compactDecimalText('1,500')).toBe('1,500');
+  });
+
+  it('no figure from 0 to 10^24 carries K, M, B, T or an exponent', () => {
+    for (let e = -9; e <= 24; e += 1) {
+      for (const m of [1, 2.5, 9.99]) {
+        const out = compactAmount(m * 10 ** e);
+        expect([m, e, /[KMBTe]/.test(out)]).toEqual([m, e, false]);
+        expect([m, e, /^(<)?[\d,]+(\.\d+)?$/.test(out)]).toEqual([m, e, true]);
+      }
+    }
   });
 });
 
@@ -210,7 +254,8 @@ describe('one row per transaction', () => {
     const onExplorer = jest.fn();
     await act(async () => { tree = renderer.create(<TxDetail tx={{ ...reg, nodeTypeTitle: 'Light node' }} t={t} onBack={() => {}} onCopy={() => {}} onExplorer={onExplorer} />); });
     expect(texts(tree)).toEqual(expect.arrayContaining(['Node registered', 'Light node', 'light_9f3a2c1d0e7b', 'f'.repeat(64), '2851100']));
-    expect(tree.root.findAll((n) => n.props.testID === 'history-icon-node')).not.toHaveLength(0);
+    // The status in a word, no badge.
+    expect(tree.root.find((n) => n.type === Text && n.props.testID === 'tx-detail-badge-confirmed').props.children).toBe(t('hist_status_confirmed'));
     await act(async () => { tree.root.find((n) => n.props.testID === 'tx-detail-explorer').props.onPress(); });
     expect(onExplorer).toHaveBeenCalledWith('f'.repeat(64), 'qnet');
   });
@@ -271,11 +316,28 @@ describe('day headers', () => {
   });
 });
 
-describe('the QNC icon', () => {
-  it('is the bundled mark Assets draws, enlarged to fill its round; no embedded copy is left', () => {
-    expect(tokenIconSource('QNC')).toBe(require('../assets/qnet_logo.png'));
-    expect(tokenIconUri('QNC')).toBe(null);
-    expect(describeTx(native()).icon).toMatchObject({ source: require('../assets/qnet_logo.png'), zoom: 1.4 });
+describe('the app mark', () => {
+  it('every token wears its icon, all bundled: nothing is fetched to draw one, and a look-alike gets its letter', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const icons = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'TokenIcons.js'), 'utf8');
+    expect(icons).not.toMatch(/https?:\/\//);
+    const { knownIcon } = require('../src/components/TokenIcons');
+    expect(knownIcon({ network: 'qnet', symbol: 'QNC' })).toBe('QNC');
+    expect(knownIcon({ network: 'solana', symbol: 'SOL' })).toBe('SOL');
+    expect(knownIcon({ network: 'solana', symbol: '1dev' })).toBe('1DEV');
+    // A token with a contract never wears a known icon, whatever symbol its deployer chose.
+    expect(knownIcon({ network: 'qnet', symbol: 'QNC', contract: 'qrc20:abc' })).toBeNull();
+    expect(knownIcon({ network: 'qnet', symbol: 'SOL' })).toBeNull();
+    const screen = fs.readFileSync(path.join(__dirname, '..', 'src', 'screens', 'WalletScreen.js'), 'utf8');
+    expect(screen).not.toMatch(/raw\.githubusercontent|source=\{\{\s*uri/);
+    // Assets (QNC, QNet tokens, SOL and 1DEV), the Send switch, Receive and the token manager.
+    expect(screen.match(/<TokenIcon /g).length).toBeGreaterThanOrEqual(6);
+    for (const f of ['HistoryTab.js', 'SolanaSend.js']) {
+      expect(fs.readFileSync(path.join(__dirname, '..', 'src', 'screens', f), 'utf8')).toMatch(/<TokenIcon /);
+    }
+    // The one image of the open wallet is the app mark in its header, the bundled file.
+    expect(screen.match(/require\('\.\.\/\.\.\/assets\/qnet_logo\.png'\)/g).length).toBeGreaterThan(0);
   });
 
   it('decodes: every chunk\'s CRC holds and the image data inflates to its full size (the embedded copy it replaces did not)', () => {
@@ -312,15 +374,15 @@ describe('screen-reader labels', () => {
     let tree;
     await act(async () => { tree = renderer.create(<HistoryRow tx={native({ status: 'pending' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
     const row = tree.root.find((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function');
-    expect(row.props.accessibilityLabel).toBe('Sent, −12.5 QNC, To: eeee…eeee, Pending, 06.10.2026, 14:29');
+    expect(row.props.accessibilityLabel).toBe('Sent, −12.5 QNC, To: eeeeee…eeeeee, Pending, 06.10.2026, 14:29');
     await act(async () => { tree.update(<HistoryRow tx={native()} t={t} hideAmounts onOpen={() => {}} />); });
     expect(tree.root.find((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function').props.accessibilityLabel)
-      .toBe('Sent, To: eeee…eeee, 06.10.2026, 14:29');
+      .toBe('Sent, To: eeeeee…eeeeee, 06.10.2026, 14:29');
     expect(rowA11yLabel(describeTx(nodeEvent()), nodeEvent(), t, false)).toBe('Node registered, Node light_9f3a2c1d0e7b, 06.10.2026, 14:29');
   });
 
-  it('addresses are shortened to their first and last four characters', () => {
-    expect(shortAddress(ME)).toBe('d9fa…823e');
+  it('addresses are shortened to their first and last six characters', () => {
+    expect(shortAddress(ME)).toBe('d9fa37…73823e');
     expect(shortAddress('short')).toBe('short');
   });
 });
@@ -401,9 +463,8 @@ describe('a token whose symbol carries a direction override (M-5)', () => {
     const tx = token({ tokenSymbol: RLO, tokenMetaTrusted: false });
     const d = describeTx(tx);
     expect(d.reserved).toBe(true);
-    expect(d.legs[0].symbol.startsWith('⚠ ')).toBe(true);
+    expect(d.legs[0].symbolTone).toBe(color.ember);
     expect(FORMAT.test(d.legs[0].symbol)).toBe(false);
-    expect(FORMAT.test(d.icon.letter)).toBe(false);
     let tree;
     await act(async () => { tree = renderer.create(<HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree).filter((w) => FORMAT.test(w))).toEqual([]);

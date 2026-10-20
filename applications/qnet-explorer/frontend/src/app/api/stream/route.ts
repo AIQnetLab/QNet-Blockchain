@@ -1,31 +1,19 @@
 import { NextRequest } from 'next/server';
-import { headHub, type HeadSnapshot } from '@/server/head-hub';
+import { headEvent, headHub, type HeadSnapshot } from '@/server/head-hub';
 import { getClientIdentifier } from '../../../../lib/rate-limit';
 
 export const dynamic = 'force-dynamic';
 
-// Server-sent head stream: one `head` event per committed block (height, hash, time, counters, sync
-// state). Rows are not pushed; a client on the live page refetches its list from the process cache.
+// Server-sent head stream: one `head` event per committed block (height, hash, time, the block's producer and
+// transaction count, counters, sync state). Rows are not pushed; a client on the live page refetches its list from the
+// process cache.
 // Bounded per client IP; a heartbeat every 15 s keeps proxies from closing an idle stream.
 
 const MAX_STREAMS_PER_IP = 6;
 const HEARTBEAT_MS = 15_000;
 const streamsPerIp = new Map<string, number>();
 
-function headPayload(s: HeadSnapshot): string {
-  const st = s.stats;
-  return JSON.stringify({
-    v: s.version,
-    height: s.height,
-    hash: s.hash,
-    timestamp: s.timestamp,
-    txTotal: st.tx_total,
-    txByType: st.tx_by_type,
-    blocksTotal: st.blocks_total,
-    emissionTotal: st.emission_total,
-    sync: { head: s.sync.last_height, prefix: s.sync.indexed_prefix, nodeHeight: s.sync.node_height, live: s.sync.ws_connected },
-  });
-}
+const headPayload = (s: HeadSnapshot): string => JSON.stringify(headEvent(s));
 
 export async function GET(request: NextRequest) {
   const ip = getClientIdentifier(request);

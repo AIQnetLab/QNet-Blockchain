@@ -286,7 +286,9 @@ describe('one parser and one entry for every request', () => {
     expect(ws.match(/openTransferLink\(url\)/g)).toHaveLength(1); // the OS link
     // The in-app browser opens no transfer request: the payment address's page never loads there.
     expect(fs.readFileSync(path.join(src, 'browser', 'BrowserScreen.js'), 'utf8')).not.toMatch(/transferLink|solanaRequest|SolanaRequest|solana:/);
-    // The from-a-link line keeps its style in one place.
-    expect(StyleSheet.flatten(require('../src/screens/WalletScreen.styles').default.sendFromLink)).toMatchObject({ textAlign: 'center' });
+    // The from-a-link line keeps its style in one place: a quiet note, start-aligned with the form.
+    const line = StyleSheet.flatten(require('../src/screens/WalletScreen.styles').default.sendFromLink);
+    expect(line).toMatchObject({ color: require('../src/theme').color.fog });
+    expect(line.textAlign).toBeUndefined();
   });
 });

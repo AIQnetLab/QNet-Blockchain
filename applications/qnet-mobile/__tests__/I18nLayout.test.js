@@ -40,13 +40,26 @@ function mockCharEm(ch) {
   if (/[A-ZА-ЯЁ]/.test(ch)) return 0.66;
   return 0.54;
 }
+// A mono face: every glyph its face's advance (theme MONO_ADVANCE, checked against the bundled files by Fonts.test).
+// A proportional face: the per-script estimate, a twentieth wider for a semibold or bold face and a fifth for the wide
+// title face (Archivo-Title: weight 760 at 110% width).
+function mockMonoEm(family) {
+  const advance = jest.requireActual('../src/theme').MONO_ADVANCE;
+  if (/Label/.test(family)) return advance.label;
+  if (/Figure/.test(family)) return advance.figure;
+  if (/Data/.test(family)) return advance.data;
+  return 0.6;
+}
 function mockTextWidth(text, style = {}) {
   const size = style.fontSize || 14;
-  const mono = /mono|courier/i.test(style.fontFamily || '');
+  const family = style.fontFamily || '';
+  const mono = /mono|courier/i.test(family);
+  const monoEm = mono ? mockMonoEm(family) : 0;
   let em = 0;
-  for (const ch of String(text)) em += mono ? (mockCharEm(ch) ? 0.6 : 0) : mockCharEm(ch);
-  const bold = style.fontWeight && (style.fontWeight === 'bold' || Number(style.fontWeight) >= 600);
-  return em * size * (bold ? 1.05 : 1) + (style.letterSpacing || 0) * [...String(text)].length;
+  for (const ch of String(text)) em += mono ? (mockCharEm(ch) ? monoEm : 0) : mockCharEm(ch);
+  const bold = /SemiBold/.test(family) || (style.fontWeight && (style.fontWeight === 'bold' || Number(style.fontWeight) >= 600));
+  const wide = /Archivo-Title/.test(family) ? 1.2 : (bold ? 1.05 : 1);
+  return em * size * wide + (style.letterSpacing || 0) * [...String(text)].length;
 }
 
 // The screens run in English ('en'), and 'en' is whichever table the suite chose: the widest text of each key over
@@ -245,6 +258,7 @@ jest.mock('../src/services/QNetLink', () => ({
   takeInitialUrl: jest.fn(async () => null),
   openSession: jest.fn(async () => ({ expiresAt: Date.now() + 60_000 })),
   prepareOffer: jest.fn(async () => ({ kind: 'connect', addresses: { qnet: mockQNET, solana: mockSOL } })),
+  readOffer: jest.requireActual('../src/services/QNetLink').readOffer,
   performIntent: jest.fn(),
   deliverAnswer: jest.fn(async () => 'delivered'),
   markHandled: jest.fn(async () => {}),
@@ -520,29 +534,30 @@ const Svg = require('react-native-svg').default;
 const { amountText } = require('../src/utils/amountFormat');
 const figure = (value, symbol) => `${amountText(value)} ${symbol}`;
 
-// The Send form's scan: one button inside the recipient field's own container, beside the address input, named by the
-// scan's title for screen readers and drawn as an icon, with no text. Returns the button.
-function expectScanInField(tree, placeholder, title) {
-  const scan = tree.root.findAll((n) => n.props.testID === 'send-scan' && typeof n.props.onPress === 'function', { deep: false });
-  expect(scan).toHaveLength(1);
-  expect(scan[0].props).toMatchObject({ accessibilityRole: 'button', accessibilityLabel: title });
-  expect(scan[0].findAllByType(Text)).toHaveLength(0);
-  expect(scan[0].findAllByType(Svg)).toHaveLength(1);
-  const field = tree.root.findAll((n) => n.props.style === walletStyles.recipientField)[0];
+// The Send form's scan: one act of the recipient field (components/ui/Field `end`, at the end of the label's line),
+// named by the scan's title for screen readers and saying Scan, with no drawn icon. Returns the act's pressable.
+const Field = require('../src/components/ui/Field').default;
+function expectScanInField(tree, placeholder, title, word = label('send_scan')) {
+  const scan = tree.root.findAll((n) => n.props.testID === 'send-scan' && typeof n.props.onPress === 'function');
+  const pressable = scan[scan.length - 1];
+  expect(pressable.props).toMatchObject({ accessibilityRole: 'button', accessibilityLabel: title });
+  expect(pressable.findAllByType(Text).map((n) => plain([].concat(n.props.children).join('')))).toEqual([word]);
+  expect(pressable.findAllByType(Svg)).toHaveLength(0);
+  const field = tree.root.findAllByType(Field).find((f) => f.findAll((n) => n === pressable).length === 1);
   expect(field).toBeDefined();
-  expect(field.findAll((n) => n === scan[0])).toHaveLength(1);
   expect(field.findAll((n) => n.type === TextInput && plain(n.props.placeholder || '') === placeholder)).toHaveLength(1);
-  return scan[0];
+  return pressable;
 }
 
-// The lock screen's message for `key`: whole width and centred under the title, and nothing in the lock column pulled up
-// over what is above it (a negative top margin), in a column that scrolls when the text is very large.
+// The lock screen's message for `key`: whole width and start-aligned under the field, and nothing in the lock column
+// pulled up over what is above it (a negative top margin), in a column that scrolls when the text is very large.
 function expectLockMessage(tree, key) {
   const message = tree.root.find((n) => n.props.testID === 'unlock-message' && n.type === Text);
   expect(plain([].concat(message.props.children).join(''))).toBe(label(key));
-  expect(StyleSheet.flatten(message.props.style)).toMatchObject({ alignSelf: 'stretch', textAlign: 'center', marginTop: 8 });
+  expect(StyleSheet.flatten(message.props.style)).toMatchObject({ alignSelf: 'stretch', marginTop: 0 });
+  expect(StyleSheet.flatten(message.props.style).textAlign).toBeUndefined();
   const column = tree.root.find((n) => n.props.testID === 'lock-column' && n.props.contentContainerStyle);
-  expect(StyleSheet.flatten(column.props.contentContainerStyle)).toMatchObject({ flexGrow: 1, justifyContent: 'center' });
+  expect(StyleSheet.flatten(column.props.contentContainerStyle)).toMatchObject({ flexGrow: 1, justifyContent: 'flex-end' });
   const pulled = column.findAll((n) => typeof n.type === 'string' && (StyleSheet.flatten(n.props.style) || {}).marginTop < 0);
   expect(pulled.map((n) => n.type)).toEqual([]);
 }
@@ -623,13 +638,17 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
 
   it('import', async () => {
     const tree = await mount();
+    // The welcome screen: the live field, what the app is, and Import as a full-width second button, not a link.
+    expect(tree.root.findAll((n) => n.props.testID === 'hex-field').length).toBeGreaterThan(0);
+    expect(texts(tree)).toContain(label('welcome_subtitle'));
+    expect(tree.root.find((n) => n.props.kind && n.props.label === L('import_wallet')).props.kind).toBe('secondary');
     await pressKey(tree, 'import_wallet');
     await type(tree, 'enter_password', 'Otter-Canyon-58');
     await type(tree, 'confirm_password', 'Otter-Canyon-58');
     const issues = [...check(tree, 'import step 1')];
     await pressKey(tree, 'common_next');
     await type(tree, 'import_placeholder', 'one two three four five');
-    await act(async () => { tree.root.find((n) => n.props.style === walletStyles.checkbox && n.props.onPress).props.onPress(); });
+    await act(async () => { tree.root.find((n) => n.props.accessibilityRole === 'checkbox' && n.props.onPress).props.onPress(); });
     await pressKey(tree, 'import_title');
     issues.push(...check(tree, 'import step 2'));
     expect(texts(tree)).toContain(plain(L('import_word_count', { count: 5 })));
@@ -724,7 +743,8 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     issues.push(...check(tree, 'send form: token'));
     await act(async () => { tree.root.find((n) => n.props.testID === 'qnet-token-QNC' && n.props.onPress).props.onPress(); });
     await flush(1);
-    expect(expectScanInField(tree, label('send_placeholder_eon'), L('scan_title')).props.hitSlop).toEqual({ top: 8, bottom: 8, right: 8 });
+    // Its target reaches 8 dp past it on every side, on the label's line above the field.
+    expect(expectScanInField(tree, label('send_placeholder_eon'), L('scan_title')).props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8, right: 8 });
     await type(tree, 'send_placeholder_eon', 'not-an-address');
     await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText('1'); });
     await flush(1);
@@ -795,7 +815,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     const issues = [...check(tree, 'assets: solana')];
     await pressKey(tree, 'assets_send');
     issues.push(...check(tree, 'solana send form'));
-    expect(expectScanInField(tree, label('send_placeholder_solana'), L('scan_title_solana')).props.hitSlop).toEqual({ top: 8, bottom: 8, right: 8 });
+    expect(expectScanInField(tree, label('send_placeholder_solana'), L('scan_title_solana')).props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8, right: 8 });
     await type(tree, 'send_placeholder_solana', 'not-an-address');
     await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText('1'); });
     await flush(1);
@@ -883,9 +903,11 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
 
     let tree = await nodeTab();
     shows(tree, ['node_answered', 'node_answered_no', 'node_epoch_ends', 'node_balance']);
-    // Each a label with its value on one line (components/InfoRow): the status, the answer, when the epoch ends (in 3 h
-    // 47 min) and the balance (1,234.567891 QNC); no device model and no count of epochs (owner, 11.10: the site's).
-    expect(tree.root.findAll((n) => n.type === 'View' && isInfoRow(n)).length).toBeGreaterThanOrEqual(4);
+    // The answer and when the epoch ends (in 3 h 47 min), each a label with its value on one line (components/InfoRow);
+    // the status in a word under the node's identity, the balance as the tab's figure (1,234.567891 QNC); no device
+    // model and no count of epochs (owner, 11.10: the site's).
+    expect(tree.root.findAll((n) => n.type === 'View' && isInfoRow(n)).length).toBeGreaterThanOrEqual(2);
+    expect(texts(tree)).toContain(label('node_status_offline'));
     expect(texts(tree)).not.toContain('Phone Model 13 Pro+');
     expect(texts(tree)).toContain(figure('1234.567891', 'QNC'));
     issues.push(...checkWidths(tree, 'node: here, offline'));
@@ -963,14 +985,14 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     Object.assign(mockState, { device: { capable: true, platform: 'ios', flags: 'mac=0,vision=0,idiom=phone', report: null } });
     mockState.node = { nodeType: 'super', pseudonym: 'super_9f3a2c1d0e7b' };
     tree = await nodeTab();
-    shows(tree, ['node_balance', 'node_move', 'node_type', 'node_last_seen', 'node_heartbeats',
+    shows(tree, ['node_balance', 'node_move', 'node_title_super', 'node_last_seen', 'node_heartbeats',
       'node_epoch_ends', 'node_reputation', 'node_banned', 'node_banned_hint']);
     issues.push(...checkWidths(tree, 'node: server node'));
     await unmount(tree);
     // Registered and not admitted to consensus yet (owner, 11.10): waiting, never Offline.
     mockState.server = { isOnline: false, admission: 'waiting', reputation: 70 };
     tree = await nodeTab();
-    shows(tree, ['node_waiting_admission', 'node_badge_waiting', 'node_move']);
+    shows(tree, ['node_waiting_admission', 'node_move']);
     expect(texts(tree)).not.toContain(label('node_server_offline'));
     issues.push(...checkWidths(tree, 'node: super node waiting for admission'));
     await unmount(tree);
@@ -979,7 +1001,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
       Object.assign(mockState, { server: { admission }, epochs: { notAdmitted: 3 } });
       tree = await nodeTab();
       shows(tree, admission === 'admitted' ? ['node_admission', 'node_admission_admitted', 'node_not_admitted']
-        : ['node_waiting_admission', 'node_badge_waiting', 'node_not_admitted']);
+        : ['node_waiting_admission', 'node_not_admitted']);
       issues.push(...checkWidths(tree, `node: super node, admission ${admission}`));
       await unmount(tree);
     }
@@ -1006,8 +1028,10 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await flush(4);
     const issues = [...check(tree, 'settings')];
     const cancel = () => pressKey(tree, 'cancel');
-    await pressKey(tree, 'autolock_1'); issues.push(...check(tree, 'auto-lock picker')); await cancel();
-    await press(tree, 'English'); issues.push(...check(tree, 'language picker')); await cancel();
+    // A picker closes with Close in its head, a dialog with Cancel among its answers.
+    const close = () => pressKey(tree, 'common_close');
+    await pressKey(tree, 'autolock_1'); issues.push(...check(tree, 'auto-lock picker')); await close();
+    await press(tree, 'English'); issues.push(...check(tree, 'language picker')); await close();
     await pressKey(tree, 'change_password'); issues.push(...check(tree, 'change password')); await cancel();
     await pressKey(tree, 'export_recovery_phrase'); issues.push(...check(tree, 'export phrase'));
     // The one warning comes before the password (owner, 07.10, as the extension says it).
@@ -1072,12 +1096,13 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     const issues = [...check(tree, 'header menu')];
     await pressKey(tree, 'tok_manage');
     issues.push(...check(tree, 'token manager'));
-    await act(async () => { tree.root.find((n) => n.props.accessibilityLabel === L('common_close') && n.props.onPress).props.onPress(); });
+    await act(async () => { tree.root.find((n) => n.props.label === L('common_close') && n.props.onPress).props.onPress(); });
     await pressTab(tree, 'browser');
     await flush(4);
     expect(texts(tree)).toContain(label('browser_bookmark_explorer'));
     issues.push(...check(tree, 'browser'));
-    await act(async () => { tree.root.find((n) => n.props.accessibilityLabel === L('browser_menu') && n.props.onPress).props.onPress(); });
+    // The browser's More (the header's has its own name for screen readers, "Open menu").
+    await act(async () => { tree.root.find((n) => n.props.label === L('common_more') && n.props.onPress && !n.props.accessibilityLabel).props.onPress(); });
     await flush(1);
     issues.push(...check(tree, 'browser menu'));
     // The tabs button next to the address bar opens the tab overview over the pane.
@@ -1215,15 +1240,24 @@ describe.each(SUITES)('the sheets, the link screen, the result card and the cras
 });
 
 describe('the bottom bar', () => {
-  it('the bottom bar labels fit a fifth of the screen in every language', () => {
+  it('the bottom bar labels fit a fifth of the screen in every language, each cell its name alone', () => {
     const translations = jest.requireActual('../src/i18n/translations').default;
-    const BottomBarStyles = { fontSize: 11, fontWeight: '600' };
-    const share = SCREEN / 5 - 4; // the label's padding
-    for (const [lang, table] of Object.entries(translations)) {
-      for (const tab of ['assets', 'history', 'browser', 'node', 'settings']) {
-        const w = mockTextWidth(table[`tab_${tab}`], BottomBarStyles) * 0.75; // minimumFontScale
-        expect([lang, tab, w <= share]).toEqual([lang, tab, true]);
+    const { barStyles } = require('../src/components/BottomBar');
+    const { setThemeLanguage } = require('../src/theme');
+    expect(barStyles.dot).toBeUndefined();
+    try {
+      for (const [lang, table] of Object.entries(translations)) {
+        setThemeLanguage(lang);
+        const label = flat(barStyles.label);
+        for (const tab of ['assets', 'history', 'browser', 'node', 'settings']) {
+          // A fifth of the screen less the name's padding.
+          const share = SCREEN / 5 - 4;
+          const w = mockTextWidth(table[`tab_${tab}`], label) * 0.75; // minimumFontScale
+          expect([lang, tab, w <= share]).toEqual([lang, tab, true]);
+        }
       }
+    } finally {
+      setThemeLanguage('en');
     }
   });
 });
@@ -1266,36 +1300,117 @@ describe('a label with its value is held to one line', () => {
 });
 
 describe('Arabic is laid out right to left', () => {
-  it('the whole screen turns, addresses and amounts stay left to right', async () => {
+  // The direction is the layout's as a whole (React Native's I18nManager, set for the language: i18n/direction), never a
+  // style on the screen, so nothing is turned twice.
+  const { I18nManager } = require('react-native');
+  const ar = jest.requireActual('../src/i18n/translations').default.ar;
+
+  it('the screen carries no direction of its own; addresses and amounts stay left to right', async () => {
     mockState.vault = 'sealed';
     await AsyncStorage.setItem('qnet_language', 'ar');
     const tree = await mount();
     const rootStyle = flat(tree.toJSON().props ? tree.toJSON().props.style : [].concat(tree.toJSON())[0].props.style);
-    expect(rootStyle.direction).toBe('rtl');
+    expect(rootStyle.direction).toBeUndefined();
     const pw = tree.root.findAll((n) => n.type === TextInput)[0];
     await act(async () => { pw.props.onChangeText('abcdefghijk'); });
-    const unlock = pressable(tree, jest.requireActual('../src/i18n/translations').default.ar.unlock_wallet);
+    const unlock = pressable(tree, ar.unlock_wallet);
     await act(async () => { await unlock.props.onPress(); });
     await flush(6);
     const main = [].concat(tree.toJSON()).find(isHost);
-    expect(flat(main.props.style).direction).toBe('rtl');
-    const address = tree.root.findAll((n) => n.type === Text && flat(n.props.style).fontFamily && [].concat(n.props.children).join('').includes(QNET));
-    expect(address.length).toBeGreaterThan(0);
-    expect(address.every((n) => flat(n.props.style).writingDirection === 'ltr')).toBe(true);
+    expect(flat(main.props.style).direction).toBeUndefined();
+    // The address on Assets reads left to right on its one line, and it is the whole address (cut only to fit).
+    const lines = tree.root.findAll((n) => n.type === Text && Array.isArray(n.props.style) && n.props.style[0] === walletStyles.addressPillText);
+    expect(lines).toHaveLength(1);
+    expect(lines.every((n) => flat(n.props.style).fontFamily && flat(n.props.style).writingDirection === 'ltr')).toBe(true);
+    expect([].concat(lines[0].props.children).join('')).toBe(QNET);
     // The bottom bar speaks Arabic.
-    const ar = jest.requireActual('../src/i18n/translations').default.ar;
     expect(texts(tree)).toContain(ar.tab_settings);
-    // On Send the scan icon sits at the field's end, the left here; its target reaches out past that edge only.
+    // On Send, Scan sits at the end of the field's label line (the left in a right-to-left layout).
     await act(async () => { await pressable(tree, ar.assets_send).props.onPress(); });
     await flush();
-    const scan = expectScanInField(tree, plain(ar.send_placeholder_eon), makeT('ar')('scan_title'));
-    expect(scan.props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8 });
+    const scan = expectScanInField(tree, plain(ar.send_placeholder_eon), makeT('ar')('scan_title'), plain(ar.send_scan));
+    expect(scan.props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8, right: 8 });
+    expect(flat(require('../src/components/ui/Field').fieldStyles.labelLine)).toMatchObject({ flexDirection: 'row', justifyContent: 'space-between' });
   });
 
-  it('every other language is laid out left to right', async () => {
+  it('choosing Arabic in Settings stores right to left for the next start and offers the restart; leaving it, left to right', async () => {
+    const allow = jest.spyOn(I18nManager, 'allowRTL');
+    const force = jest.spyOn(I18nManager, 'forceRTL');
+    const reload = jest.spyOn(require('../src/services/DeviceSecurity'), 'reloadApp').mockResolvedValue(true);
+    try {
+      mockState.vault = 'sealed';
+      await AsyncStorage.setItem('qnet_language', 'en');
+      const tree = await mount();
+      await type(tree, 'enter_password', 'abcdefghijk');
+      await pressKey(tree, 'unlock_wallet');
+      await flush(6);
+      await pressTab(tree, 'settings');
+      await flush(4);
+      const note = () => tree.root.findAll((n) => n.props.testID === 'layout-restart-note' && isHost(n));
+      expect(note()).toHaveLength(0);
+      await pressKey(tree, 'language');
+      await press(tree, 'العربية');
+      expect(await AsyncStorage.getItem('qnet_language')).toBe('ar');
+      expect(force).toHaveBeenLastCalledWith(true);
+      expect(allow).toHaveBeenLastCalledWith(true);
+      // The running layout is still left to right (I18nManager.isRTL): one line says so, with the restart that turns it.
+      expect(note()).toHaveLength(1);
+      expect(texts(tree)).toContain(ar.layout_restart_note);
+      await act(async () => { tree.root.find((n) => n.props.testID === 'layout-restart' && n.props.onPress).props.onPress(); });
+      await flush(1);
+      expect(reload).toHaveBeenCalledTimes(1);
+      await press(tree, ar.language);
+      await press(tree, 'English');
+      expect(force).toHaveBeenLastCalledWith(false);
+      expect(allow).toHaveBeenLastCalledWith(false);
+      expect(note()).toHaveLength(0);
+    } finally {
+      allow.mockRestore();
+      force.mockRestore();
+      reload.mockRestore();
+    }
+  });
+});
+
+describe('one More on every screen', () => {
+  async function unlocked() {
     mockState.vault = 'sealed';
-    await AsyncStorage.setItem('qnet_language', 'de');
+    await AsyncStorage.setItem('qnet_bg_refresh_status', '1');
     const tree = await mount();
-    expect(flat([].concat(tree.toJSON()).find(isHost).props.style).direction).toBe('ltr');
+    await type(tree, 'enter_password', 'abcdefghijk');
+    await pressKey(tree, 'unlock_wallet');
+    await flush(6);
+    return tree;
+  }
+  const mores = (tree) => tree.root.findAll((n) => n.props.label === L('common_more') && typeof n.props.onPress === 'function');
+  const toggleOf = (tree, key) => tree.root.findAll((n) => n.props.accessibilityRole === 'switch' && n.props.accessibilityLabel === L(key))[0];
+
+  it('the Browser tab hides the header\'s More; the browser bar\'s More holds its own items and the header\'s', async () => {
+    const tree = await unlocked();
+    expect(mores(tree).map((n) => n.props.testID)).toEqual(['header-more']);
+    await pressTab(tree, 'browser');
+    await flush(4);
+    // One More: the browser bar's (the header's is named "Open menu" for screen readers and has a testID).
+    expect(mores(tree)).toHaveLength(1);
+    expect(mores(tree)[0].props.testID).not.toBe('header-more');
+    await act(async () => { mores(tree)[0].props.onPress(); });
+    await flush(1);
+    const shown = texts(tree);
+    for (const key of ['browser_new_tab', 'browser_home', 'browser_clear', 'tok_manage', 'tok_hide_balances']) {
+      expect([key, shown.includes(label(key))]).toEqual([key, true]);
+    }
+    // The switch keeps the menu open and hides the balances, as in the header's menu.
+    expect(toggleOf(tree, 'tok_hide_balances').props.accessibilityState.checked).toBe(false);
+    await act(async () => { toggleOf(tree, 'tok_hide_balances').props.onPress(); });
+    await flush(1);
+    expect(toggleOf(tree, 'tok_hide_balances').props.accessibilityState.checked).toBe(true);
+    // Manage tokens closes the menu and opens the token manager over the browser.
+    await pressKey(tree, 'tok_manage');
+    expect(input(tree, 'tok_search')).toBeDefined();
+    expect(texts(tree)).not.toContain(label('browser_new_tab'));
+    await act(async () => { tree.root.find((n) => n.props.label === L('common_close') && n.props.onPress).props.onPress(); });
+    // Back on Assets the header's More returns (the browser's stays in its hidden pane, out of reach).
+    await pressTab(tree, 'assets');
+    expect(mores(tree).filter((n) => n.props.testID === 'header-more')).toHaveLength(1);
   });
 });

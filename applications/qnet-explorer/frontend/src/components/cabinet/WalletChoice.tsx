@@ -1,20 +1,24 @@
 'use client';
 
-// The ways to connect a wallet: QNet Wallet asked with a QNet Link `connect` request (docs/protocols/qnet-link-v1.md
-// section 14): its button on this phone or tablet, or its QR code for another device; the QNet extension
-// (qnet_requestAccounts), or where to get it on a computer without it; on a phone or tablet, where to get QNet Wallet
-// when it is not installed yet; and an address typed here, only to look (a read-only view, no connection). An
-// address from a QR request is marked as such (src/lib/cabinet/wallet-choice.ts). The first way offered is the one
-// primary button.
+// My node's connect card before a wallet (owner, 20.10): one main action by device, the header's Connect wallet too
+// (useConnectWallet). On a computer it asks the QNet extension (qnet_requestAccounts), or without the extension opens
+// its store page; on a phone or tablet it asks QNet Wallet with a QNet Link `connect` request
+// (docs/protocols/qnet-link-v1.md section 14), whose button then opens the app. Under it the other ways as text
+// actions: QNet Wallet on a phone by QR code (a computer); where to get QNet Wallet, and the extension when this browser
+// has it (a phone or tablet). A request in progress takes the main action's place. An address from a QR request is
+// marked as such (src/lib/cabinet/wallet-choice.ts). View by address, only to look, sits apart (ViewByAddress).
 
-import { useEffect, useState, type FormEvent } from 'react';
-import Link from 'next/link';
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import Action from '@/components/ui/Action';
+import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
+import { useConnectWallet } from '@/components/wallet/useConnectWallet';
 import { useWallet } from '@/contexts/AppContext';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
+import { APP_CONNECT_EVENT, takeAppConnect } from '@/lib/cabinet/connect-card';
 import { t, type MessageKey } from '@/lib/texts';
 import type { LinkAnswer } from '@/lib/qnet-link';
-import { installTarget, isEonAddress } from '@/lib/qnet-provider';
+import { isEonAddress, type ConnectWay } from '@/lib/qnet-provider';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
 
@@ -24,24 +28,22 @@ function answerText(answer: LinkAnswer): MessageKey {
   return answer.error === 'NO_WALLET' ? 'link_answer_no_wallet' : 'link_answer_internal';
 }
 
-const buttonClass = (primary: boolean) => (primary ? 'qnet-button activate-primary' : 'qnet-button secondary');
+// The main action's label and the line under it, by the way of this device.
+function mainWords(way: Exclude<ConnectWay, { kind: 'wait' }>): [MessageKey, MessageKey] {
+  if (way.kind === 'app') return ['connect_app_here', 'connect_app_here_note'];
+  if (way.kind === 'extension') return ['connect_ext', 'connect_ext_note'];
+  return ['connect_get_ext_link', way.store ? 'connect_get_ext' : 'connect_get_ext_other'];
+}
 
 export default function WalletChoice() {
-  const { choose, viewAddress } = useCabinet();
-  const { providerStatus, providerChannel, accounts, connect, connecting, error } = useWallet();
+  const { choose } = useCabinet();
+  const { providerStatus, providerChannel } = useWallet();
   const device = useDeviceKind();
-  // The button on this device, and a request shown as a QR code: two sessions, never one.
+  const { way, waiting, failed, run, askExtension } = useConnectWallet();
+  // The request on this device, and a request shown as a QR code: two sessions, never one.
   const button = useLinkSession({ slot: 'connect' });
   const qr = useLinkSession({ slot: 'connect-qr' });
-  const [address, setAddress] = useState('');
-  const [invalid, setInvalid] = useState(false);
-  const [askedExtension, setAskedExtension] = useState(false);
   const extension = providerStatus === 'available' && providerChannel === 'extension';
-
-  // The extension's accounts once the visitor asked for them.
-  useEffect(() => {
-    if (askedExtension && accounts) choose({ qnet: accounts.qnet, source: 'extension', solana: accounts.solana });
-  }, [askedExtension, accounts, choose]);
 
   // A `connect` answer that names a wallet chooses it, with the Solana address it shares.
   const buttonState = button.state;
@@ -57,10 +59,89 @@ export default function WalletChoice() {
     }
   }, [qrState, choose]);
 
-  const askExtension = () => {
-    setAskedExtension(true);
-    if (!accounts) void connect();
+  // QNet Wallet's request on this device, asked by Connect wallet here or in the header (askAppConnect): started now, or
+  // once this card shows.
+  const startHere = button.start;
+  const stopQr = qr.cancel;
+  useEffect(() => {
+    const take = () => {
+      if (!takeAppConnect()) return;
+      stopQr();
+      void startHere('connect');
+    };
+    take();
+    window.addEventListener(APP_CONNECT_EVENT, take);
+    return () => window.removeEventListener(APP_CONNECT_EVENT, take);
+  }, [startHere, stopQr]);
+
+  const showQr = () => {
+    button.cancel();
+    void qr.start('connect');
   };
+
+  // Known once the page runs in the browser and the wallet is detected.
+  if (!device || way.kind === 'wait') return null;
+
+  const active = qr.state.phase !== 'idle' ? qr : button.state.phase !== 'idle' ? button : null;
+  const finished = active?.state.phase === 'done' && active.state.answer.status !== 'ok' ? active.state.answer : null;
+
+  let main: ReactNode;
+  if (active) {
+    main = finished ? (
+      <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{t(answerText(finished))}</Answered>
+    ) : active.state.phase !== 'done' && (
+      <LinkWaiting
+        state={active.state}
+        qr={active === qr}
+        android={device.android}
+        onShowQr={active === button ? showQr : undefined}
+        onCancel={active.cancel}
+        onRetry={active === qr ? () => void qr.start('connect') : () => void button.start('connect')}
+      />
+    );
+  } else if (waiting) {
+    main = <Waiting>{t('wallet_extension_waiting')}</Waiting>;
+  } else {
+    const [label, note] = mainWords(way);
+    main = (
+      <>
+        {way.kind === 'install'
+          ? <Action kind="solid" href={way.href} external={way.store}>{t(label)}</Action>
+          : <Action kind="solid" onClick={run}>{t(label)}</Action>}
+        <p className="note">{t(note)}</p>
+      </>
+    );
+  }
+
+  // The other ways, while nothing is asked: never an extension offer on a phone or tablet.
+  let others: ReactNode = null;
+  if (!active && !waiting) {
+    others = device.phone ? (
+      <>
+        <Action href="/wallet">{t('connect_get_app_link')}</Action>
+        {extension && <Action onClick={askExtension}>{t('connect_ext')}</Action>}
+      </>
+    ) : (
+      <Action onClick={showQr}>{t('connect_app_qr')}</Action>
+    );
+  }
+
+  return (
+    <>
+      <div className="cab-connect-main">
+        {main}
+        {failed && <Failed>{t('wallet_extension_failed')}</Failed>}
+      </div>
+      {others && <div className="cab-connect-alt">{others}</div>}
+    </>
+  );
+}
+
+// View by address: an address typed only to look, a view, never a connected wallet (CabinetProvider viewAddress).
+export function ViewByAddress() {
+  const { viewAddress } = useCabinet();
+  const [address, setAddress] = useState('');
+  const [invalid, setInvalid] = useState(false);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -69,105 +150,33 @@ export default function WalletChoice() {
       setInvalid(true);
       return;
     }
-    // Only to look: a view, never a connected wallet (CabinetProvider viewAddress).
     viewAddress(value);
   };
 
-  const ask = () => {
-    if (!device) return;
-    if (device.phone) void button.start('connect');
-    else void qr.start('connect');
-  };
-
-  const showQr = () => {
-    button.cancel();
-    void qr.start('connect');
-  };
-
-  // Known once the page runs in the browser.
-  if (!device) return null;
-
-  const active = qr.state.phase !== 'idle' ? qr : button.state.phase !== 'idle' ? button : null;
-  const finished = active?.state.phase === 'done' && active.state.answer.status !== 'ok' ? active.state.answer : null;
-  // A computer without the extension is told where to get it.
-  const install = !extension && !device.phone ? installTarget(window.navigator) : null;
-
-  const app = (
-    <div className="cabinet-option">
-      {!active || active.state.phase === 'idle' ? (
-        <>
-          <button type="button" className={buttonClass(!extension)} onClick={ask}>
-            {t(device.phone ? 'connect_app_here' : 'connect_app_qr')}
-          </button>
-          <p className="activate-note">{t(device.phone ? 'connect_app_here_note' : 'connect_app_qr_note')}</p>
-        </>
-      ) : finished ? (
-        <>
-          <p className="activate-note" role="status">{t(answerText(finished))}</p>
-          <button type="button" className="qnet-button secondary" onClick={active.cancel}>{t('start_again')}</button>
-        </>
-      ) : active.state.phase !== 'done' && (
-        <LinkWaiting
-          state={active.state}
-          qr={active === qr}
-          android={device.android}
-          onShowQr={active === button ? showQr : undefined}
-          onCancel={active.cancel}
-          onRetry={active === qr ? () => void qr.start('connect') : () => void button.start('connect')}
-        />
-      )}
-    </div>
-  );
-
-  const ext = extension ? (
-    <div className="cabinet-option">
-      <button type="button" className={buttonClass(true)} onClick={askExtension} disabled={connecting}>{t('connect_ext')}</button>
-      <p className={connecting ? 'activate-status' : 'activate-note'} aria-live="polite">{t(connecting ? 'wallet_extension_waiting' : 'connect_ext_note')}</p>
-      {askedExtension && error && <p className="activate-error" role="alert">{t('wallet_extension_failed')}</p>}
-    </div>
-  ) : install ? (
-    <div className="cabinet-option">
-      <p className="activate-note">{t('connect_get_ext')}</p>
-      <a className="qnet-button secondary" href={install.href} target={install.kind === 'store' ? '_blank' : undefined} rel="noopener noreferrer">
-        {t('act_get_extension_link')}
-      </a>
-    </div>
-  ) : device.phone && (
-    // A phone or tablet without QNet Wallet yet: the Wallet page says where to get it.
-    <div className="cabinet-option">
-      <p className="activate-note">{t('connect_get_app')}</p>
-      <Link className="qnet-button secondary" href="/wallet">{t('connect_get_app_link')}</Link>
-    </div>
-  );
-
   return (
-    <div className="cabinet-options">
-      {extension ? ext : app}
-      {extension ? app : ext}
-      <form className="cabinet-option" onSubmit={submit} noValidate>
-        <label className="cabinet-label" htmlFor="cabinet-address">{t('connect_view_title')}</label>
-        <div className="cabinet-row">
-          <input
-            id="cabinet-address"
-            className="cabinet-input activate-mono"
-            value={address}
-            onChange={(e) => {
-              setAddress(e.target.value);
-              setInvalid(false);
-            }}
-            placeholder={t('wallet_enter_label')}
-            aria-invalid={invalid}
-            aria-describedby="cabinet-address-note"
-            autoComplete="off"
-            autoCapitalize="none"
-            spellCheck={false}
-            inputMode="text"
-          />
-          <button type="submit" className="qnet-button secondary">{t('wallet_enter_submit')}</button>
-        </div>
-        <p className="activate-note" id="cabinet-address-note">{t('connect_view_note')}</p>
-        {invalid && <p className="activate-error" role="alert">{t('wallet_enter_invalid')}</p>}
-      </form>
-    </div>
+    <form className="cab-view-by" onSubmit={submit} noValidate>
+      <label className="label" htmlFor="cabinet-address">{t('connect_view_title')}</label>
+      <p className="note" id="cabinet-address-note">{t('connect_view_note')}</p>
+      <div className="cab-field-row">
+        <input
+          id="cabinet-address"
+          className="field mono"
+          value={address}
+          onChange={(e) => {
+            setAddress(e.target.value);
+            setInvalid(false);
+          }}
+          placeholder={t('wallet_enter_label')}
+          aria-invalid={invalid}
+          aria-describedby={invalid ? 'cabinet-address-note cabinet-address-error' : 'cabinet-address-note'}
+          autoComplete="off"
+          autoCapitalize="none"
+          spellCheck={false}
+          inputMode="text"
+        />
+        <button type="submit" className="btn btn-text">{t('wallet_enter_submit')}</button>
+      </div>
+      {invalid && <p className="cab-field-error" id="cabinet-address-error" role="alert">{t('wallet_enter_invalid')}</p>}
+    </form>
   );
 }

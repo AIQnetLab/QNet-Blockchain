@@ -19,24 +19,25 @@ const ME = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const OTHER = 'e'.repeat(45);
 
 describe('History', () => {
-  it('a row within 11 characters, grouped with commas; a suffixed figure takes only the point', () => {
+  it('a row in the one amount format, grouped with commas, never a suffix or an exponent', () => {
     expect(compactAmount(98765.4321)).toBe('98,765.43');
     expect(compactAmount(1234.5)).toBe('1,234.5');
     expect(compactAmount(12345.5)).toBe('12,345.5');
-    expect(compactAmount(123456.7)).toBe('123.46K');
-    expect(compactAmount(4.2e15)).toBe('4200T');
+    expect(compactAmount(123456.7)).toBe('123,456.7');
+    expect(compactAmount(4.2e15)).toBe('4,200,000,000,000,000');
     expect(compactAmount(1e-9)).toBe('<0.00000001');
-    expect(compactAmount(3.4e32)).toBe('3.4e32');
-    expect(compactDecimalText('1,234,567.891234')).toBe('1.23M');
-    for (const n of [0.12345678, 1e-9, 99999.9999, 123456789012.345, 1e18]) {
-      expect([n, compactAmount(n).length <= 11]).toEqual([n, true]);
+    expect(compactAmount(3.4e32)).toBe('340,000,000,000,000,000,000,000,000,000,000');
+    expect(compactDecimalText('1,234,567.891234')).toBe('1,234,568');
+    // Up to 99,999,999 a figure keeps within 10 characters before its sign, so it sits beside the title.
+    for (const n of [0.12345678, 0.00000001, 99999.9999, 123456.789, 99999999.4]) {
+      expect([n, compactAmount(n).length <= 10]).toEqual([n, true]);
     }
   });
 
   it('the detail: the exact amount and the fee; a token as the history keeps it, a Solana send', () => {
     const send = { hash: 'a'.repeat(64), from: ME, to: OTHER, amount: 1234567.12345, fee: 0.00015, status: 'confirmed', timestamp: 1, type: 'send' };
     const d = describeTx(send);
-    expect(d.legs[0]).toMatchObject({ number: '−1.23M', exact: '−1,234,567.12345' });
+    expect(d.legs[0]).toMatchObject({ number: '−1,234,567', exact: '−1,234,567.12345' });
     expect(d.fee).toBe('0.00015 QNC');
     const token = {
       hash: 'b'.repeat(64), from: OTHER, to: ME, amount: 0, fee: 0, status: 'confirmed', timestamp: 1, type: 'receive',

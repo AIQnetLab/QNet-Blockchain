@@ -259,8 +259,8 @@ describe('MOBNET-R3-08: look-alike names and unasked tokens in the history', () 
     // The symbol written through tokenLabel (M-5), so no hidden or format character in it reorders the row.
     expect(rows).toMatch(/const tokenSymbol = tokenLabel\(tx\.tokenSymbol\);/);
     expect(rows).toMatch(/tx\.tokenMetaTrusted \? tokenSymbol : `\$\{tokenSymbol\} \(\$\{contractShortId\(tx\.tokenContract\)\}\)`/);
-    // Marked on the row (⚠ before the symbol) and said in words on the detail screen.
-    expect(rows).toMatch(/symbol: reserved \? `⚠ \$\{symbol\}` : symbol/);
+    // Marked on the row (the symbol in Ember) and said in words on the detail screen.
+    expect(rows).toMatch(/symbolTone: reserved \? color\.ember : tone/);
     expect(rows).toMatch(/if \(d\.reserved\) fields\.push\(<Text key="reserved" style=\{styles\.txDetailWarning\}>\{t\('tok_reserved_warning'\)\}<\/Text>\);/);
     // The rows (with the state of a node balance move in transit: services/ClaimTransit) filtered the same way.
     expect(screen).toMatch(/\? withMoveStates\(txHistory, moveState\)\.filter\(rowVisible\)/);

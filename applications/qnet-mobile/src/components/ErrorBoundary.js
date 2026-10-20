@@ -2,14 +2,14 @@ import React from 'react';
 import {
   View,
   Text,
-  StyleSheet,
-  TouchableOpacity,
   Alert,
   ScrollView
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import logger from '../utils/logger';
-import { tr, isRTL, currentLanguage } from '../i18n';
+import { tr } from '../i18n';
+import Action from './ui/Action';
+import { color, size, space, themed } from '../theme';
 
 // The caches "Clear cache" removes, by exact key (services/HistoryCache, services/NodePool, the Node tab's last reads).
 export const CACHE_KEYS = Object.freeze(['qnet_node_rewards', 'qnet_cached_server_status', 'qnet_tx_history', 'qnet_node_pool']);
@@ -151,7 +151,7 @@ class ErrorBoundary extends React.Component {
   render() {
     if (this.state.hasError) {
       return (
-        <View style={[styles.container, isRTL(currentLanguage()) ? styles.rtl : styles.ltr]}>
+        <View style={styles.container}>
           <ScrollView contentContainerStyle={styles.content}>
             <Text style={styles.title}>{tr('crash_title')}</Text>
             
@@ -174,19 +174,8 @@ class ErrorBoundary extends React.Component {
             )}
 
             <View style={styles.buttonContainer}>
-              <TouchableOpacity 
-                style={[styles.button, styles.primaryButton]}
-                onPress={this.handleReset}
-              >
-                <Text style={styles.buttonText}>{tr('common_try_again')}</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton]}
-                onPress={this.handleClearCache}
-              >
-                <Text style={styles.buttonText}>{tr('crash_clear_cache')}</Text>
-              </TouchableOpacity>
+              <Action kind="solid" label={tr('common_try_again')} onPress={this.handleReset} />
+              <Action kind="text" label={tr('crash_clear_cache')} onPress={this.handleClearCache} />
             </View>
 
             {this.state.errorCount > 2 && (
@@ -201,96 +190,61 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-const styles = StyleSheet.create({
+const styles = themed((type) => ({
   container: {
     flex: 1,
-    backgroundColor: '#0f0f1a',
+    backgroundColor: color.ink,
   },
-  // The language the wallet screen last showed decides the direction (Arabic: right to left).
-  rtl: {
-    direction: 'rtl',
-  },
-  ltr: {
-    direction: 'ltr',
-  },
-  // Fills the screen so short content centres, but can outgrow it and scroll.
+  // Fills the screen so short content sits in the middle, start-aligned, but can outgrow it and scroll.
   content: {
     flexGrow: 1,
     justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
+    alignItems: 'stretch',
+    width: '100%',
+    maxWidth: size.column,
+    alignSelf: 'center',
+    padding: space.gut,
   },
   title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#ff4444',
-    marginBottom: 10,
-    textAlign: 'center',
+    ...type('title'),
+    color: color.paper,
+    marginBottom: space.s12,
   },
   subtitle: {
-    fontSize: 16,
-    color: '#b0b0b0',
-    textAlign: 'center',
-    marginBottom: 30,
-    lineHeight: 22,
+    ...type('body'),
+    color: color.text,
+    marginBottom: space.s24,
   },
   errorDetails: {
-    backgroundColor: '#1a1a2e',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 20,
-    width: '100%',
+    paddingVertical: space.s12,
+    borderTopWidth: 1,
+    borderTopColor: color.rule,
+    marginBottom: space.s16,
   },
   errorTitle: {
-    color: '#ff4444',
-    fontWeight: 'bold',
-    marginBottom: 5,
+    ...type('label'),
+    color: color.fog,
+    marginBottom: space.s4,
   },
   errorText: {
-    color: '#fff',
-    fontSize: 12,
-    marginBottom: 10,
+    ...type('data', 12),
+    color: color.paper,
+    marginBottom: space.s8,
   },
   errorStack: {
-    color: '#888',
-    fontSize: 10,
-    fontFamily: 'monospace',
+    ...type('data', 10),
+    color: color.fog,
   },
   buttonContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
     alignSelf: 'stretch',
-    gap: 10,
-    marginTop: 20,
-  },
-  button: {
-    paddingHorizontal: 30,
-    paddingVertical: 15,
-    borderRadius: 25,
-    minWidth: 120,
-  },
-  primaryButton: {
-    backgroundColor: '#00d4ff',
-  },
-  secondaryButton: {
-    backgroundColor: '#16213e',
-    borderWidth: 1,
-    borderColor: '#00d4ff',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
-    textAlign: 'center',
+    gap: space.s8,
+    marginTop: space.s16,
   },
   warning: {
-    color: '#ff9900',
-    fontSize: 14,
-    textAlign: 'center',
-    marginTop: 20,
-    fontStyle: 'italic',
+    ...type('note'),
+    color: color.ember,
+    marginTop: space.s16,
   },
-});
+}));
 
 export default ErrorBoundary;

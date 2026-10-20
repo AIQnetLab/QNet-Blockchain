@@ -48,6 +48,7 @@ test('off, the relay refuses link, claim, reserve and unlink sessions and still 
 test('one flag for the relay and the pages: the process relay, the layout, and each page that sends a request', () => {
   assert.match(read('server/link-relay.ts'), /createLinkRelay\(\{ intents: phoneFlowsEnabled\(\) \? INTENTS : \['connect'\] \}\)/);
   assert.match(read('app/node/layout.tsx'), /<CabinetProvider phoneFlows=\{phoneFlowsEnabled\(\)\}>/);
+  assert.match(read('components/cabinet/NodeClaim.tsx'), /const \{ choice, phoneFlows \} = useCabinet\(\);[\s\S]*?return \{ extension, app: phoneFlows \};/);
   // The pages ask the provider, never the environment.
   for (const file of ['components/cabinet/LinkDevice.tsx', 'components/cabinet/UnlinkDevice.tsx', 'components/cabinet/NodeClaim.tsx', 'components/cabinet/NodeActivate.tsx']) {
     const src = read(file);
@@ -55,13 +56,13 @@ test('one flag for the relay and the pages: the process relay, the layout, and e
     assert.doesNotMatch(src, /process\.env|CABINET_PHONE_FLOWS/, file);
   }
   // Closed, Link a device is still a card of its own that names the app's way (review, 28.09: it was fine print).
-  assert.match(read('components/cabinet/LinkDevice.tsx'), /if \(!phoneFlows\) \{\s*return \(\s*<div className="activate-card">\s*<h3 className="activate-step">\{t\('action_link_device'\)\}<\/h3>\s*<p>\{t\('devices_link_closed'\)\}<\/p>\s*<\/div>\s*\);\s*\}/);
+  assert.match(read('components/cabinet/LinkDevice.tsx'), /if \(!phoneFlows\) return <ActionBlock title=\{t\('action_link_device'\)\}><p>\{t\('devices_link_closed'\)\}<\/p><\/ActionBlock>;/);
   // Closed, Unlink this device is a card of its own too, saying how the node leaves a device meanwhile.
   // Unlink: closed without the phone flows, unless the extension that holds the wallet signs the wallet's own unbind.
-  assert.match(read('components/cabinet/UnlinkDevice.tsx'), /if \(!phoneFlows && !extension\) \{\s*return \(\s*<div className="activate-card">\s*<h3 className="activate-step">\{t\(wallet \? 'unlink_title_wallet' : 'unlink_title'\)\}<\/h3>\s*<p>\{t\('unlink_closed'\)\}<\/p>\s*<\/div>\s*\);\s*\}/);
+  assert.match(read('components/cabinet/UnlinkDevice.tsx'), /if \(!phoneFlows && !extension\) return <ActionBlock title=\{t\(wallet \? 'unlink_title_wallet' : 'unlink_title'\)\}><p>\{t\('unlink_closed'\)\}<\/p><\/ActionBlock>;/);
   assert.match(read('components/cabinet/UnlinkDevice.tsx'), /const app = phoneFlows && \(/);
   // A phone that cannot activate here yet is led to the computer's way.
-  assert.match(read('components/cabinet/NodeActivate.tsx'), /\{device\?\.phone && <Link href=\{`\$\{GUIDE_HREF\}\?way=computer`\} className="qnet-button secondary">\{t\('guide_show_computer'\)\}<\/Link>\}/);
+  assert.match(read('components/cabinet/NodeActivate.tsx'), /<Next action=\{device\?\.phone && <Action href=\{`\$\{GUIDE_HREF\}\?way=computer`\}>\{t\('guide_show_computer'\)\}<\/Action>\}>/);
   assert.match(read('components/cabinet/NodeActivate.tsx'), /const paymentCard = phoneFlows \? \(/);
   // The page reads it on the server only.
   assert.doesNotMatch(read('components/cabinet/CabinetProvider.tsx'), /process\.env/);

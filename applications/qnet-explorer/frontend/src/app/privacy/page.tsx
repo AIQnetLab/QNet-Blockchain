@@ -8,42 +8,39 @@
 // Terms page; src/lib/__tests__/in-app-pages.test.mjs). The device check of a light node follows
 // docs/protocols/light-node-messages.md sections 5 to 9.
 
+import Link from 'next/link';
+import DocToc, { type TocItem } from '@/components/DocToc';
+import PageHead from '@/components/ui/PageHead';
 import { useActivationContent } from '@/contexts/AppContext';
 
 export default function PrivacyPage() {
   const full = useActivationContent();
   return (
-    <div className="page-privacy">
-      <section className="explorer-section" data-section="privacy">
-        <div className="explorer-header">
-          <h2 className="section-title">Privacy Policy</h2>
-          <p className="section-subtitle">
-            QNet Wallet for iOS and Android, the QNet Wallet browser extension, and aiqnet.io
-          </p>
-        </div>
+    <div className="pg">
+      <PageHead title="Privacy Policy" lead="QNet Wallet for iOS and Android, the QNet Wallet browser extension, and aiqnet.io" />
+      <div className="wrap pg-body doc-grid">
+        <div className="doc-main">
 
-        <div className="content-card" style={{ maxWidth: '900px', margin: '0 auto' }}>
-
-          <div className="privacy-section">
-            <h3>Who is responsible</h3>
+          <section className="doc-sec prose" id="responsible">
+            <h2>Who is responsible</h2>
             <p>
               Orrery Group LLC, 30 N Gould St Ste R, Sheridan, WY 82801, United States, publishes QNet Wallet and
               operates this website. Questions about this policy go to <a href="mailto:support@aiqnet.io">support@aiqnet.io</a>.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>In short</h3>
+          <section className="doc-sec prose" id="in-short">
+            <h2>In short</h2>
             <ul>
               <li>The wallet is non-custodial. Your recovery phrase and private keys are created on your device and never leave it.</li>
               <li>There is no account, no sign-up, no analytics or advertising SDK, and no tracking for advertising or across other apps and websites.</li>
               <li>Transactions you sign are public on the blockchain, as on every public chain.</li>
               <li>If you run a light node, QNet Blockchain needs a way to reach your phone or tablet and to tell that it is one real device: a push token, your node identity, the device&apos;s platform and model name and the device check described below are registered with the network&apos;s nodes and its device-check service, and the node&apos;s answers report how the network&apos;s wake-up messages reached the device (light node answers, below). Those records, what the network keeps from those reports (why each of the node&apos;s epochs not counted, among the last 64, was missed, and its latest answer), and the aiqnet.io server&apos;s record of each node activation that starts or finishes through the node pages or the browser extension (the activation record, below), are the only data the software keeps anywhere other than your device and the public blockchain; beyond them the aiqnet.io server holds the few request details described below in memory only, for at most a day.</li>
             </ul>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>What stays on your device</h3>
+          <section className="doc-sec prose" id="on-device">
+            <h2>What stays on your device</h2>
             <p>
               Encrypted at rest: the recovery phrase, the private keys, the node signing key, in the browser extension the
               node&apos;s activation code, and the wallet&apos;s other private records, among them, in the mobile apps,
@@ -76,29 +73,34 @@ export default function PrivacyPage() {
               encrypted wallet data, so that an approval written there from outside the extension is ignored; stored in
               the clear next to the encrypted wallet, the wallet&apos;s public QNet Blockchain and Solana addresses, a random wallet
               identifier, when the wallet was created and whether its activation is for a light or a super node, which
-              anyone who can read the browser profile sees without the password; and two records of public chain data,
+              anyone who can read the browser profile sees without the password; and three records of public chain data,
               each with a check value made with a key from the encrypted wallet data: how far the searches for the
               wallet&apos;s activation burn have read the Solana history of the wallet (its address and 1DEV account: the
-              transactions listed and checked), and the network checkpoints the extension&apos;s light client verified; and
-              one record of public chain data with no check value, since the extension verifies it again in full each
-              time it reads it: the checkpoint signed by the genesis nodes of QNet Blockchain that its light client walks
-              from.
+              transactions listed and checked); the network checkpoints the extension&apos;s light client verified; and the
+              last QNet Blockchain balance, token list and Solana balances it read and the highest network height it saw,
+              so the wallet shows them at once after an unlock; and one record of public chain data with no check value,
+              since the extension verifies it again in full each time it reads it: the checkpoint signed by the genesis
+              nodes of QNet Blockchain that its light client walks from.
               While the browser is open the extension also keeps, in the
               browser&apos;s session memory, which is not written to disk and is cleared when the browser closes: the key
-              of the unlocked wallet with its addresses, until it locks; the count of wrong passwords; the result of its
-              start-up self-test; and the recent approval requests of each website, for the limits on how often a site
-              may ask.
+              of the unlocked wallet with its addresses, until it locks; the balances and history it last showed and where
+              the popup was, with the token, recipient and amount typed into its Send form, until it locks; the count of wrong
+              passwords; the result of its start-up self-test; the recent approval requests of each website, for the
+              limits on how often a site may ask; when a copied secret is due to be cleared from the clipboard (a time,
+              never the text); and the latest certified block its light client saw and until when it asks no node for a
+              new starting point, which is public chain data.
             </p>
             <p>
               Deleting the wallet removes all of this: in the mobile app everything but the language setting and that
-              screen-lock time, in the browser extension everything but the chosen language. Uninstalling the app or the extension removes it too; an iPhone keeps an
+              screen-lock time, in the browser extension everything but the chosen language and a wallet of the earlier
+              version 2.1 that is still in the browser and opens, which stays until it is moved or removed. Uninstalling the app or the extension removes it too; an iPhone keeps an
               app&apos;s Keychain items after it is uninstalled, and the app deletes them the first time it starts after
               being installed again.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>What is sent to the network, and why</h3>
+          <section className="doc-sec prose" id="sent">
+            <h2>What is sent to the network, and why</h2>
             <ul>
               <li>
                 <strong>Transactions.</strong> A transfer, a token call, a move of a node balance or a node registration
@@ -230,10 +232,10 @@ export default function PrivacyPage() {
                 the chain, and no node identifier or personal data. Google processes the delivery under its own terms.
               </li>
             </ul>
-          </div>
+          </section>
 
-          <div className="privacy-section" id="device-check">
-            <h3>Device check for a light node</h3>
+          <section className="doc-sec prose" id="device-check">
+            <h2>Device check for a light node</h2>
             <p>
               When you link a node to a device, QNet Wallet asks the device&apos;s operating system to prove that the
               request comes from the genuine app on a real phone or tablet. The app creates a key in the device&apos;s
@@ -272,10 +274,10 @@ export default function PrivacyPage() {
               basis: your consent on the link screen for the device check (withdrawn by unlinking the device); our
               legitimate interest in preventing abuse for the IP-based signals, to which you can object.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Device permissions</h3>
+          <section className="doc-sec prose" id="permissions">
+            <h2>Device permissions</h2>
             <p>
               Biometrics or the device passcode: unlocking the wallet, through the operating system, which never shows the
               app your face, fingerprint or passcode. Push messages: the status requests a light node answers arrive as
@@ -289,12 +291,14 @@ export default function PrivacyPage() {
               in-app browser can still pass that website a photo or file you pick or take there; the camera opens only
               if you choose it in that sheet.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>This website</h3>
+          <section className="doc-sec prose" id="website">
+            <h2>This website</h2>
             <p>
               aiqnet.io shows public data of QNet Blockchain. It sets no tracking cookies and runs no analytics or advertising scripts.
+              The explorer sets one cookie, qnet.blocks, only when you press Hide on its Latest blocks strip, so the strip stays
+              folded on the explorer&apos;s pages for a year; it holds that choice and nothing else, and Show deletes it.
               The web server keeps ordinary access logs (IP address, requested page, time) for a short time, except for the
               requests between aiqnet.io&apos;s pages and the mobile app described above and the node pages&apos;
               requests about a node, a wallet or a payment address, which it does not log. Pages load images only from aiqnet.io: a token&apos;s logo,
@@ -304,7 +308,7 @@ export default function PrivacyPage() {
               an hour), and writes those counts nowhere. When you press Connect wallet and approve the site in the QNet
               Wallet browser extension, the page receives your public QNet Blockchain and Solana addresses; My node then shows that wallet,
               and what it sends the server is described next. What the extension answers on the node pages about the
-              wallet&apos;s activation is shown there, and an activation it reports is kept in the browser, as below. The node pages{full && ' (aiqnet.io/node)'} send the server the light node id of the wallet you choose there,
+              wallet&apos;s activation is shown there, and an activation it reports is kept in the browser, as below. The node pages{full && <> (<Link href="/node">aiqnet.io/node</Link>)</>} send the server the light node id of the wallet you choose there,
               or of the extension&apos;s once you approved the site in it, to read that node&apos;s public status and
               history from QNet Blockchain, and what an activation on those pages needs, described below. They also send the
               wallet&apos;s QNet Blockchain address, to ask the network whether the wallet has a node of either type and to read the
@@ -386,7 +390,7 @@ export default function PrivacyPage() {
               an hour after its ten minutes end. No IP address is stored with it.
             </p>
             <p>
-              <strong>Testnet faucet.</strong> The faucet{full && ' on aiqnet.io/testnet'} sends test tokens (1DEV and SOL on Solana
+              <strong>Testnet faucet.</strong> The faucet{full && <> on <Link href="/testnet">aiqnet.io/testnet</Link></>} sends test tokens (1DEV and SOL on Solana
               devnet) to the Solana address you enter. The aiqnet.io server sends them from the publisher&apos;s faucet
               wallet, so that transfer publicly links the faucet wallet to your address on Solana. To allow one claim of
               each token per address a day, the server keeps the address and the time of its last claim in memory for 24
@@ -398,12 +402,12 @@ export default function PrivacyPage() {
               also keeps the wallet&apos;s QNet Blockchain address and the time of its last claim in memory for 24 hours, in the same
               way.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Retention</h3>
+          <section className="doc-sec prose" id="retention">
+            <h2>Retention</h2>
             <ul>
-              <li>Data on your device: until you delete the wallet (the mobile app then keeps only its language setting and the screen-lock time, which lapses after seven days, and the extension only its chosen language) or uninstall the app or the extension.</li>
+              <li>Data on your device: until you delete the wallet (the mobile app then keeps only its language setting and the screen-lock time, which lapses after seven days, and the extension only its chosen language and a wallet of the earlier version 2.1 that still opens, until it is moved or removed) or uninstall the app or the extension.</li>
               <li>Push token on the nodes of QNet Blockchain: until the device is unlinked, until the node is linked to another device, or until the token no longer accepts deliveries — for example after the app is uninstalled. The node registration is part of the chain and stays.</li>
               <li>Device check: the device record while the node is linked and 90 days after; the operating system&apos;s proof (on Android with Google Play Integrity&apos;s report of app activity: apps running that could view the screen or control the device, and whether apps from Google Play, from the device maker or from elsewhere are installed) 7 days, or 90 days after a refusal or a pause; token hashes 24 hours; Apple&apos;s and Google&apos;s device bits as stated above.</li>
               <li>Requests from aiqnet.io to the mobile app and their encrypted answers: in server memory, at most ten minutes.</li>
@@ -416,10 +420,10 @@ export default function PrivacyPage() {
               <li>Blockchain records: permanent by design and outside anyone&apos;s control, including ours.</li>
               <li>Server access logs: a short, fixed period.</li>
             </ul>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Sharing and selling</h3>
+          <section className="doc-sec prose" id="sharing">
+            <h2>Sharing and selling</h2>
             <p>
               No data is sold, rented or shared for advertising. The only third parties that process data are the ones named
               above — push delivery (Google Firebase Cloud Messaging), Apple and Google for the device check of a light
@@ -429,10 +433,10 @@ export default function PrivacyPage() {
               as any website does, and receive wallet data from the app or the extension only as described above, after
               your approval; what they do with it is governed by their own policies.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Your rights</h3>
+          <section className="doc-sec prose" id="rights">
+            <h2>Your rights</h2>
             <p>
               Under the GDPR, the CCPA and similar laws you can ask what is held about you, ask for it to be corrected or
               deleted, and object to processing. For everything on your device you already have full control. For the push
@@ -443,15 +447,15 @@ export default function PrivacyPage() {
               stays. An activation record repeats public chain data and keeps the one-activation rule of its wallet, so it
               stays while the node pages run. Records on a public blockchain cannot be altered or deleted by anyone.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Children</h3>
+          <section className="doc-sec prose" id="children">
+            <h2>Children</h2>
             <p>The software is not directed at anyone under 18, and no data is knowingly collected from children.</p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Security</h3>
+          <section className="doc-sec prose" id="security">
+            <h2>Security</h2>
             <p>
               Keys are stored encrypted — in operating-system-backed secure storage on phones and tablets, under your
               password in the browser extension — and never leave the device. QNet Blockchain transactions are authorised by
@@ -460,29 +464,38 @@ export default function PrivacyPage() {
               chain data and already-signed transactions, so the signature, not the connection, is what protects funds.
               Connections to aiqnet.io, to the nodes of QNet Blockchain and to the Solana RPC endpoints use HTTPS.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section">
-            <h3>Changes</h3>
+          <section className="doc-sec prose" id="changes">
+            <h2>Changes</h2>
             <p>
               This policy changes when the software changes what it does with data. The date below is the date of the current
               version; the history is in the public repository.
             </p>
-          </div>
+          </section>
 
-          <div className="privacy-section" style={{
-            textAlign: 'center',
-            marginTop: '3rem',
-            paddingTop: '2rem',
-            borderTop: '1px solid rgba(0, 255, 136, 0.2)'
-          }}>
-            <p style={{ fontSize: '0.9rem', opacity: 0.7 }}>
-              Effective: October 6, 2026
-            </p>
-          </div>
+          <p className="doc-date">Effective: October 6, 2026</p>
 
         </div>
-      </section>
+        <DocToc items={TOC} />
+      </div>
     </div>
   );
 }
+
+// The sections, in the order the page shows them (src/lib/__tests__/site-pages.test.mjs checks they match).
+const TOC: readonly TocItem[] = [
+  ['responsible', 'Who is responsible'],
+  ['in-short', 'In short'],
+  ['on-device', 'What stays on your device'],
+  ['sent', 'What is sent to the network, and why'],
+  ['device-check', 'Device check for a light node'],
+  ['permissions', 'Device permissions'],
+  ['website', 'This website'],
+  ['retention', 'Retention'],
+  ['sharing', 'Sharing and selling'],
+  ['rights', 'Your rights'],
+  ['children', 'Children'],
+  ['security', 'Security'],
+  ['changes', 'Changes'],
+];

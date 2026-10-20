@@ -34,7 +34,7 @@ import { browserArea, listRecords, pruneReceipts, removeRecord, requestPersisten
 import { OWNER_BIND_V2_FEATURE, type ConsentBody, type SubmitOutcome } from './registration.ts';
 import { consentBodyOf, postConsent } from './consent-submit.ts';
 import { parseWalletNode, type WalletNodeView } from './wallet-activation.ts';
-import { ONE_DEV_UNIT } from '../one-dev.ts';
+import { fundingReceived } from './payment-request.ts';
 import { SIGN_MARGIN_MS, isReservationId } from './burn-record.ts';
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
@@ -202,7 +202,7 @@ function patch(record: PaymentRecord, extra: Partial<PaymentRecord>, deps: Activ
 
 // What the payment address must hold to burn `price`: the 1DEV, the fee, and the rent-exempt minimum after it.
 export function fundedFor(balance: PaymentBalance, price: number): boolean {
-  return balance.oneDev >= BigInt(price) * ONE_DEV_UNIT && balance.sol >= BURN_SOL_LAMPORTS;
+  return fundingReceived(balance, price).oneDev && balance.sol >= BURN_SOL_LAMPORTS;
 }
 
 // The burns the page dropped as never landed, looked at again (SITE-11): one that is final after all, and this

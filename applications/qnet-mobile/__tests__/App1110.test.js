@@ -652,9 +652,11 @@ describe('a super node registered and not admitted to consensus yet (owner, 11.1
     await tab(tree, 'node');
     const text = texts(tree);
     expect(text).toContain(t('node_waiting_admission'));
-    expect(text).toContain(t('node_badge_waiting'));
+    // Said once, as the node's status in Ember under its identity.
+    expect(tree.root.findAll((n) => n.props.testID === 'node-status' && n.props.tone === 'needs'
+      && n.props.label === t('node_waiting_admission'))).toHaveLength(1);
     expect(text).not.toContain(t('node_server_offline'));
-    expect(text).not.toContain(t('node_badge_offline'));
+    expect(text).not.toContain(t('node_status_offline'));
     expect(moveButton(tree).props.disabled).toBe(false);
   });
 });
@@ -692,6 +694,21 @@ describe('deleting the wallet says first that its node stops on this device (own
     await flush(6);
     return tree;
   };
+
+  it('"Forgot? Reset the wallet" sits in the lock column under the unlock, clear of the system bar, and a press opens the erase screen', async () => {
+    let tree;
+    await act(async () => { tree = renderer.create(<WalletScreen />); });
+    mounted.push(tree);
+    await flush(6);
+    const forgot = tree.root.find((n) => n.props.testID === 'unlock-forgot' && typeof n.props.onPress === 'function');
+    const ancestors = [];
+    for (let n = forgot.parent; n; n = n.parent) ancestors.push(n);
+    expect(ancestors.some((n) => n.props.testID === 'lock-column')).toBe(true);
+    expect(ancestors.find((n) => Array.isArray(n.props.edges)).props.edges).toContain('bottom');
+    await act(async () => { forgot.props.onPress(); });
+    await flush(6);
+    expect(texts(tree)).toContain(t('erase_title'));
+  });
 
   it('the erase screen with this wallet\'s node bound here says it stops; without one it does not', async () => {
     mockState.bound = true;

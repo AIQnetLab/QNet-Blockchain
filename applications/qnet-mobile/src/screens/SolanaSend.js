@@ -8,10 +8,14 @@
  * shows the outcome and lists the send in History until the network settles it (useSolanaSends).
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Keyboard, KeyboardAvoidingView, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Keyboard, KeyboardAvoidingView, ScrollView, Text, View } from 'react-native';
 import styles from './WalletScreen.styles';
-import { ScanIcon } from '../components/QrScanSheet';
 import { InfoRow } from '../components/InfoRow';
+import Action from '../components/ui/Action';
+import Field from '../components/ui/Field';
+import Head from '../components/ui/Head';
+import Tabs from '../components/ui/Tabs';
+import TokenIcon from '../components/TokenIcons';
 import { looksLikeKnownAddress } from '../browser/DappSheet';
 import { errorText } from '../i18n';
 import { decodeKey, fromBaseUnits, toBaseUnits } from '../crypto/SolanaTx';
@@ -155,8 +159,8 @@ export function cleanAmountInput(text, decimals, kept = '') {
  * from a link filled it in (WalletScreen openTransferLink), which a line over the form says.
  */
 export default function SolanaSendForm({
-  t, rtl, owner, symbol, onSymbol, address, onAddress, amount, onAmount, request, balances, mask = (s) => amountText(s),
-  fromLink = false, backArrow, onBack, onScan, known, reviewSend, confirmFresh, sign, onResult, onSent,
+  t, owner, symbol, onSymbol, address, onAddress, amount, onAmount, request, balances, mask = (s) => amountText(s),
+  fromLink = false, onBack, onScan, known, reviewSend, confirmFresh, sign, onResult, onSent,
 }) {
   const [busy, setBusy] = useState(false);
   const alive = useRef(true);
@@ -207,32 +211,19 @@ export default function SolanaSendForm({
         keyboardShouldPersistTaps="handled"
         testID="solana-send"
       >
-        {/* One compact row: Back, the title centred, and a spacer as wide as Back. */}
-        <View style={styles.sendScreenHeader}>
-          <TouchableOpacity onPress={onBack} style={styles.backButton} accessibilityRole="button">
-            <Text style={styles.backButtonText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{`${backArrow} ${t('common_back')}`}</Text>
-          </TouchableOpacity>
-          <Text style={styles.sendScreenTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{t('send_title', { symbol: token.symbol })}</Text>
-          <View style={styles.headerSpacer} />
-        </View>
+        <Head onBack={onBack} backLabel={t('common_back')} title={t('send_title', { symbol: token.symbol })} />
 
         {fromLink ? <Text style={styles.sendFromLink} testID="solana-send-from-link">{t('send_from_link')}</Text> : null}
 
         {/* The token sent: SOL or a token the Assets list shows. */}
-        <View style={styles.historyFilterRow} accessibilityRole="tablist">
-          {SOLANA_TOKENS.map((tk) => (
-            <TouchableOpacity
-              key={tk.symbol}
-              style={[styles.historyChip, tk.symbol === token.symbol && styles.historyChipActive]}
-              onPress={() => onSymbol(tk.symbol)}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: tk.symbol === token.symbol }}
-              testID={`solana-token-${tk.symbol}`}
-            >
-              <Text style={[styles.historyChipText, tk.symbol === token.symbol && styles.historyChipTextActive]}>{tk.symbol}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
+        <Tabs
+          items={SOLANA_TOKENS.map((tk) => ({
+            key: tk.symbol, label: tk.symbol, testID: `solana-token-${tk.symbol}`,
+            icon: <TokenIcon network="solana" symbol={tk.symbol} size={20} />,
+          }))}
+          value={token.symbol}
+          onChange={onSymbol}
+        />
 
         {/* The balance beside its label, as every figure (components/InfoRow). */}
         <View style={styles.sendBalanceInfo}>
@@ -246,50 +237,38 @@ export default function SolanaSendForm({
           />
         </View>
 
-        {/* The recipient; the scan icon at the field's end reads a Solana address or a payment request from a QR code. */}
-        <View style={styles.formGroup}>
-          <Text style={styles.label}>{t('send_to_address')}</Text>
-          <View style={styles.recipientField}>
-            <TextInput
-              style={[styles.input, styles.recipientInput, styles.recipientInputScan]}
-              placeholder={t('send_placeholder_solana')}
-              placeholderTextColor="#888"
-              value={address}
-              onChangeText={onAddress}
-              autoCapitalize="none"
-              autoCorrect={false}
-              testID="solana-send-address"
-            />
-            <TouchableOpacity
-              style={styles.scanButton}
-              onPress={() => { Keyboard.dismiss(); onScan(); }}
-              accessibilityRole="button"
+        {/* The recipient; Scan, at the end of its label's line, reads a Solana address or a payment request from a QR code. */}
+        <Field
+          label={t('send_to_address')}
+          placeholder={t('send_placeholder_solana')}
+          value={address}
+          onChangeText={onAddress}
+          autoCapitalize="none"
+          autoCorrect={false}
+          testID="solana-send-address"
+          end={(
+            <Action
+              kind="act"
+              label={t('send_scan')}
               accessibilityLabel={t('scan_title_solana')}
-              hitSlop={{ top: 8, bottom: 8, [rtl ? 'left' : 'right']: 8 }}
+              onPress={() => { Keyboard.dismiss(); onScan(); }}
               testID="send-scan"
-            >
-              <ScanIcon color="#00d4ff" />
-            </TouchableOpacity>
-          </View>
-        </View>
+            />
+          )}
+        />
 
-        <View style={styles.formGroup}>
-          <Text style={styles.label}>{t('send_amount')}</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="0.00"
-            placeholderTextColor="#888"
-            keyboardType="decimal-pad"
-            value={amount}
-            onChangeText={(text) => onAmount(cleanAmountInput(text, token.decimals, amount))}
-            maxLength={32}
-            testID="solana-send-amount"
-          />
-          <View style={styles.percentageButtons}>
-            <TouchableOpacity style={styles.percentButton} onPress={setMax} accessibilityRole="button" testID="solana-send-max">
-              <Text style={styles.percentButtonText}>{t('send_max')}</Text>
-            </TouchableOpacity>
-          </View>
+        <Field
+          label={t('send_amount')}
+          style={styles.amountField}
+          placeholder="0.00"
+          keyboardType="decimal-pad"
+          value={amount}
+          onChangeText={(text) => onAmount(cleanAmountInput(text, token.decimals, amount))}
+          maxLength={32}
+          testID="solana-send-amount"
+        />
+        <View style={styles.percentageButtons}>
+          <Action kind="act" label={t('send_max')} onPress={setMax} testID="solana-send-max" />
         </View>
 
         {/* The fee of a one-signature transfer (the review shows the exact one the network charges), and the total. */}
@@ -298,15 +277,14 @@ export default function SolanaSendForm({
           {total ? <InfoRow label={t('send_total')} value={total} ltr fit total /> : null}
         </View>
 
-        <TouchableOpacity
-          style={[styles.button, (!address || !amount || busy) && styles.buttonDisabled]}
+        <Action
+          label={t('send_button')}
+          busy={busy}
+          busyLabel={t('sending')}
           onPress={send}
-          disabled={!address || !amount || busy}
-          accessibilityRole="button"
+          disabled={!address || !amount}
           testID="solana-send-button"
-        >
-          <Text style={styles.buttonText}>{busy ? t('sending') : t('send_button')}</Text>
-        </TouchableOpacity>
+        />
       </ScrollView>
     </KeyboardAvoidingView>
   );

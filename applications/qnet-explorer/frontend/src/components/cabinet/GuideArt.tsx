@@ -8,24 +8,28 @@ import { useId, type ReactNode, type SVGProps } from 'react';
 import { t } from '@/lib/texts';
 import type { ButtonPart, Label, Part, Scene } from '@/lib/cabinet/guide';
 
+// The site's tokens (styles/tokens.css), so a picture reads in the page's own colours; white and black only for the
+// pattern that stands for a QR code.
 const C = {
-  body: '#020b12',
-  frame: 'rgba(0, 229, 240, 0.55)',
-  screen: '#071a26',
-  bar: '#0b2531',
-  text: '#e8ffff',
-  muted: '#8fb3bb',
-  line: 'rgba(143, 179, 187, 0.32)',
-  cyan: '#00e5f0',
-  onCyan: '#00181c',
-  soft: 'rgba(0, 229, 240, 0.16)',
-  hot: '#00ffff',
+  body: 'var(--ink)',
+  frame: 'var(--edge)',
+  screen: 'var(--surface)',
+  bar: 'var(--rule)',
+  text: 'var(--paper)',
+  muted: 'var(--fog)',
+  line: 'var(--rule-strong)',
+  field: 'var(--fill-field)',
+  cyan: 'var(--signal)',
+  onCyan: 'var(--ink)',
+  soft: 'var(--fill-signal)',
+  hot: 'var(--signal)',
+  shade: 'var(--scrim)',
   white: '#ffffff',
   black: '#000000',
 };
 
-const SANS = "Inter, -apple-system, 'Segoe UI', sans-serif";
-// Monospace text takes the site's one stack (--font-mono in globals.css); the rest inherits the picture's SANS.
+// Text takes the site's two stacks (--f-sans, --font-mono in styles/tokens.css); monospace only where MONO says.
+const SANS = { fontFamily: 'var(--f-sans)' };
 const MONO = { fontFamily: 'var(--font-mono)' };
 
 function say(label: Label): string {
@@ -66,13 +70,9 @@ interface Drawn {
   h: number;
 }
 
+// The control the step presses, ringed as the site rings focus: one Signal line, no glow.
 function Ring({ x, y, w, h, r }: { x: number; y: number; w: number; h: number; r: number }) {
-  return (
-    <>
-      <rect x={x - 5} y={y - 5} width={w + 10} height={h + 10} rx={r + 5} fill="none" stroke={C.hot} strokeWidth={3} opacity={0.2} />
-      <rect x={x - 2.5} y={y - 2.5} width={w + 5} height={h + 5} rx={r + 2.5} fill="none" stroke={C.hot} strokeWidth={1.4} />
-    </>
-  );
+  return <rect x={x - 3} y={y - 3} width={w + 6} height={h + 6} rx={r + 3} fill="none" stroke={C.hot} strokeWidth={1.4} />;
 }
 
 function textLines(lines: string[], x: number, y: number, size: number, props: SVGProps<SVGTextElement>, lead = 1.25): ReactNode {
@@ -82,8 +82,10 @@ function textLines(lines: string[], x: number, y: number, size: number, props: S
 }
 
 function drawButton(b: ButtonPart, x: number, y: number, w: number, s: number, key: string): Drawn {
-  const label = b.site ? say(b.label).toUpperCase() : say(b.label);
-  const em = b.site ? 0.7 : 0.6;
+  // The site's buttons are sentence case with the one 2 px radius; the app's and the extension's keep their own shape.
+  const label = say(b.label);
+  const em = 0.6;
+  const radius = b.site ? 2 : 5;
   let size = 8.2 * s;
   while (size > 6 * s && label.length * size * em > w - 12) size -= 0.5;
   const lines = label.length * size * em > w - 12 ? wrap(label, w - 12, size, em, 2) : [label];
@@ -91,16 +93,16 @@ function drawButton(b: ButtonPart, x: number, y: number, w: number, s: number, k
   const tone = b.tone ?? 'primary';
   const fill = tone === 'primary' ? C.cyan : tone === 'done' ? C.soft : 'none';
   const stroke = tone === 'secondary' ? C.frame : tone === 'done' ? 'none' : C.cyan;
-  const color = tone === 'primary' ? C.onCyan : tone === 'done' ? C.muted : '#9ff6ff';
+  const color = tone === 'primary' ? C.onCyan : tone === 'done' ? C.muted : C.cyan;
   const top = y + (h - lines.length * size * 1.2) / 2 - size * 0.12;
   return {
     h,
     node: (
       <g key={key}>
-        {b.hot && <Ring x={x} y={y} w={w} h={h} r={5} />}
-        <rect x={x} y={y} width={w} height={h} rx={5} fill={fill} stroke={stroke} strokeWidth={1} />
+        {b.hot && <Ring x={x} y={y} w={w} h={h} r={radius} />}
+        <rect x={x} y={y} width={w} height={h} rx={radius} fill={fill} stroke={stroke} strokeWidth={1} />
         {lines.map((line, i) => (
-          <text key={i} x={x + w / 2} y={top + size + i * size * 1.2} fontSize={size} fontWeight={700} textAnchor="middle" fill={color} letterSpacing={b.site ? 0.4 : 0}>
+          <text key={i} x={x + w / 2} y={top + size + i * size * 1.2} fontSize={size} fontWeight={b.site ? 600 : 700} textAnchor="middle" fill={color}>
             {line}
           </text>
         ))}
@@ -194,7 +196,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
           <g key={key}>
             {part.label && <text x={x} y={y + size} fontSize={size} fill={C.muted}>{say(part.label)}</text>}
             {part.hot && <Ring x={x} y={y + labelH} w={w} h={box} r={4} />}
-            <rect x={x} y={y + labelH} width={w} height={box} rx={4} fill="rgba(0, 0, 0, 0.45)" stroke={C.frame} strokeWidth={0.8} />
+            <rect x={x} y={y + labelH} width={w} height={box} rx={4} fill={C.field} stroke={C.frame} strokeWidth={0.8} />
             {shown && (
               <text x={x + 5} y={y + labelH + box / 2 + size * 0.36} fontSize={size} fill={part.secret || raw ? C.text : C.muted} style={raw ? MONO : undefined}>
                 {shown}
@@ -246,7 +248,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
               const cy = y + Math.floor(i / cols) * row;
               return (
                 <g key={i}>
-                  <rect x={cx} y={cy} width={pillW} height={pillH} rx={3} fill="rgba(0, 0, 0, 0.45)" stroke={C.line} strokeWidth={0.6} />
+                  <rect x={cx} y={cy} width={pillW} height={pillH} rx={3} fill={C.field} stroke={C.line} strokeWidth={0.6} />
                   <text x={cx + 3} y={cy + pillH * 0.72} fontSize={6.4 * s} fill={C.muted}>{i + 1}</text>
                   <rect x={cx + 12 * s} y={cy + pillH / 2 - 1.5} width={pillW - 16 * s} height={3} rx={1.5} fill={C.line} />
                 </g>
@@ -272,7 +274,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
               const on = i === part.chosen;
               return (
                 <g key={i}>
-                  <rect x={cx} y={cy} width={pillW} height={pillH} rx={pillH / 2} fill={on ? C.soft : 'rgba(0, 0, 0, 0.45)'} stroke={on ? C.cyan : C.line} strokeWidth={on ? 1 : 0.6} />
+                  <rect x={cx} y={cy} width={pillW} height={pillH} rx={pillH / 2} fill={on ? C.soft : C.field} stroke={on ? C.cyan : C.line} strokeWidth={on ? 1 : 0.6} />
                   <rect x={cx + pillW * 0.22} y={cy + pillH / 2 - 1.5} width={pillW * 0.56} height={3} rx={1.5} fill={on ? C.cyan : C.line} />
                 </g>
               );
@@ -292,7 +294,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
         h: box,
         node: (
           <g key={key}>
-            <rect x={x} y={y} width={w} height={box} rx={4} fill="rgba(0, 0, 0, 0.5)" stroke={C.frame} strokeWidth={0.8} />
+            <rect x={x} y={y} width={w} height={box} rx={4} fill={C.field} stroke={C.frame} strokeWidth={0.8} />
             <text x={x + w / 2} y={y + box / 2 + size * 0.36} fontSize={size} fontWeight={700} textAnchor="middle" fill={C.white} style={MONO}>
               {wrap(say(part.label), w - 8, size, 0.62, 1)[0]}
             </text>
@@ -308,7 +310,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
         node: (
           <g key={key}>
             <circle cx={x + 3} cy={y + size * 0.62} r={2.6} fill={C.cyan} />
-            {textLines(lines, x + 10, y - 1, size, { fill: '#9adfe6' })}
+            {textLines(lines, x + 10, y - 1, size, { fill: C.text })}
           </g>
         ),
       };
@@ -328,7 +330,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
               const on = i === part.current;
               return (
                 <g key={i}>
-                  <rect x={cx} y={y} width={each} height={box} rx={box / 2} fill={on ? 'rgba(0, 255, 255, 0.16)' : 'none'} stroke={on ? C.hot : C.line} strokeWidth={on ? 1 : 0.8} />
+                  <rect x={cx} y={y} width={each} height={box} rx={box / 2} fill={on ? C.soft : 'none'} stroke={on ? C.hot : C.line} strokeWidth={on ? 1 : 0.8} />
                   <text x={cx + each / 2} y={y + box / 2 + size * 0.36} fontSize={size} fontWeight={on ? 700 : 500} textAnchor="middle" fill={on ? C.white : C.muted}>
                     {wrap(say(item), each - 4, size, 0.56, 1)[0]}
                   </text>
@@ -359,7 +361,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
           const on = i === part.current;
           nodes.push(
             <g key={i}>
-              <rect x={cx} y={top} width={cardW} height={h} rx={6} fill={on ? 'rgba(0, 255, 255, 0.08)' : 'rgba(0, 0, 0, 0.35)'} stroke={on ? C.hot : C.line} strokeWidth={on ? 1.2 : 0.8} />
+              <rect x={cx} y={top} width={cardW} height={h} rx={6} fill={on ? C.soft : C.field} stroke={on ? C.hot : C.line} strokeWidth={on ? 1.2 : 0.8} />
               <text x={cx + 6} y={top + 5 * s + name} fontSize={name} fontWeight={700} fill={on ? C.white : C.text}>{say(item.label)}</text>
               {textLines(notes[i], cx + 6, noteTop, small, { fill: C.muted })}
               <text x={cx + 6} y={noteTop + small * (most * 1.25 + 1.1)} fontSize={small} fontWeight={700} fill={C.cyan}>{say(item.price)}</text>
@@ -465,7 +467,7 @@ function Browser({ scene, clip, narrow = false }: { scene: Extract<Scene, { fram
           {page.nodes}
           {popup && (
             <g>
-              <rect x={popupX} y={popupTop} width={popupW} height={popupEnd - popupTop} rx={8} fill="rgba(0, 0, 0, 0.5)" transform="translate(2 3)" />
+              <rect x={popupX} y={popupTop} width={popupW} height={popupEnd - popupTop} rx={8} fill={C.shade} transform="translate(2 3)" />
               <rect x={popupX} y={popupTop} width={popupW} height={popupEnd - popupTop} rx={8} fill={C.screen} stroke={C.hot} strokeWidth={1} />
               <path d={`M${popupX} ${popupTop + 18} v-10 a8 8 0 0 1 8 -8 h${popupW - 16} a8 8 0 0 1 8 8 v10 z`} fill={C.bar} />
               <text x={popupX + 8} y={popupTop + 13} fontSize={8.4} fontWeight={700} fill={C.cyan}>{t('ui_ext_name')}</text>
@@ -505,7 +507,7 @@ function Both({ clip, wide, narrow }: { clip: string; wide: (clip: string) => { 
   return (
     <>
       {[wide(`${clip}-w`), narrow(`${clip}-n`)].map((drawn, i) => (
-        <svg key={i} className={`guide-art ${i === 0 ? 'guide-art-wide' : 'guide-art-narrow'}`} viewBox={`0 0 ${drawn.width} ${drawn.height}`} fontFamily={SANS} aria-hidden="true" focusable="false">
+        <svg key={i} className={`guide-art ${i === 0 ? 'guide-art-wide' : 'guide-art-narrow'}`} viewBox={`0 0 ${drawn.width} ${drawn.height}`} style={SANS} aria-hidden="true" focusable="false">
           {drawn.node}
         </svg>
       ))}
@@ -517,7 +519,7 @@ export default function GuideArt({ scene }: { scene: Scene }) {
   const clip = `guide-art-${useId().replace(/:/g, '')}`;
   if (scene.frame === 'phone') {
     return (
-      <svg className="guide-art guide-art-phone" viewBox="0 0 164 224" fontFamily={SANS} aria-hidden="true" focusable="false">
+      <svg className="guide-art guide-art-phone" viewBox="0 0 164 224" style={SANS} aria-hidden="true" focusable="false">
         <Phone x={6} y={4} w={152} h={216} screen={scene.screen} url={scene.url} urlHot={scene.urlHot} parts={scene.parts} clip={clip} />
       </svg>
     );

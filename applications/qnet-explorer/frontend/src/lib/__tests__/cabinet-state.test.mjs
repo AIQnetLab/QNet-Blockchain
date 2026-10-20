@@ -66,7 +66,7 @@ test('a wallet with an activation is never offered one from scratch', () => {
   assert.match(page, /const mayBurn = choice !== null && !viewOnly && \(offer \|\| \(view\.state === 'reserved' && view\.here\)\);/);
   assert.match(page, /const burn = \(\) => withRecord\(async \(r\) => \{\s*if \(price === null \|\| !mayBurn \|\| choice === null\) return undefined;/);
   // While QNet Wallet is asked to confirm the wallet again, Burn waits for it.
-  assert.match(page, /\{stage === 'funded' && price !== null && !confirming && \(mayBurn \? \(\s*<div className="activate-card">\s*<p>\{t\('act_burn_lead'/);
+  assert.match(page, /\{stage === 'funded' && price !== null && !confirming && \(mayBurn \? \(\s*<>\s*<p>\{t\('act_burn_lead'/);
   assert.equal(page.match(/onClick=\{\(\) => void burn\(\)\}/g)?.length, 1);
   assert.match(TEXTS.act_has_activation, /nothing more is burned for it/);
 });
@@ -88,7 +88,7 @@ test('the Overview shows what is known of the wallet\'s activation, from the net
   assert.match(home, /const known = useWalletActivation\('super'\);/);
   // Recorded: the node, its balance with Move, the details, the latest epochs; a super node's own summary with its
   // balance and Move too (R4; owner, 12.10).
-  for (const part of ["t('overview_title')", "t('balance_title')", '<NodeDetails nodeId={nodeId}', '<Epochs nodeId={nodeId} show="recent" />', "t('super_title')", "t('balance_lead')", '<Move']) assert.ok(home.includes(part), part);
+  for (const part of ["t('overview_title')", "t('balance_title')", '<NodeDetails nodeId={nodeId}', '<RecentEpochs nodeId={nodeId} />', "t('super_title')", "t('balance_lead')", '<Move']) assert.ok(home.includes(part), part);
   const details = code('components/cabinet/NodeDetails.tsx');
   for (const key of ['details_title', 'code_field_status', 'ext_field_type', 'act_code', 'act_burn_tx', 'code_field_amount']) assert.ok(details.includes(`t('${key}')`), key);
   assert.match(home, /lightStatusText\(state, known\.facts\?\.height \?\? null\)/);
@@ -136,7 +136,7 @@ test('another browser\'s activation: the site\'s record follows the wallet, and 
 test('every expired piece is asked for again in one tap, the progress kept', () => {
   // A QNet Wallet request past its ten minutes: Ask again, a new request with the same content, wherever one is made.
   const waiting = code('components/cabinet/LinkWaiting.tsx');
-  assert.match(waiting, /\{state\.failure === 'expired' \? \(\s*<button type="button" className="qnet-button activate-primary" onClick=\{onRetry\}>\{t\('link_ask_again'\)\}<\/button>/);
+  assert.match(waiting, /if \(state\.failure === 'expired'\) \{[\s\S]*?<Action kind="solid" small onClick=\{onRetry\}>\{t\('link_ask_again'\)\}<\/Action>/);
   assert.equal(TEXTS.link_ask_again, 'Ask again');
   assert.match(TEXTS.link_expired, /Ask again: nothing was lost\.$/);
   const retries = {
@@ -153,22 +153,23 @@ test('every expired piece is asked for again in one tap, the progress kept', () 
   // one tap (the start card of a page without a record).
   assert.match(page, /if \(isExpired\(r, deps\.now\(\)\)\) return act\.expire\(r, deps\);/);
   assert.match(page, /if \(next === null\) setNotice\(from\.burn \? 'act_returned' : 'act_closed'\);/);
-  assert.match(page, /<button type="button" className="qnet-button activate-primary" onClick=\{\(\) => void start\(\)\} disabled=\{working \|\| !device\}>\{t\('act_start'\)\}<\/button>/);
+  assert.match(page, /<Action kind="solid" onClick=\{\(\) => void start\(\)\} disabled=\{working \|\| !device\}>\{t\('act_start'\)\}<\/Action>/);
   assert.match(TEXTS.act_closed, /To start again, make a new payment address\.$/);
   // A wallet that has its node or its activation gets no start card, so its notice offers no new address (owner, 29.09).
   assert.match(page, /\} else if \(!record && !offer\) \{/);
   assert.match(page, /const shown: MessageKey \| null = notice === 'act_closed' && !record && !offer \? 'act_closed_has_node' : notice;/);
-  assert.match(page, /\{shown && shown !== 'act_refund_failed' && <p className="activate-note" aria-live="polite">\{t\(shown\)\}<\/p>\}/);
+  assert.match(page, /\{shown && shown !== 'act_refund_failed' && <p className="note cab-notice" role="status">\{t\(shown\)\}<\/p>\}/);
   assert.doesNotMatch(TEXTS.act_closed_has_node, /make a new payment address/);
   assert.match(TEXTS.act_closed_has_node, /^The activation ended and its payment address is deleted\. This wallet already has a node or an activation, so it needs no new payment address\.$/);
   // The extension's window closed or timed out: Try again on the same step, while the wallet still has nothing anywhere;
   // Record on the network stays offered.
   const ext = code('components/cabinet/ExtensionActivate.tsx');
-  assert.match(ext, /\{again && <button type="button" className="qnet-button secondary" onClick=\{\(\) => setExt\(\{ phase: 'idle' \}\)\}>\{t\('try_again'\)\}<\/button>\}/);
+  assert.match(ext, /<Failed action=\{again \? \{ label: t\('try_again'\), onClick: \(\) => setExt\(\{ phase: 'idle' \}\) \} : null\}>/);
+  assert.match(ext, /\{again && ext\.phase === 'done' && <div className="cab-next-act"><Action kind="text" onClick=\{\(\) => setExt\(\{ phase: 'idle' \}\)\}>\{t\('try_again'\)\}<\/Action><\/div>\}/);
   // A state not known is read again every half minute by itself, and on Try again.
   const noNode = code('components/cabinet/NextSteps.tsx');
   assert.match(noNode, /const timer = window\.setInterval\(refreshActivation, UNKNOWN_RETRY_MS\);/);
   assert.match(noNode, /const UNKNOWN_RETRY_MS = 30_000;/);
   const steps = code('components/cabinet/NextSteps.tsx');
-  assert.match(steps, /\{ask\.phase === 'waiting' \? \(\s*<p className="activate-status" aria-live="polite">\{t\('wallet_extension_waiting'\)\}<\/p>\s*\) : \(\s*<button type="button" className="qnet-button activate-primary" onClick=\{\(\) => void again\(\)\}>\{t\('next_record_again'\)\}<\/button>/);
+  assert.match(steps, /\{ask\.phase === 'waiting' \? \(\s*<Waiting>\{t\('wallet_extension_waiting'\)\}<\/Waiting>\s*\) : \(\s*<div className="cab-next-act"><Action kind="solid" onClick=\{\(\) => void again\(\)\}>\{t\('next_record_again'\)\}<\/Action><\/div>/);
 });

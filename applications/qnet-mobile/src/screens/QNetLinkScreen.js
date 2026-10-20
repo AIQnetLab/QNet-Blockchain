@@ -6,13 +6,16 @@
 // nothing depends on the site receiving the answer. The same sheets, texts and buttons on every phone and tablet.
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, ScrollView, StyleSheet, BackHandler, ActivityIndicator,
+  View, Text, ScrollView, BackHandler, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { hasKey } from '../i18n';
 import { InfoField, InfoRow } from '../components/InfoRow';
+import { Answer, Answers } from '../components/ui/Action';
+import { color, layer, size, space, themed } from '../theme';
+import { shortAddress } from '../utils/addressDisplay';
 import {
-  openSession, prepareOffer, performIntent, deliverAnswer, markHandled, groupCheckNumber, LinkRefusal,
+  openSession, prepareOffer, readOffer, performIntent, deliverAnswer, markHandled, groupCheckNumber, LinkRefusal,
 } from '../services/QNetLink';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
 import { moveNote } from '../services/ClaimTransit';
@@ -39,7 +42,6 @@ const WALLET_UNLINK = { title: 'link_title_unlink_wallet', auth: 'link_auth_unli
 const byWallet = (o) => !!o && o.kind === 'unlink' && o.mode === 'wallet';
 
 // A wallet named on the sheet: its start and its end.
-const shortAddress = (a) => (typeof a === 'string' && a.length > 20 ? `${a.slice(0, 10)}…${a.slice(-6)}` : String(a || ''));
 
 // `afterOther`: this request arrived while another one was on screen and waited until that one was closed
 // (R4-MOBLINK-01); the screen says so before anything can be confirmed. `onShown` tells the owner the user has this
@@ -105,20 +107,17 @@ export default function QNetLinkScreen({
   useEffect(() => {
     alive.current = true;
     if (resumed.current) return () => { alive.current = false; };
+    // A slow network keeps the request loading (it can be closed); only the relay's or the network's answer refuses it.
+    const cancelled = () => !alive.current;
     (async () => {
       try {
-        session.current = await openSession(link);
+        session.current = await openSession(link, { cancelled });
       } catch (e) {
         set(setRefusal)(e instanceof LinkRefusal ? e.reason : 'network');
         set(setPhase)('refused');
         return;
       }
-      let o;
-      try {
-        o = await prepareOffer(link, { wallet, session: session.current, node });
-      } catch (_) {
-        o = { kind: 'unavailable', error: 'INTERNAL' };
-      }
+      const o = await readOffer(() => prepareOffer(link, { wallet, session: session.current, node }), session.current, { cancelled });
       if (!alive.current) return;
       setOffer(o);
       if (o.kind === 'unavailable' && o.error === 'NO_WALLET') {
@@ -188,7 +187,7 @@ export default function QNetLinkScreen({
       if (phase === 'confirm' && acting.current) return false; // the authentication prompt above handles it
       if (phase === 'confirm') reject();
       else if (phase === 'unavailable') dismissUnavailable();
-      else if (phase !== 'working' && phase !== 'loading') onClose();
+      else if (phase !== 'working') onClose();
       return true;
     });
     return () => sub.remove();
@@ -208,18 +207,10 @@ export default function QNetLinkScreen({
   const nodeField = (value) => <InfoField label={t('link_node')} value={value} mono fit t={t} />;
   const addressField = (label, value) => <InfoField label={label} value={value} mono fit t={t} testID="link-address" />;
 
+  // The step to take is the solid action, the way out a text action; they share the row while their labels fit.
+  // An answer of the sheet: the one solid action, or a text action (Reject, the Node tab, Google Play's licence).
   const button = (label, onPress, kind = 'primary', disabled = false, pressIn = undefined) => (
-    <TouchableOpacity
-      key={label}
-      style={[s.button, kind === 'primary' ? s.primary : s.secondary, disabled && s.disabled]}
-      onPress={onPress}
-      onPressIn={pressIn}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityState={{ disabled }}
-    >
-      <Text style={[s.buttonText, kind !== 'primary' && s.secondaryText]}>{label}</Text>
-    </TouchableOpacity>
+    <Answer key={label} primary={kind === 'primary'} label={label} onPress={onPress} onPressIn={pressIn} disabled={disabled} />
   );
 
   const refusalText = () => ({
@@ -415,7 +406,7 @@ export default function QNetLinkScreen({
 
           {phase === 'loading' || phase === 'working' ? (
             <View style={s.busy}>
-              <ActivityIndicator color="#00d4ff" />
+              <ActivityIndicator color={color.signal} />
               <Text style={s.text}>
                 {phase === 'loading' ? t('link_loading') : t(byWallet(offer) ? WALLET_UNLINK.working : (WORKING[link.intent] || 'link_working_send'))}
               </Text>
@@ -446,50 +437,39 @@ export default function QNetLinkScreen({
             </>
           ) : null}
 
-          <View style={s.actions}>
+          <Answers>
             {phase === 'confirm' ? [
               button(t('link_reject'), reject, 'secondary'),
               button(t('link_confirm'), confirm, 'primary', !armed, onPressIn),
             ] : null}
-            {phase === 'unavailable' ? button(t('link_close'), dismissUnavailable, 'secondary') : null}
-            {phase === 'refused' ? button(t('link_close'), onClose, 'secondary') : null}
+            {phase === 'unavailable' ? button(t('link_close'), dismissUnavailable) : null}
+            {phase === 'refused' || phase === 'loading' ? button(t('link_close'), onClose) : null}
             {phase === 'done' ? doneButtons() : null}
-          </View>
+          </Answers>
         </View>
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-const s = StyleSheet.create({
+const s = themed((type) => ({
   overlay: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#11131f', zIndex: 9000, elevation: 20,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: color.ink, ...layer.request,
   },
-  scroll: { flexGrow: 1, justifyContent: 'center', padding: 16 },
-  card: {
-    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 16,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
-  },
-  origin: { color: '#888888', fontSize: 13, textAlign: 'center', marginBottom: 6 },
-  title: { color: '#00d4ff', fontSize: 19, fontWeight: '700', textAlign: 'center', marginBottom: 14 },
-  text: { color: '#ffffff', fontSize: 14, lineHeight: 20, marginBottom: 10 },
-  bold: { fontWeight: '700' },
-  link: { color: '#00d4ff', textDecorationLine: 'underline' },
-  warning: { color: '#ffaa00', fontSize: 14, lineHeight: 20, marginBottom: 8 },
-  hint: { color: '#888888', fontSize: 12, lineHeight: 17, marginTop: 6 },
-  block: { marginTop: 4, marginBottom: 6 },
-  check: { color: '#ffffff', fontSize: 20, fontWeight: '700', textAlign: 'center', marginVertical: 8 },
-  busy: { alignItems: 'center', paddingVertical: 12, gap: 10 },
-  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
-  button: {
-    flexGrow: 1, flexBasis: 128, minHeight: 44, borderRadius: 10, paddingVertical: 11, paddingHorizontal: 16,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  primary: { backgroundColor: '#00d4ff' },
-  secondary: { backgroundColor: 'rgba(0, 212, 255, 0.1)', borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)' },
-  disabled: { opacity: 0.5 },
-  buttonText: { color: '#1a1a2e', fontSize: 15, fontWeight: '600', textAlign: 'center' },
-  secondaryText: { color: '#00d4ff' },
-});
+  scroll: { flexGrow: 1, padding: space.gut },
+  // The request's column, no box around it.
+  card: { width: '100%', maxWidth: size.request, alignSelf: 'center', padding: 0, borderWidth: 0 },
+  origin: { ...type('label'), color: color.fog, marginBottom: space.s8 },
+  title: { ...type('title'), color: color.paper, marginBottom: space.s16 },
+  text: { ...type('body'), color: color.text, marginBottom: space.s12 },
+  bold: { ...type('row', 15), color: color.paper },
+  link: { color: color.signal, textDecorationLine: 'underline', textDecorationColor: color.signalLine },
+  warning: { ...type('body'), color: color.ember, marginBottom: space.s8 },
+  hint: { ...type('note'), color: color.fog, marginTop: space.s8 },
+  block: { marginTop: space.s4, marginBottom: space.s8 },
+  // The check number with its words (one text: the words and the number are one translated line).
+  check: { ...type('h3'), color: color.paper, marginVertical: space.s8 },
+  busy: { alignItems: 'flex-start', paddingVertical: space.s12, gap: 10 },
+}));
 
 export const linkScreenStyles = s;

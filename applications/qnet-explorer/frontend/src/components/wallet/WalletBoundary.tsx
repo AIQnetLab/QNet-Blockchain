@@ -16,8 +16,8 @@ export default class WalletBoundary extends Component<{ children: ReactNode }, {
     if (!this.state.failed) return this.props.children;
     return (
       <div className="wallet-widget">
-        <button type="button" className="qnet-button wallet-button" onClick={() => window.location.reload()}>
-          Connect wallet
+        <button type="button" className="connect" onClick={() => window.location.reload()}>
+          Connect<span className="c-long"> wallet</span>
         </button>
       </div>
     );

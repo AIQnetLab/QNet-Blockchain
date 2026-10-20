@@ -4,7 +4,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { TEXTS } from '../texts.ts';
 
 const read = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
 // Comments may name what the code must not do; only code is checked.
@@ -79,6 +80,25 @@ test('/l is a server page; only LinkButtons reads the URL, as a whole, through t
   assert.doesNotMatch(buttons, /\bfetch\(|XMLHttpRequest|sendBeacon|WebSocket|EventSource|\bpostMessage\(|window\.open\(|<form/);
   // The URL goes only into the one intent: URL of the one Android package, falling back to the wallet page.
   assert.deepEqual(buttons.match(/androidIntentUrl\([^)]*\)/g), ['androidIntentUrl(link, WALLET_PAGE)']);
+});
+
+// Protocol section 15: link.aiqnet.io/send had no page, so a phone without QNet Wallet (and the Android button's
+// fallback) got a 404. The page never reads its URL, so the transfer in the fragment goes nowhere.
+test('/send is a server page that never reads its URL, and leads to installing QNet Wallet or sending by hand', () => {
+  assert.deepEqual(readdirSync(new URL('../../app/send/', import.meta.url)), ['page.tsx']);
+  const page = code('app/send/page.tsx');
+  assert.doesNotMatch(page, /['"]use client['"]/);
+  assert.doesNotMatch(page, /location|hash|[sS]earchParams|\bparams\b|useEffect|<script|\bdocument\.|\bwindow\./);
+  // It imports nothing that runs in the browser: the site's origin and its texts.
+  assert.deepEqual([...page.matchAll(/from '([^']+)'/g)].map((m) => m[1]), ['next', '@/lib/hosts', '@/lib/rich', '@/lib/texts']);
+  assert.match(page, /robots: \{ index: false, follow: false \}/);
+  for (const key of ['send_lead', 'send_reason_missing', 'send_reason_update', 'send_reason_embedded', 'send_by_hand', 'send_only_yours']) {
+    assert.match(page, new RegExp(`\\b(?:t|rich)\\('${key}'`), key);
+  }
+  assert.match(page, /const activatePage = <a href=\{`\$\{SITE_ORIGIN\}\/node\/activate`\}>aiqnet\.io\/node\/activate<\/a>;/);
+  assert.match(page, /walletPage: <a href=\{`\$\{SITE_ORIGIN\}\/wallet`\}>\{t\('l_wallet_page'\)\}<\/a>/);
+  // By hand: the card's own title, quoted as the page shows it.
+  assert.ok(TEXTS.send_by_hand.includes(`"${TEXTS.act_fund_manual_title}"`));
 });
 
 // Unified plan SITE-8: /activate is a permanent (308) redirect to the cabinet's activation, where the extension's

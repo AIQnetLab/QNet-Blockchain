@@ -3,7 +3,8 @@
 // page opens a file picker on iOS either (MB3-04).
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 jest.mock('../src/crypto/DilithiumCrypto', () => ({
   isDilithiumAvailable: () => true,
@@ -37,8 +38,7 @@ describe('MB3-01: a POST navigation meets the wallet-only rule', () => {
 });
 
 const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-const button = (tree, label) => tree.root.findAllByType(TouchableOpacity)
-  .find((b) => b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('') === label);
+const button = (tree, label) => tree.root.findAllByType(Action).find((b) => b.props.label === label);
 const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
 
 describe('MB3-02: a message is signed only once all of it was shown', () => {

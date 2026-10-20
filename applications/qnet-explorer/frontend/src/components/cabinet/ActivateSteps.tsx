@@ -7,32 +7,46 @@
 
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import Link from 'next/link';
+import { useWallet } from '@/contexts/AppContext';
+import Action from '@/components/ui/Action';
+import Copy from '@/components/ui/Copy';
+import EntityLink from '@/components/ui/EntityLink';
+import TokenIcon from '@/components/TokenIcon';
+import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
+import ViewTabs from '@/components/ui/ViewTabs';
+import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { number, t } from '@/lib/texts';
 import { useNodeStatus } from '@/hooks/useNodeStatus';
 import type { PaymentBalance } from '@/lib/cabinet/activation';
+import { FUNDING_SOL_LAMPORTS } from '@/lib/cabinet/burn-tx';
+import { transferKey, transferMayArrive } from '@/lib/cabinet/extension-view';
 import { receiptCode, type PaymentRecord } from '@/lib/cabinet/flow';
 import { formatUnits } from '@/lib/cabinet/node-view';
-import { fundingSol, oneDevRequest, solRequest } from '@/lib/cabinet/payment-request';
+import {
+  FUNDING_DECIMALS, PHONE_LINK, fundingButtons, fundingLeft, fundingReceived, fundingSol, fundingTransfer, requestLink, type FundingToken,
+} from '@/lib/cabinet/payment-request';
 import { handOver, handOverPass, requestFaucetPass } from '@/lib/faucet-handover';
-import { ACTIVATION_NETWORK, ONE_DEV_DECIMALS, SOL_DECIMALS, solanaTxUrl } from '@/lib/one-dev';
+import { ACTIVATION_NETWORK, ONE_DEV_DECIMALS, ONE_DEV_UNIT, SOL_DECIMALS } from '@/lib/one-dev';
 import { formatCheckNumber } from '@/lib/qnet-link';
-import { shortAddress } from '@/lib/qnet-provider';
+import type { SolanaTransfer, SolanaTransferResult } from '@/lib/qnet-provider';
 import { rich } from '@/lib/rich';
 import { decodeKey } from '@/lib/solana-message';
 import { useCabinet } from './CabinetProvider';
-import CopyButton from './CopyButton';
-import { QrCode } from './LinkWaiting';
+import { QrCode, openHref } from './LinkWaiting';
 import { DeviceRows, StatusGate } from './NodeStatus';
+import { Fact, Facts } from './parts';
 
-// The payment address and what to send to it, as on mainnet (owner, 29.09): the user sends the activation price in 1DEV
-// and the SOL the burn needs from their own wallet. A QR code of a standard payment request fills in the address, 1DEV
-// and the amount in the wallet that scans it; one request carries one token, so the SOL has a small code of its own.
-// Who the node is for: the QNet wallet that confirmed it in QNet Wallet, never this address. On testnet, a link to the Testnet
-// page's faucet for test tokens to the wallet, with the wallet's Solana address handed over without a URL
-// (src/lib/faucet-handover.ts), with the faucet pass the site gives for the wallet's signed reservation the record holds,
-// so the claim takes a place of the hour's share kept for activations (SITE M-13). Test tokens are named as such, never
-// "from any wallet or exchange" (SITE-R3-01). On a phone, where QNet Wallet on the same phone cannot scan the page, the
-// address is copied instead (SITE-F8); each request can be copied too, for a wallet that reads a pasted one (XC-11).
+type Mode = 'wallet' | 'manual';
+
+// The payment address and what to send to it from the user's own wallet (owner, 19.10): one sentence with both amounts,
+// then the two ways as tabs. "Send from your wallet": one row per transfer, with the button for what the address still
+// lacks of it, opening a wallet with it filled in (the QNet extension once it takes qnet_sendSolanaTransfer, on any
+// device; else on a phone the release's link, PHONE_LINK), done once the balance read holds its amount. "Send it
+// yourself": the address with Copy, the amounts and one QR code of it (on a phone the address and amounts come first).
+// Without a way to send from the wallet, only the address, without tabs. Under both, what has arrived, per amount. The
+// node is for the QNet wallet that confirmed it, never this address. On testnet the faucet link hands over the wallet's
+// Solana address and the faucet pass without a URL (src/lib/faucet-handover.ts, SITE M-13); test tokens are named as
+// such (SITE-R3-01).
 export function Funding({
   record,
   price,
@@ -52,8 +66,66 @@ export function Funding({
   phone?: boolean;
 }) {
   const sol = fundingSol();
-  const oneDev = oneDevRequest(record.pub, price);
-  const solOnly = solRequest(record.pub);
+  const tokens: Record<FundingToken, string> = { oneDev: '1DEV', sol: 'SOL' };
+  const tokenName = (token: FundingToken) => (ACTIVATION_NETWORK === 'testnet' ? t('act_test_token', { token: tokens[token] }) : tokens[token]);
+  const full: Record<FundingToken, string> = { oneDev: number(price), sol };
+  const left = fundingLeft(balance, price);
+  const received = fundingReceived(balance, price);
+  const { providerStatus, providerChannel, takesSolanaTransfer, sendSolanaTransfer } = useWallet();
+  const extension = providerStatus === 'available' && providerChannel === 'extension';
+  // The extension's buttons wait until it says it takes the transfer.
+  const [extensionSends, setExtensionSends] = useState(false);
+  useEffect(() => {
+    if (!extension) {
+      setExtensionSends(false);
+      return undefined;
+    }
+    let live = true;
+    void takesSolanaTransfer().then((takes) => {
+      if (live) setExtensionSends(takes);
+    });
+    return () => {
+      live = false;
+    };
+  }, [extension, takesSolanaTransfer]);
+  const [sending, setSending] = useState<FundingToken | null>(null);
+  const [outcome, setOutcome] = useState<{ token: FundingToken; result: SolanaTransferResult } | null>(null);
+  // A transfer that may still arrive, by token, with the amount it carries: its button waits for the balance until the
+  // page is reloaded, so one tap never asks for the same tokens twice.
+  const [arriving, setArriving] = useState<Partial<Record<FundingToken, string>>>({});
+  const [mode, setMode] = useState<Mode>('wallet');
+  const send = async (token: FundingToken, transfer: SolanaTransfer, amount: string) => {
+    setSending(token);
+    setOutcome(null);
+    const result = await sendSolanaTransfer(transfer);
+    setSending(null);
+    if (!result.ok && result.failure === 'unsupported') setExtensionSends(false);
+    if (transferMayArrive(result)) setArriving((was) => ({ ...was, [token]: amount }));
+    setOutcome({ token, result });
+  };
+  const buttons = fundingButtons(phone, extensionSends);
+  const android = useDeviceKind()?.android === true;
+  // A row's right side: received, waiting for a transfer that may still arrive, or the button that sends what is lacking.
+  const fundButton = (token: FundingToken) => {
+    const transfer = fundingTransfer(record.pub, token, left[token]);
+    if (!transfer) {
+      return <span key={token} className="cab-send-st">{t('act_fund_done')}</span>;
+    }
+    const waiting = arriving[token];
+    if (waiting !== undefined) {
+      return <span key={token} className="cab-send-st wait">{t('act_fund_waiting', { amount: waiting, token: tokenName(token) })}</span>;
+    }
+    const amount = formatUnits(left[token], FUNDING_DECIMALS[token]);
+    const label = t('act_fund_send', { amount, token: tokenName(token) });
+    // The 1DEV first; the SOL's button turns solid once the 1DEV arrived or is on its way.
+    const className = token === 'oneDev' || received.oneDev || arriving.oneDev !== undefined ? 'btn btn-solid btn-sm' : 'btn btn-text';
+    if (buttons === 'links') {
+      return <a key={token} href={openHref(requestLink(transfer), android)} className={className}>{label}</a>;
+    }
+    return (
+      <button key={token} type="button" className={className} onClick={() => void send(token, transfer, amount)} disabled={sending !== null}>{label}</button>
+    );
+  };
   // The faucet pass for the wallet the record holds; none without its signed reservation or off testnet.
   const [pass, setPass] = useState<string | null>(null);
   const hold = ACTIVATION_NETWORK === 'testnet' ? record.hold ?? null : null;
@@ -72,21 +144,60 @@ export function Funding({
     if (walletSolana) handOver(walletSolana);
     if (pass) handOverPass(pass);
   };
-  return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t('act_address_title')}</h3>
-      {wallet && <p>{t('act_owner', { wallet: shortAddress(wallet) })}</p>}
-      <p className="cabinet-lead">{t(ACTIVATION_NETWORK === 'mainnet' ? 'act_mainnet_send' : 'act_testnet_send', { price: number(price), sol })}</p>
-      <QrCode text={oneDev} label={t('act_request_qr', { price: number(price) })} />
-      <p className="activate-note">{phone ? t('act_request_note_phone', { price: number(price), sol }) : t('act_request_note')}</p>
-      <p className="activate-mono">{record.pub}</p>
-      <CopyButton value={record.pub} />
-      <CopyButton value={oneDev} label={t('act_copy_request')} />
-      <div className="cabinet-sol-request">
-        <QrCode text={solOnly} label={t('act_sol_qr', { sol })} small />
-        <p>{t('act_sol_line', { sol })}</p>
-        <CopyButton value={solOnly} label={t('act_copy_request')} />
+  const row = (token: FundingToken) => (
+    <div className="cab-send" data-done={received[token] || undefined}>
+      <span className="cab-send-k">{tokens[token]}</span>
+      <span className="cab-send-amt">{full[token]} {tokenName(token)}</span>
+      {fundButton(token)}
+    </div>
+  );
+  const fromWallet = buttons && (
+    <>
+      {row('oneDev')}
+      {row('sol')}
+      <p className="note">
+        {t(buttons === 'extension' ? 'act_fund_auto_extension' : PHONE_LINK === 'transfer' ? 'act_fund_auto_phone_transfer' : 'act_fund_auto_phone')}
+      </p>
+      {sending !== null && <Waiting>{t('wallet_extension_waiting')}</Waiting>}
+      {outcome && !received[outcome.token] && (outcome.result.ok
+        ? <Answered>{t(transferKey(outcome.result))}</Answered>
+        : <Failed>{t(transferKey(outcome.result))}</Failed>)}
+    </>
+  );
+  const yourself = (
+    <div className="cab-manual">
+      <figure className="cab-pay-qr">
+        <QrCode text={record.pub} label={t('act_address_qr')} size={196} />
+      </figure>
+      <div className="cab-manual-t">
+        <p className="label">{t('act_address_title')}</p>
+        <p className="ent-copy">
+          <span className="ent ent-full">{record.pub}</span>
+          <Copy value={record.pub} />
+        </p>
+        <dl className="cab-amts">
+          <div><dt>1DEV</dt><dd className="amount"><span className="amount-v num">{full.oneDev}</span> <span className="ent ent-unit"><TokenIcon solana="1DEV" size="text" />{tokenName('oneDev')}</span></dd></div>
+          <div><dt>SOL</dt><dd className="amount"><span className="amount-v num">{full.sol}</span> <span className="ent ent-unit"><TokenIcon solana="SOL" size="text" />{tokenName('sol')}</span></dd></div>
+        </dl>
       </div>
+    </div>
+  );
+  // What has arrived on the address, per amount, from the balance read (dashes before the first read).
+  const meter = (token: FundingToken, need: bigint, decimals: number, of: string) => {
+    const has = balance === null ? null : token === 'oneDev' ? balance.oneDev : balance.sol;
+    const share = has === null ? 0 : Number(need - left[token]) / Number(need);
+    return (
+      <div className="cab-meter">
+        <span className="label">{t('act_meter_label', { token: tokens[token] })}</span>
+        <span className="cab-meter-v">{has === null ? <span className="dash">—</span> : t('act_meter', { received: formatUnits(has, decimals), need: of })}</span>
+        <span className="ro-bar" aria-hidden="true"><i style={{ transform: `scaleX(${share.toFixed(4)})` }} /></span>
+      </div>
+    );
+  };
+  return (
+    <div className="cab-pay">
+      {wallet && <p className="cab-step-s">{rich('act_owner', { wallet: <EntityLink kind="address" value={wallet} /> })}</p>}
+      <p className="cab-pay-h">{t(ACTIVATION_NETWORK === 'mainnet' ? 'act_mainnet_send' : 'act_testnet_send', { price: number(price), sol })}</p>
       {ACTIVATION_NETWORK === 'testnet' && (
         <p>
           {rich('act_no_tokens', {
@@ -96,18 +207,21 @@ export function Funding({
           })}
         </p>
       )}
-      <p className="activate-note">{t('act_address_note')}</p>
-      <p className="activate-note">{t('act_keep_browser')}</p>
-      {balance && (
-        <p className="activate-status" aria-live="polite">
-          {t('act_received', {
-            oneDev: formatUnits(balance.oneDev, ONE_DEV_DECIMALS),
-            price: number(price),
-            sol: formatUnits(balance.sol, SOL_DECIMALS),
-            solNeed: sol,
-          })}
-        </p>
-      )}
+      {fromWallet ? (
+        <ViewTabs
+          className="cab-modes"
+          items={[{ key: 'wallet', label: t('act_fund_auto_title') }, { key: 'manual', label: t('act_fund_manual_title') }]}
+          value={mode}
+          onChange={setMode}
+          label={t('act_address_title')}
+        >
+          {mode === 'wallet' ? fromWallet : yourself}
+        </ViewTabs>
+      ) : yourself}
+      <div className="cab-meters" aria-live="polite">
+        {meter('oneDev', BigInt(price) * ONE_DEV_UNIT, ONE_DEV_DECIMALS, number(price))}
+        {meter('sol', FUNDING_SOL_LAMPORTS, SOL_DECIMALS, sol)}
+      </div>
     </div>
   );
 }
@@ -118,26 +232,18 @@ export function Receipt({ record, unused = false }: { record: PaymentRecord; unu
   const code = unused ? null : receiptCode(record);
   if (!record.burn) return null;
   return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t('act_receipt_title')}</h3>
+    <div className="cab-receipt">
+      <h4 className="label">{t('act_receipt_title')}</h4>
       <p>{t('act_burned', { amount: number(record.burn.amount) })}</p>
-      <dl className="activate-fields">
-        <div className="activate-field">
-          <dt>{t('act_burn_tx')}</dt>
-          <dd>
-            <a href={solanaTxUrl(record.burn.tx)} target="_blank" rel="noopener noreferrer" className="activate-mono">{record.burn.tx}</a>
-          </dd>
-        </div>
+      <Facts>
+        <Fact label={t('act_burn_tx')}><EntityLink kind="solana-tx" value={record.burn.tx} /></Fact>
         {code && (
-          <div className="activate-field">
-            <dt>{t('act_code')}</dt>
-            <dd>
-              <span className="activate-code">{code}</span> <CopyButton value={code} />
-            </dd>
-          </div>
+          <Fact label={t('act_code')}>
+            <span className="ent-copy"><span className="ent cab-code">{code}</span><Copy value={code} /></span>
+          </Fact>
         )}
-      </dl>
-      {code && <p className="activate-note">{t('act_code_note')}</p>}
+      </Facts>
+      {code && <p className="note">{t('act_code_note')}</p>}
     </div>
   );
 }
@@ -146,11 +252,11 @@ export function Receipt({ record, unused = false }: { record: PaymentRecord; unu
 // before the user confirms (SITE-1, SITE-3).
 function ConfirmLoss({ warning, confirm, busy, onConfirm, onBack }: { warning: string; confirm: string; busy: boolean; onConfirm: () => void; onBack: () => void }) {
   return (
-    <div className="activate-card" role="alert">
-      <p className="activate-error">{warning}</p>
-      <div className="cabinet-actions">
-        <button type="button" className="qnet-button activate-primary" onClick={onBack} disabled={busy}>{t('cancel')}</button>
-        <button type="button" className="qnet-button secondary" onClick={onConfirm} disabled={busy}>{confirm}</button>
+    <div className="cab-next" role="alert">
+      <p className="rq-failed">{warning}</p>
+      <div className="actions cab-next-act">
+        <Action kind="solid" onClick={onBack} disabled={busy}>{t('cancel')}</Action>
+        <Action kind="text" onClick={onConfirm} disabled={busy}>{confirm}</Action>
       </div>
     </div>
   );
@@ -160,9 +266,9 @@ function ConfirmLoss({ warning, confirm, busy, onConfirm, onBack }: { warning: s
 // the wallet's activation, registered later from any browser where the wallet is connected.
 export function LeftoversNow({ busy, onSend }: { busy: boolean; onSend: () => void }) {
   return (
-    <div className="activate-card">
-      <p className="activate-note">{t('act_leftovers_now_note')}</p>
-      <button type="button" className="qnet-button secondary" onClick={onSend} disabled={busy}>{t('act_leftovers_now')}</button>
+    <div className="cab-next">
+      <p className="note">{t('act_leftovers_now_note')}</p>
+      <div className="cab-next-act"><Action kind="text" onClick={onSend} disabled={busy}>{t('act_leftovers_now')}</Action></div>
     </div>
   );
 }
@@ -172,18 +278,18 @@ export function AnswerCheck({ record, onAnswer }: { record: PaymentRecord; onAns
   if (!record.answer || !record.link) return null;
   const asks = record.link.request.check && !record.answer.checkConfirmed;
   return (
-    <div className="activate-card">
-      <p>{t('act_answer_for', { node: record.answer.nodeId, wallet: shortAddress(record.answer.qnet) })}</p>
+    <div className="cab-sub">
+      <p>{rich('act_answer_for', { node: record.answer.nodeId, wallet: <EntityLink kind="address" value={record.answer.qnet} /> })}</p>
       {asks ? (
         <>
-          <p className="activate-code">{t('act_check', { number: formatCheckNumber(record.answer.checkNumber) })}</p>
-          <div className="cabinet-actions">
-            <button type="button" className="qnet-button activate-primary" onClick={() => onAnswer(true)}>{t('act_check_yes')}</button>
-            <button type="button" className="qnet-button secondary" onClick={() => onAnswer(false)}>{t('act_check_no')}</button>
+          <p className="cab-check-number">{t('act_check', { number: formatCheckNumber(record.answer.checkNumber) })}</p>
+          <div className="actions cab-next-act">
+            <Action kind="solid" onClick={() => onAnswer(true)}>{t('act_check_yes')}</Action>
+            <Action kind="text" onClick={() => onAnswer(false)}>{t('act_check_no')}</Action>
           </div>
         </>
       ) : (
-        <p className="activate-status" aria-live="polite">{t('act_checking_node')}</p>
+        <Waiting>{t('act_checking_node')}</Waiting>
       )}
     </div>
   );
@@ -235,11 +341,12 @@ export function Leftovers({
   const amounts = balance && { oneDev: formatUnits(balance.oneDev, ONE_DEV_DECIMALS), sol: formatUnits(balance.sol, SOL_DECIMALS) };
   const left = amounts && t('act_leftovers', amounts);
   const lacking = short !== null && short > 0n ? (
-    <div className="cabinet-choice" role="alert">
-      <p className="activate-error">{t(ACTIVATION_NETWORK === 'testnet' ? 'act_refund_short_testnet' : 'act_refund_short', { sol: formatUnits(short, SOL_DECIMALS) })}</p>
-      <QrCode text={pub} label={t('act_address_qr')} />
-      <p className="activate-mono">{pub}</p>
-      <CopyButton value={pub} />
+    <div className="cab-manual" role="alert">
+      <figure className="cab-pay-qr"><QrCode text={pub} label={t('act_address_qr')} size={196} /></figure>
+      <div className="cab-manual-t">
+        <p className="rq-failed">{t(ACTIVATION_NETWORK === 'testnet' ? 'act_refund_short_testnet' : 'act_refund_short', { sol: formatUnits(short, SOL_DECIMALS) })}</p>
+        <p className="ent-copy"><span className="ent ent-full">{pub}</span><Copy value={pub} /></p>
+      </div>
     </div>
   ) : null;
   // 1DEV stay behind for want of SOL: sending the SOL is the way, never deleting the key.
@@ -250,55 +357,56 @@ export function Leftovers({
   }
   if (empty) {
     return (
-      <div className="activate-card">
+      <div className="cab-next">
         {expired && <p>{t('act_expired')}</p>}
-        <p className="activate-status" aria-live="polite">{t('act_closing_empty')}</p>
-        <button type="button" className="activate-link-button" onClick={() => setLeaving(true)} disabled={busy}>{t('act_closing_delete')}</button>
+        <Waiting>{t('act_closing_empty')}</Waiting>
+        <div className="cab-next-act"><Action kind="text" onClick={() => setLeaving(true)} disabled={busy}>{t('act_closing_delete')}</Action></div>
       </div>
     );
   }
   if (dest) {
     return (
-      <div className="activate-card">
+      <div className="cab-next">
         {expired && <p>{t('act_expired')}</p>}
         {left && <p>{left}</p>}
-        <p className="activate-status" aria-live="polite">
-          {t('act_refund_to')} <span className="activate-mono">{dest}</span>
-        </p>
+        <Waiting>
+          {t('act_refund_to')} <span className="ent">{dest}</span>
+        </Waiting>
         {lacking}
-        {failed && !lacking && <p className="activate-error" role="alert">{t('act_refund_failed')}</p>}
+        {failed && !lacking && <Failed>{t('act_refund_failed')}</Failed>}
       </div>
     );
   }
   return (
-    <div className="activate-card">
+    <div className="cab-next">
       {expired && <p>{t('act_expired')}</p>}
       {left && <p>{left}</p>}
       {lacking}
-      <p className="activate-note">{t(ask ? 'act_refund_ask' : 'act_refund_enter')}</p>
+      <p className="note">{t(ask ? 'act_refund_ask' : 'act_refund_enter')}</p>
       {ask}
-      <form className="cabinet-choice" onSubmit={submit} noValidate>
-        <label className="cabinet-label" htmlFor="cabinet-refund">{t('act_refund_label')}</label>
-        <div className="cabinet-row">
+      <form className="cab-form" onSubmit={submit} noValidate>
+        <label className="label" htmlFor="cabinet-refund">{t('act_refund_label')}</label>
+        <div className="cab-field-row">
           <input
             id="cabinet-refund"
-            className="cabinet-input activate-mono"
+            className="field mono"
             value={typed}
             onChange={(e) => {
               setTyped(e.target.value);
               setInvalid(false);
             }}
             aria-invalid={invalid}
+            aria-describedby={invalid ? 'cabinet-refund-error' : undefined}
             autoComplete="off"
             autoCapitalize="none"
             spellCheck={false}
           />
-          <button type="submit" className="qnet-button activate-primary" disabled={busy}>{t('act_refund_send')}</button>
+          <button type="submit" className="btn btn-solid btn-sm" disabled={busy}>{t('act_refund_send')}</button>
         </div>
-        {invalid && <p className="activate-error" role="alert">{t('act_refund_invalid')}</p>}
-        {failed && !lacking && <p className="activate-error" role="alert">{t('act_refund_failed')}</p>}
+        {invalid && <p className="cab-field-error" id="cabinet-refund-error" role="alert">{t('act_refund_invalid')}</p>}
+        {failed && !lacking && <Failed>{t('act_refund_failed')}</Failed>}
       </form>
-      {mayLeave && <button type="button" className="activate-link-button" onClick={() => setLeaving(true)} disabled={busy}>{t('act_refund_leave')}</button>}
+      {mayLeave && <div className="cab-next-act"><Action kind="text" onClick={() => setLeaving(true)} disabled={busy}>{t('act_refund_leave')}</Action></div>}
     </div>
   );
 }
@@ -308,13 +416,13 @@ export function Registered({ nodeId }: { nodeId: string }) {
   const { viewOnly } = useCabinet();
   const { state, retry } = useNodeStatus(nodeId, viewOnly);
   return (
-    <div className="activate-card">
-      <p className="activate-result">{t('act_done')}</p>
+    <div className="cab-sub">
+      <Answered>{t('act_done')}</Answered>
       <StatusGate state={state} retry={retry}>
-        {(status) => (status.deviceBound ? <DeviceRows status={status} /> : <p className="activate-note">{t('act_done_device')}</p>)}
+        {(status) => (status.deviceBound ? <DeviceRows status={status} /> : <p className="note">{t('act_done_device')}</p>)}
       </StatusGate>
-      <div className="cabinet-actions">
-        <Link href="/node?tab=overview" className="qnet-button activate-primary">{t('act_go_cabinet')}</Link>
+      <div className="cab-next-act">
+        <Action kind="solid" href="/node?tab=overview">{t('act_go_cabinet')}</Action>
       </div>
     </div>
   );

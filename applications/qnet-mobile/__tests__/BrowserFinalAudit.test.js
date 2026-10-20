@@ -7,7 +7,8 @@ import fs from 'fs';
 import path from 'path';
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { AppState, Text, TouchableOpacity } from 'react-native';
+import { AppState, Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const { sha3_256 } = require('js-sha3');
 const { createDappProvider, CODES, ARM_MS, SEND_ARM_MS } = require('../src/browser/dappProvider');
@@ -58,8 +59,7 @@ const call = (s) => s.p.request(s.ctx(), 'qnet_sendTransaction', { type: 'contra
 
 describe('MB-01: an approval right after Face ID or the passcode is never dropped', () => {
   const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-  const button = (tree, label) => tree.root.findAllByType(TouchableOpacity)
-    .find((b) => b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('') === label);
+  const button = (tree, label) => tree.root.findAllByType(Action).find((b) => b.props.label === label);
   const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
   let listeners;
   let state;
@@ -214,7 +214,7 @@ describe('MB-03 and MB-04: the pages the site keeps out of the app are refused b
         t: (k) => k, onSheet: () => {}, confirmAction: () => {},
       }));
     });
-    const bookmark = tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function');
+    const bookmark = tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function')[0];
     await act(async () => { bookmark.props.onPress(); });
     const web = () => tree.root.findByType(WebView).props;
     await act(async () => { web().onNavigationStateChange({ url: 'https://aiqnet.io/explorer', title: 'Explorer', canGoBack: false }); });
@@ -227,8 +227,7 @@ describe('MB-03 and MB-04: the pages the site keeps out of the app are refused b
 });
 
 describe('MB-05: Sign arms only once the whole message was on screen', () => {
-  const button = (tree, label) => tree.root.findAllByType(TouchableOpacity)
-    .find((b) => b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('') === label);
+  const button = (tree, label) => tree.root.findAllByType(Action).find((b) => b.props.label === label);
   const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
 
   it('a message as tall as the box, border included, is not all shown; one that fits inside it is', async () => {

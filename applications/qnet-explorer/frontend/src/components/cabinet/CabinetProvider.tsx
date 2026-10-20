@@ -56,8 +56,6 @@ interface CabinetValue {
   // Reads every source again now (after an answer of the extension, a burn, a Try again).
   refreshActivation: () => void;
   choose: (choice: WalletChoice) => void;
-  // Disconnect: the wallet goes, and the extension's wallet is not taken up by itself until a tap connects one.
-  forget: () => void;
   // View by address, and its end (back to the connect screen; not a Disconnect, so it leaves no mark).
   viewAddress: (qnet: string) => void;
   stopViewing: () => void;
@@ -138,6 +136,12 @@ export function chooseWallet(next: WalletChoice): void {
 // The header's Connect wallet while this tab views an address: the view, which hides the connect card, ends.
 export function endView(): void {
   if ((heldHere ?? storedHeld()).viewing) hold({ viewing: null });
+}
+
+// Disconnect, from My node or the header's account menu: the wallet goes, and the extension's wallet is not taken up by
+// itself until a tap connects one.
+export function forgetWallet(): void {
+  hold({ choice: null, disconnected: true });
 }
 
 // The server's record of `wallet`, read on load, on return, after a step and on a timer, with the search of the wallet's
@@ -289,8 +293,6 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
 
   const choose = useCallback((next: WalletChoice) => chooseWallet(next), []);
 
-  const forget = useCallback(() => hold({ choice: null, disconnected: true }), []);
-
   const viewAddress = useCallback((qnet: string) => hold({ viewing: qnet }), []);
 
   const stopViewing = useCallback(() => hold({ viewing: null }), []);
@@ -380,9 +382,9 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
   const devicePlatform = light.state.phase === 'ok' ? light.state.value.device?.platform ?? null : null;
   const value = useMemo<CabinetValue>(() => ({
     ready, choice: current, nodeId: cv?.nodeId ?? null, walletHash: cv?.walletHash ?? null, viewOnly, phoneFlows, devicePlatform,
-    activation: kept, view, record: server.read.phase === 'ok' ? server.read.value : null, superId, refreshActivation, choose, forget, viewAddress,
+    activation: kept, view, record: server.read.phase === 'ok' ? server.read.value : null, superId, refreshActivation, choose, viewAddress,
     stopViewing, keepActivation,
-  }), [ready, current, cv?.nodeId, cv?.walletHash, viewOnly, phoneFlows, devicePlatform, kept, view, server.read, superId, refreshActivation, choose, forget,
+  }), [ready, current, cv?.nodeId, cv?.walletHash, viewOnly, phoneFlows, devicePlatform, kept, view, server.read, superId, refreshActivation, choose,
     viewAddress, stopViewing, keepActivation]);
 
   return <CabinetContext.Provider value={value}>{children}</CabinetContext.Provider>;
@@ -394,10 +396,9 @@ export function useCabinet(): CabinetValue {
   return value;
 }
 
-// The address of the connected wallet, for the site's header on every page: the one My node remembers, or the
-// extension's it takes up (extensionReconnect, not while this tab views an address); never a viewed address; null
-// before it is read.
-export function useHeldWallet(): string | null {
+// The connected wallet, for the site's header on every page: the one My node remembers, or the extension's it takes up
+// (extensionReconnect, not while this tab views an address); never a viewed address; null before it is read.
+export function useHeldChoice(): WalletChoice | null {
   const { providerStatus, providerChannel, accounts } = useWallet();
   const [kept, setKept] = useState<Held | null>(null);
   useEffect(() => {
@@ -417,5 +418,10 @@ export function useHeldWallet(): string | null {
   }, []);
   if (!kept) return null;
   const channel = providerStatus === 'available' ? providerChannel : null;
-  return shownWallet(kept.choice, kept.viewing, channel, accounts, kept.disconnected).connected?.qnet ?? null;
+  return shownWallet(kept.choice, kept.viewing, channel, accounts, kept.disconnected).connected ?? null;
+}
+
+// The connected wallet's address (useHeldChoice).
+export function useHeldWallet(): string | null {
+  return useHeldChoice()?.qnet ?? null;
 }

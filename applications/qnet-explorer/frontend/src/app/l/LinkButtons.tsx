@@ -16,16 +16,17 @@ export default function LinkButtons({ lead, button, note }: { lead: string; butt
     if (isAndroid(window.navigator) && parseLink(here)) setLink(here);
   }, []);
 
-  if (!link) return null;
-  const open = androidIntentUrl(link, WALLET_PAGE);
-  if (!open) return null;
+  const open = link ? androidIntentUrl(link, WALLET_PAGE) : null;
+  // On Android the slot keeps its room from the first paint (styles/pages.css), so the reasons below never move.
   return (
-    <div className="activate-card">
-      <p>{lead}</p>
-      <div className="link-open">
-        <a className="qnet-button activate-primary" href={open}>{button}</a>
-      </div>
-      <p className="activate-note">{note}</p>
+    <div className="link-slot">
+      {open && (
+        <>
+          <p className="body">{lead}</p>
+          <a className="btn btn-solid" href={open}>{button}</a>
+          <p className="note">{note}</p>
+        </>
+      )}
     </div>
   );
 }

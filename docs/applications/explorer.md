@@ -39,34 +39,115 @@ delegate into `frontend/`.
 
 ## What it shows
 
-- `/explorer` — chain overview with recent blocks and transactions.
-- `/explorer/block/[hash]` — block detail.
-- `/explorer/tx/[hash]` — transaction detail, with the recipient list of a `BatchTransfers` envelope.
-- `/explorer/address/[address]` — address page: balance, native transactions with incoming
-  batch-transfer credits, and token transfers.
-- `/explorer/tokens` and `/explorer/token/[contract]` — deployed token list, per-token page and
-  holder list.
+- `/explorer` — the title band with the search and six readouts, then Latest blocks beside All transactions. The search
+  (`src/components/explorer/ExplorerSearch.tsx`) takes a block height, a transaction or block hash, an address or a
+  token; `/` focuses it on a computer, its matches come from `/api/search/suggest` 250 ms after typing stops, and a
+  match opens with a full navigation. The readouts (`NetworkReadouts.tsx`): the block height (a link to the block), the
+  epoch with the blocks left, server nodes and light nodes of the last settled epoch as two readings
+  (`/api/network/stats`, read at most once a minute), the QNC supply (a link to `/explorer/qnc`) and the last block's
+  age with the node that made it. Latest blocks: 12 rows (6 on a phone), each height a link to its block over its hash,
+  with the producer (a link to its address page when the index holds `producer_address`, else its id as text), its
+  transaction count and its age; the server renders them from the head snapshot's newest blocks and each new head from
+  the head stream takes the top row with its producer and count as the oldest leaves, a skipped height as a row of its
+  own; a row without its hash or producer (a skipped height, or a head whose event did not name its block) is filled in
+  place from `GET /api/blocks?latest=N`, read at most every 2 s while one is missing
+  (`src/components/explorer/useRecentBlocks.ts`). Beside All transactions from 1,281 px wide, above it below
+  that. The epoch readout leads to the epoch's first block (epoch N holds blocks N × 14,400 on). All transactions: 50 to a page, type filters several at
+  once with All to clear them, the block column's order, numbered pages up to 200 and older pages by cursor; the first
+  page, newest first and unfiltered, is read again on a new head at most every 1.5 s. Nothing moves under the reader:
+  columns of fixed width and rows of fixed height (`src/components/ui/DataTable.tsx`), a live table keeps its row
+  elements in place and gives them the new content, a new row lands tinted, and a live table's rows are held while the
+  pointer or focus is inside it, and on a touch screen from a press on it until 3 s after the last touch there (after a
+  touch, a scroll of the page while the table is on screen holds it the same way); while held its label says how many
+  rows wait ("3 new"), or "Paused while you point at it" (`src/lib/hold.ts`, `src/components/ui/useHold.ts`). Each part renders again only for its own data: the
+  readouts and the blocks follow the head, the list only its own rows (`OnHead.tsx`), and ages count on from one clock
+  (`Ago.tsx`). While the page loads it shows the same geometry empty (`app/explorer/loading.tsx`); each other explorer
+  route loads as itself. The block, transaction, address, token, token directory and QNC pages render on the server
+  with their routes' first answers (`src/server/first-answer.ts` reads a route in-process with the visitor's request
+  headers, so the route's per-visitor limits count the read as theirs), so their notes, tables and groups are there from
+  the first paint and the client reads again only to follow the chain, a filter or a page; while one of them loads it
+  shows itself with nothing in it, and reads nothing. An explorer page is at least a screen tall, so the footer starts
+  below the first screen and nothing in view moves when a page takes the place of its loading state.
+- `/explorer/block/[hash]` — "Block N" with its type, the whole hash with Copy, its time and the blocks either side
+  (Previous and Next, the next once the chain has it; for a height the chain has not reached, the newest block); readouts for its transactions, its producer (a link to the producer's address when
+  the block names one), gas used and size; its details as rows (previous block, Merkle and state roots, VTS hash and
+  counter, signature type and signature, certificate, QRB output, version), every row "—" until the block arrives; its
+  transactions, or one line when the network pruned its body before the explorer read it; a macroblock's consensus data
+  and, opened in place, its validators and included microblocks. A height the explorer has not read is asked for again
+  as the chain reaches it, at most every 3 s and 20 times.
+- `/explorer/tx/[hash]` — the transaction's short hash as the title with its type and status, the whole hash with Copy
+  and its time; readouts for its status, block, amount and fee; From and To whole with Copy, nonce and signature; a
+  QRC-20 call's token transfer, a `BatchTransfers` envelope's recipients, or its data with addresses and blocks as
+  links. While the page loads, a row the list showed paints it from the tab's cache; a transaction not in a block the
+  explorer has read is asked for again as the chain moves.
+- `/explorer/address/[address]` — the short address as the title, the whole address spaced at its structure with Copy;
+  readouts for its balance, transactions, first seen and last active; its other tokens, its newest 100 transactions
+  with incoming batch-transfer credits (25 to a page, the first page live), and its token transfers; read again as the
+  head moves, at most every 3 s. A system account shows its name and no balance.
+- `/explorer/tokens` and `/explorer/token/[contract]` — the token directory (a lookup by contract, a filter, 25 to a
+  page, each token, deployer and deploy transaction a link) and a token's page: readouts for its supply, holders, issued
+  total and decimals, then Transfers, Holders and Contract as tabs; its transfers follow the head at most every 10 s.
 - `/explorer/qnc` — native QNC overview backed by the node rich list (top holders, total and
-  circulating supply). QNC is the native coin, so this is a coin view, not a QRC-20 token page.
-- Amounts are written in English, the whole part grouped with commas. Exact, from the base units with no
+  circulating supply). QNC is the native coin, so this is a coin view, not a QRC-20 token page. It is read again as the
+  head moves, at most every 10 s.
+- Every block, transaction, address, token and node with a known address in the explorer is written by one component,
+  `src/components/ui/EntityLink.tsx` (its rules in `src/lib/entity.ts`), and links to its page; an amount's number is
+  text and its unit, with its icon, the link to QNC or the token. The explorer's tables are put together from one set of
+  columns (`src/components/explorer/columns.tsx`) and write a transaction's sides one way (`cells.tsx`).
+- Amounts and counts read the same whatever the visitor's language or locale (42,578.81988 QNC): every formatter names
+  English (`'en'` or `'en-US'`), never the browser's locale, so the whole part is grouped with commas and the decimals
+  follow a point. Counts (heights, checkpoints, transaction, page and holder counts, gas used, the blocks left in the
+  epoch) are grouped by `number()` in `src/lib/texts.ts` alone. Amounts are exact, from the base units with no
   floating-point step (`src/lib/token-format.ts`): a block's transaction amounts (a block not indexed yet is read from
   a node's JSON with its wide integers quoted before parsing, `quoteBigInts` in `src/indexer/transform.ts`), a batch's
   recipients, the QNC page's holders and supply, token amounts and the proven balance; the circulating supply on the
   home page and in `/api/network/stats` is cut, not rounded, to two decimal places. The transaction lists, an
-  address's balance and a transaction's amount and fee round QNC of 0.01 and more to two decimal places. A table wider
-  than the screen scrolls sideways inside its card; the list's From → To stays on one line, its column as wide as what
-  it holds. Monospace text takes one stack of the platform's own fonts (`--font-mono` in `src/app/globals.css`); the
-  site ships no web font.
-- The background (`src/components/MatrixRain.tsx`), falling characters behind every page, draws at most 30 frames a
-  second, each moving the characters two steps so they fall as fast as at 60, and none while the page is hidden or the
-  system asks for reduced motion.
+  address's balance and a transaction's fee round QNC of 0.01 and more to two decimal places; a transaction's own page
+  shows its amount exact. Up to 1,180 px wide a table keeps its columns in a frame that scrolls sideways when they need
+  more room than it has (never narrower than their widths, a flexible column 176 px unless it names its own:
+  `src/lib/geometry.ts`), its first column fixed, and the page itself never does; wider, every table fits its frame.
+  A list's From / To is two lines, the sender over "to" and the recipient. In a table's flexible column on a window
+  wider than 1,180 px an address, hash or node id shows whole where the cell has room for it and in its short form
+  otherwise, chosen by a container query on the cell (`styles/base.css`), with the whole value in its title. A readout's
+  value is never cut: a long one is set smaller by its length in characters (`--ro-len`). Links, buttons and rows carry
+  no arrows; on a phone or a touch screen every small control has a 44 px tall target and a table row is the target of
+  its first entity. The site's two faces, Archivo and Martian Mono, are self-hosted through next/font (`src/app/fonts.ts`,
+  served from `/_next/static/media`); while they load, text is set in platform faces (Arial or Roboto, and Courier New or
+  another monospace face of 0.6 em) sized for each width and weight the sheets use (`src/styles/fonts.css`), so nothing
+  rewraps or moves when a face arrives. Monospace text takes one stack, Martian Mono then the platform's own
+  (`--font-mono` in `src/styles/tokens.css`). The design tokens are in `src/styles/tokens.css`, the base and the shared
+  primitives of `src/components/ui` in `src/styles/base.css`, and each rebuilt area has its own sheet
+  (`shell.css`, `home.css`, `explorer.css`, `cabinet.css`, `pages.css`), imported by the root layout after the rules of the
+  areas not yet rebuilt (`src/app/globals.css`, `src/app/mobile-fixes.css`).
+- The field (`src/components/field/Field.tsx`, drawn by `src/lib/field/rain.ts`): hex rain inside a page's head zone (the
+  home hero, the title band of `src/components/ui/PageHead.tsx`), never behind the whole page. It draws only while its
+  zone is in view, the tab is shown and the system allows motion: 30 frames a second (24 on a phone, 15 in My node),
+  waking the page once per frame it draws (a timer to just before the frame is due, then one frame request), the
+  device pixel ratio capped at 1.5 on the home hero and 1.25 elsewhere, from a glyph atlas drawn once; under reduced
+  motion it paints one still picture. When a frame's step stays over 7 ms for 30 frames it halves its density, then
+  drops to 20 frames a second, then stops on a still picture. Elements marked `data-field-clear` (the header's
+  controls) clear the cells over them and `data-field-dim` dims them (text).
+- `/` — the home page: the headline the field decodes, the live blocks (the 14 newest, kept as Latest blocks keeps its
+  rows; each height a link to its block; held while the pointer or focus is on them), the readouts (light nodes and server nodes from `/api/network/stats`, the epoch and the
+  QNC supply from the head), Get QNet Wallet (`src/components/GetTheApp.tsx`, also on `/wallet`: on a computer a QR code of
+  `/get` beside the three stores, on a phone or tablet its own store first and no extension, decided from the request's
+  user agent at first paint as `data-device` on `<html>`), the security model, the mobile-first statement with QNet
+  Wallet's eleven languages in the app's order and names (`src/lib/languages.ts`), the economic model and the open
+  source section.
 - `/wallet`, `/qnet-wallet-extension`, `/testnet`, `/dao`, `/docs`, `/docs/how-it-works`, `/privacy`, `/terms`,
-  `/support` — informational sections: the mobile wallet and the browser extension, the testnet faucet for 1DEV and
-  SOL on Solana devnet, the DAO page, the documentation index, How it works (below) and the pages the app stores link
-  to. `/wallet` describes the one app on every phone and tablet and, once `WALLET_APK_URL` is set, offers its
-  Android file, the same Play-signed build as Google Play; the app does not update itself. It links the Google Play
-  listing (https://play.google.com/store/apps/details?id=io.aiqnet.wallet, `ANDROID_PLAY_URL` in
-  `src/lib/app-links.ts`); the App Store listing is in preparation. The
+  `/support` — informational sections, each under the title band of `src/components/ui/PageHead.tsx`, laid out by
+  `src/styles/pages.css`: the mobile wallet and the browser extension, the testnet faucet for 1DEV and SOL on Solana
+  devnet, the DAO page (no governance runs on QNet Blockchain yet, so it lists no proposals and takes no votes; it says
+  that a protocol change ships in a node release with the height it takes effect at), the documentation index (each
+  document a row that opens it on GitHub), How it works (below) and the pages the app stores link to (Privacy and
+  Terms list their sections beside the text on a window wider than 960 px). `/wallet` describes the one app on every
+  phone and tablet and, once `WALLET_APK_URL` is set, offers its Android file, the same Play-signed build as Google
+  Play; the app does not update itself. It links the Google Play listing
+  (https://play.google.com/store/apps/details?id=io.aiqnet.wallet, `ANDROID_PLAY_URL` in `src/lib/app-links.ts`)
+  and, until the App Store listing is live, TestFlight (`IOS_INSTALL_URL`), and lists the app's eleven languages in
+  the app's order (`src/components/ui/LanguageList.tsx`). `/qnet-wallet-extension` links the Chrome Web Store listing
+  on a computer, for browsers that install from it at version 111 or later (the extension's
+  `minimum_chrome_version`), and sends a phone or tablet to the app. The
   Terms carry the Device rules of a light node and the privacy policy its device check; Support says what to do
   when the Node tab says the node is paused on a device or that the device can't run one: run it on another phone
   or tablet (install QNet Wallet from the app store, restore the wallet, link the node to that device), with no review step; and,
@@ -75,16 +156,22 @@ delegate into `frontend/`.
   its own epoch: the network repeats its requests during the epoch, an answer counts only before that epoch's check
   closes, about 2.5 minutes before the epoch ends, and an answer after it counts for no epoch, the next one
   included. `/nodes` is a permanent redirect to `/explorer` and
-  `/activate` one to `/node/activate` (`next.config.js`).
-- The header (`src/components/Header.tsx`): the QNET logo leads home, then Explorer, My node (`/node`), Wallet,
-  Testnet (its own tab on a testnet release, where the faucet is) and a Docs menu (Documentation, How it works, DAO,
-  Support), and the wallet control. On a
-  window 860 px wide or narrower the links, the Docs menu (its list in place) and the wallet control move into the
-  menu button's panel. The footer (`src/components/Footer.tsx`) carries, on every page, a small line under it with the
-  copyright, Privacy and Terms (Support is in the Docs menu), and, outside the app's view, the repository, X and
-  Telegram icons and the two official store badges served from `/public/badges`: the App Store badge, a link only once
-  `IOS_APP_STORE_URL` (`src/lib/app-links.ts`) names the listing and until then the badge alone, and the Google Play
-  badge linking the listing.
+  `/activate` one to `/node/activate` (`next.config.js`). A path with no page shows the site's 404 page
+  (`src/app/not-found.tsx`): the explorer's search field (`src/components/explorer/ExplorerSearch.tsx`) in its title
+  band, and a link to the explorer.
+- The header (`src/components/Header.tsx`): the wordmark "QNet Blockchain" leads home, then Explorer, My node (`/node`),
+  Wallet, Testnet (its own tab on a testnet release, where the faucet is) and a Docs menu (Documentation, How it works,
+  DAO, Support), and the account control (`src/components/wallet/connect-wallet-button.tsx`), one in the header row at
+  every width. Without a wallet it reads Connect wallet; with the wallet My node remembers it shows the node's state and
+  the short address and opens the account menu: the whole address spaced at its structure with Copy, how the wallet is
+  connected, My node's sections with one datum each (My node, Node balance, Device and History, or My node and
+  Activate without a node; `src/lib/account-menu.ts`, read when the menu is about to open) and Disconnect. It is a panel
+  under the button on a computer and a sheet from the bottom edge on a window 860 px wide or narrower, where the links
+  and the Docs menu (its list in place) open as a full-screen menu. The footer (`src/components/Footer.tsx`) carries,
+  on every page, the line "QNet Blockchain has you, Eon...", a small line with the copyright, Privacy and Terms (Support
+  is in the Docs menu) and the head block's height linked to its block, and, outside the app's view, the repository, X
+  and Telegram marks and the two official store badges served from `/public/badges`, the iOS badge opening
+  `IOS_INSTALL_URL` (`src/lib/app-links.ts`) and the Google Play badge the listing.
 - `/node`, `/node/activate`, `/node/device`, `/node/history` — the node cabinet, My node. The visitor chooses a
   wallet: the QNet Wallet extension (`qnet_requestAccounts`), an address typed there (only to look: every action the wallet
   itself confirms asks to connect it first), or QNet Wallet asked with a QNet Link `connect` request ([QNet Link
@@ -96,13 +183,21 @@ delegate into `frontend/`.
   shows it already approved the site, and follows it when the extension answers with another wallet; a wallet chosen
   another way is never replaced. Until the extension has answered, a page whose wallet that answer may set shows
   nothing. Disconnect leaves a mark (`qnet.cabinet.disconnected`) that stops this until a wallet is connected with a
-  tap. Before a wallet the page shows the connect screen with How it works in short.
+  tap. Before a wallet the page shows the connect screen: one solid main action by device, the header's Connect wallet
+  too (`src/components/wallet/useConnectWallet.ts`, `connectWay` in `src/lib/qnet-provider.ts`): "Connect the QNet Wallet
+  extension" on a computer with it, "Get the QNet Wallet extension" (its store page in a new tab, or the extension's
+  page in a browser that store does not serve) on a computer without it, "Connect QNet Wallet" on a phone or tablet,
+  which starts the `connect` request whose "Open QNet Wallet" button opens the app; nothing while the wallet is being
+  detected (`DETECT_MS`, 1 s; an announcement after that still binds). Under it the other ways as text actions: the QR
+  request for a phone (computer), Get QNet Wallet and, when that browser has it, the extension (phone or tablet). View
+  by address and How it works in short (each way opened by its title) sit apart, beside it from 1,101 px and under it
+  below.
   View by address is no connection (owner, 13.10): the typed address is kept for this tab alone, in session storage
   (`qnet.cabinet.view`), apart from the remembered wallet (a typed address an earlier version remembered as the wallet
   is dropped). While it is shown the header still offers Connect wallet (which ends the view, so the connect card
-  shows), no extension's wallet is taken up by itself, and in place of the wallet card and the way the page says
-  "Viewing <short address> — read only", with the whole address, a note that only public data is shown, and Stop
-  viewing (back to the connect screen; no Disconnect, no mark). No action that needs the wallet is offered, nor a button
+  shows), no extension's wallet is taken up by itself, and the head of the sections says "Viewing <short address> — read
+  only" (the address a link to its explorer page) with Stop viewing (back to the connect screen; no Disconnect, no
+  mark), and a note over the section says only public data is shown. No action that needs the wallet is offered, nor a button
   to one in its place: no Activate tab (its page, opened by its address, says to connect the wallet itself), no
   activation, Link a device, Unlink, Move to wallet, record on the network again or continue an activation, and each of
   those components renders nothing for a view by itself too. Only public chain facts show: online or not, answered this
@@ -111,10 +206,18 @@ delegate into `frontend/`.
   status read is `GET /api/cabinet/node/{id}?view=1` and its history read `GET /api/cabinet/node/{id}/history?view=1`
   (below), which leave those device fields, and why each epoch was not counted, out on the server too. A
   wallet connected with a tap, here, in the header or in another tab, ends the view.
-  With a wallet it shows the whole address (a tap copies it), how it was connected, Disconnect, the way to a running
-  node (Connect, Activate, then Link a device and Running for a light node, or Run the server and Running for a super
-  node) and the tabs Overview, Device and History, plus Activate only while the wallet has nothing anywhere or while an
-  activation of this browser for it is unfinished. What the pages show follows the wallet, whichever way it was
+  The page has one title, My node, in a title band with the field that the moves between sections keep. With a
+  wallet, the wallet itself (its whole address with Copy, how it was connected, Disconnect) is the header's account
+  menu; My node heads its sections with the node it shows (its state in the menu's words and its id, a link to the
+  wallet's explorer page). The sections Overview, Device and History, plus Activate only while the wallet has nothing
+  anywhere or while an activation of this browser for it is unfinished (with no node yet only Overview and Activate),
+  stand in a rail beside the section on a computer and in a bar under the thumb on a phone or small tablet (860 px or
+  narrower, hidden while the menu or the account sheet is open), each with one datum from the account menu's own rows
+  (`navItems` in `src/lib/cabinet/tabs.ts`): the node balance, the device or the server, the newest epoch, the
+  activation's step. The way to a running node (Connect, Activate, then Link a device and Running for a light node, or
+  Run the server and Running for a super node) shows over the section only while a step after Activate is open
+  (`showJourney`). While the page reads, every part stands at its final size (readouts with dashes, tables with empty
+  rows), so nothing moves when the answers come. What the pages show follows the wallet, whichever way it was
   connected and in whichever browser or device (`src/lib/cabinet/wallet-activation.ts`), from every source: the
   network (`GET /api/cabinet/wallet-node/{wallet}`, the light node's status and the super node's status: "no node" and
   "registered" only when the nodes settle it), the site's activation record of the wallet with its search of the
@@ -146,10 +249,7 @@ delegate into `frontend/`.
   with no device yet, never as an empty section.
   A bare `/node` opens Activate only for a connected wallet in the state "nothing known", else the Overview.
   The cabinet never renders in the QNet Wallet app's view (below). Its texts are English (`src/lib/texts.ts`), and the words
-  it shares with the app and the extension are theirs. Every cabinet page says that a light node runs on one phone or
-  tablet at a time, in QNet Wallet, and a super node on a server with the QNet Blockchain node software. The site's matrix rain
-  runs behind the cabinet as behind every other page; its cards, the way, the sections and any line outside a card
-  sit on opaque, blurred panels over it.
+  it shares with the app and the extension are theirs.
   - Overview (`/node?tab=overview`): without a node, the state above and its next step; with nothing known, both node
     types ("Activate a light node", "Activate a super node": `/node/activate?type=light` or `?type=super`), with the
     note that a super node is activated only in the QNet Wallet extension on a computer and runs on the user's own server.
@@ -178,11 +278,13 @@ delegate into `frontend/`.
     need no record (QNet Wallet installed, the same wallet imported) and after a few minutes, in a browser with the
     extension, "Record on QNet Blockchain": `qnet_activateNode` again, which for a wallet with an activation queues the
     record of the burn it has; once
-    recorded with no device, "Next: link your phone or tablet" first on the page, with the steps so far (burned,
-    recorded, the phone's now) and Link a device in numbered steps); the status card with the device's state (Online,
-    Offline, or a new device waiting for its first answer; else no device) and whether it answered this epoch;
-    beside the Offline state, the latest epoch the node was not counted in (below), and, in that card right under the
-    device rows, its one action: QNet Wallet open on that phone answers by itself (the network wakes a phone that holds
+    recorded with no device, "Next: link your phone or tablet" first on the page, with Link a device in numbered
+    steps); the readouts: the node's state with its sentence (Online, Offline, or a new device waiting for its first
+    answer; else no device), this epoch with whether the node answered it, the time left and the line of its blocks
+    done, the node balance with Move to wallet down to its ways (while a way to move it is open here), and the last 12
+    epochs as cells (each names its epoch and result on hover, focus or tap; at rest the line under them names the
+    newest epoch not counted, else the newest one); for an Offline device, under the readouts, the latest epoch the
+    node was not counted in (below), and its one action: QNet Wallet open on that phone answers by itself (the network wakes a phone that holds
     the node every epoch from then on), and a phone that no longer holds the node runs it again with "Run the node on
     this phone" ("that phone", with its QR code, on a computer), the `link` request of Link a device (while the site
     sends no link requests, the card says that running it there again from this page opens soon). The site sends no
@@ -194,7 +296,7 @@ delegate into `frontend/`.
     Wallet that names the wallet and the node (beside the extension's, or alone), its button on a phone or tablet and its
     QR code on a computer; the answer is the wallet's report and the balance is read again from the network. An address
     only viewed is offered no move. Under the balance, for a light and a super node alike, connected or viewed (owner,
-    13.10): "Total earned: X QNC" with its split, "Moved to the wallet: Y QNC · in the node balance: Z QNC". Y is what
+    13.10): the readings Total earned (X QNC) and Moved to the wallet (Y QNC), each unit a link to the QNC page. Y is what
     every move of the wallet took to it, from the explorer archive's moves (all of them, not the nodes' 256 epochs),
     replayed by the chain's own rule: each listed epoch above the wallet's watermark of moved epochs is credited once and
     raises it, so a move sent twice counts once. Z is the node balance. Both are of one moment: the history route's first
@@ -204,10 +306,13 @@ delegate into `frontend/`.
     the archive, gives none). The line shows it while that balance is the one the page shows; when they differ (a move or
     a new epoch between the reads) it reads the history again at once and twice more after the site's 30 s copy of it,
     saying meanwhile that it reads the latest moves, then gives up. Without a total (no archive, a move whose payload the
-    archive cut short or cannot be read, more than 5,000 moves, a node without those fields) it says "Total earned: could
-    not be read." with the node balance: never a wrong number. Then Node
+    archive cut short or cannot be read, more than 5,000 moves, a node without those fields) the readings show a dash
+    with "Could not be read.": never a wrong number. Then, where the newest 16 epochs added anything, what each added
+    as bars (moved ones in grey, a tick for an epoch not counted, an outline for one not checked, a marker at the newest
+    move), the newest six epochs with the way to every epoch, and last Node
     details: the activation code with Copy, the node type, the node
-    id, the burn with its link and amount and the block the node was recorded at, from the archive's registration
+    id, the burn with its link and amount and the block the node was recorded at (a link to that block), from the
+    archive's registration
     record, else the site's record, the extension, the burn found on the wallet's Solana address, the extension's
     answer kept here, else an activation of this browser. The code encodes the wallet the burn is for: the wallet's
     code for a burn a payment key made, the burner's code for a burn from the wallet's own Solana address (the
@@ -219,12 +324,13 @@ delegate into `frontend/`.
     it takes the registration route's `burnBy` (below); until either tells, the row says the code follows later, and the
     route is read again every 30 s while the page is shown (a read that fails keeps the answer before it). The
     code is shown by itself, and the page never asks for it: a light node never needs it, a super node's server takes
-    it in its settings. Last, the newest epochs. For a super node on the network: online or offline (the nodes' peer
-    view or its on-chain heartbeat), or "Registered, waiting for network admission" when it is online, not barred and
-    outside the network's admission: as the node's status names it (`admission` `waiting`; the note then says its
-    epochs add nothing to the node balance and show as not admitted), or, from a node that does not name it, when the
-    network's eligible set (the newest certified macroblock's eligible producers, read from its proof and kept 5
-    minutes) does not list it; offline wins, since the network also drops an admitted node that stopped sending
+    it in its settings. For a super node on the network: online or offline (the nodes' peer
+    view or its on-chain heartbeat), or "Registered, not admitted to consensus yet" (QNet Wallet's own words for it)
+    when it is online, not barred and outside the network's admission: as the node's status names it (`admission`
+    `waiting`, the node's `super_admission_label`: outside the allowlist that keeps a node out of both the eligible
+    producers and the epoch's super node share; the note then says its epochs add nothing to the node balance and show
+    as not admitted), or, from a node that does not name it, when the network's eligible set (the newest certified
+    macroblock's eligible producers, read from its proof and kept 5 minutes) does not list it; offline wins, since the network also drops an admitted node that stopped sending
     heartbeats from the set; when it was last seen (the nodes', else the archive's newest heartbeat while the archive keeps up:
     none once it wrote nothing for 120 s), its heartbeats this epoch against the number needed and whether they keep
     pace for the epoch to count (`is_reward_eligible`), the network's height and, when the network reports it
@@ -239,8 +345,8 @@ delegate into `frontend/`.
     messages](../protocols/light-node-messages.md) section 7): its state (Online, Offline, or a new device waiting
     for its first answer), its model and platform as the device said them when it linked ("Pixel 8 · Android"; the
     platform alone when no model is known: Android, iPhone or iPad, or an unknown device; display only), the UTC day it
-    linked, whether it answered this epoch, and the epoch of its last answer; for a node of an earlier version, which
-    names no device, the last counted epoch instead. An address only viewed shows the state and the epochs alone: no
+    linked, whether it answered this epoch, and the epoch of its last answer, as one entry with those three readings;
+    for a node of an earlier version, which names no device, the last counted epoch instead. An address only viewed shows the state and the epochs alone: no
     platform, no model, no linking day and no miss (its status read carries none of them). The keyless status carries no exact time of an answer or a
     wake, no delay and nothing of what QNet Wallet did with a wake, and the page shows none of it, also while a node of
     an earlier version still sends them (the site drops them before its cache). For an Online or Offline device, the
@@ -264,8 +370,8 @@ delegate into `frontend/`.
     (the push service took the push, the device fetched its challenge, or the push service said its address is gone);
     a push the service took that the phone's system then held counts as reached, alike on iPhone, iPad and Android.
     Every answer belongs to its own epoch: no line says an answer counts for another, and an answer after an
-    epoch's check counts for none. With a device linked, "Unlink the device" and "Move the node to another
-    device". Once both genesis nodes list `unbind_wallet`, the wallet signs the unlink with its own key, so a lost
+    epoch's check counts for none. With a device linked, the two actions side by side (one under the other below
+    720 px): "Move the node to another device" and "Unlink the device". Once both genesis nodes list `unbind_wallet`, the wallet signs the unlink with its own key, so a lost
     device is unlinked from here too: the QNet Wallet extension of this computer when it holds the chosen wallet
     (`qnet_unlinkNodeDevice`), otherwise an `unlink` request naming the wallet, its QR code or its button, which QNet
     Wallet with that wallet on any device confirms; before that, the same request goes to QNet Wallet on the device
@@ -275,19 +381,21 @@ delegate into `frontend/`.
     confirms it runs the node and the one before it stops. With none linked, Link a device in numbered steps. For a
     super node, that it runs on its server with no device to link, and the server's status, or that it is not on the
     network yet.
-  - History (`/node/history`): Total earned as on the Overview (its split names the history's own node balance), then
-    one list of the node's epochs, newest first, from its registration's epoch on, 30 at
-    a time with "Show more" (off while it reads; a page that fails keeps the rows and offers Try again): each epoch's
-    number, when it began and ended (in the viewer's own time zone), its result (counted; counted and moved to the
-    wallet, linked to the transaction that moved it; not counted; the registration's own epoch; not checked by the
-    network; or not readable) and the node balance it added (a moved epoch's amount exact from its move). Under an epoch
+  - History (`/node/history`): Total earned and Moved to the wallet as on the Overview, with the history's own node
+    balance as a third reading, then one list of the node's epochs, newest first, from its registration's epoch on, 30
+    at a time with "Show more" (its waiting line while it reads, the older rows added under the ones shown; a page that
+    fails keeps the rows and offers Try again): each epoch's number, when it began and ended (in the viewer's own time
+    zone), its result (counted; counted and moved to the wallet; not counted; the registration's own epoch; not checked
+    by the network; or not readable), the node balance it added (a moved epoch's amount exact from its move) and the
+    transaction that moved it to the wallet, a link to it. The table has fixed columns and rows, and scrolls sideways in
+    its frame where the section is narrower than its columns. Under an epoch
     not counted of a light node, for a connected wallet, one line says why, in the Device tab's words for that epoch's miss
     (what happened, whether the wake reached the device when known, what to do on the device's platform): the light
     node's shard owners keep the misses of its 64 epochs up to their newest record, from the device's linking on, so an
     older epoch, one from before the linking, one no owner answers for within 1.5 s (an owner of an earlier release has
     no misses route), or one not counted only because the wallet's super node earned nothing while the light node's
     group was not checked shows no line.
-    The Overview's newest epochs carry no line; it names the latest miss beside the device's state. A light and a
+    The Overview's newest epochs carry no line; it names the latest miss under the readouts of an Offline device. A light and a
     super node alike, from the archive's `NodeRegistration` rows, which the wallet sends for both (one from before the
     indexer kept its fields is read by its `client_node_reg:<node id>:` memo, a genesis node's by its
     `node_registration:<node id>:` one); the network keeps the epochs per wallet, so a wallet with both has one list,
@@ -297,9 +405,12 @@ delegate into `frontend/`.
     (256 epochs); an older one shows as moved when the archive holds its move, else as not readable, with a note saying
     so; a newer one not readable is one the nodes asked did not return just then, with a note saying that.
     An epoch the nodes report as `not_admitted` (a super node outside that epoch's admitted set) shows as not admitted,
-    never as not counted, its registration's own epoch too, with a note that it is the network's admission, not
-    missed heartbeats.
-  - Activate (`/node/activate`): an activation is offered only while every source of the wallet says it has
+    never as not counted, its registration's own epoch too, with a note that the network had not admitted it to
+    consensus yet, which is the network's admission, not missed heartbeats.
+  - Activate (`/node/activate`): the payment address's activation as four numbered steps (Confirm in QNet Wallet,
+    Pay, Burn, Register), each marked done or now (`src/lib/cabinet/activate-steps.ts`), with Burn shown disabled with
+    the line that it opens once both amounts have arrived; a stage outside them (what is left going back, another
+    burn) shows without the steps. An activation is offered only while every source of the wallet says it has
     nothing (the state "nothing known"); otherwise the page shows the wallet's state and next step instead (for a
     wallet whose node the network lists, the step it is on: "Link your phone" with Link a device one tap away on the
     Device tab, or the Overview, where an Offline device's phone runs the node again). One
@@ -331,11 +442,32 @@ delegate into `frontend/`.
     reservation, and only then does the page show the address; a decline, an error, another wallet's answer or a
     request that expired deletes the record, whose address was never shown. The
     user sends the activation price in 1DEV and 0.001 SOL (the burn's fee and the address's rent-exempt minimum,
-    rounded up) to it from their own wallet: the card says which QNet Blockchain wallet the node is registered to, and shows a QR
-    code of a payment request
-    `solana:<address>?amount=<price>&spl-token=<1DEV mint>&label=QNet%20Blockchain%20node%20activation` that fills in the address, the
-    token and the amount in the wallet that scans it, and a second, small one for the SOL, each with "Copy payment
-    request"; on a phone it says to copy the address and send both amounts from QNet Wallet; on testnet it links the
+    rounded up) to it from their own wallet: the card says which QNet Blockchain wallet the node is registered to and, in
+    one sentence, both amounts. The two ways are tabs, "Send from your wallet" first; under both, what has arrived of
+    each amount with a line that fills. "Send from your wallet" has one row and button per transfer, the 1DEV first, each for what the
+    address still lacks of that token (`fundingLeft` in `src/lib/cabinet/payment-request.ts`: with 1,000 of 1,500 1DEV
+    there, "Send 500 1DEV"); on testnet the buttons name test 1DEV and test SOL. On any device where the connected QNet
+    Wallet extension refuses a call of `qnet_sendSolanaTransfer` without params with -32602 (one without the method
+    answers 4200), the buttons ask it with `{to, mint, amount}` (`mint` null for SOL, `amount` a plain decimal in whole
+    tokens) and the user confirms in the extension's window. After it answers that it sent the transfer, or the page
+    could not learn the outcome (its 5-minute wait ran out, an unverifiable answer, a disconnect), that button reads
+    "Waiting for <amount> <token> to arrive" and takes no tap until the balance read holds the amount or the page is
+    reloaded. Without the extension, a phone or tablet gets a link per transfer, from one builder (`requestLink`), of the
+    kind the release constant `PHONE_LINK` names: testnet is `'transfer'`, mainnet `'request'`. `'transfer'` is QNet Wallet's transfer link
+    `https://link.aiqnet.io/send#to=<address>&mint=<1DEV mint>&amount=<amount>` (no `mint` for the SOL;
+    [QNet Link v1](../protocols/qnet-link-v1.md) section 15), which only QNet Wallet opens, in its Solana Send with them
+    filled in, so a devnet request never reaches a wallet app of another Solana cluster; on Android the button is that
+    link's `intent:` URL naming `io.aiqnet.wallet`, falling back to the link itself, whose page on the link host says to
+    install QNet Wallet or send by hand. `'request'` (a mainnet release) is the standard request link
+    `solana:<address>?amount=<amount>&spl-token=<1DEV mint>&label=QNet%20Blockchain%20node%20activation` (no
+    `spl-token` for the SOL), which opens the phone's wallet app. The card's note says what the
+    buttons open: the extension, QNet Wallet on this device (adding that without QNet Wallet the way is "Send
+    it yourself"), or the phone's wallet app. The 1DEV mint is the one of the release's cluster
+    (`ONE_DEV_MINTS[BURN_CLUSTER]` in `src/lib/one-dev.ts`, the extension's literals). A button reads
+    "Received" once the payment address's balance read holds the full amount, and the SOL button is the primary one
+    once the 1DEV is in or on its way. "Send it yourself" shows one QR code of the plain address, the address with Copy
+    and the two amounts (on a phone the address and amounts before the code); where no button is offered only this way
+    shows, without the tabs. On testnet it links the
     Testnet page's faucet ("Get them to your wallet"), handing over the connected wallet's Solana address without a
     URL (`src/lib/faucet-handover.ts`), with the faucet pass the site gives for the wallet's signed reservation (see
     Faucet). Then the page burns (only for the connected wallet that signed the reservation,
@@ -366,7 +498,8 @@ delegate into `frontend/`.
     `/node/code` to the Overview (307), and `/node/guide` to `/docs/how-it-works` (308); `/node?tab=` with an old
     section's name goes to its new place too.
   - How it works (`/docs/how-it-works`, in the Docs menu and linked from the connect screen; `?way=phone`,
-    `computer` or `super`): short plain steps, each with a picture that draws only the labels the app, the extension
+    `computer` or `super`, and without it the way that fits the device that asked, read from the request's user agent
+    so the steps never change after load: Phone only on a phone or tablet): short plain steps, each with a picture that draws only the labels the app, the extension
     or the site shows on that screen, then the questions people ask; readable without a wallet.
     - Phone only (14 steps, only with `CABINET_PHONE_FLOWS` on): "Create New Wallet" or "Import Existing Wallet" in
       QNet Wallet (a phone with a screen lock asks for no password), the 12 words and their check, aiqnet.io/node in
@@ -386,7 +519,7 @@ delegate into `frontend/`.
       shows, QNet Wallet with the same wallet (the one whose 12 words are on the server, imported with "Import Existing
       Wallet"), whose Node tab shows the registered super node by itself on every phone and tablet with that wallet,
       with no device to link (the wallet derives the super node's id from its own address): its status ("Active",
-      "Server offline" or "Registered — waiting for admission to QNet Blockchain"), when it was last seen, its node
+      "Server offline" or "Registered, not admitted to consensus yet"), when it was last seen, its node
       balance and Move to wallet, drawn as the app's super node card; and the move of the node balance
       with My node's Move to wallet and the extension's window, or in QNet Wallet: Node tab, Move to wallet on the super
       node's card.
@@ -407,9 +540,13 @@ delegate into `frontend/`.
 - `link.aiqnet.io` is served by the same app: `/l` there is the page a browser shows for a link the app did
   not open; on Android it offers the button that opens QNet Wallet (`io.aiqnet.wallet`, the same Play-signed
   file from Google Play and from aiqnet.io), reading its own
-  URL only through the link parser and sending it nowhere. The link page renders outside the site's shell
+  URL only through the link parser and sending it nowhere. `/send` there is the page a browser shows for a transfer
+  link QNet Wallet did not open (no app, an app too old for it, another app's browser, and the Android button's
+  fallback): static, it never reads its URL, and it says to install QNet Wallet (linking `/wallet`) or send the
+  tokens by hand from the payment address card (linking `/node/activate`). Both link pages (`LINK_PAGES` in
+  `src/lib/hosts.ts`) render outside the site's shell
   on every host (`src/components/SiteShell.tsx`): no wallet context, wallet control or navigation. That host
-  serves only its exact files (`/l`, the two app-association files, `/manifest.json`, and the icons the page head
+  serves only its exact files (`/l`, `/send`, the two app-association files, `/manifest.json`, and the icons the page head
   and the manifest name: `/favicon.ico` with 16, 32 and 48 px and the PNGs of 16, 32, 48, 128, 180, 192 and 512 px,
   each that size); every other path there, API routes included, is a 308 redirect to the same path on
   aiqnet.io, whatever the request's headers (a prefetch or router request included). The build assets under
@@ -417,15 +554,17 @@ delegate into `frontend/`.
   host renders outside the shell. nginx passes every proxied request's own `Host`, so no location hands the
   app `127.0.0.1`, which it would serve as a local run.
 - `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` (served on both hosts)
-  name the apps allowed to open `link.aiqnet.io/l` links, from the constants in `src/lib/app-links.ts`;
+  name the apps allowed to open `link.aiqnet.io/l` and `/send` links, from the constants in `src/lib/app-links.ts`
+  (the iOS file lists both paths for the one app id; the Android statement names no path, the app's verified filter does);
   an app whose signing identity is not known yet is left out, and `npm run check:release` fails until
   all are set.
 - The header's wallet control (`src/components/wallet/connect-wallet-button.tsx`) shows, on every page, the
   wallet the node cabinet shows (the one it remembers, or the extension's it takes up) and leads to `/node`.
-  Without one, **Connect wallet** on a computer with the QNet Wallet extension asks the extension at once
-  (`qnet_requestAccounts`, the connect card's call), and My node keeps that wallet and opens; on a phone or tablet, or
-  without the extension, it leads to the cabinet's connect screen (on a page that shows the connect card it brings the
-  card into view). In the QNet Wallet app's view (below) it connects the page's wallet provider instead
+  Without one, **Connect wallet** is the connect screen's own: on a computer with the QNet Wallet extension it asks the
+  extension at once (`qnet_requestAccounts`), and My node keeps that wallet and opens; on a computer without it, it
+  opens the extension's store page in a new tab; on a phone or tablet it leads to the cabinet's connect screen and
+  starts QNet Wallet's `connect` request there (on a page that shows the connect card it brings the card into view).
+  It is disabled while the wallet is being detected. In the QNet Wallet app's view (below) it connects the page's wallet provider instead
   (`src/lib/qnet-provider.ts`, state in `src/contexts/AppContext.tsx`). Connecting gives the site the approved QNet
   Blockchain and Solana addresses only; it asks the wallet for no signature and no transaction.
 - Every page response carries a Content-Security-Policy with a per-request script nonce
@@ -467,13 +606,17 @@ Three parts, each its own process:
 Every block commit is one transaction. A commit that writes the head block, a delete that moves the
 head and a reset each send `NOTIFY explorer_head` inside their transaction.
 `src/server/head-hub.ts` keeps one `LISTEN` connection per web process and on each notification
-refreshes one snapshot — `explorer_stats`, `sync_state` and the latest 50 enriched transactions —
-that `/api/stream`, `/api/head` and the default first page of `/api/activity` serve from memory and
-`/api/network/stats` takes its head and totals from; without a `LISTEN` connection it re-reads every
-5 s. The overview, home and address pages follow the head through `useChainHead`: one `EventSource`
+refreshes one snapshot — `explorer_stats`, `sync_state`, the latest 50 enriched transactions and the newest 14 blocks
+(height, hash, time, producer, `producer_address`, transaction count; one indexed read of those columns) —
+that `/api/stream`, `/api/head`, `/api/blocks`, the default first page of `/api/activity` and the home and overview
+pages serve from memory and `/api/network/stats` takes its head and totals from; without a `LISTEN` connection it
+re-reads every 5 s. The head event (`/api/stream`) and `/api/head` share one shape (`headEvent`): the head, its block's
+`{producer, producerAddress, txCount}` when the snapshot's newest block is the head (else null), the counters and the
+sync state. The overview, home and address pages follow the head through `useChainHead`: one `EventSource`
 on `/api/stream` per tab, closed while the tab is hidden, with a 15 s poll of `/api/head` when the
-stream fails. On a new head the overview refetches its default first page, the home page its stats at
-most every 10 s and the address page its data at most every 3 s.
+stream fails. On a new head the overview refetches its default first page, the home page its node counts
+at most once a minute (its epoch, supply and live blocks come from the head itself) and the address page its data at
+most every 3 s. The footer joins the stream for its block height only while it is near the screen.
 
 The migration runner (`src/indexer/migrate.ts`) applies every `migrations/NNN_*.sql` file not yet
 recorded in `schema_migrations`, in name order, each file as one transaction. A database whose tables
@@ -601,12 +744,13 @@ own, so explorer traffic never crowds it out.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/activity` | Transaction list from the index, enriched for display: keyset pages by `cursor` and `dir`, numbered `page` jumps up to 200, a `types` filter; the default first page comes from the head snapshot |
-| `GET /api/address/[address]` | Address summary and history, with incoming `BatchTransfers` credits merged in |
+| `GET /api/activity` | Transaction list from the index, enriched for display: keyset pages by `cursor` and `dir`, numbered `page` jumps up to 200, a `types` filter; the default first page comes from the head snapshot. Amounts are raw: `amount_raw`, the nano QNC moved (a digit string), and on a QRC-20 transfer `tokenAmountRaw` in the token's base units with `tokenDecimals`; the pages write them exactly (`src/lib/explorer-view.ts` `rowAmount`) |
+| `GET /api/address/[address]` | Address summary and history, with incoming `BatchTransfers` credits merged in; `balance_raw` is the node's balance in nano QNC (null for a system account) and each transaction's `amount_raw` its nano QNC, both digit strings, the node's answer read with wide integers quoted so a balance past 2^53 nano QNC stays exact |
 | `GET /api/address/[address]/history?cursor=&limit=` | The wallet's history feed: transactions sent or received, batch credits and token transfers as one newest-first list, `limit` 1–100 (default 50), ordered by block, source, position and hash, paged by the returned `next_cursor`. Amounts are raw (nano QNC or token base units, with the token's deploy-time symbol, decimals and logo); `fee` is the nano QNC the chain debited a sender |
 | `GET /api/address/[address]/balance-proof` | The balance verified against a committee certificate (Balance check, below) |
+| `GET /api/blocks?latest=N` | The newest blocks from the head snapshot (height, hash, time, producer, producer address, transaction count), `N` 1–14 (default 12), no query of its own; 120 requests a minute per client |
 | `GET /api/blocks/[hash]` | Block by hash |
-| `GET /api/tx/[hash]` | Transaction by hash; a `BatchTransfers` envelope carries its recipients |
+| `GET /api/tx/[hash]` | Transaction by hash, its `amount_raw` and `fee_raw` in nano QNC (digit strings); a `BatchTransfers` envelope carries its recipients |
 | `GET /api/tokens`, `GET /api/token/[contract]`, `GET /api/token/[contract]/holders` | Token list, token detail, holders |
 | `GET /api/token/[contract]/logo` | The token's on-chain logo, fetched by the server (`src/server/logo-proxy.ts`) from the URL the nodes report for the contract: https on port 443 only, no host that resolves to a private, loopback, link-local, shared, documentation, multicast or reserved address (the connection goes to the address checked), no redirects, at most 256 KB in 5 s, a PNG, JPEG, WebP or GIF by its own bytes (never SVG), nothing of the visitor passed on. Kept in memory (6 h, a missing logo 10 min; at most 2,000 logos and 32 MB), at most 4 fetches at once; 404 when there is no usable logo, 503 while busy; 600 requests per minute per client |
 | `GET /api/qnc` | Native QNC rich list, proxied from the node's `/api/v1/richlist`; the genesis-funded load-test accounts come apart as `genesis_allocations` and the QNC page shows them on one line instead of among holders. `GET /api/address/[address]` sets `genesisAllocation` for such an account and the address page says so |
@@ -730,9 +874,11 @@ server started after the build. It is skipped when `CI` is set or `LIGHT_REFRESH
 `LIGHT_REFRESH_BUDGET_S` seconds (300 by default; the server's follower carries on from where it stopped), needs
 Node.js 22.6 or later for the light client's TypeScript, never fails the build and writes no tracked file, so the
 host's checkout stays clean for the next pull. Run by hand (`node scripts/light-pin.mjs`, `--budget-s N`, `--store
-FILE`) it exits 1 short of the head; it roots at a capsule as the server does. `--write-pin` instead rewrites the
-`<ws-pin>` block of `pin.ts` with the macroblock `--margin` (4 by default) below the certified head and the one below
-it as anchors, both verified by a walk in that run from the committed pin with no store and no capsule (a pin every
+FILE`) it exits 1 short of the head, and at once for a flag given without its value; it roots at a capsule as the
+server does. `--write-pin` instead rewrites the `<ws-pin>` block of `pin.ts` with the macroblock `--margin` (4 by
+default) below the certified head, or the one `--index N` names (the index the mobile wallet pinned, so both pins name
+one block; refused above the certified head, and at or one above the committed pin before any node is read),
+and the one below it as anchors, both verified by a walk in that run from the committed pin with no store and no capsule (a pin every
 host starts from rests on the pin before it, never on one machine's file; a client holding stored checkpoints or a
 capsule, or rooted at another pin, is refused), its `MacroBlock::hash` named alike by every genesis node that answers,
 at least three, for a header whose state root is the one the walk verified, `provenFrom` naming the committed pin,
@@ -758,7 +904,9 @@ vectors made by them), and that `src/server/solana-rpc.ts` sends and confirms ov
 SDK runs in the process that holds the key. A claim asks for one token: at most 1500 1DEV or 0.01 SOL; the
 `/testnet` page asks for 1,500 1DEV and 0.005 SOL as a pair, enough for a wallet to send the activation's 1DEV and
 SOL to a payment address of My node, whose card links the page and hands over the wallet's Solana address (read once
-from the tab's session storage, never from the URL). The faucet sends test tokens only: on a release whose network is
+from the tab's session storage, never from the URL). The line under the page's form shows a waiting line while the
+claims run, then what was sent with each Solana transaction linked to the Solana explorer, or why nothing was sent and
+when to try again. The faucet sends test tokens only: on a release whose network is
 not testnet (from `BURN_CLUSTER` in `src/lib/qnet-link.ts`, never a setting) the route answers 404. Every claim passes
 the same admission (`src/server/faucet-guard.ts`): one claim of each token per address a day, keyed on the
 `(address, token type)` pair so the page's pair never refuses itself; 5 claims of each token per client IP an hour and

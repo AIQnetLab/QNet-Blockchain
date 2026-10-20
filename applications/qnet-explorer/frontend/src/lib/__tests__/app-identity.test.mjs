@@ -6,7 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ANDROID_PLAY_PACKAGE, IOS_BUNDLE_ID, assetLinks } from '../app-links.ts';
+import { ANDROID_PLAY_PACKAGE, IOS_BUNDLE_ID, LINK_PATH, TRANSFER_PATH, appleAppSiteAssociation, assetLinks } from '../app-links.ts';
+import { LINK_HOST } from '../hosts.ts';
 
 const MOBILE = new URL('../../../../../qnet-mobile/', import.meta.url);
 const read = (path) => readFileSync(new URL(path, MOBILE), 'utf8');
@@ -26,6 +27,24 @@ test('the Android applicationId is the one package the Digital Asset Links state
   }
   assert.deepEqual(assetLinks().map((a) => a.target.package_name), [ANDROID_PLAY_PACKAGE]);
   assert.doesNotMatch(gradle, /productFlavors/);
+});
+
+// The paths the association covers are the ones QNet Wallet takes: its one verified Android filter on link.aiqnet.io
+// (the site's intent: URL reaches the app through it too), its iOS associated domain and its two readers. A published
+// path the filter lacks would leave the payment address's Android button on the fallback page.
+test('the paths apple-app-site-association lists are the ones the app\'s verified filter and readers take', () => {
+  const paths = appleAppSiteAssociation('ABCDE12345', IOS_BUNDLE_ID).applinks.details[0].components.map((c) => c['/']);
+  assert.deepEqual(paths, [LINK_PATH, TRANSFER_PATH]);
+  const manifest = read('android/app/src/main/AndroidManifest.xml');
+  const verified = [...manifest.matchAll(/<intent-filter android:autoVerify="true">([\s\S]*?)<\/intent-filter>/g)].map((m) => m[1]);
+  assert.equal(verified.length, 1);
+  const data = [...verified[0].matchAll(/<data ([^>]*?)\/>/g)]
+    .map((m) => Object.fromEntries([...m[1].matchAll(/android:(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]])));
+  assert.deepEqual([...new Set(data.map((d) => d.host).filter(Boolean))], [LINK_HOST]);
+  assert.deepEqual(data.map((d) => d.path).filter(Boolean).sort(), [...paths].sort());
+  assert.match(read('ios/QNetMobile/QNetMobile.entitlements'), /<string>applinks:link\.aiqnet\.io<\/string>/);
+  assert.match(read('src/services/QNetLink.js'), /PREFIX: 'https:\/\/link\.aiqnet\.io\/l#v1\.'/);
+  assert.match(read('src/services/transferLink.js'), /const TRANSFER_PATH = 'https:\/\/link\.aiqnet\.io\/send';/);
 });
 
 test('every iOS build configuration\'s bundle identifier is the one apple-app-site-association names', () => {

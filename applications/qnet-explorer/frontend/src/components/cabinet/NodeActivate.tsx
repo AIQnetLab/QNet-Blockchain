@@ -3,10 +3,10 @@
 // /node/activate (unified plan flows A and B; shared contracts C1 and C4): a light node paid from a one-time payment
 // address in this browser. QNet Wallet first confirms the wallet the node is for (a QNet Link `reserve` request: the
 // wallet signs its reservation, and the address exists for that wallet only), then the address is funded from the
-// user's own wallet as on mainnet (owner, 29.09: the page names the exact amounts, with payment request QR codes; on
-// testnet it links the Testnet page's faucet for test tokens to the wallet), the burn is bound to that wallet's light
-// node before it is sent and shows its code once final, and one QNet Link `link` request that QNet Wallet confirms
-// registers the node. That last step also works later from any browser where the wallet is connected (NextSteps.tsx
+// user's own wallet as on mainnet (owner, 29.09 and 19.10: the page names the exact amounts, with buttons that open a
+// wallet with each transfer filled in and one QR code of the address; on testnet it links the Testnet page's faucet for
+// test tokens to the wallet), the burn is bound to that wallet's light node before it is sent and shows its code once
+// final, and one QNet Link `link` request that QNet Wallet confirms registers the node. That last step also works later from any browser where the wallet is connected (NextSteps.tsx
 // FinishLight): the burn is the wallet's activation for good.
 // The record of the activation lives in this browser (src/lib/cabinet/payment-store.ts); every step is a function of
 // src/lib/cabinet/activation.ts, taken again from the record after a reload, so the phone browser may discard this
@@ -27,14 +27,19 @@
 // activation is not open yet.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useWallet } from '@/contexts/AppContext';
+import Action from '@/components/ui/Action';
+import EntityLink from '@/components/ui/EntityLink';
+import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import { number, t, type MessageKey } from '@/lib/texts';
+import { rich } from '@/lib/rich';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useNodeStatus } from '@/hooks/useNodeStatus';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { sameQuote, type PriceQuote } from '@/lib/activation-price';
 import * as act from '@/lib/cabinet/activation';
+import { activationStep, stepAt } from '@/lib/cabinet/activate-steps';
 import { verifyReserveAnswer } from '@/lib/cabinet/burn-record';
 import { verifyConsent } from '@/lib/cabinet/consent-verify';
 import {
@@ -53,6 +58,7 @@ import { useCabinet } from './CabinetProvider';
 import ExtensionActivate, { requestedType } from './ExtensionActivate';
 import LinkWaiting from './LinkWaiting';
 import { NoNode, NodeNext } from './NextSteps';
+import { Group, Next, Step, Steps } from './parts';
 
 // How often each stage that waits on the network is looked at again while the page is shown. Every activating page
 // reads Solana through the site's one server, so the funding read is not polled faster than a transfer lands; the
@@ -392,6 +398,13 @@ export default function NodeActivate() {
     if (ready && !choice && registeredWallet) choose({ qnet: registeredWallet, source: 'app' });
   }, [ready, choice, registeredWallet, choose]);
 
+  // A finished registration with nothing left to send back opens My node at once (owner 20.10).
+  const router = useRouter();
+  const finished = record?.stage === 'done' && registered !== null && !mayReturnLeftovers(record);
+  useEffect(() => {
+    if (finished) router.replace('/node?tab=overview');
+  }, [finished, router]);
+
   // A button's step; `undefined` leaves the record as it is, null means the step deleted it.
   const withRecord = async (run: (r: PaymentRecord) => Promise<PaymentRecord | null | undefined>) => {
     if (!record || working) return;
@@ -501,10 +514,10 @@ export default function NodeActivate() {
   const pinned = record ? pinnedWallet(record) : null;
   const askedOther = refundAnswer?.status === 'ok' && !!refundAnswer.qnet && pinned !== null && refundAnswer.qnet !== pinned;
   const refundAskView = refundAsk.state.phase === 'idle' || refundAsk.state.phase === 'done' ? (
-    <div className="cabinet-choice">
-      {askedOther && <p className="activate-error" role="alert">{t('act_refund_other_wallet')}</p>}
-      {refundAnswer && refundAnswer.status !== 'ok' && <p className="activate-note" role="status">{t(refusedAnswerText(refundAnswer))}</p>}
-      <button type="button" className="qnet-button activate-primary" onClick={() => void refundAsk.start('connect')} disabled={working}>{t('wallet_ask_app')}</button>
+    <div className="cab-move-way">
+      {askedOther && <Failed>{t('act_refund_other_wallet')}</Failed>}
+      {refundAnswer && refundAnswer.status !== 'ok' && <Answered>{t(refusedAnswerText(refundAnswer))}</Answered>}
+      <Action kind="solid" onClick={() => void refundAsk.start('connect')} disabled={working}>{t('wallet_ask_app')}</Action>
     </div>
   ) : (
     <LinkWaiting
@@ -519,13 +532,11 @@ export default function NodeActivate() {
   // The wallet's confirmation in QNet Wallet: the buttons that open the request, or the request while it is shown.
   // `onCancel`: ends what waits for it (the record at walletConfirm, else only the request).
   const confirmView = (r: PaymentRecord, onCancel: () => void) => (confirmState.phase === 'idle' || confirmState.phase === 'done' ? (
-    <div className="cabinet-actions">
-      <button type="button" className="qnet-button activate-primary" onClick={() => askWallet(r, !device?.phone)} disabled={!device || working}>
+    <div className="actions cab-next-act">
+      <Action kind="solid" onClick={() => askWallet(r, !device?.phone)} disabled={!device || working}>
         {t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
-      </button>
-      {device?.phone && (
-        <button type="button" className="activate-link-button" onClick={() => askWallet(r, true)} disabled={working}>{t('wallet_other_device')}</button>
-      )}
+      </Action>
+      {device?.phone && <Action kind="text" onClick={() => askWallet(r, true)} disabled={working}>{t('wallet_other_device')}</Action>}
     </div>
   ) : (
     <LinkWaiting
@@ -538,6 +549,11 @@ export default function NodeActivate() {
     />
   ));
 
+  // The step texts before a step is reached: what it will do.
+  const payAhead = <p className="cab-step-s">{t(ACTIVATION_NETWORK === 'testnet' ? 'act_way_3_testnet' : 'act_way_3_mainnet')}</p>;
+  const burnAhead = <p className="cab-step-s">{t('act_way_4')}</p>;
+  const registerAhead = <p className="cab-step-s">{t('act_way_5')}</p>;
+
   let body: ReactNode;
   // Nothing is offered before every source of the wallet answered: a wallet with an activation never sees a new one for
   // a moment (the state card says what is being checked).
@@ -545,7 +561,7 @@ export default function NodeActivate() {
     body = null;
   } else if (!record && viewOnly) {
     // An address only viewed: the wallet itself connects before an activation for it starts.
-    body = <div className="activate-card"><p>{t('connect_first')}</p></div>;
+    body = <Next><p>{t('connect_first')}</p></Next>;
   } else if (!record && !offer) {
     // The wallet has a node, a burn, something on its way, or a source that did not answer: its state and next step;
     // nothing new starts here. The extension's answer given on this page stays in view instead of the state card.
@@ -561,67 +577,65 @@ export default function NodeActivate() {
     const install = device && !device.phone && !extension ? installTarget(window.navigator) : null;
     // A super node: only the QNet extension on a computer activates it, and it runs on the user's own server.
     const superCard = !extensionHolds && (
-      <div className="activate-card">
-        <h3 className="activate-step">{t('act_super_title')}</h3>
+      <Group level={3} title={t('act_super_title')}>
         <p>{t('super_note')}</p>
-        {install ? (
-          <a href={install.href} className="qnet-button secondary" target={install.kind === 'store' ? '_blank' : undefined} rel="noopener noreferrer">{t('super_note_install')}</a>
-        ) : (
-          <Link href={`${GUIDE_HREF}?way=super`} className="qnet-button secondary">{t('super_note_guide')}</Link>
-        )}
-      </div>
+        <div className="cab-next-act">
+          {install ? (
+            <Action href={install.href} external={install.kind === 'store'}>{t('super_note_install')}</Action>
+          ) : (
+            <Action href={`${GUIDE_HREF}?way=super`}>{t('super_note_guide')}</Action>
+          )}
+        </div>
+      </Group>
     );
-    // A light node from a one-time payment address, run in QNet Wallet.
+    // A light node from a one-time payment address, run in QNet Wallet: the four steps, the first one to do now.
     const paymentCard = phoneFlows ? (
-      <div className="activate-card">
-        <h3 className="activate-step">{t('act_payment_title')}</h3>
-        <p className="cabinet-lead">{t('act_lead')}</p>
-        <ol className="activate-facts">
-          <li>{t('act_way_1')}</li>
-          <li>{t('act_way_2')}</li>
-          <li>{t(ACTIVATION_NETWORK === 'testnet' ? 'act_way_3_testnet' : 'act_way_3_mainnet')}</li>
-          <li>{t('act_way_4')}</li>
-          <li>{t('act_way_5')}</li>
-        </ol>
-        {!supported ? (
-          <p className="activate-error" role="alert">{t('act_unsupported')}</p>
-        ) : setup.phase === 'loading' ? (
-          <p className="activate-status" aria-live="polite">{t('checking')}</p>
-        ) : setup.phase === 'unavailable' ? (
-          <div role="alert">
-            <p className="activate-error">{t('act_price_unavailable')}</p>
-            <button type="button" className="qnet-button secondary" onClick={() => void loadSetup()}>{t('try_again')}</button>
-          </div>
-        ) : setup.quote.phase !== 1 ? (
-          <p>{t('act_no_burn_phase')}</p>
-        ) : paymentClosed ? (
-          <p className="activate-status">{t('act_payment_not_open')}</p>
-        ) : (
-          <>
-            <p>{t('act_price', { price: number(setup.quote.cost) })}</p>
-            <button type="button" className="qnet-button activate-primary" onClick={() => void start()} disabled={working || !device}>{t('act_start')}</button>
-          </>
-        )}
-      </div>
+      <Group level={3} title={t('act_payment_title')}>
+        <p className="lead">{t('act_lead')}</p>
+        <Steps label={t('progress_label')}>
+          <Step n={1} at="now" title={t('act_reserve_title')} level={4}>
+            <p className="cab-step-s">{t('act_way_1')} {t('act_way_2')}</p>
+            {!supported ? (
+              <Failed>{t('act_unsupported')}</Failed>
+            ) : setup.phase === 'loading' ? (
+              <Waiting>{t('checking')}</Waiting>
+            ) : setup.phase === 'unavailable' ? (
+              <Failed action={{ label: t('try_again'), onClick: () => void loadSetup() }}>{t('act_price_unavailable')}</Failed>
+            ) : setup.quote.phase !== 1 ? (
+              <p>{t('act_no_burn_phase')}</p>
+            ) : paymentClosed ? (
+              <p className="note">{t('act_payment_not_open')}</p>
+            ) : (
+              <>
+                <p>{t('act_price', { price: number(setup.quote.cost) })}</p>
+                <div className="cab-next-act"><Action kind="solid" onClick={() => void start()} disabled={working || !device}>{t('act_start')}</Action></div>
+              </>
+            )}
+          </Step>
+          <Step n={2} at="ahead" title={t('act_step_pay')} level={4}>{payAhead}</Step>
+          <Step n={3} at="ahead" title={t('act_burn')} level={4}>{burnAhead}</Step>
+          <Step n={4} at="ahead" title={t('act_step_register')} level={4}>{registerAhead}</Step>
+        </Steps>
+      </Group>
     ) : !extensionHolds && (
-      <div className="activate-card">
+      <Next action={device?.phone && <Action href={`${GUIDE_HREF}?way=computer`}>{t('guide_show_computer')}</Action>}>
         <p>{t('act_phone_closed')}</p>
         {install && (
-          <p className="activate-note">
+          <p className="note">
             {t('act_get_extension')}{' '}
             <a href={install.href} target={install.kind === 'store' ? '_blank' : undefined} rel="noopener noreferrer">{t('act_get_extension_link')}</a>
           </p>
         )}
-        {device?.phone && <Link href={`${GUIDE_HREF}?way=computer`} className="qnet-button secondary">{t('guide_show_computer')}</Link>}
-      </div>
+      </Next>
     );
     body = (
       <>
+        <h2 className="cab-title">{t(extensionHolds ? 'activate_title' : wantsSuper ? 'action_activate_super' : 'action_activate_light')}</h2>
         {extensionHolds && <ExtensionActivate key={choice?.qnet ?? ''} offer onAnswered={() => setExtensionAnswered(true)} />}
         {/* An extension with another wallet: said, never offered for this one. */}
-        {extension && !extensionHolds && <div className="activate-card"><p>{t('act_extension_other_wallet')}</p></div>}
+        {extension && !extensionHolds && <Next><p>{t('act_extension_other_wallet')}</p></Next>}
         {/* The extension's card says it among its facts. */}
-        {!extensionHolds && <p className="activate-note">{t('one_code')}</p>}
+        {!extensionHolds && <p className="note">{t('one_code')}</p>}
         {wantsSuper ? <>{superCard}{paymentCard}</> : <>{paymentCard}{superCard}</>}
       </>
     );
@@ -631,117 +645,130 @@ export default function NodeActivate() {
     // The wallet the activation is for: the one QNet Wallet confirmed (or is asked to confirm), else the chosen one.
     const named = pinned ?? choice?.qnet ?? null;
     const confirming = (stage === 'funding' || stage === 'funded') && confirmState.phase !== 'idle' && confirmState.phase !== 'done';
+    // The step to do now (activate-steps.ts); null outside the four steps.
+    const now = activationStep(stage);
+    // QNet Wallet's confirmation asked again while the address is funded: inside the step it belongs to now.
+    const reconfirm = confirming && (
+      <div className="cab-sub">
+        <h4 className="label">{t('act_reserve_title')}</h4>
+        {named && <p>{rich('act_reserve_lead', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+        {confirmView(record, confirmCancel)}
+      </div>
+    );
+    const receipt = record.burn && !['burnSent', 'burnUnknown', 'burnFailed'].includes(stage) && <Receipt record={record} unused={stage === 'otherBurn'} />;
     body = (
       <>
-        {resumed && isUnfinished(record) && <p className="activate-note">{t('act_resume')}</p>}
-        {stage === 'walletConfirm' && (
-          <div className="activate-card">
-            <h3 className="activate-step">{t('act_reserve_title')}</h3>
-            {named && <p>{t('act_reserve_lead', { wallet: shortAddress(named) })}</p>}
-            {confirmView(record, () => void cancel())}
-          </div>
+        <h2 className="cab-title">{t('action_activate_light')}</h2>
+        {resumed && isUnfinished(record) && <p className="note">{t('act_resume')}</p>}
+        {now !== null && (
+          <Steps label={t('progress_label')}>
+            <Step n={1} at={stepAt(1, now)} title={t('act_reserve_title')}>
+              {stage === 'walletConfirm' ? (
+                <>
+                  {named && <p className="cab-step-s">{rich('act_reserve_lead', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+                  {confirmView(record, () => void cancel())}
+                </>
+              ) : named && <p className="cab-step-s">{rich('act_reserve_done', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+            </Step>
+            <Step n={2} at={stepAt(2, now)} title={t('act_step_pay')}>
+              {stage === 'funding' && reconfirm}
+              {(stage === 'funding' || stage === 'funded') && price === null && (
+                setup.phase === 'unavailable' ? (
+                  <Failed action={{ label: t('try_again'), onClick: () => void loadSetup() }}>{t('act_price_unavailable')}</Failed>
+                ) : (
+                  <Waiting>{t(setup.phase === 'loading' ? 'checking' : 'act_no_burn_phase')}</Waiting>
+                )
+              )}
+              {(stage === 'funding' || stage === 'funded') && price !== null && (
+                <Funding record={record} price={price} balance={balance} wallet={named} walletSolana={choice?.solana ?? null} phone={device?.phone === true} />
+              )}
+              {stage === 'walletConfirm' && payAhead}
+            </Step>
+            <Step n={3} at={stepAt(3, now)} title={t('act_burn')}>
+              {stage === 'funded' && reconfirm}
+              {(stage === 'walletConfirm' || (stage === 'funding' && price !== null)) && (
+                <>
+                  {burnAhead}
+                  {/* The burn opens once both amounts are on the address; until then it says so. */}
+                  {stage === 'funding' && (
+                    <div className="cab-next-act">
+                      <Action kind="solid" disabled>{t('act_burn')}</Action>
+                      <p className="note">{t('act_burn_opens')}</p>
+                    </div>
+                  )}
+                </>
+              )}
+              {stage === 'funded' && price !== null && !confirming && (mayBurn ? (
+                <>
+                  <p>{t('act_burn_lead', { price: number(price) })}</p>
+                  {paymentClosed && <p className="note">{t('act_payment_not_open')}</p>}
+                  <div className="cab-next-act"><Action kind="solid" onClick={() => void burn()} disabled={working || paymentClosed}>{t('act_burn')}</Action></div>
+                </>
+              ) : choice === null || viewOnly ? (
+                <p>{t(viewOnly ? 'connect_first' : 'act_no_wallet')}</p>
+              ) : view.state === 'node' ? (
+                <p>{t('act_wallet_has_node')}</p>
+              ) : <NoNode pending={view.state === 'recording'} />)}
+              {(stage === 'burnSent' || stage === 'burnUnknown') && <Waiting>{t(stage === 'burnSent' ? 'act_burning' : 'act_burn_unknown')}</Waiting>}
+              {stage === 'burnFailed' && (
+                <Failed action={{ label: t('act_try_again'), onClick: () => void withRecord((r) => act.retryBurn(r, deps)) }}>{t('act_burn_failed')}</Failed>
+              )}
+              {/* The burn stays in view to the end, with its code. */}
+              {now > 3 && receipt}
+            </Step>
+            <Step n={4} at={stepAt(4, now)} title={t('act_step_register')}>
+              {now < 4 && registerAhead}
+              {(stage === 'burnFinal' || stage === 'linkOpen') && (
+                <>
+                  <p>{t('act_link_lead')}</p>
+                  {named && <p className="note">{rich('act_link_named', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+                  {stage === 'burnFinal' || session.state.phase === 'idle' ? (
+                    <div className="actions cab-next-act">
+                      <Action kind="solid" onClick={() => void openRequest(!device?.phone)} disabled={!device || working}>
+                        {t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
+                      </Action>
+                      {device?.phone && <Action kind="text" onClick={() => void openRequest(true)} disabled={working}>{t('wallet_other_device')}</Action>}
+                      {stage === 'linkOpen' && <Action kind="quiet" onClick={() => void cancelRequest()}>{t('cancel')}</Action>}
+                    </div>
+                  ) : session.state.phase !== 'done' && (
+                    <LinkWaiting
+                      state={session.state}
+                      qr={record.link?.qr === true}
+                      android={device?.android === true}
+                      onShowQr={record.link?.qr ? undefined : () => void openRequest(true)}
+                      onCancel={() => void cancelRequest()}
+                      onRetry={retryRequest}
+                    />
+                  )}
+                </>
+              )}
+              {stage === 'consentVerified' && <AnswerCheck record={record} onAnswer={(matches) => void withRecord((r) => act.answerCheck(r, matches, deps))} />}
+              {stopped && (
+                <div role="alert">
+                  <p className="rq-failed">{t(stopped, { wallet: named ? shortAddress(named) : '' })}</p>
+                  {stage === 'consentStale' ? (
+                    <div className="cab-next-act"><Action kind="solid" onClick={() => void askAgain()} disabled={!device || working}>{t('act_ask_again')}</Action></div>
+                  ) : stage === 'mismatch' && (
+                    <div className="cab-next-act"><Action kind="text" onClick={() => void withRecord((r) => act.relink(r, deps))}>{t('act_relink')}</Action></div>
+                  )}
+                </div>
+              )}
+              {(stage === 'beneficiaryConfirmed' || stage === 'submitted' || stage === 'onChain') && <Waiting>{t('act_recording')}</Waiting>}
+              {stage === 'submitted' && record.submit?.lastCode === 'bind_v2_pending' && <p className="note">{t('act_bind_v2_pending')}</p>}
+              {stage === 'refused' && (
+                record.submit?.lastCode === 'wallet_has_node' ? (
+                  <Failed>{t('act_refused_wallet_has_node')}</Failed>
+                ) : (
+                  <Failed action={{ label: t('act_try_again'), onClick: () => void withRecord((r) => act.resubmit(r, deps)) }}>{t('act_refused', { code: record.submit?.lastCode ?? 'refused' })}</Failed>
+                )
+              )}
+              {stage === 'done' && registered && <Registered nodeId={registered.nodeId} />}
+            </Step>
+          </Steps>
         )}
-        {(stage === 'funding' || stage === 'funded') && price === null && (
-          setup.phase === 'unavailable' ? (
-            <div role="alert">
-              <p className="activate-error">{t('act_price_unavailable')}</p>
-              <button type="button" className="qnet-button secondary" onClick={() => void loadSetup()}>{t('try_again')}</button>
-            </div>
-          ) : (
-            <p className="activate-status" aria-live="polite">{t(setup.phase === 'loading' ? 'checking' : 'act_no_burn_phase')}</p>
-          )
-        )}
-        {(stage === 'funding' || stage === 'funded') && price !== null && (
-          <Funding record={record} price={price} balance={balance} wallet={named} walletSolana={choice?.solana ?? null} phone={device?.phone === true} />
-        )}
-        {confirming && (
-          <div className="activate-card">
-            <h3 className="activate-step">{t('act_reserve_title')}</h3>
-            {named && <p>{t('act_reserve_lead', { wallet: shortAddress(named) })}</p>}
-            {confirmView(record, confirmCancel)}
-          </div>
-        )}
-        {stage === 'funded' && price !== null && !confirming && (mayBurn ? (
-          <div className="activate-card">
-            <p>{t('act_burn_lead', { price: number(price) })}</p>
-            {paymentClosed && <p className="activate-status">{t('act_payment_not_open')}</p>}
-            <button type="button" className="qnet-button activate-primary" onClick={() => void burn()} disabled={working || paymentClosed}>{t('act_burn')}</button>
-          </div>
-        ) : choice === null || viewOnly ? (
-          <div className="activate-card"><p>{t(viewOnly ? 'connect_first' : 'act_no_wallet')}</p></div>
-        ) : view.state === 'node' ? (
-          <div className="activate-card"><p>{t('act_wallet_has_node')}</p></div>
-        ) : <NoNode pending={view.state === 'recording'} />)}
-        {(stage === 'burnSent' || stage === 'burnUnknown') && (
-          <p className="activate-status" aria-live="polite">{t(stage === 'burnSent' ? 'act_burning' : 'act_burn_unknown')}</p>
-        )}
-        {stage === 'burnFailed' && (
-          <div className="activate-card" role="alert">
-            <p className="activate-error">{t('act_burn_failed')}</p>
-            <button type="button" className="qnet-button secondary" onClick={() => void withRecord((r) => act.retryBurn(r, deps))}>{t('act_try_again')}</button>
-          </div>
-        )}
-        {/* The burn stays in view to the end, with its code; none for a burn whose wallet's node came from another burn. */}
-        {record.burn && !['burnSent', 'burnUnknown', 'burnFailed'].includes(stage) && <Receipt record={record} unused={stage === 'otherBurn'} />}
-        {(stage === 'burnFinal' || stage === 'linkOpen') && (
-          <div className="activate-card">
-            <h3 className="activate-step">{t('act_link_title')}</h3>
-            <p>{t('act_link_lead')}</p>
-            {named && <p className="activate-note">{t('act_link_named', { wallet: shortAddress(named) })}</p>}
-            {stage === 'burnFinal' || session.state.phase === 'idle' ? (
-              <div className="cabinet-actions">
-                <button type="button" className="qnet-button activate-primary" onClick={() => void openRequest(!device?.phone)} disabled={!device || working}>
-                  {t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
-                </button>
-                {device?.phone && (
-                  <button type="button" className="activate-link-button" onClick={() => void openRequest(true)} disabled={working}>{t('wallet_other_device')}</button>
-                )}
-                {stage === 'linkOpen' && <button type="button" className="qnet-button secondary" onClick={() => void cancelRequest()}>{t('cancel')}</button>}
-              </div>
-            ) : session.state.phase !== 'done' && (
-              <LinkWaiting
-                state={session.state}
-                qr={record.link?.qr === true}
-                android={device?.android === true}
-                onShowQr={record.link?.qr ? undefined : () => void openRequest(true)}
-                onCancel={() => void cancelRequest()}
-                onRetry={retryRequest}
-              />
-            )}
-          </div>
-        )}
-        {stage === 'consentVerified' && <AnswerCheck record={record} onAnswer={(matches) => void withRecord((r) => act.answerCheck(r, matches, deps))} />}
-        {stopped && (
-          <div className="activate-card" role="alert">
-            <p className="activate-error">{t(stopped, { wallet: named ? shortAddress(named) : '' })}</p>
-            {stage === 'consentStale' ? (
-              <button type="button" className="qnet-button activate-primary" onClick={() => void askAgain()} disabled={!device || working}>{t('act_ask_again')}</button>
-            ) : stage === 'mismatch' && (
-              <button type="button" className="qnet-button secondary" onClick={() => void withRecord((r) => act.relink(r, deps))}>{t('act_relink')}</button>
-            )}
-          </div>
-        )}
-        {(stage === 'beneficiaryConfirmed' || stage === 'submitted' || stage === 'onChain') && (
-          <p className="activate-status" aria-live="polite">{t('act_recording')}</p>
-        )}
-        {stage === 'submitted' && record.submit?.lastCode === 'bind_v2_pending' && <p className="activate-note">{t('act_bind_v2_pending')}</p>}
-        {stage === 'refused' && (
-          <div className="activate-card" role="alert">
-            {record.submit?.lastCode === 'wallet_has_node' ? (
-              <p className="activate-error">{t('act_refused_wallet_has_node')}</p>
-            ) : (
-              <>
-                <p className="activate-error">{t('act_refused', { code: record.submit?.lastCode ?? 'refused' })}</p>
-                <button type="button" className="qnet-button secondary" onClick={() => void withRecord((r) => act.resubmit(r, deps))}>{t('act_try_again')}</button>
-              </>
-            )}
-          </div>
-        )}
-        {stage === 'otherBurn' && (
-          <div className="activate-card" role="alert">
-            <p className="activate-error">{t('act_other_burn')}</p>
-          </div>
-        )}
+        {/* Outside the steps: the burn whose wallet's node came from another burn, and what is left going back. */}
+        {now === null && receipt}
+        {stage === 'otherBurn' && <Failed>{t('act_other_burn')}</Failed>}
         {mayReturnLeftovers(record) && <LeftoversNow busy={working} onSend={() => void withRecord((r) => act.returnLeftovers(r, deps))} />}
         {(stage === 'leftovers' || stage === 'closing') && (
           <Leftovers
@@ -758,9 +785,9 @@ export default function NodeActivate() {
             onLeave={() => void withRecord((r) => act.done(r, deps))}
           />
         )}
-        {stage === 'done' && registered && <Registered nodeId={registered.nodeId} />}
+        {(stage === 'funding' || stage === 'funded') && <p className="note cab-keep">{t('act_keep_browser')}</p>}
         {mayCancel(record) && (
-          <button type="button" className="activate-link-button" onClick={() => void cancel()} disabled={working}>{t('act_discard')}</button>
+          <div className="cab-next-act"><Action kind="text" onClick={() => void cancel()} disabled={working}>{t('act_discard')}</Action></div>
         )}
       </>
     );
@@ -773,7 +800,7 @@ export default function NodeActivate() {
     // Without a wallet the page shows only an unfinished activation of this browser; else My node asks for one first.
     <CabinetFrame tab="activate" open={record === undefined ? null : record !== null && isUnfinished(record)}>
       {body}
-      {shown && shown !== 'act_refund_failed' && <p className="activate-note" aria-live="polite">{t(shown)}</p>}
+      {shown && shown !== 'act_refund_failed' && <p className="note cab-notice" role="status">{t(shown)}</p>}
     </CabinetFrame>
   );
 }

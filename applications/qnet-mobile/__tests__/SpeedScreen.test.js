@@ -193,7 +193,8 @@ async function sendForm() {
   return tree;
 }
 
-const sendButton = (tree) => byTestId(tree, 'send-button').find((n) => typeof n.props.onPress === 'function');
+// The button itself: the innermost pressable of the action (components/ui/Action wraps a Pressable).
+const sendButton = (tree) => byTestId(tree, 'send-button').filter((n) => typeof n.props.onPress === 'function').pop();
 
 beforeEach(async () => {
   await AsyncStorage.clear();
@@ -241,7 +242,7 @@ describe('the Send button', () => {
     // Taken at once: a spinner, and the button off, before any check answered.
     expect(byTestId(tree, 'send-busy').length).toBeGreaterThan(0);
     expect(sendButton(tree).props.disabled).toBe(true);
-    expect(sendButton(tree).props.accessibilityState).toEqual({ busy: true });
+    expect(sendButton(tree).props.accessibilityState).toEqual({ disabled: true, busy: true });
     // The balance, the recipient and the kept transactions are all asked before any answers.
     expect([...mockState.calls].sort()).toEqual(['balance', 'kept', 'recipient']);
     // A second tap, even one that lands before the screen turned busy, starts nothing.

@@ -2,6 +2,7 @@
 // services outside a screen (native prompts, the crash screen) speak in. Strings live in ./locales, one file per
 // language, every file with every key (__tests__/I18n.test.js).
 import { I18nManager, Platform, Settings } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import translations from './translations';
 
 // The picker's order; each name is written in its own language.
@@ -86,6 +87,18 @@ export function deviceLanguage() {
   const lang = (id.split(/[-_]/)[0] || '').toLowerCase();
   if (lang === 'zh') return 'zh-CN';
   return isSupported(lang) ? lang : DEFAULT_LANGUAGE;
+}
+
+// The user's choice of language, kept when the wallet is deleted (WalletManager.ERASE_ALLOW_LIST).
+export const LANGUAGE_KEY = 'qnet_language';
+
+/** The language the app opens in: the user's choice, else the phone's (deviceLanguage). */
+export async function savedLanguage() {
+  try {
+    const saved = await AsyncStorage.getItem(LANGUAGE_KEY);
+    if (isSupported(saved)) return saved;
+  } catch (_) { /* unreadable storage: the phone's language */ }
+  return deviceLanguage();
 }
 
 // The language of the open screen, for code that runs outside it: native prompt titles, the crash screen.

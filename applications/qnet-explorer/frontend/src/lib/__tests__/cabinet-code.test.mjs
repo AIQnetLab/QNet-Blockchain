@@ -116,10 +116,10 @@ test('a receipt names the wallet its burn was bound to; Node details show one co
   const page = readFileSync(new URL('../../components/cabinet/NodeDetails.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   assert.doesNotMatch(page, /facts\.other|showOther|code_show_other|code_recover_other/);
   for (const key of ['code_show_other', 'code_recover_other']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);
-  const value = page.slice(page.indexOf('function CodeValue('), page.indexOf('// The details card'));
-  assert.match(value, /if \(!facts\.code\) return <span className="activate-note">\{t\('code_code_later'\)\}<\/span>;/);
-  assert.equal(value.match(/className="activate-code"/g).length, 1, 'one code');
-  assert.equal(value.match(/<CopyButton /g).length, 1);
+  const value = page.slice(page.indexOf('function CodeValue('), page.indexOf('// The details of the wallet'));
+  assert.match(value, /if \(!facts\.code\) return <span className="note">\{t\('code_code_later'\)\}<\/span>;/);
+  assert.equal(value.match(/className="ent cab-code"/g).length, 1, 'one code');
+  assert.equal(value.match(/<Copy /g).length, 1);
   assert.doesNotMatch(value, /<button /);
 });
 
@@ -468,8 +468,12 @@ test('Node details show the activation by themselves, with no field to check ano
   assert.match(page, /\{t\(registration\.kind === 'notArchived' \? 'code_not_archived' : 'code_archive_unavailable'\)\}/);
   // Status on the network, type, node id, code, burn and amount, and where the page learned them.
   for (const key of ['code_field_status', 'ext_field_type', 'code_field_node', 'act_code', 'act_burn_tx', 'code_field_amount', 'super_id']) assert.ok(page.includes(`'${key}'`), key);
-  assert.match(page, /<a href=\{solanaTxUrl\(facts\.burnTx\)\} target="_blank" rel="noopener noreferrer" className="activate-mono">\{facts\.burnTx\}<\/a>/);
-  assert.match(page, /<p className="activate-note">\{t\(SOURCE_TEXT\[facts\.source\]\)\}<\/p>/);
+  // The burn is a Solana transaction: its link leaves the site (EntityLink solana-tx), the node id links to the wallet's
+  // address page, the block the node was recorded at to its block.
+  assert.match(page, /<Fact label=\{t\('act_burn_tx'\)\}><EntityLink kind="solana-tx" value=\{facts\.burnTx\} \/><\/Fact>/);
+  assert.match(page, /<EntityLink kind="node" value=\{nodeId\} address=\{choice\?\.qnet \?\? null\} full \/>/);
+  assert.match(page, /rich\('code_status_recorded_at', \{ height: <EntityLink kind="block" value=\{height\} \/> \}\)/);
+  assert.match(page, /<p className="note">\{t\(SOURCE_TEXT\[facts\.source\]\)\}<\/p>/);
   // Nothing to type: no form, no check button, no text of one.
   assert.doesNotMatch(page, /<form |<input |CheckAnother|code_check/);
   for (const key of ['code_check_other', 'code_input', 'code_check', 'code_malformed', 'code_match', 'code_no_match']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);

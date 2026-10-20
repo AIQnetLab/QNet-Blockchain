@@ -10,6 +10,8 @@
 // computer, where it shows a QR code). The request is the same.
 
 import { useEffect, useRef } from 'react';
+import Action from '@/components/ui/Action';
+import { Answered } from '@/components/ui/RequestState';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { t, type MessageKey } from '@/lib/texts';
@@ -17,6 +19,7 @@ import { isHeldWallet } from '@/lib/cabinet/wallet-choice';
 import { formatCheckNumber, type LinkAnswer, type LinkDeviceRequest } from '@/lib/qnet-link';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
+import { ActionBlock } from './parts';
 
 // What an answer says, as QNet Wallet's report.
 function answerKey(answer: LinkAnswer): MessageKey {
@@ -43,15 +46,8 @@ export default function LinkDevice({ onLinked, move = false, relink = false }: {
   // An address only viewed is never offered a link.
   if (viewOnly) return null;
   // Until the site sends link requests, the way is the app's own Node tab: said in the card's own words, not as a note.
-  if (!phoneFlows && relink) return <p className="activate-note">{t('relink_closed')}</p>;
-  if (!phoneFlows) {
-    return (
-      <div className="activate-card">
-        <h3 className="activate-step">{t('action_link_device')}</h3>
-        <p>{t('devices_link_closed')}</p>
-      </div>
-    );
-  }
+  if (!phoneFlows && relink) return <p className="note">{t('relink_closed')}</p>;
+  if (!phoneFlows) return <ActionBlock title={t('action_link_device')}><p>{t('devices_link_closed')}</p></ActionBlock>;
   if (!choice || !walletHash) return null;
 
   const request = (asQr: boolean): LinkDeviceRequest => ({ burnTx: null, walletHash, check: asQr && !isHeldWallet(choice) });
@@ -73,14 +69,13 @@ export default function LinkDevice({ onLinked, move = false, relink = false }: {
 
   const body = (
     <>
-      <p className="activate-note">{t(relink ? 'relink_lead' : move ? 'devices_move_lead' : 'devices_link_lead')}</p>
+      <p>{t(relink ? 'relink_lead' : move ? 'devices_move_lead' : 'devices_link_lead')}</p>
       {!active || active.state.phase === 'idle' ? (
-        <button type="button" className="qnet-button activate-primary" onClick={ask} disabled={!device}>{t(label)}</button>
+        <div className="cab-next-act"><Action kind="solid" onClick={ask} disabled={!device}>{t(label)}</Action></div>
       ) : done ? (
         <>
-          <p className="activate-note" role="status">{t(answerKey(done.answer))}</p>
-          {checked && <p className="activate-code">{t('devices_check', { number: formatCheckNumber(done.checkNumber) })}</p>}
-          <button type="button" className="qnet-button secondary" onClick={active.cancel}>{t('start_again')}</button>
+          <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{t(answerKey(done.answer))}</Answered>
+          {checked && <p className="cab-check-number">{t('devices_check', { number: formatCheckNumber(done.checkNumber) })}</p>}
         </>
       ) : (
         <LinkWaiting
@@ -94,11 +89,6 @@ export default function LinkDevice({ onLinked, move = false, relink = false }: {
       )}
     </>
   );
-  if (relink) return <div className="cabinet-choice">{body}</div>;
-  return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t(title)}</h3>
-      {body}
-    </div>
-  );
+  if (relink) return <div className="cab-next">{body}</div>;
+  return <ActionBlock title={t(title)}>{body}</ActionBlock>;
 }

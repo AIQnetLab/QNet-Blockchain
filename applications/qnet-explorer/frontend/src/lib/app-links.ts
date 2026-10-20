@@ -1,5 +1,5 @@
-// Which apps may open https://link.aiqnet.io/l links (QNet Link v1, docs/protocols/qnet-link-v1.md
-// section 4): the Android Digital Asset Links statement and the iOS apple-app-site-association file,
+// Which apps may open https://link.aiqnet.io/l and /send links (QNet Link v1, docs/protocols/qnet-link-v1.md
+// sections 4 and 15): the Android Digital Asset Links statement and the iOS apple-app-site-association file,
 // both served from /.well-known on link.aiqnet.io (and on aiqnet.io, where nothing claims them). An app
 // whose signing identity is not known yet is left out, never guessed: `npm run check:release` fails
 // until every value below is set.
@@ -15,17 +15,25 @@ export const ANDROID_PLAY_PACKAGE = 'io.aiqnet.wallet';
 // The live Google Play listing of that package (owner, 05.10: accepted into the store).
 export const ANDROID_PLAY_URL = `https://play.google.com/store/apps/details?id=${ANDROID_PLAY_PACKAGE}`;
 // The iOS app's store listing (https://apps.apple.com/app/id<numeric app id>) once it is published; until then null, and
-// the footer shows the badge without a link (owner, 12.10: a badge never opens a placeholder). Setting it turns that
-// badge into the link.
+// the footer shows the badge without a link, with a TestFlight link beside it (owner, 12.10: a badge never opens a
+// placeholder). Setting it turns that badge into the link.
 export const IOS_APP_STORE_URL: string | null = null;
+// The public TestFlight group, where iPhone and iPad install the app until the App Store listing is live.
+export const IOS_TESTFLIGHT_URL = 'https://testflight.apple.com/join/EeBbs439';
+// Where an iPhone or iPad installs the app now: the App Store listing once it exists, else TestFlight.
+export const IOS_INSTALL_URL: string = IOS_APP_STORE_URL ?? IOS_TESTFLIGHT_URL;
+// The one link to print as a QR code: /get sends each device to its own store (src/app/get/route.ts).
+export const GET_APP_URL = 'https://aiqnet.io/get?from=qr';
 export const ANDROID_PLAY_CERT_SHA256: string | null = '2A:A5:A0:B0:40:DD:D2:50:3A:EA:28:BC:AC:8D:47:89:24:7D:8A:E4:7A:20:B4:9B:6A:C6:B1:E1:BE:7D:D0:4A';
 
 // iOS: the Apple Developer Team ID of Orrery Group LLC.
 export const IOS_TEAM_ID: string | null = '33H36C42XS';
 export const IOS_BUNDLE_ID = 'com.qnetmobile';
 
-// The only path the apps handle; the data is in the fragment.
+// The only paths the apps handle, the data in the fragment: QNet Link requests and transfer links. The Android
+// statement names no path (the app's own verified filter lists them); the iOS file lists both.
 export const LINK_PATH = '/l';
+export const TRANSFER_PATH = '/send';
 
 export const isFingerprint = (value: unknown): value is string => typeof value === 'string' && FINGERPRINT_RE.test(value);
 export const isTeamId = (value: unknown): value is string => typeof value === 'string' && TEAM_ID_RE.test(value);
@@ -48,7 +56,10 @@ export function assetLinks(apps: AndroidApp[] = [
 
 export function appleAppSiteAssociation(teamId: string | null = IOS_TEAM_ID, bundleId: string = IOS_BUNDLE_ID): object {
   const details = isTeamId(teamId)
-    ? [{ appIDs: [`${teamId}.${bundleId}`], components: [{ '/': LINK_PATH, comment: 'QNet Link v1 requests' }] }]
+    ? [{
+      appIDs: [`${teamId}.${bundleId}`],
+      components: [{ '/': LINK_PATH, comment: 'QNet Link v1 requests' }, { '/': TRANSFER_PATH, comment: 'QNet Wallet transfer links' }],
+    }]
     : [];
   return { applinks: { details } };
 }

@@ -88,7 +88,7 @@ describe('B1: Lock Wallet', () => {
     const ws = read('src/screens/WalletScreen.js');
     const from = ws.indexOf("{t('danger_zone')}");
     const button = ws.slice(from, ws.indexOf("{t('delete_wallet')}", from));
-    expect(button).toMatch(/onPress=\{\(\) => lockSession\(\)\}\s*>\s*<Text style=\{\[styles\.actionButtonText, \{color: '#ff4444'\}\]\}>\{t\('lock_wallet'\)\}<\/Text>\s*<\/TouchableOpacity>/);
+    expect(button).toMatch(/<LinkRow title=\{t\('lock_wallet'\)\} onPress=\{\(\) => lockSession\(\)\} \/>/);
     expect(button).not.toMatch(/showAlert/);
   });
 });

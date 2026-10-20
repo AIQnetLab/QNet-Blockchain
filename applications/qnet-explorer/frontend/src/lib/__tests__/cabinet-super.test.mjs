@@ -2,7 +2,7 @@
 // public image, no build on the server; the provider's firewall; the phrase in a root-only file typed with no shell
 // history; the server's public IPv4, which the node writes on the network at registration; absolute paths; the check,
 // the failures it names, a new release and the timeline), and its status: registered, online and outside the network's
-// admission (as the node names it, else outside the eligible set) reads "Registered, waiting for network admission", not
+// admission (as the node names it, else outside the eligible set) reads "Registered, not admitted to consensus yet", not
 // Offline (a silent one reads Offline); the eligible set as the newest certified macroblock's proof carries it; the pace
 // this epoch and the heights. Run: npm run test:wallet
 
@@ -109,7 +109,7 @@ test('the server steps: the public image, the provider\'s firewall, the phrase t
   }
   assert.match(repo('development/qnet-integration/src/node/lifecycle.rs'), /const MIN_RAM_SERVER_MB: u64 = 4_000;/);
   // The node id the log names, shown with the steps once known.
-  assert.match(steps, /\{nodeId && <p className="activate-note">\{t\('super_step_node_id', \{ id: nodeId \}\)\}<\/p>\}/);
+  assert.match(steps, /\{nodeId && <p className="note">\{t\('super_step_node_id', \{ id: nodeId \}\)\}<\/p>\}/);
   assert.match(code('components/cabinet/NodeDetails.tsx'), /<SuperNext code=\{facts\.code\} burnTx=\{facts\.burnTx\} burnAmount=\{facts\.amount\} nodeId=\{nodeId\} \/>/);
 });
 
@@ -179,33 +179,37 @@ test('the eligible set: the newest certified macroblock\'s, from its proof, kept
   assert.match(src, /if \(!budget\('readKnown', url\)\) return null;/);
 });
 
-test('the status rows: waiting for network admission instead of Offline, the pace this epoch, the heights', () => {
+test('the status rows: not admitted to consensus yet instead of Offline, the pace this epoch, the heights', async () => {
   const rows = code('components/cabinet/NodeStatus.tsx');
   const sup = rows.slice(rows.indexOf('export function SuperRows('));
+  assert.match(rows, /export function superBadge\(status: SuperStatusView\): Badge \{\s*const state = superState\(status\);\s*if \(state === 'waiting'\) return \{ tone: 'quiet', word: 'badge_waiting', text: 'super_waiting' \};/);
   assert.match(sup, /const state = superState\(status\);/);
-  assert.match(sup, /state === 'waiting' \? \{ tone: 'waiting', badge: 'badge_waiting', text: 'super_waiting' \} as const/);
   // The note says why: the node's own admission (its epochs add nothing until it is admitted), else the eligible set.
-  assert.match(sup, /\{state === 'waiting' && <p className="activate-note">\{t\(status\.admission === 'waiting' \? 'super_waiting_note' : 'super_waiting_set_note'\)\}<\/p>\}/);
-  assert.match(sup, /\{status\.onPace !== null && <p>\{t\(status\.onPace \? 'super_on_pace' : 'super_behind'\)\}<\/p>\}/);
-  assert.match(sup, /behind <= SERVER_SYNC_BLOCKS \? t\('super_height_synced'/);
-  assert.match(sup, /return network === null \? null : <p>\{t\('super_height_network', \{ height: number\(network\) \}\)\}<\/p>;/);
-  // A last-seen time older than half a day names its day.
-  assert.match(rows, /function pastTime\(ms: number\): string \{\s*return Date\.now\(\) - ms < 12 \* 3_600_000 \? TIME\.format\(ms\) : DAY_TIME\.format\(ms\);/);
-  assert.match(sup, /t\('super_last_seen', \{ time: pastTime\(status\.lastSeenAt\) \}\)/);
+  assert.match(sup, /\{state === 'waiting' && <p className="note">\{t\(status\.admission === 'waiting' \? 'super_waiting_note' : 'super_waiting_set_note'\)\}<\/p>\}/);
+  assert.match(sup, /\{status\.onPace !== null && <Fact label=\{t\('super_pace_label'\)\}>\{t\(status\.onPace \? 'super_on_pace' : 'super_behind'\)\}<\/Fact>\}/);
+  // Each height is a link to its block.
+  assert.match(sup, /behind <= SERVER_SYNC_BLOCKS \? rich\('super_height_synced', \{ height \}\)/);
+  assert.match(sup, /return network === null \? null : <Fact label=\{t\('super_height_label'\)\}>\{rich\('super_height_network', \{ height: <EntityLink kind="block" value=\{network\} \/> \}\)\}<\/Fact>;/);
+  // A last-seen time older than half a day names its day (format.ts clockAgo, the site's one clock).
+  assert.match(sup, /\{status\.lastSeenAt === null \? t\('super_not_known'\) : clockAgo\(status\.lastSeenAt, Date\.now\(\)\)\}/);
+  const { clockAgo } = await import('../format.ts');
+  const now = Date.UTC(2026, 9, 19, 12, 0);
+  assert.match(clockAgo(now - 3_600_000, now), /^\d\d:\d\d$/);
+  assert.match(clockAgo(now - 13 * 3_600_000, now), /^[A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
   assert.equal(SERVER_SYNC_BLOCKS, 5);
-  assert.equal(TEXTS.super_waiting, 'Registered, waiting for network admission');
-  assert.match(TEXTS.super_waiting_note, /has not admitted it yet: until it does, its epochs add nothing to the node balance and show as not admitted\./);
+  assert.equal(TEXTS.super_waiting, 'Registered, not admitted to consensus yet');
+  assert.match(TEXTS.super_waiting_note, /has not admitted it to consensus yet: until it does, its epochs add nothing to the node balance and show as not admitted\./);
   assert.match(TEXTS.super_waiting_set_note, /does not have it among the nodes that confirm its blocks yet\./);
   for (const key of ['super_waiting_note', 'super_waiting_set_note']) assert.match(TEXTS[key], /Its node balance stays this wallet's to move\.$/);
   // Not registered yet: said so on the Overview and the Device tab, and that the network sees the server when it does;
   // the burned super node's steps say it too.
-  assert.match(code('components/cabinet/NodeHome.tsx'), /\{status\.registered \? <SuperRows status=\{status\} \/> : <p>\{t\(status\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\}/);
+  assert.match(code('components/cabinet/NodeHome.tsx'), /\{status\.registered \? <SuperFacts status=\{status\} \/> : <p>\{t\(status\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\}/);
   assert.match(code('components/cabinet/NodeDevices.tsx'), /\(state\.value\.registered \? <SuperRows status=\{state\.value\} \/> : <p>\{t\(state\.value\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\)/);
-  assert.match(code('components/cabinet/NextSteps.tsx'), /\{view\.superConnected && <p className="activate-status" role="status">\{t\('super_connected'\)\}<\/p>\}/);
+  assert.match(code('components/cabinet/NextSteps.tsx'), /\{view\.superConnected && <Answered>\{t\('super_connected'\)\}<\/Answered>\}/);
   // The node balance stays on the Overview for every registered super node, waiting or not, with Move to wallet for the
   // wallet's own super node (owner, 12.10).
   const home = code('components/cabinet/NodeHome.tsx');
   const overview = home.slice(home.indexOf('function SuperOverview('), home.indexOf('function Overview('));
-  assert.match(overview, /<BalanceRow status=\{status\} \/>\s*<Earned nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\} \/>\s*<p className="activate-note">\{t\('balance_lead'\)\}<\/p>/);
+  assert.match(overview, /<Balance nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\}>/);
   assert.match(overview, /<Move\s+qnet=\{choice\.qnet\}\s+nodeId=\{nodeId\}/);
 });

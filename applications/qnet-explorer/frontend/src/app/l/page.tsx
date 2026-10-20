@@ -16,23 +16,26 @@ export const metadata: Metadata = { title: pageTitle('l_title'), robots: { index
 export default function LinkPage() {
   const nodePage = <a href={`${SITE_ORIGIN}/node`}>aiqnet.io/node</a>;
   return (
-    <div className="page-link">
-      <section className="explorer-section activate-page" data-section="link">
-        <div className="explorer-header">
-          <h2 className="section-title">{t('l_title')}</h2>
-          <p className="section-subtitle">{t('l_subtitle')}</p>
+    <div className="pg pg-bare">
+      {/* The title band without the field: these pages render alone, with no script of the site's around them. */}
+      <div className="page-head">
+        <div className="wrap page-head-in">
+          <h1 className="page-title">{t('l_title')}</h1>
+          <p className="lead">{t('l_subtitle')}</p>
         </div>
+      </div>
+      <div className="wrap pg-body">
         <LinkButtons lead={t('l_button_lead')} button={t('link_open_app')} note={t('l_button_note')} />
-        <div className="activate-card">
+        <div className="prose">
           <p>{t('l_lead')}</p>
-          <ul className="activate-facts">
+          <ul>
             <li>{rich('l_reason_missing', { walletPage: <a href={`${SITE_ORIGIN}/wallet`}>{t('l_wallet_page')}</a>, nodePage })}</li>
             <li>{rich('l_reason_update', { nodePage })}</li>
             <li>{t('l_reason_embedded')}</li>
           </ul>
-          <p className="activate-note">{t('l_only_yours')}</p>
+          <p className="note">{t('l_only_yours')}</p>
         </div>
-      </section>
+      </div>
     </div>
   );
 }

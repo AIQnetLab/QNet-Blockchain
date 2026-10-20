@@ -216,7 +216,7 @@ test('the extension doc and the protocol describe its burn search, NO_WALLET and
   const releaseNotes = browserDoc.slice(browserDoc.indexOf('## Store release notes'), browserDoc.indexOf('## Languages'));
   assert.match(moveParagraph, /^- \*\*A wallet of the earlier version\.\*\* The store's 2\.1\.x kept its wallet/);
   assert.match(moveParagraph, /the worker takes only the wallet's recovery phrase, never the keys stored beside it/);
-  assert.match(releaseNotes, /^## Store release notes 3\.1\.2: the first screen offers \*\*Create a new wallet\*\*[\s\S]* 3\.1\.0: a wallet created in version 2\.1 moves into this version\./);
+  assert.match(releaseNotes, /^## Store release notes 3\.1\.6: a copied recovery phrase, private key or activation code leaves the clipboard on time also after the popup closes[\s\S]* Deleting or resetting the wallet keeps a wallet of version 2\.1 that is still in the browser[\s\S]* 3\.1\.2: the first screen offers \*\*Create a new wallet\*\*[\s\S]* 3\.1\.0: a wallet created in version 2\.1 moves into this version\./);
   assert.doesNotMatch(browserDoc.replace(moveParagraph, '').replace(releaseNotes, ''), /2\.1\.x|version 2\.1\b/);
   assert.doesNotMatch(extActivation, /earlier\.js|previousAddress|readEarlierWallet/);
   assert.match(extActivation, /if \(scan\.canonical\) return \{ status: 'exists', activation: await storeCanonical\(scan\.canonical, owner\) \};/);
@@ -240,7 +240,7 @@ test('the docs and the site say that a node takes the phrase only in its canonic
   // The cabinet's super-node next step (components/cabinet/NextSteps.tsx SuperNext, text in src/lib/texts.ts).
   const site = flat(read('applications/qnet-explorer/frontend/src/lib/texts.ts'));
   assert.match(site, /Write the phrase as its words in lowercase, on one line, separated by single spaces\. The node uses the text as written and does not check it/);
-  assert.match(read('applications/qnet-explorer/frontend/src/components/cabinet/NextSteps.tsx'), /<p className="activate-note">\{t\('ext_super_spelling'\)\}<\/p>/);
+  assert.match(read('applications/qnet-explorer/frontend/src/components/cabinet/NextSteps.tsx'), /<p className="note">\{t\('ext_super_spelling'\)\}<\/p>/);
 });
 
 // R5-XPD-03: the extension's public document contradicted the shipped code: content scripts on www. and

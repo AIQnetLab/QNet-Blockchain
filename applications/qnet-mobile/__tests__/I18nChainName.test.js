@@ -62,10 +62,10 @@ describe('the chain\'s name', () => {
 
   it('the screens write it from one place, never as a bare QNet', () => {
     const ws = read('src/screens/WalletScreen.js');
-    expect(ws).toMatch(/>\{CHAIN_NAME\}<\/Text>/);
-    expect(ws).toMatch(/\[\['qnet', CHAIN_NAME\], \['solana', 'Solana'\]\]/);
+    // The QNet Blockchain | Solana switch of Assets and of History.
+    expect(ws.match(/items=\{\[\{ key: 'qnet', label: CHAIN_NAME \}, \{ key: 'solana', label: 'Solana' \}\]\}/g)).toHaveLength(2);
     expect(ws).toMatch(/network: isQnetSend \? CHAIN_NAME : 'Solana'/);
-    expect(ws).toMatch(/subtitle=\{`\$\{CHAIN_NAME\} testnet · \$\{t\('solana_devnet'\)\}`\}/);
+    expect(ws).toMatch(/note=\{`\$\{CHAIN_NAME\} testnet · \$\{t\('solana_devnet'\)\}`\}/);
     for (const file of ['src/screens/WalletScreen.js', 'src/screens/NodeTab.js', 'src/screens/HistoryTab.js',
       'src/screens/QNetLinkScreen.js', 'src/screens/SolanaSend.js', 'src/components/SendReview.js',
       'src/components/TxResultCard.js', 'src/components/QrScanSheet.js', 'src/browser/BrowserScreen.js',

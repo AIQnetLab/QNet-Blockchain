@@ -266,7 +266,7 @@ describe('A1: the lock screen', () => {
 
   it('no erase choice next to Unlock; a small "Forgot?" link opens its own confirmation, never under the system prompt', () => {
     expect(lock).not.toMatch(/erase_and_restore/);
-    expect(lock).toMatch(/\{deviceAuth && unlockPrompting \? null : \(\s*<TouchableOpacity\s+style=\{styles\.lockForgot\}\s+onPress=\{\(\) => \{ setEraseText\(''\); setShowEraseConfirm\(true\); \}\}/);
+    expect(lock).toMatch(/\{deviceAuth && unlockPrompting \? null : \(\s*<Action\s+kind="quiet"\s+align="center"\s+label=\{t\('unlock_forgot_reset'\)\}\s+onPress=\{\(\) => \{ setEraseText\(''\); setShowEraseConfirm\(true\); \}\}/);
     expect(lock).toMatch(/\{unlockPrompting \? null : \(/);
     expect(t('unlock_forgot_reset')).toBe('Forgot? Reset the wallet');
   });
@@ -285,7 +285,7 @@ describe('A4: History', () => {
   const OTHER = 'e'.repeat(45);
   const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string').join(''));
 
-  it('amounts are written compactly, never longer than 11 characters, and never cut', () => {
+  it('amounts are written in the one amount format with few decimals, never a suffix, and never cut', () => {
     expect(H.compactAmount(0)).toBe('0');
     expect(H.compactAmount(1.5)).toBe('1.5');
     expect(H.compactAmount(12.345678)).toBe('12.3457');
@@ -294,12 +294,12 @@ describe('A4: History', () => {
     expect(H.compactAmount(98765.4321)).toBe('98,765.43');
     expect(H.compactAmount(999.12341)).toBe('999.1234');
     expect(H.compactAmount(1234.5)).toBe('1,234.5');
-    expect(H.compactAmount(123456.7)).toBe('123.46K');
-    expect(H.compactAmount(1234567.12345)).toBe('1.23M');
-    expect(H.compactAmount(9007199254.740993)).toBe('9.01B');
-    expect(H.compactAmount(4.2e15)).toBe('4200T');
-    expect(H.compactDecimalText('1,234,567.891234')).toBe('1.23M');
-    for (const n of [0.12345678, 1e-9, 99999.9999, 123456789012.345, 1e18]) expect(H.compactAmount(n).length).toBeLessThanOrEqual(11);
+    expect(H.compactAmount(123456.7)).toBe('123,456.7');
+    expect(H.compactAmount(1234567.12345)).toBe('1,234,567');
+    expect(H.compactAmount(9007199254.740993)).toBe('9,007,199,255');
+    expect(H.compactAmount(4.2e15)).toBe('4,200,000,000,000,000');
+    expect(H.compactDecimalText('1,234,567.891234')).toBe('1,234,568');
+    for (const n of [0.12345678, 1e-9, 99999.9999, 123456789012.345, 1e18]) expect(H.compactAmount(n)).not.toMatch(/[KMBTe]/);
   });
 
   it('a row: what happened over its status and whom with, and the amount; the number never shrinks, only the symbol may', async () => {
@@ -308,18 +308,19 @@ describe('A4: History', () => {
     let tree;
     await act(async () => { tree = renderer.create(<H.HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={onOpen} />); });
     const shown = texts(tree);
-    expect(shown).toEqual(expect.arrayContaining([t('hist_sent'), '−1.23M', ' QNC', t('hist_status_pending')]));
-    const amount = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === '−1.23M');
+    expect(shown).toEqual(expect.arrayContaining([t('hist_sent'), '−1,234,567', ' QNC', t('hist_status_pending')]));
+    const amount = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === '−1,234,567');
     expect(amount.props.numberOfLines).toBe(1);
     expect(amount.props.adjustsFontSizeToFit).toBeFalsy();
     const symbol = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === ' QNC');
     expect(symbol.props.ellipsizeMode).toBe('tail');
-    await act(async () => { tree.root.findByType(TouchableOpacity).props.onPress(); });
+    await act(async () => { tree.root.find((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function').props.onPress(); });
     expect(onOpen).toHaveBeenCalledWith(tx);
-    // A Solana send carries its token's own icon; a confirmed row shows no status line.
+    // A Solana send is named by its symbol (no icon); a confirmed row shows no status line.
     const sol = { hash: 's'.repeat(88), chain: 'solana', from: 'a', to: 'b', solSymbol: 'SOL', solAmount: '0.5', solFee: '0.000005', status: 'confirmed', timestamp: 1, type: 'send' };
     await act(async () => { tree.update(<H.HistoryRow tx={sol} t={t} hideAmounts={false} onOpen={onOpen} />); });
-    expect(tree.root.findAll((n) => n.props && n.props.source && n.props.source.uri === require('../src/components/TokenIcons').tokenIconUri('SOL'))).not.toHaveLength(0);
+    expect(tree.root.findAll((n) => n.props && n.props.source)).toHaveLength(0);
+    expect(texts(tree)).toEqual(expect.arrayContaining(['−0.5', ' SOL']));
     expect(texts(tree)).not.toContain(t('hist_status_confirmed'));
   });
 
@@ -360,8 +361,8 @@ describe('A4: History', () => {
   it('the tab: the same QNet · Solana selector as Assets, no filter chips', () => {
     const ws = read('src/screens/WalletScreen.js');
     const tab = ws.slice(ws.indexOf("      case 'history': {"), ws.indexOf("      case 'node': {"));
-    expect(tab).toMatch(/\[\['qnet', CHAIN_NAME\], \['solana', 'Solana'\]\]\.map/);
-    expect(tab).toMatch(/onPress=\{\(\) => setSelectedNetwork\(key\)\}/);
+    expect(tab).toMatch(/<Tabs\s+items=\{\[\{ key: 'qnet', label: CHAIN_NAME \}, \{ key: 'solana', label: 'Solana' \}\]\}/);
+    expect(tab).toMatch(/onChange=\{setSelectedNetwork\}/);
     expect(tab).not.toMatch(/historyChip|assetChips|matchesAsset/);
     // One row per transaction under a header for its day (06.10).
     expect(tab).toMatch(/const listed = historySections\(historyEntries\(onQnet/);

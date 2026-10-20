@@ -1,7 +1,7 @@
-'use client';
+// The documentation is kept in the repository next to the code it describes; every row opens the current version of
+// one document there. A server component: the list never changes in the browser.
 
-// The documentation is kept in the repository next to the code it describes; every card opens the
-// current version of one document there.
+import PageHead from '@/components/ui/PageHead';
 
 const DOCS = 'https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/docs';
 
@@ -60,42 +60,39 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
   },
 ];
 
+const WHITEPAPER = 'https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/QNet_Whitepaper.md';
+
+function DocRow({ href, name, what }: { href: string; name: string; what: string }) {
+  return (
+    <li>
+      <a className="rowlink" href={href} target="_blank" rel="noopener noreferrer">
+        <span className="rowlink-n">{name}</span>
+        <span className="rowlink-d">{what}</span>
+      </a>
+    </li>
+  );
+}
+
 export default function DocsPage() {
   return (
-    <div className="page-docs">
-      <section className="explorer-section" data-section="docs">
-        <div className="explorer-header">
-          <h2 className="section-title">Documentation</h2>
-          <p className="section-subtitle">
-            Kept in the repository next to the code it describes — each card opens the current version
-          </p>
-        </div>
-
+    <div className="pg">
+      <PageHead title="Documentation" lead="Kept in the repository next to the code it describes. Each row opens the current version on GitHub." />
+      <div className="wrap pg-body">
         {SECTIONS.map((s) => (
-          <div key={s.title} style={{ marginBottom: '2.5rem' }}>
-            <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>{s.title}</h3>
-            <div className="tools-grid-large">
-              {s.items.map((d) => (
-                <a
-                  key={d.path}
-                  className="tool-card-large"
-                  href={`${DOCS}/${d.path}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{ display: 'block', textDecoration: 'none' }}
-                >
-                  <h4>{d.name}</h4>
-                  <p>{d.what}</p>
-                </a>
-              ))}
-            </div>
-          </div>
+          <section key={s.title} className="doc-sec">
+            <h2>{s.title}</h2>
+            <ul className="rowlinks">
+              {s.items.map((d) => <DocRow key={d.path} href={`${DOCS}/${d.path}`} name={d.name} what={d.what} />)}
+            </ul>
+          </section>
         ))}
-
-        <p style={{ textAlign: 'center', opacity: 0.7, fontSize: '0.9rem' }}>
-          The whitepaper is at the repository root: <a href="https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/QNet_Whitepaper.md" target="_blank" rel="noopener noreferrer">QNet_Whitepaper.md</a>
-        </p>
-      </section>
+        <section className="doc-sec">
+          <h2>Whitepaper</h2>
+          <ul className="rowlinks">
+            <DocRow href={WHITEPAPER} name="QNet_Whitepaper.md" what="The whitepaper, at the repository root." />
+          </ul>
+        </section>
+      </div>
     </div>
   );
 }

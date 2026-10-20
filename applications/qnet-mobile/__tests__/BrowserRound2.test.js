@@ -91,7 +91,7 @@ describe('MBR2-01: a new document of the same origin is a new page', () => {
           t: (k) => k, onSheet: (s) => sheets.push(s), confirmAction: () => {},
         }));
       });
-      const bookmark = tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function');
+      const bookmark = tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function')[0];
       await act(async () => { bookmark.props.onPress(); });
       const web = () => tree.root.findByType(WebView).props;
       await act(async () => { web().onNavigationStateChange({ url: `${SITE}/pay`, title: 'Pay', loading: false }); });

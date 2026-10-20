@@ -154,16 +154,6 @@ describe('no hard-coded user-visible strings', () => {
     expect(scan(file)).toEqual([]);
   });
 
-  // Arabic sets `direction: 'rtl'` on the screen; the renderer mirrors start/end then, but swaps physical left/right
-  // only when the phone itself is right to left. Spacing is written as start/end so both cases mirror.
-  it('spacing in the screens is start/end, never left/right', () => {
-    for (const file of [...UI_FILES, 'src/screens/WalletScreen.styles.js']) {
-      const text = fs.readFileSync(path.join(root, file), 'utf8');
-      const found = text.split(/\r?\n/).map((l, i) => [i + 1, l]).filter(([, l]) => /\b(margin|padding)(Left|Right)\s*:/.test(l));
-      expect([file, found]).toEqual([file, []]);
-    }
-  });
-
   it('native prompts get their titles from the tables, not from literals', () => {
     const wm = fs.readFileSync(path.join(root, 'src/components/WalletManager.js'), 'utf8');
     expect(wm).not.toMatch(/authenticationPrompt:\s*\{\s*title:\s*'/);

@@ -81,8 +81,8 @@ describe('the flows', () => {
       expect([file, bottomTabs.includes(tab), flow(file).includes(`id: "tab-${tab}"`)]).toEqual([file, true, true]);
     }
     // Send and Receive open from Assets, and each returns there.
-    expect(flow('send.yaml')).toMatch(/id: "assets-send"[\s\S]*shot\/02-send[\s\S]*tapOn: "\.\*Back"\s*$/);
-    expect(flow('receive.yaml')).toMatch(/tapOn: "Receive"[\s\S]*shot\/03-receive[\s\S]*tapOn: "\.\*Back"\s*$/);
+    expect(flow('send.yaml')).toMatch(/id: "assets-send"[\s\S]*shot\/02-send[\s\S]*tapOn: "\(\?i\)\.\*Back"\s*$/);
+    expect(flow('receive.yaml')).toMatch(/tapOn: "Receive"[\s\S]*shot\/03-receive[\s\S]*tapOn: "\(\?i\)\.\*Back"\s*$/);
     // Settings captures the language list open.
     expect(flow('settings.yaml')).toMatch(/tapOn: "English"[\s\S]*visible: "Русский"[\s\S]*shot\/06-settings/);
     // The send review is captured and cancelled; nothing is ever typed into the app, and the keyboard's return submits
@@ -130,11 +130,11 @@ describe('the flows', () => {
       ['Words: (12|24) ✓', `${en.import_word_count_live.replace('{count}', '12')} ✓`],
       ['I accept the .*', en.terms_accept_template.replace('{terms}', en.terms_of_service)],
       ['Import Wallet', en.import_title],
-      ['To address', en.send_to_address],
+      ['(?i)To address', en.send_to_address],
       ['Enter an EON address', en.send_placeholder_eon],
       ['Check this send', en.send_review_title],
       ['Cancel', en.cancel],
-      ['.*Back', `← ${en.common_back}`],
+      ['(?i).*Back', en.common_back],
       ['Receive', en.assets_receive],
       ['No transactions yet', en.hist_empty],
       ['Checking node status.*', en.node_checking],
@@ -144,14 +144,15 @@ describe('the flows', () => {
       ['Never', en.autolock_never],
       ['Password', en.password],
     ];
+    // A pattern led by (?i) matches in any case (a label or an act, set in capitals); JavaScript takes it as a flag.
     for (const [pattern, shown] of texts) {
-      expect([pattern, new RegExp(`^(?:${pattern})$`, 'is').test(shown)]).toEqual([pattern, true]);
+      expect([pattern, new RegExp(`^(?:${pattern.replace(/^\(\?i\)/, '')})$`, 'is').test(shown)]).toEqual([pattern, true]);
     }
-    // Every text a flow looks for is one of those, or the system's Paste, the 25% button, or the ticked checkbox.
+    // Every text a flow looks for is one of those, or the system's Paste, or the 25% act.
     const screen = read(ROOT, 'src', 'screens', 'WalletScreen.js');
-    expect(screen).toContain('>25%</Text>');
+    expect(screen).toContain("[25, '25%']");
     const used = [...allFlows.matchAll(/(?:tapOn|longPressOn|visible|notVisible|text|leftOf|below|FIELD): "([^"]+)"/g)].map((m) => m[1]);
-    const known = new Set([...texts.map(([p]) => p), 'Paste', '25%', '✓']);
+    const known = new Set([...texts.map(([p]) => p), 'Paste', '25%']);
     expect(used.filter((u) => !known.has(u))).toEqual([]);
     // The QNC row's figure, never its dash.
     const figure = new RegExp(`^(?:${/visible: '([^']+)'/.exec(flow('wallet.yaml'))[1]})$`, 'is');
@@ -160,7 +161,9 @@ describe('the flows', () => {
     // Element ids: the bottom bar's tabs and testIDs the screens set.
     const sources = ['screens/WalletScreen.js', 'screens/HistoryTab.js'].map((f) => read(ROOT, 'src', f)).join('\n');
     for (const id of new Set([...allFlows.matchAll(/id: "([^"]+)"/g)].map((m) => m[1]))) {
-      const found = id.startsWith('tab-') ? bottomTabs.includes(id.slice(4)) : sources.includes(`testID="${id}"`);
+      // An id set on an element, or on an action of a pair (components/ui/Action ActionPair takes its props as an object).
+      const found = id.startsWith('tab-') ? bottomTabs.includes(id.slice(4))
+        : sources.includes(`testID="${id}"`) || sources.includes(`testID: '${id}'`);
       expect([id, found]).toEqual([id, true]);
     }
   });

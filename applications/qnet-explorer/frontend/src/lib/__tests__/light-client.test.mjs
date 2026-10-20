@@ -330,9 +330,9 @@ const testVerify = (message, sigHex, pkHex) => {
   }
 };
 const wireOf = (c) => ({ ...c, sigs: c.sigs.map(([id, name]) => [id, GALC_V.signatures[name]]) });
-// The vectors' K (38960) sits above the pin the release pin was proven from (38944) and below the release pin itself, which
-// refuses it as below_pin: the vector tests judge it against a pin at that older index.
-const VECTOR_PIN = pinAt(WS_CHECKPOINT.provenFrom.index);
+// The vectors' K (38960) sits below the release pin, which refuses it as below_pin: the vector tests judge it against a
+// pin fixed below K, so a refresh of the release pin leaves them alone.
+const VECTOR_PIN = pinAt(38944);
 const VECTOR_RULES = { networkId: GALC_V.networkId, interval: GALC_V.constants.mintInterval, pinIndex: VECTOR_PIN.index, keys: TEST_GENESIS_KEYS };
 
 test('the genesis keys are the node\'s and the wallets\', byte for byte', () => {
@@ -731,13 +731,14 @@ test('the route, the page and explorer.md describe the committee check, and noth
   assert.doesNotMatch(route, /validators\/proof|\/api\/v1\/account\/\$\{address\}`|consensus|nodesAgreed|CONSENSUS_RATIO/);
   assert.match(route, /if \(!r\.verified\) return \{ success: true, verified: false, reason: r\.reason, error: MESSAGES\[r\.reason\] \};/);
   assert.match(route, /verificationMethod: 'committee-certificate',/);
-  const page = readFileSync(new URL('app/explorer/address/[address]/page.tsx', SRC), 'utf8');
+  const page = readFileSync(new URL('app/explorer/address/[address]/AddressClient.tsx', SRC), 'utf8');
   assert.doesNotMatch(page, /Multi-Node Consensus|Nodes Agreed|Multi-node consensus|Cryptographically Verified/);
   assert.match(page, /Verified by the committee certificate/);
   assert.match(page, /if \(data\.success && data\.verified === true && typeof data\.stateRoot === 'string' && typeof data\.balanceNano === 'string' && \/\^\\d\+\$\/\.test\(data\.balanceNano\)\) \{/);
-  // The answer's `balance` stays the canonical decimal; the page groups the exact nano QNC as English writes it.
+  // The answer's `balance` stays the canonical decimal; the page groups the exact nano QNC as English writes it (qnc of
+  // src/lib/format.ts, the site's one QNC formatter).
   assert.match(route, /balance: qncText\(r\.balanceNano\),\s*balanceNano: r\.balanceNano,/);
-  assert.match(page, /<span className="detail-value">\{formatQnc\(result\.balanceNano\)\} QNC\{result\.exists \? '' : ' \(no account yet\)'\}<\/span>/);
+  assert.match(page, /<Row label="Proven balance">\{qnc\(result\.balanceNano\)\} QNC\{result\.exists \? '' : ' \(no account yet\)'\}<\/Row>/);
   // A second request for an address under check shares that check; the page's block stays hidden, and the doc says so.
   assert.match(route, /let running = inflight\.get\(address\);\s*if \(!running\) \{\s*running = sharedBalanceProver\(\)\.provenBalance\(address\)\.then\(/);
   assert.match(route, /\}\)\.finally\(\(\) => inflight\.delete\(address\)\);\s*inflight\.set\(address, running\);/);

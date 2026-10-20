@@ -1,10 +1,11 @@
 // What the node cabinet shows of the QNet extension's answers (docs/protocols/qnet-link-v1.md sections 7, 10 and
-// 14.10), as text keys: an activation's heading, lead and error, a failed call, a move of the node balance. The
-// extension answers through the browser itself, so its answer is its own report. Pure; the words are in
-// src/lib/texts.ts.
+// 14.10), as text keys: an activation's heading, lead and error, a failed call, a move of the node balance, a transfer
+// to a payment address. The extension answers through the browser itself, so its answer is its own report. Pure; the
+// words are in src/lib/texts.ts.
 
 import type { MessageKey } from '../texts.ts';
 import type { ActivationAnswer, ActivationErrorCode, ClaimFailure, ExtensionActivation, ExtensionFailure, LinkAnswer, LinkError } from '../qnet-link.ts';
+import type { SolanaTransferResult } from '../qnet-provider.ts';
 
 // What a checked activation answer is, for its heading: an `exists` that names a burn of the device that went
 // through (protocol section 7.1) is 'superseded'.
@@ -40,11 +41,23 @@ export function errorKey(code: ActivationErrorCode): MessageKey {
 
 // A call that threw or answered what the page could not verify. An activation's timeout, failure and
 // unverifiable answer leave a burn possible; a move of the node balance burns nothing; an unlink changes nothing the
-// device rows would not show.
-export function failureKey(failure: ClaimFailure, action: 'activate' | 'claim' | 'unlink'): MessageKey {
+// device rows would not show; a transfer that may have gone shows on the payment address's balance.
+export function failureKey(failure: ClaimFailure, action: 'activate' | 'claim' | 'unlink' | 'transfer'): MessageKey {
   if (failure === 'other_wallet') return action === 'unlink' ? 'unlink_failure_other_wallet' : 'claim_failure_other_wallet';
   if (action !== 'activate' && (failure === 'timeout' || failure === 'failed' || failure === 'unverifiable')) return `${action}_failure_${failure}`;
   return `ext_failure_${failure}`;
+}
+
+// What became of a transfer the page asked the extension for.
+export function transferKey(result: SolanaTransferResult): MessageKey {
+  if (result.ok) return 'transfer_sent';
+  return result.failure === 'short' ? 'transfer_failure_short' : failureKey(result.failure, 'transfer');
+}
+
+// Whether that transfer may still reach the address: sent, or an outcome the page could not learn while the
+// extension's window may still be open. Its button then waits for the balance instead of asking a second time.
+export function transferMayArrive(result: SolanaTransferResult): boolean {
+  return result.ok || result.failure === 'timeout' || result.failure === 'unverifiable' || result.failure === 'disconnected';
 }
 
 // Whether a burn of this wallet may be on its way after an answer: `pending` (sent, not final), and the two errors

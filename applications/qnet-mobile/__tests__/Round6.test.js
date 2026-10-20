@@ -8,7 +8,8 @@
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const fs = require('fs');
 const path = require('path');
@@ -228,8 +229,7 @@ describe('MB-R2-02: the Send form checks what the wallet may still spend, read n
 describe('MB-R2-03: the sheet offers to read an unread balance again', () => {
   const QNET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
   const TO = '02dca74ef2eae3be97feon499504db891ae0c60e364a8';
-  const labels = (tree) => tree.root.findAllByType(TouchableOpacity)
-    .map((b) => ({ label: b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join(''), props: b.props }));
+  const labels = (tree) => tree.root.findAllByType(Action).map((b) => ({ label: b.props.label, props: b.props }));
 
   it('a preview without the balance shows Try again, which reads it again; Reject stays a rejection', async () => {
     const actions = { approve: jest.fn(), reject: jest.fn(), dismiss: jest.fn(), loadPreview: jest.fn() };

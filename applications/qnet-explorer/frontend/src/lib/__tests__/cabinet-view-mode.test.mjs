@@ -50,7 +50,7 @@ test('a view never sets the connected state: no connected wallet, read only, and
   // The provider and the header read the one rule; the header shows only the connected wallet.
   const provider = code('components/cabinet/CabinetProvider.tsx');
   assert.match(provider, /const \{ taken, connected, current, viewOnly \} = useMemo\(\s*\(\) => shownWallet\(choice, viewing, loaded \? channel : null, accounts, disconnected\),/);
-  assert.match(provider, /return shownWallet\(kept\.choice, kept\.viewing, channel, accounts, kept\.disconnected\)\.connected\?\.qnet \?\? null;/);
+  assert.match(provider, /return shownWallet\(kept\.choice, kept\.viewing, channel, accounts, kept\.disconnected\)\.connected \?\? null;/);
   // The extension's activation is asked, and kept answers read, for a connected wallet only.
   assert.match(provider, /const applies = channel === 'extension' && connected !== null && \(connected\.source === 'extension' \|\| accounts\?\.qnet === connected\.qnet\);/);
   assert.match(provider, /const kept = connected \? activations\[connected\.qnet\] \?\? null : null;/);
@@ -92,13 +92,17 @@ test('the view is kept for this tab apart from the wallet, and a wallet connecte
 
 test('the page while viewing: the line that it is viewed read only with Stop viewing, no progress, no wallet card, no Activate', () => {
   const frame = code('components/cabinet/CabinetFrame.tsx');
-  assert.match(frame, /\{viewOnly \? <ViewingCard qnet=\{choice\.qnet\} \/> : \(\s*<>\s*<CabinetProgress connected view=\{view\} \/>\s*<WalletCard choice=\{choice\} \/>/);
-  const viewing = frame.slice(frame.indexOf('function ViewingCard('), frame.indexOf('function Dashboard('));
-  assert.match(viewing, /\{t\('view_line', \{ wallet: shortAddress\(qnet\) \}\)\}/);
-  assert.match(viewing, /onClick=\{stopViewing\}>\{t\('view_stop'\)\}/);
+  // A view: its note, and no journey; the wallet itself (address, Copy, Disconnect) is the header's account menu, never
+  // the page's.
+  assert.match(frame, /\{viewOnly && <p className="note cab-lead-note">\{t\('view_note'\)\}<\/p>\}/);
+  assert.match(frame, /\{!viewOnly && showJourney\(tab, true, view\) && <CabinetProgress connected view=\{view\} \/>\}/);
+  assert.doesNotMatch(frame, /WalletCard|ViewingCard|forget|disconnect|SOURCE_TEXT/);
+  // The rail's head says the address is viewed read only, with Stop viewing, in place of the node's line.
+  const nav = code('components/cabinet/CabinetNav.tsx');
+  const viewing = nav.slice(nav.indexOf('if (viewOnly && wallet) {'), nav.indexOf('const none ='));
+  assert.match(viewing, /<p className="cab-id-line" role="status">\{rich\('view_line', \{ wallet: <EntityLink kind="address" value=\{wallet\} \/> \}\)\}<\/p>/);
+  assert.match(viewing, /<Action kind="quiet" onClick=\{stopViewing\}>\{t\('view_stop'\)\}<\/Action>/);
   assert.doesNotMatch(viewing, /forget|disconnect|wallet_label|SOURCE_TEXT|CabinetProgress/);
-  // The wallet card is a connected wallet's only.
-  assert.match(frame, /function WalletCard\(\{ choice \}: \{ choice: WalletChoice \}\) \{[\s\S]*?if \(choice\.source === 'entered'\) return null;/);
   // No Activate section for a view, except on its own page.
   for (const state of ['none', 'node', null]) assert.deepEqual(visibleTabs(state, true, 'overview', true), TABS.filter((t) => t !== 'activate'), String(state));
   assert.deepEqual(visibleTabs('none', false, 'overview', false), [...TABS], 'a connected wallet keeps it');
@@ -106,8 +110,12 @@ test('the page while viewing: the line that it is viewed read only with Stop vie
   // offers Connect wallet, which ends the view so that the connect card shows; connecting the extension from there ends
   // it as any tap does.
   const button = code('components/wallet/connect-wallet-button.tsx');
-  assert.match(button, /const held = useHeldWallet\(\);/);
-  assert.match(button, /function toConnect\(event: MouseEvent<HTMLAnchorElement>\) \{\s*endView\(\);\s*const card = document\.getElementById\(CONNECT_ID\);/);
+  assert.match(button, /const choice = useHeldChoice\(\);\s*const held = choice\?\.qnet \?\? null;/);
+  assert.match(button, /function toConnect\(event: MouseEvent<HTMLAnchorElement>, run: \(\) => void\) \{\s*run\(\);\s*const card = document\.getElementById\(CONNECT_ID\);/);
+  // Every way of Connect wallet ends the view first (useConnectWallet).
+  const hook = code('components/wallet/useConnectWallet.ts');
+  assert.match(hook, /const askExtension = useCallback\(\(\) => \{\s*endView\(\);/);
+  assert.match(hook, /else if \(kind === 'app'\) \{\s*endView\(\);\s*askAppConnect\(\);/);
   assert.match(code('components/cabinet/CabinetProvider.tsx'), /export function endView\(\): void \{\s*if \(\(heldHere \?\? storedHeld\(\)\)\.viewing\) hold\(\{ viewing: null \}\);\s*\}/);
 });
 
@@ -167,8 +175,8 @@ test('the device details that are the owner\'s are left out of a view: the route
   // The rows: the network's facts only for a view (no platform, no model, no day it linked, no miss).
   const rows = code('components/cabinet/NodeStatus.tsx');
   assert.match(rows, /const named = viewOnly \? null : device;/);
-  assert.match(rows, /\{full && named && deviceName\(named\) && <p>\{deviceName\(named\)\}<\/p>\}/);
-  assert.match(rows, /\{full && !viewOnly && device\?\.linkedSince != null && /);
+  assert.match(rows, /\{full \? \([\s\S]*?\{named && deviceName\(named\) && <p className="cab-dev-name">\{deviceName\(named\)\}<\/p>\}/);
+  assert.match(rows, /\{!viewOnly && <Readout label=\{t\('device_since'\)\} value=\{device\?\.linkedSince != null \? DAY\.format\(device\.linkedSince \* 1000\) : null\} \/>\}/);
   assert.match(rows, /const missed = !viewOnly && \(state === 'offline' \|\| \(full && state === 'online'\)\);/);
 });
 

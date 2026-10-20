@@ -4,13 +4,18 @@
 const walletStyles = require('../src/screens/WalletScreen.styles').default;
 const { sheetStyles } = require('../src/browser/DappSheet');
 const { linkScreenStyles } = require('../src/screens/QNetLinkScreen');
+const { menuStyles } = require('../src/components/ui/Menu');
+const { layer } = require('../src/theme');
+
+// The prompts and alerts are sheets (components/ui/Sheet) at the alert level, which places them by theme.layer.
+const alertSheet = layer.alert;
 
 const layers = {
   'browser request sheet': sheetStyles.overlay,
   'QNet Link screen': linkScreenStyles.overlay,
-  'password prompt, delete prompt, alerts (modalOverlay)': walletStyles.modalOverlay,
-  'header menu backdrop': walletStyles.menuBackdrop,
-  'header menu': walletStyles.menuCard,
+  'password prompt, delete prompt, alerts (alert sheet)': alertSheet,
+  'header menu backdrop': menuStyles.backdropRoot,
+  'header menu': menuStyles.cardRoot,
 };
 
 it('every root overlay is drawn in the order it is touched', () => {
@@ -25,8 +30,8 @@ it('every root overlay is drawn in the order it is touched', () => {
 
 it('the password prompt and the alerts are above the request sheets in both', () => {
   for (const sheet of [sheetStyles.overlay, linkScreenStyles.overlay]) {
-    expect(walletStyles.modalOverlay.zIndex).toBeGreaterThan(sheet.zIndex);
-    expect(walletStyles.modalOverlay.elevation).toBeGreaterThan(sheet.elevation);
+    expect(alertSheet.zIndex).toBeGreaterThan(sheet.zIndex);
+    expect(alertSheet.elevation).toBeGreaterThan(sheet.elevation);
   }
 });
 
@@ -39,9 +44,12 @@ it('the prompt and the alerts are rendered after the sheets, with the style that
   expect(at.every((i) => i >= 0)).toBe(true);
   expect([...at].sort((x, y) => x - y)).toEqual(at);
   for (const fn of ['const renderFreshPrompt', 'const renderDeletePrompt', 'const renderCustomAlert']) {
-    const body = src.slice(src.indexOf(fn), src.indexOf(fn) + 400);
-    expect([fn, body.includes('styles.modalOverlay')]).toEqual([fn, true]);
+    const body = src.slice(src.indexOf(fn), src.indexOf(fn) + 600);
+    expect([fn, /<Sheet[\s\S]*?level="alert"/.test(body)]).toEqual([fn, true]);
   }
+  // A sheet takes its level's place in both orders.
+  const sheetSrc = require('fs').readFileSync(require('path').join(__dirname, '../src/components/ui/Sheet.js'), 'utf8');
+  expect(sheetSrc).toMatch(/style=\{\[s\.overlay, layer\[level\] \|\| layer\.alert\]\}/);
 });
 
 // MOBLINK-R2-03: a browser sheet opened before a QNet Link request neither covers it nor stays approvable under it.

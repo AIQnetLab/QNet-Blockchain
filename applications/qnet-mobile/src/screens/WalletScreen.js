@@ -3,8 +3,7 @@ import {
   View,
   Text,
   StyleSheet,
-  TouchableOpacity,
-  TextInput,
+  Pressable,
   Alert,
   ScrollView,
   Image,
@@ -15,14 +14,11 @@ import {
   Linking,
   AppState,
   Modal,
-  Animated,
-  Easing,
   Share,
   FlatList,
   KeyboardAvoidingView,
   BackHandler,
   Keyboard,
-  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView, SafeAreaInsetsContext } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -34,6 +30,7 @@ import { DeviceKeyError } from '../crypto/Vault';
 import {
   useSecureScreen, useProtectedInteraction, deviceIntegrity, deviceAuthenticate, screenReaderApps, setNativeTexts, bootClock,
   guardSeedField, pasteboardChangeCount, clearPasteboardIfChanged, clearClipboard, copySecret, SECRET_CLIPBOARD_SECONDS,
+  reloadApp,
 } from '../services/DeviceSecurity';
 import { PASSWORD_INPUT_PROPS, SEED_INPUT_PROPS, CONFIRM_INPUT_PROPS, looksPasted } from '../utils/sensitiveInput';
 import QRCode from 'react-native-qrcode-svg';
@@ -78,8 +75,7 @@ import { LEGACY_MOVE, NEW_APP_PLAY_URL, NEW_APP_SITE_URL } from '../config/legac
 import NodeTab, { keptServerStatus, linkedHere } from './NodeTab';
 import { getRandomGenesisNode, EXPLORER_API, explorerTxUrl, solanaExplorerTxUrl, ONE_DEV_MINT } from '../config/nodes';
 import TxResultCard from '../components/TxResultCard';
-import { FIGURE_LINE, InfoRow, SettingRow, figureFitsIn } from '../components/InfoRow';
-import { tokenIconUri } from '../components/TokenIcons';
+import { FIGURE_LINE, InfoRow, LinkRow, SettingRow, figureFitsIn } from '../components/InfoRow';
 import { DayHeader, HistoryRow, TxDetail, dateTime } from './HistoryTab';
 import {
   txDirection,
@@ -95,7 +91,17 @@ import { GENESIS_WALLETS, genesisWalletMatches } from '../config/genesisWallets'
 import { parseLink, takeInitialUrl } from '../services/QNetLink';
 import QNetLinkScreen from './QNetLinkScreen';
 import BottomBar from '../components/BottomBar';
-import QrScanSheet, { ScanIcon } from '../components/QrScanSheet';
+import Action, { ActionPair, ActionRow } from '../components/ui/Action';
+import Field from '../components/ui/Field';
+import Head from '../components/ui/Head';
+import HexField from '../components/ui/HexField';
+import Menu from '../components/ui/Menu';
+import Sheet from '../components/ui/Sheet';
+import Tabs from '../components/ui/Tabs';
+import CopyGlyph from '../components/ui/CopyGlyph';
+import TokenIcon from '../components/TokenIcons';
+import { Checkbox, Toggle } from '../components/ui/Toggle';
+import QrScanSheet from '../components/QrScanSheet';
 import BrowserScreen, { recipientContext } from '../browser/BrowserScreen';
 import DappSheet, { pendingLine } from '../browser/DappSheet';
 import SendReview, { recipientWarnings } from '../components/SendReview';
@@ -103,7 +109,7 @@ import SolanaSendForm, { cleanAmountInput, useSolanaSends } from './SolanaSend';
 import { SOLANA_TOKENS, solanaHistoryRow, solanaToken } from '../services/SolanaSend';
 import { solanaScanToForm } from '../utils/solanaRequest';
 import { readTransferLink } from '../services/transferLink';
-import { groupAddress } from '../utils/addressDisplay';
+import { addressParts, groupAddress } from '../utils/addressDisplay';
 import { createGrantStore } from '../browser/grants';
 import { describeOrigin, handedOverByBrowser } from '../browser/url';
 import { mergeTokenBalances, optimisticTokenRow, tokenFigureRow } from '../utils/balanceMerge';
@@ -114,9 +120,11 @@ import {
 import { autoSendable, refusalHeals } from '../services/PendingTx';
 import { loadCachedHistory, saveCachedHistory } from '../services/HistoryCache';
 import {
-  LANGUAGES, makeT, isRTL, languageName, isSupported, deviceLanguage, setCurrentLanguage, errorText, CHAIN_NAME,
+  LANGUAGES, LANGUAGE_KEY, makeT, languageName, savedLanguage, setCurrentLanguage, errorText, CHAIN_NAME,
 } from '../i18n';
+import { applyLayoutDirection, layoutLags } from '../i18n/direction';
 import styles from './WalletScreen.styles';
+import { color, setThemeLanguage } from '../theme';
 import logger from '../utils/logger';
 
 // Module-level block height cache, shared across all renders: one height read per 15 s at most, and a read in flight is
@@ -163,11 +171,11 @@ const LINK_FROM_OUTSIDE_MS = 2000;
 const NOTHING_SENT_CODES = ['PENDING_SETTLED', 'PENDING_CHANGED', 'PENDING_CHOICE', 'NONCE_UNKNOWN', 'TOO_MANY_PENDING', 'NONCE_CHANGED',
   'PENDING_UNREADABLE'];
 
-// A full screen keeps clear of the status bar, the notch and the side insets from the safe area on every device (a
-// tablet's status bar, Slide Over and Split View differ from a phone's); the bottom bar keeps clear of the bottom itself.
 // The longest a pull-to-refresh spinner turns (pullRefresh); the read it started may finish later.
 const REFRESH_SPIN_MS = 3_000;
-const SCREEN_EDGES = ['top', 'left', 'right'];
+// A full screen keeps clear of the status bar, the notch, the side insets and the system navigation bar on every device
+// (a tablet's status bar, Slide Over and Split View differ from a phone's), so nothing on it sits under a system bar.
+const SCREEN_EDGES = ['top', 'left', 'right', 'bottom'];
 // The open wallet's screen: its header takes the top inset itself, so its colour fills the status bar's area too.
 const MAIN_EDGES = ['left', 'right'];
 const NO_INSETS = { top: 0, right: 0, bottom: 0, left: 0 };
@@ -214,39 +222,6 @@ const TabBox = React.memo(
     prev.deps.length === next.deps.length &&
     prev.deps.every((v, i) => Object.is(v, next.deps[i]))
 );
-
-// Compact pill toggle: track hugs the knob (28px pill, 22px knob) — same on both platforms.
-// Smoothly-animated pill switch: the knob glides (translateX) and the track color eases between
-// states instead of snapping. Track 46×28, 3px padding, 22px knob ⇒ travel = 46 − 2·3 − 22 = 18px.
-// useNativeDriver:false because the track backgroundColor is interpolated (color isn't native-driven).
-const PillToggle = React.memo(function PillToggle({ value, onValueChange }) {
-  const anim = useRef(new Animated.Value(value ? 1 : 0)).current;
-  useEffect(() => {
-    Animated.timing(anim, {
-      toValue: value ? 1 : 0,
-      duration: 180,
-      easing: Easing.out(Easing.cubic),
-      useNativeDriver: false,
-    }).start();
-  }, [value, anim]);
-  const trackColor = anim.interpolate({ inputRange: [0, 1], outputRange: ['#33475b', '#00d4ff'] });
-  const knobX = anim.interpolate({ inputRange: [0, 1], outputRange: [0, 18] });
-  return (
-    <TouchableOpacity activeOpacity={0.8} onPress={() => onValueChange(!value)}>
-      <Animated.View style={{ width: 46, height: 28, borderRadius: 14, padding: 3, justifyContent: 'center',
-                              backgroundColor: trackColor }}>
-        <Animated.View style={{ width: 22, height: 22, borderRadius: 11, backgroundColor: '#ffffff',
-                                transform: [{ translateX: knobX }] }} />
-      </Animated.View>
-    </TouchableOpacity>
-  );
-});
-
-// A logo is drawn as-is only when it is a short emoji; text (letters, digits, a URL) gets the one-letter
-// avatar instead, which fits the fixed disc it sits in.
-function isGlyphLogo(logo) {
-  return logo.length > 0 && logo.length <= 8 && !/[A-Za-z0-9]/.test(logo);
-}
 
 // The last height read and when (ms), for the epoch clock that counts on from it (requestPace.estimatedHeight).
 const heightRead = () => ({ height: _blockHeightCache.height, at: _blockHeightCache.fetchedAt });
@@ -295,6 +270,38 @@ function TokenBalance({ text }) {
   return (
     <View style={beside ? styles.tokenBalance : styles.tokenBalanceUnder}>
       <Text style={styles.tokenAmount} {...(beside ? FIGURE_LINE : null)}>{text}</Text>
+    </View>
+  );
+}
+
+// The app's mark: in the header, and over the app's name on the screens that hold no data (first read, loading,
+// welcome, lock).
+const APP_MARK = require('../../assets/qnet_logo.png');
+function AppMark() {
+  return <Image source={APP_MARK} style={styles.lockLogo} resizeMode="contain" />;
+}
+
+// An address as the subject of Receive, whole on two lines: a QNet Blockchain address in its own
+// structure (19 hex and "eon", then 15 hex and the 8-hex check), any other in groups of four. Display only: what is
+// copied is the raw address.
+const SUBJECT_LINE = { numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.5, maxFontSizeMultiplier: 1.2 };
+// The whole address on the one line of the Assets card, next to its copy mark: shrunk to fit a 320 dp screen, never cut.
+const ADDRESS_LINE = { ...SUBJECT_LINE, minimumFontScale: 0.45 };
+function SubjectAddress({ address }) {
+  const parts = addressParts(address);
+  const groups = parts ? null : groupAddress(address).split(' ');
+  const half = groups ? Math.ceil(groups.length / 2) : 0;
+  const lines = parts
+    ? [[parts[0], parts[1]], [parts[2], parts[3]]]
+    : [[groups.slice(0, half).join(' '), ''], [groups.slice(half).join(' '), '']];
+  return (
+    <View style={styles.subjectAddress}>
+      {lines.map(([main, tail], i) => (
+        <Text key={i} style={styles.subjectLine} {...SUBJECT_LINE}>
+          {main}
+          {tail ? <Text style={i === 0 ? styles.subjectQuiet : null}>{` ${tail}`}</Text> : null}
+        </Text>
+      ))}
     </View>
   );
 }
@@ -415,13 +422,12 @@ const WalletScreen = () => {
     () => new Set(customTokens.map((c) => c.contract_address || c.contract).filter(Boolean)), [customTokens]);
   const isTokenShown = (contract) => tokenVisible(contract, { hidden: hiddenTokens, added: addedTokens, shown: shownTokens });
   // A token as every screen names it: its symbol, else its name, else "Token", each through tokenLabel (no hidden or
-  // format character can reorder it, M-5); and the letter of its avatar.
+  // format character can reorder it, M-5).
   const tokenTitle = (tk) => tokenLabel(tk.symbol) || tokenLabel(tk.name) || t('tok_default_name');
-  const tokenInitial = (tk) => (tokenLabel(tk.symbol) || tokenLabel(tk.name) || 'T').slice(0, 1).toUpperCase();
   const [hiddenTokens, setHiddenTokens] = useState(new Set()); // user-hidden token contracts (spam control)
   const [balancesHidden, setBalancesHidden] = useState(false); // privacy: mask all amounts (persisted)
-  const [showHeaderMenu, setShowHeaderMenu] = useState(false); // header ⋮ dropdown
-  const [headerBottom, setHeaderBottom] = useState(0); // header's measured bottom edge; the ⋮ menu card opens 12 dp above it
+  const [showHeaderMenu, setShowHeaderMenu] = useState(false); // the header's More menu
+  const [headerBottom, setHeaderBottom] = useState(0); // the header's measured bottom edge, where the More menu opens
   const [showTokenManager, setShowTokenManager] = useState(false); // token visibility/search manager
   const [tokenMgrQuery, setTokenMgrQuery] = useState(''); // manager search filter
   // Add-Custom-Token modal
@@ -456,14 +462,11 @@ const WalletScreen = () => {
   const [keptTxs, setKeptTxs] = useState([]); // this wallet's kept transactions (MOBNET-R3-01)
   const [language, setLanguage] = useState('en');
   // Every string on screen comes from the translator (i18n); a new one per language, so memoized rows and tabs
-  // follow a change. Arabic lays the screen out right to left.
-  const t = useMemo(() => makeT(language), [language]);
+  // follow a change. The layout's direction follows the language as a whole (i18n/direction).
+  const t = useMemo(() => { setThemeLanguage(language); return makeT(language); }, [language]);
   // A canonical figure (decimal text or a number) as every screen writes it (utils/amountFormat), with its symbol;
   // fields, signing and the history cache keep the canonical text.
   const shownAmount = (value, symbol) => `${amountText(value)}${symbol ? ` ${symbol}` : ''}`;
-  const rtl = isRTL(language);
-  const dirStyle = rtl ? styles.dirRtl : styles.dirLtr;
-  const backArrow = rtl ? '→' : '←';
   const termsParts = t('terms_accept_template').split('{terms}');
   const [autoLockTime, setAutoLockTime] = useState(DEFAULT_AUTO_LOCK);
   // The revealed recovery phrase lives only here, in its own overlay, never in the generic alert state;
@@ -703,9 +706,6 @@ const WalletScreen = () => {
       // console.error('Failed to copy:', error);
     }
   };
-
-  // The icon of a known asset (components/TokenIcons): the same images the History rows draw.
-  const getTokenIconUrl = tokenIconUri;
 
   useEffect(() => {
     // A reinstall on iOS finds the previous install's Keychain items: they go before anything reads them. On
@@ -2794,14 +2794,11 @@ const WalletScreen = () => {
 
   const loadSettings = async () => {
     try {
-      const [savedAutoLockTime, savedLanguage] = await Promise.all([
-        AsyncStorage.getItem('qnet_autolock_time'),
-        AsyncStorage.getItem('qnet_language'),
-      ]);
+      const [savedAutoLockTime, lang] = await Promise.all([AsyncStorage.getItem('qnet_autolock_time'), savedLanguage()]);
 
       // A value outside the choices (the old 60) falls back to the default.
       setAutoLockTime(AUTO_LOCK_CHOICES.includes(savedAutoLockTime) ? savedAutoLockTime : DEFAULT_AUTO_LOCK);
-      setLanguage(isSupported(savedLanguage) ? savedLanguage : deviceLanguage());
+      setLanguage(lang);
       // Every send confirms now (MPLAT-R2-01): the old large-send threshold setting has no use.
       AsyncStorage.removeItem('qnet_send_confirm_qnc').catch(() => {});
     } catch (error) {
@@ -3119,9 +3116,16 @@ const WalletScreen = () => {
     return () => sub.remove();
   }, [wallet, tempWallet, autoLockTime, walletDeviceAuth, password]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The restart a new layout direction takes: the app's JS starts again as at a cold start, so the wallet locks.
+  const restartForLayout = () => {
+    reloadApp().then((started) => { if (!started) logger.warn('[WARN][I18N] layout restart unavailable'); });
+  };
+
+  // A language of the other direction turns the layout once the app's JS starts again (Settings offers the restart).
   const saveLanguage = async (lang) => {
     try {
-      await AsyncStorage.setItem('qnet_language', lang);
+      await AsyncStorage.setItem(LANGUAGE_KEY, lang);
+      applyLayoutDirection(lang);
       setLanguage(lang);
     } catch (error) {
       showAlert(t('error'), t('err_save_language'));
@@ -3444,6 +3448,30 @@ const WalletScreen = () => {
   const renderFormError = (error, afterLine) => (error
     ? <Text style={[styles.errorText, afterLine ? styles.errorAfterLine : null]} testID="form-error">{error}</Text> : null);
 
+  // The terms line of the create and import forms: the box, then the sentence with the Terms of Service as a link.
+  const renderTermsRow = () => (
+    <View style={styles.termsContainer}>
+      <Checkbox checked={termsAccepted} onPress={() => setTermsAccepted(!termsAccepted)} accessibilityLabel={t('terms_of_service')} />
+      <Text style={styles.termsText}>
+        {termsParts[0]}
+        <Text style={styles.termsLink} onPress={() => setShowTermsModal(true)} accessibilityRole="link">{t('terms_of_service')}</Text>
+        {termsParts[1]}
+      </Text>
+    </View>
+  );
+
+  // A recovery phrase as a list in two columns: each word's number, then the word, a hairline under each line.
+  const renderSeedWords = (words) => (
+    <View style={styles.seedGrid}>
+      {words.map((word, index) => (
+        <View key={index} style={styles.seedWordContainer}>
+          <View style={styles.seedWordNumberBox}><Text style={styles.seedWordNumber}>{String(index + 1).padStart(2, '0')}</Text></View>
+          <Text style={styles.seedWordText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{word}</Text>
+        </View>
+      ))}
+    </View>
+  );
+
   // Android: before a recovery phrase is shown (a new wallet's) or typed (an import), the enabled accessibility
   // services that did not come with the system are named and the user decides: such a service can read the words
   // on screen and the text typed, and below Android 14 nothing hides them from it. Resolves true to go on.
@@ -3756,7 +3784,7 @@ const WalletScreen = () => {
     // Check if all required words are filled
     const emptyWords = positions.filter(pos => !seedConfirmWords[pos] || seedConfirmWords[pos].trim() === '');
     if (emptyWords.length > 0) {
-      setVerificationError(`⚠️ ${t('seed_select_word', { n: emptyWords[0] + 1 })}`);
+      setVerificationError(t('seed_select_word', { n: emptyWords[0] + 1 }));
       return;
     }
     
@@ -3769,9 +3797,9 @@ const WalletScreen = () => {
     }
     
     if (incorrectWords.length > 0) {
-      setVerificationError(`❌ ${incorrectWords.length === 1
+      setVerificationError(incorrectWords.length === 1
         ? t('seed_word_wrong', { n: incorrectWords[0] })
-        : t('seed_words_wrong', { list: `#${incorrectWords.join(', #')}` })}`);
+        : t('seed_words_wrong', { list: `#${incorrectWords.join(', #')}` }));
       return;
     }
     
@@ -5353,7 +5381,7 @@ const WalletScreen = () => {
   const deleteWallet = async () => {
     const here = await nodeRunsHere();
     showAlert(
-      `⚠️ ${t('delete_wallet')}`,
+      t('delete_wallet'),
       here ? `${t('node_stops_here')}\n\n${t('delete_wallet_confirm')}` : t('delete_wallet_confirm'),
       [
         { text: t('cancel'), style: 'cancel' },
@@ -5440,61 +5468,27 @@ const WalletScreen = () => {
         supportedOrientations={MODAL_ORIENTATIONS}
         onRequestClose={() => setShowTermsModal(false)}
       >
-        <SafeAreaView style={[styles.termsModal, dirStyle]}>
-          <View style={styles.termsModalContent}>
-            <View style={styles.termsModalHeader}>
-              <Text style={styles.termsModalTitle}>{t('terms_title')}</Text>
-              <TouchableOpacity
-                style={styles.termsModalClose}
-                accessibilityRole="button"
-                accessibilityLabel={t('common_close')}
-                onPress={() => setShowTermsModal(false)}
-              >
-                <Text style={styles.termsModalCloseText}>×</Text>
-              </TouchableOpacity>
-            </View>
-            
-            <ScrollView 
-              style={styles.termsModalBody}
-              showsVerticalScrollIndicator={true}
-              bounces={true}
-              scrollEnabled={true}
-            >
-              <Text style={styles.termsModalText}>{t('terms_text')}</Text>
-              {LEGAL_LINKS.slice(0, 2).map(([labelKey, url]) => (
-                <TouchableOpacity key={url} onPress={() => Linking.openURL(url).catch(() => {})}>
-                  <Text style={[styles.termsModalText, { color: '#00d4ff', marginTop: 12 }]}>{t(labelKey)}: {url}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-            
-            <View style={styles.termsModalButtons}>
-              <TouchableOpacity 
-                style={[styles.termsModalButton, styles.termsModalDecline]}
-                onPress={() => {
-                  setShowTermsModal(false);
-                  setTermsAccepted(false);
-                }}
-              >
-                <Text style={[styles.termsModalButtonText, styles.termsModalDeclineText]}>
-                  {t('decline')}
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[styles.termsModalButton, styles.termsModalAccept]}
-                onPress={() => {
-                  setShowTermsModal(false);
-                  setTermsAccepted(true);
-                }}
-              >
-                <Text style={[styles.termsModalButtonText, styles.termsModalAcceptText]}>
-                  {t('accept')}
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </SafeAreaView>
+        <View style={styles.termsModal}>
+          <Sheet
+            t={t}
+            title={t('terms_title')}
+            onClose={() => setShowTermsModal(false)}
+            height="86%"
+            actions={(
+              <ActionPair
+                start={{ label: t('decline'), onPress: () => { setShowTermsModal(false); setTermsAccepted(false); } }}
+                end={{ label: t('accept'), onPress: () => { setShowTermsModal(false); setTermsAccepted(true); } }}
+              />
+            )}
+          >
+            <Text style={styles.termsModalText}>{t('terms_text')}</Text>
+            {LEGAL_LINKS.slice(0, 2).map(([labelKey, url]) => (
+              <Text key={url} style={[styles.termsModalText, styles.termsModalLink]} onPress={() => Linking.openURL(url).catch(() => {})} accessibilityRole="link">
+                {t(labelKey)}
+              </Text>
+            ))}
+          </Sheet>
+        </View>
       </Modal>
     );
   };
@@ -5502,54 +5496,33 @@ const WalletScreen = () => {
   // Custom alert (styled like extension). Every screen renders it, so an alert raised before the wallet opens is shown too.
   const renderCustomAlert = () => {
     if (!customAlert) return null;
-
+    // A way out reads as a text button, what cannot be undone in Ember, the one answer that goes on as the solid one.
+    const solidAt = customAlert.buttons.findIndex((b) => b.style !== 'cancel' && b.style !== 'destructive');
+    const kindOf = (button, index) => (button.style === 'destructive' ? 'destructive' : (index === solidAt ? 'solid' : 'text'));
     return (
-      <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-        <View style={[styles.modalBox, { maxWidth: 350 }]}>
-          {/* Modal Header with icon */}
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>
-              {customAlert.title}
-            </Text>
-          </View>
-
-          {/* Modal Content: scrolls inside the box, so a long body never pushes the actions out */}
-          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-            <Text style={styles.modalContent}>
-              {customAlert.message}
-            </Text>
-          </ScrollView>
-
-          {/* Modal Actions */}
-          <View style={styles.modalActions}>
+      <Sheet
+        t={t}
+        level="alert"
+        title={customAlert.title}
+        actions={(
+          <ActionRow>
             {customAlert.buttons.map((button, index) => (
-              <TouchableOpacity
+              <Action
                 key={index}
-                style={[
-                  styles.modalButton,
-                  button.style === 'destructive' ?
-                    styles.modalButtonDanger :
-                    button.style === 'cancel' ?
-                      styles.modalButtonSecondary :
-                      styles.modalButtonPrimary,
-                ]}
+                kind={kindOf(button, index)}
+                align="center"
+                label={button.text}
                 onPress={() => {
                   setCustomAlert(null);
                   if (button.onPress) button.onPress();
                 }}
-              >
-                <Text style={[
-                  styles.modalButtonText,
-                  button.style === 'destructive' && styles.modalButtonTextDanger,
-                  button.style === 'cancel' && styles.modalButtonTextSecondary
-                ]}>
-                  {button.text}
-                </Text>
-              </TouchableOpacity>
+              />
             ))}
-          </View>
-        </View>
-      </KeyboardAvoidingView>
+          </ActionRow>
+        )}
+      >
+        <Text style={styles.modalContent}>{customAlert.message}</Text>
+      </Sheet>
     );
   };
 
@@ -5597,6 +5570,12 @@ const WalletScreen = () => {
     setActiveTab(tab);
   };
 
+  // What the header's More holds (Settings is a tab of the bottom bar); on the Browser tab the browser bar's More.
+  const walletMenuItems = [
+    { label: t('tok_manage'), onPress: () => { setShowHeaderMenu(false); setTokenMgrQuery(''); setShowTokenManager(true); } },
+    { label: t('tok_hide_balances'), toggle: { value: balancesHidden, onValueChange: toggleBalancesHidden }, divider: true },
+  ];
+
   // The browser pane. It is the first child of every screen the open (or locked) wallet can show, under one
   // key, so switching tabs, locking and unlocking keep its pages; it covers the tab content area when its tab
   // is open and is invisible and untouchable otherwise.
@@ -5622,10 +5601,10 @@ const WalletScreen = () => {
           credential={wallet ? password : ''}
           walletManager={walletManager}
           t={t}
-          rtl={rtl}
           onSheet={setDappSheet}
           confirmAction={confirmBrowserAction}
           onSent={onDappSent}
+          walletMenu={walletMenuItems}
           dev={__DEV__}
         />
       </View>
@@ -5703,35 +5682,22 @@ const WalletScreen = () => {
   const renderSeedReveal = () => {
     if (!seedReveal) return null;
     return (
-      <View style={styles.modalOverlay}>
-        <View style={[styles.modalBox, { maxWidth: 380 }]}>
-          <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody}>
-            <Text style={styles.modalTitle}>{t('export_recovery_phrase')}</Text>
-            <View style={[styles.seedGrid, { marginVertical: 10 }]}>
-              {seedReveal.map((word, index) => (
-                <View key={index} style={[styles.seedWordContainer, { padding: 8, marginBottom: 6 }]}>
-                  <Text style={[styles.seedWordNumber, { fontSize: 11 }]}>{index + 1}</Text>
-                  <Text style={[styles.seedWordText, { fontSize: 13 }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{word}</Text>
-                </View>
-              ))}
-            </View>
-          </ScrollView>
-          <View style={styles.modalActions}>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonSecondary]}
-              onPress={() => copyRecoveryPhrase(seedReveal)}
-            >
-              <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t(seedCopied ? 'common_copied' : 'seed_copy')}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonPrimary]}
-              onPress={() => setSeedReveal(null)}
-            >
-              <Text style={styles.modalButtonText}>{t('common_done')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
+      <Sheet
+        t={t}
+        title={t('export_recovery_phrase')}
+        actions={(
+          <ActionPair
+            start={{
+              label: t(seedCopied ? 'common_copied' : 'common_copy'),
+              labels: [t('common_copy'), t('common_copied')],
+              onPress: () => copyRecoveryPhrase(seedReveal),
+            }}
+            end={{ label: t('common_done'), onPress: () => setSeedReveal(null) }}
+          />
+        )}
+      >
+        {renderSeedWords(seedReveal)}
+      </Sheet>
     );
   };
 
@@ -5753,44 +5719,37 @@ const WalletScreen = () => {
     if (!keyReveal) return null;
     const blocks = KEY_ACCOUNTS.filter(([which]) => keyReveal[which]);
     return (
-      <View style={styles.modalOverlay}>
-        <View style={[styles.modalBox, { maxWidth: 380 }]}>
-          <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody}>
-            <Text style={styles.modalTitle}>{t('export_private_key')}</Text>
-            {blocks.map(([which, title, format]) => {
-              const entry = keyReveal[which] || {};
-              return (
-                <View key={which} style={styles.keyRevealBlock}>
-                  <Text style={styles.modalLabel}>{t(title)}</Text>
-                  {entry.key ? (
-                    <>
-                      <Text style={styles.keyRevealFormat}>{t(format)}</Text>
-                      <View style={styles.keyRevealBox}>
-                        <Text style={styles.keyRevealKey} selectable={false} testID={'key-shown-' + which}>{entry.key}</Text>
-                      </View>
-                      <TouchableOpacity
-                        style={[styles.modalButton, styles.modalButtonSecondary, styles.keyRevealCopy]}
-                        onPress={() => copyPrivateKey(which)}
-                        accessibilityRole="button"
-                        testID={'key-copy-' + which}
-                      >
-                        <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t(keyCopied === which ? 'common_copied' : 'seed_copy')}</Text>
-                      </TouchableOpacity>
-                    </>
-                  ) : (
-                    <Text style={styles.modalWarning}>{t('private_key_unavailable')}</Text>
-                  )}
-                </View>
-              );
-            })}
-          </ScrollView>
-          <View style={styles.modalActions}>
-            <TouchableOpacity style={[styles.modalButton, styles.modalButtonPrimary]} onPress={closeKeyReveal} testID="key-reveal-done">
-              <Text style={styles.modalButtonText}>{t('common_done')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
+      <Sheet
+        t={t}
+        title={t('export_private_key')}
+        actions={<Action label={t('common_done')} onPress={closeKeyReveal} testID="key-reveal-done" />}
+      >
+        {blocks.map(([which, title, format]) => {
+          const entry = keyReveal[which] || {};
+          return (
+            <View key={which} style={styles.keyRevealBlock}>
+              <Text style={styles.modalLabel}>{t(title)}</Text>
+              {entry.key ? (
+                <>
+                  <Text style={styles.keyRevealFormat}>{t(format)}</Text>
+                  <View style={styles.keyRevealBox}>
+                    <Text style={styles.keyRevealKey} selectable={false} testID={'key-shown-' + which}>{entry.key}</Text>
+                  </View>
+                  <Action
+                    kind="text"
+                    label={t(keyCopied === which ? 'common_copied' : 'common_copy')}
+                    labels={[t('common_copy'), t('common_copied')]}
+                    onPress={() => copyPrivateKey(which)}
+                    testID={'key-copy-' + which}
+                  />
+                </>
+              ) : (
+                <Text style={styles.modalWarning}>{t('private_key_unavailable')}</Text>
+              )}
+            </View>
+          );
+        })}
+      </Sheet>
     );
   };
 
@@ -5799,38 +5758,26 @@ const WalletScreen = () => {
   const renderEraseConfirm = () => {
     if (!showEraseConfirm) return null;
     return (
-      <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-        <View style={styles.modalBox}>
-          <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-            <Text style={styles.modalTitle}>{t('erase_title')}</Text>
-            {eraseNodeHere ? <Text style={styles.modalWarning} testID="erase-node-here">{t('node_stops_here')}</Text> : null}
-            <Text style={styles.modalWarning}>{t('erase_warning')}</Text>
-            <Text style={styles.modalContent}>{t('erase_type_confirm', { word: 'ERASE' })}</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="ERASE"
-              placeholderTextColor="#888"
-              value={eraseText}
-              onChangeText={setEraseText}
-              {...CONFIRM_INPUT_PROPS}
-            />
-          </ScrollView>
-          <View style={styles.modalActions}>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonSecondary]}
-              onPress={() => { setShowEraseConfirm(false); setEraseText(''); }}
-            >
-              <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonDanger]}
-              onPress={confirmErase}
-            >
-              <Text style={[styles.modalButtonText, styles.modalButtonTextDanger]}>{t('erase_button')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
+      <Sheet
+        t={t}
+        title={t('erase_title')}
+        actions={(
+          <ActionPair
+            start={{ label: t('cancel'), onPress: () => { setShowEraseConfirm(false); setEraseText(''); } }}
+            end={{ kind: 'destructive', align: 'center', label: t('erase_button'), onPress: confirmErase }}
+          />
+        )}
+      >
+        {eraseNodeHere ? <Text style={styles.modalWarning} testID="erase-node-here">{t('node_stops_here')}</Text> : null}
+        <Text style={styles.modalWarning}>{t('erase_warning')}</Text>
+        <Text style={styles.modalContent}>{t('erase_type_confirm', { word: 'ERASE' })}</Text>
+        <Field
+          placeholder="ERASE"
+          value={eraseText}
+          onChangeText={setEraseText}
+          {...CONFIRM_INPUT_PROPS}
+        />
+      </Sheet>
     );
   };
 
@@ -5839,46 +5786,36 @@ const WalletScreen = () => {
   const renderFreshPrompt = () => {
     if (!freshPrompt) return null;
     return (
-      <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-        <View style={styles.modalBox}>
-          <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-            <Text style={styles.modalTitle}>{t('fresh_title')}</Text>
-            <Text style={styles.modalWarning}>{freshPrompt.reason}</Text>
-            {freshPrompt.recipient ? (
-              <>
-                <Text style={styles.modalContent}>{t('send_review_to')}</Text>
-                <Text style={styles.freshRecipient}>{freshPrompt.recipient}</Text>
-              </>
-            ) : null}
-            {freshPrompt.note ? <Text style={styles.modalWarning}>{freshPrompt.note}</Text> : null}
-            <TextInput
-              style={styles.input}
-              placeholder={t('password')}
-              accessibilityLabel={t('fresh_title')}
-              placeholderTextColor="#888"
-              value={freshPassword}
-              onChangeText={setFreshPassword}
-              onSubmitEditing={submitFresh}
-              returnKeyType="done"
-              {...PASSWORD_INPUT_PROPS}
-            />
-          </ScrollView>
-          <View style={styles.modalActions}>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonSecondary]}
-              onPress={() => resolveFresh(false)}
-            >
-              <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonPrimary]}
-              onPress={submitFresh}
-            >
-              <Text style={styles.modalButtonText}>{t('common_confirm')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
+      <Sheet
+        t={t}
+        level="alert"
+        title={t('fresh_title')}
+        actions={(
+          <ActionPair
+            start={{ label: t('cancel'), onPress: () => resolveFresh(false) }}
+            end={{ label: t('common_confirm'), onPress: submitFresh }}
+          />
+        )}
+      >
+        <Text style={styles.modalWarning}>{freshPrompt.reason}</Text>
+        {freshPrompt.recipient ? (
+          <>
+            <Text style={styles.modalLabel}>{t('send_review_to')}</Text>
+            <Text style={styles.freshRecipient}>{freshPrompt.recipient}</Text>
+          </>
+        ) : null}
+        {freshPrompt.note ? <Text style={styles.modalWarning}>{freshPrompt.note}</Text> : null}
+        <Field
+          label={t('password')}
+          placeholder={t('password')}
+          accessibilityLabel={t('fresh_title')}
+          value={freshPassword}
+          onChangeText={setFreshPassword}
+          onSubmitEditing={submitFresh}
+          returnKeyType="done"
+          {...PASSWORD_INPUT_PROPS}
+        />
+      </Sheet>
     );
   };
 
@@ -5886,39 +5823,29 @@ const WalletScreen = () => {
   const renderDeletePrompt = () => {
     if (!showDeletePrompt) return null;
     return (
-      <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-        <View style={styles.modalBox}>
-          <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-            <Text style={styles.modalTitle}>{t('delete_wallet')}</Text>
-            <Text style={styles.modalWarning}>{t('delete_enter_password')}</Text>
-            <TextInput
-              style={styles.input}
-              placeholder={t('password')}
-              accessibilityLabel={t('delete_enter_password')}
-              placeholderTextColor="#888"
-              value={deletePassword}
-              onChangeText={setDeletePassword}
-              onSubmitEditing={confirmDeleteWithPassword}
-              returnKeyType="done"
-              {...PASSWORD_INPUT_PROPS}
-            />
-          </ScrollView>
-          <View style={styles.modalActions}>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonSecondary]}
-              onPress={() => { setShowDeletePrompt(false); setDeletePassword(''); }}
-            >
-              <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.modalButton, styles.modalButtonDanger]}
-              onPress={confirmDeleteWithPassword}
-            >
-              <Text style={[styles.modalButtonText, styles.modalButtonTextDanger]}>{t('delete_wallet')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
+      <Sheet
+        t={t}
+        level="alert"
+        title={t('delete_wallet')}
+        actions={(
+          <ActionPair
+            start={{ label: t('cancel'), onPress: () => { setShowDeletePrompt(false); setDeletePassword(''); } }}
+            end={{ kind: 'destructive', align: 'center', label: t('delete_wallet'), onPress: confirmDeleteWithPassword }}
+          />
+        )}
+      >
+        <Text style={styles.modalWarning}>{t('delete_enter_password')}</Text>
+        <Field
+          label={t('password')}
+          placeholder={t('password')}
+          accessibilityLabel={t('delete_enter_password')}
+          value={deletePassword}
+          onChangeText={setDeletePassword}
+          onSubmitEditing={confirmDeleteWithPassword}
+          returnKeyType="done"
+          {...PASSWORD_INPUT_PROPS}
+        />
+      </Sheet>
     );
   };
 
@@ -5985,10 +5912,10 @@ const WalletScreen = () => {
   // welcome screen of a device without a wallet ever shows before the wallet on it was looked for.
   if (erasing || !walletKnown) {
     return (
-      <SafeAreaView style={[styles.container, dirStyle]} edges={SCREEN_EDGES}>
+      <SafeAreaView style={styles.container} edges={SCREEN_EDGES}>
         <View style={styles.centerContent}>
-          <Image source={require('../../assets/qnet_logo.png')} style={styles.lockLogo} resizeMode="contain" />
-          <Text style={styles.title}>{t('qnet_wallet')}</Text>
+          <AppMark />
+          <Text style={styles.display}>{t('qnet_wallet')}</Text>
           {erasing ? <Text style={styles.subtitle}>{t('deleting_wallet')}</Text> : null}
         </View>
         {renderCustomAlert()}
@@ -5998,10 +5925,11 @@ const WalletScreen = () => {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.container, dirStyle]}>
+      <SafeAreaView style={styles.container}>
         {renderBrowserPane('loading')}
         <View style={styles.centerContent}>
-          <Text style={styles.title}>{t('qnet_wallet')}</Text>
+          <AppMark />
+          <Text style={styles.display}>{t('qnet_wallet')}</Text>
           <Text style={styles.subtitle}>{t('common_loading')}</Text>
         </View>
         {renderTermsModal()}
@@ -6015,7 +5943,7 @@ const WalletScreen = () => {
   if (vaultProblem) {
     return (
       <SafeAreaView
-        style={[styles.container, dirStyle]}
+        style={styles.container}
         edges={SCREEN_EDGES}
       >
         <View style={styles.centerContent}>
@@ -6024,21 +5952,12 @@ const WalletScreen = () => {
             {t(vaultProblem === 'corrupt' ? 'vault_corrupt' : vaultProblem === 'unreadable' ? 'vault_unreadable' : 'vault_device_key')}
           </Text>
           {vaultProblem !== 'unreadable' && (
-            <Text style={[styles.modalContent, { marginBottom: 16 }]}>
-              {t('vault_nothing_deleted')}
-            </Text>
+            <Text style={styles.formNote}>{t('vault_nothing_deleted')}</Text>
           )}
-          <TouchableOpacity style={styles.button} onPress={() => { setVaultProblem(null); checkWalletExists(); }}>
-            <Text style={styles.buttonText}>{t('common_try_again')}</Text>
-          </TouchableOpacity>
+          <Action label={t('common_try_again')} onPress={() => { setVaultProblem(null); checkWalletExists(); }} style={styles.formAction} />
           {/* Storage that cannot be read right now may read again: nothing is offered to erase for that. */}
           {vaultProblem !== 'unreadable' && (
-            <TouchableOpacity
-              style={[styles.button, styles.secondaryButton]}
-              onPress={() => { setEraseText(''); setShowEraseConfirm(true); }}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('erase_and_restore')}</Text>
-            </TouchableOpacity>
+            <Action kind="destructive" label={t('erase_and_restore')} onPress={() => { setEraseText(''); setShowEraseConfirm(true); }} />
           )}
         </View>
         {renderEraseConfirm()}
@@ -6053,79 +5972,55 @@ const WalletScreen = () => {
     const positions = Object.keys(seedConfirmWords).map(Number).sort((a, b) => a - b);
     
     return (
-      <SafeAreaView style={[styles.container, dirStyle]} onTouchStart={handleUserActivity}>
+      <SafeAreaView style={styles.container} onTouchStart={handleUserActivity}>
         <ScrollView
           contentContainerStyle={styles.seedConfirmContent}
           showsVerticalScrollIndicator={true}
           bounces={true}
           scrollEnabled={true}
         >
-          <Text style={styles.title}>{t('seed_confirm_title')}</Text>
+          <Head
+            title={t('seed_confirm_title')}
+            titleStyle={styles.title}
+            backLabel={t('common_back')}
+            onBack={() => {
+              // Back to the phrase, with no error left over.
+              setVerificationError('');
+              setShowSeedConfirm(false);
+              setShowCreateOptions('show-seed');
+            }}
+          />
           <Text style={styles.subtitle}>
             {t('seed_confirm_subtitle')}
           </Text>
-          
-          {positions.map(pos => (
-            <View key={pos} style={styles.seedConfirmGroup}>
-              <Text style={styles.label}>{t('seed_select_word_label', { n: pos + 1 })}</Text>
-              <View style={styles.wordChoicesContainer}>
-                {wordChoices[pos]?.map((word, idx) => (
-                  <TouchableOpacity
-                    key={idx}
-                    style={[
-                      styles.wordChoiceButton,
-                      seedConfirmWords[pos] === word && styles.wordChoiceSelected
-                    ]}
-                    onPress={() => {
-                      // Clear error when user makes a selection
-                      setVerificationError('');
-                      setSeedConfirmWords({
-                        ...seedConfirmWords,
-                        [pos]: word
-                      });
-                    }}
-                  >
-                    <Text style={[
-                      styles.wordChoiceText,
-                      seedConfirmWords[pos] === word && styles.wordChoiceTextSelected
-                    ]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-                      {word}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
+
+          {positions.map((pos) => {
+            const choices = wordChoices[pos] || [];
+            return (
+              <View key={pos} style={styles.seedConfirmGroup}>
+                <Text style={styles.label}>{t('seed_select_word_label', { n: pos + 1 })}</Text>
+                <Tabs
+                  role="radio"
+                  items={choices.map((word, idx) => ({ key: String(idx), label: word }))}
+                  value={String(choices.indexOf(seedConfirmWords[pos]))}
+                  onChange={(key) => {
+                    setVerificationError('');
+                    setSeedConfirmWords({ ...seedConfirmWords, [pos]: choices[Number(key)] });
+                  }}
+                />
               </View>
-            </View>
-          ))}
-          
-          {/* Verification Error Message (like in browser extension) */}
-          {verificationError ? (
-            <View style={styles.verificationErrorBox}>
-              <Text style={styles.verificationErrorText}>{verificationError}</Text>
-            </View>
-          ) : null}
-          
-          <TouchableOpacity 
-            style={styles.button}
+            );
+          })}
+
+          {verificationError ? <Text style={styles.verificationErrorText}>{verificationError}</Text> : null}
+
+          <Action
+            label={t('seed_confirm_create')}
+            busy={!!loading}
+            busyLabel={t('verifying')}
             onPress={confirmSeedPhrase}
-            disabled={Boolean(loading || !Object.values(seedConfirmWords).every(w => w && w.length > 0))}
-          >
-            <Text style={styles.buttonText}>
-              {loading ? t('verifying') : t('seed_confirm_create')}
-            </Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity 
-            style={[styles.button, styles.secondaryButton]}
-            onPress={() => {
-              // Clear error when going back
-              setVerificationError('');
-              // Direct action without modal for better UX
-              setShowSeedConfirm(false);
-              setShowCreateOptions('show-seed'); // Go back to seed display
-            }}
-          >
-            <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('common_back')}</Text>
-          </TouchableOpacity>
+            disabled={!Object.values(seedConfirmWords).every(w => w && w.length > 0)}
+          />
         </ScrollView>
         {renderCustomAlert()}
       </SafeAreaView>
@@ -6136,15 +6031,18 @@ const WalletScreen = () => {
     if (!showCreateOptions) {
       return (
         <SafeAreaView 
-          style={[styles.container, dirStyle]}
+          style={styles.container}
           edges={SCREEN_EDGES}
         >
-          <View style={styles.centerContent}>
-            <Text style={styles.title}>{t('qnet_wallet')}</Text>
+          <HexField />
+          <View style={styles.fieldColumn}>
+            <AppMark />
+            <Text style={styles.display}>{t('qnet_wallet')}</Text>
             <Text style={styles.subtitle}>{t('welcome_subtitle')}</Text>
-            
-            <TouchableOpacity 
-              style={styles.button}
+
+            <Action
+              label={t('create_new_wallet')}
+              style={styles.formAction}
               onPress={() => {
                 // Clear all password fields when starting create
                 setPassword('');
@@ -6153,12 +6051,11 @@ const WalletScreen = () => {
                 setTermsAccepted(false); // Reset terms
                 setShowCreateOptions('create');
               }}
-            >
-              <Text style={styles.buttonText}>{t('create_new_wallet')}</Text>
-            </TouchableOpacity>
+            />
 
-            <TouchableOpacity
-              style={[styles.button, styles.secondaryButton]}
+            <Action
+              kind="secondary"
+              label={t('import_wallet')}
               onPress={async () => {
                 // Under the screen lock there is no password step: the phrase field is the first screen of the import,
                 // so the checks that otherwise follow the password step run here.
@@ -6172,9 +6069,7 @@ const WalletScreen = () => {
                 setImportStep(1);
                 setShowCreateOptions('import');
               }}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('import_wallet')}</Text>
-            </TouchableOpacity>
+            />
           </View>
           {vaultChecked ? renderLinkRequest() : null}
           {renderCustomAlert()}
@@ -6185,7 +6080,7 @@ const WalletScreen = () => {
     if (showCreateOptions === 'create') {
       return (
         <SafeAreaView 
-          style={[styles.container, dirStyle]}
+          style={styles.container}
           edges={SCREEN_EDGES}
         >
           <KeyboardAvoidingView style={styles.keyboardAvoid} behavior="padding">
@@ -6196,16 +6091,27 @@ const WalletScreen = () => {
             scrollEnabled={true}
             keyboardShouldPersistTaps="handled"
           >
-            <Text style={styles.title}>{t('create_wallet')}</Text>
+            <Head
+              title={t('create_wallet')}
+              titleStyle={styles.title}
+              backLabel={t('common_back')}
+              onBack={() => {
+                setShowCreateOptions(false);
+                setPassword('');
+                setConfirmPassword('');
+                setPasswordError('');
+                setTermsAccepted(false); // Reset terms
+              }}
+            />
             <Text style={styles.subtitle}>
               {deviceAuth ? t('create_protected') : t('create_password_hint', { min: MIN_PASSWORD })}
             </Text>
 
             {!deviceAuth && (<>
-            <TextInput
-              style={[styles.input, passwordError && typedPassword.length > 0 && typedPassword.length < MIN_PASSWORD ? styles.inputError : null]}
+            <Field
+              label={t('password')}
+              invalid={!!passwordError && typedPassword.length > 0 && typedPassword.length < MIN_PASSWORD}
               placeholder={t('enter_password')}
-              placeholderTextColor="#888"
               {...PASSWORD_INPUT_PROPS}
               value={typedPassword}
               onChangeText={(text) => {
@@ -6216,10 +6122,10 @@ const WalletScreen = () => {
 
             {renderPasswordLength(typedPassword)}
 
-            <TextInput
-              style={[styles.input, passwordError && confirmPassword.length > 0 && typedPassword !== confirmPassword ? styles.inputError : null]}
+            <Field
+              label={t('confirm_password')}
+              invalid={!!passwordError && confirmPassword.length > 0 && typedPassword !== confirmPassword}
               placeholder={t('confirm_password')}
-              placeholderTextColor="#888"
               {...PASSWORD_INPUT_PROPS}
               value={confirmPassword}
               onChangeText={(text) => {
@@ -6232,48 +6138,14 @@ const WalletScreen = () => {
             </>)}
 
             {renderFormError(passwordError, !deviceAuth && matchShown(typedPassword, confirmPassword))}
-            
-            {/* Terms of Service Checkbox */}
-            <View style={styles.termsContainer}>
-            <TouchableOpacity 
-                style={styles.checkbox}
-                onPress={() => setTermsAccepted(!termsAccepted)}
-              >
-                <View style={[styles.checkboxInner, termsAccepted && styles.checkboxChecked]}>
-                  {termsAccepted && <Text style={styles.checkmark}>✓</Text>}
-                </View>
-              </TouchableOpacity>
-              <View style={styles.termsTextContainer}>
-                <Text style={styles.termsText}>
-                  {termsParts[0]}
-                  <Text style={styles.termsLink} onPress={() => setShowTermsModal(true)} accessibilityRole="link">{t('terms_of_service')}</Text>
-                  {termsParts[1]}
-                </Text>
-              </View>
-            </View>
-            
-            <TouchableOpacity 
-              style={[styles.button, !termsAccepted && styles.buttonDisabled]}
+
+            {renderTermsRow()}
+
+            <Action
+              label={loading ? t('creating') : t('create_wallet')}
               onPress={createWallet}
               disabled={loading || !termsAccepted}
-            >
-              <Text style={styles.buttonText}>
-                {loading ? t('creating') : t('create_wallet')}
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity 
-              style={[styles.button, styles.secondaryButton]}
-              onPress={() => {
-                setShowCreateOptions(false);
-                setPassword('');
-                setConfirmPassword('');
-                setPasswordError('');
-                setTermsAccepted(false); // Reset terms
-              }}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('common_back')}</Text>
-            </TouchableOpacity>
+            />
           </ScrollView>
           </KeyboardAvoidingView>
           {renderTermsModal()}
@@ -6287,51 +6159,37 @@ const WalletScreen = () => {
       const words = tempWallet.mnemonic.split(' ');
       
       return (
-        <SafeAreaView style={[styles.container, dirStyle]} onTouchStart={handleUserActivity}>
+        <SafeAreaView style={styles.container} onTouchStart={handleUserActivity}>
           <ScrollView
-            contentContainerStyle={[styles.formContent, {paddingTop: 40, paddingBottom: 100}]}
+            contentContainerStyle={[styles.formContent, styles.seedContent]}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
           >
-            <Text style={[styles.title, {fontSize: 18}]}>{t('seed_save_title')}</Text>
+            <Head title={t('seed_save_title')} titleStyle={styles.title} />
             {/* Written down, then checked word by word; Copy puts it on the clipboard on an explicit tap only. */}
-            <Text style={[styles.subtitle, {fontSize: 13, marginBottom: 15}]}>
-              {t('seed_save_body')}
-            </Text>
+            <Text style={styles.subtitle}>{t('seed_save_body')}</Text>
 
-            <View style={[styles.seedGrid, {marginVertical: 10}]}>
-              {words.map((word, index) => (
-                <View key={index} style={[styles.seedWordContainer, {padding: 8, marginBottom: 6}]}>
-                  <Text style={[styles.seedWordNumber, {fontSize: 11}]}>{index + 1}</Text>
-                  <Text style={[styles.seedWordText, {fontSize: 13}]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{word}</Text>
-                </View>
-              ))}
-            </View>
+            {renderSeedWords(words)}
 
-            <Text style={[styles.seedWarningText, {marginTop: 10, marginBottom: 15, fontSize: 13}]}>
-              ⚠️ {t('seed_never_share')}
-            </Text>
+            <Text style={styles.seedWarningText}>{t('seed_never_share')}</Text>
 
-            <Text style={[styles.subtitle, {fontSize: 13, marginBottom: 10}]}>
-              {t('seed_copy_warning', { seconds: SECRET_CLIPBOARD_SECONDS })}
-            </Text>
-            <TouchableOpacity
-              style={[styles.button, styles.secondaryButton]}
+            <Text style={styles.formNote}>{t('seed_copy_warning', { seconds: SECRET_CLIPBOARD_SECONDS })}</Text>
+            <Action
+              kind="text"
+              label={t(seedCopied ? 'common_copied' : 'common_copy')}
+              labels={[t('common_copy'), t('common_copied')]}
               onPress={() => copyRecoveryPhrase(words)}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t(seedCopied ? 'common_copied' : 'seed_copy')}</Text>
-            </TouchableOpacity>
+              style={styles.formAction}
+            />
 
-            <TouchableOpacity
-              style={[styles.button, {marginBottom: 20}]}
+            <Action
+              label={t('seed_wrote_it')}
               onPress={() => {
                 setShowSeedConfirm(true);
                 setShowCreateOptions(false);
               }}
-            >
-              <Text style={styles.buttonText}>{t('seed_wrote_it')}</Text>
-            </TouchableOpacity>
+            />
           </ScrollView>
           {renderCustomAlert()}
         </SafeAreaView>
@@ -6343,7 +6201,7 @@ const WalletScreen = () => {
       if (importStep === 1 && !deviceAuth) {
         return (
           <SafeAreaView 
-            style={[styles.container, dirStyle]}
+            style={styles.container}
             edges={SCREEN_EDGES}
           >
             <KeyboardAvoidingView style={styles.keyboardAvoid} behavior="padding">
@@ -6354,13 +6212,26 @@ const WalletScreen = () => {
               scrollEnabled={true}
               keyboardShouldPersistTaps="handled"
             >
-              <Text style={styles.title}>{t('import_title')}</Text>
+              <Head
+                title={t('import_title')}
+                titleStyle={styles.title}
+                backLabel={t('common_back')}
+                onBack={() => {
+                  setShowCreateOptions(false);
+                  setPassword('');
+                  setConfirmPassword('');
+                  forgetImportPhrase();
+                  setPasswordError('');
+                  setTermsAccepted(false); // Reset terms
+                  setImportStep(1);
+                }}
+              />
               <Text style={styles.subtitle}>{t('import_step1', { min: MIN_PASSWORD })}</Text>
-              
-              <TextInput
-                style={[styles.input, passwordError && typedPassword.length > 0 && typedPassword.length < MIN_PASSWORD ? styles.inputError : null]}
+
+              <Field
+                label={t('password')}
+                invalid={!!passwordError && typedPassword.length > 0 && typedPassword.length < MIN_PASSWORD}
                 placeholder={t('enter_password')}
-                placeholderTextColor="#888"
                 {...PASSWORD_INPUT_PROPS}
                 value={typedPassword}
                 onChangeText={(text) => {
@@ -6371,10 +6242,10 @@ const WalletScreen = () => {
 
               {renderPasswordLength(typedPassword)}
 
-              <TextInput
-                style={[styles.input, passwordError && confirmPassword.length > 0 && typedPassword !== confirmPassword ? styles.inputError : null]}
+              <Field
+                label={t('confirm_password')}
+                invalid={!!passwordError && confirmPassword.length > 0 && typedPassword !== confirmPassword}
                 placeholder={t('confirm_password')}
-                placeholderTextColor="#888"
                 {...PASSWORD_INPUT_PROPS}
                 value={confirmPassword}
                 onChangeText={(text) => {
@@ -6386,9 +6257,9 @@ const WalletScreen = () => {
               {renderPasswordMatch(typedPassword, confirmPassword)}
 
               {renderFormError(passwordError, matchShown(typedPassword, confirmPassword))}
-              
-              <TouchableOpacity
-                style={styles.button}
+
+              <Action
+                label={t('common_next')}
                 onPress={async () => {
                   if (!validatePassword()) {
                     return;
@@ -6396,26 +6267,7 @@ const WalletScreen = () => {
                   if (!(await confirmPhraseScreen())) return;
                   setImportStep(2);
                 }}
-              >
-                <Text style={styles.buttonText}>
-                  {t('common_next')}
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton]}
-                onPress={() => {
-                  setShowCreateOptions(false);
-                  setPassword('');
-                  setConfirmPassword('');
-                  forgetImportPhrase();
-                  setPasswordError('');
-                  setTermsAccepted(false); // Reset terms
-                  setImportStep(1);
-                }}
-              >
-                <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('common_back')}</Text>
-              </TouchableOpacity>
+              />
             </ScrollView>
             </KeyboardAvoidingView>
             {renderTermsModal()}
@@ -6428,7 +6280,7 @@ const WalletScreen = () => {
       if (importStep === 2 || deviceAuth) {
         return (
           <SafeAreaView
-            style={[styles.container, dirStyle]}
+            style={styles.container}
             edges={SCREEN_EDGES}
             onTouchStart={handleUserActivity}
           >
@@ -6440,14 +6292,23 @@ const WalletScreen = () => {
               scrollEnabled={true}
               keyboardShouldPersistTaps="handled"
             >
-              <Text style={styles.title}>{t('import_title')}</Text>
+              <Head
+                title={t('import_title')}
+                titleStyle={styles.title}
+                backLabel={t('common_back')}
+                onBack={() => {
+                  if (deviceAuth) { setShowCreateOptions(false); setPassword(''); setConfirmPassword(''); } // no password step under the screen lock
+                  setImportStep(1);
+                  forgetImportPhrase();
+                  setPasswordError('');
+                  setTermsAccepted(false); // Reset terms
+                }}
+              />
               {/* Under the screen lock there is no password step: the phrase is the only one, with no number. */}
               <Text style={styles.subtitle}>{t(deviceAuth ? 'import_step_phrase' : 'import_step2')}</Text>
 
-              <TextInput
-                style={[styles.input, styles.textArea]}
+              <Field
                 placeholder={t('import_placeholder')}
-                placeholderTextColor="#888"
                 multiline
                 {...SEED_INPUT_PROPS}
                 value={seedPhrase}
@@ -6471,48 +6332,14 @@ const WalletScreen = () => {
               )}
 
               {renderFormError(passwordError, seedPhrase.trim().length > 0)}
-              
-              {/* Terms of Service Checkbox */}
-              <View style={styles.termsContainer}>
-              <TouchableOpacity 
-                  style={styles.checkbox}
-                  onPress={() => setTermsAccepted(!termsAccepted)}
-                >
-                  <View style={[styles.checkboxInner, termsAccepted && styles.checkboxChecked]}>
-                    {termsAccepted && <Text style={styles.checkmark}>✓</Text>}
-                  </View>
-                </TouchableOpacity>
-                <View style={styles.termsTextContainer}>
-                  <Text style={styles.termsText}>
-                    {termsParts[0]}
-                    <Text style={styles.termsLink} onPress={() => setShowTermsModal(true)} accessibilityRole="link">{t('terms_of_service')}</Text>
-                    {termsParts[1]}
-                  </Text>
-                </View>
-              </View>
-              
-              <TouchableOpacity 
-                style={[styles.button, !termsAccepted && styles.buttonDisabled]}
+
+              {renderTermsRow()}
+
+              <Action
+                label={loading ? t('importing') : t('import_title')}
                 onPress={importWallet}
                 disabled={loading || !termsAccepted}
-              >
-                <Text style={styles.buttonText}>
-                  {loading ? t('importing') : t('import_title')}
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton]}
-                onPress={() => {
-                  if (deviceAuth) { setShowCreateOptions(false); setPassword(''); setConfirmPassword(''); } // no password step under the screen lock
-                  setImportStep(1);
-                  forgetImportPhrase();
-                  setPasswordError('');
-                  setTermsAccepted(false); // Reset terms
-                }}
-              >
-                <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('common_back')}</Text>
-              </TouchableOpacity>
+              />
             </ScrollView>
             </KeyboardAvoidingView>
             {renderTermsModal()}
@@ -6532,31 +6359,30 @@ const WalletScreen = () => {
 
     return (
       <SafeAreaView
-        style={[styles.container, dirStyle]}
+        style={styles.container}
         edges={SCREEN_EDGES}
       >
         {renderBrowserPane('locked')}
         {/* A plain lock screen (owner, 04.10): the app's mark and name, the unlock itself, and the way out for a
             forgotten unlock as a small link that opens its own confirmation. No erase choice stands next to Unlock.
             The column scrolls when a very large system font makes it taller than the screen. */}
-        <ScrollView contentContainerStyle={styles.lockColumn} keyboardShouldPersistTaps="handled" testID="lock-column">
-          <Image source={require('../../assets/qnet_logo.png')} style={styles.lockLogo} resizeMode="contain" />
-          <Text style={styles.title}>{t('qnet_wallet')}</Text>
-          {linkRequest ? <Text style={styles.modalWarning}>{t('link_waiting_unlock')}</Text> : null}
+        <HexField />
+        <ScrollView contentContainerStyle={styles.fieldColumn} keyboardShouldPersistTaps="handled" testID="lock-column">
+          <AppMark />
+          <Text style={styles.display}>{t('qnet_wallet')}</Text>
+          {linkRequest ? <Text style={styles.lockNote}>{t('link_waiting_unlock')}</Text> : null}
           {/* The apps that can read the screen and act for you, under either lock: a password is typed here, and the
               screen lock's prompt is approved here. */}
           {lockReaders.length > 0 ? (
-            <Text style={styles.modalWarning}>
+            <Text style={styles.lockNote}>
               {t(deviceAuth ? 'readers_confirm_note' : 'readers_lock_note', { apps: lockReaders.join(', ') })}
             </Text>
           ) : null}
 
           {lockoutMs > 0 ? (
-            <View style={styles.lockoutBanner}>
-              <Text style={styles.lockoutText}>
-                {t('unlock_locked_for', { time: lockoutDisplay })}
-              </Text>
-            </View>
+            <Text style={styles.lockoutText}>
+              {t('unlock_locked_for', { time: lockoutDisplay })}
+            </Text>
           ) : deviceAuth ? (
             /* Under the screen lock the system prompt opens by itself (autoUnlockRef: at every start, every lock and
                every auto-lock), so nothing stands under it; once it ended without opening the wallet, Unlock asks again. */
@@ -6566,24 +6392,20 @@ const WalletScreen = () => {
               ) : null}
 
               {unlockPrompting ? null : (
-                <TouchableOpacity
-                  style={styles.button}
+                <Action
+                  label={loading ? t('unlocking') : t('unlock_wallet')}
                   onPress={handleBiometricUnlock}
                   disabled={loading}
                   testID="unlock-button"
-                >
-                  <Text style={styles.buttonText}>
-                    {loading ? t('unlocking') : t('unlock_wallet')}
-                  </Text>
-                </TouchableOpacity>
+                />
               )}
             </>
           ) : (
             <>
-              <TextInput
-                style={styles.input}
+              <Field
+                label={t('password')}
+                style={styles.lockField}
                 placeholder={t('enter_password')}
-                placeholderTextColor="#888"
                 {...PASSWORD_INPUT_PROPS}
                 value={typedPassword}
                 onChangeText={setPassword}
@@ -6595,40 +6417,33 @@ const WalletScreen = () => {
                 <Text style={styles.lockMessage} testID="unlock-message">{unlockError}</Text>
               ) : null}
 
-              <TouchableOpacity
-                style={styles.button}
+              <Action
+                label={loading ? t('unlocking') : t('unlock_wallet')}
                 onPress={unlockWallet}
                 disabled={loading}
                 testID="unlock-button"
-              >
-                <Text style={styles.buttonText}>
-                  {loading ? t('unlocking') : t('unlock_wallet')}
-                </Text>
-              </TouchableOpacity>
+                style={styles.formAction}
+              />
 
               {biometricEnabled && (
-                <TouchableOpacity
-                  style={[styles.button, styles.secondaryButton]}
-                  onPress={handleBiometricUnlock}
-                >
-                  <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('biometric_unlock')}</Text>
-                </TouchableOpacity>
+                <Action kind="secondary" label={t('biometric_unlock')} onPress={handleBiometricUnlock} />
               )}
             </>
           )}
+
+          {/* A forgotten unlock: the wallet is erased here (typed ERASE, and under the screen lock a fresh device check)
+              and restored from its recovery phrase. In the column under the unlock, never while the system prompt is up. */}
+          {deviceAuth && unlockPrompting ? null : (
+            <Action
+              kind="quiet"
+              align="center"
+              label={t('unlock_forgot_reset')}
+              onPress={() => { setEraseText(''); setShowEraseConfirm(true); }}
+              testID="unlock-forgot"
+              style={styles.lockForgot}
+            />
+          )}
         </ScrollView>
-        {/* A forgotten unlock: the wallet is erased here (typed ERASE, and under the screen lock a fresh device check) and
-            restored from its recovery phrase. Out of the way, and never while the system prompt is up. */}
-        {deviceAuth && unlockPrompting ? null : (
-          <TouchableOpacity
-            style={styles.lockForgot}
-            onPress={() => { setEraseText(''); setShowEraseConfirm(true); }}
-            accessibilityRole="button"
-            testID="unlock-forgot"
-          >
-            <Text style={styles.lockForgotText} numberOfLines={2}>{t('unlock_forgot_reset')}</Text>
-          </TouchableOpacity>
-        )}
         {renderEraseConfirm()}
         {renderCustomAlert()}
       </SafeAreaView>
@@ -6643,7 +6458,6 @@ const WalletScreen = () => {
           return (
             <SolanaSendForm
               t={t}
-              rtl={rtl}
               owner={wallet.solanaAddress || wallet.address}
               symbol={sendingToken.symbol}
               onSymbol={switchSolanaToken}
@@ -6655,7 +6469,6 @@ const WalletScreen = () => {
               fromLink={sendFromLink}
               balances={{ SOL: fmtAmount(balance, 9), '1DEV': fmtAmount(tokenBalances['1dev'], 6) }}
               mask={shownBalance}
-              backArrow={backArrow}
               onBack={closeSendScreen}
               onScan={() => setShowScan(true)}
               known={[...new Set(solanaSends.sends.map((e) => e.to))]}
@@ -6693,43 +6506,26 @@ const WalletScreen = () => {
               contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
               keyboardShouldPersistTaps="handled"
             >
-              {/* One compact row: Back, the title centred, and a spacer as wide as Back. */}
-              <View style={styles.sendScreenHeader}>
-                <TouchableOpacity onPress={closeSendScreen} style={styles.backButton} accessibilityRole="button">
-                  <Text style={styles.backButtonText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{`${backArrow} ${t('common_back')}`}</Text>
-                </TouchableOpacity>
-                <Text style={styles.sendScreenTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-                  {sendChoices.length > 1 ? t('assets_send') : t('send_title', { symbol: sendingToken.symbol })}
-                </Text>
-                <View style={styles.headerSpacer} />
-              </View>
-              
+              <Head
+                onBack={closeSendScreen}
+                backLabel={t('common_back')}
+                title={sendChoices.length > 1 ? t('assets_send') : t('send_title', { symbol: sendingToken.symbol })}
+              />
+
               {/* The token sent: QNC or a QNet token the Assets list shows, side by side and scrolled sideways when they are
-                  many, as the Solana form switches SOL and 1DEV. */}
-              {(() => {
-                const choices = sendChoices;
-                if (choices.length < 2) return null;
-                const active = sendingToken.contract || 'QNC';
-                return (
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.sendTokenScroll}
-                    contentContainerStyle={styles.sendTokenRow} accessibilityRole="tablist" keyboardShouldPersistTaps="handled">
-                    {choices.map((c) => (
-                      <TouchableOpacity
-                        key={c.key}
-                        style={[styles.historyChip, c.key === active && styles.historyChipActive]}
-                        onPress={() => switchQnetToken(c)}
-                        accessibilityRole="tab"
-                        accessibilityState={{ selected: c.key === active }}
-                        testID={'qnet-token-' + (c.contract ? c.contract.slice(0, 12) : 'QNC')}
-                      >
-                        <Text style={[styles.historyChipText, c.key === active && styles.historyChipTextActive]} numberOfLines={1}>
-                          {c.reserved ? '⚠ ' + c.symbol : c.symbol}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                );
-              })()}
+                  many, as the Solana form switches SOL and 1DEV; a token named after QNet is in Ember. */}
+              <Tabs
+                scroll
+                items={sendChoices.map((c) => ({
+                  key: c.key,
+                  label: c.symbol,
+                  icon: <TokenIcon network="qnet" symbol={c.symbol} contract={c.contract} size={20} />,
+                  tone: c.reserved ? 'warn' : null,
+                  testID: 'qnet-token-' + (c.contract ? c.contract.slice(0, 12) : 'QNC'),
+                }))}
+                value={sendingToken.contract || 'QNC'}
+                onChange={(key) => switchQnetToken(sendChoices.find((c) => c.key === key))}
+              />
 
               {/* The balance beside its label, as every figure (components/InfoRow); a token names its contract under it (and
                   one named after QNet is marked as not QNC), as on Assets. */}
@@ -6740,87 +6536,52 @@ const WalletScreen = () => {
                   <View style={styles.sendBalanceNotes}>
                     <Text style={styles.tokenPrice}>{t('tok_contract_id', { id: contractShortId(sendingToken.contract) })}</Text>
                     {sendingToken.reserved || usesReservedName(sendingToken.symbol, '') ? (
-                      <Text style={[styles.tokenPrice, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text>
+                      <Text style={[styles.tokenPrice, styles.tokenWarn]}>{t('tok_reserved_warning')}</Text>
                     ) : null}
                   </View>
                 ) : null}
               </View>
               
-              {/* Recipient Address; on QNet a scan icon at the field's end reads a QNet address from a QR code. */}
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>{t('send_to_address')}</Text>
-                <View style={styles.recipientField}>
-                  <TextInput
-                    style={[styles.input, styles.recipientInput, sendingToken.network === 'qnet' && styles.recipientInputScan]}
-                    placeholder={t(sendingToken.network === 'qnet' ? 'send_placeholder_eon' : 'send_placeholder_address')}
-                    placeholderTextColor="#888"
-                    value={sendAddress}
-                    onChangeText={onRecipientChange}
-                    autoCapitalize="none"
-                    autoCorrect={false}
+              {/* The recipient; on QNet, Scan at the end of its label's line reads a QNet address from a QR code. */}
+              <Field
+                label={t('send_to_address')}
+                placeholder={t(sendingToken.network === 'qnet' ? 'send_placeholder_eon' : 'send_placeholder_address')}
+                value={sendAddress}
+                onChangeText={onRecipientChange}
+                autoCapitalize="none"
+                autoCorrect={false}
+                end={sendingToken.network === 'qnet' ? (
+                  <Action
+                    kind="act"
+                    label={t('send_scan')}
+                    accessibilityLabel={t('scan_title')}
+                    onPress={() => { Keyboard.dismiss(); setShowScan(true); }}
+                    testID="send-scan"
                   />
-                  {sendingToken.network === 'qnet' ? (
-                    <TouchableOpacity
-                      style={styles.scanButton}
-                      onPress={() => { Keyboard.dismiss(); setShowScan(true); }}
-                      accessibilityRole="button"
-                      accessibilityLabel={t('scan_title')}
-                      // Only outwards, past the field's edge: inwards the text ends where the icon's target starts.
-                      hitSlop={{ top: 8, bottom: 8, [rtl ? 'left' : 'right']: 8 }}
-                      testID="send-scan"
-                    >
-                      <ScanIcon color="#00d4ff" />
-                    </TouchableOpacity>
-                  ) : null}
-                </View>
-              </View>
-              
-              {/* Amount Input */}
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>{t('send_amount')}</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="0.00"
-                  placeholderTextColor="#888"
-                  keyboardType="decimal-pad"
-                  value={sendAmount}
-                  onChangeText={validateAmountInput}
-                  maxLength={20}
-                />
-                {/* A token takes no more decimals than its own (L-9): said under the field, before Send refuses it. */}
-                {sendingToken.contract && (String(sendAmount || '').split('.')[1] || '').length > (Number(sendingToken.decimals) || 0) ? (
-                  <Text style={[styles.tokenPrice, { color: '#ff5555' }]} testID="send-amount-decimals">
-                    {t('err_AMOUNT_DECIMALS', { decimals: Number(sendingToken.decimals) || 0 })}
-                  </Text>
                 ) : null}
+              />
 
-                {/* Percentage Buttons */}
-                <View style={styles.percentageButtons}>
-                  <TouchableOpacity 
-                    style={styles.percentButton}
-                    onPress={() => setAmountPercentage(25)}
-                  >
-                    <Text style={styles.percentButtonText}>25%</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity 
-                    style={styles.percentButton}
-                    onPress={() => setAmountPercentage(50)}
-                  >
-                    <Text style={styles.percentButtonText}>50%</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity 
-                    style={styles.percentButton}
-                    onPress={() => setAmountPercentage(75)}
-                  >
-                    <Text style={styles.percentButtonText}>75%</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity 
-                    style={styles.percentButton}
-                    onPress={() => setAmountPercentage(100)}
-                  >
-                    <Text style={styles.percentButtonText}>{t('send_max')}</Text>
-                  </TouchableOpacity>
-                </View>
+              <Field
+                label={t('send_amount')}
+                style={styles.amountField}
+                placeholder="0.00"
+                keyboardType="decimal-pad"
+                value={sendAmount}
+                onChangeText={validateAmountInput}
+                maxLength={20}
+              />
+              {/* A token takes no more decimals than its own (L-9): said under the field, before Send refuses it. */}
+              {sendingToken.contract && (String(sendAmount || '').split('.')[1] || '').length > (Number(sendingToken.decimals) || 0) ? (
+                <Text style={[styles.tokenPrice, styles.tokenWarn]} testID="send-amount-decimals">
+                  {t('err_AMOUNT_DECIMALS', { decimals: Number(sendingToken.decimals) || 0 })}
+                </Text>
+              ) : null}
+
+              {/* A share of the balance, as acts in one start-aligned line. */}
+              <View style={styles.percentageButtons}>
+                {[[25, '25%'], [50, '50%'], [75, '75%'], [100, t('send_max')]].map(([share, label]) => (
+                  <Action key={share} kind="act" label={label} onPress={() => setAmountPercentage(share)} />
+                ))}
               </View>
               
               {/* The network fee, and the total the balance check charges (amount + fee for QNC; a QRC-20 send pays its fee
@@ -6840,24 +6601,16 @@ const WalletScreen = () => {
                 ) : null}
               </View>
               
-              {/* Send Button: busy, with a spinner, from the tap until the send is over (pressSend). */}
-              <TouchableOpacity
-                style={[styles.button, (!sendAddress || !sendAmount || sendingTransaction || sendChecking) && styles.buttonDisabled]}
+              {/* Send: busy, with a spinner, from the tap until the send is over (pressSend). */}
+              <Action
+                label={t('send_button')}
+                busy={sendChecking || sendingTransaction}
+                busyLabel={sendingTransaction ? t('sending') : t('send_button')}
+                busyTestID="send-busy"
                 onPress={pressSend}
-                disabled={!sendAddress || !sendAmount || sendingTransaction || sendChecking}
-                accessibilityRole="button"
-                accessibilityState={{ busy: sendChecking || sendingTransaction }}
+                disabled={!sendAddress || !sendAmount}
                 testID="send-button"
-              >
-                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center' }}>
-                  {(sendChecking || sendingTransaction) && (
-                    <ActivityIndicator size="small" color="#1a1a2e" style={{ marginEnd: 8 }} testID="send-busy" />
-                  )}
-                  <Text style={styles.buttonText}>
-                    {sendingTransaction ? t('sending') : t('send_button')}
-                  </Text>
-                </View>
-              </TouchableOpacity>
+              />
             </ScrollView>
             </KeyboardAvoidingView>
             )} />
@@ -6882,44 +6635,25 @@ const WalletScreen = () => {
                   figureWaitersRef.current.push(resolve);
                   Promise.resolve(loadBalance(wallet.publicKey)).catch(() => {}).finally(resolve);
                 }))}
-                colors={['#00d4ff']}
-                tintColor="#00d4ff"
-                titleColor="#00d4ff"
-                title={t('pull_to_refresh')}
+                colors={[color.signal]}
+                tintColor={color.signal}
               />
             }
           >
-            {/* Network Selector */}
-            <View style={styles.networkSelector}>
-              <TouchableOpacity 
-                style={[styles.networkTab, selectedNetwork === 'qnet' && styles.networkTabActive]}
-                onPress={() => {
-                  setSelectedNetwork('qnet');
-                  // Refresh balance for QNet network
-                  if (wallet && wallet.publicKey) {
-                    loadBalance(wallet.publicKey);
-                  }
-                }}
-              >
-                <Text style={[styles.networkTabText, selectedNetwork === 'qnet' && styles.networkTabTextActive]}>{CHAIN_NAME}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.networkTab, selectedNetwork === 'solana' && styles.networkTabActive]}
-                onPress={() => {
-                  setSelectedNetwork('solana');
-                  // Refresh balance for Solana network
-                  if (wallet && wallet.publicKey) {
-                    loadBalance(wallet.publicKey);
-                  }
-                }}
-              >
-                <Text style={[styles.networkTabText, selectedNetwork === 'solana' && styles.networkTabTextActive]}>Solana</Text>
-              </TouchableOpacity>
-            </View>
+            {/* The network shown; a switch reads its balances again. */}
+            <Tabs
+              items={[{ key: 'qnet', label: CHAIN_NAME }, { key: 'solana', label: 'Solana' }]}
+              value={selectedNetwork}
+              onChange={(key) => {
+                setSelectedNetwork(key);
+                if (wallet && wallet.publicKey) {
+                  loadBalance(wallet.publicKey);
+                }
+              }}
+            />
 
-            {/* The address in full on one line, fitted to the card (the font shrinks before anything wraps or is cut; a
-                larger system text size counts up to 1.2 times, so the smallest fit holds it on a 320 dp screen); the
-                address itself copies it. */}
+            {/* The address on one line, cut in its middle to fit, in one rounded element a tap copies (the glyph turns to a
+                tick and the line says it was copied). */}
             {(() => {
               const cardAddress = selectedNetwork === 'qnet'
                 ? (wallet.qnetAddress || wallet.address)
@@ -6927,48 +6661,34 @@ const WalletScreen = () => {
               const cardType = selectedNetwork === 'qnet' ? 'qnet' : 'solana';
               const copied = copiedAddress === cardType;
               return (
-                <TouchableOpacity
-                  style={styles.addressContainer}
+                <Pressable
                   onPress={() => copyToClipboard(cardAddress, cardType)}
+                  style={({ pressed }) => [styles.addressPill, copied && styles.addressPillDone, pressed && styles.rowPressed]}
                   accessibilityRole="button"
                   accessibilityLabel={cardAddress}
                   accessibilityHint={t('common_tap_to_copy')}
                   testID="address-card"
                 >
-                  <View style={styles.addressRow}>
-                    <Text
-                      style={[styles.addressText, copied && styles.addressTextCopied]}
-                      numberOfLines={1}
-                      adjustsFontSizeToFit
-                      minimumFontScale={0.5}
-                      maxFontSizeMultiplier={1.2}
-                    >
-                      {cardAddress}
-                    </Text>
-                  </View>
-                  <Text style={[styles.copyHint, copied && { color: '#00ff00' }]}>
-                    {copied ? `✓ ${t('copied_check')}` : t('common_tap_to_copy')}
+                  <Text style={[styles.addressPillText, copied && styles.addressPillCopied]} {...ADDRESS_LINE}>
+                    {copied ? t('common_copied') : cardAddress}
                   </Text>
-                </TouchableOpacity>
+                  <CopyGlyph done={copied} />
+                </Pressable>
               );
             })()}
 
             {/* Send and Receive live here (the bottom bar has no tab for them). Send opens QNC on QNet and SOL on Solana,
                 whose Send screen switches to the other Solana token. */}
-            <View style={styles.assetActions}>
-              <TouchableOpacity
-                style={styles.assetAction}
-                onPress={() => (selectedNetwork === 'qnet'
-                  ? openSendModal('QNC', tokenBalances.qnc, 'qnet') : openSendModal('SOL', balance, 'solana'))}
-                accessibilityRole="button"
-                testID="assets-send"
-              >
-                <Text style={styles.assetActionText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{t('assets_send')}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.assetAction} onPress={() => setActiveTab('receive')} accessibilityRole="button">
-                <Text style={styles.assetActionText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{t('assets_receive')}</Text>
-              </TouchableOpacity>
-            </View>
+            <ActionPair
+              style={styles.assetActions}
+              start={{ label: t('assets_receive'), onPress: () => setActiveTab('receive') }}
+              end={{
+                label: t('assets_send'),
+                onPress: () => (selectedNetwork === 'qnet'
+                  ? openSendModal('QNC', tokenBalances.qnc, 'qnet') : openSendModal('SOL', balance, 'solana')),
+                testID: 'assets-send',
+              }}
+            />
 
             {/* One quiet line, steady while it holds: the network stopped certifying, or QNC reads failed for a sustained
                 time (balanceLine); reads that start and end say nothing. */}
@@ -6981,17 +6701,15 @@ const WalletScreen = () => {
                 whether the wallet still sends each by itself, and "Stop sending" where no node holds it. */}
             {selectedNetwork === 'qnet' && keptTxs.length > 0 && (
               <View style={styles.tokenList}>
-                <Text style={styles.tokenName}>{t('kept_title', { count: keptTxs.length })}</Text>
+                <Text style={styles.listKicker}>{t('kept_title', { count: keptTxs.length })}</Text>
                 {keptTxs.map((p) => (
                   <View key={`kept-${p.nonce}`} style={styles.tokenItem}>
                     <View style={styles.tokenDetails}>
-                      <Text style={styles.tokenPrice}>{pendingLine(t, p)}</Text>
+                      <Text style={styles.keptLine}>{pendingLine(t, p)}</Text>
                       <Text style={styles.tokenPrice}>{keptStatus(p)}</Text>
                     </View>
                     {p.canStop && (
-                      <TouchableOpacity onPress={() => { stopKept(p); }} accessibilityRole="button">
-                        <Text style={[styles.tokenPrice, { color: '#ff5555' }]}>{t('kept_stop')}</Text>
-                      </TouchableOpacity>
+                      <Action kind="destructive" label={t('kept_stop')} onPress={() => { stopKept(p); }} align="end" />
                     )}
                   </View>
                 ))}
@@ -7003,33 +6721,28 @@ const WalletScreen = () => {
               <View style={styles.tokenList}>
                 {/* QNC Token - Clickable to open Send screen. Hidden if toggled off in the token manager. */}
                 {!hiddenTokens.has('native:qnc') && (
-                <TouchableOpacity
-                  style={tokenRowStyle(figure('qnc', fmtAmount(tokenBalances.qnc, 5)))}
+                <Pressable
+                  style={({ pressed }) => [tokenRowStyle(figure('qnc', fmtAmount(tokenBalances.qnc, 5))), pressed && styles.rowPressed]}
                   onPress={() => openSendModal('QNC', tokenBalances.qnc, 'qnet')}
-                  activeOpacity={0.6}
+                  accessibilityRole="button"
                 >
                   <View style={styles.tokenInfo}>
-                    <View style={styles.tokenIcon}>
-                        <Image
-                        source={require('../../assets/qnet_logo.png')}
-                          style={styles.tokenIconImage}
-                          resizeMode="contain"
-                        />
-                    </View>
+                    <TokenIcon network="qnet" symbol="QNC" style={styles.tokenIcon} />
                     <View style={styles.tokenDetails}>
                       <Text style={styles.tokenName}>QNC</Text>
                     </View>
                   </View>
                   <TokenBalance text={figure('qnc', fmtAmount(tokenBalances.qnc, 5))} />
-                </TouchableOpacity>
+                </Pressable>
                 )}
-                {/* QRC-20 holdings + custom tokens (deduped, hidden filtered via ⋮ manager); tap=Send, long-press=hide. */}
+                {/* QRC-20 holdings + custom tokens (deduped, hidden in the token manager); tap=Send, long-press=hide. */}
                 {qrcTokens.filter((tk) => isTokenShown(tk.contract)).map((tk) => {
                   const reserved = usesReservedName(tk.symbol, tk.name);
                   return (
-                  <TouchableOpacity
+                  <Pressable
                     key={tk.contract}
-                    style={tokenRowStyle(shownBalance(tokenFigure(tk)))}
+                    style={({ pressed }) => [tokenRowStyle(shownBalance(tokenFigure(tk))), pressed && styles.rowPressed]}
+                    accessibilityRole="button"
                     onPress={() => openSendModal(
                       tokenTitle(tk),
                       parseFloat(tk.balance) || 0,
@@ -7043,107 +6756,56 @@ const WalletScreen = () => {
                         { text: t('tok_hide'), style: 'destructive', onPress: () => hideToken(tk.contract) },
                       ]);
                     }}
-                    activeOpacity={0.6}
                   >
+                    {/* A token with a contract wears its letter, never a known icon; its symbol and contract say which it is. */}
                     <View style={styles.tokenInfo}>
-                      {(() => {
-                        // Token icon: an inert emoji logo, else a deterministic coloured-circle letter
-                        // avatar (colour from the contract address). Privacy: a node-supplied https logo
-                        // is never loaded as <Image> here — it would leak the device IP/timing to an
-                        // attacker-controlled host — so a URL logo falls through to the letter avatar.
-                        const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
-                        const isEmoji = isGlyphLogo(logo);
-                        let h = 0;
-                        const seed = String(tk.contract || tk.symbol || '?');
-                        for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-                        const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
-                        return (
-                          <View style={[styles.tokenIcon, { backgroundColor: bg, borderRadius: 20 }]}>
-                            <Text style={[styles.tokenIconText, { color: '#ffffff' }]}>
-                              {isEmoji ? logo : tokenInitial(tk)}
-                            </Text>
-                          </View>
-                        );
-                      })()}
+                      <TokenIcon network="qnet" symbol={tk.symbol} contract={tk.contract} style={styles.tokenIcon} />
                       <View style={styles.tokenDetails}>
                         {/* A token's symbol and name wrap rather than lose their ends (where a look-alike differs). */}
-                        <Text style={styles.tokenName}>{tokenTitle(tk)}</Text>
+                        <Text style={[styles.tokenName, reserved && styles.tokenWarn]}>{tokenTitle(tk)}</Text>
                         {!!tk.name && tk.name !== tk.symbol && (
                           <Text style={styles.tokenPrice}>{tokenLabel(tk.name)}</Text>
                         )}
                         {/* Every token row names its contract; one named after QNet is marked as not QNC. */}
                         <Text style={styles.tokenPrice}>{t('tok_contract_id', { id: contractShortId(tk.contract) })}</Text>
-                        {reserved && <Text style={[styles.tokenPrice, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text>}
+                        {reserved && <Text style={[styles.tokenPrice, styles.tokenWarn]}>{t('tok_reserved_warning')}</Text>}
                       </View>
                     </View>
                     <TokenBalance text={shownBalance(tokenFigure(tk))} />
-                  </TouchableOpacity>
+                  </Pressable>
                   );
                 })}
                 {(() => {
                   // Tokens sent to this wallet unasked: off the list until the user shows them (MOBNET-R2-08).
                   const unasked = qrcTokens.filter((tk) => tk.contract && !hiddenTokens.has(tk.contract) && !isTokenShown(tk.contract)).length;
                   return unasked > 0 ? (
-                    <TouchableOpacity onPress={() => { setTokenMgrQuery(''); setShowTokenManager(true); }} accessibilityRole="button">
-                      <Text style={[styles.tokenPrice, { textAlign: 'center', marginTop: 8 }]}>{t('tok_unasked_hidden', { count: unasked })}</Text>
-                    </TouchableOpacity>
+                    <Text style={styles.inlineLink} onPress={() => { setTokenMgrQuery(''); setShowTokenManager(true); }} accessibilityRole="link">
+                      {t('tok_unasked_hidden', { count: unasked })}
+                    </Text>
                   ) : null;
                 })()}
               </View>
             ) : (
               <View style={styles.tokenList}>
-                {/* SOL Token - opens its Send screen */}
-                <TouchableOpacity
-                  style={tokenRowStyle(figure('sol', fmtAmount(balance, 4)))}
-                  onPress={() => openSendModal('SOL', balance, 'solana')}
-                  activeOpacity={0.6}
-                  testID="solana-row-SOL"
-                >
-                  <View style={styles.tokenInfo}>
-                    <View style={styles.tokenIcon}>
-                      {getTokenIconUrl('SOL') ? (
-                        <Image 
-                          source={{uri: getTokenIconUrl('SOL')}} 
-                          style={styles.tokenIconImage}
-                          resizeMode="contain"
-                        />
-                      ) : (
-                      <Text style={styles.tokenIconText}>S</Text>
-                      )}
+                {/* Said once for both rows: the Solana network this build uses. */}
+                <Text style={styles.tokenPrice}>{t('solana_devnet')}</Text>
+                {[['SOL', 'sol', balance], ['1DEV', 'oneDev', tokenBalances['1dev']]].map(([symbol, key, value]) => (
+                  <Pressable
+                    key={symbol}
+                    style={({ pressed }) => [tokenRowStyle(figure(key, fmtAmount(value, 4))), pressed && styles.rowPressed]}
+                    onPress={() => openSendModal(symbol, value, 'solana')}
+                    accessibilityRole="button"
+                    testID={`solana-row-${symbol}`}
+                  >
+                    <View style={styles.tokenInfo}>
+                      <TokenIcon network="solana" symbol={symbol} style={styles.tokenIcon} />
+                      <View style={styles.tokenDetails}>
+                        <Text style={styles.tokenName}>{symbol}</Text>
+                      </View>
                     </View>
-                    <View style={styles.tokenDetails}>
-                      <Text style={styles.tokenName}>SOL</Text>
-                      <Text style={styles.tokenPrice}>{t('solana_devnet')}</Text>
-                    </View>
-                  </View>
-                  <TokenBalance text={figure('sol', fmtAmount(balance, 4))} />
-                </TouchableOpacity>
-                {/* 1DEV Token - opens its Send screen */}
-                <TouchableOpacity
-                  style={tokenRowStyle(figure('oneDev', fmtAmount(tokenBalances['1dev'], 4)))}
-                  onPress={() => openSendModal('1DEV', tokenBalances['1dev'], 'solana')}
-                  activeOpacity={0.6}
-                  testID="solana-row-1DEV"
-                >
-                  <View style={styles.tokenInfo}>
-                    <View style={styles.tokenIcon}>
-                      {getTokenIconUrl('1DEV') ? (
-                        <Image 
-                          source={{uri: getTokenIconUrl('1DEV')}} 
-                          style={styles.tokenIconImage}
-                          resizeMode="contain"
-                        />
-                      ) : (
-                      <Text style={styles.tokenIconText}>D</Text>
-                      )}
-                    </View>
-                    <View style={styles.tokenDetails}>
-                      <Text style={styles.tokenName}>1DEV</Text>
-                      <Text style={styles.tokenPrice}>{t('solana_devnet')}</Text>
-                    </View>
-                  </View>
-                  <TokenBalance text={figure('oneDev', fmtAmount(tokenBalances['1dev'], 4))} />
-                </TouchableOpacity>
+                    <TokenBalance text={figure(key, fmtAmount(value, 4))} />
+                  </Pressable>
+                ))}
               </View>
             )}
 
@@ -7170,56 +6832,43 @@ const WalletScreen = () => {
             bounces={true}
             scrollEnabled={true}
           >
-            {/* Receive opens from Assets (the bottom bar keeps Assets lit); Back returns there. The same compact row as
-                Send: Back, the title, a spacer. */}
-            <View style={styles.sendScreenHeader}>
-              <TouchableOpacity onPress={() => setActiveTab('assets')} style={styles.backButton} accessibilityRole="button">
-                <Text style={styles.backButtonText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{`${backArrow} ${t('common_back')}`}</Text>
-              </TouchableOpacity>
-              <Text style={styles.sendScreenTitle} numberOfLines={1}>{t('receive_title')}</Text>
-              <View style={styles.headerSpacer} />
+            {/* Receive opens from Assets (the bottom bar keeps Assets lit); Back returns there. */}
+            <Head onBack={() => setActiveTab('assets')} backLabel={t('common_back')} title={t('receive_title')} />
+
+            {/* The code on white with its quiet zone (a camera needs it), at the column's start; then what the address
+                takes, and the address whole in one rounded element a tap copies. */}
+            <View style={styles.qrWrapper}>
+              <QRCode
+                value={currentReceiveAddress || '-'}
+                size={176}
+                quietZone={24}
+                color={color.qrDark}
+                backgroundColor={color.qrLight}
+              />
             </View>
-
-            <View style={styles.receiveContent}>
-              {/* REAL QR Code */}
-              <View style={styles.qrContainer}>
-                <View style={styles.qrWrapper}>
-                  <QRCode
-                    value={currentReceiveAddress || '-'}
-                    size={200}
-                    color='black'
-                    backgroundColor='white'
-                  />
-                </View>
-              </View>
-
-              {/* One line on what the address takes, then the address in full on one line (fitted as on the Assets card);
-                  tapping it copies it. */}
-              <View style={styles.addressDisplay}>
-                <Text style={[styles.label, { textAlign: 'center' }]}>
-                  {t(selectedNetwork === 'qnet' ? 'receive_your_qnet' : 'receive_your_solana')}
-                </Text>
-
-                <TouchableOpacity
-                  onPress={() => {
-                    const addressType = selectedNetwork === 'qnet' ? 'qnet-receive' : 'solana-receive';
-                    copyToClipboard(currentReceiveAddress, addressType);
-                  }}
-                  activeOpacity={0.7}
+            <View style={styles.receiveHead}>
+              <TokenIcon network={selectedNetwork === 'qnet' ? 'qnet' : 'solana'} symbol={selectedNetwork === 'qnet' ? 'QNC' : 'SOL'} size={24} />
+              <Text style={styles.receiveLine}>
+                {t(selectedNetwork === 'qnet' ? 'receive_your_qnet' : 'receive_your_solana')}
+              </Text>
+            </View>
+            {(() => {
+              const addressType = selectedNetwork === 'qnet' ? 'qnet-receive' : 'solana-receive';
+              const copied = copiedAddress === addressType;
+              return (
+                <Pressable
+                  onPress={() => copyToClipboard(currentReceiveAddress, addressType)}
+                  style={({ pressed }) => [styles.addressPill, copied && styles.addressPillDone, pressed && styles.rowPressed]}
                   accessibilityRole="button"
                   accessibilityLabel={currentReceiveAddress}
-                  accessibilityHint={t('common_tap_to_copy')}
+                  accessibilityHint={t(copied ? 'common_copied' : 'common_tap_to_copy')}
                   testID="receive-address"
                 >
-                  <Text style={styles.addressText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5} maxFontSizeMultiplier={1.2}>
-                    {currentReceiveAddress}
-                  </Text>
-                  <Text style={styles.tapToCopy}>
-                    {copiedAddress.includes('receive') ? `✓ ${t('copied_check')}` : t('common_tap_to_copy')}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </View>
+                  <SubjectAddress address={currentReceiveAddress} />
+                  <CopyGlyph done={copied} />
+                </Pressable>
+              );
+            })()}
           </ScrollView>
           )} />
         );
@@ -7257,42 +6906,34 @@ const WalletScreen = () => {
               : <HistoryRow tx={item} onOpen={openTxDetail} hideAmounts={balancesHidden} t={t} />)}
             ListHeaderComponent={
               <>
-                <Text style={[styles.sectionTitle, { marginBottom: 16 }]}>{t('hist_title')}</Text>
+                <Head title={t('hist_title')} />
                 {/* The same network selector as Assets, sharing its choice. */}
-                <View style={styles.networkSelector}>
-                  {[['qnet', CHAIN_NAME], ['solana', 'Solana']].map(([key, name]) => (
-                    <TouchableOpacity
-                      key={key}
-                      style={[styles.networkTab, selectedNetwork === key && styles.networkTabActive]}
-                      onPress={() => setSelectedNetwork(key)}
-                      accessibilityRole="tab"
-                      accessibilityState={{ selected: selectedNetwork === key }}
-                      testID={`history-network-${key}`}
-                    >
-                      <Text style={[styles.networkTabText, selectedNetwork === key && styles.networkTabTextActive]}>{name}</Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
+                <Tabs
+                  items={[{ key: 'qnet', label: CHAIN_NAME }, { key: 'solana', label: 'Solana' }]}
+                  value={selectedNetwork}
+                  onChange={setSelectedNetwork}
+                  testIDPrefix="history-network"
+                />
                 {unaskedRows > 0 ? (
-                  <TouchableOpacity onPress={() => { setTokenMgrQuery(''); setShowTokenManager(true); }} accessibilityRole="button">
-                    <Text style={[styles.tokenPrice, { textAlign: 'center', marginBottom: 12 }]}>{t('hist_unasked_hidden', { count: unaskedRows })}</Text>
-                  </TouchableOpacity>
+                  <Text style={styles.inlineLink} onPress={() => { setTokenMgrQuery(''); setShowTokenManager(true); }} accessibilityRole="link">
+                    {t('hist_unasked_hidden', { count: unaskedRows })}
+                  </Text>
                 ) : null}
                 {/* Only this device's Solana sends are listed: said once, above the Solana list. */}
                 {onQnet ? null : (
-                  <Text style={[styles.tokenPrice, { textAlign: 'center', marginBottom: 12 }]} testID="history-solana-scope">{t('hist_solana_scope')}</Text>
+                  <Text style={styles.histScope} testID="history-solana-scope">{t('hist_solana_scope')}</Text>
                 )}
               </>
             }
             ListEmptyComponent={
-              <View style={{ alignItems: 'center', paddingVertical: 40 }}>
-                <Text style={{ color: '#666', fontSize: 16, textAlign: 'center' }}>{t('hist_empty')}</Text>
+              <View style={styles.histEmptyBox}>
+                <Text style={styles.histEmpty}>{t('hist_empty')}</Text>
               </View>
             }
             onEndReached={onQnet ? loadOlderHistory : undefined}
             onEndReachedThreshold={0.5}
             ListFooterComponent={onQnet && historyLoadingOlder
-              ? <Text style={{ color: '#666', fontSize: 12, textAlign: 'center', paddingVertical: 16 }}>{t('hist_loading_older')}</Text>
+              ? <Text style={styles.histLoadingOlder}>{t('hist_loading_older')}</Text>
               : null}
             showsVerticalScrollIndicator={true}
             onScroll={handleUserActivity}
@@ -7305,8 +6946,8 @@ const WalletScreen = () => {
               <RefreshControl
                 refreshing={refreshing.history}
                 onRefresh={() => pullRefresh('history', () => loadTxHistory(true))}
-                colors={['#00d4ff']}
-                tintColor="#00d4ff"
+                colors={[color.signal]}
+                tintColor={color.signal}
               />
             }
           />
@@ -7340,6 +6981,7 @@ const WalletScreen = () => {
             scrollEnabled={true}
             onScroll={handleUserActivity}
             scrollEventThrottle={500}
+            stickyHeaderIndices={[0]}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing.node}
@@ -7351,20 +6993,20 @@ const WalletScreen = () => {
                     loadLightNodeStatus({ rewards: true }), loadSiteRecord({ force: true }),
                   ]);
                 })}
-                colors={['#00d4ff']}
-                tintColor="#00d4ff"
-                titleColor="#00d4ff"
-                title={t('pull_to_refresh')}
+                colors={[color.signal]}
+                tintColor={color.signal}
               />
             }
           >
+            {/* The title pinned over the scroll (stickyHeaderIndices), so the tiles pass under it and it is never cut. */}
+            <View style={styles.stickyHead}>
+              <Head title={t('node_title')} />
+            </View>
             {LEGACY_MOVE ? (
-              <View>
-                <Text style={styles.tabTitle}>{t('node_title')}</Text>
-                <Text style={styles.nodeExplainer}>{t('legacy_move_node')}</Text>
-              </View>
+              <Text style={styles.nodeExplainer}>{t('legacy_move_node')}</Text>
             ) : (
             <NodeTab
+              showHead={false}
               t={t}
               server={server}
               light={light}
@@ -7373,13 +7015,11 @@ const WalletScreen = () => {
               balancesHidden={balancesHidden}
               busy={{ move: processingValidation, use: nodeUseBusy }}
               refusal={useRefusal}
-              copied={copiedAddress}
               onMove={handleMoveLightBalance}
               onMoveServer={handleClaimServerNodeRewards}
               onUse={handleUseDevice}
               onPlayDialog={(kind) => { showPlayDialog(kind).catch(() => {}); }}
               onOpenBackground={() => { openBackgroundSettings().catch(() => {}); }}
-              onCopy={(id) => copyToClipboard(id)}
               nodeTitle={(type) => nodeTitle(t, type)}
               transit={transit.owner === wallet?.qnetAddress ? transit : null}
             />
@@ -7399,8 +7039,8 @@ const WalletScreen = () => {
             bounces={true}
             scrollEnabled={true}
           >
-            <Text style={styles.tabTitle}>{t('settings')}</Text>
-            
+            <Head title={t('settings')} />
+
             {/* General Settings */}
             <View style={styles.settingGroup}>
               <Text style={styles.settingGroupTitle}>{t('general')}</Text>
@@ -7418,6 +7058,13 @@ const WalletScreen = () => {
                 value={languageName(language)}
                 onPress={() => setShowLanguagePicker(true)}
               />
+              {/* A language of the other direction turns the layout when the app's JS starts again. */}
+              {layoutLags(language) ? (
+                <View style={styles.layoutNote} testID="layout-restart-note">
+                  <Text style={styles.settingSubtitle}>{t('layout_restart_note')}</Text>
+                  <Action kind="act" label={t('layout_restart')} onPress={restartForLayout} testID="layout-restart" />
+                </View>
+              ) : null}
             </View>
 
             {/* Security Settings - Lazy loaded */}
@@ -7426,7 +7073,7 @@ const WalletScreen = () => {
                 <Text style={styles.settingGroupTitle}>{t('security_options')}</Text>
 
                 {deviceCompromised && (
-                  <Text style={[styles.settingSubtitle, { color: '#ff9800', marginBottom: 10 }]}>
+                  <Text style={[styles.settingSubtitle, styles.settingWarning]}>
                     {t('set_rooted_warning')}
                   </Text>
                 )}
@@ -7434,57 +7081,43 @@ const WalletScreen = () => {
                 {/* Android, when the Keystore could not seal the vault: a copy of the app's data is protected by
                     the password alone (MVA-R2-04). Every unlock tries the seal again. */}
                 {!deviceAuth && hwSeal === 'unsealed' && (
-                  <Text style={[styles.settingSubtitle, { color: '#ffb74d', marginBottom: 8 }]}>
+                  <Text style={[styles.settingSubtitle, styles.settingWarning]}>
                     {t('hw_seal_missing')}
                   </Text>
                 )}
 
                 {/* A wallet under the screen lock has no password to change. */}
                 {!deviceAuth && (
-                <TouchableOpacity
-                  style={styles.actionButton}
-                  onPress={() => setShowChangePassword(true)}
-                >
-                  <Text style={styles.actionButtonText}>{t('change_password')}</Text>
-                </TouchableOpacity>
+                  <LinkRow title={t('change_password')} onPress={() => setShowChangePassword(true)} />
                 )}
 
                 {/* A password wallet on a device with a screen lock that can hold its secret may move there. */}
                 {!deviceAuth && deviceAuthAvail && (
-                  <TouchableOpacity
-                    style={styles.actionButton}
+                  <LinkRow
+                    title={t('set_device_unlock')}
                     onPress={() => { setBiometricPassword(''); setShowBiometricPasswordPrompt('device'); }}
-                  >
-                    <Text style={styles.actionButtonText}>{t('set_device_unlock')}</Text>
-                  </TouchableOpacity>
+                  />
                 )}
 
                 {biometricSupported && !deviceAuth && (
-                  <TouchableOpacity
-                    style={[styles.actionButton, biometricEnabled && { borderColor: '#4caf50', borderWidth: 1 }]}
+                  <LinkRow
+                    title={t('enable_biometric')}
                     onPress={handleToggleBiometric}
-                  >
-                    <Text style={styles.actionButtonText}>
-                      {biometricEnabled ? '✓ ' : ''}{t('enable_biometric')}
-                    </Text>
-                  </TouchableOpacity>
+                    end={<Toggle value={!!biometricEnabled} onValueChange={() => handleToggleBiometric()} accessibilityLabel={t('enable_biometric')} />}
+                  />
                 )}
 
-                <TouchableOpacity
-                  style={styles.actionButton}
+                <LinkRow
+                  title={t('export_recovery_phrase')}
                   onPress={() => { setExportWhat('phrase'); setShowExportSeed(true); }}
-                >
-                  <Text style={styles.actionButtonText}>{t('export_recovery_phrase')}</Text>
-                </TouchableOpacity>
+                />
 
                 {/* The private keys behind the same check as the phrase (WalletManager.revealPrivateKeys). */}
-                <TouchableOpacity
-                  style={styles.actionButton}
+                <LinkRow
+                  title={t('export_private_key')}
                   onPress={() => { setExportWhat('key'); setExportAccount('qnet'); setShowExportSeed(true); }}
                   testID="settings-export-key"
-                >
-                  <Text style={styles.actionButtonText}>{t('export_private_key')}</Text>
-                </TouchableOpacity>
+                />
               </View>
             )}
 
@@ -7499,16 +7132,22 @@ const WalletScreen = () => {
                 const d = describeOrigin(site.origin);
                 const name = d ? `${d.host}${d.port ? `:${d.port}` : ''}` : site.origin;
                 return (
-                  <SettingRow
+                  <LinkRow
                     key={site.origin}
                     title={name}
-                    host
-                    subtitle={d && d.idn ? `${site.origin} · ${t('sites_idn')}` : site.origin}
-                    subtitleLines={2}
-                    ltrSubtitle
-                    value={t('sites_revoke')}
-                    onPress={() => revokeSite(site.origin)}
-                    accessibilityLabel={`${t('sites_revoke')} ${name}`}
+                    middle
+                    note={d && d.idn ? `${site.origin} · ${t('sites_idn')}` : site.origin}
+                    noteLines={2}
+                    ltrNote
+                    end={(
+                      <Action
+                        kind="act"
+                        label={t('sites_revoke')}
+                        onPress={() => revokeSite(site.origin)}
+                        accessibilityLabel={`${t('sites_revoke')} ${name}`}
+                        align="end"
+                      />
+                    )}
                   />
                 );
               })}
@@ -7519,37 +7158,24 @@ const WalletScreen = () => {
             <View style={styles.settingGroup}>
               <Text style={styles.settingGroupTitle}>{t('network')}</Text>
 
-              <SettingRow title={t('current_network')} subtitle={`${CHAIN_NAME} testnet · ${t('solana_devnet')}`} />
+              <LinkRow title={t('current_network')} note={`${CHAIN_NAME} testnet · ${t('solana_devnet')}`} />
             </View>
 
             {/* The published texts, one tap from the app (the stores require the privacy policy in-app too). */}
             <View style={styles.settingGroup}>
               <Text style={styles.settingGroupTitle}>{t('set_legal')}</Text>
               {LEGAL_LINKS.map(([labelKey, url]) => (
-                <TouchableOpacity key={url} style={styles.actionButton} onPress={() => Linking.openURL(url).catch(() => {})}>
-                  <Text style={styles.actionButtonText}>{t(labelKey)}</Text>
-                </TouchableOpacity>
+                <LinkRow key={url} title={t(labelKey)} accessibilityRole="link" onPress={() => Linking.openURL(url).catch(() => {})} />
               ))}
             </View>
 
             {/* Danger Zone */}
             <View style={styles.settingGroup}>
-              <Text style={[styles.settingGroupTitle, {color: '#ff4444'}]}>{t('danger_zone')}</Text>
-              
-              {/* Locks at once, the same lock as auto-lock: the wallet stays on the device and its node keeps running. */}
-              <TouchableOpacity
-                style={[styles.actionButton, {backgroundColor: '#16213e', borderColor: '#ff4444'}]}
-                onPress={() => lockSession()}
-              >
-                <Text style={[styles.actionButtonText, {color: '#ff4444'}]}>{t('lock_wallet')}</Text>
-              </TouchableOpacity>
+              <Text style={styles.settingGroupTitle}>{t('danger_zone')}</Text>
 
-              <TouchableOpacity 
-                style={[styles.actionButton, {backgroundColor: '#16213e', borderColor: '#ff4444'}]}
-                onPress={deleteWallet}
-              >
-                <Text style={[styles.actionButtonText, {color: '#ff4444'}]}>{t('delete_wallet')}</Text>
-              </TouchableOpacity>
+              {/* Locks at once, the same lock as auto-lock: the wallet stays on the device and its node keeps running. */}
+              <LinkRow title={t('lock_wallet')} onPress={() => lockSession()} />
+              <LinkRow title={t('delete_wallet')} tone="warn" onPress={deleteWallet} />
             </View>
           </ScrollView>
           )} />
@@ -7562,24 +7188,20 @@ const WalletScreen = () => {
 
   return (
     <SafeAreaView
-      style={[styles.container, dirStyle]}
+      style={styles.container}
       edges={MAIN_EDGES}
       onTouchStart={handleUserActivity}
     >
       {renderBrowserPane('main')}
-      <View style={[styles.header, { paddingTop: 15 + insets.top }]} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
-        <Text style={styles.title}>{t('qnet_wallet')}</Text>
-        {/* Overflow menu: token manager / hide balances (Settings is a tab of the bottom bar) */}
-        <TouchableOpacity
-          style={styles.headerMenuBtn}
-          accessibilityRole="button"
-          accessibilityLabel={t('menu_open')}
-          onPress={() => setShowHeaderMenu((v) => !v)}
-          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-          activeOpacity={0.6}
-        >
-          <Text style={styles.headerMenuIcon}>⋮</Text>
-        </TouchableOpacity>
+      <View style={[styles.header, { paddingTop: insets.top }]} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
+        <View style={styles.headerRow}>
+          <Image source={APP_MARK} style={styles.headerMark} resizeMode="contain" accessibilityIgnoresInvertColors />
+          <Text style={styles.wordmark} numberOfLines={1} accessibilityRole="header">{t('qnet_wallet')}</Text>
+          {/* More: walletMenuItems. On the Browser tab the browser bar's More holds them, so a screen has one More. */}
+          {activeTab === 'browser' ? null : (
+            <Action kind="act" label={t('common_more')} accessibilityLabel={t('menu_open')} onPress={() => setShowHeaderMenu((v) => !v)} align="end" testID="header-more" />
+          )}
+        </View>
       </View>
 
       {/* Tab Content (on the Browser tab the browser pane below it shows through, and gets the touches) */}
@@ -7601,7 +7223,6 @@ const WalletScreen = () => {
                 t={t}
                 hideAmounts={balancesHidden}
                 copied={copiedAddress}
-                backArrow={backArrow}
                 onBack={() => setTxDetail(null)}
                 onCopy={(text, key) => copyToClipboard(text, key)}
                 onExplorer={handleOpenTx}
@@ -7629,7 +7250,6 @@ const WalletScreen = () => {
                 explorer={txResult.chain !== 'solana'}
                 error={txResult.error}
                 onAction={dismissTxResult}
-                onCopied={() => showAlert(t('common_copied'), t('tx_hash_copied'))}
                 t={t}
               />
             </ScrollView>
@@ -7637,7 +7257,12 @@ const WalletScreen = () => {
         ) : null}
       </View>
 
-      <BottomBar active={activeTab} onSelect={selectTab} t={t} hidden={keyboardUp} />
+      <BottomBar
+        active={activeTab}
+        onSelect={selectTab}
+        t={t}
+        hidden={keyboardUp}
+      />
 
       {/* The Send screen's QR scan: a QNet address read goes into the recipient field, where the send is reviewed and
           confirmed as always. */}
@@ -7663,404 +7288,259 @@ const WalletScreen = () => {
 
       {/* Change Password Modal */}
       {showChangePassword && (
-        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-          <View style={styles.modalBox}>
-            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-              <Text style={styles.modalTitle}>{t(showChangePassword === 'reprotect' ? 'reprotect_password' : 'change_password')}</Text>
-
-              {/* A wallet whose screen-lock secret is gone has no current password: the open session is the proof. */}
-              {showChangePassword === 'reprotect' ? (
-                <Text style={styles.modalContent}>{t('reprotect_password_body')}</Text>
-              ) : (
-                <>
-                  <Text style={styles.modalLabel}>{t('enter_current_password')}</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder={t('password')}
-                    accessibilityLabel={t('enter_current_password')}
-                    placeholderTextColor="#888"
-                    {...PASSWORD_INPUT_PROPS}
-                    value={currentPassword}
-                    onChangeText={setCurrentPassword}
-                  />
-                </>
-              )}
-
-              <Text style={styles.modalLabel}>{t('enter_new_password', { min: MIN_PASSWORD })}</Text>
-              <TextInput
-                style={styles.input}
-                placeholder={t('password')}
-                accessibilityLabel={t('enter_new_password', { min: MIN_PASSWORD })}
-                placeholderTextColor="#888"
-                {...PASSWORD_INPUT_PROPS}
-                value={newPassword}
-                onChangeText={setNewPassword}
-              />
-              {renderPasswordLength(newPassword)}
-
-              <Text style={styles.modalLabel}>{t('confirm_new_password')}</Text>
-              <TextInput
-                style={styles.input}
-                placeholder={t('password')}
-                accessibilityLabel={t('confirm_new_password')}
-                placeholderTextColor="#888"
-                {...PASSWORD_INPUT_PROPS}
-                value={confirmNewPassword}
-                onChangeText={setConfirmNewPassword}
-              />
-              {renderPasswordMatch(newPassword, confirmNewPassword)}
-            </ScrollView>
-
-            <View style={styles.modalActions}>
-              <TouchableOpacity 
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={() => {
+        <Sheet
+          t={t}
+          title={t(showChangePassword === 'reprotect' ? 'reprotect_password' : 'change_password')}
+          actions={(
+            <ActionPair
+              start={{
+                label: t('cancel'),
+                onPress: () => {
                   setShowChangePassword(false);
                   setCurrentPassword('');
                   setNewPassword('');
                   setConfirmNewPassword('');
-                }}
-              >
-                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-              </TouchableOpacity>
+                },
+              }}
+              end={{
+                label: loading ? t('changing') : t(showChangePassword === 'reprotect' ? 'reprotect_save' : 'change'),
+                onPress: showChangePassword === 'reprotect' ? handleReprotectPassword : handleChangePassword,
+                disabled: loading,
+              }}
+            />
+          )}
+        >
+          {/* A wallet whose screen-lock secret is gone has no current password: the open session is the proof. */}
+          {showChangePassword === 'reprotect' ? (
+            <Text style={styles.modalContent}>{t('reprotect_password_body')}</Text>
+          ) : (
+            <Field
+              label={t('enter_current_password')}
+              placeholder={t('password')}
+              accessibilityLabel={t('enter_current_password')}
+              {...PASSWORD_INPUT_PROPS}
+              value={currentPassword}
+              onChangeText={setCurrentPassword}
+            />
+          )}
 
-              <TouchableOpacity 
-                style={[styles.modalButton, styles.modalButtonPrimary]}
-                onPress={showChangePassword === 'reprotect' ? handleReprotectPassword : handleChangePassword}
-                disabled={loading}
-              >
-                <Text style={styles.modalButtonText}>{loading ? t('changing') : t(showChangePassword === 'reprotect' ? 'reprotect_save' : 'change')}</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
+          <Field
+            label={t('enter_new_password', { min: MIN_PASSWORD })}
+            placeholder={t('password')}
+            accessibilityLabel={t('enter_new_password', { min: MIN_PASSWORD })}
+            {...PASSWORD_INPUT_PROPS}
+            value={newPassword}
+            onChangeText={setNewPassword}
+          />
+          {renderPasswordLength(newPassword)}
+
+          <Field
+            label={t('confirm_new_password')}
+            placeholder={t('password')}
+            accessibilityLabel={t('confirm_new_password')}
+            {...PASSWORD_INPUT_PROPS}
+            value={confirmNewPassword}
+            onChangeText={setConfirmNewPassword}
+          />
+          {renderPasswordMatch(newPassword, confirmNewPassword)}
+        </Sheet>
       )}
 
-      {/* Header ⋮ overflow menu */}
-      {showHeaderMenu && (
-        <>
-          <TouchableOpacity style={styles.menuBackdrop} activeOpacity={1} onPress={() => setShowHeaderMenu(false)} />
-          <View style={[styles.menuCard, { top: headerBottom - 12 }]}>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => { setShowHeaderMenu(false); setTokenMgrQuery(''); setShowTokenManager(true); }}
-              activeOpacity={0.6}
-            >
-              <Text style={styles.menuItemText}>{t('tok_manage')}</Text>
-              <Text style={styles.menuItemHint}>{rtl ? '‹' : '›'}</Text>
-            </TouchableOpacity>
-            <View style={styles.menuDivider} />
-            <View style={styles.menuItem}>
-              <Text style={styles.menuItemText}>{t('tok_hide_balances')}</Text>
-              <PillToggle value={balancesHidden} onValueChange={toggleBalancesHidden} />
-            </View>
-          </View>
-        </>
+      {/* The header's More menu */}
+      {showHeaderMenu && activeTab !== 'browser' && (
+        <Menu items={walletMenuItems} onClose={() => setShowHeaderMenu(false)} closeLabel={t('common_close')} top={headerBottom} />
       )}
 
       {/* Token manager: search + per-token visibility + add-by-address; local view only, never touches balances. */}
       {showTokenManager && (
-        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-          <View style={[styles.modalBox, styles.mgrBox]}>
-            <View style={styles.mgrHeader}>
-              <Text style={[styles.modalTitle, styles.mgrTitle]}>{t('tok_manage')}</Text>
-              <TouchableOpacity onPress={() => { setShowTokenManager(false); setAddTokenError(''); }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} accessibilityRole="button" accessibilityLabel={t('common_close')}>
-                <Text style={styles.mgrClose}>✕</Text>
-              </TouchableOpacity>
-            </View>
-            <TextInput
-              style={styles.mgrSearch}
-              placeholder={t('tok_search')}
-              placeholderTextColor="#888"
-              value={tokenMgrQuery}
-              onChangeText={(q) => { setTokenMgrQuery(q); if (addTokenError) setAddTokenError(''); }}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            {/* Toggle-add feedback (the add-token modal is not used from here). */}
-            {addingToken && <Text style={styles.mgrHint}>{t('tok_adding')}</Text>}
-            {!!addTokenError && <Text style={styles.mgrError}>{addTokenError}</Text>}
-            <FlatList
-              data={tokenMgrResults}
-              keyExtractor={(tk) => tk.contract}
-              keyboardShouldPersistTaps="handled"
-              style={styles.mgrList}
-              ListEmptyComponent={<Text style={styles.mgrEmpty}>{t('tok_empty')}</Text>}
-              renderItem={({ item: tk }) => {
-                const isQnc = tk.contract === 'native:qnc';
-                const addable = !!tk._addable;
-                const visible = !addable && (isQnc ? !hiddenTokens.has(tk.contract) : isTokenShown(tk.contract));
-                const reserved = !isQnc && !addable && usesReservedName(tk.symbol, tk.name);
-                // Inert letter/emoji avatar (never load a node-supplied URL logo); QNC = app icon.
-                const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
-                const isEmoji = isGlyphLogo(logo);
-                let h = 0; const seed = String(tk.contract || tk.symbol || '?');
-                for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-                const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
-                const title = addable ? `${tk.contract.slice(0, 10)}…${tk.contract.slice(-6)}` : tokenTitle(tk);
-                return (
-                  <View style={styles.mgrRow}>
-                    <View style={[styles.tokenIcon, { backgroundColor: isQnc ? 'transparent' : bg, borderRadius: 18, width: 36, height: 36, marginEnd: 10 }]}>
-                      {isQnc ? (
-                        <Image source={require('../../assets/qnet_logo.png')} style={{ width: 36, height: 36 }} resizeMode="contain" />
-                      ) : (
-                        <Text style={[styles.tokenIconText, { color: '#ffffff', fontSize: 15 }]}>
-                          {isEmoji ? logo : tokenInitial(tk)}
-                        </Text>
-                      )}
-                    </View>
-                    <View style={styles.mgrRowInfo}>
-                      <Text style={styles.mgrRowSym} numberOfLines={1}>{title}</Text>
-                      <Text style={styles.mgrRowBal}>{addable ? t('tok_not_tracked') : shownBalance(tokenFigure(tk))}</Text>
-                      {!isQnc && !addable ? <Text style={styles.mgrRowBal}>{t('tok_contract_id', { id: contractShortId(tk.contract) })}</Text> : null}
-                      {reserved ? <Text style={[styles.mgrRowBal, { color: '#ff5555' }]}>{t('tok_reserved_warning')}</Text> : null}
-                    </View>
-                    <PillToggle
-                      value={addable ? false : visible}
-                      onValueChange={(v) => addable ? (v && handleAddCustomToken(tk.contract)) : setTokenVisible(tk.contract, v)}
-                    />
+        <Sheet
+          t={t}
+          title={t('tok_manage')}
+          onClose={() => { setShowTokenManager(false); setAddTokenError(''); }}
+          height="80%"
+          scroll={false}
+          bodyStyle={styles.mgrBody}
+        >
+          <Field
+            placeholder={t('tok_search')}
+            accessibilityLabel={t('tok_search')}
+            value={tokenMgrQuery}
+            onChangeText={(q) => { setTokenMgrQuery(q); if (addTokenError) setAddTokenError(''); }}
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.mgrSearch}
+          />
+          {/* Toggle-add feedback (the add-token modal is not used from here). */}
+          {addingToken && <Text style={styles.mgrHint}>{t('tok_adding')}</Text>}
+          {!!addTokenError && <Text style={styles.mgrError}>{addTokenError}</Text>}
+          <FlatList
+            data={tokenMgrResults}
+            keyExtractor={(tk) => tk.contract}
+            keyboardShouldPersistTaps="handled"
+            style={styles.mgrList}
+            ListEmptyComponent={<Text style={styles.mgrEmpty}>{t('tok_empty')}</Text>}
+            renderItem={({ item: tk }) => {
+              const isQnc = tk.contract === 'native:qnc';
+              const addable = !!tk._addable;
+              const visible = !addable && (isQnc ? !hiddenTokens.has(tk.contract) : isTokenShown(tk.contract));
+              const reserved = !isQnc && !addable && usesReservedName(tk.symbol, tk.name);
+              const title = addable ? `${tk.contract.slice(0, 10)}…${tk.contract.slice(-6)}` : tokenTitle(tk);
+              // Its icon (a letter for a token with a contract), the symbol, what it holds, and its contract.
+              return (
+                <View style={styles.mgrRow}>
+                  <TokenIcon network="qnet" symbol={isQnc ? 'QNC' : tk.symbol} contract={isQnc ? null : tk.contract} size={32} style={styles.tokenIcon} />
+                  <View style={styles.mgrRowInfo}>
+                    <Text style={[styles.mgrRowSym, reserved && styles.tokenWarn]} numberOfLines={1}>{title}</Text>
+                    <Text style={addable ? styles.mgrRowNote : styles.mgrRowBal}>{addable ? t('tok_not_tracked') : shownBalance(tokenFigure(tk))}</Text>
+                    {!isQnc && !addable ? <Text style={styles.mgrRowId}>{t('tok_contract_id', { id: contractShortId(tk.contract) })}</Text> : null}
+                    {reserved ? <Text style={[styles.mgrRowNote, styles.tokenWarn]}>{t('tok_reserved_warning')}</Text> : null}
                   </View>
-                );
-              }}
-            />
-          </View>
-        </KeyboardAvoidingView>
+                  <Toggle
+                    accessibilityLabel={title}
+                    value={addable ? false : visible}
+                    onValueChange={(v) => addable ? (v && handleAddCustomToken(tk.contract)) : setTokenVisible(tk.contract, v)}
+                  />
+                </View>
+              );
+            }}
+          />
+        </Sheet>
       )}
 
       {/* Add Custom QRC-20 Token Modal */}
       {showAddTokenModal && (
-        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-          <View style={styles.modalBox}>
-            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-              <Text style={styles.modalTitle}>{t('tok_add_title')}</Text>
-              <Text style={styles.modalContent}>
-                {t('tok_add_body')}
-              </Text>
-              <TextInput
-                style={styles.input}
-                placeholder={t('tok_contract_placeholder')}
-                placeholderTextColor="#888"
-                value={addTokenAddress}
-                onChangeText={(txt) => { setAddTokenAddress(txt.trim()); setAddTokenError(''); }}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-              {!!addTokenError && (
-                <Text style={[styles.modalContent, { color: '#ff5555' }]}>{addTokenError}</Text>
-              )}
-            </ScrollView>
-            <View style={styles.modalActions}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={closeAddTokenModal}
-                disabled={addingToken}
-              >
-                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonPrimary]}
-                onPress={handleAddCustomToken}
-                disabled={addingToken}
-              >
-                <Text style={styles.modalButtonText}>{addingToken ? t('adding') : t('common_add')}</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
+        <Sheet
+          t={t}
+          title={t('tok_add_title')}
+          actions={(
+            <ActionPair
+              start={{ label: t('cancel'), onPress: closeAddTokenModal, disabled: addingToken }}
+              end={{ label: addingToken ? t('adding') : t('common_add'), onPress: handleAddCustomToken, disabled: addingToken }}
+            />
+          )}
+        >
+          <Text style={styles.modalContent}>{t('tok_add_body')}</Text>
+          <Field
+            placeholder={t('tok_contract_placeholder')}
+            accessibilityLabel={t('tok_add_title')}
+            error={addTokenError || null}
+            value={addTokenAddress}
+            onChangeText={(txt) => { setAddTokenAddress(txt.trim()); setAddTokenError(''); }}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+        </Sheet>
       )}
 
       {/* Settings' password prompt: biometric unlock on, or the move to the screen lock */}
       {showBiometricPasswordPrompt && (
-        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-          <View style={styles.modalBox}>
-            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-              <Text style={styles.modalTitle}>{t(showBiometricPasswordPrompt === 'device' ? 'set_device_unlock' : 'enable_biometric')}</Text>
-              {showBiometricPasswordPrompt === 'device' ? (
-                <Text style={styles.modalContent}>{t('device_unlock_offer_body')}</Text>
-              ) : null}
-              <TextInput
-                style={styles.input}
-                placeholder={t('password')}
-                accessibilityLabel={t('enter_current_password')}
-                placeholderTextColor="#888"
-                {...PASSWORD_INPUT_PROPS}
-                value={biometricPassword}
-                onChangeText={setBiometricPassword}
-                onSubmitEditing={handleConfirmBiometricEnable}
-                returnKeyType="done"
-              />
-            </ScrollView>
-            <View style={styles.modalActions}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={() => { setShowBiometricPasswordPrompt(false); setBiometricPassword(''); }}
-              >
-                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonPrimary]}
-                onPress={handleConfirmBiometricEnable}
-              >
-                <Text style={styles.modalButtonText}>{t(showBiometricPasswordPrompt === 'device' ? 'device_unlock_offer_yes' : 'enable_biometric')}</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
+        <Sheet
+          t={t}
+          title={t(showBiometricPasswordPrompt === 'device' ? 'set_device_unlock' : 'enable_biometric')}
+          actions={(
+            <ActionPair
+              start={{ label: t('cancel'), onPress: () => { setShowBiometricPasswordPrompt(false); setBiometricPassword(''); } }}
+              end={{
+                label: t(showBiometricPasswordPrompt === 'device' ? 'device_unlock_offer_yes' : 'enable_biometric'),
+                onPress: handleConfirmBiometricEnable,
+              }}
+            />
+          )}
+        >
+          {showBiometricPasswordPrompt === 'device' ? (
+            <Text style={styles.modalContent}>{t('device_unlock_offer_body')}</Text>
+          ) : null}
+          <Field
+            label={t('enter_current_password')}
+            placeholder={t('password')}
+            accessibilityLabel={t('enter_current_password')}
+            {...PASSWORD_INPUT_PROPS}
+            value={biometricPassword}
+            onChangeText={setBiometricPassword}
+            onSubmitEditing={handleConfirmBiometricEnable}
+            returnKeyType="done"
+          />
+        </Sheet>
       )}
 
       {/* Export the recovery phrase or the private keys: the same check before either. */}
       {showExportSeed && (
-        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
-          <View style={styles.modalBox}>
-            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-              <Text style={styles.modalTitle}>{t(exportWhat === 'key' ? 'export_private_key' : 'export_recovery_phrase')}</Text>
-              <Text style={styles.modalWarning}>
-                {t(exportWhat === 'key' ? 'private_key_warning' : 'recovery_phrase_warning')}
-              </Text>
-              {exportWhat === 'key' && (
-              <>
+        <Sheet
+          t={t}
+          title={t(exportWhat === 'key' ? 'export_private_key' : 'export_recovery_phrase')}
+          actions={(
+            <ActionPair
+              start={{ label: t('cancel'), onPress: () => { setShowExportSeed(false); setExportPassword(''); } }}
+              end={{
+                label: loading || revealBusy ? t('verifying') : t('show'),
+                onPress: () => (exportWhat === 'key' ? exportPrivateKey() : exportSeedPhrase()),
+                disabled: loading || revealBusy,
+              }}
+            />
+          )}
+        >
+          <Text style={styles.modalWarning}>
+            {t(exportWhat === 'key' ? 'private_key_warning' : 'recovery_phrase_warning')}
+          </Text>
+          {exportWhat === 'key' && (
+            <>
               <Text style={styles.modalLabel}>{t('private_key_account')}</Text>
-              <View style={styles.keyAccountRow} accessibilityRole="radiogroup">
-                {KEY_ACCOUNTS.map(([which, title]) => (
-                  <TouchableOpacity
-                    key={which}
-                    style={[styles.keyAccountOption, exportAccount === which && styles.keyAccountOptionOn]}
-                    onPress={() => setExportAccount(which)}
-                    accessibilityRole="radio"
-                    accessibilityState={{ selected: exportAccount === which }}
-                    testID={'key-account-' + which}
-                  >
-                    <Text style={[styles.keyAccountText, exportAccount === which && styles.keyAccountTextOn]}>{t(title)}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-              <Text style={styles.keyRevealFormat}>{t(exportAccount === 'solana' ? 'private_key_solana_format' : 'private_key_qnet_format')}</Text>
-              </>
-              )}
-
-              {!deviceAuth && (
-              <>
-              <Text style={styles.modalLabel}>{t('enter_password_to_reveal')}</Text>
-              <TextInput
-                style={styles.input}
-                placeholder={t('password')}
-                accessibilityLabel={t('enter_password_to_reveal')}
-                placeholderTextColor="#888"
-                {...PASSWORD_INPUT_PROPS}
-                value={exportPassword}
-                onChangeText={setExportPassword}
+              <Tabs
+                role="radio"
+                items={KEY_ACCOUNTS.map(([which, title]) => ({ key: which, label: t(title), testID: 'key-account-' + which }))}
+                value={exportAccount}
+                onChange={setExportAccount}
               />
-              </>
-              )}
-            </ScrollView>
+              <Text style={styles.keyRevealFormat}>{t(exportAccount === 'solana' ? 'private_key_solana_format' : 'private_key_qnet_format')}</Text>
+            </>
+          )}
 
-            <View style={styles.modalActions}>
-              <TouchableOpacity 
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={() => {
-                  setShowExportSeed(false);
-                  setExportPassword('');
-                }}
-              >
-                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity 
-                style={[styles.modalButton, styles.modalButtonPrimary]}
-                onPress={() => (exportWhat === 'key' ? exportPrivateKey() : exportSeedPhrase())}
-                disabled={loading || revealBusy}
-              >
-                <Text style={styles.modalButtonText}>{loading || revealBusy ? t('verifying') : t('show')}</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
+          {!deviceAuth && (
+            <Field
+              label={t('enter_password_to_reveal')}
+              placeholder={t('password')}
+              accessibilityLabel={t('enter_password_to_reveal')}
+              {...PASSWORD_INPUT_PROPS}
+              value={exportPassword}
+              onChangeText={setExportPassword}
+            />
+          )}
+        </Sheet>
       )}
 
-      {/* Auto-Lock Time Picker Modal */}
+      {/* The auto-lock picker: the chosen time carries the Signal bar. */}
       {showAutoLockPicker && (
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalBox, styles.modalBody]}>
-            <Text style={styles.modalTitle}>{t('auto_lock_timer')}</Text>
-            <Text style={styles.modalSubtitle}>{t('select_inactivity_time')}</Text>
-            
-            <ScrollView style={styles.modalScroll}>
-              {AUTO_LOCK_CHOICES.map((time) => (
-                <TouchableOpacity
-                  key={time}
-                  style={[
-                    styles.timeOption,
-                    autoLockTime === time && styles.timeOptionActive
-                  ]}
-                  onPress={() => saveAutoLockTime(time)}
-                >
-                  <Text style={[
-                    styles.timeOptionText,
-                    autoLockTime === time && styles.timeOptionTextActive
-                  ]}>
-                    {t(`autolock_${time}`)}
-                  </Text>
-                  {autoLockTime === time && <Text style={styles.checkmark}>✓</Text>}
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-
-            <TouchableOpacity 
-              style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
-              onPress={() => setShowAutoLockPicker(false)}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('cancel')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+        <Sheet t={t} title={t('auto_lock_timer')} onClose={() => setShowAutoLockPicker(false)}>
+          <Text style={styles.modalSubtitle}>{t('select_inactivity_time')}</Text>
+          {AUTO_LOCK_CHOICES.map((time) => (
+            <LinkRow
+              key={time}
+              title={t(`autolock_${time}`)}
+              selected={autoLockTime === time}
+              accessibilityRole="radio"
+              onPress={() => saveAutoLockTime(time)}
+            />
+          ))}
+        </Sheet>
       )}
 
-      {/* Language Picker Modal */}
+      {/* The language picker: each language named in its own script, the chosen one with the Signal bar. */}
       {showLanguagePicker && (
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalBox, styles.modalBody]}>
-            <Text style={styles.modalTitle}>{t('language')}</Text>
-            <Text style={styles.modalSubtitle}>{t('language_subtitle')}</Text>
-            
-            <ScrollView 
-              style={styles.modalScroll}
-              onScroll={handleUserActivity} 
-              scrollEventThrottle={1000}
-              showsVerticalScrollIndicator={true}
-              bounces={true}
-              scrollEnabled={true}
-            >
-              {LANGUAGES.map((lang) => (
-                <TouchableOpacity
-                  key={lang.code}
-                  style={[
-                    styles.timeOption,
-                    language === lang.code && styles.timeOptionActive
-                  ]}
-                  onPress={() => {
-                    saveLanguage(lang.code);
-                    setShowLanguagePicker(false);
-                  }}
-                >
-                  <Text style={[
-                    styles.timeOptionText,
-                    language === lang.code && styles.timeOptionTextActive
-                  ]}>
-                    {lang.name}
-                  </Text>
-                  {language === lang.code && <Text style={styles.checkmark}>✓</Text>}
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-
-            <TouchableOpacity 
-              style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
-              onPress={() => setShowLanguagePicker(false)}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('cancel')}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+        <Sheet t={t} title={t('language')} onClose={() => setShowLanguagePicker(false)}>
+          <Text style={styles.modalSubtitle}>{t('language_subtitle')}</Text>
+          {LANGUAGES.map((lang) => (
+            <LinkRow
+              key={lang.code}
+              title={lang.name}
+              selected={language === lang.code}
+              accessibilityRole="radio"
+              onPress={() => {
+                saveLanguage(lang.code);
+                setShowLanguagePicker(false);
+              }}
+            />
+          ))}
+        </Sheet>
       )}
 
       {/* Under the password prompt and the alerts, over everything else. */}

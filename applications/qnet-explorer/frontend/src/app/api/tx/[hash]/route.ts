@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionByHash, getBatchRecipients } from '../../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../../lib/rate-limit';
-import { mapTxType, formatAmount } from '@/lib/tx-mapping';
+import { mapTxType } from '@/lib/tx-mapping';
 import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
+import { quoteBigInts } from '@/indexer/transform';
 import { fetchNode, nodeConfigError } from '@/lib/node-api';
 
 // Rate limiting: 200 requests per minute per IP
@@ -35,7 +36,8 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
     
     let data: { status?: string; transaction?: Record<string, unknown> };
     try {
-      data = JSON.parse(text) as { status?: string; transaction?: Record<string, unknown> };
+      // Wide integers quoted first, so an amount past 2^53 nano QNC stays exact.
+      data = JSON.parse(quoteBigInts(text)) as { status?: string; transaction?: Record<string, unknown> };
     } catch (parseErr) {
       // console.warn('[TX] Failed to parse transaction JSON:', parseErr);
       return null;
@@ -181,7 +183,7 @@ export async function GET(
       const totalFee = sender.startsWith('system_') || sender === 'genesis'
         ? BigInt(0)
         : chainFeeNanoBig(BigInt(dbTx.gas_price || '0'), BigInt(dbTx.gas_limit || '0'), true);
-      const fee = totalFee > 0n ? formatAmount(totalFee.toString()) : '0';
+      const feeRaw = totalFee.toString();
       // Recipients of a batch envelope live in batch_transfers; the page expands them from tx_type_data.
       let typeData = parseTxTypeData(dbTx.tx_type_data);
       if (dbTx.tx_type === 'BatchTransfers') {
@@ -193,8 +195,10 @@ export async function GET(
       // Note: PostgreSQL BIGINT may come as string, so convert first
       let finalTimestamp = Number(dbTx.timestamp) > 0 ? Number(dbTx.timestamp) : 0;
       
-      // If timestamp is 0 and block is 0, fetch block timestamp
-      if (finalTimestamp === 0 && dbTx.block === 0) {
+      // If timestamp is 0 and block is 0, fetch block timestamp; a page's first answer asks no node (first-answer.ts)
+      // and says so, and the page reads the time again.
+      const timeUnread = finalTimestamp === 0 && dbTx.block === 0 && request.signal.aborted;
+      if (finalTimestamp === 0 && dbTx.block === 0 && !timeUnread) {
         try {
           const blockRes = await fetchNode('/api/v1/block/0', { cache: 'no-store', timeoutMs: 5000 });
           if (blockRes && blockRes.ok) {
@@ -232,12 +236,11 @@ export async function GET(
           timestamp: finalTimestamp,
           from,
           to: dbTx.to_address || 'N/A',
-          amount: formatAmount(dbTx.amount),
-          amount_raw: dbTx.amount,
+          amount_raw: String(dbTx.amount || '0'),
           nonce: dbTx.nonce,
           gas_price: dbTx.gas_price,
           gas_limit: dbTx.gas_limit,
-          fee,
+          fee_raw: feeRaw,
           signature: dbTx.signature,
           public_key: dbTx.public_key,
           signature_type: signatureType,
@@ -246,6 +249,7 @@ export async function GET(
           dilithium_public_key: dbTx.dilithium_public_key,
           data: dbTx.data,
           tx_type_data: typeData,
+          ...(timeUnread ? { nodeUnread: true } : {}),
         },
       }, {
         headers: {
@@ -256,6 +260,11 @@ export async function GET(
       });
     }
     
+    // Not in the index: only a node can tell. A page's first answer asks none (first-answer.ts): its client asks.
+    if (request.signal.aborted) {
+      return NextResponse.json({ success: false, error: 'Transaction not found', nodeUnread: true }, { status: 404 });
+    }
+
     // 2. Try tx_index (RocksDB) from node
     let tx = await fetchTransaction(hash);
     
@@ -317,15 +326,7 @@ export async function GET(
     }
     
     // The fee the chain debits: ML-DSA-signed TXs pay 1.5x the gas price; genesis/system TXs pay nothing.
-    let fee: string;
-    if (isSystemTx) {
-      fee = '0';
-    } else {
-      const gasPrice = (tx.gas_price as number) || 0;
-      const gasLimit = (tx.gas_limit as number) || 0;
-      const totalFee = chainFeeNano(gasPrice, gasLimit, isQuantumSigned);
-      fee = totalFee > 0 ? formatAmount(totalFee) : '0';
-    }
+    const feeRaw = isSystemTx ? '0' : String(chainFeeNano((tx.gas_price as number) || 0, (tx.gas_limit as number) || 0, isQuantumSigned));
     
     // Return ALL fields from transaction
     return NextResponse.json({
@@ -341,12 +342,11 @@ export async function GET(
         timestamp: ts,
         from,
         to: (tx.to_address || tx.to || 'N/A') as string,
-        amount: formatAmount(tx.amount as number),
-        amount_raw: tx.amount as number,
+        amount_raw: String((tx.amount as number | string | undefined) || '0'),
         nonce: tx.nonce as number | undefined,
         gas_price: tx.gas_price as number | undefined,
         gas_limit: tx.gas_limit as number | undefined,
-        fee,
+        fee_raw: feeRaw,
         signature: tx.signature as string | undefined,
         public_key: tx.public_key as string | undefined,
         signature_type: signatureType,

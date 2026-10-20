@@ -4,13 +4,15 @@ interface UseIntersectionObserverOptions {
   threshold?: number | number[];
   root?: Element | null;
   rootMargin?: string;
+  // What it answers before the first observation (a part at the top of the page starts on screen).
+  initial?: boolean;
 }
 
 export const useIntersectionObserver = (
   elementRef: React.RefObject<Element>,
   options: UseIntersectionObserverOptions = {}
 ): boolean => {
-  const [isIntersecting, setIsIntersecting] = useState(false);
+  const [isIntersecting, setIsIntersecting] = useState(options.initial ?? false);
 
   useEffect(() => {
     const element = elementRef.current;

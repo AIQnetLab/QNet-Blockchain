@@ -12,4 +12,4 @@ appId: com.qnetmobile
     file: control.js
     env:
       ACTION: "shot/03-receive"
-- tapOn: ".*Back"
+- tapOn: "(?i).*Back"

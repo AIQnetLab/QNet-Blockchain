@@ -1,62 +1,53 @@
-import { Platform, StyleSheet } from 'react-native';
+import { StyleSheet } from 'react-native';
+import { color, radius, sheet, size, space, themed } from '../theme';
 
 // One centred column of at most 640 on every screen, so a tablet or a wide window shows the phone layout, not lines
-// stretched across the screen. Flex only: nothing reads the window width. The screen's own background shows beside it.
+// stretched across the screen. Flex only: nothing reads the window width. Its content is start-aligned and vertically
+// centred (fieldColumn sets it at the foot).
 const COLUMN = {
   width: '100%',
-  maxWidth: 640,
+  maxWidth: size.column,
   alignSelf: 'center',
   justifyContent: 'center',
-  alignItems: 'center',
-  padding: 20,
+  alignItems: 'stretch',
+  padding: space.gut,
 };
 
-const styles = StyleSheet.create({
-  // The layout direction of a whole screen (Arabic is right to left), and runs that stay left to right in any
-  // language: addresses, hashes, amounts.
-  dirLtr: {
-    direction: 'ltr',
-  },
-  dirRtl: {
-    direction: 'rtl',
-  },
+// Every entry is drawn in the theme's tokens and type roles (theme.js); one sheet per script group (themed).
+const styles = themed((type) => ({
+  // Runs that stay left to right in any language: addresses, hashes, amounts (the layout's direction follows the
+  // language as a whole, i18n/direction).
   ltr: {
     writingDirection: 'ltr',
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 100,
-  },
-  loadingText: {
-    color: '#8e8e93',
-    fontSize: 16,
-    marginTop: 10,
-    fontFamily: 'Courier New',
-  },
   container: {
     flex: 1,
-    backgroundColor: '#11131f', // Same as splash screen background for smooth transition
+    backgroundColor: color.ink, // the splash screen's background, so the first frame follows it seamlessly
   },
   centerContent: {
     flex: 1,
     ...COLUMN,
   },
-  // The lock screen's column, in a scroll view: it scrolls when a very large system font makes it taller than the screen.
-  lockColumn: {
+  // The welcome and lock screens' column: the mark, the name and the actions at its foot, under the live field of the
+  // top half. The lock screen's scrolls when a very large system font makes it taller than the screen.
+  fieldColumn: {
     flexGrow: 1,
     ...COLUMN,
+    justifyContent: 'flex-end',
   },
   formContent: {
     flexGrow: 1,
     width: '100%',
-    maxWidth: 640,
+    maxWidth: size.column,
     alignSelf: 'center',
     justifyContent: 'flex-start',
-    alignItems: 'center',
-    padding: 20,
-    paddingTop: 80,
+    alignItems: 'stretch',
+    padding: space.gut,
+    paddingTop: space.s24,
+  },
+  // The recovery phrase shown once: room under the last action for a large system font.
+  seedContent: {
+    paddingBottom: space.s48,
   },
   // Wraps a form's ScrollView so an open keyboard shrinks the form instead of covering it.
   keyboardAvoid: {
@@ -64,148 +55,96 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
-    padding: 20,
+    padding: space.gut,
   },
   scrollContentContainer: {
     width: '100%',
-    maxWidth: 640,
+    maxWidth: size.column,
     alignSelf: 'center',
-    paddingBottom: 20,
+    paddingBottom: space.s24,
   },
+  // A form's title (the storage problem, create, import, the phrase): the title face a little smaller than a tab's, so
+  // the longest word of every language (a German compound) fits a 320 dp screen.
   title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    color: '#00d4ff',
-    textAlign: 'center',
-    marginBottom: 10,
+    ...type('title', 26),
+    color: color.paper,
+    marginBottom: space.s12,
+  },
+  // The app's name on the screens that hold no data (welcome, lock, loading), at the start edge in either direction.
+  display: {
+    ...type('display'),
+    color: color.paper,
+    marginBottom: space.s12,
+    alignSelf: 'flex-start',
   },
   subtitle: {
-    fontSize: 16,
-    color: '#b0b0b0',
-    textAlign: 'center',
-    marginBottom: 30,
+    ...type('body'),
+    color: color.text,
+    marginBottom: space.s32,
   },
-  // At least 50 high, growing with a large system font instead of clipping; the vertical padding overrides Android's theme padding.
-  input: {
-    width: '100%',
-    minHeight: 50,
-    paddingVertical: 12,
-    backgroundColor: 'rgba(22, 33, 62, 0.8)',
-    borderRadius: 10,
-    paddingHorizontal: 15,
-    color: '#ffffff',
-    fontSize: 16,
-    marginBottom: 20,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.5)',
+  // A quiet line of a form (a storage problem's reassurance, the phrase's clipboard rule).
+  formNote: {
+    ...type('note'),
+    color: color.fog,
+    marginBottom: space.s16,
   },
-  // At least 50 high, and taller when a large system font wraps the label, instead of clipping it.
-  button: {
-    width: '100%',
-    minHeight: 50,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    backgroundColor: '#00d4ff',
-    borderRadius: 10,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 15,
+  // The solid action of a form, with the next action under it.
+  formAction: {
+    marginBottom: space.s12,
   },
-  secondaryButton: {
-    backgroundColor: 'transparent',
-    borderWidth: 2,
-    borderColor: '#00d4ff',
-  },
-  buttonText: {
-    color: '#1a1a2e',
-    fontSize: 18,
-    fontWeight: 'bold',
-    textAlign: 'center',
-  },
-  secondaryButtonText: {
-    color: '#00d4ff',
-  },
-  textArea: {
-    minHeight: 100,
-    textAlignVertical: 'top',
-    paddingTop: 15,
-  },
-  inputError: {
-    borderColor: '#ff4444',
-    borderWidth: 2,
-  },
+  // A form's live lines, tucked under the field above them (components/ui/Field keeps 16 under itself).
   passwordHint: {
-    color: '#ffaa00',
-    fontSize: 14,
-    marginTop: -15,
-    marginBottom: 15,
+    ...type('note'),
+    color: color.fog,
+    marginTop: -space.s8,
+    marginBottom: space.s16,
     alignSelf: 'flex-start',
   },
   passwordSuccess: {
-    color: '#00ff88',
-    fontSize: 14,
-    marginTop: -15,
-    marginBottom: 15,
+    ...type('note'),
+    color: color.paper,
+    marginTop: -space.s8,
+    marginBottom: space.s16,
     alignSelf: 'flex-start',
   },
   errorText: {
-    color: '#ff4444',
-    fontSize: 14,
-    marginTop: -15,
-    marginBottom: 15,
+    ...type('note'),
+    color: color.ember,
+    marginTop: -space.s8,
+    marginBottom: space.s16,
     alignSelf: 'flex-start',
   },
-  // An error under a feedback line, which already ends 15 below its field: 6 between the two lines, not 0.
+  // An error under a feedback line, which already ends 16 below its field: 8 between the two lines, not 0.
   errorAfterLine: {
-    marginTop: -9,
-  },
-  balanceCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 20,
-    marginBottom: 20,
-    alignItems: 'center',
-  },
-  balanceLabel: {
-    color: '#b0b0b0',
-    fontSize: 16,
-    marginBottom: 5,
-  },
-  balanceAmount: {
-    color: '#00d4ff',
-    fontSize: 32,
-    fontWeight: 'bold',
-  },
-  addressCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 20,
-    marginBottom: 20,
-  },
-  addressLabel: {
-    color: '#b0b0b0',
-    fontSize: 16,
-    marginBottom: 5,
-  },
-  actionButton: {
-    backgroundColor: '#16213e',
-    borderRadius: 10,
-    padding: 15,
-    marginBottom: 15,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#00d4ff',
-  },
-  actionButtonText: {
-    color: '#00d4ff',
-    fontSize: 16,
-    fontWeight: '600',
+    marginTop: 0,
   },
   header: {
-    paddingVertical: 15,
-    backgroundColor: '#16213e',
+    backgroundColor: color.ink,
     borderBottomWidth: 1,
-    borderBottomColor: '#00d4ff',
+    borderBottomColor: color.rule,
+  },
+  // The app's mark and name at the start, More at the end.
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    columnGap: space.s8,
+    minHeight: size.header,
+    width: '100%',
+    maxWidth: size.column,
+    alignSelf: 'center',
+    paddingHorizontal: space.gut,
+  },
+  headerMark: {
+    width: 22,
+    height: 22,
+  },
+  // Its own width at the start, next to the mark (a line of Latin letters would otherwise keep to the left in a
+  // right-to-left layout); More goes to the end.
+  wordmark: {
+    ...type('wordmark'),
+    flexShrink: 1,
+    marginEnd: 'auto',
+    color: color.paper,
   },
   // Between the header and the bottom bar (components/BottomBar, which keeps clear of the system bars itself).
   tabContentContainer: {
@@ -215,594 +154,247 @@ const styles = StyleSheet.create({
   // everything else; invisible and untouchable while another tab is open or the wallet is locked.
   browserPane: {
     position: 'absolute',
-    left: 0,
-    right: 0,
+    start: 0,
+    end: 0,
     top: 0,
     height: 0,
   },
   browserPaneHidden: {
     opacity: 0,
   },
-  tabTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#00d4ff',
-    marginBottom: 20,
-  },
-  formGroup: {
-    marginBottom: 20,
-  },
   seedConfirmContent: {
     flexGrow: 1,
+    width: '100%',
+    maxWidth: size.column,
+    alignSelf: 'center',
     justifyContent: 'flex-start',
     alignItems: 'stretch',
-    padding: 20,
-    paddingTop: 40,
-    backgroundColor: '#0f0f1a',
+    padding: space.gut,
+    paddingTop: space.s24,
+    backgroundColor: color.ink,
   },
   seedConfirmGroup: {
-    marginBottom: 24,
+    marginBottom: space.s24,
     width: '100%',
   },
   label: {
-    color: '#b0b0b0',
-    fontSize: 14,
-    marginBottom: 8,
-    fontWeight: '600',
+    ...type('label'),
+    color: color.fog,
+    marginBottom: space.s8,
   },
-  feeText: {
-    color: '#00d4ff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  receiveContent: {
-    alignItems: 'center',
-  },
-  qrPlaceholder: {
-    width: 200,
-    height: 200,
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 30,
-    borderWidth: 2,
-    borderColor: '#00d4ff',
-  },
-  qrContainer: {
-    alignItems: 'center',
-    marginBottom: 30,
-  },
+  // A camera reads the code off white: the code carries its own quiet zone, at the column's start.
   qrWrapper: {
-    backgroundColor: '#ffffff',
-    padding: 20,
-    borderRadius: 15,
-    marginBottom: 15,
-    elevation: 5,
-    shadowColor: '#00d4ff',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-  },
-  qrLabel: {
-    color: '#aaa',
-    fontSize: 14,
-    textAlign: 'center',
-  },
-  addressBox: {
-    backgroundColor: '#16213e',
-    borderRadius: 10,
-    padding: 15,
-    marginVertical: 15,
-    borderWidth: 1,
-    borderColor: '#00d4ff20',
-  },
-  receiveButtons: {
-    flexDirection: 'row',
-    marginTop: 10,
-  },
-  tapToCopy: {
-    color: '#00d4ff',
-    fontSize: 12,
-    marginTop: 10,
-    fontStyle: 'italic',
-    textAlign: 'center',
-  },
-  qrText: {
-    color: '#00d4ff',
-    fontSize: 20,
-    fontWeight: 'bold',
-  },
-  qrSubtext: {
-    color: '#888',
-    fontSize: 14,
-    marginTop: 5,
-  },
-  addressDisplay: {
-    width: '100%',
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 20,
-  },
-  addressDisplayText: {
-    color: '#ffffff',
-    fontSize: 12,
-    marginBottom: 15,
-    padding: 10,
-    backgroundColor: '#1a1a2e',
-    borderRadius: 8,
-  },
-  statusText: {
-    color: '#888',
-    fontSize: 14,
-  },
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingTop: 60,
-  },
-  emptyText: {
-    color: '#888',
-    fontSize: 16,
-  },
-  amountInputGroup: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  amountInput: {
-    flex: 1,
-    marginBottom: 0,
-  },
-  tokenSelector: {
-    flexDirection: 'row',
-    gap: 5,
-  },
-  tokenButton: {
-    paddingHorizontal: 15,
-    paddingVertical: 10,
-    backgroundColor: '#16213e',
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#00d4ff',
-  },
-  tokenButtonActive: {
-    backgroundColor: '#00d4ff',
-  },
-  tokenButtonText: {
-    color: '#00d4ff',
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
-  tokenButtonTextActive: {
-    color: '#1a1a2e',
+    alignSelf: 'flex-start',
+    borderRadius: radius.box,
+    overflow: 'hidden',
+    marginBottom: space.s16,
   },
   settingGroup: {
-    marginBottom: 30,
+    marginBottom: space.s32,
   },
+  // A group's kicker over its rows, a strong rule under it.
   settingGroupTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#00d4ff',
-    marginBottom: 15,
+    ...type('label'),
+    color: color.fog,
+    paddingBottom: space.s8,
+    marginBottom: space.s4,
+    borderBottomWidth: 1,
+    borderBottomColor: color.ruleStrong,
   },
   // A line of Settings that is not a setting's row (components/InfoRow SettingRow): a warning, no sites yet.
   settingSubtitle: {
-    color: '#888',
-    fontSize: 13,
+    ...type('note'),
+    color: color.fog,
   },
-  modalOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0, 0, 0, 0.9)', // Darker overlay for better contrast
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-    // Android draws siblings by elevation before zIndex, but touches follow zIndex: the password prompt and the
-    // alerts sit above the browser request sheet and the QNet Link screen (elevation 20, zIndex 9000) in both, or
-    // the prompt their Confirm opens would take taps while drawn underneath them (__tests__/OverlayOrder.test.js).
-    zIndex: 9999,
-    elevation: 40,
+  settingWarning: {
+    color: color.ember,
   },
-  modalBox: {
-    backgroundColor: '#1a1a2e', // Like extension modal background
-    borderRadius: 20, // Smoother corners
-    padding: 0, // Content padding handled separately
-    width: '90%', // Reduced from 100% to add margin from edges
-    maxWidth: 360, // Slightly reduced for better mobile view
-    maxHeight: '80%', // Limit height for small screens
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.3)', // Slightly brighter border
-    shadowColor: '#00d4ff',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.3,
-    shadowRadius: 20,
-    elevation: 25,
-    overflow: 'hidden',
+  // Under the language's row while the layout still has the other direction: the line and its Restart.
+  layoutNote: {
+    alignItems: 'flex-start',
+    paddingTop: space.s8,
   },
-  modalHeader: {
-    backgroundColor: 'rgba(0, 212, 255, 0.1)', // Subtle header background
-    paddingVertical: 20,
-    paddingHorizontal: 24,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(0, 212, 255, 0.2)',
-  },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#00d4ff',
-    textAlign: 'center',
-    letterSpacing: 0.5,
-  },
+  // A sheet's sentence (components/ui/Sheet keeps the gutter).
   modalContent: {
-    color: '#ffffff',
-    fontSize: 14,
-    lineHeight: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    textAlign: 'center',
-  },
-  modalContentContainer: {
-    paddingHorizontal: 4,
-    paddingVertical: 10,
-  },
-  // Modal body that shrinks and scrolls under modalBox's 80% cap, so the title and buttons stay visible.
-  modalScroll: {
-    flexGrow: 0,
-    flexShrink: 1,
-  },
-  // Inner padding for modals whose content sits directly in modalBox (padding 0).
-  modalBody: {
-    paddingHorizontal: 20,
-    paddingTop: 20,
-  },
-  // KeyboardAvoidingView sets paddingBottom (0 while the keyboard is closed); a zero top keeps the box centred.
-  modalOverlayKeyboard: {
-    paddingTop: 0,
-  },
-  // Buttons share a row while their labels fit; a long label takes a row of its own instead of breaking a word.
-  modalActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-    paddingHorizontal: 20,
-    paddingBottom: 20,
-    paddingTop: 5,
-  },
-  modalButton: {
-    flexGrow: 1,
-    flexShrink: 1,
-    minWidth: '40%',
-    paddingVertical: 11,
-    paddingHorizontal: 18,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 42,
-  },
-  modalButtonPrimary: {
-    backgroundColor: '#00d4ff',
-    shadowColor: '#00d4ff',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  modalButtonSecondary: {
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.3)',
-  },
-  modalButtonDanger: {
-    backgroundColor: '#ff4444',
-    shadowColor: '#ff4444',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 5,
-  },
-  modalButtonText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#1a1a2e',
-    letterSpacing: 0.3,
-    textAlign: 'center',
-  },
-  modalButtonTextSecondary: {
-    color: '#00d4ff',
-  },
-  modalButtonTextDanger: {
-    color: '#ffffff',
+    ...type('body'),
+    color: color.text,
+    marginBottom: space.s16,
   },
   modalWarning: {
-    color: '#ffaa00',
-    fontSize: 14,
-    marginBottom: 15,
-    textAlign: 'center',
-    lineHeight: 20,
+    ...type('body'),
+    color: color.ember,
+    marginBottom: space.s16,
   },
   // A send's recipient on its password prompt: whole, in groups of four, left to right in every language.
   freshRecipient: {
-    color: '#ffffff',
-    fontSize: 15,
-    lineHeight: 22,
-    fontFamily: 'monospace',
+    ...type('address'),
+    color: color.paper,
     writingDirection: 'ltr',
-    textAlign: 'left',
-    backgroundColor: '#11131f',
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 15,
+    backgroundColor: color.fillField,
+    borderWidth: 1,
+    borderColor: color.edge,
+    borderRadius: radius.box,
+    padding: space.s12,
+    marginBottom: space.s16,
   },
   // What a field in a dialog is for: above the field, wrapping, so the placeholder stays one short word.
   modalLabel: {
-    color: '#b0b0b0',
-    fontSize: 13,
-    fontWeight: '600',
-    marginBottom: 6,
+    ...type('label'),
+    color: color.fog,
+    marginBottom: space.s8,
   },
   modalSubtitle: {
-    color: '#b0b0b0',
-    fontSize: 14,
-    marginBottom: 20,
-    textAlign: 'center',
+    ...type('note'),
+    color: color.fog,
+    marginBottom: space.s12,
   },
-  timeOption: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: '#1a1a2e',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: '#00d4ff',
-  },
-  timeOptionActive: {
-    backgroundColor: '#00d4ff',
-    borderColor: '#00d4ff',
-  },
-  timeOptionText: {
-    flexShrink: 1,
-    color: '#ffffff',
-    fontSize: 16,
-  },
-  timeOptionTextActive: {
-    color: '#1a1a2e',
-    fontWeight: 'bold',
-  },
+  // A recovery phrase: two columns of words, each with its number in a column of its own, hairlines between lines.
   seedGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'space-between',
-    width: '100%',
-    marginVertical: 15,
-    paddingHorizontal: 5,
+    alignSelf: 'stretch',
+    marginVertical: space.s16,
   },
   seedWordContainer: {
     width: '48%',
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(22, 33, 62, 0.8)',
-    borderRadius: 10,
-    padding: 10,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.3)',
+    minHeight: size.rowMin,
+    borderBottomWidth: 1,
+    borderBottomColor: color.rule,
+  },
+  // The number's column: the number against the word after it, in either direction.
+  seedWordNumberBox: {
+    width: 24,
+    marginEnd: space.s8,
+    alignItems: 'flex-end',
   },
   seedWordNumber: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    color: '#00d4ff',
-    marginEnd: 10,
-    minWidth: 20,
+    ...type('data'),
+    color: color.fog,
   },
   seedWordText: {
-    fontSize: 14,
-    color: '#ffffff',
+    ...type('address'),
+    color: color.paper,
     flex: 1,
   },
   seedWarningText: {
-    color: '#ffaa00',
-    textAlign: 'center',
-    fontWeight: '600',
+    ...type('body'),
+    color: color.ember,
+    marginBottom: space.s16,
   },
-  wordChoicesContainer: {
+  // An address in one rounded element a tap copies: the address (one line on Assets, whole on Receive), the copy glyph.
+  addressPill: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    gap: 10,
-    marginTop: 10,
-  },
-  wordChoiceButton: {
-    backgroundColor: 'rgba(22, 33, 62, 0.8)',
-    borderRadius: 8,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.3)',
-    width: '48%',
-  },
-  wordChoiceSelected: {
-    backgroundColor: 'rgba(0, 212, 255, 0.2)',
-    borderColor: '#00d4ff',
-    borderWidth: 2,
-  },
-  wordChoiceText: {
-    color: '#ffffff',
-    fontSize: 14,
-    textAlign: 'center',
-  },
-  wordChoiceTextSelected: {
-    color: '#00d4ff',
-    fontWeight: 'bold',
-  },
-  networkSelector: {
-    flexDirection: 'row',
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    padding: 4,
-    marginBottom: 20,
-  },
-  networkTab: {
-    flex: 1,
-    paddingVertical: 10,
     alignItems: 'center',
-    borderRadius: 8,
-  },
-  networkTabActive: {
-    backgroundColor: '#00d4ff',
-  },
-  networkTabText: {
-    color: '#888',
-    fontWeight: '600',
-  },
-  networkTabTextActive: {
-    color: '#1a1a2e',
-  },
-  addressContainer: {
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    padding: 10,
-    paddingHorizontal: 5,
-    marginBottom: 20,
+    columnGap: space.s12,
+    minHeight: size.rowMin,
+    paddingVertical: space.s12,
+    paddingHorizontal: space.s16,
+    marginBottom: space.s16,
+    borderRadius: radius.tile,
     borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
+    borderColor: color.ruleStrong,
+    backgroundColor: color.surface,
   },
-  addressText: {
-    color: '#ffffff',
+  addressPillDone: {
+    borderColor: color.signalLine,
+  },
+  addressPillText: {
+    ...type('address', 14),
+    color: color.paper,
     writingDirection: 'ltr',
-    fontSize: 12,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginVertical: 2,
-    letterSpacing: 0.5,
-    width: '100%',
-    textAlign: 'center',
-    lineHeight: 17,
-    paddingHorizontal: 0,
-    transform: [{ scaleX: 0.88 }],
+    flex: 1,
   },
-  copyHint: {
-    color: '#00d4ff',
-    fontSize: 11,
-    textAlign: 'center',
+  addressPillCopied: {
+    color: color.signal,
+  },
+  subjectAddress: {
+    flex: 1,
+  },
+  subjectLine: {
+    ...type('address'),
+    color: color.paper,
+    writingDirection: 'ltr',
+  },
+  subjectQuiet: {
+    color: color.fog,
+  },
+  // Receive: the network's icon and what the address takes, between the code and the address.
+  receiveHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    columnGap: space.s8,
+    marginBottom: space.s8,
+  },
+  receiveLine: {
+    ...type('note'),
+    color: color.fog,
+    flexShrink: 1,
   },
   // The quiet line under Send and Receive when the figures could not be updated for a while, or the network stopped.
   balanceStatusLine: {
-    color: '#8a8fa3',
-    fontSize: 12,
+    ...type('note', 12),
+    color: color.fog,
     textAlign: 'center',
-    marginTop: 8,
+    marginTop: space.s8,
   },
-  // A move of a node balance in transit, on its own line under the QNC row (services/ClaimTransit).
-  // At the row's end, where the QNC figure is, on either side of a right-to-left screen.
-  transitLine: {
-    alignSelf: 'flex-end',
-    color: '#ffaa00',
-    fontSize: 13,
-    marginTop: -4,
-    marginBottom: 8,
-    paddingHorizontal: 15,
-  },
-  // The QNet Send screen's token switch: one row of chips, scrolled sideways when they do not fit.
-  sendTokenScroll: {
-    flexGrow: 0,
-    marginBottom: 12,
-  },
-  sendTokenRow: {
-    flexDirection: 'row',
-  },
-  // Settings → Export private key: one block per key, the key shown in a box.
+  // Settings, Export private key: one block per key, the key shown in a box.
   keyRevealBlock: {
-    marginBottom: 16,
+    marginBottom: space.s16,
   },
   keyRevealFormat: {
-    color: '#888',
-    fontSize: 12,
+    ...type('note', 12),
+    color: color.fog,
     marginBottom: 6,
   },
   keyRevealBox: {
-    backgroundColor: '#11131f',
-    borderRadius: 8,
+    backgroundColor: color.fillField,
+    borderRadius: radius.box,
     borderWidth: 1,
-    borderColor: '#2a2d3e',
-    padding: 12,
+    borderColor: color.edge,
+    padding: space.s12,
     minHeight: 64,
     justifyContent: 'center',
-    marginBottom: 8,
+    marginBottom: space.s8,
   },
   keyRevealKey: {
-    color: '#ffffff',
-    fontSize: 13,
-    lineHeight: 19,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    ...type('data'),
+    color: color.paper,
     writingDirection: 'ltr',
-    textAlign: 'left',
   },
-  keyRevealCopy: {
-    flex: 0,
-    alignSelf: 'stretch',
-  },
-  // The account whose key is exported, chosen before the password: one option under the other, so a long name fits.
-  keyAccountRow: {
-    flexDirection: 'column',
-    gap: 8,
-    marginBottom: 8,
-  },
-  keyAccountOption: {
-    alignSelf: 'stretch',
-    paddingVertical: 10,
-    paddingHorizontal: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#2a2d3e',
-    backgroundColor: '#11131f',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  keyAccountOptionOn: {
-    borderColor: 'rgba(0, 212, 255, 0.6)',
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-  },
-  keyAccountText: {
-    color: '#b0b0b0',
-    fontSize: 13,
-    textAlign: 'center',
-  },
-  keyAccountTextOn: {
-    color: '#ffffff',
-    fontWeight: '600',
-  },
-  // Send / Receive under the address on Assets.
+  // Receive and Send under the address on Assets.
   assetActions: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 4,
-    marginBottom: 20,
-  },
-  assetAction: {
-    flex: 1,
-    minHeight: 44,
-    borderRadius: 12,
-    paddingVertical: 11,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(0, 212, 255, 0.12)',
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.4)',
-  },
-  assetActionText: {
-    color: '#00d4ff',
-    fontSize: 15,
-    fontWeight: '600',
+    marginBottom: space.s16,
   },
   tokenList: {
-    marginBottom: 20,
+    marginBottom: space.s24,
+  },
+  // A list's kicker (the transactions not settled yet), a strong rule under it.
+  listKicker: {
+    ...type('label'),
+    color: color.fog,
+    paddingBottom: space.s8,
+    borderBottomWidth: 1,
+    borderBottomColor: color.ruleStrong,
+  },
+  keptLine: {
+    ...type('data'),
+    color: color.paper,
+  },
+  // A row under the finger.
+  rowPressed: {
+    backgroundColor: color.fillPress,
+  },
+  // A line that opens what it names (the tokens sent unasked), start-aligned.
+  inlineLink: {
+    ...type('note'),
+    color: color.signal,
+    textDecorationLine: 'underline',
+    textDecorationColor: color.signalLine,
+    alignSelf: 'flex-start',
+    paddingVertical: space.s12,
   },
   // The unsettled transactions' rows wrap: "Stop sending" takes its own line when it does not fit.
   tokenItem: {
@@ -810,70 +402,32 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    padding: 15,
-    marginBottom: 10,
+    paddingVertical: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: color.rule,
   },
   tokenInfo: {
     flexDirection: 'row',
     alignItems: 'center',
     flexShrink: 1,
     maxWidth: '100%',
-    marginEnd: 12,
-  },
-  tokenIcon: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginEnd: 12,
-  },
-  tokenIconText: {
-    color: '#1a1a2e',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-  tokenIconEmoji: {
-    fontSize: 24,
-  },
-  tokenIconImage: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-  },
-  addressRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: '100%',
-    position: 'relative',
-  },
-  addressTextCopied: {
-    color: '#00d4ff',
-  },
-  checkMark: {
-    color: '#00ff00',
-    fontSize: 12,
-    marginStart: 6,
-    fontWeight: 'bold',
-    position: 'absolute',
-    end: 10,
-    top: '50%',
-    transform: [{ translateY: -6 }],
+    marginEnd: space.s12,
   },
   tokenDetails: {
     justifyContent: 'center',
     flexShrink: 1,
   },
   tokenName: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
+    ...type('row'),
+    color: color.paper,
   },
   tokenPrice: {
-    color: '#888',
-    fontSize: 12,
+    ...type('note', 12),
+    color: color.fog,
+  },
+  // A warning or a refusal on a token's line (a reserved name, a stop).
+  tokenWarn: {
+    color: color.ember,
   },
   // A balance beside its token in up to two fifths of the row, shrinking to fit; one that would not fit there even at
   // half its size goes under the token, whole (screens/WalletScreen TokenBalance).
@@ -886,502 +440,237 @@ const styles = StyleSheet.create({
   tokenBalanceUnder: {
     width: '100%',
     alignItems: 'flex-end',
-    marginTop: 8,
+    marginTop: space.s8,
   },
   tokenAmount: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
-    textAlign: 'right',
+    ...type('amount', 16),
+    color: color.paper,
   },
-  tokenValue: {
-    color: '#888',
-    fontSize: 12,
-    textAlign: 'right',
-  },
-  // A token on Assets: its icon and name, and its balance on the same line (tokenBalance), or under them (tokenItemWrap).
+  // A token on Assets, a rounded tile of its own: its icon and name, and its balance on the same line (tokenBalance), or
+  // under them (tokenItemWrap).
   tokenItemClickable: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
+    paddingVertical: space.s12,
+    paddingHorizontal: space.s16,
+    marginBottom: space.s8,
+    borderRadius: radius.tile,
     borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
+    borderColor: color.rule,
+    backgroundColor: color.surface,
+  },
+  tokenIcon: {
+    marginEnd: space.s12,
   },
   tokenItemWrap: {
     flexWrap: 'wrap',
   },
-  tokenSendHint: {
-    color: '#00d4ff',
-    fontSize: 24,
-    fontWeight: '300',
-    marginStart: 8,
-  },
-  // Header overflow (⋮) menu
-  headerMenuBtn: {
-    position: 'absolute',
-    end: 14,
-    top: 0,
-    bottom: 0,
-    justifyContent: 'center',
-    paddingHorizontal: 6,
-  },
-  headerMenuIcon: {
-    color: '#00d4ff',
-    fontSize: 30,
-    fontWeight: '700',
-    lineHeight: 32,
-  },
-  menuBackdrop: {
-    position: 'absolute',
-    top: 0, left: 0, right: 0, bottom: 0,
-    zIndex: 10000,
-    elevation: 45, // drawn in the order it is touched (see modalOverlay)
-  },
-  menuCard: {
-    position: 'absolute',
-    end: 10,
-    minWidth: 210,
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.3)',
-    paddingVertical: 4,
-    zIndex: 10001,
-    elevation: 50,
-    shadowColor: '#000',
-    shadowOpacity: 0.4,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 6 },
-  },
-  menuItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 13,
-    paddingHorizontal: 16,
-  },
-  menuItemText: {
-    flexShrink: 1,
-    color: '#e6f6ff',
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  menuItemHint: {
-    color: '#00d4ff',
-    fontSize: 15,
-    fontWeight: '700',
-    marginStart: 24,
-  },
-  menuDivider: {
-    height: 1,
-    backgroundColor: 'rgba(255, 255, 255, 0.07)',
-    marginHorizontal: 8,
-  },
-  // Token manager modal
-  mgrBox: {
-    width: '92%',
-    maxWidth: 420,
-    height: '78%',
-    maxHeight: '78%',
-  },
-  mgrHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 16,
-    paddingHorizontal: 18,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(0, 212, 255, 0.2)',
-    backgroundColor: 'rgba(0, 212, 255, 0.08)',
-  },
-  // Wraps beside the close X instead of pushing it out of the header.
-  mgrTitle: {
-    flexShrink: 1,
-    marginEnd: 12,
-  },
-  mgrClose: {
-    color: '#8aa0b3',
-    fontSize: 20,
-    fontWeight: '700',
-  },
   mgrSearch: {
-    minHeight: 44,
-    paddingVertical: 10,
-    marginHorizontal: 14,
-    marginTop: 14,
-    marginBottom: 8,
-    backgroundColor: 'rgba(22, 33, 62, 0.9)',
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    color: '#ffffff',
-    fontSize: 15,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.35)',
+    marginBottom: space.s8,
   },
-  mgrAddBtn: {
-    marginHorizontal: 14,
-    marginBottom: 8,
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.4)',
-    borderStyle: 'dashed',
-  },
-  mgrAddText: {
-    color: '#00d4ff',
-    fontSize: 14,
-    fontWeight: '600',
+  // The token manager's body fills its sheet, so the list scrolls inside it.
+  mgrBody: {
+    flex: 1,
   },
   mgrList: {
     flex: 1,
-    paddingHorizontal: 14,
   },
   mgrRow: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 10,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255, 255, 255, 0.05)',
+    borderBottomColor: color.rule,
   },
   mgrRowInfo: {
     flex: 1,
     justifyContent: 'center',
+    alignItems: 'flex-start',
   },
   mgrRowSym: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '600',
+    ...type('row', 15),
+    color: color.paper,
   },
   mgrRowBal: {
-    color: '#8aa0b3',
-    fontSize: 12,
+    ...type('amount', 13),
+    color: color.paper,
+    marginTop: 2,
+  },
+  mgrRowNote: {
+    ...type('note', 12),
+    color: color.fog,
+    marginTop: 2,
+  },
+  mgrRowId: {
+    ...type('data', 12),
+    color: color.fog,
     marginTop: 2,
   },
   mgrEmpty: {
-    color: '#8aa0b3',
-    fontSize: 13,
-    textAlign: 'center',
+    ...type('note'),
+    color: color.fog,
     paddingVertical: 30,
     paddingHorizontal: 10,
-    lineHeight: 19,
   },
   mgrHint: {
-    color: '#8aa0b3',
-    fontSize: 12,
-    paddingHorizontal: 4,
-    marginBottom: 8,
+    ...type('note', 12),
+    color: color.fog,
+    paddingHorizontal: space.s4,
+    marginBottom: space.s8,
   },
   mgrError: {
-    color: '#ff5555',
-    fontSize: 12,
-    paddingHorizontal: 4,
-    marginBottom: 8,
+    ...type('note', 12),
+    color: color.ember,
+    paddingHorizontal: space.s4,
+    marginBottom: space.s8,
   },
-  // Send Modal Styles
-  // The Send forms' balance: its row (components/InfoRow) in a tinted box, a token's contract under it.
+  // The Send forms' balance: its row (components/InfoRow), a token's contract under it.
   sendBalanceInfo: {
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    marginBottom: 16,
+    marginBottom: space.s16,
   },
   sendBalanceNotes: {
     paddingBottom: 10,
   },
   // The line over a Send form a payment request from a link filled in (SolanaSend fromLink).
   sendFromLink: {
-    color: '#ffaa00',
-    fontSize: 13,
-    textAlign: 'center',
-    marginBottom: 12,
+    ...type('note'),
+    color: color.fog,
+    marginBottom: space.s12,
+  },
+  // The amount field, with its share acts close under it.
+  amountField: {
+    marginBottom: space.s4,
   },
   percentageButtons: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: 10,
-    gap: 8,
-  },
-  percentButton: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 212, 255, 0.15)',
-    borderRadius: 6,
-    paddingVertical: 8,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.3)',
-  },
-  percentButtonText: {
-    color: '#00d4ff',
-    fontSize: 12,
-    fontWeight: '600',
+    flexWrap: 'wrap',
+    columnGap: space.s24,
+    marginBottom: space.s16,
   },
   // The Send forms' fee and total rows (components/InfoRow).
   sendFigures: {
-    marginTop: 8,
-    marginBottom: 16,
+    marginTop: space.s8,
+    marginBottom: space.s16,
   },
-  // Send Screen Styles (inline, not modal)
   sendScreenContainer: {
     paddingTop: 0,
   },
   // A sub-screen (Send, Receive) starts right under the app header: its compact row takes the place of the top padding.
   subScreen: {
-    paddingTop: 4,
+    paddingTop: space.s4,
   },
-  sendScreenHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    minHeight: 40,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
-    marginBottom: 14,
-  },
-  sendScreenTitle: {
-    color: '#00d4ff',
-    fontSize: 18,
-    fontWeight: '600',
-    flexShrink: 1,
-    textAlign: 'center',
-    marginHorizontal: 8,
-  },
-  // Back and the spacer opposite share the row's sides equally, so the title stays centred in any language.
-  backButton: {
-    flex: 1,
-    alignItems: 'flex-start',
-    paddingVertical: 8,
-    paddingEnd: 4,
-  },
-  headerSpacer: {
-    flex: 1,
-  },
-  backButtonText: {
-    color: '#00d4ff',
-    fontSize: 16,
-  },
-  // The Send screen's recipient field, full width; on QNet the scan icon sits inside it at the end (the right, the left
-  // in Arabic). The wrapper takes the field's bottom margin so the icon is centred on the field alone.
-  recipientField: {
-    marginBottom: 20,
-  },
-  recipientInput: {
-    marginBottom: 0,
-  },
-  // The icon's 44 dp target covers the field's last 44 dp: its 1 dp border and 43 dp of end padding, so the text stops
-  // where the target starts.
-  recipientInputScan: {
-    paddingEnd: 43,
-  },
-  scanButton: {
-    position: 'absolute',
-    end: 0,
-    top: 0,
-    bottom: 0,
-    width: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  // Transaction Result Styles
+  // Transaction result: start-aligned over the tab.
   txResultContainer: {
-    alignItems: 'center',
-    paddingVertical: 40,
-    paddingHorizontal: 20,
-  },
-  txSuccessIcon: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: 'rgba(0, 255, 136, 0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 24,
-  },
-  txSuccessIconText: {
-    color: '#00ff88',
-    fontSize: 40,
-    fontWeight: '700',
-  },
-  txErrorIcon: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: 'rgba(255, 68, 68, 0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 24,
-  },
-  txErrorIconText: {
-    color: '#ff4444',
-    fontSize: 40,
-    fontWeight: '700',
+    alignItems: 'stretch',
+    paddingVertical: space.s24,
   },
   txResultOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#11131f',
-  },
-  txPendingIcon: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: 'rgba(255, 184, 0, 0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 24,
-  },
-  txPendingIconText: {
-    color: '#ffb800',
-    fontSize: 40,
-    fontWeight: '700',
+    backgroundColor: color.ink,
   },
   txResultTitle: {
-    color: '#ffffff',
-    fontSize: 24,
-    fontWeight: '700',
-    marginBottom: 16,
-    textAlign: 'center',
+    ...type('title'),
+    color: color.paper,
+    marginBottom: space.s16,
+  },
+  txResultTitleFailed: {
+    color: color.ember,
   },
   txResultAmount: {
-    color: '#00d4ff',
-    fontSize: 32,
-    fontWeight: '700',
-    marginBottom: 8,
+    ...type('figure'),
+    color: color.paper,
+    marginBottom: space.s16,
+    alignSelf: 'flex-start',
   },
-  // The recipient's field (components/InfoRow) across the card's width.
+  // The recipient's field (components/InfoRow) across the column.
   txResultTo: {
     alignSelf: 'stretch',
-    marginBottom: 16,
+    marginBottom: space.s8,
   },
-  // The hash's field (components/InfoRow, its own padding above and below) and the hint, in a tinted box.
   txHashContainer: {
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 14,
-    width: '100%',
-    marginBottom: 24,
-  },
-  txHashHint: {
-    color: '#666',
-    fontSize: 11,
-    marginTop: 6,
+    alignSelf: 'stretch',
+    marginBottom: space.s16,
   },
   txResultNote: {
-    color: '#888',
-    fontSize: 13,
-    textAlign: 'center',
-    marginBottom: 20,
-    paddingHorizontal: 8,
+    ...type('body'),
+    color: color.text,
+    marginBottom: space.s16,
   },
-  historyFilterRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginBottom: 12,
+  histEmptyBox: {
+    paddingVertical: 40,
   },
-  historyChip: {
-    backgroundColor: '#16213e',
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#1a1a2e',
-    paddingVertical: 6,
-    paddingHorizontal: 14,
-    marginEnd: 8,
-    marginBottom: 8,
+  histEmpty: {
+    ...type('body'),
+    color: color.fog,
   },
-  historyChipActive: {
-    backgroundColor: 'rgba(0, 212, 255, 0.15)',
-    borderColor: '#00d4ff',
+  histLoadingOlder: {
+    ...type('note', 12),
+    color: color.fog,
+    paddingVertical: space.s16,
   },
-  historyChipText: {
-    color: '#888',
-    fontSize: 13,
-    fontWeight: '600',
+  // Which Solana sends History lists, said once above them.
+  histScope: {
+    ...type('note'),
+    color: color.fog,
+    marginBottom: space.s12,
   },
-  historyChipTextActive: {
-    color: '#00d4ff',
-  },
-  // A history row's status: Pending, Confirmed or Failed.
-  historyBadge: {
-    borderRadius: 6,
-    paddingHorizontal: 6,
-    paddingVertical: 1,
-    marginEnd: 6,
-    marginVertical: 1,
-  },
-  historyBadge_pending: { backgroundColor: 'rgba(255, 170, 0, 0.15)' },
-  historyBadge_moving: { backgroundColor: 'rgba(255, 170, 0, 0.15)' },
-  historyBadge_confirmed: { backgroundColor: 'rgba(0, 255, 136, 0.12)' },
-  historyBadge_failed: { backgroundColor: 'rgba(255, 68, 68, 0.15)' },
-  historyBadge_dropped: { backgroundColor: 'rgba(138, 143, 163, 0.15)' },
-  historyBadge_unverified: { backgroundColor: 'rgba(138, 143, 163, 0.15)' },
-  historyBadge_included: { backgroundColor: 'rgba(0, 212, 255, 0.12)' },
-  historyBadgeText: {
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  historyBadgeText_pending: { color: '#ffaa00' },
-  historyBadgeText_moving: { color: '#ffaa00' },
-  historyBadgeText_confirmed: { color: '#00ff88' },
-  historyBadgeText_failed: { color: '#ff4444' },
-  historyBadgeText_dropped: { color: '#8a8fa3' },
-  historyBadgeText_unverified: { color: '#8a8fa3' },
-  historyBadgeText_included: { color: '#00d4ff' },
-  // History (screens/HistoryTab): a header per day, then one compact row per transaction, the amount never cut.
+  // History (screens/HistoryTab): a header per day, then one row per transaction, the amount never cut.
   histDay: {
-    color: '#7d8299',
-    fontSize: 13,
-    fontWeight: '600',
-    marginTop: 8,
-    marginBottom: 8,
-    paddingHorizontal: 4,
+    ...type('label'),
+    color: color.fog,
+    marginTop: space.s24,
+    marginBottom: 0,
+    paddingBottom: space.s8,
+    borderBottomWidth: 1,
+    borderBottomColor: color.ruleStrong,
   },
   histRow: {
+    justifyContent: 'center',
+    minHeight: 60,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: color.rule,
+  },
+  histRowPressed: {
+    backgroundColor: color.fillPress,
+  },
+  histLine: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    marginBottom: 8,
   },
-  // The app's mark drawn larger than its round, its clear margin cut off (screens/HistoryTab AssetIcon).
-  histIconZoom: {
-    overflow: 'hidden',
+  // The token's icon at a row's start; a row with no amount keeps its room, so the titles stay aligned.
+  histIcon: {
+    marginEnd: space.s12,
+  },
+  // The detail screen's amount: the token's icon, then the figure and its symbol on one line.
+  txDetailLeg: {
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    columnGap: space.s12,
+    marginTop: space.s8,
   },
-  // The action's badge over the icon's lower end corner, ringed in the card's colour so it reads apart from the logo.
-  histBadge: {
-    position: 'absolute',
-    bottom: -4,
-    end: -4,
-    backgroundColor: '#16213e',
-    alignItems: 'center',
-    justifyContent: 'center',
+  txDetailLegText: {
+    flex: 1,
+    marginTop: 0,
+    alignSelf: 'center',
   },
-  // The sent arrow on a screen laid out right to left points the way that screen reads.
-  histBadgeMirrored: {
-    transform: [{ scaleX: -1 }],
+  histIconBlank: {
+    width: 30,
+    marginEnd: space.s12,
   },
   histMiddle: {
     flex: 1,
     minWidth: 0,
-    marginStart: 12,
-    marginEnd: 8,
+    marginEnd: space.s8,
   },
   histTitle: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '600',
+    ...type('row', 15),
+    color: color.paper,
   },
   histSub: {
-    color: '#7d8299',
-    fontSize: 12,
+    ...type('data', 12),
+    color: color.fog,
     marginTop: 2,
   },
   // The line under the title: whom with, then the status of a row not final, which wraps under it when both do not fit.
@@ -1389,7 +678,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     alignItems: 'baseline',
-    columnGap: 8,
+    columnGap: space.s8,
   },
   histParty: {
     flexShrink: 1,
@@ -1400,6 +689,14 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     maxWidth: '45%',
     alignItems: 'flex-end',
+  },
+  // Amounts too long to sit beside the title: on a line of their own under it, the whole width, at its end.
+  histWide: {
+    alignItems: 'flex-end',
+    marginTop: space.s4,
+  },
+  histAmountWide: {
+    flexShrink: 1,
   },
   // An amount reads left to right in every language: the sign, the number, the symbol.
   histAmountLine: {
@@ -1419,442 +716,263 @@ const styles = StyleSheet.create({
   },
   // The number keeps its full width; only the symbol after it gives way.
   histAmount: {
+    ...type('amount'),
     flexShrink: 0,
-    fontSize: 15,
-    fontWeight: '600',
     writingDirection: 'ltr',
   },
   // A symbol longer than about six characters ends in an ellipsis (its detail screen and the row's label say it whole).
   histSymbol: {
+    ...type('data'),
     flexShrink: 1,
     maxWidth: 64,
-    fontSize: 13,
-    fontWeight: '600',
   },
   // Under its number, a symbol is no wider than the longest number (about ten characters) so it never widens the column.
   histSymbolStacked: {
+    ...type('data'),
     maxWidth: 80,
-    fontSize: 13,
-    fontWeight: '600',
     marginTop: 1,
     writingDirection: 'ltr',
   },
   // A row's status while it is not final, after whom it was with on the line under its title.
   histStatus: {
-    fontWeight: '600',
+    ...type('note', 12),
   },
-  histStatus_pending: { color: '#ffaa00' },
-  histStatus_moving: { color: '#ffaa00' },
-  histStatus_failed: { color: '#ff4444' },
-  histStatus_dropped: { color: '#8a8fa3' },
-  histStatus_unverified: { color: '#8a8fa3' },
-  histStatus_included: { color: '#00d4ff' },
-  // The detail screen of one transaction.
-  txDetailHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  txDetailBack: {
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingEnd: 16,
-  },
-  txDetailBackText: {
-    color: '#00d4ff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
+  histStatus_pending: { color: color.fog },
+  histStatus_moving: { color: color.fog },
+  histStatus_failed: { color: color.ember },
+  histStatus_dropped: { color: color.ember },
+  histStatus_unverified: { color: color.fog },
+  histStatus_included: { color: color.fog },
+  // The detail screen of one transaction: its fields' rows.
   txDetailCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 16,
-  },
-  txDetailIcon: {
-    alignSelf: 'center',
-    marginBottom: 12,
-  },
-  txDetailHeading: {
-    color: '#ffffff',
-    fontSize: 18,
-    fontWeight: '700',
-    textAlign: 'center',
+    marginBottom: space.s16,
   },
   txDetailAmount: {
-    fontSize: 26,
-    fontWeight: '700',
-    textAlign: 'center',
-    marginTop: 8,
+    ...type('figure'),
+    marginTop: space.s8,
     writingDirection: 'ltr',
+    alignSelf: 'flex-start',
   },
   txDetailBadge: {
-    alignSelf: 'center',
-    marginTop: 8,
-    marginBottom: 8,
-    marginEnd: 0,
+    marginTop: space.s8,
+    marginBottom: space.s16,
   },
   txDetailWarning: {
-    color: '#ff5555',
-    fontSize: 12,
-    marginTop: 8,
+    ...type('note', 12),
+    color: color.ember,
+    marginTop: space.s8,
   },
   txErrorMessage: {
-    color: '#ff6b6b',
-    fontSize: 14,
-    textAlign: 'center',
-    marginBottom: 24,
-    paddingHorizontal: 20,
-  },
-  txDoneButton: {
-    backgroundColor: '#00d4ff',
-    borderRadius: 12,
-    paddingVertical: 16,
-    paddingHorizontal: 60,
-    marginTop: 20,
-  },
-  txDoneButtonText: {
-    color: '#0a0a1a',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#ffffff',
-    marginBottom: 15,
-  },
-  sectionSubtitle: {
-    fontSize: 13,
-    color: '#ffa500',
-    marginBottom: 15,
-    textAlign: 'center',
-    fontStyle: 'italic',
-  },
-  nodeMonitoringCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 16,
-    marginBottom: 20,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
-  },
-  nodeMonitoringHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  // The node id beside the status badge (screens/NodeTab NodeId).
-  nodeIdBox: {
-    flex: 1,
-    marginEnd: 12,
+    ...type('body'),
+    color: color.ember,
+    marginBottom: space.s24,
   },
   nodeMonitoringTitle: {
-    flexShrink: 1,
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#ffffff',
+    ...type('h3'),
+    color: color.paper,
   },
   nodeExplainer: {
-    fontSize: 13,
-    lineHeight: 18,
-    color: '#888888',
-    marginBottom: 16,
+    ...type('body'),
+    color: color.text,
+    marginBottom: space.s8,
   },
-  alertInput: {
+  // A tile of the Node tab (the node, its balance, its status), the same rounded element as a token on Assets.
+  nodeGroup: {
+    padding: space.s16,
+    marginBottom: space.s12,
+    borderRadius: radius.tile,
     borderWidth: 1,
-    borderColor: '#333',
-    borderRadius: 8,
-    padding: 10,
-    marginTop: 10,
-    marginHorizontal: 16,
-    color: '#ffffff',
-    backgroundColor: '#1a1a2a',
+    borderColor: color.rule,
+    backgroundColor: color.surface,
   },
-  statusBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 12,
+  // The node tile's head: the status chip before the type on one row, the whole name under them.
+  nodeHead: {
+    rowGap: space.s8,
+    marginBottom: space.s12,
   },
-  statusBadgeActive: {
-    backgroundColor: 'rgba(255, 170, 0, 0.2)',
-  },
-  statusBadgeActivated: {
-    backgroundColor: 'rgba(52, 199, 89, 0.2)',
-  },
-  statusBadgeInactive: {
-    backgroundColor: 'rgba(255, 59, 48, 0.2)',
-    borderColor: '#ff3b30',
-  },
-  statusBadgeText: {
-    textAlign: 'center',
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#00ff7f',
-  },
-  statusBadgeTextActive: {
-    color: '#ffaa00',
-  },
-  nodeMonitoringInfo: {
-    marginBottom: 12,
-  },
-  serverActivationNotice: {
-    backgroundColor: 'rgba(255, 170, 0, 0.1)',
-    borderRadius: 10,
-    padding: 15,
-    marginTop: 15,
+  nodeHeadRow: {
+    flexDirection: 'row',
     alignItems: 'center',
+    flexWrap: 'wrap',
+    columnGap: space.s12,
+    rowGap: space.s8,
+  },
+  nodeName: {
+    ...type('data'),
+    color: color.fog,
+    writingDirection: 'ltr',
+  },
+  nodeChip: {
+    alignSelf: 'flex-start',
+    paddingVertical: space.s4,
+    paddingHorizontal: space.s12,
+    borderRadius: radius.tile,
     borderWidth: 1,
-    borderColor: 'rgba(255, 170, 0, 0.3)',
   },
-  serverActivationIcon: {
-    fontSize: 24,
-    marginBottom: 8,
+  nodeChipLive: {
+    borderColor: color.signalLine,
+    backgroundColor: color.fillPress,
   },
-  serverActivationText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#ffaa00',
-    marginBottom: 4,
-    textAlign: 'center',
+  nodeChipNeeds: {
+    borderColor: color.ember,
   },
-  serverActivationSubtext: {
-    fontSize: 12,
-    color: '#888888',
-    textAlign: 'center',
-  },
-  // A Node tab card of label and value rows (components/InfoRow), padded as the History detail card is.
-  rewardsCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
-  },
-  rewardsTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#ffffff',
-    marginBottom: 6,
-  },
-  // Plain note under a reward row (pending rewards stay out of the balance until claimed).
-  rewardHint: {
-    fontSize: 12,
-    color: '#888888',
-    marginTop: -4,
-    marginBottom: 12,
-  },
-  validatorNote: {
-    fontSize: 12,
-    color: '#888888',
-    marginTop: 15,
-    paddingTop: 15,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 255, 255, 0.05)',
-    lineHeight: 18,
-  },
-  emptySubtext: {
-    fontSize: 13,
-    color: '#888888',
-    marginTop: 8,
-    textAlign: 'center',
-  },
-  buttonDisabled: {
-    opacity: 0.5,
-  },
-  qncTokenIcon: {
-    borderWidth: 2,
-    borderColor: '#6B46C1',
-    backgroundColor: 'rgba(107, 70, 193, 0.1)',
-  },
-  qncIconInner: {
-    width: '100%',
-    height: '100%',
-    borderRadius: 20,
-    backgroundColor: '#0f0f1a',
+  // The epoch so far (NodeTab EpochBar): a track, its filled part, and the mark where it stands now.
+  epochBar: {
+    height: 6,
+    borderRadius: radius.dot,
+    backgroundColor: color.rule,
+    marginTop: space.s4,
+    marginBottom: space.s12,
     justifyContent: 'center',
-    alignItems: 'center',
   },
-  // Verification error styles (like in browser extension)
-  verificationErrorBox: {
-    backgroundColor: 'rgba(255, 59, 48, 0.1)',
-    borderRadius: 8,
-    padding: 15,
-    marginTop: 10,
-    marginBottom: 10,
+  epochFill: {
+    position: 'absolute',
+    start: 0,
+    top: 0,
+    bottom: 0,
+    borderRadius: radius.dot,
+    backgroundColor: color.edge,
+  },
+  epochFillYes: {
+    backgroundColor: color.signalLine,
+  },
+  epochMark: {
+    position: 'absolute',
+    width: 12,
+    height: 12,
+    borderRadius: radius.tile,
+    marginStart: -6,
+    borderWidth: 2,
+    borderColor: color.surface,
+  },
+  epochMarkYes: {
+    backgroundColor: color.signal,
+  },
+  epochMarkNo: {
+    backgroundColor: color.fog,
+  },
+  // The one action for what needs care (the background restriction), under the rows of its tile.
+  nodeCare: {
+    marginTop: space.s12,
+  },
+  // The Node tab's title, pinned over its scroll so the tiles pass under it and it is never cut.
+  stickyHead: {
+    backgroundColor: color.ink,
+  },
+  // The node balance: the one big figure of the tab, in Signal while it can move now.
+  nodeFigure: {
+    ...type('figure'),
+    color: color.paper,
+    writingDirection: 'ltr',
+    marginBottom: space.s16,
+    alignSelf: 'flex-start',
+  },
+  nodeFigureLive: {
+    color: color.signal,
+  },
+  // A light node under its wallet's server node: its tiles after a wider gap.
+  nodeSecond: {
+    paddingTop: space.s12,
+  },
+  // Offline, or waiting for admission: a word that asks for something.
+  statusNeeds: {
+    color: color.ember,
+  },
+  // The Node tab's status tile: the epoch bar and its label and value rows (components/InfoRow).
+  rewardsCard: {
+    padding: space.s16,
+    marginBottom: space.s12,
+    borderRadius: radius.tile,
     borderWidth: 1,
-    borderColor: 'rgba(255, 59, 48, 0.3)',
-    width: '100%',
+    borderColor: color.rule,
+    backgroundColor: color.surface,
   },
+  // A group's kicker, a strong rule under it.
+  rewardsTitle: {
+    ...type('label'),
+    color: color.fog,
+    paddingBottom: space.s8,
+    marginBottom: space.s8,
+    borderBottomWidth: 1,
+    borderBottomColor: color.ruleStrong,
+  },
+  // A quiet line in a Node tab group (a refusal's reason, the licence, a ban's reason).
+  rewardHint: {
+    ...type('note'),
+    color: color.fog,
+    marginBottom: space.s12,
+  },
+  // The phrase check's refusal: an Ember line, no box.
   verificationErrorText: {
-    color: '#ff3b30',
-    fontSize: 14,
-    textAlign: 'center',
-    fontWeight: '500',
+    ...type('body'),
+    color: color.ember,
+    marginBottom: space.s16,
   },
-  // Terms of Service styles
+  // The terms line: the box, then the sentence.
   termsContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginVertical: 15,
-    paddingHorizontal: 20,
-  },
-  checkbox: {
-    width: 24,
-    height: 24,
-    marginEnd: 10,
-  },
-  checkboxInner: {
-    width: 24,
-    height: 24,
-    borderWidth: 2,
-    borderColor: '#00d4ff',
-    borderRadius: 4,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'transparent',
-  },
-  checkboxChecked: {
-    backgroundColor: '#00d4ff',
-  },
-  checkmark: {
-    color: '#000000',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  termsTextContainer: {
-    flexDirection: 'row',
-    flex: 1,
-    flexWrap: 'wrap',
+    columnGap: space.s12,
+    marginVertical: space.s16,
   },
   termsText: {
-    flexShrink: 1,
-    fontSize: 14,
-    color: '#ffffff',
+    ...type('note', 14),
+    flex: 1,
+    color: color.text,
   },
   termsLink: {
-    fontSize: 14,
-    color: '#00d4ff',
+    ...type('note', 14),
+    color: color.signal,
     textDecorationLine: 'underline',
+    textDecorationColor: color.signalLine,
   },
+  // The terms' window: its sheet (components/ui/Sheet) over the screen.
   termsModal: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.9)',
-  },
-  termsModalContent: {
-    flex: 1,
-    margin: 20,
-    backgroundColor: '#1a1a1a',
-    borderRadius: 12,
-    padding: 20,
-  },
-  termsModalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  // Wraps beside the close X instead of pushing it out of the card.
-  termsModalTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#ffffff',
-    flexShrink: 1,
-    marginEnd: 12,
-  },
-  termsModalClose: {
-    padding: 5,
-  },
-  termsModalCloseText: {
-    fontSize: 24,
-    color: '#888888',
-  },
-  termsModalBody: {
     flex: 1,
   },
   termsModalText: {
-    fontSize: 14,
-    color: '#cccccc',
-    lineHeight: 20,
+    ...type('body'),
+    color: color.text,
   },
-  termsModalButtons: {
-    flexDirection: 'row',
-    marginTop: 20,
-    gap: 10,
+  termsModalLink: {
+    color: color.signal,
+    textDecorationLine: 'underline',
+    textDecorationColor: color.signalLine,
+    alignSelf: 'flex-start',
+    marginTop: space.s12,
   },
-  termsModalButton: {
-    flex: 1,
-    paddingVertical: 12,
-    paddingHorizontal: 8,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  termsModalAccept: {
-    backgroundColor: '#00d4ff',
-  },
-  termsModalDecline: {
-    backgroundColor: '#333333',
-  },
-  termsModalButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  termsModalAcceptText: {
-    color: '#000000',
-  },
-  termsModalDeclineText: {
-    color: '#ffffff',
-  },
-  // The lock screen's mark above the app's name, and its small "forgot" link at the foot of the screen.
+  // The app's mark above its name on the screens that hold no data, and the lock screen's "forgot" act under the unlock.
   lockLogo: {
-    width: 72,
-    height: 72,
-    alignSelf: 'center',
-    marginBottom: 16,
+    width: 64,
+    height: 64,
+    alignSelf: 'flex-start',
+    marginBottom: space.s8,
   },
   lockForgot: {
-    alignSelf: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    marginBottom: 12,
-    minHeight: 44,
-    justifyContent: 'center',
+    marginTop: space.s16,
   },
-  lockForgotText: {
-    color: '#8a8fa3',
-    fontSize: 13,
-    textAlign: 'center',
-    textDecorationLine: 'underline',
+  // A waiting request or the screen-reading apps, above the unlock.
+  lockNote: {
+    ...type('note'),
+    color: color.ember,
+    marginBottom: space.s16,
   },
-  // What the lock screen says when an unlock did not open the wallet: the column's whole width, centred in every
-  // direction, clear of the title above and the field or button around it, wrapping at any system text size.
+  lockField: {
+    marginTop: space.s16,
+  },
+  // What the lock screen says when an unlock did not open the wallet: under the field, wrapping at any text size.
   lockMessage: {
+    ...type('note', 14),
     alignSelf: 'stretch',
-    color: '#ff4444',
-    fontSize: 14,
-    lineHeight: 20,
-    textAlign: 'center',
-    marginTop: 8,
-    marginBottom: 16,
-    paddingHorizontal: 8,
-  },
-  lockoutBanner: {
-    backgroundColor: '#2a1a1a',
-    borderWidth: 1,
-    borderColor: '#ff4444',
-    borderRadius: 12,
-    paddingVertical: 20,
-    paddingHorizontal: 24,
-    marginTop: 16,
-    alignItems: 'center',
+    color: color.ember,
+    marginTop: 0,
+    marginBottom: space.s16,
   },
   lockoutText: {
-    color: '#ff6b6b',
-    fontSize: 15,
-    fontWeight: '600',
-    textAlign: 'center',
+    ...type('body'),
+    color: color.ember,
+    marginTop: space.s16,
   },
-});
+}));
 
 export default styles;

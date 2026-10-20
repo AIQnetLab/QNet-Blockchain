@@ -1106,12 +1106,12 @@ test('payment activation opens only once both settling genesis nodes list owner_
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
   assert.match(page, /not_open: 'act_payment_not_open',/);
   assert.match(page, /const paymentClosed = lightStatus\.state\.phase === 'ok' && !lightStatus\.state\.value\.features\.includes\(OWNER_BIND_V2_FEATURE\);/);
-  assert.match(page, /\) : paymentClosed \? \(\s*<p className="activate-status">\{t\('act_payment_not_open'\)\}<\/p>\s*\) : \(/);
+  assert.match(page, /\) : paymentClosed \? \(\s*<p className="note">\{t\('act_payment_not_open'\)\}<\/p>\s*\) : \(/);
   assert.match(page, /disabled=\{working \|\| paymentClosed\}>\{t\('act_burn'\)\}/);
-  assert.match(page, /\{stage === 'submitted' && record\.submit\?\.lastCode === 'bind_v2_pending' && <p className="activate-note">\{t\('act_bind_v2_pending'\)\}<\/p>\}/);
+  assert.match(page, /\{stage === 'submitted' && record\.submit\?\.lastCode === 'bind_v2_pending' && <p className="note">\{t\('act_bind_v2_pending'\)\}<\/p>\}/);
   const finish = readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8');
   assert.match(finish, /if \(outcome\.code === 'bind_v2_pending'\) return null;/);
-  assert.match(finish, /\{outcome\?\.result === 'retry' && outcome\.code === 'bind_v2_pending' && <p className="activate-note">\{t\('act_bind_v2_pending'\)\}<\/p>\}/);
+  assert.match(finish, /\{outcome\?\.result === 'retry' && outcome\.code === 'bind_v2_pending' && <p className="note">\{t\('act_bind_v2_pending'\)\}<\/p>\}/);
 });
 
 // SITE-R2-02: a refund that cannot pay for itself is never signed (Solana would refuse it at every try); the page learns
@@ -1167,12 +1167,12 @@ test('what is left that cannot pay for its own refund: nothing is signed, the pa
   // The page: the address, its QR code and what it lacks; no "Leave it" while 1DEV would stay behind; a typed
   // address short of SOL is sent to by itself once the SOL arrives.
   const steps = readFileSync(new URL('../../components/cabinet/ActivateSteps.tsx', import.meta.url), 'utf8');
-  assert.match(steps, /<p className="activate-error">\{t\(ACTIVATION_NETWORK === 'testnet' \? 'act_refund_short_testnet' : 'act_refund_short', \{ sol: formatUnits\(short, SOL_DECIMALS\) \}\)\}<\/p>\s*<QrCode text=\{pub\} label=\{t\('act_address_qr'\)\} \/>/);
+  assert.match(steps, /<figure className="cab-pay-qr"><QrCode text=\{pub\} label=\{t\('act_address_qr'\)\} size=\{196\} \/><\/figure>\s*<div className="cab-manual-t">\s*<p className="rq-failed">\{t\(ACTIVATION_NETWORK === 'testnet' \? 'act_refund_short_testnet' : 'act_refund_short', \{ sol: formatUnits\(short, SOL_DECIMALS\) \}\)\}<\/p>/);
   // Test SOL comes from the faucet or the user's wallet, never "from any wallet or exchange" (XC-10).
   assert.doesNotMatch(TEXTS.act_refund_short_testnet, /exchange/);
   assert.match(TEXTS.act_refund_short_testnet, /Send \{sol\} test SOL more to it from your wallet \(the Testnet page's faucet gives test SOL\)/);
   assert.match(steps, /const mayLeave = !\(lacking && \(balance === null \|\| balance\.oneDev > 0n\)\);\s*if \(leaving && mayLeave\) \{/);
-  assert.match(steps, /\{mayLeave && <button type="button" className="activate-link-button" onClick=\{\(\) => setLeaving\(true\)\} disabled=\{busy\}>\{t\('act_refund_leave'\)\}<\/button>\}/);
+  assert.match(steps, /\{mayLeave && <div className="cab-next-act"><Action kind="text" onClick=\{\(\) => setLeaving\(true\)\} disabled=\{busy\}>\{t\('act_refund_leave'\)\}<\/Action><\/div>\}/);
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
   assert.match(page, /const to = dest \?\? typedDest\.current;\s*const got = await act\.settleLeftovers\(r, to, deps\);/);
   assert.match(page, /if \(result\.outcome !== 'unavailable'\) typedDest\.current = result\.outcome === 'short' \? to : null;/);
@@ -1325,7 +1325,7 @@ test('the key lives 24 hours before a burn; after it, only until what is left ha
   assert.match(steps, /const warning = empty \|\| !amounts \? t\('act_closing_delete_warn'\) : t\('act_refund_leave_warn', amounts\);\s*return <ConfirmLoss warning=\{warning\} confirm=\{t\('act_delete_key'\)\} busy=\{busy\} onConfirm=\{onLeave\} onBack=\{\(\) => setLeaving\(false\)\} \/>;/);
   assert.equal(steps.match(/onClick=\{onLeave\}/g), null, 'no button deletes the key at once');
   assert.equal((steps.match(/onClick=\{\(\) => setLeaving\(true\)\}/g) ?? []).length, 2);
-  assert.match(steps, /<p className="activate-note">\{t\('act_leftovers_now_note'\)\}<\/p>\s*<button type="button" className="qnet-button secondary" onClick=\{onSend\} disabled=\{busy\}>\{t\('act_leftovers_now'\)\}<\/button>/);
+  assert.match(steps, /<p className="note">\{t\('act_leftovers_now_note'\)\}<\/p>\s*<div className="cab-next-act"><Action kind="text" onClick=\{onSend\} disabled=\{busy\}>\{t\('act_leftovers_now'\)\}<\/Action><\/div>/);
   assert.doesNotMatch(steps, /act_abandon/);
   assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'act_abandon_warn'), false);
   assert.match(TEXTS.act_leftovers_now_note, /^The burn stays this wallet's activation: finish the registration later in any browser where this wallet is connected\./);
@@ -1688,7 +1688,7 @@ test('a consent too old at record time: QNet Wallet is asked again for the same 
   // The page asks again in one tap: back to the burn's request step, and the request opens at once.
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
   assert.match(page, /const askAgain = \(\) => withRecord\(async \(r\) => \{\s*const back = await act\.relink\(r, deps\);\s*if \(back\.stage !== 'burnFinal'\) return back;\s*const asQr = !device\?\.phone;\s*const opened = await act\.openLink\(back, asQr, choice, deps\);\s*if \(opened\?\.link\) void \(asQr \? qr : button\)\.start\('link', opened\.link\.request\);/);
-  assert.match(page, /\{stage === 'consentStale' \? \(\s*<button type="button" className="qnet-button activate-primary" onClick=\{\(\) => void askAgain\(\)\}/);
+  assert.match(page, /\{stage === 'consentStale' \? \(\s*<div className="cab-next-act"><Action kind="solid" onClick=\{\(\) => void askAgain\(\)\}/);
   assert.match(TEXTS.act_stale, /Ask QNet Wallet again: the burn and its code stay\.$/);
 });
 

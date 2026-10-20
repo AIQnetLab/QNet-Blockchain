@@ -8,14 +8,14 @@ appId: com.qnetmobile
 - tapOn:
     id: "assets-send"
 - extendedWaitUntil:
-    visible: "To address"
+    visible: "(?i)To address"
     timeout: 10000
 - runFlow:
     file: paste.yaml
     env:
       FIELD: "Enter an EON address"
-# A tap on the label closes the keyboard.
-- tapOn: "To address"
+# A tap on the label closes the keyboard. Labels and acts are set in capitals, so their texts match in any case.
+- tapOn: "(?i)To address"
 - tapOn: "25%"
 - runFlow:
     when:
@@ -37,4 +37,4 @@ appId: com.qnetmobile
       true: ${MAESTRO_QNET_OWN_WALLET == 'true'}
     commands:
       - tapOn: "Cancel"
-- tapOn: ".*Back"
+- tapOn: "(?i).*Back"

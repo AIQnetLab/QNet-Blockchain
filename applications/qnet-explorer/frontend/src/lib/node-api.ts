@@ -66,20 +66,25 @@ export interface NodeFetchOptions extends Omit<RequestInit, 'signal'> {
   timeoutMs?: number;
   /** False for a request that must not reach two nodes (a write): only the first healthy node is asked. */
   failover?: boolean;
+  /** The caller's own end (a page's first answer, a visitor gone): once it fires no further node is asked, and the node
+   *  asked is not put in cooldown for it. */
+  deadline?: AbortSignal;
 }
 
 // The first answer to `path` that is neither a transport failure nor a 5xx; null when no node gives one.
 // Nodes in cooldown are asked only when every node is in cooldown, so a caller that loops over many
 // reads pays for a dead node once per cooldown, not once per read.
 export async function fetchNode(path: string, opts: NodeFetchOptions = {}): Promise<Response | null> {
-  const { timeoutMs = 10_000, failover = true, headers, ...init } = opts;
+  const { timeoutMs = 10_000, failover = true, headers, deadline, ...init } = opts;
   const now = Date.now();
   const all = RESOLVED.endpoints;
   const healthy = all.filter(e => (failedUntil.get(e) || 0) <= now);
   const candidates = healthy.length > 0 ? healthy : all;
   for (const base of failover ? candidates : candidates.slice(0, 1)) {
+    if (deadline?.aborted) return null;
+    const timeout = AbortSignal.timeout(timeoutMs);
     try {
-      const res = await fetch(`${base}${path}`, { ...init, headers: headers ?? nodeHeaders(), signal: AbortSignal.timeout(timeoutMs) });
+      const res = await fetch(`${base}${path}`, { ...init, headers: headers ?? nodeHeaders(), signal: deadline ? AbortSignal.any([deadline, timeout]) : timeout });
       if (res.status < 500) {
         failedUntil.delete(base);
         return res;
@@ -87,6 +92,7 @@ export async function fetchNode(path: string, opts: NodeFetchOptions = {}): Prom
     } catch {
       // unreachable or timed out: the next node is asked
     }
+    if (deadline?.aborted) return null;
     failedUntil.set(base, Date.now() + COOLDOWN_MS);
   }
   return null;

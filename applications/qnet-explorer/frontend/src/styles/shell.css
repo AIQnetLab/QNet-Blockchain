@@ -1,0 +1,185 @@
+/* shell.css: the header (navigation, Docs menu, account control and menu), the phone's menu and sheet, the footer. */
+
+/* ---------- The page: header, main and footer in one column ---------- */
+.app-wrapper { min-height: 100vh; display: flex; flex-direction: column; }
+main.qnet-container { flex: 1; display: flex; flex-direction: column; width: 100%; padding-top: var(--hdr); }
+/* A rebuilt page draws its own title band under the transparent header. */
+main.qnet-container:has(.page-head, .hero) { padding-top: 0; }
+
+/* ---------- Header ---------- */
+.hdr {
+  position: fixed; inset: 0 0 auto 0; z-index: 50; height: var(--hdr);
+  background: transparent; border-bottom: 1px solid transparent;
+  transition: background-color 200ms ease, border-color 200ms ease;
+}
+.hdr[data-scrolled] { background: var(--ink); border-bottom-color: var(--rule); }
+.hdr-in { height: 100%; display: flex; align-items: center; gap: 40px; }
+
+.brand { display: flex; align-items: center; gap: 10px; flex: none; min-height: 44px; color: var(--paper); white-space: nowrap; }
+.brand img { display: block; width: 28px; height: 28px; border-radius: 50%; }
+.brand-name { font-weight: 500; font-size: 15.5px; letter-spacing: -.01em; }
+.brand-name b { font-weight: 700; }
+
+.nav { flex: 1; display: flex; align-items: center; gap: 28px; min-width: 0; }
+/* Before the wallet is detected the links are laid out but not shown: nothing moves when they appear. */
+.nav[data-pending] { visibility: hidden; }
+.nav-link {
+  position: relative; display: inline-flex; align-items: center; gap: 7px; min-height: 44px; padding: 0; margin: 0; border: 0; background: none;
+  font: inherit; font-size: 15px; font-weight: 500; line-height: 1; color: var(--paper-78); cursor: pointer; white-space: nowrap;
+  transition: color var(--t-hover);
+}
+.nav-link:hover { color: var(--paper); }
+.nav-link[aria-current='page'], .nav-link[data-current] { color: var(--paper); }
+/* The current page's line is an overlay: it never changes the link's size. */
+.nav-link[aria-current='page']::after, .nav-link[data-current]::after { content: ''; position: absolute; left: 0; right: 0; bottom: 9px; height: 2px; background: var(--signal); }
+.docs-btn[data-current]::after { right: 14px; }
+
+.chev { width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform 200ms ease; flex: none; }
+.docs { position: relative; }
+.docs-btn[aria-expanded='true'] .chev, .acct-btn[aria-expanded='true'] .chev { transform: translateY(1px) rotate(-135deg); }
+.docs-menu {
+  position: absolute; top: calc(100% + 6px); left: -16px; z-index: 55; min-width: 220px; padding: 8px 0;
+  background: var(--surface); border: 1px solid var(--rule); box-shadow: var(--shadow-menu);
+}
+.docs-menu[hidden] { display: none; }
+.docs-link { display: flex; align-items: center; min-height: 44px; padding: 0 16px; font-size: var(--t-small); color: var(--paper-85); transition: background-color var(--t-hover), color var(--t-hover); }
+.docs-link:hover { color: var(--paper); background: var(--fill-signal); }
+.docs-link[aria-current='page'] { color: var(--paper); }
+
+.hdr-acct { margin-left: auto; flex: none; }
+.menu-btn {
+  display: none; flex: none; min-height: 44px; padding: 0 0 0 4px; margin: 0; border: 0; background: none; color: var(--paper); cursor: pointer;
+  font-family: var(--font-mono); font-stretch: 87.5%; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+}
+
+/* ---------- Account control ---------- */
+.wallet-widget { position: relative; display: flex; align-items: center; }
+/* Connect wallet: the header's one action, as text with the Signal underline. */
+.connect {
+  display: inline-flex; align-items: center; min-height: 44px; margin: 0; padding: 0; border: 0; background: none; cursor: pointer; text-align: right;
+  font: inherit; font-size: 15px; font-weight: 600; line-height: 1; color: var(--paper); white-space: nowrap;
+  text-decoration: underline; text-decoration-color: var(--signal); text-decoration-thickness: 2px; text-underline-offset: .45em;
+  transition: color var(--t-hover);
+}
+.connect:hover { color: var(--signal); }
+.connect:disabled { color: var(--fog); text-decoration-color: var(--rule-strong); cursor: default; }
+.connect[aria-busy='true'] { cursor: progress; }
+
+.acct { position: relative; }
+.acct-btn {
+  display: inline-flex; align-items: center; gap: 10px; min-height: 44px; margin: 0; padding: 0; border: 0; background: none; cursor: pointer;
+  font-family: var(--font-mono); font-stretch: 87.5%; font-size: 13px; line-height: 1; color: var(--paper); white-space: nowrap;
+}
+.acct-a { text-decoration: underline; text-decoration-color: var(--rule-strong); text-underline-offset: .45em; transition: text-decoration-color var(--t-hover); }
+.acct-btn:hover .acct-a, .acct-btn[aria-expanded='true'] .acct-a { text-decoration-color: var(--signal); }
+.a-short { display: none; }
+.acct-scrim { display: none; }
+.acct-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 55; width: 368px; padding: 18px 22px 6px;
+  background: var(--surface); border: 1px solid var(--rule); box-shadow: var(--shadow-menu); outline: none;
+}
+.acct:not([data-open]) .acct-menu { display: none; }
+.acct-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.acct-close { display: none; }
+.acct-addr { margin: 10px 0 0; font-size: 14px; line-height: 1.55; color: var(--paper); overflow-wrap: anywhere; }
+.acct-src { margin: 2px 0 0; font-size: var(--t-sub); line-height: 1.45; color: var(--fog); }
+.acct-links { margin-top: 14px; border-top: 1px solid var(--rule); }
+.acct-links a {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 46px; padding: 10px 0;
+  border-bottom: 1px solid var(--rule); font-size: 15.5px; color: var(--paper);
+}
+.acct-links a:hover .acct-k { text-decoration: underline; text-decoration-color: var(--signal); text-underline-offset: .25em; }
+.acct-d { display: inline-flex; align-items: center; gap: 8px; min-width: 0; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); color: var(--fog); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.acct-d[data-tone='signal'] { color: var(--signal); }
+.acct-d[data-tone='ember'] { color: var(--ember); }
+.acct-out {
+  display: block; width: 100%; min-height: 48px; margin: 0; padding: 12px 0; border: 0; background: none; cursor: pointer; text-align: left;
+  font: inherit; font-size: 15.5px; color: var(--paper-78); transition: color var(--t-hover);
+}
+.acct-out:hover { color: var(--paper); }
+/* In the QNet app's view: which address the menu shows, as two underlined tabs. */
+.acct-views { display: flex; gap: 20px; margin-top: 8px; border-bottom: 1px solid var(--rule); }
+.acct-view { position: relative; min-height: 44px; margin: 0; padding: 0; border: 0; background: none; cursor: pointer; font: inherit; font-size: var(--t-small); color: var(--fog); }
+.acct-view:hover { color: var(--paper); }
+.acct-view[aria-selected='true'] { color: var(--paper); }
+.acct-view[aria-selected='true']::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--signal); }
+
+/* A wallet's error, under the control for a few seconds, never pushing the header. */
+.wallet-error {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 55; display: flex; align-items: flex-start; gap: 12px; width: max-content; max-width: min(340px, calc(100vw - 32px));
+  padding: 12px 14px; background: var(--surface); border: 1px solid var(--rule); box-shadow: var(--shadow-menu); font-size: var(--t-note); line-height: 1.45; color: var(--ember);
+}
+.wallet-error-close { padding: 0 4px; font-size: 16px; }
+
+/* ---------- Phone: the menu is a full screen under the header, the account a sheet from the bottom edge ---------- */
+@media (max-width: 860px) {
+  .hdr-in { gap: 18px; }
+  .menu-btn { display: inline-flex; align-items: center; }
+  .nav {
+    position: fixed; top: var(--hdr); left: 0; right: 0; z-index: 52; height: calc(100dvh - var(--hdr));
+    display: none; flex-direction: column; align-items: stretch; gap: 0; padding: 12px var(--gut) 32px;
+    background: var(--ink); border-top: 1px solid var(--rule); overflow-y: auto; overscroll-behavior: contain;
+  }
+  .hdr[data-open] { background: var(--ink); }
+  .hdr[data-open] .nav { display: flex; }
+  .nav-link {
+    width: 100%; justify-content: space-between; min-height: 0; padding: 14px 0; border-bottom: 1px solid var(--rule);
+    font-size: 28px; font-weight: 600; font-stretch: 108%; letter-spacing: -.02em; line-height: 1.08; color: var(--paper); text-align: left;
+  }
+  .nav-link[aria-current='page'], .nav-link[data-current] { color: var(--signal); }
+  .nav-link[aria-current='page']::after, .nav-link[data-current]::after { display: none; }
+  .docs-menu { position: static; min-width: 0; padding: 4px 0 8px; background: none; border: 0; box-shadow: none; }
+  .docs-link { min-height: 44px; padding: 0; font-size: 18px; }
+  .docs-link:hover { background: none; }
+  .connect .c-long { display: none; }
+  .acct-btn { gap: 8px; font-size: 12.5px; }
+  .acct-btn .chev, .a-long { display: none; }
+  .a-short { display: inline; }
+  .acct-scrim {
+    display: block; position: fixed; inset: 0; z-index: 60; background: var(--scrim);
+    opacity: 0; visibility: hidden; transition: opacity var(--t-sheet) var(--ease-out), visibility 0s var(--t-sheet);
+  }
+  .acct-menu, .acct:not([data-open]) .acct-menu {
+    position: fixed; top: auto; left: 0; right: 0; bottom: 0; z-index: 61; display: block; width: auto; max-height: 86dvh; overflow-y: auto;
+    padding: 18px var(--gut) calc(8px + env(safe-area-inset-bottom)); border: 0; border-top: 1px solid var(--rule-strong); box-shadow: var(--shadow-sheet);
+    transform: translateY(100%); visibility: hidden; transition: transform var(--t-sheet) var(--ease-out), visibility 0s var(--t-sheet);
+  }
+  .acct[data-open] .acct-scrim { opacity: 1; visibility: visible; transition: opacity var(--t-sheet) var(--ease-out); }
+  .acct[data-open] .acct-menu { transform: none; visibility: visible; transition: transform var(--t-sheet) var(--ease-out); }
+  .acct-close { display: inline-flex; }
+  .acct-addr { font-size: 15px; }
+  .acct-links a { min-height: 54px; font-size: 17px; }
+  .acct-out { min-height: 56px; font-size: 17px; }
+}
+
+/* ---------- Footer ---------- */
+.ftr { margin-top: auto; border-top: 1px solid var(--rule); padding: clamp(72px, 9vw, 120px) 0 28px; }
+.ftr-line { margin: 0 0 clamp(40px, 5vw, 72px); font-weight: 300; font-size: var(--t-wordmark-line); line-height: 1.05; letter-spacing: -.03em; color: var(--paper); }
+/* The marks and the store badges: one row that keeps its height in the QNet app's view, where it is empty. */
+.ftr-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-height: 44px; margin-bottom: 28px; }
+.ftr-mark { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; color: var(--fog); transition: color var(--t-hover); }
+.ftr-mark:hover { color: var(--paper); }
+.ftr-mark svg { display: block; }
+.store-badges { display: flex; align-items: center; gap: 12px; flex: none; margin-left: 12px; }
+.app-store-badge, .google-play-badge { display: flex; align-items: center; min-height: 44px; }
+.app-store-badge img { display: block; height: 40px; width: auto; }
+/* The official Google Play artwork carries its own clear space: drawn larger, so the visible badge matches. */
+.google-play-badge img { display: block; height: 60px; width: auto; margin-block: -10px; }
+.ftr-legal {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 24px; padding-top: 24px; border-top: 1px solid var(--rule);
+  font-family: var(--font-mono); font-stretch: 87.5%; font-size: 12px; color: var(--fog);
+}
+.ftr-links { display: flex; gap: 24px; }
+.ftr-link { display: inline-flex; align-items: center; min-height: 44px; color: var(--paper-85); text-decoration: underline; text-decoration-color: var(--rule-strong); text-underline-offset: .3em; transition: text-decoration-color var(--t-hover); }
+.ftr-link:hover { text-decoration-color: var(--signal); }
+.ftr-height { margin-left: auto; display: inline-flex; align-items: center; gap: 10px; }
+.ftr-height .ent { font-size: 12px; min-width: 9ch; }
+.ftr-height .dash { min-width: 9ch; }
+@media (max-width: 560px) {
+  .ftr-height { margin-left: 0; width: 100%; }
+}
+/* Where the badges wrap under the marks and the TestFlight link, the row keeps two lines in the QNet app's view too. */
+@media (max-width: 640px) {
+  .ftr-row { min-height: 96px; }
+  .store-badges { margin-left: 0; }
+}

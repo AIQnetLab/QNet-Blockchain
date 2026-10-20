@@ -10,6 +10,9 @@ export const EXTENSION_STORE_URL = 'https://chromewebstore.google.com/detail/pah
 
 const ANNOUNCE_EVENT = 'qnet:announceProvider';
 const REQUEST_EVENT = 'qnet:requestProvider';
+// How long the page waits for the wallet's announcement before it counts the wallet as missing; a later announcement
+// still binds.
+export const DETECT_MS = 1_000;
 const PASSIVE_TIMEOUT_MS = 5_000;
 // The user may take a while in the approval window; past this the page stops waiting.
 const CONNECT_TIMEOUT_MS = 180_000;
@@ -20,6 +23,9 @@ export type AddressView = 'qnet' | 'solana';
 // Where the announced provider runs: the browser extension, or the QNet app's in-app browser, which
 // offers no node activation (docs/protocols/qnet-link-v1.md section 11).
 export type WalletChannel = 'extension' | 'mobile';
+
+// The page's search for the wallet: until DETECT_MS has passed without one it is 'detecting'.
+export type ProviderStatus = 'detecting' | 'available' | 'missing';
 
 export interface WalletAccounts {
   qnet: string;
@@ -48,6 +54,16 @@ export function isSolanaAddress(value: unknown): value is string {
   if (typeof value !== 'string' || value.length < 32 || value.length > 44) return false;
   try {
     return bs58.decode(value).length === 32;
+  } catch {
+    return false;
+  }
+}
+
+// A Solana transaction signature is the base58 of 64 bytes (64 to 88 characters).
+export function isSolanaSignature(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 64 || value.length > 88) return false;
+  try {
+    return bs58.decode(value).length === 64;
   } catch {
     return false;
   }
@@ -128,6 +144,34 @@ export function aliasProvider(win: unknown): QNetProvider | null {
   }
 }
 
+// The page's search for the wallet: the first QNet announcement binds; with none within `ms`, the window.qnet alias
+// binds, else `onMissing` runs. An announcement after that still binds (an extension that injected late). Returns the
+// cleanup.
+export function detectProvider(
+  win: EventTarget,
+  onProvider: (provider: QNetProvider, channel: WalletChannel) => void,
+  onMissing: () => void,
+  ms: number = DETECT_MS,
+): () => void {
+  let bound = false;
+  const bind = (provider: QNetProvider, channel: WalletChannel) => {
+    if (bound) return;
+    bound = true;
+    onProvider(provider, channel);
+  };
+  const stop = watchProviders(win, bind);
+  const timer = setTimeout(() => {
+    if (bound) return;
+    const alias = aliasProvider(win);
+    if (alias) bind(alias, 'extension');
+    else onMissing();
+  }, ms);
+  return () => {
+    stop();
+    clearTimeout(timer);
+  };
+}
+
 // One request, rejected with Error('timeout') when the wallet has not answered in time.
 export function callProvider(provider: QNetProvider, method: string, timeoutMs: number, params?: unknown): Promise<unknown> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -158,6 +202,26 @@ export function isApprovalCooldown(err: unknown): boolean {
     return (err as { message?: unknown }).message === COOLDOWN_MESSAGE;
   } catch {
     return false;
+  }
+}
+
+export type ProviderFailure = 'rejected' | 'cooldown' | 'unauthorized' | 'unsupported' | 'disconnected' | 'timeout' | 'failed';
+
+// A provider call that threw, by its protocol code (applications/qnet-wallet CONTRACTS.md 4.5); 4200 is a wallet
+// without the method.
+export function providerFailure(err: unknown): ProviderFailure {
+  if (err instanceof Error && err.message === 'timeout' && errorCode(err) === null) return 'timeout';
+  switch (errorCode(err)) {
+    case 4001:
+      return isApprovalCooldown(err) ? 'cooldown' : 'rejected';
+    case 4100:
+      return 'unauthorized';
+    case 4200:
+      return 'unsupported';
+    case 4900:
+      return 'disconnected';
+    default:
+      return 'failed';
   }
 }
 
@@ -212,6 +276,70 @@ export async function revokeAccess(provider: QNetProvider): Promise<boolean> {
   }
 }
 
+// qnet_sendSolanaTransfer (aiqnet.io only): the extension's Solana send window opens with the recipient, the token and
+// the amount filled in, and the user confirms there; the site cannot change any of them once asked.
+export const SOLANA_TRANSFER_METHOD = 'qnet_sendSolanaTransfer';
+// The user reviews the transfer in the extension's window.
+const SOLANA_TRANSFER_TIMEOUT_MS = 5 * 60_000;
+
+// One transfer: SOL (`mint` null) or a token, `amount` in whole units.
+export interface SolanaTransfer {
+  to: string;
+  mint: string | null;
+  amount: string;
+}
+
+// A plain decimal above zero: no sign, exponent, grouping, leading zero or trailing zero in the fraction.
+const TRANSFER_AMOUNT_RE = /^(?:0|[1-9]\d{0,19})(?:\.\d{0,17}[1-9])?$/;
+
+export function isSolanaTransfer(value: unknown): value is SolanaTransfer {
+  if (typeof value !== 'object' || value === null) return false;
+  const { to, mint, amount } = value as Record<string, unknown>;
+  return isSolanaAddress(to) && (mint === null || isSolanaAddress(mint)) && typeof amount === 'string' && TRANSFER_AMOUNT_RE.test(amount) && amount !== '0';
+}
+
+// `short`: the window refused it for the wallet's balance (INSUFFICIENT_SOL, INSUFFICIENT_TOKENS); `failed` also covers
+// an error result (Solana unreachable, a refused transaction, no wallet).
+export type SolanaTransferResult = { ok: true; signature: string } | { ok: false; failure: ProviderFailure | 'short' | 'unverifiable' };
+
+// Exactly {status: 'submitted', signature} or {status: 'error', error}; anything else is unverifiable.
+export function readSolanaTransfer(value: unknown): SolanaTransferResult {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false, failure: 'unverifiable' };
+    const r = value as Record<string, unknown>;
+    const keys = Object.keys(r).sort().join(',');
+    if (r.status === 'submitted' && keys === 'signature,status' && isSolanaSignature(r.signature)) return { ok: true, signature: r.signature };
+    if (r.status === 'error' && keys === 'error,status' && typeof r.error === 'string') {
+      return { ok: false, failure: r.error === 'INSUFFICIENT_SOL' || r.error === 'INSUFFICIENT_TOKENS' ? 'short' : 'failed' };
+    }
+  } catch {
+    // a hostile object: unverifiable
+  }
+  return { ok: false, failure: 'unverifiable' };
+}
+
+// Whether the extension takes the transfer, asked without a window: one that has the method refuses a call without
+// params (-32602) before anything else, one without it answers 4200.
+export async function supportsSolanaTransfer(provider: QNetProvider): Promise<boolean> {
+  try {
+    await callProvider(provider, SOLANA_TRANSFER_METHOD, PASSIVE_TIMEOUT_MS);
+  } catch (err) {
+    return errorCode(err) === -32602;
+  }
+  return false;
+}
+
+export async function sendSolanaTransfer(provider: QNetProvider, transfer: SolanaTransfer): Promise<SolanaTransferResult> {
+  if (!isSolanaTransfer(transfer)) return { ok: false, failure: 'failed' };
+  let result: unknown;
+  try {
+    result = await callProvider(provider, SOLANA_TRANSFER_METHOD, SOLANA_TRANSFER_TIMEOUT_MS, { to: transfer.to, mint: transfer.mint, amount: transfer.amount });
+  } catch (err) {
+    return { ok: false, failure: providerFailure(err) };
+  }
+  return readSolanaTransfer(result);
+}
+
 // Where "Connect wallet" sends a visitor whose browser has no QNet provider: the extension's store page
 // on a desktop browser that installs from that store, the mobile app's page on a phone (browser extensions do
 // not run there), and the extension page, which lists the supported browsers, anywhere else.
@@ -256,6 +384,24 @@ export function installTarget(nav: NavigatorLike | null | undefined): InstallTar
     : /\b(Chrome|Chromium|Edg)\//.test(ua) && !/\bFirefox\//.test(ua);
   if (chromium) return { kind: 'store', href: EXTENSION_STORE_URL };
   return { kind: 'unsupported', href: '/qnet-wallet-extension' };
+}
+
+// What Connect wallet does, the header's and My node's alike (owner, 20.10): nothing while the wallet is being detected;
+// on a phone or tablet it asks QNet Wallet (never an extension offer); on a computer it asks the QNet extension, or
+// without one opens the extension's store page at once (`store`; in a browser that store does not serve, the page that
+// lists the browsers it installs in).
+export type ConnectWay =
+  | { kind: 'wait' }
+  | { kind: 'app' }
+  | { kind: 'extension' }
+  | { kind: 'install'; href: string; store: boolean };
+
+export function connectWay(status: ProviderStatus, channel: WalletChannel | null, device: { phone: boolean } | null, nav: NavigatorLike | null | undefined): ConnectWay {
+  if (status === 'detecting' || device === null) return { kind: 'wait' };
+  if (device.phone) return { kind: 'app' };
+  if (status === 'available' && channel === 'extension') return { kind: 'extension' };
+  const target = installTarget(nav);
+  return { kind: 'install', href: target.href, store: target.kind === 'store' };
 }
 
 export function shortAddress(address: string): string {

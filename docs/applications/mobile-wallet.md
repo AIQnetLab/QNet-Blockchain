@@ -29,25 +29,41 @@ against a committee quorum certificate, and runs this wallet's light node on the
 - Opens websites in a built-in browser whose pages can connect the wallet through the same provider as the
   browser extension ([In-app browser](#in-app-browser)).
 
-The UI is a single wallet screen with a bottom bar of five tabs — Assets, History, Browser, Node, Settings
-(`src/components/BottomBar.js`, drawn icons, the active tab lit, clear of the gesture bar and home indicator).
+The UI is a single wallet screen under a header (the app mark, "QNet Wallet", and More, which opens Manage tokens and
+Hide balances; on the Browser tab the browser bar's More holds them and the header shows none, so a screen has one More,
+both drawn by `src/components/ui/Menu.js`) with a bottom bar of five tabs — Assets, History, Browser, Node, Settings (`src/components/BottomBar.js`,
+each tab its name alone, the current one marked by a line over it, the Node tab carrying the live dot while this
+wallet's node runs, `NodeTab.nodeLive`: its server node online and admitted, or its light node online on this device;
+clear of the gesture bar and home indicator). Every colour, face, size, radius and duration comes from one theme
+(`src/theme.js`): a dark ink background, Signal (`#3CF0DC`) only for what can be acted on or is live, Ember
+(`#FFB547`) for what needs the user; words in Archivo, numbers, addresses and labels in Martian Mono, both under the SIL
+Open Font License 1.1 and bundled as six static faces in `assets/native/fonts/` with their licence texts (Android reads
+the folder as an asset source, iOS lists the faces in `UIAppFonts`; `scripts/fonts/build-fonts.py` cuts them from the
+families' variable files). Russian sets words in the system face and keeps Martian Mono for numbers and labels;
+Chinese, Japanese, Korean and Arabic set words and labels in the system face, without capitals or tracking. Shared
+pieces live in `src/components/ui/` (actions, fields, tabs, status words, switch, sheet, screen head).
 Send and Receive are buttons on Assets (Send opens QNC on the QNet Blockchain side and SOL on the Solana side, and each token row
 opens its own Send); the QNet Blockchain Send form switches between QNC and every QNet Blockchain token the Assets list shows, the Solana form
 between SOL and 1DEV; Android back returns from Receive and the other tabs to Assets.
-It includes QR receive, clipboard copy, hideable balances and spam-token hiding. The Assets address card and Receive
-show the address whole on one line (the font shrinking before anything wraps or is cut; a larger system text size
-counts up to 1.2 times there, so the smallest fit still holds the whole address on a 320 dp screen), as the QNet Link
-sheet and a site's connect sheet show both addresses, and a tap on it copies it
-("Copied" for two seconds); there is no separate Copy button. Every label with its value, on every screen (the Node
+It includes QR receive, clipboard copy, hideable balances and spam-token hiding. Assets and Receive show the address
+whole as the screen's subject, on two lines: a QNet Blockchain address in its own structure (19 hex characters and
+"eon", then 15 hex characters and the 8-character check, `utils/addressDisplay.addressParts`), a Solana address in groups
+of four (each line shrinking before anything wraps or is cut; a larger system text size counts up to 1.2 times), as the
+QNet Link sheet and a site's connect sheet show both addresses on one fitted line; a tap on it, or the Copy act under
+it, copies the raw address ("Copied" on the act for two seconds). The asset rows draw no icon: the symbol, the name and
+the contract id say which asset it is, and "Solana devnet" is said once above the Solana rows. On Receive the QR code
+(176 dp with a quiet zone of 24) sits at the column's start, then the line on what the address takes and the address. Every label with its value, on every screen (the Node
 tab, the Send forms, a send's review and result, a site's request sheet, the QNet Link sheet, a transaction's detail,
-Settings), is drawn by one component (`src/components/InfoRow.js`) in one type per role: the label grey at the line's
-start, with no colon, the value white at its end (an amount to act on in blue, a state green, orange or red); a
-setting's title white, its value blue in the box a tap opens. Both stay on one line in every language on a 320 dp
+Settings), is drawn by one component (`src/components/InfoRow.js`) in one type per role, rows parted by hairlines: the
+label in Fog at the line's start, with no colon, the value in Paper at its end (an amount that can be moved now in
+Signal, a state that needs the user in Ember), a figure in the mono face; a setting's title in Paper, its value in
+Signal at the row's end, the whole row the target a tap opens. Both stay on one line in every language on a 320 dp
 screen: the texts are written to fit side by side at full size, a larger system text size counts up to 1.2 times, and
 the two shrink together by at most a fifth; a figure (an amount) may shrink to half its size, its label
 giving way far less, and one that would not fit even so goes under its label, whole. A total in two currencies takes a
 line for each. An id or an address to share sits whole on one line under its label, a hash is shortened in its middle
-and copied whole on a tap, and a text that must be read whole (a memo, a recipient to confirm) wraps under its label.
+and copied whole on a tap (its label line carries a Copy act that answers Copied), and a text that must be read whole
+(a memo, a recipient to confirm) wraps under its label.
 A value stays selectable. A balance on Assets sits beside its token while it fits two fifths of the row at half its
 size; a longer one (a token's exact balance has up to 18 decimals) takes a line of its own under the token, whole, and a
 token's symbol and name wrap rather than lose their ends. Every amount on screen (Assets, the Send forms with their
@@ -78,15 +94,26 @@ it, else English: Android's locale, and on iPhone and iPad the first of the user
 the app in the iOS Settings included); Settings → Language changes it (a display preference, kept when the wallet is
 deleted). The iOS build declares the same eleven languages (`CFBundleLocalizations`), so the App Store lists them, and
 the purpose strings iOS itself shows (Face ID, camera) come in each (`ios/QNetMobile/<lang>.lproj/InfoPlist.strings`). Arabic
-lays the screen out right to left; addresses, hashes, codes and amounts stay left to right, and a value put into an
-Arabic sentence is wrapped in a bidi isolate. The wallet's own errors are translated by code; what a node answered
+mirrors the whole layout on Android and iOS through React Native's I18nManager (`src/i18n/direction.js`: right to left
+forced and allowed for Arabic, both off for every other language, so a phone set to a right-to-left language does not
+turn an English screen). The native side reads the direction when the root view is made, so it takes effect when the
+app's JS starts again (`QNetSecurity.reloadApp`: the React context made anew on Android, the bridge reloaded on iOS; the
+wallet locks, as at a cold start). At launch the wallet screen waits until the saved language's direction is stored; when
+the running layout has the other one, the JS restarts once (never twice in a row for the same direction, and the screen
+is drawn anyway if no restart came within 4 s). After a change of language to or from Arabic, Settings shows "The layout
+changes after the app restarts." under Language, with Restart. The screens are written in start and end terms only (no
+left or right margin, padding, position or text alignment, no direction style), so nothing is turned twice; a title,
+note, figure or value that may be Latin letters takes its own width at the start edge (the platforms align a text by its
+own script), and the switch's knob slides toward the end edge. Addresses, hashes, codes and amounts stay left to right (`writingDirection: 'ltr'`, the
+History amount line in an `ltr` row), and a value put into an Arabic sentence is wrapped in a bidi isolate. The wallet's own errors are translated by code; what a node answered
 is shown after them as details. The native prompts (biometric and Face ID reasons, the Android biometric button, the
 iOS screen-recording cover, the Android notice for a tap through another app's window) get their words from the same
 tables. Recovery phrases,
 addresses, env names (`QNET_*`), token symbols and brand names are never translated. The few texts that name Google
 Play live in `src/i18n/overlays/android/` (`overlay.android.js`), which no iOS build carries. Tests: every key in every
 language with the same placeholders (`__tests__/I18n.test.js`), no hard-coded user-visible string in the screens
-(`__tests__/I18nHardcoded.test.js`), and the real screens rendered at 320 dp in every language and with the longest
+(`__tests__/I18nHardcoded.test.js`), the direction of each language, the launch restart and no left or right in any
+stylesheet (`__tests__/LayoutDirection.test.js`), and the real screens rendered at 320 dp in every language and with the longest
 text of every key, checked for cut-off text, words that do not fit and overflowing rows (`__tests__/I18nLayout.test.js`).
 
 ## Identity and key derivation
@@ -243,9 +270,11 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   prompt ended without opening the wallet (cancelled, failed), an **Unlock your wallet** button asks again. A password
   wallet shows its password field, the same button and, where set up, biometric unlock. What an unlock that did not
   open the wallet says sits under the title (under the password field in a password wallet) across the column's width,
-  centred in every language and clear of the lines around it (`styles.lockMessage`); the column scrolls when a very
-  large system text size makes it taller than the screen. At the foot of the screen a
-  small link **Forgot? Reset the wallet** opens the erase confirmation (typed ERASE, and under the screen lock a fresh
+  start-aligned and clear of the lines around it (`styles.lockMessage`); the column scrolls when a very
+  large system text size makes it taller than the screen. The welcome and lock screens carry a still field of hex
+  characters along their top (`components/ui/HexField`, one fixed seed, no animation, hidden from screen readers) over
+  the app mark and its name. At the foot of the screen a
+  small act **Forgot? Reset the wallet** opens the erase confirmation (typed ERASE, and under the screen lock a fresh
   device check), after which the wallet is restored from its recovery phrase; it is never shown while the system
   prompt is up. No erase choice stands next to Unlock. Before the stored wallet was read the screen shows only the
   app's name, never the welcome screen of a device without a wallet. An unlock prompt owed at a cold start (the app's
@@ -485,24 +514,19 @@ no proof badge; only the checks above make a value count as proven where the app
   "Sent 0 QNC" beside it, and the value rows of one transaction (its token transfers, a batch's credits) are one row
   with their legs; the rows each feed served stay as they are in the cache. Rows come newest first under a header for
   their day (`historySections`): Today, Yesterday, then the date as the app's language writes it (the year only when it
-  is not this year's), and Earlier last for rows without a real time. Each row holds at 320 dp: on its start the asset's
-  icon (the app's bundled mark for QNC, enlarged to fill its round, the same SOL and 1DEV icons as Assets, a token's
-  letter or emoji) with a small badge at its lower end corner drawn as the app's other vector icons, a disc in the
-  amount's colour with a dark glyph: sent (an arrow up and out, white), received (an arrow down, green), sent to itself
-  (a loop, blue), swap (two arrows, blue), a node action (registration, back online, check-in, the node balance moved
-  into the wallet: a hexagon, blue), a contract call or deploy (code brackets, grey), burn (a flame, amber) and nothing
-  moved (a cross on red: failed or not found), the same glyphs and colours as the browser extension's History. Then what
+  is not this year's), and Earlier last for rows without a real time. Each row holds at 320 dp and draws no icon and no
+  badge: on its start what
   happened in plain words (Sent, Received, Sent to self, Burned, Swap, Node registered, Node back online, Node check-in,
   Moved from node, Contract call, Contract deployed: the transaction's type decides, `txKind`, either source naming it;
-  an activation transaction of older blocks reads Node registered) over whom it was with: "To: abcd…wxyz" or "From:
-  abcd…wxyz", the node ("Node light_…"), the contract ("Contract 1a2b3c…9f0e"), "From: node balance" for a move from the
-  node, "Genesis" or "QNet Blockchain" for a sender that is QNet Blockchain itself (never its id), a swap's pair, nothing for a transfer to the wallet itself (as in the extension), or its block when none is
+  an activation transaction of older blocks reads Node registered) over whom it was with: "To: abcdef…uvwxyz" or "From:
+  abcdef…uvwxyz" (the first and last six characters, `utils/addressDisplay.shortAddress`), the node ("Node light_…"), the contract ("Contract 1a2b3c…9f0e"), "From: node balance" for a move from the
+  node, "Genesis" or "QNet Blockchain" for a sender that is QNet Blockchain itself (never its id), nothing for a swap (its two legs say it) or a transfer to the wallet itself (as in the extension), or its block when none is
   known; a row not final says its status after it, Pending, Unverified, Not credited yet, Moving (a move of the node
   balance in transit), Failed or Not found (`historyBadge`, `describeTx`; a confirmed row says no status), as the
   extension does: whom with keeps one line, and the status goes under it when both do not fit. On its
-  end the amount with its sign and symbol, incoming green with +, outgoing white with − (the minus sign, as the
-  extension writes it), a transfer to the wallet itself blue, and grey for one that failed or was not found (nothing
-  moved); a swap has two lines, the received leg first, and a row that moves nothing (a node registration, a contract
+  end the amount with its sign and symbol in the mono face, incoming in Mint with +, outgoing in Paper with − (the
+  minus sign, as the extension writes it), a transfer to the wallet itself in Paper, and in Fog for one that failed or
+  was not found (nothing moved), whose status word is in Ember; a swap has two lines, the received leg first, and a row that moves nothing (a node registration, a contract
   call without value) has none. A row's screen-reader label says, in the extension's order, what happened, the amounts
   (not while amounts are hidden), whom with, its status and the time. A transaction sent from this wallet that no source
   reports 65 minutes after it was sent (the wallet sends it again by itself for 30 minutes, a node keeps each copy 30
@@ -514,12 +538,16 @@ no proof badge; only the checks above make a value count as proven where the app
   answered for stays Pending until a later refresh can ask (`rowsDueToDrop`, `mergeHistory` `settled`), and so does one
   whose sent history no node gave (`resolveSubmitByNonce` learns nothing from a read that failed). A confirmed, failed
   or reported row with the same hash always replaces a Pending or Not found row, an older page's included, and the result
-  card's own check by nonce removes either. The amount is written compactly, by the extension's rule too
-  (grouped below 100,000 with at most two decimals from 1,000, four from 1 and eight below 1; K, M, B, T from 100,000
-  with at most two), in the one amount format (comma groups, point decimals); the detail shows the exact figure in it and never shrinks or ends in an ellipsis; only a token's symbol, a name, may. The amounts take at
-  most 45% of the row, so what happened and whom with keep the rest, and a single amount whose number and symbol run
-  past 13 characters (a long symbol, a dust amount) puts the symbol under the number, as the extension does. A token the
-  wallet did not add carries its contract id, and one named after QNC or QNet Blockchain a ⚠ (in any spelling a reader takes for it:
+  card's own check by nonce removes either. The amount is written in the one amount format (comma groups, point
+  decimals) with few decimals and never a suffix or an exponent (`compactAmount`: at most eight decimals below 1, four
+  from 1, two from 1,000 and up to a million, the whole number rounded from a million); the detail shows the exact
+  figure in it. A row's number never ends in an ellipsis; only a token's symbol, a name, may. The amounts take at most
+  45% of the row, so what happened and whom with keep the rest; a number longer than 45% of the narrowest row holds at
+  the largest text size a row follows (`BESIDE_CHARS`, 11 characters) takes the line under the title, the whole width,
+  shrinking to fit; a single amount whose number and symbol run past 13 characters (a long symbol, a dust amount) puts
+  the symbol under the number. A token the
+  wallet did not add carries its contract id, and one named after QNC or QNet Blockchain is marked (on History its symbol in
+  Ember, with the warning on its detail; in any spelling a reader takes for it:
   look-alike letters of other scripts, small capitals, letterlike symbols and letters in a filled circle or square are
   read as Latin letters before NFKD and again after it, so the lunate sigma, which NFKD changes, still reads as C, and
   an accent is dropped, so QNĊ reads as QNC); so
@@ -527,11 +555,12 @@ no proof badge; only the checks above make a value count as proven where the app
   hidden or format character (a direction override, U+202E, can make a symbol read as QNC), and every token symbol and name, on
   History as on Assets, Send and Manage tokens, is written with such characters replaced by � (`tokenSafety.tokenLabel`,
   `usesReservedName`). Tapping a row opens its detail screen over
-  the tab, with Back, under the same icon and badge: what happened, the exact amounts, the status, the node's type and
+  the tab, with Back (the word) over its title, what happened: the exact amounts in the figure face, the status in a
+  word, the node's type and
   name for a node row, the fee, both addresses (each copies; a sender that is QNet Blockchain itself is named in words and
   neither copied nor drawn as an id: "Node balance" for a move of the node balance, "Genesis", and "QNet Blockchain" for
   "system" and any other system account, `systemSenderKey`), the time, the transaction hash (copies), the block when a
-  source named it, a memo when there is one, and one button: "View in the explorer" for a transaction the network ran (a QNet Blockchain one in a block opens QNet Blockchain Explorer, a Solana send the cluster's public explorer, `config/nodes.js`
+  source named it, a memo when there is one, and one text action: "View in the explorer" for a transaction the network ran (a QNet Blockchain one in a block opens QNet Blockchain Explorer, a Solana send the cluster's public explorer, `config/nodes.js`
   `solanaExplorerTxUrl`), otherwise (one still pending or not found, a Solana send that expired unrun) "Copy the
   transaction hash"; a node event the registry alone reports has no transaction hash, so neither.
 - **Account events.** The node sends `{"type":"BalanceUpdate","data":{"address","block_height"}}` on the address
@@ -771,7 +800,8 @@ The 1952-byte public key is carried on the wire until a confirmed chain read rep
 `has_dilithium_pk`, after which it is elided and the node rehydrates it from state. A `pk_unresolved`
 rejection forces a fresh nonce read that re-attaches the key.
 
-On the QNet Blockchain Send form a scan icon inside the recipient field, at its end, opens the camera (`src/components/QrScanSheet.js`);
+On the QNet Blockchain Send form the Scan act at the end of the recipient field's label line (the field keeps its whole
+width for the address and its placeholder in every language) opens the camera (`src/components/QrScanSheet.js`);
 the camera permission is asked for only then, on both platforms. A refusal shows one line and Open settings instead of
 the camera; back from the settings with the camera allowed, the same sheet starts scanning. Frames are decoded on the
 device and none is stored or sent: on iOS by the system, on Android by an open-source QR decoder bundled in the app
@@ -784,7 +814,7 @@ accepts: 45 characters with "eon" in the middle and its SHA3 checksum (`src/util
 `WalletManager.recipientAddress`).
 The app's own Receive QR carries the bare address. Anything else (a Solana address, a web address, 64 hex, other text
 or payment codes) shows "Not a QNet Blockchain address" while the camera keeps scanning, and nothing read is ever opened. The
-send is then reviewed and confirmed as below. The Solana Send form has its own scan icon and reading ([Solana
+send is then reviewed and confirmed as below. The Solana Send form has its own Scan act and reading ([Solana
 sends](#solana-sends)).
 
 A send from the Send form is reviewed before anything is asked (`src/components/SendReview.js`): the whole
@@ -860,7 +890,7 @@ QRC-721 mint, transfer, approve, transferFrom; plus `deployToken` and `deployNft
 
 The Solana side of Assets lists SOL and 1DEV; its Send button opens the Solana Send form with SOL, and each row opens
 it with its own token (`src/screens/SolanaSend.js`). The form, laid out like the QNet Blockchain one, has the token (SOL or 1DEV,
-switchable on the form), the recipient with a scan icon at the field's end, the amount (digits and one decimal point,
+switchable on the form), the recipient with the Scan act on its label's line, the amount (digits and one decimal point,
 no more decimal places than the token has) with MAX, the fee of a one-signature transfer (0.000005 SOL) and the total.
 MAX reads the balance now: all SOL but that fee, or all of the token in the account a transfer spends from. The 1DEV
 figure on Assets and the form's Available line follow the same rule (`heldTokenBase`: the fullest initialized account
@@ -1072,16 +1102,22 @@ naming this device's key is enough, and it counts as another key only when two o
 device's (an owner a rotation's statement has not reached yet still names the key before). A tag of another key only
 says that the device's key for the node is missing, with **Use this device**.
 
+Each node is a group with no box around it, the groups parted by space and rules: its identity (its type, its id with
+Copy for a light node, and its status in a word: the live dot and Online, or Offline or Waiting for admission in
+Ember), then the node balance as the tab's figure (in Signal while at least 1 QNC can move) with **Move to wallet**,
+then its status rows under a kicker. Where **Use this device** is offered it is the solid action and the move is a text
+action under it.
+
 | State | What the tab shows |
 |---|---|
 | no node | "This wallet has no node." Nothing to tap, no link. Also a light node bound to no device, or with no binding on this device that the network gives no verdict on, and one aiqnet.io recorded that the network does not list yet (no device is bound to it). |
 | another device | "This wallet's node is linked to another device, or to this device before QNet Wallet was reinstalled." Nothing to tap, no balance. |
 | linking | "The node will run on this device once QNet Blockchain records it." (a pending-link record of the link sheet); while the owners report the registration in the genesis nodes' pool (`registration_pending`), "QNet Blockchain is recording the node in a block. It will run on this device once that is done." While a link is pending and the chain does not list the node, its status is read again every 10 seconds for the first two minutes after the link, then every minute, on every tab while the app is in front (`requestPace.linkingReadMs`), starting at once when the QNet Link sheet answers `ok`; the same schedule, from the time it went, while a binding with no answer waits (below) |
 | not recorded | "QNet Blockchain did not record the node. Nothing changed on this device." (the record's 24 hours passed and two owners say the node is not on the chain; the binding the sheet kept, with its ping key, push token and wakes, goes with the record, as it does when two owners refuse its ping key) |
-| this device | Online or Offline (Online only from the network's `needs_reactivation`), "Answered this epoch", the epoch clock ("Epoch ends in ~3 h 47 min": the time left, at least a minute), "Background: Unrestricted" or "Restricted" with, while restricted, one button to the system settings ([Background priority](#background-priority-on-android-and-ios)), the node balance and **Move to wallet** (it takes a balance of 1 QNC or more, with no note under it); no button ends the node here (below); with the device state: from the next epoch, a device check that waits (below), paused until a date; a device check not finished once the chain's epoch is past the key rotation's due epoch plus the node's 30-day grace (180 epochs: until then the node still counts the unrotated key, and a check not finished waits for something a new key does not end) says the key was not renewed in time and offers **Use this device**; a pause with no end (the device's certificate chain was revoked) says the device can't run the node right now and offers **Use this device**, the one way back; a binding that holds no device key once two genesis nodes take them (made before they did, or its key is gone after a reinstall, a restore or an offload) says so as advice (until the network requires the device signature its replies still count, so it never says the node is not counted) and offers **Use this device**, unless the device cannot run a node at all, which says only that |
+| this device | Online (with the live dot) or Offline (Online only from the network's `needs_reactivation`), "Answered this epoch", the epoch clock ("Epoch ends in ~3 h 47 min": the time left, at least a minute), "Background: Unrestricted" or "Restricted" with, while restricted, one button to the system settings ([Background priority](#background-priority-on-android-and-ios)), the node balance and **Move to wallet** (it takes a balance of 1 QNC or more, with no note under it); no button ends the node here (below); with the device state: from the next epoch, a device check that waits (below), paused until a date; a device check not finished once the chain's epoch is past the key rotation's due epoch plus the node's 30-day grace (180 epochs: until then the node still counts the unrotated key, and a check not finished waits for something a new key does not end) says the key was not renewed in time and offers **Use this device**; a pause with no end (the device's certificate chain was revoked) says the device can't run the node right now and offers **Use this device**, the one way back; a binding that holds no device key once two genesis nodes take them (made before they did, or its key is gone after a reinstall, a restore or an offload) says so as advice (until the network requires the device signature its replies still count, so it never says the node is not counted) and offers **Use this device**, unless the device cannot run a node at all, which says only that |
 | checking, network not reached | for the node this device holds a binding of: "Checking node status…" or "QNet Blockchain could not be reached.", then the node balance and **Move to wallet** |
-| server node | a super or genesis node of this wallet, which runs on its server, on every device that holds the wallet: its id heading the card, Online or Offline, its type and status, "Last seen: {time} ago" (from the node's `last_seen_ago_seconds`, only when the answering node saw it), "Network admission: Admitted" when the node reports its admission to the epoch's rewarded set (`admission` `admitted`, `NodeTab.rewardAdmission`), "Epoch heartbeats: n of m needed", "Epochs not admitted: k" when any (below; no missed epochs: the site's cabinet shows them), the epoch clock, a permanent ban when there is one ("Reputation: Banned", its reason, double signing, under it), the node balance and **Move to wallet**; no code, price or link. Before its first answer "Checking node status…"; a read that fails keeps the last good status of the node on screen, with "QNet Blockchain could not be reached. Pull down to try again." above it (`NodeTab.keptServerStatus`), and with none that sentence alone; the server text ("Super nodes run on a server") only when the network says the node is not registered |
-| server node waiting for admission | a super node the network registered and does not admit to consensus yet (a network rule holds outside super nodes back while registrations stay open): its status `admission` `waiting` (the node's `super_admission_label`: outside the epoch's consensus-admitted set), as the site shows it (`PushService.checkServerNodeStatus` `admission`, `NodeTab.waitingAdmission`). The badge says WAITING and the status row "Registered, not admitted to consensus yet", never Offline; the balance and **Move to wallet** as above. A node that names no admission, or `not_required` (no admission rule governs the epoch), reads as before |
+| server node | a super or genesis node of this wallet, which runs on its server, on every device that holds the wallet: its type and id heading the card, Active (with the live dot) or Offline, "Last seen: {time} ago" (from the node's `last_seen_ago_seconds`, only when the answering node saw it), "Network admission: Admitted" when the node reports its admission to the epoch's rewarded set (`admission` `admitted`, `NodeTab.rewardAdmission`), "Epoch heartbeats: n of m needed", "Epochs not admitted: k" when any (below; no missed epochs: the site's cabinet shows them), the epoch clock, a permanent ban when there is one ("Reputation: Banned", its reason, double signing, under it), the node balance and **Move to wallet**; no code, price or link. Before its first answer "Checking node status…"; a read that fails keeps the last good status of the node on screen, with "QNet Blockchain could not be reached. Pull down to try again." above it (`NodeTab.keptServerStatus`), and with none that sentence alone; the server text ("Super nodes run on a server") only when the network says the node is not registered |
+| server node waiting for admission | a super node the network registered and does not admit to consensus yet (a network rule holds outside super nodes back while registrations stay open): its status `admission` `waiting` (the node's `super_admission_label`: outside the epoch's consensus-admitted set), as the site shows it (`PushService.checkServerNodeStatus` `admission`, `NodeTab.waitingAdmission`). Its status says "Registered, not admitted to consensus yet" in Ember, never Offline; the balance and **Move to wallet** as above. A node that names no admission, or `not_required` (no admission rule governs the epoch), reads as before |
 | not on the network yet | for a super node: "This wallet's super node has not joined QNet Blockchain yet. It runs on a server with QNet Blockchain node software." (aiqnet.io records the node, below, and the network does not list a super node); nothing to tap |
 
 **The last missed epoch.** The device view also carries `last_miss` and `last_answer` (light node messages section
@@ -1570,9 +1606,9 @@ website works the same with both.
   policy.
 - **Tabs** (`src/browser/tabs.js`), in memory only, never stored. The tabs button next to the address bar shows how many
   are open and opens the tab overview over the browser: each tab by its page's title (hidden characters replaced) and
-  host, or "Start page", the one in front marked; a tap brings a tab forward, × closes it (a screen reader names the
-  tab it closes; the next tab comes forward, the one before when it was the last; closing the only tab leaves a fresh
-  start page), "New tab" (also in the ⋮ menu) opens the start page in a new tab in front, and "Close all tabs" leaves
+  host, or "Start page", the one in front marked by a line at its start; a tap brings a tab forward, Close at its end
+  closes it (a screen reader names the tab it closes; the next tab comes forward, the one before when it was the last;
+  closing the only tab leaves a fresh start page), "New tab" (also in More) opens the start page in a new tab in front, and "Close all tabs" leaves
   one fresh start page, after asking first while a tab holds a page (the sites open in them are signed out). While the
   overview is up it is all a screen reader reaches: the toolbar, the notices and the pages under it are hidden. At
   most 8 tabs: every open tab keeps its page loaded (nothing is discarded in the background), so the cap bounds the
@@ -1588,8 +1624,11 @@ website works the same with both.
   behind drops its WebView and reopens its page when it comes forward (the back history of a reopened tab starts
   again). Android back closes the overview, the menu or the typed address first, then goes back in the tab in front;
   from that tab's first page it leaves the Browser tab. Pages of every tab go into the recent pages; a page that
-  finishes loading in a closed tab, or while "Clear browsing data" runs, is not kept. On a narrow phone (a toolbar
-  under 360 dp wide, a 320 dp phone) Forward is in the ⋮ menu, so the address keeps its room for the domain.
+  finishes loading in a closed tab, or while "Clear browsing data" runs, is not kept. The toolbar is the same at every
+  width: Back (the word), the address (the domain in full weight, no lock: every page is https), the tab count and
+  More, whose menu holds Share, Copy address, Forward (while there is a page to go to), Stop while a page loads or
+  Reload otherwise, New tab, Start page and "Clear browsing data" (in Ember), then, under a rule, the header's Manage
+  tokens and Hide balances (the header's More is hidden on this tab).
 - **Browsing session.** Cookies and site storage (localStorage, IndexedDB, service workers) live for one browsing
   session: it starts empty with the first page opened while no tab holds a page, and ends once no tab holds one (the
   last such tab closed, "Close all tabs", "Clear browsing data", a change of wallet, the app ending). The two platforms
@@ -1969,7 +2008,7 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.1 (30) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.1 (31) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds run R8 in full mode (the default of the Android
   Gradle plugin 8.11) over `proguard-android-optimize.txt` with resource shrinking: React Native's consumer rules keep
   what it reaches by reflection or JNI, the default file keeps native and `JavascriptInterface` methods, AAPT keeps what
@@ -1983,13 +2022,13 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   behind both system bars, every screen takes the insets from `SafeAreaProvider`, the JS `StatusBar`'s colour and
   translucency calls are ignored, and `MainActivity` gives the bars the dark app's look: light icons on both and no
   system scrim over the app's own bottom bar. From Android 12 the Terms modal's window keeps React Native's own setup,
-  whose navigation bar follows the system's light or dark mode. Below API 29 the status bar is the app's `#11131f` and
-  the navigation bar the theme's black. React Native's own code still writes the bars' colours through the window
+  whose navigation bar follows the system's light or dark mode. Below API 29 both bars are the app's `#05080A` (the
+  theme's `statusBarColor` and `navigationBarColor`). React Native's own code still writes the bars' colours through the window
   colour setters Android 15 deprecates (they do nothing there); the app's own code calls none of them.
 - The app icon and the launch screen are drawn from the vector sources in `assets/app-icon/`: on Android an adaptive
   icon (`ic_launcher_foreground` over `ic_launcher_background`, with the round and legacy icons) and a launch screen
   that shows the app mark alone (`splash_logo`, 192 dp, a drawable per density at exactly that size, so a device
-  receives only its own) on `#11131f`; on iOS the `AppIcon` set and the same mark (`LaunchIcon`, 192 pt at 1x, 2x and
+  receives only its own) on `#05080A`; on iOS the `AppIcon` set and the same mark (`LaunchIcon`, 192 pt at 1x, 2x and
   3x) on the same background. The app mark inside the app (`assets/qnet_logo.png`, drawn at 72 at most) comes at 1x,
   2x, 3x and 4x, so no screen decodes it larger than it shows.
 - ML-DSA-65 is native: PQClean reference C compiled through the NDK by CMake for `armeabi-v7a`,

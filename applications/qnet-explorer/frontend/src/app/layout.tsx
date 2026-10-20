@@ -1,10 +1,21 @@
-import "./globals.css";
-import "./mobile-fixes.css";
+// The stylesheets in cascade order: tokens, the base and shared primitives, the rules of areas not yet rebuilt, then
+// one sheet per area (shell, home, explorer, My node, the other pages).
+import '@/styles/tokens.css';
+import '@/styles/base.css';
+import './globals.css';
+import './mobile-fixes.css';
+import '@/styles/shell.css';
+import '@/styles/home.css';
+import '@/styles/explorer.css';
+import '@/styles/cabinet.css';
+import '@/styles/pages.css';
 
 import { headers } from 'next/headers';
 import { ThemeProvider } from "@/components/theme/theme-provider";
 import SiteShell from '@/components/SiteShell';
 import { LINK_HOST, requestHost } from '@/lib/hosts';
+import { installTarget } from '@/lib/install-target';
+import { archivo, martian } from './fonts';
 import type { Metadata, Viewport } from 'next';
 
 export const metadata: Metadata = {
@@ -50,6 +61,8 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
+  viewportFit: 'cover',
+  themeColor: '#05080A',
 };
 
 export default async function RootLayout({
@@ -61,15 +74,20 @@ export default async function RootLayout({
   // (src/proxy.ts), which Next.js puts on its scripts. The site has no inline scripts of its own.
   // Any page rendered for the link host renders without the site's shell (SiteShell): the link page, and
   // any other page a request there could reach past the proxy's host rule (SITE-R4-CSP-01).
-  const onLinkHost = requestHost((await headers()).get('host')) === LINK_HOST;
+  const request = await headers();
+  const onLinkHost = requestHost(request.get('host')) === LINK_HOST;
+  // Device-dependent layouts (the store to install from) are decided at first paint from the request; the shell
+  // corrects only an iPad in desktop mode, which only the page can tell by its touch points.
+  const device = installTarget(request.get('user-agent'));
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" data-device={device} className={`${archivo.variable} ${martian.variable}`} suppressHydrationWarning>
       <head>
         <link rel="manifest" href="/manifest.json" />
       </head>
-      <body suppressHydrationWarning className="font-sans antialiased quantum-bg">
+      <body suppressHydrationWarning>
+        {/* data-theme, not class: the class list of <html> carries the font variables. */}
         <ThemeProvider
-          attribute="class"
+          attribute="data-theme"
           defaultTheme="dark"
           enableSystem
           disableTransitionOnChange

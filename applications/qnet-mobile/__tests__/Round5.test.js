@@ -432,7 +432,9 @@ describe('MOBLINK-R5-01: a QNet Link request ends the wallet\'s own confirmation
     const { sheetStyles } = require('../src/browser/DappSheet');
     const walletStyles = require('../src/screens/WalletScreen.styles').default;
     expect([sendReviewStyles.overlay.zIndex, sendReviewStyles.overlay.elevation]).toEqual([sheetStyles.overlay.zIndex, sheetStyles.overlay.elevation]);
-    expect(walletStyles.modalOverlay.zIndex).toBeGreaterThan(sendReviewStyles.overlay.zIndex);
+    // The prompts and alerts are sheets at the alert level (components/ui/Sheet, theme.layer).
+    expect(require('../src/theme').layer.alert.zIndex).toBeGreaterThan(sendReviewStyles.overlay.zIndex);
+    expect(require('../src/theme').layer.alert.elevation).toBeGreaterThan(sendReviewStyles.overlay.elevation);
     const s = SCREEN();
     const tail = s.slice(s.lastIndexOf('{renderSendReview()}'));
     expect(tail.indexOf('{renderSendReview()}')).toBeLessThan(tail.indexOf('{renderFreshPrompt()}'));

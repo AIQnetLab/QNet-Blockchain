@@ -104,10 +104,22 @@ async function mount() {
       return {
         text,
         loading: bar.props.testID === 'browser-address-loading',
-        lock: bar.findAll((n) => n.type && n.type.name === 'LockGlyph').length > 0,
       };
     },
-    stop: () => !!pressable((n) => n.props.accessibilityLabel === 'browser_stop'),
+    // Whether More offers Stop now (it does while a page loads): the menu is opened, read and closed again.
+    stop: () => {
+      const more = () => tree.root.findAll((n) => n.props.label === 'common_more' && typeof n.props.onPress === 'function')[0];
+      act(() => { more().props.onPress(); });
+      const offered = tree.root.findAll((n) => n.type === Text && n.props.children === 'browser_stop').length > 0;
+      act(() => { more().props.onPress(); });
+      return offered;
+    },
+    // An item of More, pressed.
+    menu: async (label) => {
+      await act(async () => { tree.root.findAll((n) => n.props.label === 'common_more' && n.props.onPress)[0].props.onPress(); });
+      const item = tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.findAllByType(Text).some((x) => x.props.children === label))[0];
+      await act(async () => { item.props.onPress(); });
+    },
     bar: () => tree.root.findAll((n) => n.type === View && typeof flat(n).width === 'string' && flat(n).width.endsWith('%')).map((n) => flat(n).width),
     notice: () => tree.root.findAllByType(Text).some((n) => /^browser_blocked/.test(String(n.props.children))),
     // Types an address and opens it (on a page, the address bar is tapped first).
@@ -129,7 +141,7 @@ async function mount() {
       await act(async () => { m.web().props.onNavigationStateChange({ url, title: 'Page', loading: false, ...extra }); });
     },
     home: async () => {
-      await act(async () => { tree.root.find((n) => n.props.accessibilityLabel === 'browser_menu' && n.props.onPress).props.onPress(); });
+      await act(async () => { tree.root.findAll((n) => n.props.label === 'common_more' && n.props.onPress)[0].props.onPress(); });
       const item = tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.findAllByType(Text).some((x) => x.props.children === 'browser_home'))[0];
       await act(async () => { item.props.onPress(); });
     },
@@ -143,19 +155,19 @@ describe('a tapped link opens at once, its address in the address bar', () => {
     const m = await mount();
     await m.open('dapp.example/one');
     // A page opened from the start page: its address at once, before the WebView reported anything.
-    expect(m.address()).toEqual({ text: 'dapp.example', loading: true, lock: false });
+    expect(m.address()).toEqual({ text: 'dapp.example', loading: true });
     await m.nav(`${SITE}/one`);
-    expect(m.address()).toEqual({ text: 'dapp.example', loading: false, lock: true });
+    expect(m.address()).toEqual({ text: 'dapp.example', loading: false });
     expect([m.stop(), m.bar()]).toEqual([false, []]);
 
     expect(await m.tap('https://game.example/start')).toBe(true);
-    expect(m.address()).toEqual({ text: 'game.example', loading: true, lock: false });
+    expect(m.address()).toEqual({ text: 'game.example', loading: true });
     expect([m.stop(), m.bar()]).toEqual([true, ['5%']]);
     await act(async () => { m.web().props.onLoadProgress({ nativeEvent: { progress: 0.3 } }); }); // Android: no `loading`
     expect([m.stop(), m.bar()]).toEqual([true, ['30%']]);
     // The commit: the page's own address, with the lock.
     await m.nav('https://game.example/start', { loading: true });
-    expect(m.address()).toEqual({ text: 'game.example', loading: false, lock: true });
+    expect(m.address()).toEqual({ text: 'game.example', loading: false });
     await m.unmount();
   });
 
@@ -167,7 +179,7 @@ describe('a tapped link opens at once, its address in the address bar', () => {
     expect(m.address()).toMatchObject({ text: 'files.example', loading: true });
     // The finish event names the page still shown (the patched WebView on both platforms).
     await m.nav(`${SITE}/one`, { loading: false });
-    expect(m.address()).toEqual({ text: 'dapp.example', loading: false, lock: true });
+    expect(m.address()).toEqual({ text: 'dapp.example', loading: false });
     expect(m.stop()).toBe(false);
     await m.unmount();
   });
@@ -176,7 +188,7 @@ describe('a tapped link opens at once, its address in the address bar', () => {
     const m = await mount();
     await m.open('dapp.example/one');
     await m.nav(`${SITE}/one`);
-    const committed = { text: 'dapp.example', loading: false, lock: true };
+    const committed = { text: 'dapp.example', loading: false };
     expect(await m.tap('https://ads.example/frame', { isTopFrame: false })).toBe(true);
     expect(m.address()).toEqual(committed);
     expect(await m.tap('data:text/html,x', { isTopFrame: false })).toBe(true); // a subframe judged as one
@@ -196,11 +208,11 @@ describe('a tapped link opens at once, its address in the address bar', () => {
     await m.open('dapp.example/one');
     await m.nav(`${SITE}/one`, { canGoBack: true });
     await m.tap('https://game.example/');
-    await act(async () => { m.tree.root.findAll((n) => n.props.accessibilityLabel === 'browser_stop' && n.props.onPress)[0].props.onPress(); });
-    expect(m.address()).toEqual({ text: 'dapp.example', loading: false, lock: true });
+    await m.menu('browser_stop');
+    expect(m.address()).toEqual({ text: 'dapp.example', loading: false });
     expect(m.calls('stopLoading')).toHaveLength(1);
     await m.tap('https://game.example/');
-    await act(async () => { m.tree.root.findAll((n) => n.props.accessibilityLabel === 'browser_back' && n.props.onPress)[0].props.onPress(); });
+    await act(async () => { m.tree.root.findAll((n) => n.props.label === 'browser_back' && n.props.onPress)[0].props.onPress(); });
     expect(m.address()).toMatchObject({ text: 'dapp.example', loading: false });
     expect(m.calls('goBack')).toHaveLength(1);
     await m.unmount();
@@ -208,9 +220,9 @@ describe('a tapped link opens at once, its address in the address bar', () => {
 
   it('the bookmark shows its address at once in a new tab', async () => {
     const m = await mount();
-    await act(async () => { m.tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && n.props.onPress).props.onPress(); });
+    await act(async () => { m.tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && n.props.onPress)[0].props.onPress(); });
     expect(m.web().props.source).toEqual({ uri: 'https://aiqnet.io/explorer' });
-    expect(m.address()).toEqual({ text: 'aiqnet.io', loading: true, lock: false });
+    expect(m.address()).toEqual({ text: 'aiqnet.io', loading: true });
     await m.unmount();
   });
 
@@ -225,7 +237,7 @@ describe('a tapped link opens at once, its address in the address bar', () => {
     await m.open('dapp.example/one');
     expect(m.web().props.source).toEqual({ uri: `${SITE}/one`, method: 'GET' });
     expect(m.web().props.source).not.toEqual(given);
-    expect(m.address()).toEqual({ text: 'dapp.example', loading: true, lock: false });
+    expect(m.address()).toEqual({ text: 'dapp.example', loading: true });
     expect(m.calls('reload')).toHaveLength(0);
     await m.nav(`${SITE}/one`);
     // The page on screen, opened again (typed, or from the recent pages): a WebView never loads its own page again
@@ -278,7 +290,7 @@ describe('Android: a navigation JS answers late is loaded once the policy allows
     await act(async () => { handler({ nativeEvent: { url: 'https://game.example/', isTopFrame: true, lockIdentifier: 7 } }); });
     await act(async () => { handler({ nativeEvent: { url: 'https://game.example/', isTopFrame: true } }); });
     expect(loads).toEqual([[true, 'https://game.example/', 7], [true, 'https://game.example/', undefined]]);
-    expect(m.address()).toEqual({ text: 'game.example', loading: true, lock: false });
+    expect(m.address()).toEqual({ text: 'game.example', loading: true });
     await act(async () => { handler({ nativeEvent: { url: 'https://exa mple.com/', isTopFrame: true } }); });
     expect(loads[2]).toEqual([false, 'https://exa mple.com/', undefined]);
     await m.unmount();

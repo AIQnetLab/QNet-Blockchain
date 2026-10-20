@@ -11,18 +11,28 @@
 // names the node) and qnet-link-v1.vectors.json (the extension's activation answers).
 
 import jsSha3 from 'js-sha3';
-import bs58 from 'bs58';
 import { ed25519 } from '@noble/curves/ed25519';
 import { blake3 } from '@noble/hashes/blake3';
 import { sha256, sha512 } from '@noble/hashes/sha2';
-import { ANDROID_PLAY_PACKAGE } from './app-links.ts';
+import { ANDROID_PLAY_PACKAGE, TRANSFER_PATH } from './app-links.ts';
 import { LINK_ORIGIN, SITE_ORIGIN } from './hosts.ts';
-import { callProvider, errorCode, isApprovalCooldown, isEonAddress, isSolanaAddress, type QNetProvider } from './qnet-provider.ts';
+import {
+  callProvider, errorCode, isEonAddress, isSolanaAddress, isSolanaSignature, providerFailure, type ProviderFailure, type QNetProvider,
+} from './qnet-provider.ts';
 import { decodeKey } from './solana-message.ts';
 
 export { LINK_HOST, LINK_ORIGIN, SITE_ORIGIN } from './hosts.ts';
+export { isSolanaSignature };
 export const LINK_PREFIX = `${LINK_ORIGIN}/l#v1.`;
 export const LINK_RE = /^https:\/\/link\.aiqnet\.io\/l#v1\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})\.(connect|link|claim|reserve|unlink)(?:\.([A-Za-z0-9_-]{43}))?$/;
+// The transfer link (section 15): one SOL or 1DEV transfer filled into QNet Wallet's Solana Send, `mint` only for 1DEV.
+export const TRANSFER_LINK_PREFIX = `${LINK_ORIGIN}${TRANSFER_PATH}#`;
+export const TRANSFER_LINK_RE = /^https:\/\/link\.aiqnet\.io\/send#to=([1-9A-HJ-NP-Za-km-z]{32,44})(?:&mint=([1-9A-HJ-NP-Za-km-z]{32,44}))?&amount=(?!0$)(?:0|[1-9]\d{0,19})(?:\.\d{0,17}[1-9])?$/;
+// A transfer link QNet Wallet reads: the whole form above, with `to` and `mint` each the base58 of exactly 32 bytes.
+export function isTransferLink(link: string): boolean {
+  const m = TRANSFER_LINK_RE.exec(link);
+  return m !== null && isSolanaAddress(m[1]) && (m[2] === undefined || isSolanaAddress(m[2]));
+}
 // Where the link page's button falls back to when the app is not installed.
 export const WALLET_PAGE = `${SITE_ORIGIN}/wallet`;
 // The one Android package: the same Play-signed file from Google Play and from aiqnet.io (section 14.2).
@@ -251,16 +261,6 @@ export const isSuperNodeId = (value: unknown): value is string => typeof value =
 // The form of the node a `claim` request names: a light node id or a wallet's super node id.
 export const isClaimNodeId = (value: unknown): value is string => typeof value === 'string' && CLAIM_NODE_ID_RE.test(value);
 
-// A Solana transaction signature is the base58 of 64 bytes (64 to 88 characters).
-export function isSolanaSignature(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length < 64 || value.length > 88) return false;
-  try {
-    return bs58.decode(value).length === 64;
-  } catch {
-    return false;
-  }
-}
-
 // A u64 as its decimal string: no sign, no leading zero.
 export function isU64String(value: unknown): value is string {
   return typeof value === 'string' && U64_RE.test(value) && BigInt(value) <= U64_MAX;
@@ -431,12 +431,12 @@ export function parseLink(text: unknown): ParsedLink | null {
   return reqHash === undefined ? { id, sitePub, intent: intent as LinkIntent } : { id, sitePub, intent: intent as LinkIntent, reqHash };
 }
 
-// Sections 4.1 and 14.3: the intent: URL that opens `link` in the app on Android; the browser loads
-// `fallback` when the app is not installed. Android's Intent.parseUri takes the fields from the last '#',
+// Sections 4.1, 14.3 and 15: the intent: URL that opens `link` (or a transfer link) in the app on Android; the browser
+// loads `fallback` when the app is not installed. Android's Intent.parseUri takes the fields from the last '#',
 // so the link before it keeps its fragment and arrives as the intent's data unchanged. Null for anything
 // but a valid link and an https fallback.
 export function androidIntentUrl(link: string, fallback: string): string | null {
-  if (!parseLink(link) || !fallback.startsWith('https://')) return null;
+  if (!(parseLink(link) || isTransferLink(link)) || !fallback.startsWith('https://')) return null;
   return `intent://${link.slice('https://'.length)}#Intent;scheme=https;package=${ANDROID_PACKAGE};`
     + `S.browser_fallback_url=${encodeURIComponent(fallback)};end`;
 }
@@ -682,8 +682,7 @@ export function validateActivation(plaintext: string, nodeType: NodeType): Activ
   return { ok: true, answer: r as unknown as ActivationAnswer };
 }
 
-export type ExtensionFailure =
-  | 'rejected' | 'cooldown' | 'unauthorized' | 'unsupported' | 'disconnected' | 'timeout' | 'failed' | 'unverifiable';
+export type ExtensionFailure = ProviderFailure | 'unverifiable';
 export type ExtensionActivation = { ok: true; answer: ActivationAnswer } | { ok: false; failure: ExtensionFailure };
 
 // The extension's result {status, ...} read as the answer {v: 1, intent, ...result}; a result that names v
@@ -695,24 +694,6 @@ export function extensionAnswerText(result: unknown, intent: 'activate' | 'claim
     return JSON.stringify({ v: 1, intent, ...copy });
   } catch {
     return null;
-  }
-}
-
-// A provider call that threw, by its protocol code (applications/qnet-wallet CONTRACTS.md 4.5); 4200 is an
-// extension too old for the method.
-function providerFailure(err: unknown): ExtensionFailure {
-  if (err instanceof Error && err.message === 'timeout' && errorCode(err) === null) return 'timeout';
-  switch (errorCode(err)) {
-    case 4001:
-      return isApprovalCooldown(err) ? 'cooldown' : 'rejected';
-    case 4100:
-      return 'unauthorized';
-    case 4200:
-      return 'unsupported';
-    case 4900:
-      return 'disconnected';
-    default:
-      return 'failed';
   }
 }
 

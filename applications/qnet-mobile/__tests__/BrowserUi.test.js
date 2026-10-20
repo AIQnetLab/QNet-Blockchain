@@ -4,7 +4,8 @@
 // pages the browser keeps.
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity, BackHandler } from 'react-native';
+import { Text, BackHandler } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const BottomBar = require('../src/components/BottomBar').default;
 const { BOTTOM_TABS } = require('../src/components/BottomBar');
@@ -14,18 +15,19 @@ const { formatNano } = require('../src/utils/amountFormat');
 
 const t = require('../src/i18n').makeT('en'); // the app's translator: English, placeholders filled
 const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string' || typeof c === 'number').join('')).join('\n');
-const buttons = (tree) => tree.root.findAllByType(TouchableOpacity)
-  .map((b) => ({ label: b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join(''), props: b.props }));
+const buttons = (tree) => tree.root.findAllByType(Action).map((b) => ({ label: b.props.label, props: b.props }));
 const button = (tree, label) => buttons(tree).find((b) => b.label === label);
 // The sheet's arming is timed on the clock: the tests move a fake clock (timers and Date together) rather than wait on the
 // real one, so a slow machine never decides whether a press came before or after arming (M16).
 const wait = (ms) => act(async () => { jest.advanceTimersByTime(ms); });
+// The bar's cells: what a tap on each tab reaches.
+const tabCells = (tree) => tree.root.findAll((n) => /^tab-[a-z]+$/.test(n.props.testID || '') && typeof n.props.onPress === 'function');
 
 describe('the bottom bar', () => {
   it('has Assets, History, Browser, Node and Settings, each labelled for screen readers', async () => {
     let tree;
     await act(async () => { tree = renderer.create(<BottomBar active="assets" onSelect={() => {}} t={t} />); });
-    const tabs = tree.root.findAllByType(TouchableOpacity);
+    const tabs = tabCells(tree);
     expect(tabs.map((n) => n.props.testID)).toEqual(BOTTOM_TABS.map((k) => `tab-${k}`));
     expect(tabs.map((n) => n.props.accessibilityLabel)).toEqual(['Assets', 'History', 'Browser', 'Node', 'Settings']);
     expect(tabs.map((n) => n.props.accessibilityState.selected)).toEqual([true, false, false, false, false]);
@@ -42,19 +44,47 @@ describe('the bottom bar', () => {
       const text = [].concat(label.props.children).join('');
       expect(text.length * 11 * 0.6 * minimumFontScale).toBeLessThanOrEqual(share - 4);
     }
-    const items = tree.root.findAllByType(TouchableOpacity);
+    const items = tabCells(tree);
+    expect(items).toHaveLength(5);
     for (const item of items) {
-      const style = [].concat(item.props.style).reduce((a, b) => ({ ...a, ...b }), {});
+      const style = [].concat(item.props.style({ pressed: false })).reduce((a, b) => ({ ...a, ...b }), {});
       expect(style).toMatchObject({ flex: 1, minWidth: 0 });
       expect(style.width).toBeUndefined();
     }
+  });
+
+  it('each tab is its name alone, the current one marked by a Signal line over it; no icon is drawn', async () => {
+    const Svg = require('react-native-svg').default;
+    const { StyleSheet } = require('react-native');
+    const { color } = require('../src/theme');
+    let tree;
+    await act(async () => { tree = renderer.create(<BottomBar active="history" onSelect={() => {}} t={t} />); });
+    expect(tree.root.findAllByType(Svg)).toHaveLength(0);
+    expect(tabCells(tree).map((c) => c.findAllByType(Text).map((n) => n.props.children).join(''))).toEqual(
+      ['Assets', 'History', 'Browser', 'Node', 'Settings']);
+    const marks = tree.root.findAll((n) => n.props.testID === 'tab-current' && typeof n.type === 'string');
+    expect(marks).toHaveLength(1);
+    expect(StyleSheet.flatten(marks[0].props.style).backgroundColor).toBe(color.signal);
+    const current = tabCells(tree).find((c) => c.props.testID === 'tab-history');
+    expect(current.findAll((n) => n.props.testID === 'tab-current' && typeof n.type === 'string')).toHaveLength(1);
+    const name = current.findAllByType(Text)[0];
+    expect(StyleSheet.flatten(name.props.style).color).toBe(color.paper);
+  });
+
+  it('the Node cell is its name alone, as every other tab: no live dot blinks in the bar', async () => {
+    let tree;
+    await act(async () => { tree = renderer.create(<BottomBar active="assets" onSelect={() => {}} t={t} nodeLive />); });
+    const node = tabCells(tree).find((c) => c.props.testID === 'tab-node');
+    expect(node.findAll((n) => n.props.testID === 'tab-node-live')).toHaveLength(0);
+    expect(node.findAllByType(Text).map((n) => n.props.children)).toEqual([t('tab_node')]);
+    await act(async () => { tree.unmount(); });
   });
 
   it('lights Assets for Receive, reports the tab pressed, and steps aside for the keyboard', async () => {
     const onSelect = jest.fn();
     let tree;
     await act(async () => { tree = renderer.create(<BottomBar active="receive" onSelect={onSelect} t={t} />); });
-    const tab = (k) => tree.root.findAllByType(TouchableOpacity).find((n) => n.props.testID === `tab-${k}`);
+    const tab = (k) => tabCells(tree).find((n) => n.props.testID === `tab-${k}`);
     expect(tab('assets').props.accessibilityState.selected).toBe(true);
     await act(async () => { tab('browser').props.onPress(); });
     expect(onSelect).toHaveBeenCalledWith('browser');
@@ -273,7 +303,7 @@ describe('Android back in the browser', () => {
       tree = renderer.create(<BrowserScreen ref={ref} visible wallet={null} credential="" walletManager={{}} t={t} onSheet={() => {}} confirmAction={() => {}} />);
     });
     expect(ref.current.handleBack()).toBe(false); // start page: nothing to go back to here
-    const bookmark = tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function');
+    const bookmark = tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function')[0];
     await act(async () => { bookmark.props.onPress(); });
     const web = () => tree.root.findByType(WebView).props;
     await act(async () => { web().onNavigationStateChange({ url: 'https://aiqnet.io/explorer/block/1', canGoBack: true, loading: false }); });

@@ -143,7 +143,8 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
         hash: (t.hash as string) || '',
         type: getTransactionType(t.tx_type, (t.from as string)),
         from: (t.from as string) || '',
-        to: (t.to as string) || (t.from as string) || '',
+        // No recipient (a heartbeat, a registration) stays none, as the other lists say it, never the sender again.
+        to: (t.to as string) || 'N/A',
         amount: String(t.amount || 0),
         // Every non-system TX on chain is ML-DSA signed (unsigned value TXs are refused); system TXs pay nothing.
         fee: (t.gas_price && Number(t.gas_price) < U64_MAX - 1000 && !String(t.from || '').startsWith('system_'))
@@ -156,8 +157,9 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
   };
 }
 
-// Fetch block from PostgreSQL first, then fallback to Node RPC
-async function fetchBlock(identifier: string): Promise<Block | null> {
+// Fetch block from PostgreSQL first, then fallback to Node RPC; 'unread' when the index has no such block and the
+// caller asks no node (a page's first answer, first-answer.ts).
+async function fetchBlock(identifier: string, deadline: AbortSignal): Promise<Block | 'unread' | null> {
   const isHeight = /^\d+$/.test(identifier);
   
   // 1. Try PostgreSQL first
@@ -179,7 +181,7 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
         hash: tx.hash,
         type: getTransactionType(tx.tx_type, tx.from_address),
         from: tx.from_address,
-        to: tx.to_address || tx.from_address,
+        to: tx.to_address || 'N/A',
         amount: String(tx.amount || 0),
         fee: tx.gas_price && !String(tx.from_address || '').startsWith('system_')
           ? chainFeeNanoBig(BigInt(tx.gas_price), BigInt(tx.gas_limit), true).toString() : undefined,
@@ -195,11 +197,12 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
   }
   
   // 2. Fallback to Node RPC
+  if (deadline.aborted) return 'unread';
   try {
     const path = isHeight
       ? `/api/v1/block/${encodeURIComponent(identifier)}`
       : `/api/v1/block/hash/${encodeURIComponent(identifier)}`;
-    const response = await fetchNode(path, { cache: 'no-store' });
+    const response = await fetchNode(path, { cache: 'no-store', deadline });
     if (!response || !response.ok) {
       return null;
     }
@@ -228,12 +231,13 @@ export async function GET(
     );
   }
   
-  const block = await fetchBlock(hash);
+  const block = await fetchBlock(hash, request.signal);
   
-  if (!block) {
+  if (!block || block === 'unread') {
     return NextResponse.json({
       success: false,
       error: 'Block not found',
+      ...(block === 'unread' ? { nodeUnread: true } : {}),
     }, { status: 404 });
   }
   

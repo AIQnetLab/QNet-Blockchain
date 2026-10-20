@@ -10,8 +10,12 @@
 // none until that is known. A code authorizes nothing; every read here is public.
 
 import { useEffect, useState, type ReactNode } from 'react';
-import Link from 'next/link';
+import Action from '@/components/ui/Action';
+import Copy from '@/components/ui/Copy';
+import EntityLink from '@/components/ui/EntityLink';
+import { Waiting } from '@/components/ui/RequestState';
 import { number, t, type MessageKey } from '@/lib/texts';
+import { rich } from '@/lib/rich';
 import { useNodeStatus, useSuperStatus } from '@/hooks/useNodeStatus';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
 import {
@@ -21,12 +25,11 @@ import {
 import type { PaymentRecord } from '@/lib/cabinet/flow';
 import { TAB_HREF } from '@/lib/cabinet/tabs';
 import { ownSolanaOf } from '@/lib/cabinet/wallet-choice';
-import { solanaTxUrl } from '@/lib/one-dev';
 import type { NodeState } from '@/lib/cabinet/node-view';
 import type { NodeType } from '@/lib/qnet-link';
 import { useCabinet } from './CabinetProvider';
-import CopyButton from './CopyButton';
 import { SuperNext } from './NextSteps';
+import { Fact, Facts, Group, Notes } from './parts';
 
 const REQUEST: RequestInit = { cache: 'no-store', credentials: 'omit', redirect: 'error' };
 // While whose burn a registration's is cannot be told, its record is read again this often (the route keeps an answer
@@ -109,73 +112,69 @@ export function useWalletActivation(nodeType: NodeType = 'light'): WalletActivat
   return { facts, registration, records: stored };
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="activate-field">
-      <dt>{label}</dt>
-      <dd>{children}</dd>
-    </div>
-  );
-}
-
-// The one code, or that it follows later (a burn not final yet, or a registration whose burn the page cannot tell yet).
+// The one code with Copy, or that it follows later (a burn not final yet, or a registration whose burn the page cannot
+// tell yet).
 function CodeValue({ facts }: { facts: ActivationFacts }) {
-  if (!facts.code) return <span className="activate-note">{t('code_code_later')}</span>;
+  if (!facts.code) return <span className="note">{t('code_code_later')}</span>;
   return (
-    <div className="cabinet-choice">
-      <p>
-        <span className="activate-code">{facts.code}</span> <CopyButton value={facts.code} />
-      </p>
-    </div>
+    <span className="ent-copy">
+      <span className="ent cab-code">{facts.code}</span>
+      <Copy value={facts.code} />
+    </span>
   );
 }
 
-// The details card of the wallet's node of `nodeType`, and a super node's server settings. `statusText`: how the node
-// stands on the network; `nodeId`: the node's id.
-export default function NodeDetails({ nodeType = 'light', nodeId, statusText, known }: { nodeType?: NodeType; nodeId: string; statusText: string; known: WalletActivation }) {
-  const { viewOnly } = useCabinet();
+// The details of the wallet's node of `nodeType`, and a super node's server settings. `statusText`: how the node stands
+// on the network; `nodeId`: the node's id.
+export default function NodeDetails({ nodeType = 'light', nodeId, statusText, known }: { nodeType?: NodeType; nodeId: string; statusText: ReactNode; known: WalletActivation }) {
+  const { viewOnly, choice } = useCabinet();
   const { facts, registration } = known;
   const light = nodeType === 'light';
   return (
     <>
-      <div className="activate-card">
-        <h3 className="activate-step">{t('details_title')}</h3>
-        <dl className="activate-fields">
-          <Field label={t('code_field_status')}>{statusText}</Field>
-          <Field label={t('ext_field_type')}>{t(light ? 'ext_type_light' : 'ext_type_super')}</Field>
-          <Field label={t(light ? 'code_field_node' : 'super_id')}>
-            <span className="activate-mono">{nodeId}</span>
-          </Field>
+      <Group title={t('details_title')}>
+        <Facts>
+          <Fact label={t('code_field_status')}>{statusText}</Fact>
+          <Fact label={t('ext_field_type')}>{t(light ? 'ext_type_light' : 'ext_type_super')}</Fact>
+          <Fact label={t(light ? 'code_field_node' : 'super_id')}>
+            <EntityLink kind="node" value={nodeId} address={choice?.qnet ?? null} full />
+          </Fact>
           {facts && (
             <>
-              <Field label={t('act_code')}><CodeValue facts={facts} /></Field>
-              <Field label={t('act_burn_tx')}>
-                <a href={solanaTxUrl(facts.burnTx)} target="_blank" rel="noopener noreferrer" className="activate-mono">{facts.burnTx}</a>
-              </Field>
-              <Field label={t('code_field_amount')}>{t('ext_amount', { amount: number(facts.amount) })}</Field>
+              <Fact label={t('act_code')}><CodeValue facts={facts} /></Fact>
+              <Fact label={t('act_burn_tx')}><EntityLink kind="solana-tx" value={facts.burnTx} /></Fact>
+              <Fact label={t('code_field_amount')}>{t('ext_amount', { amount: number(facts.amount) })}</Fact>
             </>
           )}
-        </dl>
-        {facts ? (
-          <p className="activate-note">{t(SOURCE_TEXT[facts.source])}</p>
-        ) : registration === null ? (
-          <p className="activate-status" aria-live="polite">{t('checking')}</p>
-        ) : registration.kind === 'none' ? null : (
-          // Registered, without its burn details here: the explorer keeps none, or could not be read.
-          <p>{t(registration.kind === 'notArchived' ? 'code_not_archived' : 'code_archive_unavailable')}</p>
-        )}
-        {/* A light node's code is only a receipt; a super node's server needs it (audit M23). */}
-        {facts?.code && <p className="activate-note">{t(light ? 'details_note' : 'details_note_super')}</p>}
-        {facts?.open && !viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
-      </div>
-      {!light && facts?.code && <div className="activate-card"><SuperNext code={facts.code} burnTx={facts.burnTx} burnAmount={facts.amount} nodeId={nodeId} /></div>}
+        </Facts>
+        <Notes>
+          {facts ? (
+            <p className="note">{t(SOURCE_TEXT[facts.source])}</p>
+          ) : registration === null ? (
+            <Waiting>{t('checking')}</Waiting>
+          ) : registration.kind === 'none' ? null : (
+            // Registered, without its burn details here: the explorer keeps none, or could not be read.
+            <p className="note">{t(registration.kind === 'notArchived' ? 'code_not_archived' : 'code_archive_unavailable')}</p>
+          )}
+          {/* A light node's code is only a receipt; a super node's server needs it (audit M23). */}
+          {facts?.code && <p className="note">{t(light ? 'details_note' : 'details_note_super')}</p>}
+        </Notes>
+        {facts?.open && !viewOnly && <div className="cab-next"><Action kind="solid" href={TAB_HREF.activate}>{t('code_continue')}</Action></div>}
+      </Group>
+      {!light && facts?.code && <SuperNext code={facts.code} burnTx={facts.burnTx} burnAmount={facts.amount} nodeId={nodeId} />}
     </>
   );
 }
 
-// How a light node stands on the network, for its details.
-export function lightStatusText(state: NodeState, height: number | null): string {
+// How a node stands on the network, for its details: recorded at its block (a link to it), recorded, being recorded, or
+// not yet.
+export function recordedText(state: 'none' | 'pending' | 'recorded', height: number | null): ReactNode {
   if (state === 'none') return t('code_status_not_yet');
   if (state === 'pending') return t('code_status_pending');
-  return height != null ? t('code_status_recorded_at', { height: number(height) }) : t('code_status_recorded');
+  return height != null ? rich('code_status_recorded_at', { height: <EntityLink kind="block" value={height} /> }) : t('code_status_recorded');
+}
+
+// How a light node stands on the network, for its details.
+export function lightStatusText(state: NodeState, height: number | null): ReactNode {
+  return recordedText(state === 'none' ? 'none' : state === 'pending' ? 'pending' : 'recorded', height);
 }

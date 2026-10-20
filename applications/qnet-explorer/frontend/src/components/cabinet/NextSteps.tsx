@@ -18,6 +18,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useWallet } from '@/contexts/AppContext';
+import Action from '@/components/ui/Action';
+import Copy from '@/components/ui/Copy';
+import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import { number, t, type MessageKey } from '@/lib/texts';
 import { burnNext } from '@/lib/cabinet/burn-next';
 import { consentBodyOf, ownBurnBodyOf, postConsent } from '@/lib/cabinet/consent-submit';
@@ -34,10 +37,10 @@ import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
 import { useCabinet } from './CabinetProvider';
-import CopyButton from './CopyButton';
 import LinkDevice from './LinkDevice';
 import LinkWaiting from './LinkWaiting';
 import { shownTime } from './NodeStatus';
+import { Group, Next, Notes } from './parts';
 
 // How long the page waits for the record before it offers to ask the extension again.
 export const RECORD_AGAIN_MS = 3 * 60_000;
@@ -53,15 +56,6 @@ const CHECK_TEXT: Record<Check, MessageKey> = {
   extension: 'check_extension',
   solana: 'check_solana',
 };
-
-function Step({ at, children }: { at: 'done' | 'now' | 'ahead'; children: ReactNode }) {
-  return (
-    <li className={`cabinet-check ${at}`} aria-current={at === 'now' ? 'step' : undefined}>
-      {children}
-      {at !== 'ahead' && <span className="cabinet-hidden-text">{t(at === 'done' ? 'progress_done' : 'progress_now')}</span>}
-    </li>
-  );
-}
 
 // The node of wallet `qnet` on its way to the QNet network. `since`: when the extension answered (the kept
 // activation), else the page counts from when it first showed this; `burnFinal`: false while the burn is not final on
@@ -104,48 +98,42 @@ export function Recording({ qnet, since, burnFinal = true, pending = false, askA
   };
 
   return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t('next_record_title')}</h3>
-      <ol className="cabinet-checks" aria-label={t('progress_label')}>
-        <Step at={burnFinal ? 'done' : 'now'}>{t(burnFinal ? 'next_step_burn' : 'next_step_burn_pending')}</Step>
-        <Step at={burnFinal ? 'now' : 'ahead'}>{t('next_step_record')}</Step>
-        <Step at="ahead">{t('next_step_link')}</Step>
-      </ol>
+    <Group title={t('next_record_title')}>
       {/* The extension's own record, or a registration the network holds (a payment address's too). */}
-      <p className="activate-status" aria-live="polite">{t(pending || !askAgain ? 'registration_pending' : burnFinal ? 'next_recording' : 'ext_lead_pending')}</p>
-      <p className="activate-note">{minutes < 1 ? t('next_waited_now') : t('next_waited', { minutes: number(minutes) })}</p>
-      {view.networkDown && choice?.qnet === qnet && <p className="activate-note" role="status">{t('next_network_down')}</p>}
+      <Waiting>{t(pending || !askAgain ? 'registration_pending' : burnFinal ? 'next_recording' : 'ext_lead_pending')}</Waiting>
+      <p className="note">{minutes < 1 ? t('next_waited_now') : t('next_waited', { minutes: number(minutes) })}</p>
+      {view.networkDown && choice?.qnet === qnet && <p className="note" role="status">{t('next_network_down')}</p>}
       {/* Asking again is the extension's own way: a browser without it waits for the network, and a burn that does not
           end up registered comes back with Continue in QNet Wallet. */}
       {late && askAgain && extension && !viewOnly && (
-        <div className="cabinet-choice">
+        <Next>
           {holds ? (
             <>
               {/* Nothing is burned again only for a burn that is final; for one that is not, the extension checks it. */}
               <p>{t(burnFinal ? 'next_record_again_lead' : 'next_record_again_lead_pending')}</p>
               {ask.phase === 'waiting' ? (
-                <p className="activate-status" aria-live="polite">{t('wallet_extension_waiting')}</p>
+                <Waiting>{t('wallet_extension_waiting')}</Waiting>
               ) : (
-                <button type="button" className="qnet-button activate-primary" onClick={() => void again()}>{t('next_record_again')}</button>
+                <div className="cab-next-act"><Action kind="solid" onClick={() => void again()}>{t('next_record_again')}</Action></div>
               )}
             </>
           ) : (
-            <p className="activate-note">{t('next_record_other_wallet')}</p>
+            <p className="note">{t('next_record_other_wallet')}</p>
           )}
-          {ask.phase === 'failed' && <p className="activate-error" role="alert">{t(ask.key)}</p>}
-        </div>
+          {ask.phase === 'failed' && <Failed>{t(ask.key)}</Failed>}
+        </Next>
       )}
-      {ask.phase === 'asked' && <p className="activate-result" role="status">{t('next_record_asked')}</p>}
+      {ask.phase === 'asked' && <Answered>{t('next_record_asked')}</Answered>}
       {/* What needs no record goes on meanwhile; a payment address's registration runs on the phone that consented. */}
       {askAgain && (
         <>
           <p>{t('next_phone_ready')}</p>
-          <ol className="activate-facts">
+          <ol className="cab-list">
             <PhoneReady />
           </ol>
         </>
       )}
-    </div>
+    </Group>
   );
 }
 
@@ -168,21 +156,15 @@ export function LinkPhone({ onLinked }: { onLinked?: () => void }) {
   const { phoneFlows, viewOnly } = useCabinet();
   return (
     <>
-      <div className="activate-card">
-        <h3 className="activate-step">{t('next_link_title')}</h3>
-        <ol className="cabinet-checks" aria-label={t('progress_label')}>
-          <Step at="done">{t('next_step_burn')}</Step>
-          <Step at="done">{t('next_step_record')}</Step>
-          <Step at="now">{t('next_step_link')}</Step>
-        </ol>
-        <p className="activate-result" role="status">{t('next_link_lead')}</p>
-        <ol className="activate-facts">
+      <Group title={t('next_link_title')}>
+        <p>{t('next_link_lead')}</p>
+        <ol className="cab-list">
           <PhoneReady />
           <li>{t(phoneFlows ? 'next_link_3_qr' : 'next_link_3_app')}</li>
         </ol>
-        {!onLinked && phoneFlows && !viewOnly && <Link href={TAB_HREF.device} className="qnet-button activate-primary">{t('action_link_device')}</Link>}
-        <p className="activate-note">{t('next_link_done')}</p>
-      </div>
+        {!onLinked && phoneFlows && !viewOnly && <div className="cab-next-act"><Action kind="solid" href={TAB_HREF.device}>{t('action_link_device')}</Action></div>}
+        <p className="note">{t('next_link_done')}</p>
+      </Group>
       {onLinked && phoneFlows && !viewOnly && <LinkDevice onLinked={onLinked} />}
     </>
   );
@@ -198,21 +180,16 @@ export function NodeNext() {
   if (step === 'link') return <LinkPhone />;
   const text: MessageKey = step === 'offline' ? 'next_offline' : step === 'answer' ? 'next_device_pending' : step === 'running' ? 'next_running'
     : step === 'server' ? 'next_super' : 'act_wallet_has_node';
-  return (
-    <div className="activate-card">
-      <p>{t(text)}</p>
-      <Link href={TAB_HREF.overview} className="qnet-button activate-primary">{t('next_open_overview')}</Link>
-    </div>
-  );
+  return <Next action={<Action kind="solid" href={TAB_HREF.overview}>{t('next_open_overview')}</Action>}><p>{t(text)}</p></Next>;
 }
 
 // A command to type on the server, with Copy.
 function Command({ text }: { text: string }) {
   return (
-    <>
-      <pre className="activate-env">{text}</pre>
-      <CopyButton value={text} />
-    </>
+    <div className="cab-cmd">
+      <pre>{text}</pre>
+      <Copy value={text} label={t('copy')} />
+    </div>
   );
 }
 
@@ -278,19 +255,18 @@ export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: s
   ].join('\n');
   const update = `docker pull ${NODE_IMAGE}\ndocker stop -t 60 ${NODE_CONTAINER} && docker rm ${NODE_CONTAINER}`;
   return (
-    <div className="activate-next">
-      <h4>{t('super_steps_title')}</h4>
-      <ol className="activate-facts">
+    <Group title={t('super_steps_title')}>
+      <ol className="cab-cmds">
         <li>
           <p>{t('super_step_server')}</p>
           <Command text={server} />
-          <p className="activate-note">{t('super_step_firewall')}</p>
+          <p className="note">{t('super_step_firewall')}</p>
         </li>
         <li>
           <p>{t('super_step_seed')}</p>
           <Command text={seed} />
-          <p className="activate-note">{t('ext_super_spelling')}</p>
-          <p className="activate-note">{t('super_step_dedicated')}</p>
+          <p className="note">{t('ext_super_spelling')}</p>
+          <p className="note">{t('super_step_dedicated')}</p>
         </li>
         <li>
           <p>{t('super_step_ip')}</p>
@@ -303,38 +279,40 @@ export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: s
         <li>
           <p>{t('super_step_check')}</p>
           <Command text={check} />
-          {nodeId && <p className="activate-note">{t('super_step_node_id', { id: nodeId })}</p>}
-          <p className="activate-note">{t('super_step_errors')}</p>
+          {nodeId && <p className="note">{t('super_step_node_id', { id: nodeId })}</p>}
+          <p className="note">{t('super_step_errors')}</p>
         </li>
         <li>
           <p>{t('super_step_update')}</p>
           <Command text={update} />
         </li>
       </ol>
-      <p className="activate-note">{t('super_step_joined')}</p>
-      <p>
-        {t('ext_super_seed')}{' '}
-        <a href={RUNNING_A_NODE} target="_blank" rel="noopener noreferrer">{t('ext_super_running')}</a>.
-      </p>
-    </div>
+      <Notes>
+        <p className="note">{t('super_step_joined')}</p>
+        <p className="note">
+          {t('ext_super_seed')}{' '}
+          <a href={RUNNING_A_NODE} target="_blank" rel="noopener noreferrer">{t('ext_super_running')}</a>.
+        </p>
+      </Notes>
+    </Group>
   );
 }
 
 // The code of a known burn, shown first (R1), with the burn it comes from.
 function CodeCard({ burn }: { burn: KnownBurn }) {
   return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t('burned_title')}</h3>
+    <Group title={t('burned_title')}>
       {burn.code ? (
-        <p>
-          <span className="activate-code">{burn.code}</span> <CopyButton value={burn.code} />
+        <p className="ent-copy cab-code-line">
+          <span className="ent cab-code">{burn.code}</span>
+          <Copy value={burn.code} />
         </p>
       ) : (
-        <p className="activate-note">{t('code_code_later')}</p>
+        <p className="note">{t('code_code_later')}</p>
       )}
       <p>{t(burn.nodeType === 'super' ? 'super_code_lead' : 'burned_light_lead')}</p>
-      <p className="activate-note">{t(burn.nodeType === 'super' ? 'ext_type_super' : 'ext_type_light')} · {t('ext_amount', { amount: number(burn.burnAmount) })}</p>
-    </div>
+      <p className="note">{t(burn.nodeType === 'super' ? 'ext_type_super' : 'ext_type_light')} · {t('ext_amount', { amount: number(burn.burnAmount) })}</p>
+    </Group>
   );
 }
 
@@ -412,22 +390,21 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
     void post(consent);
   }, [answer, usable, qnet, burn.burnTx, burn.burnAmount, burner, post]);
 
-  if (viewOnly) return <div className="activate-card"><p>{t('burned_payment_lead')}</p></div>;
+  if (viewOnly) return <Next><p>{t('burned_payment_lead')}</p></Next>;
   if (outcome && (outcome.result === 'admitted' || outcome.result === 'registered')) {
     return <Recording qnet={qnet} since={null} pending={outcome.result === 'registered'} askAgain={false} />;
   }
   const notice = answer && !usable ? answerNotice(answer, qnet) : outcome ? outcomeNotice(outcome) : null;
   const waiting = session.state.phase === 'starting' || session.state.phase === 'waiting' || session.state.phase === 'failed';
   return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t('act_link_title')}</h3>
+    <Group title={t('act_link_title')}>
       <p>{t('burned_payment_lead')}</p>
-      {notice && <p className="activate-error" role="alert">{notice}</p>}
-      {outcome?.result === 'retry' && outcome.code === 'bind_v2_pending' && <p className="activate-note">{t('act_bind_v2_pending')}</p>}
+      {notice && <Failed>{notice}</Failed>}
+      {outcome?.result === 'retry' && outcome.code === 'bind_v2_pending' && <p className="note">{t('act_bind_v2_pending')}</p>}
       {posting ? (
-        <p className="activate-status" aria-live="polite">{t('act_recording')}</p>
+        <Waiting>{t('act_recording')}</Waiting>
       ) : outcome?.result === 'retry' && body ? (
-        <button type="button" className="qnet-button activate-primary" onClick={() => void post(body)}>{t('try_again')}</button>
+        <div className="cab-next-act"><Action kind="solid" onClick={() => void post(body)}>{t('try_again')}</Action></div>
       ) : waiting ? (
         <LinkWaiting
           state={session.state}
@@ -438,14 +415,12 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
           onRetry={() => open(qr)}
         />
       ) : (
-        <div className="cabinet-actions">
-          <button type="button" className="qnet-button activate-primary" onClick={() => open(!device?.phone)} disabled={!device}>
-            {t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
-          </button>
-          {device?.phone && <button type="button" className="activate-link-button" onClick={() => open(true)}>{t('wallet_other_device')}</button>}
+        <div className="actions cab-next-act">
+          <Action kind="solid" onClick={() => open(!device?.phone)} disabled={!device}>{t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}</Action>
+          {device?.phone && <Action kind="text" onClick={() => open(true)}>{t('wallet_other_device')}</Action>}
         </div>
       )}
-    </div>
+    </Group>
   );
 }
 
@@ -468,17 +443,16 @@ function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
       <CodeCard burn={burn} />
       {next.step === 'server' ? (
         burn.code && (
-          <div className="activate-card">
+          <>
             {/* The network sees the server before its registration lands: it is catching up (best effort, never a no). */}
-            {view.superConnected && <p className="activate-status" role="status">{t('super_connected')}</p>}
+            {view.superConnected && <Answered>{t('super_connected')}</Answered>}
             <SuperNext code={burn.code} burnTx={burn.burnTx} burnAmount={burn.burnAmount} nodeId={superNodeId(qnet)} />
-          </div>
+          </>
         )
       ) : next.step === 'resume' ? (
-        <div className="activate-card">
+        <Next action={!viewOnly && <Action kind="solid" href={TAB_HREF.activate}>{t('code_continue')}</Action>}>
           <p>{t('next_resume')}</p>
-          {!viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
-        </div>
+        </Next>
       ) : next.step === 'finish' ? (
         <FinishLight qnet={qnet} burn={burn} burner={next.burner} />
       ) : (
@@ -496,13 +470,12 @@ function Unknown({ missing, update }: { missing: Check[]; update: boolean }) {
     return () => window.clearInterval(timer);
   }, [refreshActivation]);
   return (
-    <div className="activate-card" role="alert">
-      {missing.map((check) => <p key={check} className="activate-error">{t(CHECK_TEXT[check])}</p>)}
+    <Next alert action={<Action kind="text" onClick={refreshActivation}>{t('try_again')}</Action>}>
+      {missing.map((check) => <p key={check} className="rq-failed">{t(CHECK_TEXT[check])}</p>)}
       {update && <p>{t('state_update_extension')}</p>}
       <p>{t('state_unknown')}</p>
-      <button type="button" className="qnet-button secondary" onClick={refreshActivation}>{t('try_again')}</button>
-      <p className="activate-note">{t('state_retry_note')}</p>
-    </div>
+      <p className="note">{t('state_retry_note')}</p>
+    </Next>
   );
 }
 
@@ -513,33 +486,25 @@ function Unknown({ missing, update }: { missing: Check[]; update: boolean }) {
 export function NoNode({ pending, overview = false }: { pending: boolean; overview?: boolean }) {
   const { choice, viewOnly, view } = useCabinet();
   if (!choice) return null;
-  const card = (children: ReactNode, alert = false) => <div className="activate-card" role={alert ? 'alert' : undefined}>{children}</div>;
+  const card = (children: ReactNode, alert = false, action?: ReactNode) => <Next alert={alert} action={action}>{children}</Next>;
   switch (view.state) {
     case 'loading':
-      return <p className="activate-status" aria-live="polite">{t('state_loading')}</p>;
+      return <Waiting>{t('state_loading')}</Waiting>;
     case 'locked':
       return card(<p>{t(view.lockedBy === 'not_connected' ? 'state_not_connected' : 'state_locked')}</p>);
     case 'unknown':
       return <Unknown missing={view.missing} update={view.extensionUpdate} />;
     case 'reserved':
-      return card(view.here ? (
-        <>
-          <p>{t('state_reserved_here')}</p>
-          {!viewOnly && <Link href={TAB_HREF.activate} className="qnet-button activate-primary">{t('code_continue')}</Link>}
-        </>
-      ) : <p>{t('state_reserved', { time: shownTime(view.until) })}</p>);
+      return view.here
+        ? card(<p>{t('state_reserved_here')}</p>, false, !viewOnly && <Action kind="solid" href={TAB_HREF.activate}>{t('code_continue')}</Action>)
+        : card(<p>{t('state_reserved', { time: shownTime(view.until) })}</p>);
     case 'sending':
-      return card(<p className="activate-status" aria-live="polite">{t('state_sending')}</p>);
+      return <Waiting>{t('state_sending')}</Waiting>;
     case 'burned':
       if (!view.burn) return card(<p>{t('state_unusable')}</p>, true);
       // The code and its next step are the Overview's; the other sections point there.
       if (!overview) {
-        return card(
-          <>
-            <p>{t(view.burn.nodeType === 'super' ? 'next_super' : 'act_has_activation')}</p>
-            <Link href={TAB_HREF.overview} className="qnet-button secondary">{t('next_open_overview')}</Link>
-          </>,
-        );
+        return card(<p>{t(view.burn.nodeType === 'super' ? 'next_super' : 'act_has_activation')}</p>, false, <Action href={TAB_HREF.overview}>{t('next_open_overview')}</Action>);
       }
       return <Burned burn={view.burn} qnet={choice.qnet} />;
     case 'recording':
@@ -550,19 +515,24 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
         </>
       );
     case 'none':
-      return card(
+      return (
         <>
-          <p>{t('no_node')}</p>
           {/* An address only viewed is offered no activation: only the wallet itself starts one. */}
-          {!viewOnly && (
-            <div className="cabinet-actions">
-              <Link href={`${TAB_HREF.activate}?type=light`} className="qnet-button activate-primary">{t('action_activate_light')}</Link>
-              <Link href={`${TAB_HREF.activate}?type=super`} className="qnet-button secondary">{t('action_activate_super')}</Link>
-            </div>
-          )}
-          <p className="activate-note">{t('no_node_super_where')}</p>
-          <p className="activate-note">{t('one_code')}</p>
-        </>,
+          <Next
+            action={!viewOnly && (
+              <div className="actions">
+                <Action kind="solid" href={`${TAB_HREF.activate}?type=light`}>{t('action_activate_light')}</Action>
+                <Action href={`${TAB_HREF.activate}?type=super`}>{t('action_activate_super')}</Action>
+              </div>
+            )}
+          >
+            <p className="lead">{t('no_node')}</p>
+          </Next>
+          <Notes>
+            <p className="note">{t('one_code')}</p>
+            <p className="note">{t('no_node_super_where')}</p>
+          </Notes>
+        </>
       );
     default:
       // A node on the network: its section shows it.

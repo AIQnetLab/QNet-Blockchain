@@ -1,0 +1,262 @@
+/* home.css: the home page (app/HomeClient.tsx) and Get QNet Wallet (components/GetTheApp.tsx, also on /wallet). */
+
+/* ---------- Hero ---------- */
+.hero { position: relative; isolation: isolate; overflow: hidden; min-height: min(100svh, 1040px); padding-top: var(--hdr); display: flex; flex-direction: column; }
+/* The rain ends above the readouts, where it would be a tenth as bright under the fade: the canvas costs its area. */
+.hero .field-zone { bottom: 20%; }
+.hero .field-canvas {
+  -webkit-mask-image: linear-gradient(to bottom, var(--ink) 0%, var(--ink) 66%, transparent 100%);
+  mask-image: linear-gradient(to bottom, var(--ink) 0%, var(--ink) 66%, transparent 100%);
+}
+.hero-grid {
+  flex: 1; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); align-items: end;
+  padding-top: clamp(56px, 10vh, 120px); padding-bottom: clamp(44px, 6vh, 72px);
+}
+.hero-copy { grid-column: 1 / span 8; }
+.display { margin: 0; font-weight: 800; font-stretch: 112%; font-size: var(--t-display); line-height: .88; letter-spacing: -.04em; color: var(--paper); }
+.display .line { display: block; white-space: nowrap; }
+.ch { position: relative; }
+/* The decode: each letter waits transparent, cycles glyphs in mono, then locks into the display face with a flash. */
+.hero[data-decoding] .ch:not(.lock) { color: transparent; }
+.ch.scr::after {
+  content: attr(data-g); position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono); font-weight: 300; font-stretch: 100%; font-size: .56em; letter-spacing: 0; color: var(--signal);
+}
+.ch.lock { color: var(--paper); animation: lockflash var(--t-reveal) ease-out; }
+@keyframes lockflash { from { color: var(--white); text-shadow: 0 0 26px var(--signal-glow); } to { color: var(--paper); text-shadow: none; } }
+.deck { margin: clamp(30px, 3.4vw, 48px) 0 0; max-width: 28ch; font-size: var(--t-deck); line-height: 1.32; font-weight: 450; color: var(--paper); }
+.hero-p { margin-top: 16px; max-width: 54ch; font-size: 16.5px; }
+.hero-acts { margin-top: 36px; }
+
+/* The live column at the hero's right edge: the rain falls into it, the matrix becomes the chain. */
+.stream { grid-column: 10 / span 3; align-self: end; display: flex; flex-direction: column; min-width: 0; transition: opacity 1s ease .2s; }
+.hero[data-decoding] .stream { opacity: 0; }
+.stream-head { display: flex; align-items: center; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--rule-strong); }
+/* A window of fixed height: rows fill it from the top, so nothing around it moves as blocks arrive. */
+.stream-view {
+  height: 460px; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, var(--ink) 62%, transparent);
+  mask-image: linear-gradient(to bottom, var(--ink) 62%, transparent);
+}
+.stream-list { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+.blk { height: var(--row-2); border-bottom: 1px solid var(--rule); font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); line-height: 1.35; color: var(--fog); }
+.blk-in { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: 24px 18px; column-gap: 12px; align-content: center; height: 100%; }
+/* A row: the height with its transaction count, the age at the right; under them the hash and the producer. */
+.blk-h { display: flex; align-items: baseline; gap: 12px; min-width: 0; font-size: 15px; letter-spacing: -.02em; white-space: nowrap; }
+.blk-h .ent { font-size: inherit; }
+.blk-h .flash { position: relative; }
+.blk-txs { font-size: var(--t-label); letter-spacing: 0; color: var(--fog); }
+.blk-in[data-new] .flash::after { content: attr(data-v); position: absolute; left: 0; top: 0; color: var(--ember); opacity: 0; pointer-events: none; animation: emberfade var(--t-flash) ease-out; }
+/* The age keeps the width of "59m ago", so its box stays put as "9s ago" becomes "10s ago". */
+.blk-age { min-width: 7ch; text-align: right; white-space: nowrap; align-self: center; }
+.blk-by { grid-column: 1 / -1; display: flex; gap: 14px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.blk-by .ent { font-size: inherit; overflow: hidden; text-overflow: ellipsis; }
+.blk-hash { flex: none; }
+.hero-ro { padding-bottom: clamp(36px, 4vw, 56px); --ro-sub-lines: 2; }
+/* A tablet in portrait: three across; the measured rate takes the two places beside the supply. */
+@media (min-width: 600px) and (max-width: 860px) {
+  .hero-ro .readouts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .hero-ro .readouts .ro[data-wide='true'] { grid-column: span 2; }
+}
+
+/* ---------- Get QNet Wallet: one measurement, the 264 px code and three rows a third of it each ---------- */
+.get-body { display: grid; grid-template-columns: 264px minmax(0, 1fr); column-gap: clamp(32px, 5vw, 80px); padding-bottom: 40px; }
+.qr { position: relative; width: 264px; margin: 0; }
+.qr-code { display: block; width: 264px; height: 264px; border-radius: var(--radius); }
+.qr figcaption { position: absolute; top: 100%; left: 0; margin-top: 16px; white-space: nowrap; }
+.stores { display: grid; grid-template-rows: repeat(3, 88px); margin: 0; padding: 0; list-style: none; }
+.stores li { border-top: 1px solid var(--rule-strong); }
+.stores li:last-child { border-bottom: 1px solid var(--rule-strong); }
+.store {
+  height: 100%; display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 4fr) minmax(0, 4fr); align-items: center; column-gap: 24px;
+  padding: 0 8px 0 4px; transition: background-color var(--t-hover);
+}
+.store:hover { background: var(--fill-store); }
+.store-n { font-weight: 640; font-stretch: 104%; font-size: clamp(22px, 2vw, 28px); letter-spacing: -.02em; color: var(--paper); white-space: nowrap; }
+.store-d { color: var(--fog); font-size: 15.5px; }
+.store-u {
+  justify-self: end; max-width: 100%; font-family: var(--font-mono); font-stretch: 87.5%; font-size: 12px; color: var(--signal);
+  text-decoration: underline; text-decoration-color: var(--signal-line); text-underline-offset: .3em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.store:hover .store-u { text-decoration-color: var(--signal); }
+/* A phone or tablet: its own store as one button, the other phone store in a sentence; no code, no extension. */
+.own { display: none; grid-column: 1 / -1; }
+[data-device='ios'] .own-ios, [data-device='android'] .own-android { display: block; }
+[data-device='ios'] .get .qr, [data-device='ios'] .get .stores, [data-device='android'] .get .qr, [data-device='android'] .get .stores { display: none; }
+[data-device='ios'] .get-body, [data-device='android'] .get-body { padding-bottom: 0; }
+.own .btn-solid { width: 100%; justify-content: center; padding: 22px 24px; font-size: 18px; }
+/* A tablet: the button keeps a phone's width instead of stretching across the page. */
+@media (min-width: 600px) {
+  .own .btn-solid { width: auto; min-width: 360px; }
+}
+.own-note { margin: 12px 0 0; color: var(--fog); font-size: var(--t-small); }
+.own-others { margin-top: 24px; font-size: 16px; }
+@media (max-width: 760px) {
+  .get-body { grid-template-columns: minmax(0, 1fr); row-gap: 72px; padding-bottom: 0; }
+  .stores { grid-template-rows: none; }
+  .store { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; padding: 18px 4px; row-gap: 4px; }
+  .store-n { grid-column: 1; }
+  .store-d { grid-column: 1; grid-row: 2; }
+  .store-u { display: none; }
+}
+
+/* ---------- Security model: one row each, the datum on the left ---------- */
+.feat { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); padding: 36px 0 44px; border-top: 1px solid var(--rule); }
+.feat-k { grid-column: 1 / span 5; margin: 0; font-family: var(--font-mono); font-stretch: 80%; font-weight: 300; font-size: var(--t-datum); line-height: 1.05; letter-spacing: -.035em; color: var(--paper); }
+.feat-t { grid-column: 6 / span 7; }
+.feat .h3 { margin-bottom: 12px; }
+.feat .body { max-width: 62ch; }
+@media (max-width: 860px) {
+  .feat-k, .feat-t { grid-column: 1 / -1; }
+  .feat { padding: 28px 0 34px; }
+  .feat-k { margin-bottom: 18px; }
+}
+
+/* ---------- Mobile-first blockchain ---------- */
+.mf { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); }
+.mf-head { grid-column: 1 / span 5; position: sticky; top: calc(var(--hdr) + 40px); align-self: start; }
+.mf-head .lead { margin-top: 24px; max-width: 40ch; }
+.mf-list { grid-column: 7 / span 6; }
+.mf-item { padding: 28px 0 36px; border-top: 1px solid var(--rule); }
+.mf-item:first-child { border-top: 0; padding-top: 0; }
+.mf-item .h3 { margin-bottom: 12px; }
+.langs { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 16px 0 0; padding: 0; list-style: none; font-size: 14.5px; color: var(--paper); }
+
+.epoch { margin-top: clamp(48px, 6vw, 80px); max-width: 460px; }
+.ep-track { position: relative; height: 44px; margin-top: 18px; overflow: hidden; }
+.ep-track::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: var(--rule-strong); }
+.ep-tick { position: absolute; top: 8px; width: 1px; height: 28px; background: var(--fog); }
+/* The tick lights as the marker passes: a Signal copy over it, opacity only. */
+.ep-tick::after { content: ''; position: absolute; left: -1px; right: -1px; top: -4px; bottom: -4px; background: var(--signal); opacity: 0; animation: tick 9s linear infinite; animation-delay: calc(var(--p) * 9s); }
+@keyframes tick { 0% { opacity: 1; } 9%, 100% { opacity: 0; } }
+.ep-att { position: absolute; top: 50%; width: 9px; height: 9px; margin: -4.5px 0 0 -4.5px; background: var(--ember); transform: rotate(45deg); }
+.ep-runner { position: absolute; inset: 0; animation: run 9s linear infinite; pointer-events: none; }
+.ep-run { position: absolute; top: 50%; left: 100%; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%; background: var(--signal); }
+@keyframes run { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+.ep-scale { display: flex; justify-content: space-between; margin-top: 6px; font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-label); color: var(--fog); }
+.epoch figcaption { margin-top: 20px; display: flex; flex-direction: column; gap: 8px; font-size: var(--t-note); color: var(--text); }
+.ep-key { display: flex; align-items: center; gap: 12px; }
+.k-tick { width: 1px; height: 16px; margin: 0 4px; background: var(--fog); flex: none; }
+.k-att { width: 8px; height: 8px; margin: 0 1px; background: var(--ember); transform: rotate(45deg); flex: none; }
+
+.split { margin-top: 22px; display: flex; gap: 3px; }
+.split > div { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.split i { display: block; height: 6px; background: var(--paper); }
+.split > div + div i { background: var(--fog); }
+.split-v { font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-small); color: var(--paper); }
+.split-n { font-size: var(--t-sub); color: var(--fog); white-space: nowrap; }
+@media (max-width: 960px) {
+  .mf-head, .mf-list { grid-column: 1 / -1; }
+  .mf-head { position: static; margin-bottom: 56px; }
+  .mf-item:first-child { border-top: 1px solid var(--rule); padding-top: 28px; }
+}
+
+/* ---------- Economic model ---------- */
+/* The two phases in reading order, side by side on a computer and one under the other on a phone, each under a short
+   top rule like a readout; Phase 2 says when it starts. No connector is drawn. */
+.phases { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); row-gap: 40px; align-items: start; }
+.phase { grid-column: span 6; padding-top: 20px; border-top: 1px solid var(--rule-strong); }
+.phase .label { margin-bottom: 18px; }
+.phase-t { margin: 0 0 16px; font-size: clamp(26px, 2.6vw, 36px); font-weight: 680; font-stretch: 106%; letter-spacing: -.025em; line-height: 1.1; color: var(--paper); }
+.phase .phase-when { margin: 0 0 12px; }
+.eco-charts { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); row-gap: 72px; margin-top: clamp(80px, 9vw, 128px); }
+.halving { grid-column: 1 / span 7; }
+.mult { grid-column: 9 / span 4; }
+.eco-charts .h3 { margin-bottom: 24px; }
+.eco-charts figcaption { margin-top: 20px; font-size: var(--t-small); max-width: 56ch; }
+/* The plot stretches with its column; every label is HTML at a fixed size, so a phone reads it as well. */
+.hv-unit, .hv-years { font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-label); color: var(--fog); text-align: right; }
+.hv-unit { margin: 0 0 10px; }
+.hv-years { margin: 4px 0 0; }
+.hv-plot { position: relative; height: 228px; }
+.hv-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.hv-grid line { stroke: var(--rule); stroke-width: 1; }
+.hv-axis { stroke: var(--rule-strong); }
+.hv-area { fill: var(--fill-plot); }
+.hv-line { fill: none; stroke: var(--paper); stroke-width: 1.5; }
+.hv-drop { fill: none; stroke: var(--ember); stroke-width: 2; }
+.hv-op { position: absolute; transform: translateY(-50%); padding-left: 7px; font-size: 13px; font-weight: 520; line-height: 1; color: var(--paper); white-space: nowrap; }
+.hv-op.em { color: var(--ember); }
+.hv-x { position: relative; height: 16px; margin-top: 10px; font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-label); color: var(--fog); }
+.hv-x span { position: absolute; top: 0; transform: translateX(-50%); }
+.hv-x span:first-child { transform: none; }
+.hv-x span:last-child { transform: translateX(-100%); }
+.mb { border-top: 1px solid var(--rule-strong); }
+.mb > div { padding: 14px 0 16px; border-bottom: 1px solid var(--rule); }
+.mb dt { font-family: var(--font-mono); font-stretch: 87.5%; font-size: 12px; color: var(--fog); }
+.mb dd { margin: 10px 0 0; display: grid; grid-template-columns: minmax(0, 1fr) 60px; align-items: center; column-gap: 14px; }
+.mb .track { position: relative; height: 10px; }
+.mb .track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--paper); }
+.mb b { font-family: var(--font-mono); font-stretch: 80%; font-weight: 300; font-size: 22px; line-height: 1; letter-spacing: -.02em; color: var(--paper); text-align: right; }
+.specs { margin-top: clamp(80px, 9vw, 128px); }
+.spec { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); padding: 28px 0 32px; border-top: 1px solid var(--rule); }
+.spec .h3 { grid-column: 1 / span 4; }
+.spec .body { grid-column: 6 / span 7; }
+.spec .body p { margin: 0; }
+.pools { list-style: none; counter-reset: pool; display: grid; gap: 10px; margin: 0 0 10px; padding: 0; }
+.pools li { counter-increment: pool; display: grid; grid-template-columns: 28px 1fr; }
+.pools li::before { content: counter(pool) '.'; font-family: var(--font-mono); font-size: 13px; color: var(--fog); padding-top: 3px; }
+@media (max-width: 960px) {
+  .phase { grid-column: 1 / -1; }
+  .halving, .mult { grid-column: 1 / -1; }
+  .spec .h3, .spec .body { grid-column: 1 / -1; }
+  .spec .h3 { margin-bottom: 12px; }
+}
+@media (max-width: 640px) { .hv-plot { height: 196px; } .hv-op { font-size: 12px; padding-left: 5px; } }
+
+/* ---------- Open source ---------- */
+.verify { overflow: hidden; }
+.verify-word {
+  position: relative; margin: 0 0 clamp(48px, 6vw, 88px); font-weight: 900; font-stretch: 125%; font-size: var(--t-verify); line-height: .82; letter-spacing: -.045em;
+  color: transparent; -webkit-text-stroke: 1px var(--rule-strong); white-space: nowrap; user-select: none;
+}
+/* A Signal fill scans the outline every 7 s (clip-path only), paused while the section is out of view (.off). */
+.verify-word::after { content: attr(data-text); position: absolute; inset: 0; color: var(--signal); -webkit-text-stroke: 0; clip-path: inset(0 100% 0 0); animation: scan 7s cubic-bezier(.6, 0, .3, 1) .3s infinite; }
+@keyframes scan { 0% { clip-path: inset(0 100% 0 0); } 18%, 30% { clip-path: inset(0 0 0 0); } 46%, 100% { clip-path: inset(0 0 0 100%); } }
+.verify-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); row-gap: 28px; align-items: start; }
+.verify-grid > .h2 { grid-column: 1 / span 6; }
+.verify-copy { grid-column: 7 / span 6; }
+.vlic { margin-top: 14px; max-width: 52ch; }
+.vlinks { margin: 32px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--rule); }
+.vlinks li { border-bottom: 1px solid var(--rule); }
+.vlink { display: grid; grid-template-columns: minmax(0, 1fr); align-items: baseline; padding: 20px 0; }
+.vlink-t {
+  font-size: clamp(20px, 1.8vw, 24px); font-weight: 600; color: var(--signal);
+  text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .22em; text-decoration-color: var(--signal-line);
+}
+.vlink:hover .vlink-t { text-decoration-thickness: 2px; text-decoration-color: var(--signal); }
+.vlink-u { grid-column: 1 / -1; margin-top: 6px; font-family: var(--font-mono); font-stretch: 87.5%; font-size: 12px; color: var(--fog); overflow-wrap: anywhere; }
+@media (max-width: 960px) { .verify-grid > .h2, .verify-copy { grid-column: 1 / -1; } }
+@media (prefers-reduced-motion: reduce) { .verify-word::after { clip-path: none; opacity: .9; } }
+
+/* Sections fade up 16 px as they enter (home only; content is in place without JS and under reduced motion). */
+.home[data-reveal] .rv { opacity: 0; transform: translateY(16px); transition: opacity var(--t-reveal) ease, transform var(--t-reveal) var(--ease-out); }
+.home[data-reveal] .rv.in { opacity: 1; transform: none; }
+
+/* ---------- Phone: a dense band of rain over the headline, the live column as a one-line ticker ---------- */
+@media (max-width: 860px) {
+  .hero { min-height: 0; }
+  .hero .field-zone { bottom: auto; height: 540px; }
+  .hero .field-canvas {
+    -webkit-mask-image: linear-gradient(to bottom, var(--ink) 0, var(--ink) 300px, transparent 540px);
+    mask-image: linear-gradient(to bottom, var(--ink) 0, var(--ink) 300px, transparent 540px);
+  }
+  .hero-grid { grid-template-columns: minmax(0, 1fr); padding-top: 168px; padding-bottom: 32px; row-gap: 32px; }
+  .hero-copy, .stream { grid-column: 1 / -1; }
+  .display { font-stretch: 100%; font-size: var(--t-display-phone); letter-spacing: -.045em; }
+  .deck { margin-top: 26px; }
+  .hero-acts { margin-top: 28px; }
+  .stream { flex-direction: row; align-items: center; gap: 14px; height: 44px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+  .stream-head { border: 0; padding: 0; flex: none; }
+  /* The window is the band's full 44 px, so each height's touch target is not cut to its line. */
+  .stream-view {
+    flex: 1; align-self: stretch; display: flex; align-items: center; min-width: 0; height: auto;
+    -webkit-mask-image: linear-gradient(to right, var(--ink) 70%, transparent);
+    mask-image: linear-gradient(to right, var(--ink) 70%, transparent);
+  }
+  .stream-list { flex-direction: row; gap: 22px; }
+  .blk { height: auto; border: 0; flex: none; white-space: nowrap; }
+  .blk-in { display: block; height: auto; }
+  .blk-h { font-size: 13px; gap: 8px; }
+  .blk-age, .blk-by { display: none; }
+}

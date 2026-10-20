@@ -247,7 +247,7 @@ describe('the browser screen', () => {
         t: (k) => k, onSheet: (s) => sheets.push(s), confirmAction: () => {},
       }));
     });
-    const bookmark = tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function');
+    const bookmark = tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function')[0];
     await act(async () => { bookmark.props.onPress(); });
     const web = () => tree.root.findByType(WebView).props;
     await act(async () => { web().onNavigationStateChange({ url: 'https://dapp.example/app', title: 'dApp', loading: false }); });

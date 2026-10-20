@@ -1,130 +1,103 @@
-'use client';
+// The browser extension's page: what it does, where it installs from and the steps after. The provider sends a browser
+// without a usable extension here (src/lib/qnet-provider.ts). A server component: nothing on it changes in the browser.
 
-import React from 'react';
+import Link from 'next/link';
+import Action from '@/components/ui/Action';
+import PageHead from '@/components/ui/PageHead';
+import Section from '@/components/ui/Section';
+import { EXTENSION_STORE_URL } from '@/lib/qnet-provider';
+
+// The manifest's minimum_chrome_version (applications/qnet-wallet/dist/manifest.json).
+const MIN_BROWSER_VERSION = 111;
+
+const STEPS: [string, string][] = [
+  ['Open the listing', 'Install from the Chrome Web Store above opens the QNet Wallet listing in a new tab.'],
+  ['Add it to the browser', 'Add the extension from the listing and confirm in the browser’s window.'],
+  ['Pin it to the toolbar', 'Pin QNet Wallet so its window is one click away.'],
+  ['Create or import a wallet', 'Create a new wallet, or import one with its recovery phrase.'],
+];
 
 export default function QNetWalletExtensionPage() {
-  const handleDownload = () => {
-    window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg', '_blank', 'noopener,noreferrer');
-  };
-
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900 text-white">
-      <div className="container mx-auto px-4 py-16">
-        <div className="max-w-4xl mx-auto text-center">
-          {/* Header */}
-          <div className="mb-12">
-            <h1 className="text-5xl font-bold mb-6 bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
-              QNet Wallet Extension
-            </h1>
-            <p className="text-xl text-gray-300 max-w-2xl mx-auto">
-              The browser wallet for QNet Blockchain: hold and send QNC, SOL and 1DEV, with keys that never leave your browser.
-              Its Activate tab, or aiqnet.io/node, burns 1DEV on Solana and issues the activation code of the wallet&apos;s
+    <div className="pg">
+      <PageHead
+        title="QNet Wallet extension"
+        lead="The browser wallet for QNet Blockchain: hold and send QNC, SOL and 1DEV, with keys that never leave your browser."
+      >
+        <div className="pg-act desk-only" data-field-clear>
+          <Action kind="solid" href={EXTENSION_STORE_URL} external>Install from the Chrome Web Store</Action>
+          <p className="note">For browsers that install extensions from the Chrome Web Store, version {MIN_BROWSER_VERSION} or later.</p>
+        </div>
+        <p className="body phone-only" data-field-dim="0.1">
+          The extension runs in a computer&apos;s browser. On a phone or tablet, <Link href="/wallet#get">install the QNet Wallet app</Link>.
+        </p>
+      </PageHead>
+
+      <Section id="what" title="What it does" variant="tool" className="topics">
+        <div className="spec">
+          <h3 className="h3">Secure storage</h3>
+          <div className="body">
+            <p>Your private keys are encrypted and stored locally. Only you have access to your funds.</p>
+          </div>
+        </div>
+        <div className="spec">
+          <h3 className="h3">Verified balances</h3>
+          <div className="body">
+            <p>
+              A balance counts as verified only when the node&apos;s account proof folds to a state root that the validator
+              committee of QNet Blockchain signed, which the extension checks itself.
+            </p>
+          </div>
+        </div>
+        <div className="spec">
+          <h3 className="h3">Site connection</h3>
+          <div className="body">
+            <p>
+              Sites can ask the extension to connect and to sign; every request is shown to you first, with the requesting
+              site, and the key stays where it is. Approved sites can be removed in the settings.
+            </p>
+          </div>
+        </div>
+        <div className="spec">
+          <h3 className="h3">Node activation</h3>
+          <div className="body">
+            <p>
+              Its Activate tab, or <Link href="/node">aiqnet.io/node</Link>, burns 1DEV on Solana and issues the activation code of the wallet&apos;s
               one node: a light node, which it also records on QNet Blockchain, or a super node, which only the extension
               activates and which runs on your own server. It recovers the code of an earlier burn, and its &quot;Record on QNet
               Blockchain&quot; button records an earlier burn&apos;s light node.
             </p>
           </div>
-
-          {/* Features Grid */}
-          <div className="grid md:grid-cols-3 gap-8 mb-12">
-            <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
-              <div className="text-4xl mb-4">🔐</div>
-              <h3 className="text-xl font-semibold mb-3">Secure Storage</h3>
-              <p className="text-gray-300">
-                Your private keys are encrypted and stored locally. Only you have access to your funds.
-              </p>
-            </div>
-
-            <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
-              <div className="text-4xl mb-4">⚡</div>
-              <h3 className="text-xl font-semibold mb-3">Verified Balances</h3>
-              <p className="text-gray-300">
-                A balance counts as verified only when the node&apos;s account proof folds to a state root that the validator committee of QNet Blockchain signed, which the extension checks itself.
-              </p>
-            </div>
-
-            <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
-              <div className="text-4xl mb-4">💰</div>
-              <h3 className="text-xl font-semibold mb-3">Site connection</h3>
-              <p className="text-gray-300">
-                Sites can ask the extension to connect and to sign; every request is shown to you first, with the requesting
-                site, and the key stays where it is. Approved sites can be removed in the settings.
-              </p>
-            </div>
-          </div>
-
-          {/* Download Section */}
-          <div className="bg-gradient-to-r from-cyan-500 to-blue-500 p-8 rounded-lg mb-12">
-            <h2 className="text-3xl font-bold mb-4">Download QNet Wallet</h2>
-            <p className="text-lg mb-6 opacity-90">
-              Available for Chrome, Edge, and other Chromium-based browsers
-            </p>
-            
-            <button
-              onClick={handleDownload}
-              className="bg-white text-blue-600 font-bold py-4 px-8 rounded-lg text-lg hover:bg-gray-100 transition-colors shadow-lg"
-            >
-              📦 Download Extension
-            </button>
-            
-            <div className="mt-6 text-sm opacity-75">
-              <p>✅ Free • ✅ Open Source • ✅ No Registration Required</p>
-            </div>
-          </div>
-
-          {/* Installation Steps */}
-          <div className="bg-gray-800 bg-opacity-50 p-8 rounded-lg">
-            <h2 className="text-2xl font-bold mb-6">Installation Steps</h2>
-            
-            <div className="grid md:grid-cols-2 gap-6 text-left">
-              <div className="space-y-4">
-                <div className="flex items-start space-x-3">
-                  <div className="w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center text-black font-bold flex-shrink-0">1</div>
-                  <div>
-                    <h4 className="font-semibold">Download Extension</h4>
-                    <p className="text-gray-300 text-sm">Click the download button above to get the latest version</p>
-                  </div>
-                </div>
-                
-                <div className="flex items-start space-x-3">
-                  <div className="w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center text-black font-bold flex-shrink-0">2</div>
-                  <div>
-                    <h4 className="font-semibold">Install in Browser</h4>
-                    <p className="text-gray-300 text-sm">Add to Chrome/Edge from the Web Store</p>
-                  </div>
-                </div>
-              </div>
-              
-              <div className="space-y-4">
-                <div className="flex items-start space-x-3">
-                  <div className="w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center text-black font-bold flex-shrink-0">3</div>
-                  <div>
-                    <h4 className="font-semibold">Pin to Toolbar</h4>
-                    <p className="text-gray-300 text-sm">Pin the extension for easy access</p>
-                  </div>
-                </div>
-                
-                <div className="flex items-start space-x-3">
-                  <div className="w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center text-black font-bold flex-shrink-0">4</div>
-                  <div>
-                    <h4 className="font-semibold">Start Using</h4>
-                    <p className="text-gray-300 text-sm">Create wallet or import existing recovery phrase</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* System Requirements */}
-          <div className="mt-12 text-center">
-            <h3 className="text-lg font-semibold mb-4">System Requirements</h3>
-            <div className="flex justify-center space-x-8 text-gray-300">
-              <div>🌐 Chrome 111+</div>
-              <div>🔷 Edge 111+</div>
-            </div>
-          </div>
         </div>
-      </div>
+      </Section>
+
+      <Section id="install" title="Installation" variant="tool">
+        {/* The site's numbered steps (styles/cabinet.css, the activation's too): the order is the information. */}
+        <ol className="cab-steps">
+          {STEPS.map(([title, text], i) => (
+            <li key={title} className="cab-step">
+              <span className="cab-step-n" aria-hidden="true">{i + 1}</span>
+              <div className="cab-step-body">
+                <h3 className="cab-step-t">{title}</h3>
+                <p>{text}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      </Section>
+
+      <Section id="requirements" title="System requirements" variant="tool">
+        <dl className="kv">
+          <div>
+            <dt>Browser</dt>
+            <dd>One that installs extensions from the Chrome Web Store, version {MIN_BROWSER_VERSION} or later</dd>
+          </div>
+          <div>
+            <dt>Device</dt>
+            <dd>A computer; phones and tablets use the QNet Wallet app</dd>
+          </div>
+        </dl>
+      </Section>
     </div>
   );
-} 
+}

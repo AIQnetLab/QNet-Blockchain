@@ -315,10 +315,10 @@ server {
     }
 }
 
-# QNet Link host (docs/protocols/qnet-link-v1.md section 4): the links the site hands to the QNet app live
+# QNet Link host (docs/protocols/qnet-link-v1.md sections 4 and 15): the links the site hands to the QNet app live
 # on a host of their own, so a browser never keeps them as a same-host navigation. The same Next.js app
-# answers here: src/proxy.ts serves /l and the /.well-known app-association files and redirects every
-# other path to aiqnet.io. Same proxy headers as aiqnet.io, no headers of nginx's own (no second CSP).
+# answers here: src/proxy.ts serves the link pages /l and /send and the /.well-known app-association files and
+# redirects every other path to aiqnet.io. Same proxy headers as aiqnet.io, no headers of nginx's own (no second CSP).
 server {
     listen 80;
     server_name link.aiqnet.io;

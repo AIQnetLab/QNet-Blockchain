@@ -85,6 +85,10 @@ export function genesisResponseUrl(url) {
 // explorer keeps all of them, so the wallet pages its history from here.
 export const EXPLORER_API = 'https://aiqnet.io';
 
+// One request the user waits on in front of them: a slow network's first contact (name lookup, connection, TLS)
+// alone can take about 15 s, and a request cut before that never gets through.
+export const FIRST_CONTACT_MS = 20000;
+
 /**
  * Public page of one transaction. One source, so a moved path is changed in one place. It opens in the system browser,
  * an ordinary visit to the site; the `from=app` query only names where the visit came from, and the site shows the same

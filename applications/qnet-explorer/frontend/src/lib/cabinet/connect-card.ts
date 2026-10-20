@@ -15,3 +15,21 @@ export function showConnectCard(card: HTMLElement, smooth: boolean): void {
   window.clearTimeout(timers.get(card));
   timers.set(card, window.setTimeout(() => card.classList.remove(FLASH_CLASS), FLASH_MS));
 }
+
+// Connect wallet on a phone or tablet, from the header or the connect card: QNet Wallet's `connect` request belongs to
+// the connect card (its session and its answer), which starts it now if it is shown, else once it shows. Kept in this
+// page's memory only, so a reload never starts a request by itself.
+export const APP_CONNECT_EVENT = 'qnet-app-connect';
+let appConnectAsked = false;
+
+export function askAppConnect(target: EventTarget = window): void {
+  appConnectAsked = true;
+  target.dispatchEvent(new Event(APP_CONNECT_EVENT));
+}
+
+// True once per ask: the card that takes it starts the request.
+export function takeAppConnect(): boolean {
+  const asked = appConnectAsked;
+  appConnectAsked = false;
+  return asked;
+}

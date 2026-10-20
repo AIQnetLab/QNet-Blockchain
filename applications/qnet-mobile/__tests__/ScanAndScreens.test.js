@@ -162,24 +162,23 @@ describe('the scan sheet (components/QrScanSheet)', () => {
 });
 
 describe('the scan on the Send screen, QNet only', () => {
-  const form = screen.slice(screen.indexOf('{/* Recipient Address'), screen.indexOf('{/* Amount Input */}'));
+  const form = screen.slice(screen.indexOf("{/* The recipient; on QNet, Scan"), screen.indexOf("label={t('send_amount')}"));
 
-  it('the scan is an icon inside the recipient field only on QNet, and the sheet opens only for a QNet send', () => {
-    // One container holds the address field and, after it, the icon button: no word on it, no row above the field.
+  it('Scan is an act inside the recipient field only on QNet, and the sheet opens only for a QNet send', () => {
+    // The recipient's field, its label above it, and Scan at its end on QNet only: a word, no drawn icon.
     expect(form).toMatch(new RegExp([
-      String.raw`<Text style=\{styles\.label\}>\{t\('send_to_address'\)\}</Text>\s*`,
-      String.raw`<View style=\{styles\.recipientField\}>\s*<TextInput[^/]*?/>\s*`,
-      String.raw`\{sendingToken\.network === 'qnet' \? \(\s*<TouchableOpacity[\s\S]*?testID="send-scan"\s*>\s*`,
-      String.raw`<ScanIcon color="#00d4ff" />\s*</TouchableOpacity>\s*\) : null\}\s*</View>\s*</View>`,
+      String.raw`<Field\s+label=\{t\('send_to_address'\)\}[\s\S]*?`,
+      String.raw`end=\{sendingToken\.network === 'qnet' \? \(\s*<Action\s+kind="act"\s+label=\{t\('send_scan'\)\}`,
+      String.raw`[\s\S]*?testID="send-scan"\s*/>\s*\) : null\}`,
     ].join('')));
-    expect(form).toMatch(/style=\{\[styles\.input, styles\.recipientInput, sendingToken\.network === 'qnet' && styles\.recipientInputScan\]\}/);
     // Named for screen readers by the scan's title; the keyboard goes away and the sheet opens as before.
-    expect(form).toMatch(/accessibilityRole="button"\s*accessibilityLabel=\{t\('scan_title'\)\}/);
+    expect(form).toMatch(/accessibilityLabel=\{t\('scan_title'\)\}/);
     expect(form).toMatch(/onPress=\{\(\) => \{ Keyboard\.dismiss\(\); setShowScan\(true\); \}\}/);
-    // The target reaches past the field's outer edge only, never over the text.
-    expect(form).toMatch(/hitSlop=\{\{ top: 8, bottom: 8, \[rtl \? 'left' : 'right'\]: 8 \}\}/);
-    expect(form).not.toMatch(/scan_button|recipientLabel/);
-    for (const table of Object.values(translations)) expect('scan_button' in table).toBe(false);
+    expect(form).not.toMatch(/ScanIcon|scan_button|recipientLabel/);
+    for (const table of Object.values(translations)) {
+      expect('scan_button' in table).toBe(false);
+      expect(typeof table.send_scan).toBe('string');
+    }
     expect(screen).toMatch(/\{showScan && showSendScreen && sendingToken && sendingToken\.network === 'qnet' && activeTab === 'assets' \? \(\s*<QrScanSheet/);
     // What the sheet hands over goes into the field only: the review and the fresh check still come after Send.
     expect(screen).toMatch(/onAddress=\{\(address\) => \{ setSendAddress\(address\); setShowScan\(false\); \}\}/);
@@ -191,65 +190,34 @@ describe('the scan on the Send screen, QNet only', () => {
     expect(screen).toMatch(/if \(showScan\) \{ setShowScan\(false\); return true; \}/);
   });
 
-  it('the field keeps its full width; the icon\'s 44 dp target covers its end, which turns with the screen\'s direction', () => {
-    const styles = require('../src/screens/WalletScreen.styles').default;
-    const field = StyleSheet.flatten([styles.input, styles.recipientInput, styles.recipientInputScan]);
-    const button = StyleSheet.flatten(styles.scanButton);
-    expect(field.width).toBe('100%');
-    expect(button).toEqual({
-      position: 'absolute', end: 0, top: 0, bottom: 0, width: 44, alignItems: 'center', justifyContent: 'center',
-    });
-    // The text stops where the target starts (border and end padding together), and the field is at least 44 high.
-    expect(field.borderWidth + field.paddingEnd).toBe(button.width);
-    expect(field.minHeight).toBeGreaterThanOrEqual(44);
-    // Start and end only, no left or right: in Arabic the screen runs right to left and the icon sits on the left.
-    for (const st of [button, StyleSheet.flatten(styles.recipientInputScan)]) {
-      expect(Object.keys(st).filter((k) => /left|right/i.test(k))).toEqual([]);
-    }
-    // The wrapper takes the field's bottom margin, so the button spans the field alone and the icon is centred on it.
-    expect(field.marginBottom).toBe(0);
-    expect(styles.recipientField.marginBottom).toBe(styles.input.marginBottom);
+  it('the field keeps its whole width; Scan sits at the end of its label\'s line, which turns with the screen\'s direction', async () => {
+    const Field = require('../src/components/ui/Field').default;
+    const { fieldStyles } = require('../src/components/ui/Field');
+    const { actionStyles } = require('../src/components/ui/Action');
+    const { TextInput, View } = require('react-native');
+    expect(StyleSheet.flatten(fieldStyles.group).alignSelf).toBe('stretch');
+    const line = StyleSheet.flatten(fieldStyles.labelLine);
+    expect(line).toMatchObject({ flexDirection: 'row', justifyContent: 'space-between' });
+    // Start and end only, no left or right: in Arabic the screen runs right to left and Scan sits on the left.
+    expect(Object.keys(line).filter((k) => /left|right/i.test(k))).toEqual([]);
+    let tree;
+    await act(async () => { tree = renderer.create(<Field label="To" placeholder="x" end={<Text testID="act">Сканировать</Text>} />); });
+    // The act is on the label's line, outside the input: the text and the placeholder keep the field's whole width.
+    const input = tree.root.findByType(TextInput);
+    expect(StyleSheet.flatten(input.props.style).paddingEnd).toBeUndefined();
+    const row = tree.root.findAll((n) => n.type === View && n.props.style === fieldStyles.labelLine)[0];
+    expect(row.findAll((n) => n.props.testID === 'act').length).toBeGreaterThan(0);
+    expect(StyleSheet.flatten(input.props.style).minHeight).toBeGreaterThanOrEqual(44);
+    expect(StyleSheet.flatten(actionStyles.plain).minHeight).toBeGreaterThanOrEqual(44);
+    await act(async () => { tree.unmount(); });
   });
 
-  it('the icon is drawn like the tab bar icons: a 24 box, the same stroke, corners and a QR code centred in it', () => {
-    const { ScanIcon, SCAN_CORNERS, SCAN_SQUARES } = require('../src/components/QrScanSheet');
-    const Svg = require('react-native-svg').default;
-    const { Path, Rect } = require('react-native-svg');
-    let tree;
-    act(() => { tree = renderer.create(<ScanIcon color="#00d4ff" />); });
-    expect(tree.root.findByType(Svg).props).toMatchObject({ width: 24, height: 24, viewBox: '0 0 24 24' });
-    expect(tree.root.findByType(Path).props).toMatchObject({
-      d: SCAN_CORNERS, stroke: '#00d4ff', strokeWidth: 1.8, fill: 'none', strokeLinecap: 'round', strokeLinejoin: 'round',
-    });
-    expect(tree.root.findAllByType(Rect).map((r) => r.props.fill)).toEqual(SCAN_SQUARES.map(() => '#00d4ff'));
-    expect(tree.root.findAllByType(Text)).toHaveLength(0);
-    act(() => tree.unmount());
-
-    // The corner brackets' points: four mirror images of one corner, from 3 to 21 (the stroke stays inside the box).
-    const points = [];
-    let x = 0;
-    let y = 0;
-    for (const [, c, args] of SCAN_CORNERS.matchAll(/([MVHhva])([^MVHhva]*)/g)) {
-      const n = (args.match(/-?[\d.]+/g) || []).map(Number);
-      if (c === 'M') [x, y] = n;
-      else if (c === 'V') y = n[0];
-      else if (c === 'H') x = n[0];
-      else if (c === 'h') x += n[0];
-      else if (c === 'v') y += n[0];
-      else { x += n[5]; y += n[6]; } // a: a quarter circle to its end point
-      points.push(`${x},${y}`);
-    }
-    expect(points).toHaveLength(16);
-    for (const p of points) {
-      const [px, py] = p.split(',').map(Number);
-      expect([p, points.includes(`${24 - px},${py}`), points.includes(`${px},${24 - py}`)]).toEqual([p, true, true]);
-      expect(Math.min(px, py) - 0.9).toBeGreaterThanOrEqual(2);
-      expect(Math.max(px, py) + 0.9).toBeLessThanOrEqual(22);
-    }
-    // The QR code between them is centred on (12, 12).
-    const lo = Math.min(...SCAN_SQUARES.flatMap((q) => [q.x, q.y]));
-    const hi = Math.max(...SCAN_SQUARES.flatMap((q) => [q.x + q.size, q.y + q.size]));
-    expect(Math.abs((lo + hi) / 2 - 12)).toBeLessThan(0.01);
+  it('no drawn scan icon is left: the act says Scan in every language', () => {
+    const sheet = read('src/components/QrScanSheet.js');
+    expect(sheet).not.toMatch(/react-native-svg|ScanIcon|SCAN_CORNERS/);
+    expect(require('../src/components/QrScanSheet').ScanIcon).toBeUndefined();
+    expect(t('send_scan')).toBe('Scan');
+    for (const [lang, table] of Object.entries(translations)) expect([lang, !!table.send_scan]).toEqual([lang, true]);
   });
 
   it('the camera is declared on both platforms, and the scanner is a dependency', () => {
@@ -320,14 +288,23 @@ describe('Receive and the address card', () => {
     }
   });
 
-  it('the address is whole on the card and on Receive, and a tap on it copies it; there is no Copy button', () => {
-    const card = screen.slice(screen.indexOf('testID="address-card"') - 600, screen.indexOf('testID="address-card"') + 900);
+  it('the address is one rounded element a tap copies, with its copy glyph and no Copy word: one line on Assets, whole on Receive', () => {
+    const card = screen.slice(screen.indexOf('testID="address-card"') - 600, screen.indexOf('testID="address-card"') + 500);
     for (const part of [card, receive]) {
       expect(part).toMatch(/accessibilityRole="button"/);
       expect(part).toMatch(/copyToClipboard\(/);
-      expect(part).not.toMatch(/slice\(0, ?\d+\)|…|ellipsizeMode/);
-      expect(part).not.toMatch(/t\('seed_copy'\)|>Copy</);
+      expect(part).toMatch(/style=\{\(\{ pressed \}\) => \[styles\.addressPill, copied && styles\.addressPillDone, pressed && styles\.rowPressed\]\}/);
+      expect(part).toMatch(/<CopyGlyph done=\{copied\} \/>/);
+      expect(part).not.toMatch(/common_copy'|slice\(0, ?\d+\)|…/);
     }
+    // Assets: the whole address on one line, shrunk to fit, never cut; copied, the line says so.
+    expect(card).toMatch(/\{\.\.\.ADDRESS_LINE\}>\s*\{copied \? t\('common_copied'\) : cardAddress\}/);
+    expect(card).not.toMatch(/ellipsizeMode="middle"/);
+    // Receive: every character, as the screen's subject.
+    expect(receive).toMatch(/<SubjectAddress address=\{currentReceiveAddress\} \/>/);
+    // The subject form shows every character: the parts joined back are the address.
+    const subject = screen.slice(screen.indexOf('function SubjectAddress'), screen.indexOf('function SubjectAddress') + 900);
+    expect(subject).not.toMatch(/ellipsizeMode|…/);
   });
 });
 
@@ -352,22 +329,6 @@ describe('auto-lock: Never', () => {
     expect(screen).toMatch(/const relaxing = autoLockRank\(time\) > autoLockRank\(autoLockTime\);/);
     // An open wallet gets no grace limit; the onboarding screens holding a phrase keep the default one.
     expect(screen).toMatch(/autoLockTime === 'never'\s*\? \(wallet \? Infinity : parseInt\(DEFAULT_AUTO_LOCK, 10\) \* 60 \* 1000\)/);
-  });
-});
-
-describe('the Settings tab icon', () => {
-  it('is a gear of eight equal teeth centred on the 24-unit box, like the other icons', () => {
-    const { GEAR_PATH } = require('../src/components/BottomBar');
-    const points = [...GEAR_PATH.matchAll(/[ML]([\d.]+) ([\d.]+)|A[\d.]+ [\d.]+ 0 0 1 ([\d.]+) ([\d.]+)/g)]
-      .map((m) => (m[1] ? [+m[1], +m[2]] : [+m[3], +m[4]]))
-      .slice(0, -1); // the last arc ends where the path started
-    const radii = points.map(([x, y]) => Math.hypot(x - 12, y - 12));
-    for (const r of radii) expect(Math.min(Math.abs(r - 9.3), Math.abs(r - 7.1))).toBeLessThan(0.02);
-    const cx = points.reduce((a, [x]) => a + x, 0) / points.length;
-    const cy = points.reduce((a, [, y]) => a + y, 0) / points.length;
-    expect(Math.abs(cx - 12)).toBeLessThan(0.05);
-    expect(Math.abs(cy - 12)).toBeLessThan(0.05);
-    expect(radii.filter((r) => Math.abs(r - 9.3) < 0.02)).toHaveLength(16);
   });
 });
 

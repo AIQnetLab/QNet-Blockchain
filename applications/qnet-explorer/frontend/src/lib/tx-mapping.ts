@@ -1,6 +1,7 @@
 // ============================================================================
-// Shared transaction type mapping and amount formatting
-// Single source of truth — used by SSR page, API routes, and client components
+// Shared transaction type mapping
+// Single source of truth — used by SSR page, API routes, and client components; amounts are written by
+// format.ts (qnc, amount) from their raw values.
 // ============================================================================
 
 // Extract the QRC-20/contract method name from a ContractCall's `data`
@@ -87,26 +88,3 @@ export function mapTxType(
   return map[normalized] || 'System';
 }
 
-// Format nanoQNC → QNC with full precision
-// v3.52: Dynamic precision — never lose small amounts, trim trailing zeros
-export function formatAmount(amount: number | string | undefined): string {
-  // Zero-value txs (Heartbeat, Registration, Activation, light attestations, system) carry no QNC:
-  // render a bare "0" with NO unit — the render sink also drops the coin icon (unit present iff value).
-  if (!amount) return '0';
-  const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num === 0 || !Number.isFinite(num)) return '0';
-  const qnc = num / 1e9;
-
-  if (qnc >= 0.01) {
-    return qnc.toLocaleString('en-US', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    }) + ' QNC';
-  }
-
-  const fixed = qnc.toFixed(9);
-  const trimmed = fixed.replace(/\.?0+$/, '');
-  const [intPart, decPart] = trimmed.split('.');
-  const intFormatted = Number(intPart).toLocaleString('en-US');
-  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
-}

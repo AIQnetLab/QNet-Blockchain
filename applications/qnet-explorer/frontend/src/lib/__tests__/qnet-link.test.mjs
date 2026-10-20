@@ -35,6 +35,8 @@ import {
   SESSION_BODY_MAX_BYTES,
   SESSION_TTL_S,
   SITE_ORIGIN,
+  TRANSFER_LINK_PREFIX,
+  TRANSFER_LINK_RE,
   WALLET_HASH_PREFIX,
   WALLET_PAGE,
   activateWithExtension,
@@ -156,6 +158,34 @@ test('android: the site button\'s intent: URL, whose data is the link itself', (
   // A fallback with its own '#' and ';' is encoded, so the fields still start at "#Intent;".
   const odd = parseUri(androidIntentUrl(link, 'https://aiqnet.io/wallet?a=1;b=2#x'));
   assert.deepEqual(odd, { data: link, package: 'io.aiqnet.wallet', fallback: 'https://aiqnet.io/wallet?a=1;b=2#x' });
+});
+
+// Section 15: the payment address's Android button is the same intent: URL with the transfer link in place of the link.
+test('android: a transfer link\'s intent: URL, whose data is the transfer link itself; nothing else on /send', () => {
+  const to = '9z1QsPH2k9xpYY9EQYh8EdPjhnt9CXnsxZZkYgT5Km96';
+  const mint = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
+  assert.equal(TRANSFER_LINK_PREFIX, 'https://link.aiqnet.io/send#');
+  for (const send of [`${TRANSFER_LINK_PREFIX}to=${to}&mint=${mint}&amount=1500`, `${TRANSFER_LINK_PREFIX}to=${to}&amount=0.001`]) {
+    assert.match(send, TRANSFER_LINK_RE);
+    const url = androidIntentUrl(send, send);
+    assert.equal(url, `intent://${send.slice('https://'.length)}#Intent;scheme=https;package=io.aiqnet.wallet;S.browser_fallback_url=${encodeURIComponent(send)};end`);
+    assert.deepEqual(parseUri(url), { data: send, package: 'io.aiqnet.wallet', fallback: send });
+    assert.equal(parseLink(send), null, 'a transfer link is no QNet Link request');
+  }
+  for (const bad of [
+    `${TRANSFER_LINK_PREFIX}to=${to}&amount=0`, `${TRANSFER_LINK_PREFIX}to=${to}&amount=1#Intent;scheme=x;end`,
+    `${TRANSFER_LINK_PREFIX}to=${to}&amount=1;x`, `${TRANSFER_LINK_PREFIX}amount=1&to=${to}`, `https://link.aiqnet.io/send?to=${to}&amount=1`,
+    `solana:${to}?amount=1`, `https://aiqnet.io/send#to=${to}&amount=1`,
+  ]) {
+    assert.equal(androidIntentUrl(bad, WALLET_PAGE), null, bad);
+  }
+  // Base58 of the right length that is not 32 bytes (fewer, or 33): a link QNet Wallet refuses gets no intent: URL.
+  for (const key of ['2'.repeat(32), 'z'.repeat(44)]) {
+    for (const bad of [`${TRANSFER_LINK_PREFIX}to=${key}&amount=1`, `${TRANSFER_LINK_PREFIX}to=${to}&mint=${key}&amount=1`]) {
+      assert.match(bad, TRANSFER_LINK_RE);
+      assert.equal(androidIntentUrl(bad, bad), null, bad);
+    }
+  }
 });
 
 test('activation code: the node KAT and every revision 1 answer', () => {

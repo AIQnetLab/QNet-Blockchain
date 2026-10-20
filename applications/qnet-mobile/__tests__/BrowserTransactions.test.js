@@ -15,7 +15,8 @@ jest.mock('../src/crypto/DilithiumCrypto', () => {
 
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const AsyncStorage = require('@react-native-async-storage/async-storage');
 const { sha3_256, shake256 } = require('js-sha3');
@@ -482,8 +483,7 @@ describe('the wallet signs what the sheet showed, through its own send path', ()
 
 describe('the sheet of a token transfer and of a contract call', () => {
   const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string' || typeof c === 'number').join('')).join('\n');
-  const button = (tree, label) => tree.root.findAllByType(TouchableOpacity)
-    .find((b) => b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('') === label);
+  const button = (tree, label) => tree.root.findAllByType(Action).find((b) => b.props.label === label);
   const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
   const mounted = [];
   afterEach(async () => { await act(async () => { while (mounted.length) mounted.pop().unmount(); }); });

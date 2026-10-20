@@ -9,7 +9,8 @@
  * send never goes in addition to it (browser/dappProvider, the extension's one transaction in flight).
  */
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, StyleSheet, BackHandler, ActivityIndicator, AppState } from 'react-native';
+import { View, Text, Pressable, ScrollView, BackHandler, ActivityIndicator, AppState } from 'react-native';
+import { Answer, Answers } from '../components/ui/Action';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { describeOrigin } from './url';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
@@ -20,6 +21,7 @@ import { formatUnits } from './dappRequests';
 import { refusalReason } from '../utils/txRefusal';
 import { amountText, formatNano, qncText } from '../utils/amountFormat';
 import { InfoField, InfoRow } from '../components/InfoRow';
+import { color, layer, radius, size, space, themed } from '../theme';
 
 // A send moves money: a longer untouched look before it arms (the times live with the provider, which also counts
 // a page that leaves under an armed sheet as a rejection).
@@ -218,37 +220,28 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
   const wholeField = (label, value, mono = true) => <InfoField label={label} value={value} mono={mono} t={t} />;
   const addressField = (label, value) => <InfoField label={label} value={value} mono fit t={t} testID="dapp-address" />;
 
+  // An answer of the sheet: the one solid action (Confirm, Retry, Close) or a text action (Reject).
   const button = (label, onPress, primary, disabled = false, pressIn = undefined) => (
-    <TouchableOpacity
-      key={label}
-      style={[s.button, primary ? s.primary : s.secondary, disabled && s.disabled]}
-      onPress={onPress}
-      onPressIn={pressIn}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityState={{ disabled }}
-    >
-      <Text style={[s.buttonText, !primary && s.secondaryText]}>{label}</Text>
-    </TouchableOpacity>
+    <Answer key={label} primary={primary} label={label} onPress={onPress} onPressIn={pressIn} disabled={disabled} />
   );
 
   const choiceButton = (value, label, disabled) => (
-    <TouchableOpacity
+    <Pressable
       key={value}
-      style={[s.choice, pick === value && s.choiceOn, disabled && s.disabled]}
+      style={[s.choice, pick === value && s.choiceOn]}
       onPress={() => { if (!disabled) setPick(value); }}
       disabled={disabled}
       accessibilityRole="radio"
       accessibilityState={{ selected: pick === value, disabled }}
       testID={`pick-${value}`}
     >
-      <Text style={[s.choiceText, pick === value && s.choiceTextOn]}>{label}</Text>
-    </TouchableOpacity>
+      <Text style={[s.choiceText, pick === value && s.choiceTextOn, disabled && s.disabledText]}>{label}</Text>
+    </Pressable>
   );
 
   const pendingBlock = () => (
     <View style={s.pendingBox}>
-      <Text style={s.warning}>{t('pending_title', { count: pending.length })}</Text>
+      <Text style={s.kicker}>{t('pending_title', { count: pending.length })}</Text>
       {pending.map((p) => <Text key={`p${p.nonce}`} style={s.mono}>{pendingLine(t, p)}</Text>)}
       {inFlight ? <Text style={s.hint} testID="in-flight">{t('dapp_in_flight')}</Text> : (
         <>
@@ -340,7 +333,7 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
 
   const reading = () => (
     <View style={s.busy}>
-      {view.previewError ? null : <ActivityIndicator color="#00d4ff" />}
+      {view.previewError ? null : <ActivityIndicator color={color.signal} />}
       <Text style={view.previewError === 'TOKEN_DECIMALS' ? s.alert : s.hint}>
         {t(!view.previewError ? 'common_loading' : view.previewError === 'TOKEN_DECIMALS' ? 'dapp_token_decimals_differ' : 'dapp_send_preview_failed')}
       </Text>
@@ -494,13 +487,13 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
           {outcome ? outcomeBody() : kind === 'connect' ? connectBody() : kind === 'sign' ? signBody() : sendBody()}
           {view.busy ? (
             <View style={s.busy}>
-              <ActivityIndicator color="#00d4ff" />
+              <ActivityIndicator color={color.signal} />
               <Text style={s.text}>{busyText}</Text>
             </View>
           ) : null}
           {view.queued > 0 && !outcome ? <Text style={s.hint}>{t('dapp_queued', { count: view.queued })}</Text> : null}
           {failNote && !outcome && !view.busy ? <Text style={s.alert}>{t('dapp_approve_again')}</Text> : null}
-          <View style={s.actions}>
+          <Answers>
             {outcome ? button(t('dapp_close'), () => actions.dismiss(view.id), true) : [
               button(t('dapp_reject'), reject, false, acting || view.busy),
               // A preview that could not be read, or that came without a balance the send is checked against, offers to
@@ -509,70 +502,66 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
                 ? button(t('dapp_retry'), () => actions.loadPreview(view.id), true)
                 : button(confirmLabel, confirm, true, !armed || acting || view.busy, onPressIn),
             ]}
-          </View>
+          </Answers>
         </View>
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-const s = StyleSheet.create({
-  // Over the browser and every screen, under the password prompt and the alerts (WalletScreen modalOverlay):
+const s = themed((type) => ({
+  // Over the browser and every screen, under the password prompt and the alerts (sheets at theme.layer.alert):
   // elevation and zIndex rank it the same way, so it is drawn where it is touched.
   overlay: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(8, 10, 20, 0.97)', zIndex: 9000, elevation: 20,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: color.ink, ...layer.request,
   },
-  scroll: { flexGrow: 1, justifyContent: 'center', padding: 16 },
-  card: {
-    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 16,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
-  },
-  originBox: { alignItems: 'center', marginBottom: 12 },
-  originLabel: { color: '#888888', fontSize: 12, marginBottom: 4 },
-  originHost: { fontSize: 20, textAlign: 'center', writingDirection: 'ltr' },
-  originPrefix: { color: '#9aa3b5', fontWeight: '400' },
-  originDomain: { color: '#ffffff', fontWeight: '700' },
-  originFull: { color: '#888888', fontSize: 12, fontFamily: 'monospace', marginTop: 4, textAlign: 'center', writingDirection: 'ltr' },
-  title: { color: '#00d4ff', fontSize: 18, fontWeight: '700', textAlign: 'center', marginBottom: 12 },
-  text: { color: '#ffffff', fontSize: 14, lineHeight: 20, marginBottom: 10 },
-  hint: { color: '#888888', fontSize: 12, lineHeight: 17, marginTop: 4, marginBottom: 4 },
-  warning: { color: '#ffaa00', fontSize: 13, lineHeight: 19, marginTop: 6, marginBottom: 6 },
-  alert: { color: '#ff5555', fontSize: 13, lineHeight: 19, fontWeight: '600', marginTop: 6, marginBottom: 6 },
+  scroll: { flexGrow: 1, padding: space.gut },
+  // The request's column, no box around it.
+  card: { width: '100%', maxWidth: size.request, alignSelf: 'center', padding: 0, borderWidth: 0 },
+  originBox: { alignItems: 'flex-start', marginBottom: space.s16 },
+  originLabel: { ...type('label'), color: color.fog, marginBottom: space.s4 },
+  originHost: { ...type('h3'), color: color.paper, writingDirection: 'ltr' },
+  originPrefix: { color: color.fog },
+  originDomain: { color: color.paper },
+  originFull: { ...type('data', 12), color: color.fog, marginTop: space.s4, writingDirection: 'ltr' },
+  title: { ...type('title'), color: color.paper, marginBottom: space.s16 },
+  text: { ...type('body'), color: color.text, marginBottom: space.s12 },
+  hint: { ...type('note'), color: color.fog, marginTop: space.s4, marginBottom: space.s4 },
+  warning: { ...type('note'), color: color.ember, marginTop: space.s8, marginBottom: space.s8 },
+  alert: { ...type('row', 15), color: color.ember, marginTop: space.s8, marginBottom: space.s8 },
   // The input and the unconfirmed transactions stay left-to-right in every language.
-  mono: { color: '#ffffff', fontSize: 13, fontFamily: 'monospace', writingDirection: 'ltr', textAlign: 'left' },
+  mono: { ...type('data'), color: color.paper, writingDirection: 'ltr' },
   messageBox: {
-    maxHeight: 220, backgroundColor: '#11131f', borderRadius: 8, borderWidth: MESSAGE_BORDER, borderColor: 'rgba(0, 212, 255, 0.2)',
+    maxHeight: 220, backgroundColor: color.fillField, borderRadius: radius.box, borderWidth: MESSAGE_BORDER, borderColor: color.edge,
   },
   // Inside the scrolled content, so the content height the fit check compares is the whole text with its padding.
   messageContent: { padding: 10 },
-  message: { color: '#ffffff', fontSize: 14, lineHeight: 20 },
+  message: { ...type('body'), color: color.paper },
   // A call's input, under its label (components/InfoRow).
   inputBox: {
-    maxHeight: 140, marginTop: 6, backgroundColor: '#11131f', borderRadius: 8, borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.2)',
-    padding: 8,
+    maxHeight: 140, marginTop: space.s8, backgroundColor: color.fillField, borderRadius: radius.box, borderWidth: 1,
+    borderColor: color.edge, padding: space.s8,
   },
-  busy: { alignItems: 'center', paddingVertical: 10, gap: 8 },
+  busy: { alignItems: 'flex-start', paddingVertical: 10, gap: space.s8 },
+  // The unconfirmed transactions: a group under its kicker, no box.
+  kicker: { ...type('label'), color: color.fog, marginBottom: space.s4 },
   pendingBox: {
-    borderWidth: 1, borderColor: 'rgba(255, 170, 0, 0.4)', borderRadius: 10, padding: 10, marginTop: 6, marginBottom: 10, gap: 4,
+    borderTopWidth: 1, borderTopColor: color.ruleStrong, paddingTop: space.s8, marginTop: space.s8, marginBottom: space.s12,
+    gap: space.s4,
   },
-  choices: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 },
+  // The Replace choice: underlined options over a strong rule.
+  choices: {
+    flexDirection: 'row', flexWrap: 'wrap', columnGap: space.s24, marginTop: space.s8, borderBottomWidth: 1,
+    borderBottomColor: color.ruleStrong,
+  },
   choice: {
-    flexGrow: 1, flexBasis: 120, minHeight: 40, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)', alignItems: 'center', justifyContent: 'center',
+    flexShrink: 1, minHeight: size.rowMin, paddingVertical: space.s8, marginBottom: -1,
+    borderBottomWidth: 2, borderBottomColor: color.clear, justifyContent: 'center',
   },
-  choiceOn: { backgroundColor: 'rgba(0, 212, 255, 0.2)', borderColor: '#00d4ff' },
-  choiceText: { color: '#9aa3b5', fontSize: 14, textAlign: 'center' },
-  choiceTextOn: { color: '#ffffff', fontWeight: '700' },
-  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
-  button: {
-    flexGrow: 1, flexBasis: 128, minHeight: 44, borderRadius: 10, paddingVertical: 11, paddingHorizontal: 16,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  primary: { backgroundColor: '#00d4ff' },
-  secondary: { backgroundColor: 'rgba(0, 212, 255, 0.1)', borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)' },
-  disabled: { opacity: 0.5 },
-  buttonText: { color: '#1a1a2e', fontSize: 15, fontWeight: '600', textAlign: 'center' },
-  secondaryText: { color: '#00d4ff' },
-});
+  choiceOn: { borderBottomColor: color.signal },
+  choiceText: { ...type('row', 15), color: color.fog },
+  choiceTextOn: { color: color.paper },
+  disabledText: { color: color.fog },
+}));
 
 export const sheetStyles = s;

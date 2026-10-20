@@ -108,6 +108,7 @@ jest.mock('../src/services/QNetLink', () => ({
   parseLink: jest.fn((url) => mockLinks[url] || null),
   takeInitialUrl: jest.fn(async () => null),
   openSession: jest.fn(), prepareOffer: jest.fn(), performIntent: jest.fn(), deliverAnswer: jest.fn(), markHandled: jest.fn(),
+  readOffer: jest.requireActual('../src/services/QNetLink').readOffer,
   LinkRefusal: class LinkRefusal extends Error {},
 }));
 
@@ -117,7 +118,9 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const WalletScreen = require('../src/screens/WalletScreen').default;
 
 const flush = async (n = 4) => { for (let i = 0; i < n; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
-const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).flat(Infinity).filter((c) => typeof c === 'string').join('')).join('\n');
+// What the screen shows: an action's other label, held at no height to keep its width (components/ui/Action), is not.
+const texts = (tree) => tree.root.findAllByType(Text).filter((n) => !n.props.accessibilityElementsHidden)
+  .map((n) => [].concat(n.props.children).flat(Infinity).filter((c) => typeof c === 'string').join('')).join('\n');
 function pressable(tree, text) {
   const all = tree.root.findAll((n) => typeof n.props.onPress === 'function'
     && n.findAllByType(Text).some((x) => [].concat(x.props.children).flat(Infinity).filter((c) => typeof c === 'string').join('').includes(text)));
@@ -866,7 +869,7 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     expect(texts(tree)).toContain(t('seed_save_title'));
     expect(texts(tree)).toContain(t('seed_copy_warning', { seconds: 60 }));
     expect(copy).not.toHaveBeenCalled();
-    await pressExact(tree, t('seed_copy'));
+    await pressExact(tree, t('common_copy'));
     expect(copy).toHaveBeenCalledWith(PHRASE);
     expect(lines(tree)).toContain(t('common_copied'));
   });
@@ -892,7 +895,7 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     for (const word of PHRASE.split(' ')) expect(lines(tree)).toContain(word);
     expect(texts(tree)).not.toContain(t('seed_copy_warning', { seconds: 60 }));
     expect(copy).not.toHaveBeenCalled();
-    await pressExact(tree, t('seed_copy'));
+    await pressExact(tree, t('common_copy'));
     expect(copy).toHaveBeenCalledWith(PHRASE);
     expect(lines(tree)).toContain(t('common_copied'));
     await pressExact(tree, t('common_done'));
@@ -909,7 +912,7 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     await press(tree, 'accept');
     await press(tree, 'create_wallet');
     const timers = jest.spyOn(global, 'setTimeout');
-    await pressExact(tree, t('seed_copy'));
+    await pressExact(tree, t('common_copy'));
     expect(lines(tree)).toContain(t('common_copied'));
     // The last timer of that length is the button's (the copy's own clear is set first).
     const at = timers.mock.calls.map((c) => c[1]).lastIndexOf(SECRET_CLIPBOARD_SECONDS * 1000);
@@ -917,7 +920,7 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     clearTimeout(timers.mock.results[at].value);
     await act(async () => { timers.mock.calls[at][0](); });
     expect(lines(tree)).not.toContain(t('common_copied'));
-    expect(lines(tree)).toContain(t('seed_copy'));
+    expect(lines(tree)).toContain(t('common_copy'));
   });
 });
 

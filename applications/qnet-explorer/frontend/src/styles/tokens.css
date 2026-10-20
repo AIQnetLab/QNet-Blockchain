@@ -1,0 +1,92 @@
+/* The site's design tokens: every colour, face, size and duration the stylesheets use. Imported first. */
+
+:root {
+  color-scheme: dark;
+
+  /* Colour: Ink page, Paper text, Signal = act on it or live, Ember = a change or something that needs you. */
+  --ink: #05080A;
+  --surface: #0A1013;
+  --rule: #1A2529;
+  --rule-strong: #2B3A3F;
+  --edge: #56686D;
+  --edge-hover: #6A7C81;
+  --fog: #8D9CA1;
+  --paper: #E8F0F0;
+  --paper-78: rgb(232 240 240 / .78);
+  --paper-85: rgb(232 240 240 / .85);
+  --text: rgb(232 240 240 / .8);
+  --signal: #3CF0DC;
+  --signal-line: rgb(60 240 220 / .55);
+  --signal-glow: rgb(60 240 220 / .95);
+  --signal-pale: #B9FFF6;
+  --white: #FFFFFF;
+  --ember: #FFB547;
+  --mint: #9BE7A6;
+  --lilac: #C7B8FF;
+  --fill-field: rgb(232 240 240 / .035);
+  --fill-field-focus: rgb(232 240 240 / .055);
+  --fill-row: rgb(232 240 240 / .03);
+  --fill-signal: rgb(60 240 220 / .06);
+  --fill-store: rgb(60 240 220 / .045);
+  --fill-disabled: rgb(232 240 240 / .07);
+  --fill-plot: rgb(232 240 240 / .045);
+  --ember-tint: rgb(255 181 71 / .11);
+  --scrim: rgb(0 0 0 / .6);
+  --ink-96: rgb(5 8 10 / .96);
+  --shadow-menu: 0 24px 48px rgb(0 0 0 / .5);
+  --shadow-sheet: 0 -24px 48px rgb(0 0 0 / .5);
+
+  /* Faces: next/font sets --font-archivo and --font-martian on <html> (src/app/fonts.ts). */
+  --f-sans: var(--font-archivo), 'Helvetica Neue', Arial, system-ui, sans-serif;
+  --font-mono: var(--font-martian), ui-monospace, Menlo, Consolas, monospace;
+
+  /* Type scale (B-SPEC 2.3). */
+  --t-label: 11.5px;
+  --t-th: 10.5px;
+  --t-data: 12.5px;
+  --t-note: 14px;
+  --t-small: 15px;
+  --t-sub: 13.5px;
+  --t-body: 17px;
+  --t-lead: clamp(18px, 1.5vw, 21px);
+  --t-deck: clamp(20px, 1.75vw, 26px);
+  --t-h3: clamp(20px, 1.7vw, 24px);
+  --t-table-title: clamp(24px, 2.1vw, 30px);
+  --t-h2: clamp(38px, 5.2vw, 76px);
+  --t-page: clamp(34px, 4.2vw, 60px);
+  --t-display: clamp(52px, 9.4vw, 140px);
+  --t-display-phone: clamp(46px, 16.2vw, 104px);
+  /* Under 390 px the word (4.6 em wide) is held inside the gutters; from 390 px up it is the size it always was. */
+  --t-verify: clamp(56px, max(17.5vw, min(72px, 21.5vw - 7px)), 262px);
+  --t-readout: clamp(24px, 2.4vw, 36px);
+  --t-readout-tool: clamp(22px, 2vw, 30px);
+  --t-figure: clamp(44px, 5vw, 76px);
+  --t-datum: clamp(28px, 3.2vw, 46px);
+  --t-wordmark-line: clamp(28px, 4.2vw, 60px);
+
+  /* Space and layout. */
+  --maxw: 1360px;
+  --gut: clamp(16px, 4vw, 56px);
+  --col-gap: 24px;
+  --hdr: 64px;
+  --bar: 64px;
+  --row: 44px;
+  --row-2: 60px;
+  --row-3: 80px;
+  --sec-pad: clamp(88px, 11vw, 160px);
+  --sec-pad-tool: clamp(48px, 6vw, 88px);
+  --sec-head-gap: clamp(48px, 6vw, 88px);
+  --block-gap: clamp(48px, 5vw, 72px);
+  --ro-gap: clamp(20px, 2.6vw, 40px);
+  --radius: 2px;
+  --focus: 2px solid var(--signal);
+
+  /* Motion. */
+  --ease-out: cubic-bezier(.2, .7, .2, 1);
+  --t-hover: 150ms;
+  --t-sheet: 240ms;
+  --t-slide: 500ms;
+  --t-progress: 600ms;
+  --t-reveal: 700ms;
+  --t-flash: 1.8s;
+}

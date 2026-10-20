@@ -114,6 +114,8 @@ function siteSources() {
   };
   walk('app/');
   walk('components/');
+  // My node's section names, which the rail and the bar take from tabs.ts.
+  out.push(readFileSync(new URL('lib/cabinet/tabs.ts', root), 'utf8'));
   return out.join('\n');
 }
 
@@ -124,10 +126,10 @@ test('the pictures\' labels are the app\'s and the extension\'s own words', () =
   }
   // Every app and extension label key of the texts is checked here.
   for (const key of Object.keys(TEXTS).filter((k) => /^ui_(app|ext)_/.test(k))) assert.ok(key in UI_APP || key in UI_EXT, key);
-  // The faucet page's own heading and button (the site writes its buttons in capitals).
+  // The faucet page's own heading and button come from the keys the picture draws, so the two never differ.
   const testnet = readFileSync(new URL('../../app/testnet/page.tsx', import.meta.url), 'utf8');
-  assert.ok(testnet.includes(`>${TEXTS.ui_faucet_title}<`));
-  assert.ok(testnet.includes(`'${TEXTS.ui_faucet_button.toUpperCase()}'`));
+  assert.match(testnet, /title=\{t\('ui_faucet_title'\)\}/);
+  assert.match(testnet, /\{t\('ui_faucet_button'\)\}/);
 });
 
 // Owner, 06.10: a picture draws only what the user sees on that screen. On QNet Wallet's screens every label is the
@@ -136,7 +138,8 @@ test('the pictures\' labels are the app\'s and the extension\'s own words', () =
 test('every label a picture draws is one the screen it draws shows', () => {
   const site = siteSources();
   const lower = site.toLowerCase();
-  const onSite = (key) => site.includes(`'${key}'`) || lower.includes(`>${TEXTS[key].toLowerCase()}<`) || site.includes(`'${TEXTS[key].toUpperCase()}'`);
+  // A page's title band takes its title as a prop (title="QNet Wallet"), so that counts as shown too.
+  const onSite = (key) => site.includes(`'${key}'`) || lower.includes(`>${TEXTS[key].toLowerCase()}<`) || site.includes(`'${TEXTS[key].toUpperCase()}'`) || site.includes(`title="${TEXTS[key]}"`);
   let drawn = 0;
   const used = new Set();
   for (const o of ALL) {
@@ -184,9 +187,10 @@ test('every label a picture draws is one the screen it draws shows', () => {
   assert.match(sheet, /\{addressField\(t\('link_qnet_address'\), o\.addresses\.qnet\)\}\s*\{addressField\(t\('link_solana_address'\), o\.addresses\.solana\)\}/);
   assert.match(repo('applications/qnet-mobile/src/crypto/NodePreimages.js'), /return `light_mobile_\$\{bytesToHex\(blake3\(utf8ToBytes\(`LIGHT_NODE_PRIVACY_\$\{walletOf\(wallet\)\}`\)\)\)\.slice\(0, 16\)\}`;/);
   const node = repo('applications/qnet-mobile/src/screens/NodeTab.js');
-  // The balance row, then the move: "Move to wallet", "Moving…" while it runs, "Moving X" while a move is in transit.
-  assert.match(node, /<InfoRow label=\{t\('node_balance'\)\} value=\{qncText\(shownNano, t\.lang, hidden\)\}[^>]*\/>\s*<Button label=\{label\}/);
-  assert.match(node, /const label = move \? t\('node_moving', \{ amount: qncText\(move\.amountNano, t\.lang, hidden\) \}\)\s*: \(moving \? t\('claiming'\) : t\('node_move'\)\);/);
+  // The balance row, then the move: "Move to wallet", "Moving…" while it runs, "Moving X" while a move is in transit; the
+  // amounts in the one format of every language, so no language goes into them.
+  assert.match(node, /<InfoRow label=\{t\('node_balance'\)\} value=\{qncText\(shownNano, hidden\)\}[^>]*\/>\s*<Button label=\{label\}/);
+  assert.match(node, /const label = move \? t\('node_moving', \{ amount: qncText\(move\.amountNano, hidden\) \}\)\s*: \(moving \? t\('claiming'\) : t\('node_move'\)\);/);
   // A light node only on the device it is linked to: the Node tab draws no node it does not run (owner, 11.10).
   assert.match(node, /if \(view\.state === 'elsewhere' \|\| view\.state === 'no_device'\) return false;/);
   assert.equal(APP.node_no_device, undefined);
@@ -202,7 +206,7 @@ test('every label a picture draws is one the screen it draws shows', () => {
   // The Activate tab's two node type cards, each with its price (ExtensionActivate.tsx).
   const activate = readFileSync(new URL('../../components/cabinet/ExtensionActivate.tsx', import.meta.url), 'utf8');
   assert.match(activate, /\{NODE_TYPES\.map\(\(type\) => \(/);
-  assert.match(activate, /<span className="activate-type-price"><PriceLabel price=\{prices\[type\]\} \/><\/span>/);
+  assert.match(activate, /<span className="cab-type-p"><PriceLabel price=\{prices\[type\]\} \/><\/span>/);
   for (const o of ALL) {
     for (const step of guides(o).filter((s) => s.id === 'activate')) {
       const choice = step.scene.parts.find((p) => p.kind === 'choice');
@@ -262,7 +266,7 @@ test('no guide step about keeping the app running or phone settings, and no text
   assert.doesNotMatch(page, /mailto:|support@|faq_help|\/support/);
   // The answers are the same with the site's phone flows on or off, so they name no button of My node that only the
   // phone flows show ("Move the node to another device" is a link request, NodeDevices.tsx / LinkDevice.tsx).
-  assert.match(readFileSync(new URL('../../components/cabinet/LinkDevice.tsx', import.meta.url), 'utf8'), /if \(!phoneFlows\) \{\s*return \(/);
+  assert.match(readFileSync(new URL('../../components/cabinet/LinkDevice.tsx', import.meta.url), 'utf8'), /if \(!phoneFlows\) return <ActionBlock title=\{t\('action_link_device'\)\}><p>\{t\('devices_link_closed'\)\}<\/p><\/ActionBlock>;/);
   for (const key of Object.keys(TEXTS).filter((k) => /^faq_/.test(k))) {
     assert.doesNotMatch(TEXTS[key], new RegExp(`${TEXTS.devices_move_title}|${TEXTS.claim_with_app}|${TEXTS.action_link_device}`), key);
   }
@@ -373,7 +377,7 @@ test('the steps follow the release\'s network and the site\'s phone flows', () =
   // Right after the burn the Activate tab's "Link a device" opens the Device tab, which shows the QR code as the
   // Overview does (NextSteps.tsx LinkPhone).
   assert.match(TEXTS.guide_pc_link, /^Back on the computer, click "Link a device" on My node's Overview or Device tab: a QR code appears\./);
-  assert.match(readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8'), /\{!onLinked && phoneFlows && !viewOnly && <Link href=\{TAB_HREF\.device\} className="qnet-button activate-primary">\{t\('action_link_device'\)\}<\/Link>\}/);
+  assert.match(readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8'), /\{!onLinked && phoneFlows && !viewOnly && <div className="cab-next-act"><Action kind="solid" href=\{TAB_HREF\.device\}>\{t\('action_link_device'\)\}<\/Action><\/div>\}/);
   // A phone that is not linked yet: QNet Wallet shows a light node only on its own device, so the phone has no button of
   // its own to take the node, and nothing tells the reader to look for one (owner, 11.10).
   assert.match(TEXTS.guide_pc_phone, /Until the phone is linked, its "Node" tab says "This wallet has no node\."$/);
@@ -390,8 +394,8 @@ test('the steps follow the release\'s network and the site\'s phone flows', () =
   // The page picks by the release's network and the provider's flag, never by a setting of its own.
   const page = readFileSync(new URL('../../components/cabinet/NodeGuide.tsx', import.meta.url), 'utf8');
   assert.match(page, /const options = \{ network: ACTIVATION_NETWORK, phoneFlows \};/);
-  assert.match(page, /function Guide\(\{ phoneFlows \}: \{ phoneFlows: boolean \}\) \{/);
-  assert.match(readFileSync(new URL('../../app/docs/how-it-works/page.tsx', import.meta.url), 'utf8'), /return <NodeGuide phoneFlows=\{phoneFlowsEnabled\(\)\} \/>;/);
+  assert.match(page, /function Guide\(\{ phoneFlows, phone \}: \{ phoneFlows: boolean; phone: boolean \}\) \{/);
+  assert.match(readFileSync(new URL('../../app/docs/how-it-works/page.tsx', import.meta.url), 'utf8'), /return <NodeGuide phoneFlows=\{phoneFlowsEnabled\(\)\} phone=\{phone\} \/>;/);
   // The short version: three steps from a phone, four from a computer, five for a super node, whose last is QNet Wallet
   // with the same wallet; the first steps say create or import, and the computer's last one works with the phone flows
   // on or off.
@@ -435,8 +439,7 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   assert.equal(TEXTS.guide_super_code, 'The page shows your activation code and every server step right away; later the Overview shows them in any browser where this wallet is connected.');
   assert.doesNotMatch(TEXTS.guide_super_code, /extension|Recover/);
   // The server scene shows the labels the page shows over its steps (NextSteps.tsx SuperNext, its Copy buttons).
-  const next = readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8')
-    + readFileSync(new URL('../../components/cabinet/CopyButton.tsx', import.meta.url), 'utf8');
+  const next = readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8');
   for (const label of sceneLabels(step('server').scene).filter((l) => typeof l === 'string')) {
     assert.ok(next.includes(`t('${label}')`), `the page shows ${label}`);
   }
@@ -449,8 +452,8 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   // Once the node is registered, QNet Wallet with the same wallet shows it by itself on every phone and tablet, with no
   // device to link: the wallet derives the super node's id from its own address and looks it up on QNet Blockchain
   // (WalletManager generateSuperNodePseudonym, WalletScreen loadAllUserNodes), and the Node tab's super node card
-  // (NodeTab.js ServerNodeCard) shows its type, status (Active, Server offline, or registered and waiting for
-  // admission), last seen, node balance and Move to wallet, with no Use this device.
+  // (NodeTab.js ServerNodeCard) shows its type, status (Active, Server offline, or registered and not admitted to
+  // consensus yet, quoted in the app's own words), last seen, node balance and Move to wallet, with no Use this device.
   const app = step('app');
   assert.equal(sup[sup.indexOf(app) - 1].id, 'watch');
   assert.equal(app.text, 'guide_super_app');
@@ -458,7 +461,8 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   assert.equal(app.scene.screen, 'app');
   assert.deepEqual(sceneLabels(app.scene).filter((l) => typeof l === 'string'), ['ui_app_node_tab', 'ui_app_node_type', 'ui_app_super_node', 'ui_app_status_node', 'ui_app_active', 'ui_app_last_seen', 'ui_app_node_balance', 'action_move']);
   assert.match(TEXTS.guide_super_app, /^Once the node is registered, QNet Wallet shows it by itself, with no device to link: open QNet Wallet on a phone or tablet with this same wallet, the one whose 12 words are on the server \(to add it there, tap "Import Existing Wallet" and type those words\)\./);
-  assert.match(TEXTS.guide_super_app, /Its "Node" tab shows the node's status, when it was last seen, whether QNet Blockchain has admitted it \("Registered — waiting for admission to QNet Blockchain" until it does\) and its node balance with "Move to wallet"\. Every phone and tablet with this wallet shows the same card\.$/);
+  assert.match(TEXTS.guide_super_app, /Its "Node" tab shows the node's status, when it was last seen, whether QNet Blockchain has admitted it \("[^"]+" until it does\) and its node balance with "Move to wallet"\. Every phone and tablet with this wallet shows the same card\.$/);
+  assert.ok(TEXTS.guide_super_app.includes(`("${APP.node_waiting_admission}" until it does)`));
   const manager = repo('applications/qnet-mobile/src/components/WalletManager.js');
   assert.match(manager, /const hashBytes = blake3\(Buffer\.from\(`SUPER_NODE_PRIVACY_\$\{walletAddress\}`, 'utf8'\)\);\s*return `super_node_\$\{Buffer\.from\(hashBytes\.slice\(0, 8\)\)\.toString\('hex'\)\}`;/);
   const screen = repo('applications/qnet-mobile/src/screens/WalletScreen.js');
@@ -471,7 +475,6 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.match(card, /const statusText = waiting \? t\('node_waiting_admission'\) : t\(status\.isOnline \? 'node_active' : 'node_server_offline'\);/);
   assert.doesNotMatch(card, /node_use/);
-  assert.equal(APP.node_waiting_admission, 'Registered — waiting for admission to QNet Blockchain');
   assert.match(TEXTS.guide_or_move_app, /on the phone that runs the node: "Node" tab, "Move to wallet"\.$/);
   // From 1 QNC, as the app's button takes it (NodeTab.js BalanceBlock), and as the light guides say.
   assert.equal(TEXTS.guide_super_move, TEXTS.guide_pc_move);
@@ -498,7 +501,8 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   assert.match(TEXTS.faq_server_a, /Moving it to a server with another address is not possible yet: QNet Blockchain takes its connections only from the address it registered with\./);
   assert.doesNotMatch(TEXTS.faq_server_a, /same command/);
   assert.match(readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8'), /const NODE_CONTAINER = 'qnet-super';[\s\S]*`docker run -d --name \$\{NODE_CONTAINER\} --restart=always \\\\`/);
-  assert.match(TEXTS.guide_super_watch, /^Once its registration is on QNet Blockchain, the Overview shows the node: online or not, or registered and waiting for the network to admit it, when it was last seen, its heartbeats this epoch/);
+  assert.match(TEXTS.guide_super_watch, /^Once its registration is on QNet Blockchain, the Overview shows the node: online or not, or "[^"]+", when it was last seen, its heartbeats this epoch/);
+  assert.ok(TEXTS.guide_super_watch.includes(`"${TEXTS.super_waiting}"`));
   assert.match(TEXTS.guide_super_watch, /at least 9 of its 10 heartbeats/);
   assert.match(TEXTS.guide_super_intro, /use a wallet that has no node yet and keep it for the node alone, since the server holds its 12 words\.$/);
   assert.equal(TEXTS.guide_short_super_4, 'The Overview shows the node once its registration is on QNet Blockchain.');
@@ -509,7 +513,7 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   // The intro is the last line before step 1: no summary lines repeat it.
   for (const key of ['guide_light_summary', 'guide_super_summary']) assert.ok(!(key in TEXTS), key);
   const page = readFileSync(new URL('../../components/cabinet/NodeGuide.tsx', import.meta.url), 'utf8');
-  assert.match(page, /<p className="activate-note">\{t\(WAY_INTRO\[way\]\)\}<\/p>\s*<\/div>/);
+  assert.match(page, /<p className="lead guide-way">\{t\(WAY_INTRO\[way\]\)\}<\/p>\s*\{steps \? \(\s*<Steps steps=\{steps\} \/>/);
   // No password field in any burn window; the unlock is named in the step.
   for (const o of ALL) {
     for (const s of guides(o).filter((x) => x.id === 'burn' && x.scene.popup)) {
@@ -527,7 +531,8 @@ test('the guide covers a light and a super node, and no burn window asks for a p
   }
   // The page offers the three ways and keeps the pick in ?way=.
   assert.match(page, /const WAYS: Way\[\] = \['phone', 'computer', 'super'\];/);
-  assert.match(page, /if \(way === 'phone' \|\| way === 'computer' \|\| way === 'super'\) setPicked\(way\);/);
+  assert.match(page, /const asWay = \(value: string \| null\): Way \| null => \(WAYS as \(string \| null\)\[\]\)\.includes\(value\) \? value as Way : null;/);
+  assert.match(page, /const \[picked, setPicked\] = useState<Way \| null>\(\(\) => asWay\(search\.get\('way'\)\)\);/);
   assert.match(page, /const steps = way === 'phone' \? phoneGuide\(options\) : way === 'super' \? superGuide\(options\) : computerGuide\(options\);/);
 });
 
@@ -553,7 +558,9 @@ test('the words stay plain: no jargon, and an epoch is always said to be about 4
   const plain = Object.keys(TEXTS).filter((k) => /^(guide|faq|connect|progress|wallet_source|wallet_label|wallet_copy|wallet_disconnect|overview|epoch_note|nav_)/.test(k));
   assert.ok(plain.length > 80);
   for (const key of plain) {
-    assert.doesNotMatch(TEXTS[key], /\b(relay|attestation|attest|quorum|consensus|genesis|validator|macroblock|shard|nonce|ML-DSA)\b/i, key);
+    // A step may quote the waiting status as the Overview and QNet Wallet show it, in their own words.
+    const own = TEXTS[key].split(`"${TEXTS.super_waiting}"`).join('""');
+    assert.doesNotMatch(own, /\b(relay|attestation|attest|quorum|consensus|genesis|validator|macroblock|shard|nonce|ML-DSA)\b/i, key);
     if (/\bepoch/i.test(TEXTS[key])) assert.match(TEXTS[key], /about 4 hours/, key);
   }
   // Each step says what to do in a few sentences.
@@ -573,5 +580,5 @@ test('the steps that send to the Wallet page or the faucet link them', () => {
   for (const o of ALL) for (const step of guides(o)) if (step.link) assert.ok(Object.prototype.hasOwnProperty.call(TEXTS, step.link.label), step.id);
   const page = readFileSync(new URL('../../components/cabinet/NodeGuide.tsx', import.meta.url), 'utf8');
   assert.match(page, /\{step\.link && <Link href=\{step\.link\.href\} className="guide-step-link">\{t\(step\.link\.label\)\}<\/Link>\}/);
-  assert.match(readFileSync(new URL('../../app/globals.css', import.meta.url), 'utf8'), /\.guide-step-link \{[^}]*min-height: 44px;/);
+  assert.match(readFileSync(new URL('../../styles/pages.css', import.meta.url), 'utf8'), /\.guide-step-link \{[^}]*min-height: 44px;/);
 });

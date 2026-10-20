@@ -1,21 +1,27 @@
+import { cookies } from 'next/headers';
 import ExplorerClient from './ExplorerClient';
-import { headHub } from '@/server/head-hub';
+import { headBlockFacts, headHub } from '@/server/head-hub';
+import type { RecentBlock } from '@/lib/explorer-view';
+import { STRIP_COOKIE, stripHidden } from '@/lib/strip-pref';
 
-// The list page renders from the process head snapshot: no per-request query, the HTML already carries
-// the newest rows and counters; the client keeps it live over the head stream.
+// The list page renders from the process head snapshot, with no query of its own: the HTML already carries the newest
+// transactions, the readouts and the latest blocks (folded when the visitor hid them), and the client keeps them live
+// over the head stream.
 export const dynamic = 'force-dynamic';
 
 export default async function ExplorerPage() {
-  let initialData: Awaited<ReturnType<typeof headHub.snapshot>>['rows'] = [];
-  let initialHeight = 0;
-  let initialTotal = 0;
+  let initial: React.ComponentProps<typeof ExplorerClient>['initial'] = { rows: [], height: 0, total: 0, hash: null, timestamp: 0, emissionNano: '0', block: null };
+  let blocks: RecentBlock[] = [];
   try {
     const s = await headHub.snapshot();
-    initialData = s.rows;
-    initialHeight = Math.max(s.height, 0);
-    initialTotal = s.stats.tx_total;
-  } catch (err) {
-    console.error(`[ERR][WEB] explorer_ssr_failed err=${err instanceof Error ? err.message : String(err)}`);
+    blocks = s.blocks;
+    initial = {
+      rows: s.rows, height: Math.max(s.height, 0), total: s.stats.tx_total, hash: s.hash, timestamp: s.timestamp, emissionNano: String(s.stats.emission_total || '0'),
+      block: headBlockFacts(s),
+    };
+  } catch (error) {
+    console.error(`[ERR][WEB] explorer_ssr_failed err=${error instanceof Error ? error.message : String(error)}`);
   }
-  return <ExplorerClient initialData={initialData} initialHeight={initialHeight} initialTotal={initialTotal} />;
+  const hidden = stripHidden((await cookies()).get(STRIP_COOKIE)?.value);
+  return <ExplorerClient initial={initial} blocks={blocks} blocksHidden={hidden} />;
 }

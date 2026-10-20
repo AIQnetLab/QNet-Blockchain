@@ -530,9 +530,18 @@ export async function getTransactionsByBlock(blockHeight: number): Promise<Trans
   return result.rows;
 }
 
-// Latest blocks for a block feed, newest first.
-export async function getLatestBlocks(limit: number = 20): Promise<BlockRow[]> {
+export type RecentBlockRow = Pick<BlockRow, 'height' | 'hash' | 'timestamp' | 'producer' | 'producer_address' | 'tx_count'>;
+
+// The newest blocks with what the lists show of each, newest first: only those columns, never the bodies. With `top`,
+// the `limit` heights from it down (a page of the block history): a range of the height key, at most `limit` rows.
+export async function getLatestBlocks(limit: number = 20, top?: number): Promise<RecentBlockRow[]> {
   const n = Math.min(Math.max(Math.trunc(limit) || 20, 1), 100);
-  const result = await query<BlockRow>('SELECT * FROM blocks ORDER BY height DESC LIMIT $1', [n]);
+  if (top === undefined) {
+    const result = await query<RecentBlockRow>('SELECT height, hash, timestamp, producer, producer_address, tx_count FROM blocks ORDER BY height DESC LIMIT $1', [n]);
+    return result.rows;
+  }
+  if (!Number.isSafeInteger(top) || top < 0) throw new Error('Invalid block height');
+  const result = await query<RecentBlockRow>(
+    'SELECT height, hash, timestamp, producer, producer_address, tx_count FROM blocks WHERE height <= $1 AND height > $2 ORDER BY height DESC', [top, top - n]);
   return result.rows;
 }

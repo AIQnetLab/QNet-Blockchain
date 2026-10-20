@@ -48,6 +48,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.FragmentActivity
 import com.facebook.drawee.backends.pipeline.Fresco
+import com.facebook.react.ReactApplication
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.LifecycleEventListener
 import com.facebook.react.bridge.Promise
@@ -98,6 +99,7 @@ import javax.crypto.spec.SecretKeySpec
  * - The names the device's model is built from for a node's binding (JS: DeviceModel).
  * - Deleting or replacing the wallet: the in-app browser's cookies, site storage and HTTP cache, and the app's image
  *   cache (clearWebData).
+ * - The restart of the app's JS a new layout direction takes (reloadApp).
  */
 class SecurityModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
@@ -224,6 +226,24 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun setTexts(texts: ReadableMap) {
         if (texts.hasKey("obscuredTouch")) texts.getString("obscuredTouch")?.takeIf { it.isNotBlank() }?.let { obscuredText = it }
+    }
+
+    /**
+     * Starts the app's JS again from its bundle (JS: DeviceSecurity.reloadApp): the root view is made anew and reads the
+     * layout direction I18nManager stored. Resolves false when the app is not in front.
+     */
+    @Suppress("DEPRECATION")
+    @ReactMethod
+    fun reloadApp(promise: Promise) {
+        val app = reactContext.applicationContext as? ReactApplication
+        if (app == null || reactContext.currentActivity == null) return promise.resolve(false)
+        promise.resolve(true)
+        main.post {
+            runCatching {
+                if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) app.reactHost?.reload("layout direction")
+                else app.reactNativeHost.reactInstanceManager.recreateReactContextInBackground()
+            }.onFailure { android.util.Log.w("QNetSecurity", "[WARN][I18N] layout restart failed error=${it.javaClass.simpleName}") }
+        }
     }
 
     // ── Touches through another app's window (MPLAT-R5-02) ───────────────────────────────────────

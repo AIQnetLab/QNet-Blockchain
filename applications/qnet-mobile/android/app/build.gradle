@@ -51,7 +51,7 @@ android {
         applicationId legacyMove ? "com.qnetmobile" : "io.aiqnet.wallet"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 30
+        versionCode 31
         versionName "1.3.1"
         buildConfigField "boolean", "QNET_LEGACY_MOVE", legacyMove ? "true" : "false"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -101,6 +101,8 @@ android {
     // machine. Kept outside `src/debug`, which the repository's .gitignore excludes as a build folder.
     sourceSets {
         debug.res.srcDirs += 'src/metroDebug/res'
+        // The app's faces and their licence texts, kept once in assets/native/fonts for both platforms.
+        main.assets.srcDirs += '../../assets/native'
     }
 
     buildTypes {

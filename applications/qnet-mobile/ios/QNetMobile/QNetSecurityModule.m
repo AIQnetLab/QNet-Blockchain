@@ -12,9 +12,11 @@
  *   hooking check. No network.
  * - The hardware identifier the device's model is named by for a node's binding (JS: DeviceModel).
  * - Deleting or replacing the wallet: the site data web views left in the default web data store (clearWebData).
+ * - The restart of the app's JS a new layout direction takes (reloadApp).
  */
 
 #import <React/RCTBridgeModule.h>
+#import <React/RCTReloadCommand.h>
 #import <UIKit/UIKit.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <Security/Security.h>
@@ -135,6 +137,15 @@ static UIWindow *QNetKeyWindow(void)
 RCT_EXPORT_METHOD(setTexts:(NSDictionary *)texts)
 {
   _texts = [texts isKindOfClass:[NSDictionary class]] ? [texts copy] : nil;
+}
+
+// Starts the app's JS again from its bundle (JS: DeviceSecurity.reloadApp): the root view is made anew and reads the
+// layout direction I18nManager stored.
+RCT_EXPORT_METHOD(reloadApp:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+  resolve(@YES);
+  dispatch_async(dispatch_get_main_queue(), ^{ RCTTriggerReloadCommandListeners(@"layout direction"); });
 }
 
 RCT_EXPORT_METHOD(setSecureScreen:(BOOL)on)

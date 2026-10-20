@@ -72,16 +72,6 @@ export function formatQncTruncated(nano: string | number | bigint | undefined, p
   return places > 0 ? `${whole}.${fraction.padEnd(places, '0').slice(0, places)}` : whole;
 }
 
-// Format `<amount> <SYMBOL>` in one shot.
-export function formatTokenAmountWithSymbol(
-  raw: string | number | bigint | undefined,
-  decimals: number,
-  symbol: string
-): string {
-  const amount = formatTokenAmount(raw, decimals);
-  return symbol ? `${amount} ${symbol}` : amount;
-}
-
 // Group the integer part with thousands separators (works on arbitrarily long
 // integer strings — no Number() round-trip).
 function groupInteger(intStr: string): string {

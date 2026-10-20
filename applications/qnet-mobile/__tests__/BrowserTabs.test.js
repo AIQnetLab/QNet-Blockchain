@@ -251,7 +251,7 @@ async function mount({ wallet = WALLET, confirm = true } = {}) {
       return { done };
     },
     menuItem: async (label) => {
-      await act(async () => { tree.root.find((n) => n.props.accessibilityLabel === 'browser_menu' && n.props.onPress).props.onPress(); });
+      await act(async () => { tree.root.findAll((n) => n.props.label === 'common_more' && n.props.onPress)[0].props.onPress(); });
       const item = tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.findAllByType(Text).some((x) => x.props.children === label))[0];
       await act(async () => { item.props.onPress(); });
     },
@@ -712,7 +712,7 @@ describe('the tab overview for a screen reader, its close buttons, and close all
   it('while it is up, only the overview is reachable: the toolbar, the notices and the pages are hidden', async () => {
     const m = await twoTabs(OTHER);
     const chrome = () => m.tree.root.findAll((n) => n.props.testID === 'browser-chrome' && n.props.importantForAccessibility)[0];
-    const menuButton = m.tree.root.find((n) => n.props.accessibilityLabel === 'browser_menu' && n.props.onPress);
+    const menuButton = m.tree.root.findAll((n) => n.props.label === 'common_more' && n.props.onPress)[0];
     expect(inside(menuButton, chrome())).toBe(true);
     expect(inside(m.webs()[1], chrome())).toBe(true);
     expect(chrome().props).toMatchObject({ importantForAccessibility: 'auto', accessibilityElementsHidden: false });
@@ -724,7 +724,7 @@ describe('the tab overview for a screen reader, its close buttons, and close all
     await m.unmount();
   });
 
-  it('each × names the tab it closes', async () => {
+  it('each Close names the tab it closes', async () => {
     const m = await twoTabs(OTHER);
     await m.newTab();
     await m.press('browser-tabs');
@@ -773,7 +773,7 @@ describe('a lost render process (Android: one renderer for every tab)', () => {
     await act(async () => { w2.props.onRenderProcessGone({ nativeEvent: { didCrash: false } }); });
     // Only the tab in front has a WebView again, on the page it showed, joining the session (no wipe).
     expect(m.webs().map((w) => [w.props.source.uri, w.props.incognito])).toEqual([[`${OTHER}/two/level/9`, false]]);
-    const back = m.tree.root.find((n) => n.props.accessibilityLabel === 'browser_back' && n.props.onPress);
+    const back = m.tree.root.findAll((n) => n.props.label === 'browser_back' && n.props.onPress)[0];
     expect(back.props.disabled).toBe(true); // the new web view has no history yet
     await m.switchTo(0);
     expect(m.webs().map((w) => [w.props.source.uri, w.props.incognito]))
@@ -795,11 +795,17 @@ describe('a lost render process (Android: one renderer for every tab)', () => {
 
 describe('the toolbar', () => {
   const flat = (n) => StyleSheet.flatten(n.props.style) || {};
-  const toolbarOf = (m) => m.tree.root.findAll((n) => n.type === View && typeof n.props.onLayout === 'function'
-    && flat(n).flexDirection === 'row' && flat(n).paddingHorizontal === 4)[0];
   const tool = (m, label) => m.tree.root.findAll((n) => n.props.accessibilityLabel === label && typeof n.props.onPress === 'function')[0];
+  const action = (m, label) => m.tree.root.findAll((n) => n.props.label === label && typeof n.props.onPress === 'function')[0];
+  // What More offers now: the menu is opened, read and closed again.
+  const offered = (m, label) => {
+    act(() => { action(m, 'common_more').props.onPress(); });
+    const there = m.tree.root.findAll((n) => n.type === Text && n.props.children === label).length > 0;
+    act(() => { action(m, 'common_more').props.onPress(); });
+    return there;
+  };
 
-  it('follows the tab in front: address, back and forward, stop or reload, and the progress bar', async () => {
+  it('follows the tab in front: address, back, forward, stop or reload in More, and the progress bar', async () => {
     const m = await twoTabs(OTHER);
     const [w1, w2] = m.webs();
     await m.nav(w1, `${SITE}/one`, { canGoBack: true, canGoForward: false, loading: false });
@@ -811,10 +817,10 @@ describe('the toolbar', () => {
     const hostShown = () => ['dapp.example', 'game.example'].filter((h) => tool(m, h));
     const shown = () => ({
       host: hostShown(),
-      back: tool(m, 'browser_back').props.disabled,
-      forward: tool(m, 'browser_forward').props.disabled,
-      stop: !!tool(m, 'browser_stop'),
-      reload: !!tool(m, 'browser_reload'),
+      back: action(m, 'browser_back').props.disabled,
+      forward: !offered(m, 'browser_forward'),
+      stop: offered(m, 'browser_stop'),
+      reload: offered(m, 'browser_reload'),
       bar: bar(),
     });
     const second = { host: ['game.example'], back: true, forward: false, stop: true, reload: false, bar: ['40%'] };
@@ -842,28 +848,33 @@ describe('the toolbar', () => {
     await m.unmount();
   });
 
-  it('on a 320 dp phone Forward moves into the menu, so the address keeps the room it had before the tabs button', async () => {
+  it('is the same at every width: Back, the address, the tab count and More, in words; Forward is in More', async () => {
     const m = await twoTabs(OTHER);
     await m.nav(m.webs()[1], `${OTHER}/two`, { canGoForward: true });
-    // One per tool (a touchable's inner view carries its label too).
-    const tools = () => new Set(toolbarOf(m).findAll((n) => typeof n.props.onPress === 'function' && flat(n).width === 36)
-      .map((n) => n.props.accessibilityLabel)).size;
-    expect([tools(), !!tool(m, 'browser_forward')]).toEqual([5, true]);
-    await act(async () => { toolbarOf(m).props.onLayout({ nativeEvent: { layout: { width: 320, height: 48 } } }); });
-    expect([tools(), !!tool(m, 'browser_forward')]).toEqual([4, false]);
-    // The room left for the address text at 320 dp: the toolbar's padding, the 36 dp tools, the address box's margins,
-    // the pill's padding and the lock with its gap. About 121 dp, as before the tabs button (85 dp with five tools).
-    const bar = flat(toolbarOf(m));
-    const box = flat(m.tree.root.findAll((n) => n.type === View && flat(n).flex === 1 && flat(n).minWidth === 0 && flat(n).marginHorizontal === 2)[0]);
-    const pill = flat(tool(m, 'game.example'));
-    const room = (n) => 320 - 2 * bar.paddingHorizontal - n * 36 - 2 * box.marginHorizontal - 2 * pill.paddingHorizontal - 13 - pill.gap;
-    expect([room(tools()), room(5)]).toEqual([121, 85]);
-    // Forward is in the menu while there is a page to go forward to.
+    const Svg = require('react-native-svg').default;
+    const chrome = m.tree.root.findAll((n) => n.props.testID === 'browser-chrome' && n.type === View)[0];
+    // Nothing measures the bar to drop a button, and nothing in it is drawn: the words and the tab count say it all.
+    expect(chrome.findAll((n) => n.type === View && typeof n.props.onLayout === 'function')).toHaveLength(0);
+    expect(chrome.findAllByType(Svg)).toHaveLength(0);
+    expect(['browser_back', 'common_more'].map((label) => !!action(m, label))).toEqual([true, true]);
+    expect(!!m.pressable('browser-tabs')).toBe(true);
+    expect(['browser_forward', 'browser_reload', 'browser_stop'].map((label) => !!tool(m, label) || !!action(m, label)))
+      .toEqual([false, false, false]);
+    // No lock before the address: every page this browser opens is https.
+    expect(m.tree.root.findAll((n) => n.type && n.type.name === 'LockGlyph')).toHaveLength(0);
+    // More, on a page that has finished loading: its items in order, the one that cannot be undone in Ember.
+    const named = () => m.tree.root.findAll((n) => n.type === Text && typeof n.props.children === 'string' && /^browser_/.test(n.props.children));
+    const before = new Set(named());
+    act(() => { action(m, 'common_more').props.onPress(); });
+    const items = named().filter((n) => !before.has(n));
+    expect(items.map((n) => n.props.children)).toEqual(
+      ['browser_share', 'browser_copy', 'browser_forward', 'browser_reload', 'browser_new_tab', 'browser_home', 'browser_clear']);
+    const { color } = require('../src/theme');
+    expect(flat(items[items.length - 1]).color).toBe(color.ember);
+    act(() => { action(m, 'common_more').props.onPress(); });
+    // Forward is in More while there is a page to go forward to.
     await m.menuItem('browser_forward');
     expect(m.calls(m.webs()[1]).filter(([k]) => k === 'goForward')).toHaveLength(1);
-    // A wider toolbar has the button again.
-    await act(async () => { toolbarOf(m).props.onLayout({ nativeEvent: { layout: { width: 411, height: 48 } } }); });
-    expect([tools(), !!tool(m, 'browser_forward')]).toEqual([5, true]);
     await m.unmount();
   });
 });

@@ -11,8 +11,16 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const {
   LINK, parseLink, decodeB64url, encodeB64url, contributoryKey, sealAnswer, openAnswer, sessionKey, checkNumber,
   groupCheckNumber, requestText, reqHashOf, walletHashOf, buildPlaintext, plaintextProblem, openSession, deliverAnswer,
-  markHandled, wasHandled, LinkRefusal, prepareOffer, performIntent,
+  markHandled, wasHandled, LinkRefusal, prepareOffer, performIntent, readOffer,
 } = require('../src/services/QNetLink');
+const { FIRST_CONTACT_MS } = require('../src/config/nodes');
+// A clock that only the waits move: `sleep` advances it, and `waits` records each wait.
+const fakeClock = () => {
+  const c = { t: 1_000_000, waits: [] };
+  c.now = () => c.t;
+  c.sleep = async (ms) => { c.waits.push(ms); c.t += ms; };
+  return c;
+};
 const { superNodeId } = require('../src/crypto/NodePreimages');
 
 const ROOT = path.join(__dirname, '..');
@@ -287,10 +295,73 @@ describe('the relay session', () => {
       [() => reply(200, viewFor(c), 'https://evil.example/api/link/sessions/x'), 'network'],
     ]) {
       relay = make;
-      const e = await openSession(linkOf(c)).catch((x) => x);
+      const clock = fakeClock();
+      const e = await openSession(linkOf(c), clock).catch((x) => x);
       expect(e).toBeInstanceOf(LinkRefusal);
       expect(e.reason).toBe(reason);
     }
+  });
+
+  it('waits out a slow or failing network, then opens the session: the first failure is never the answer', async () => {
+    const c = byName('claim-light-ok');
+    const failures = [
+      () => Promise.reject(new TypeError('Network request failed')), () => reply(503, ''), () => reply(429, ''),
+      () => Promise.reject(new Error('Aborted')),
+    ];
+    let n = 0;
+    relay = () => (n < failures.length ? failures[n++]() : reply(200, viewFor(c)));
+    calls.length = 0;
+    const clock = fakeClock();
+    const s = await openSession(linkOf(c), clock);
+    expect(s.request).toEqual(c.request);
+    expect(calls).toHaveLength(5);
+    expect(clock.waits).toEqual([1000, 2000, 4000, 5000]);
+    // Each try has the time a slow network's first contact takes.
+    expect(LINK.RELAY_TIMEOUT_MS).toBe(FIRST_CONTACT_MS);
+    expect(FIRST_CONTACT_MS).toBeGreaterThanOrEqual(20000);
+  });
+
+  it('says the network failed only once the session could no longer be opened, and stops when the screen went', async () => {
+    const c = byName('claim-light-ok');
+    relay = () => Promise.reject(new TypeError('Network request failed'));
+    const clock = fakeClock();
+    const start = clock.t;
+    await expect(openSession(linkOf(c), clock)).rejects.toMatchObject({ reason: 'network' });
+    const waited = clock.t - start;
+    expect(waited).toBeLessThanOrEqual((LINK.SESSION_TTL_S - LINK.MIN_REMAINING_S) * 1000);
+    expect(waited).toBeGreaterThan((LINK.SESSION_TTL_S - LINK.MIN_REMAINING_S) * 1000 - 5000);
+    calls.length = 0;
+    await expect(openSession(linkOf(c), { ...fakeClock(), cancelled: () => true })).rejects.toMatchObject({ reason: 'network' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('reads the offer again while the network has not answered it, within the time left to confirm', async () => {
+    const OFFER = { kind: 'reserve', qnet: W.address, nodeId: 'n', burner: 'b' };
+    const NET = { kind: 'unavailable', error: 'NETWORK' };
+    let clock = fakeClock();
+    const session = { expiresAt: clock.t + 200000 };
+    const prepare = jest.fn().mockResolvedValueOnce(NET).mockResolvedValueOnce(NET).mockResolvedValue(OFFER);
+    expect(await readOffer(prepare, session, clock)).toEqual(OFFER);
+    expect(clock.waits).toEqual([1000, 2000]);
+    // A refusal is the answer at once; a read that throws is INTERNAL.
+    for (const [p, out] of [
+      [async () => ({ kind: 'unavailable', error: 'NODE_OTHER' }), { kind: 'unavailable', error: 'NODE_OTHER' }],
+      [async () => { throw new Error('x'); }, { kind: 'unavailable', error: 'INTERNAL' }],
+    ]) {
+      clock = fakeClock();
+      expect(await readOffer(p, { expiresAt: clock.t + 200000 }, clock)).toEqual(out);
+      expect(clock.waits).toEqual([]);
+    }
+    // A network that never answers: NETWORK, with MIN_REMAINING_S of the session still left.
+    clock = fakeClock();
+    const end = clock.t + 200000;
+    expect(await readOffer(async () => NET, { expiresAt: end }, clock)).toEqual(NET);
+    expect(clock.t).toBeLessThanOrEqual(end - LINK.MIN_REMAINING_S * 1000);
+    expect(clock.t).toBeGreaterThan(end - LINK.MIN_REMAINING_S * 1000 - 5000);
+    // The screen went: no further read.
+    const once = jest.fn(async () => NET);
+    await readOffer(once, { expiresAt: Date.now() + 200000 }, { ...fakeClock(), cancelled: () => true });
+    expect(once).toHaveBeenCalledTimes(1);
   });
 
   it('a session this device already decided on is refused without asking the relay; the id itself is not stored', async () => {
@@ -527,7 +598,7 @@ describe('what each intent offers before anything is signed', () => {
     const { nodeLinkActions } = require('../src/services/NodeLinkActions');
     const wm = { confirmServerNode: jest.fn(async () => true) };
     expect(await nodeLinkActions({ walletManager: wm, credential: 'c' }).otherNode(W.address)).toBe(true);
-    expect(wm.confirmServerNode).toHaveBeenCalledWith(W.address, { nodeType: 'super' });
+    expect(wm.confirmServerNode).toHaveBeenCalledWith(W.address, { nodeType: 'super', timeoutMs: FIRST_CONTACT_MS });
     wm.confirmServerNode = jest.fn(async () => { throw new Error('down'); });
     expect(await nodeLinkActions({ walletManager: wm, credential: 'c' }).otherNode(W.address)).toBe(null);
   });
@@ -570,7 +641,21 @@ describe('what each intent offers before anything is signed', () => {
       expect(await actions.record(W.address)).toBe(null);
       global.fetch = jest.fn(async () => { throw new TypeError('Network request failed'); });
       expect(await actions.record(W.address)).toBe(null);
+      // A slow first contact is waited for, up to FIRST_CONTACT_MS, before the read counts as failed.
+      jest.useFakeTimers();
+      let signal = null;
+      global.fetch = jest.fn((url, init) => new Promise((resolve, reject) => {
+        signal = init.signal;
+        init.signal.addEventListener('abort', () => reject(new Error('Aborted')));
+      }));
+      const pending = actions.record(W.address);
+      jest.advanceTimersByTime(15000);
+      expect(signal.aborted).toBe(false);
+      jest.advanceTimersByTime(FIRST_CONTACT_MS - 15000);
+      expect(signal.aborted).toBe(true);
+      expect(await pending).toBe(null);
     } finally {
+      jest.useRealTimers();
       global.fetch = saved;
     }
   });

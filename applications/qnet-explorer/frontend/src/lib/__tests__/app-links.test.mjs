@@ -38,13 +38,19 @@ test('an unknown Play signing certificate is left out, never guessed', () => {
   }
 });
 
-test('apple-app-site-association: no app until the Team ID is set, then only the /l path', () => {
+test('apple-app-site-association: no app until the Team ID is set, then only the /l and /send paths', () => {
   if (IOS_TEAM_ID === null) assert.deepEqual(appleAppSiteAssociation(), { applinks: { details: [] } });
+  // One app for both: QNet Link requests and the payment address's transfer links (qnet-link-v1.md sections 4 and 15).
   assert.deepEqual(appleAppSiteAssociation('ABCDE12345', IOS_BUNDLE_ID), {
     applinks: {
-      details: [{ appIDs: [`ABCDE12345.${IOS_BUNDLE_ID}`], components: [{ '/': '/l', comment: 'QNet Link v1 requests' }] }],
+      details: [{
+        appIDs: [`ABCDE12345.${IOS_BUNDLE_ID}`],
+        components: [{ '/': '/l', comment: 'QNet Link v1 requests' }, { '/': '/send', comment: 'QNet Wallet transfer links' }],
+      }],
     },
   });
+  // The Digital Asset Links statement names no path: the app's own verified filter lists them (app-identity.test.mjs).
+  for (const statement of assetLinks()) assert.deepEqual(Object.keys(statement).sort(), ['relation', 'target']);
   for (const bad of ['abcde12345', 'ABCDE1234', 'ABCDE123456', 'ABCDE-2345', '']) {
     assert.deepEqual(appleAppSiteAssociation(bad), { applinks: { details: [] } }, bad);
   }

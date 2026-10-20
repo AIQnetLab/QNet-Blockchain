@@ -8,13 +8,15 @@
  * screen untouched for a moment, and only a press that began after that counts (utils/useArmedConfirm).
  */
 import React from 'react';
-import { View, Text, TouchableOpacity, ScrollView, StyleSheet } from 'react-native';
+import { View, Text, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
 import { SEND_ARM_MS } from '../browser/dappProvider';
 import { looksLikeKnownAddress } from '../browser/DappSheet';
 import { groupAddress } from '../utils/addressDisplay';
 import { InfoField, InfoRow } from './InfoRow';
+import { ActionPair } from './ui/Action';
+import { color, layer, radius, size, space, themed } from '../theme';
 
 /**
  * The recipient warnings for `to` (lowercase EON), from the sealed list of addresses this wallet signed transfers to
@@ -58,57 +60,36 @@ export default function SendReview({ review, t, onCancel, onConfirm }) {
           {w.incomingOnly ? <Text style={s.alert}>{t('dapp_send_incoming_only')}</Text> : null}
           {w.firstTime ? <Text style={s.warning}>{t('dapp_send_first_time')}</Text> : null}
           <Text style={s.hint}>{t('send_review_check')}</Text>
-          <View style={s.actions}>
-            <TouchableOpacity style={[s.button, s.secondary]} onPress={onCancel} accessibilityRole="button">
-              <Text style={[s.buttonText, s.secondaryText]}>{t('cancel')}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[s.button, s.primary, !armed && s.disabled]}
-              onPress={confirm}
-              onPressIn={onPressIn}
-              disabled={!armed}
-              accessibilityRole="button"
-              accessibilityState={{ disabled: !armed }}
-              testID="send-review-confirm"
-            >
-              <Text style={s.buttonText}>{t('common_confirm')}</Text>
-            </TouchableOpacity>
-          </View>
+          <ActionPair
+            style={s.actions}
+            start={{ label: t('cancel'), onPress: onCancel }}
+            end={{ label: t('common_confirm'), onPress: confirm, onPressIn, disabled: !armed, testID: 'send-review-confirm' }}
+          />
         </View>
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-const s = StyleSheet.create({
+const s = themed((type) => ({
   // Ranked like the request sheets: over every screen, under the password prompt and the alerts (MBL-04).
   overlay: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(8, 10, 20, 0.97)', zIndex: 9000, elevation: 20,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: color.ink, ...layer.request,
   },
-  scroll: { flexGrow: 1, justifyContent: 'center', padding: 16 },
-  card: {
-    width: '100%', maxWidth: 520, alignSelf: 'center', backgroundColor: '#1a1a2e', borderRadius: 16, padding: 16,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
-  },
-  title: { color: '#00d4ff', fontSize: 18, fontWeight: '700', textAlign: 'center', marginBottom: 12 },
-  // The whole recipient over the rows, under its label (components/InfoRow), left to right in groups.
+  scroll: { flexGrow: 1, padding: space.gut },
+  card: { width: '100%', maxWidth: size.request, alignSelf: 'center' },
+  title: { ...type('title'), color: color.paper, marginBottom: space.s16 },
+  // The whole recipient over the rows, under its label (components/InfoRow), left to right in groups: the one box, as
+  // it is the thing being checked.
   recipient: {
-    color: '#ffffff', fontSize: 16, lineHeight: 24, fontFamily: 'monospace', writingDirection: 'ltr', textAlign: 'left',
-    backgroundColor: '#11131f', borderRadius: 8, padding: 10, marginTop: 6,
+    ...type('address'), color: color.paper, writingDirection: 'ltr',
+    backgroundColor: color.fillField, borderWidth: 1, borderColor: color.edge, borderRadius: radius.box, padding: space.s12,
+    marginTop: space.s8,
   },
-  hint: { color: '#888888', fontSize: 12, lineHeight: 17, marginTop: 6, marginBottom: 4 },
-  warning: { color: '#ffaa00', fontSize: 13, lineHeight: 19, marginTop: 6, marginBottom: 6 },
-  alert: { color: '#ff5555', fontSize: 13, lineHeight: 19, fontWeight: '600', marginTop: 6, marginBottom: 6 },
-  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
-  button: {
-    flexGrow: 1, flexBasis: 128, minHeight: 44, borderRadius: 10, paddingVertical: 11, paddingHorizontal: 16,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  primary: { backgroundColor: '#00d4ff' },
-  secondary: { backgroundColor: 'rgba(0, 212, 255, 0.1)', borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)' },
-  disabled: { opacity: 0.5 },
-  buttonText: { color: '#1a1a2e', fontSize: 15, fontWeight: '600', textAlign: 'center' },
-  secondaryText: { color: '#00d4ff' },
-});
+  hint: { ...type('note'), color: color.fog, marginTop: space.s8, marginBottom: space.s4 },
+  warning: { ...type('note'), color: color.ember, marginTop: space.s8, marginBottom: space.s8 },
+  alert: { ...type('body'), color: color.ember, marginTop: space.s8, marginBottom: space.s8 },
+  actions: { marginTop: space.s16 },
+}));
 
 export const sendReviewStyles = s;

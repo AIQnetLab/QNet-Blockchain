@@ -3,7 +3,8 @@
 // request performs nothing; and the one thing a request can do is share this wallet's two addresses.
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 jest.mock('../src/services/QNetLink', () => {
   const actual = jest.requireActual('../src/services/QNetLink');
@@ -27,8 +28,7 @@ const OFFER = { kind: 'connect', addresses: ADDRESSES };
 const OK = { status: 'ok', ...ADDRESSES };
 
 const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-const buttons = (tree) => tree.root.findAllByType(TouchableOpacity)
-  .map((b) => ({ label: b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join(''), props: b.props }));
+const buttons = (tree) => tree.root.findAllByType(Action).map((b) => ({ label: b.props.label, props: b.props }));
 const button = (tree, label) => buttons(tree).find((b) => b.label === label);
 const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
 // A real press: the finger goes down (onPressIn), then the press ends (onPress). Only a press that began after the
@@ -63,7 +63,7 @@ describe('a connect request', () => {
       ADDRESSES.qnet, ADDRESSES.solana]) {
       expect(shown).toContain(s);
     }
-    expect(QNetLink.openSession).toHaveBeenCalledWith(CONNECT);
+    expect(QNetLink.openSession).toHaveBeenCalledWith(CONNECT, { cancelled: expect.any(Function) });
     expect(QNetLink.prepareOffer).toHaveBeenCalledWith(CONNECT, { wallet: props.wallet, session: expect.any(Object), node: null });
     expect(QNetLink.deliverAnswer).not.toHaveBeenCalled();
     await act(async () => { tree.unmount(); });
@@ -178,6 +178,43 @@ describe('a connect request', () => {
     expect(QNetLink.deliverAnswer).toHaveBeenCalledWith(CONNECT, expect.any(Object), { status: 'error', error: 'INTERNAL' });
     expect(QNetLink.performIntent).not.toHaveBeenCalled();
     expect(props.onClose).toHaveBeenCalled();
+    await act(async () => { tree.unmount(); });
+  });
+});
+
+describe('a slow network', () => {
+  it('keeps the request loading, with no error, while the session is still being fetched; Close leaves it', async () => {
+    let open;
+    QNetLink.openSession.mockImplementation(() => new Promise((r) => { open = r; }));
+    const tree = await mount(CONNECT);
+    expect(texts(tree)).toContain(t('link_loading'));
+    expect(texts(tree)).not.toContain(t('link_refused_title'));
+    expect(buttons(tree).map((b) => b.label)).toEqual(['Close']);
+    await act(async () => { open({ expiresAt: Date.now() + 500000 }); });
+    await wait(0);
+    expect(texts(tree)).toContain(ADDRESSES.qnet);
+    await act(async () => { tree.unmount(); });
+    // Closing while it loads ends the wait: the screen's tries stop.
+    QNetLink.openSession.mockImplementation(() => new Promise(() => {}));
+    const slow = await mount(CONNECT);
+    await act(async () => { await button(slow, 'Close').props.onPress(); });
+    expect(props.onClose).toHaveBeenCalled();
+    const { cancelled } = QNetLink.openSession.mock.calls[QNetLink.openSession.mock.calls.length - 1][1];
+    expect(cancelled()).toBe(false);
+    await act(async () => { slow.unmount(); });
+    expect(cancelled()).toBe(true);
+  });
+
+  it('an offer the network has not answered yet is read again, still loading, and the request comes up', async () => {
+    QNetLink.prepareOffer.mockReset();
+    QNetLink.prepareOffer.mockResolvedValueOnce({ kind: 'unavailable', error: 'NETWORK' }).mockResolvedValue(OFFER);
+    const tree = await mount(CONNECT);
+    expect(texts(tree)).toContain(t('link_loading'));
+    expect(texts(tree)).not.toContain(t('link_unavailable_title'));
+    await wait(1100);
+    expect(QNetLink.prepareOffer).toHaveBeenCalledTimes(2);
+    expect(texts(tree)).toContain(ADDRESSES.qnet);
+    expect(texts(tree)).not.toContain(t('link_unavailable_title'));
     await act(async () => { tree.unmount(); });
   });
 });
@@ -357,7 +394,7 @@ describe('the link and claim sheets', () => {
     QNetLink.performIntent.mockResolvedValue({ status: 'ok', qnet: ADDRESSES.qnet, nodeId: NODE_ID, consent: {}, bound: true, here: true });
     const onOpenNode = jest.fn();
     const tree = await mount(LINK_L, { onOpenNode });
-    expect(texts(tree)).toContain(t('link_switch_other', { wallet: 'd9fa370374…73823e' }));
+    expect(texts(tree)).toContain(t('link_switch_other', { wallet: 'd9fa37…73823e' }));
     await wait(ARMED);
     await act(async () => { await press(button(tree, 'Confirm')); });
     expect(texts(tree)).toContain(t('node_linking'));

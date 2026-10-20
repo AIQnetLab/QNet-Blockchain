@@ -6,15 +6,19 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  aliasProvider,
+  detectProvider,
   loadView,
   readAccounts,
   requestAccounts,
   revokeAccess,
   saveView,
-  watchProviders,
+  sendSolanaTransfer,
+  supportsSolanaTransfer,
   type AddressView,
+  type ProviderStatus,
   type QNetProvider,
+  type SolanaTransfer,
+  type SolanaTransferResult,
   type WalletAccounts,
   type WalletChannel,
 } from '@/lib/qnet-provider';
@@ -23,12 +27,6 @@ import {
   type ExtensionUnlink, type NodeType,
 } from '@/lib/qnet-link';
 import { showsActivationContent } from '@/lib/activate-view';
-
-// How long the page waits for the wallet's announcement before offering the install link. A later
-// announcement still binds.
-const DETECT_MS = 1_000;
-
-export type ProviderStatus = 'detecting' | 'available' | 'missing';
 
 interface WalletContextValue {
   providerStatus: ProviderStatus;
@@ -54,6 +52,10 @@ interface WalletContextValue {
   readActivation: () => Promise<ExtensionActivationRead>;
   // qnet_unlinkNodeDevice: the extension unlinks its own wallet's light node from its device; checked for `wallet`.
   unlinkNodeDevice: (wallet: string) => Promise<ExtensionUnlink>;
+  // qnet_sendSolanaTransfer: whether the bound extension takes it (asked without a window), and the transfer, which the
+  // user confirms in the extension's window.
+  takesSolanaTransfer: () => Promise<boolean>;
+  sendSolanaTransfer: (transfer: SolanaTransfer) => Promise<SolanaTransferResult>;
 }
 
 const WalletContext = createContext<WalletContextValue | undefined>(undefined);
@@ -81,25 +83,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     setViewState(loadView(localStore()));
-    let bound = false;
-    const bind = (p: QNetProvider, channel: WalletChannel) => {
-      if (bound) return;
-      bound = true;
-      setProvider(p);
-      setProviderChannel(channel);
-      setProviderStatus('available');
-    };
-    const stop = watchProviders(window, bind);
-    const timer = window.setTimeout(() => {
-      if (bound) return;
-      const alias = aliasProvider(window);
-      if (alias) bind(alias, 'extension');
-      else setProviderStatus('missing');
-    }, DETECT_MS);
-    return () => {
-      stop();
-      window.clearTimeout(timer);
-    };
+    return detectProvider(
+      window,
+      (p: QNetProvider, channel: WalletChannel) => {
+        setProvider(p);
+        setProviderChannel(channel);
+        setProviderStatus('available');
+      },
+      () => setProviderStatus('missing'),
+    );
   }, []);
 
   useEffect(() => {
@@ -198,13 +190,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [provider],
   );
 
+  const takesSolanaTransfer = useCallback(
+    async (): Promise<boolean> => (provider && providerChannel === 'extension' ? supportsSolanaTransfer(provider) : false),
+    [provider, providerChannel],
+  );
+
+  const sendTransfer = useCallback(
+    async (transfer: SolanaTransfer): Promise<SolanaTransferResult> =>
+      provider ? sendSolanaTransfer(provider, transfer) : { ok: false, failure: 'unsupported' },
+    [provider],
+  );
+
   const value = useMemo<WalletContextValue>(
     () => ({
       providerStatus, providerChannel, accounts, accountsKnown, view, connecting, error, connect, disconnect, setView, clearError, activateNode,
-      claimNodeBalance, readActivation, unlinkNodeDevice,
+      claimNodeBalance, readActivation, unlinkNodeDevice, takesSolanaTransfer, sendSolanaTransfer: sendTransfer,
     }),
     [providerStatus, providerChannel, accounts, accountsKnown, view, connecting, error, connect, disconnect, setView, clearError, activateNode,
-      claimNodeBalance, readActivation, unlinkNodeDevice],
+      claimNodeBalance, readActivation, unlinkNodeDevice, takesSolanaTransfer, sendTransfer],
   );
 
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;

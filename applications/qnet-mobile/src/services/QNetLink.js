@@ -21,6 +21,7 @@ import { bytesToHex, hexToBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 import { isSolanaAddress, isSolanaSignature } from '../utils/solanaFormat';
 import { eonFromPublicKeyBytes } from '../crypto/WalletIdentity';
 import { lightNodeId, ownNodeType } from '../crypto/NodePreimages';
+import { FIRST_CONTACT_MS } from '../config/nodes';
 
 const CAPS = Object.freeze({
   connect: Object.freeze({ plaintext: 1024, ct: 1040 }),
@@ -53,7 +54,7 @@ export const LINK = Object.freeze({
   MIN_REMAINING_S: 30,
   CAPS,
   CT_MIN_BYTES: 17,
-  RELAY_TIMEOUT_MS: 10000,
+  RELAY_TIMEOUT_MS: FIRST_CONTACT_MS,
   // Every u64 of an answer is a decimal string; the smallest move is 1 QNC.
   CLAIM_MIN_NANO: 1000000000,
   // A consent is admitted this long after it was signed (qnet-link-v1 section 14.2).
@@ -431,6 +432,30 @@ export class LinkRefusal extends Error {
   }
 }
 
+const pause = (ms) => new Promise((r) => { setTimeout(r, ms); });
+
+// Runs `attempt` again, with the wait doubling up to `maxWait`, while its result is `transient` and the next try still
+// starts before `deadline`; stops early once `cancelled()`. The last result.
+async function retryWhile(attempt, transient, { deadline, now, sleep, wait, maxWait, cancelled = () => false }) {
+  for (;;) {
+    const result = await attempt();
+    if (!transient(result) || cancelled() || now() + wait >= deadline) return result;
+    await sleep(wait);
+    wait = Math.min(wait * 2, maxWait);
+  }
+}
+
+// A relay request through a network failure, a busy relay (429) or a relay error (5xx): the relay's first other
+// answer, or null when none came before `deadline`.
+async function relayRetry(path, options, timing) {
+  const reply = await retryWhile(
+    () => relayRequest(path, options).catch(() => null),
+    (r) => !r || r.status === 429 || r.status >= 500,
+    timing,
+  );
+  return reply && reply.status !== 429 && reply.status < 500 ? reply : null;
+}
+
 async function relayRequest(path, { method = 'GET', body = null } = {}) {
   const url = `${LINK.RELAY}${path}`;
   const ctl = new AbortController();
@@ -503,16 +528,16 @@ export async function markHandled(id, now = Date.now()) {
 
 /**
  * The relay's session for a parsed link, checked against it: { expiresAt, request } (`request` null for `connect`).
- * Throws LinkRefusal. A session this device already decided on is refused before anything is fetched.
+ * Throws LinkRefusal. A session this device already decided on is refused before anything is fetched. A slow or
+ * failing network is waited out for as long as the session could still be opened; only the relay's answer refuses it.
+ * `cancelled()`: the screen went, so no further try is made.
  */
-export async function openSession(link, { now = Date.now } = {}) {
+export async function openSession(link, { now = Date.now, sleep = pause, cancelled = () => false } = {}) {
   if (await wasHandled(link.id, now())) throw new LinkRefusal('handled');
-  let reply;
-  try {
-    reply = await relayRequest(`/api/link/sessions/${link.id}`);
-  } catch (_) {
-    throw new LinkRefusal('network');
-  }
+  const reply = await relayRetry(`/api/link/sessions/${link.id}`, {}, {
+    deadline: now() + (LINK.SESSION_TTL_S - LINK.MIN_REMAINING_S) * 1000, now, sleep, wait: 1000, maxWait: 5000, cancelled,
+  });
+  if (!reply) throw new LinkRefusal('network');
   if (reply.status === 404) throw new LinkRefusal('not_found');
   if (reply.status !== 200) throw new LinkRefusal('network');
   let body = null;
@@ -529,9 +554,7 @@ export async function openSession(link, { now = Date.now } = {}) {
  * not build goes out as INTERNAL. `onCheck(number)` hears the check number once the relay took an answer that names
  * this wallet, when the request asked for it (`check: true`).
  */
-export async function deliverAnswer(link, session, answer, {
-  now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), onCheck = null,
-} = {}) {
+export async function deliverAnswer(link, session, answer, { now = Date.now, sleep = pause, onCheck = null } = {}) {
   const view = { intent: link.intent, request: (session && session.request) || null };
   let plaintext;
   try {
@@ -542,23 +565,17 @@ export async function deliverAnswer(link, session, answer, {
   const sealed = seal({ id: link.id, intent: link.intent, reqHash: link.reqHash || null, sitePub: link.sitePub, plaintext });
   const body = JSON.stringify(sealed.body);
   const named = JSON.parse(plaintext).qnet !== undefined;
-  let wait = 2000;
-  for (;;) {
-    let reply = null;
-    try { reply = await relayRequest(`/api/link/sessions/${link.id}/response`, { method: 'POST', body }); } catch (_) { reply = null; }
-    if (reply) {
-      if (reply.status === 201 || reply.status === 200) {
-        if (onCheck && named && view.request && view.request.check === true) onCheck(sealed.check);
-        return 'delivered';
-      }
-      if (reply.status === 409) return 'conflict';
-      if (reply.status === 404) return 'expired';
-      if (reply.status !== 429 && reply.status < 500) return 'failed';
-    }
-    if (now() + wait >= session.expiresAt) return 'failed';
-    await sleep(wait);
-    wait = Math.min(wait * 2, 30000);
+  const reply = await relayRetry(`/api/link/sessions/${link.id}/response`, { method: 'POST', body }, {
+    deadline: session.expiresAt, now, sleep, wait: 2000, maxWait: 30000,
+  });
+  if (!reply) return 'failed';
+  if (reply.status === 201 || reply.status === 200) {
+    if (onCheck && named && view.request && view.request.check === true) onCheck(sealed.check);
+    return 'delivered';
   }
+  if (reply.status === 409) return 'conflict';
+  if (reply.status === 404) return 'expired';
+  return 'failed';
 }
 
 // ---------------------------------------------------------------- the intents (section 14.8)
@@ -694,6 +711,20 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
   return {
     kind: 'link', mode: 'consent', nodeId, qnet, burnTx: request.burnTx, burner, device, features, switchFrom: capable ? switchFrom : null,
   };
+}
+
+/**
+ * An offer read (`prepare`: prepareOffer for the screen's request) taken again with backoff while the network has not
+ * answered it yet (unavailable NETWORK) and at least MIN_REMAINING_S of `session` would be left to confirm in; any other
+ * offer, or the last one, is the answer. `cancelled()`: the screen went, so no further read is made.
+ */
+export function readOffer(prepare, session, { now = Date.now, sleep = pause, cancelled = () => false } = {}) {
+  const deadline = session && Number.isFinite(session.expiresAt) ? session.expiresAt - LINK.MIN_REMAINING_S * 1000 : 0;
+  return retryWhile(
+    () => Promise.resolve().then(prepare).catch(() => unavailable('INTERNAL')),
+    (o) => !!o && o.kind === 'unavailable' && o.error === 'NETWORK',
+    { deadline, now, sleep, wait: 1000, maxWait: 5000, cancelled },
+  );
 }
 
 // The `claim` offer for the node the request names (`nodeId`): this wallet's light node, whose public status two of its

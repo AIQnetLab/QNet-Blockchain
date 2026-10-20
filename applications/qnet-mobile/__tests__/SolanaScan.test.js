@@ -238,26 +238,43 @@ describe('whole addresses fit one line', () => {
       .toMatchObject({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.5, maxFontSizeMultiplier: 1.2 });
     act(() => field.unmount());
     const screen = fs.readFileSync(path.join(ROOT, 'src/screens/WalletScreen.js'), 'utf8');
-    const card = screen.slice(screen.indexOf('testID="address-card"'), screen.indexOf('{cardAddress}', screen.indexOf('testID="address-card"')));
-    expect(card).toMatch(/numberOfLines=\{1\}\s*adjustsFontSizeToFit\s*minimumFontScale=\{0\.5\}\s*maxFontSizeMultiplier=\{1\.2\}/);
-    const receive = screen.slice(screen.indexOf('testID="receive-address"'), screen.indexOf('{currentReceiveAddress}', screen.indexOf('testID="receive-address"')));
-    expect(receive).toMatch(/numberOfLines=\{1\} adjustsFontSizeToFit minimumFontScale=\{0\.5\} maxFontSizeMultiplier=\{1\.2\}/);
+    // The Assets card and Receive show the address as their subject (SubjectAddress): whole, on two lines, each one
+    // line whose font shrinks to half at most, a larger text size counted up to 1.2 times.
+    // Assets: the whole address on one line in its rounded element, its copy mark beside it, the font shrinking to fit,
+    // never cut (owner 20.10).
+    const card = screen.slice(screen.indexOf('testID="address-card"'), screen.indexOf('testID="address-card"') + 220);
+    expect(card).toMatch(/<Text style=\{\[styles\.addressPillText, copied && styles\.addressPillCopied\]\} \{\.\.\.ADDRESS_LINE\}>/);
+    expect(card).not.toMatch(/ellipsizeMode/);
+    expect(screen).toMatch(/const ADDRESS_LINE = \{ \.\.\.SUBJECT_LINE, minimumFontScale: 0\.45 \};/);
+    const receive = screen.slice(screen.indexOf('testID="receive-address"'), screen.indexOf('testID="receive-address"') + 120);
+    expect(receive).toMatch(/<SubjectAddress address=\{currentReceiveAddress\} \/>/);
+    expect(screen).toMatch(/const SUBJECT_LINE = \{ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0\.5, maxFontSizeMultiplier: 1\.2 \};/);
     expect(screen).not.toMatch(/numberOfLines=\{2\}\s*adjustsFontSizeToFit\s*minimumFontScale=\{0\.6\}/);
-    // The Receive address on a 320 dp screen: the tab's padding and the address box's padding; the Assets card: the
-    // tab's padding, the card's side padding and border; a site's sheet: the scroll's and the card's padding and border.
+    // Each line on a 320 dp screen, inside the tab's padding; a site's sheet: the scroll's and the card's padding and
+    // border.
     const styles = require('../src/screens/WalletScreen.styles').default;
-    const st = flat(styles.addressText);
-    const receiveInner = 320 - 2 * flat(styles.content).padding - 2 * flat(styles.addressDisplay).padding;
-    const box = flat(styles.addressContainer);
-    const cardInner = 320 - 2 * flat(styles.content).padding - 2 * box.paddingHorizontal - 2 * box.borderWidth;
+    const st = flat(styles.subjectLine);
+    const inner = 320 - 2 * flat(styles.content).padding;
     const { sheetStyles } = require('../src/browser/DappSheet');
-    const sheetInner = 320 - 2 * flat(sheetStyles.scroll).padding - 2 * flat(sheetStyles.card).padding - 2 * flat(sheetStyles.card).borderWidth;
+    const sheetInner = 320 - 2 * flat(sheetStyles.scroll).padding - 2 * (flat(sheetStyles.card).padding || 0) - 2 * (flat(sheetStyles.card).borderWidth || 0);
     const SOL = associatedTokenAddress(ADDR, ONE_DEV_MINT).padEnd(44, 'W'); // the longest a Solana address can be
+    const { addressParts, groupAddress } = require('../src/utils/addressDisplay');
+    const [head, eon, tail, check] = addressParts(QNET);
+    const groups = groupAddress(SOL).split(' ');
+    const half = Math.ceil(groups.length / 2);
+    for (const line of [`${head} ${eon}`, `${tail} ${check}`, groups.slice(0, half).join(' '), groups.slice(half).join(' ')]) {
+      expect(width(line, st) * 0.5).toBeLessThanOrEqual(inner);
+      expect(widestFit(line, st)).toBeLessThanOrEqual(inner);
+    }
+    for (const text of [QNET, SOL]) expect(widestFit(text, flat(infoStyles.mono))).toBeLessThanOrEqual(sheetInner);
+    // The Assets card's one line on a 320 dp screen: the tab's padding, the element's padding and border, the gap and the
+    // copy mark (18 dp) around it, at the largest text size it follows and its smallest scale (0.45).
+    const pill = flat(styles.addressPill);
+    const pillInner = inner - 2 * pill.paddingHorizontal - 2 * pill.borderWidth - pill.columnGap - 18;
+    const pt = flat(styles.addressPillText);
     for (const text of [QNET, SOL]) {
-      expect(width(text, st) * 0.5).toBeLessThanOrEqual(receiveInner);
-      expect(widestFit(text, st)).toBeLessThanOrEqual(receiveInner);
-      expect(widestFit(text, st)).toBeLessThanOrEqual(cardInner);
-      expect(widestFit(text, flat(infoStyles.mono))).toBeLessThanOrEqual(sheetInner);
+      expect([...text].length * (MONO_EM * pt.fontSize * LARGEST_TEXT * 0.45 + (pt.letterSpacing || 0) * LARGEST_TEXT))
+        .toBeLessThanOrEqual(pillInner);
     }
     expect(associatedTokenAddress(ADDR, ONE_DEV_MINT).length).toBeLessThanOrEqual(44);
   });

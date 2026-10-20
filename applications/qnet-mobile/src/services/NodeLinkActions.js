@@ -16,6 +16,7 @@ import {
 import { checkDevice, isThisDevice } from './NodeDeviceKey';
 import { nodeView } from '../screens/NodeTab';
 import { readNodeRecordState } from './NodeRecordRead';
+import { FIRST_CONTACT_MS } from '../config/nodes';
 import { acceptedBalance, claimedNano } from './ClaimTransit';
 import { ownNodeType } from '../crypto/NodePreimages';
 
@@ -91,12 +92,12 @@ export function nodeLinkActions({
     serverNode,
     // Whether the network holds a super or genesis node for the wallet: true or false when two genesis nodes agree
     // (WalletManager.confirmServerNode), null when they do not.
-    otherNode: (qnet) => walletManager.confirmServerNode(qnet, { nodeType: 'super' }).catch(() => null),
+    otherNode: (qnet) => walletManager.confirmServerNode(qnet, { nodeType: 'super', timeoutMs: FIRST_CONTACT_MS }).catch(() => null),
     // aiqnet.io's record of the wallet's burn ({ state, nodeType }), null when it cannot be read (NodeRecordRead).
     record: (qnet) => readNodeRecordState(qnet).catch(() => null),
-    status: (nodeId) => readNodeStatus(nodeId),
+    status: (nodeId) => readNodeStatus(nodeId, { timeoutMs: FIRST_CONTACT_MS }),
     // Whether the chain lists the wallet's super node, as two genesis nodes say alike (true, false, or null).
-    serverListed: (nodeId) => readServerNodeListed(nodeId).catch(() => null),
+    serverListed: (nodeId) => readServerNodeListed(nodeId, { timeoutMs: FIRST_CONTACT_MS }).catch(() => null),
     // The status signed with this device's ping key, which tells whether the network names this device's binding.
     pingStatus: (nodeId) => readNodeStatus(nodeId, { signStatus: signStatusWithPingKey }),
     // Whether the Node tab offers Use this device for this device's binding `local` by that status (NodeTab nodeView,

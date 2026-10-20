@@ -1,8 +1,13 @@
-// The 1DEV token: an SPL token on Solana devnet, the cluster the QNet network verifies activation burns on
-// (BURN_CLUSTER in src/lib/qnet-link.ts). One source for the faucet and the node cabinet.
+// The 1DEV token: an SPL token with one mint per Solana cluster; the release uses the one of the cluster the QNet network
+// verifies activation burns on (BURN_CLUSTER in src/lib/qnet-link.ts). One source for the faucet and the node cabinet.
 import { BURN_CLUSTER } from './qnet-link.ts';
 
-export const ONE_DEV_MINT = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
+// The same literals as the browser extension's config.js and the node's network profiles.
+export const ONE_DEV_MINTS: Readonly<Record<'devnet' | 'mainnet', string>> = Object.freeze({
+  devnet: '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ',
+  mainnet: '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump',
+});
+export const ONE_DEV_MINT: string = ONE_DEV_MINTS[BURN_CLUSTER];
 export const ONE_DEV_DECIMALS = 6;
 export const ONE_DEV_UNIT = 10n ** BigInt(ONE_DEV_DECIMALS);
 export const SOL_DECIMALS = 9;

@@ -273,7 +273,7 @@ describe('the model the network names', () => {
       return tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
     };
     const here = render({ status: status(dev, { bindingSeqAgreed: SEQ }), local: { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: true } });
-    expect(here).toContain(t('node_badge_online'));
+    expect(here).toContain(t('node_status_online'));
     expect(here).not.toMatch(/Acme Phone 7|Android|Device/);
     // Bound to another device: not shown at all (owner, 11.10), so neither is its model.
     expect(render({ status: status(dev) })).not.toMatch(/Acme Phone 7|Android/);

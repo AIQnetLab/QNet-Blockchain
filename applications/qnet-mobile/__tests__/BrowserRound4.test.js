@@ -6,7 +6,8 @@
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const fs = require('fs');
 const path = require('path');
@@ -124,8 +125,7 @@ describe('MB-R1-01: a site\'s QNC transfer is refused when the balance is unread
 
   describe('the sheet', () => {
     const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string').join('')).join('\n');
-    const button = (tree, label) => tree.root.findAllByType(TouchableOpacity)
-      .find((b) => b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('') === label);
+    const button = (tree, label) => tree.root.findAllByType(Action).find((b) => b.props.label === label);
     const wait = (ms) => act(() => new Promise((r) => { setTimeout(r, ms); }));
     const mounted = [];
     afterEach(async () => { await act(async () => { while (mounted.length) mounted.pop().unmount(); }); });
@@ -238,7 +238,7 @@ describe('MB-R1-02: a wallet-only page refused natively on Android is said and o
         visible: true, wallet: null, credential: '', walletManager: {}, t: (k) => k, onSheet: () => {}, confirmAction: () => {},
       }));
     });
-    const bookmark = tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function');
+    const bookmark = tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function')[0];
     await act(async () => { bookmark.props.onPress(); });
     // The address bar (it shows the explorer's address from the moment it is opened).
     const bar = tree.root.findAll((n) => n.props && typeof n.props.onPress === 'function' && /^browser-address/.test(n.props.testID || ''))[0];

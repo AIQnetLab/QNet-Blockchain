@@ -645,7 +645,7 @@ export function superGuide({ network }: GuideOptions): GuideStep[] {
           nodeTabs,
           { kind: 'title', label: 'super_title' },
           { kind: 'status', label: 'badge_online' },
-          { kind: 'small', label: { key: 'super_heartbeats', vars: { current: '7', required: '9' } } },
+          { kind: 'row', label: 'ro_heartbeats_sub', value: { key: 'super_heartbeats_of', vars: { current: '7', required: '9' } } },
           { kind: 'small', label: BALANCE },
         ],
       },

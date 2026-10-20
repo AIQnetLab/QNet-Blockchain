@@ -43,12 +43,12 @@ appId: com.qnetmobile
     visible: "Words: (12|24) ✓"
     timeout: 15000
 - tapOn: "Step 2: Enter your recovery phrase"
-# The terms checkbox has no text of its own: it is the element left of the sentence, and shows ✓ once ticked.
+# The terms checkbox has no text of its own: it is the element left of the sentence, and is checked once ticked.
 - tapOn:
     leftOf: "I accept the .*"
 - extendedWaitUntil:
     visible:
-      text: "✓"
+      checked: true
       leftOf: "I accept the .*"
     timeout: 5000
 - tapOn:

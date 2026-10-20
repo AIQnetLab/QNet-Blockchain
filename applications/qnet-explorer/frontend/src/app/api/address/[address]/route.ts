@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionsByAddress, getAddressTokenTransfers, getContractDeployByAddress, getBatchCreditsByAddress } from '../../../../../lib/db';
-import { mapTxType, formatAmount } from '@/lib/tx-mapping';
+import { mapTxType } from '@/lib/tx-mapping';
 import { formatTokenAmount } from '@/lib/token-format';
 import { parseDeployMeta, type DeployMeta } from '@/lib/deploy-meta';
 import { fetchNode } from '@/lib/node-api';
+import { accountView, type NodeAccountRead } from '@/lib/explorer-reads';
+import { quoteBigInts } from '@/indexer/transform';
 
 // ============================================================================
 // PRODUCTION v3.0: PostgreSQL-based address data
@@ -14,7 +16,11 @@ const SYSTEM_ADDRESSES = ['system_rewards_pool', 'system_emission', 'genesis'];
 
 export interface AddressData {
   address: string;
-  balance: string;
+  // Nano QNC as the node reads it (a digit string); null for a system account, whose balance is not read, and while no
+  // node has answered (`nodeUnread`).
+  balance_raw: string | null;
+  // No node answered in time: the balance and the token holdings are not known yet, and the page reads them again.
+  nodeUnread?: true;
   txCount: number;
   firstSeen: number;
   lastActive: number;
@@ -39,8 +45,7 @@ export interface AddressData {
     type: string;
     from: string;
     to: string;
-    amount: string;
-    fee?: string;
+    amount_raw: string;        // nano QNC
     timestamp: number;
     block: number;
     status: 'confirmed' | 'pending';
@@ -80,9 +85,9 @@ interface NodeTokenEntry {
 // Fetch and map this address's QRC-20 holdings from the node. Returns [] on any
 // error (never throws) so it can run in parallel with the balance/tx fetch
 // without failing the whole address response.
-async function fetchAddressTokens(address: string): Promise<AddressToken[]> {
+async function fetchAddressTokens(address: string, deadline: AbortSignal): Promise<AddressToken[]> {
   try {
-    const res = await fetchNode(`/api/v1/account/${encodeURIComponent(address)}/tokens`);
+    const res = await fetchNode(`/api/v1/account/${encodeURIComponent(address)}/tokens`, { deadline });
     if (!res || !res.ok) return [];
     const body = await res.json().catch(() => null);
     const rawList: unknown = body?.tokens;
@@ -112,7 +117,7 @@ function createSystemAddressData(address: string): AddressData {
   const now = Date.now();
   return {
     address,
-    balance: '∞',
+    balance_raw: null,
     txCount: 0,
     firstSeen: now,
     lastActive: now,
@@ -149,15 +154,26 @@ export async function GET(
     return NextResponse.json({ success: false, error: 'Invalid EON address' }, { status: 400 });
   }
   
-  // The node is the source of truth for balance; PostgreSQL for TX history.
-  const fetchAccount = () => fetchNode(`/api/v1/account/${encodeURIComponent(address)}`)
-    .then(r => (r && r.ok ? r.json() : null)).catch(() => null);
+  // The node is the source of truth for balance; PostgreSQL for TX history. The request's signal ends the node reads (a
+  // page's first answer past its wait, a visitor gone): the answer then carries the history and says the balance is unread.
+  const deadline = request.signal;
+  const fetchAccount = async (): Promise<NodeAccountRead> => {
+    const res = await fetchNode(`/api/v1/account/${encodeURIComponent(address)}`, { deadline });
+    if (!res) return { answered: false };
+    if (!res.ok) return { answered: true, account: null };
+    try {
+      // The balance past 2^53 nano QNC stays exact: wide integers are quoted before parsing.
+      return { answered: true, account: JSON.parse(quoteBigInts(await res.text())) };
+    } catch {
+      return deadline.aborted ? { answered: false } : { answered: true, account: null };
+    }
+  };
 
   try {
     // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history + token transfers
-    const [accountResponse, tokens, txResult, batchCredits, tokenTransferRows] = await Promise.all([
+    const [account, tokens, txResult, batchCredits, tokenTransferRows] = await Promise.all([
       fetchAccount(),
-      fetchAddressTokens(address),
+      fetchAddressTokens(address, deadline),
       getTransactionsByAddress(address, 1, 100),
       getBatchCreditsByAddress(address, 100),
       getAddressTokenTransfers(address, 50),
@@ -197,14 +213,6 @@ export async function GET(
         timestamp: ts > 946684800000 ? ts : 0,
       };
     });
-    
-    // Balance from node (nanoQNC) — authoritative source
-    let balance = 0;
-    if (accountResponse && typeof accountResponse.balance === 'number') {
-      balance = accountResponse.balance;
-    } else if (accountResponse && accountResponse.balance) {
-      balance = Number(accountResponse.balance) || 0;
-    }
     
     // Calculate first seen, last active from transactions
     let firstSeen = 0;
@@ -252,7 +260,7 @@ export async function GET(
       type: mapTxType(tx.tx_type, tx.from_address, tx.data),
       from: tx.from_address,
       to: tx.to_address || 'N/A',
-      amount: formatAmount(Number(tx.amount) || 0),
+      amount_raw: String(tx.amount || '0'),
       // Convert timestamp to milliseconds if needed, and ensure it's valid
       timestamp: (() => {
         let ts = Number(tx.timestamp) || 0;
@@ -271,8 +279,8 @@ export async function GET(
       source: 'node+postgresql',
       data: {
         address,
-        balance: formatAmount(balance),
-        genesisAllocation: accountResponse?.genesis_allocation === true,
+        // Balance from node (nanoQNC) — authoritative source
+        ...accountView(account),
         txCount: total,
         txCountCapped: totalCapped,
         firstSeen: firstSeen,
@@ -287,25 +295,21 @@ export async function GET(
     // the node is authoritative for balance, so still serve balance + token holdings
     // and flag history as temporarily unavailable — the address page renders with real
     // data instead of hard-failing. A transient DB blip must not blank the whole page.
-    const [accountResponse, tokens] = await Promise.all([
+    const [account, tokens] = await Promise.all([
       fetchAccount(),
-      fetchAddressTokens(address),
+      fetchAddressTokens(address, deadline),
     ]);
-    if (!accountResponse) {
+    if (!account.answered || !account.account) {
       // Node also unreachable (DB down + node blip): balance is genuinely unknown. Don't fabricate a
       // 0 balance as authoritative under a "balance is current" banner — fail honestly instead.
-      return NextResponse.json({ success: false, error: 'Address data temporarily unavailable' }, { status: 503 });
+      return NextResponse.json({ success: false, error: 'Address data temporarily unavailable', ...(account.answered ? {} : { nodeUnread: true }) }, { status: 503 });
     }
-    let balance = 0;
-    if (typeof accountResponse.balance === 'number') balance = accountResponse.balance;
-    else if (accountResponse.balance) balance = Number(accountResponse.balance) || 0;
     return NextResponse.json({
       success: true,
       source: 'node',
       data: {
         address,
-        balance: formatAmount(balance),
-        genesisAllocation: accountResponse.genesis_allocation === true,
+        ...accountView(account),
         txCount: 0,
         firstSeen: 0,
         lastActive: 0,

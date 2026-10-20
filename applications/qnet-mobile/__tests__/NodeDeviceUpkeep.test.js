@@ -30,7 +30,8 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
 
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const AsyncStorage = require('@react-native-async-storage/async-storage');
 const Keychain = require('react-native-keychain');
@@ -206,7 +207,7 @@ describe('MN-2: a binding with no usable device key is offered Use this device',
     const text = tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
     expect(text).toContain(t('node_device_again'));
     expect(text).not.toMatch(/answers again when the app is opened/);
-    const ids = tree.root.findAllByType(TouchableOpacity).map((n) => n.props.testID);
+    const ids = tree.root.findAllByType(Action).map((n) => n.props.testID);
     expect(ids).toEqual(expect.arrayContaining(['node-use']));
     expect(ids).not.toContain('node-stop');
   });

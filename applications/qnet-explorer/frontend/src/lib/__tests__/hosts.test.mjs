@@ -5,8 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
-import { LINK_HOST, LINK_ORIGIN, LINK_PAGE_PATH, SITE_HOST, SITE_ICONS, SITE_ORIGIN, hostRedirect, requestHost } from '../hosts.ts';
-import { LINK_PREFIX } from '../qnet-link.ts';
+import { LINK_HOST, LINK_ORIGIN, LINK_PAGES, LINK_PAGE_PATH, SITE_HOST, SITE_ICONS, SITE_ORIGIN, hostRedirect, requestHost } from '../hosts.ts';
+import { TRANSFER_PATH } from '../app-links.ts';
+import { LINK_PREFIX, TRANSFER_LINK_PREFIX } from '../qnet-link.ts';
 
 test('the link host is its own host; the site stays on aiqnet.io', () => {
   assert.equal(SITE_HOST, 'aiqnet.io');
@@ -17,13 +18,19 @@ test('the link host is its own host; the site stays on aiqnet.io', () => {
   assert.ok(LINK_PREFIX.startsWith(`${LINK_ORIGIN}${LINK_PAGE_PATH}#`));
 });
 
-test('the link host serves the link page and the app-association files itself', () => {
-  for (const path of [LINK_PAGE_PATH, '/.well-known/assetlinks.json', '/.well-known/apple-app-site-association', '/manifest.json', '/icon-32.png']) {
+// The transfer link's page went to aiqnet.io/send, which has no page: a phone without QNet Wallet got a 404.
+test('the link host serves the two link pages and the app-association files itself', () => {
+  assert.deepEqual([...LINK_PAGES], [LINK_PAGE_PATH, TRANSFER_PATH]);
+  assert.equal(TRANSFER_PATH, '/send');
+  assert.ok(TRANSFER_LINK_PREFIX.startsWith(`${LINK_ORIGIN}${TRANSFER_PATH}#`));
+  for (const page of LINK_PAGES) assert.ok(existsSync(new URL(`../../app${page}/page.tsx`, import.meta.url)), page);
+  for (const path of [LINK_PAGE_PATH, TRANSFER_PATH, '/.well-known/assetlinks.json', '/.well-known/apple-app-site-association', '/manifest.json', '/icon-32.png']) {
     assert.equal(hostRedirect(LINK_HOST, path, ''), null, path);
     assert.equal(hostRedirect(LINK_HOST, path, '', true), null, `${path} (development build)`);
   }
   // A Next.js data request for the page keeps its query.
   assert.equal(hostRedirect(LINK_HOST, '/l', '?_rsc=abc'), null);
+  assert.equal(hostRedirect(LINK_HOST, '/send', '?_rsc=abc'), null);
 });
 
 // SITE-R4-CSP-01: the rule let /icon-<any digits>.png through, and a path without a file there rendered the
@@ -46,7 +53,8 @@ test('the link host serves exactly the icons the page head and the manifest name
 
 test('every other path on the link host goes to the site, query included, in every build', () => {
   for (const [path, search] of [
-    ['/', ''], ['/activate', ''], ['/wallet', '?x=1'], ['/l/', ''], ['/L', ''], ['/lx', ''], ['/.well-known/other', ''],
+    ['/', ''], ['/activate', ''], ['/wallet', '?x=1'], ['/l/', ''], ['/L', ''], ['/lx', ''], ['/send/', ''], ['/sendx', ''],
+    ['/send/x', ''], ['/.well-known/other', ''],
     ['/api/link/sessions', ''], ['/api/link/sessions/0123/response', ''], ['//evil.example', ''], ['/icon-1.png', ''],
     ['/manifest.json/', ''], ['/_next/image', '?url=x'],
   ]) {

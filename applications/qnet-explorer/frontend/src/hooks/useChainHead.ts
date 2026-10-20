@@ -1,15 +1,19 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import type { HeadBlockFacts } from '@/lib/explorer-view';
 
 // Live chain head for client components: one event stream per tab (shared by every subscriber),
 // paused while the tab is hidden, falling back to a 15 s poll of /api/head when streaming fails.
+
+export type { HeadBlockFacts };
 
 export interface ChainHead {
   v: number;
   height: number;
   hash: string | null;
   timestamp: number;
+  block: HeadBlockFacts | null;
   txTotal: number;
   txByType: Record<string, number>;
   blocksTotal: number;
@@ -18,7 +22,7 @@ export interface ChainHead {
   connected: boolean;
 }
 
-const EMPTY: ChainHead = { v: 0, height: 0, hash: null, timestamp: 0, txTotal: 0, txByType: {}, blocksTotal: 0, emissionTotal: '0', sync: { head: -1, prefix: -1, nodeHeight: 0, live: false }, connected: false };
+const EMPTY: ChainHead = { v: 0, height: 0, hash: null, timestamp: 0, block: null, txTotal: 0, txByType: {}, blocksTotal: 0, emissionTotal: '0', sync: { head: -1, prefix: -1, nodeHeight: 0, live: false }, connected: false };
 const POLL_MS = 15_000;
 const RECONNECT_MS = 20_000;
 
@@ -35,11 +39,17 @@ function publish(next: Partial<ChainHead>) {
   for (const l of listeners) l(current);
 }
 
+function blockFacts(b: unknown): HeadBlockFacts | null {
+  const o = b as Partial<HeadBlockFacts> | null;
+  if (!o || typeof o.producer !== 'string') return null;
+  return { producer: o.producer, producerAddress: typeof o.producerAddress === 'string' ? o.producerAddress : null, txCount: typeof o.txCount === 'number' ? o.txCount : null };
+}
+
 function parse(data: string): Partial<ChainHead> | null {
   try {
     const d = JSON.parse(data);
     if (typeof d?.height !== 'number') return null;
-    return { v: d.v, height: d.height, hash: d.hash ?? null, timestamp: d.timestamp || 0, txTotal: d.txTotal || 0, txByType: d.txByType || {}, blocksTotal: d.blocksTotal || 0, emissionTotal: String(d.emissionTotal ?? '0'), sync: d.sync || current.sync };
+    return { v: d.v, height: d.height, hash: d.hash ?? null, timestamp: d.timestamp || 0, block: blockFacts(d.block), txTotal: d.txTotal || 0, txByType: d.txByType || {}, blocksTotal: d.blocksTotal || 0, emissionTotal: String(d.emissionTotal ?? '0'), sync: d.sync || current.sync };
   } catch { return null; }
 }
 

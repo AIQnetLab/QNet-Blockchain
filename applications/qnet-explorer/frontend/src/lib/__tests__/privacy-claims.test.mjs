@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { TEXTS } from '../texts.ts';
+import { STRIP_COOKIE, stripCookie, stripHiddenIn } from '../strip-pref.ts';
 
 const SRC = new URL('../../', import.meta.url);
 const REPO = new URL('../../../../../../', import.meta.url);
@@ -37,7 +38,7 @@ test('what the site stores in the browser: the address view, the node pages\' wa
   assert.match(policy, /They also send the wallet's QNet Blockchain address, to ask the network whether the wallet has a node of either type and to read the wallet's activation record, the id of its super node, to read that node's status, and, when the page knows it, the wallet's own Solana address, whose public Solana history the server searches for an activation burn: the server asks a Solana RPC endpoint and keeps the answer in its memory for five minutes\./);
   assert.doesNotMatch(policy, /stays in the open tab/);
   assert.match(policy, /The browser keeps those keys for this site only and never hands them out\. A request expires after ten minutes; the page deletes what is left of an expired one when it next opens\./);
-  assert.match(policy, /The node pages\{full && ' \(aiqnet\.io\/node\)'\} send the server the light node id of the wallet you choose there, or of the extension's once you approved the site in it, to read that node's public status and history from QNet Blockchain, and what an activation on those pages needs/);
+  assert.match(policy, /The node pages\{full && <> \( aiqnet\.io\/node \) \} send the server the light node id of the wallet you choose there, or of the extension's once you approved the site in it, to read that node's public status and history from QNet Blockchain, and what an activation on those pages needs/);
   // Owner, 11.10: no "I'm back" on the site, so the policy names no wake the pages ask for.
   assert.doesNotMatch(policy, /I'm back|press I/);
   const users = [];
@@ -46,9 +47,20 @@ test('what the site stores in the browser: the address view, the node pages\' wa
     if (/localStorage|sessionStorage|indexedDB|document\.cookie|caches\.open/.test(text)) users.push(url.pathname.split('/src/')[1]);
   }
   // The view preference (AppContext), the node pages' wallet (CabinetProvider), open request (link-store) and
-  // payment address (payment-store), the wallet's Solana address handed to the faucet page (faucet-handover), and the
-  // explorer cache removing what an earlier version stored. No cookie.
-  assert.deepEqual(users.sort(), ['components/cabinet/CabinetProvider.tsx', 'contexts/AppContext.tsx', 'lib/cabinet/payment-store.ts', 'lib/explorer-cache.ts', 'lib/faucet-handover.ts', 'lib/link-store.ts']);
+  // payment address (payment-store), the wallet's Solana address handed to the faucet page (faucet-handover), the
+  // explorer cache removing what an earlier version stored, and the one cookie: the Latest blocks strip folded.
+  assert.deepEqual(users.sort(), ['components/cabinet/CabinetProvider.tsx', 'components/explorer/LatestBlocks.tsx', 'contexts/AppContext.tsx', 'lib/cabinet/payment-store.ts', 'lib/explorer-cache.ts', 'lib/faucet-handover.ts', 'lib/link-store.ts']);
+  // Owner 20.10: Hide folds the strip and the page keeps it folded. The cookie is written only by Hide (deleted by Show),
+  // holds that choice alone, travels only with the explorer's pages, and the policy names it.
+  assert.match(policy, /The explorer sets one cookie, qnet\.blocks, only when you press Hide on its Latest blocks strip, so the strip stays folded on the explorer's pages for a year; it holds that choice and nothing else, and Show deletes it\./);
+  assert.equal(STRIP_COOKIE, 'qnet.blocks');
+  assert.equal(stripCookie(true, true), 'qnet.blocks=hidden; Path=/explorer; Max-Age=31536000; SameSite=Lax; Secure');
+  assert.equal(stripCookie(false, false), 'qnet.blocks=; Path=/explorer; Max-Age=0; SameSite=Lax');
+  assert.equal(stripHiddenIn('a=1; qnet.blocks=hidden; b=2'), true);
+  assert.equal(stripHiddenIn('qnet.blocks='), false);
+  assert.equal(stripHiddenIn(''), false);
+  const latest = readFileSync(new URL('components/explorer/LatestBlocks.tsx', SRC), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  assert.deepEqual(latest.match(/document\.cookie[^;]*;/g), ['document.cookie);', "document.cookie = stripCookie(open, window.location.protocol === 'https:');"]);
   // The hand-over (owner, 29.09): one key in this tab's session storage, read once by the faucet page and removed.
   assert.match(policy, /When you follow the node pages' link to the testnet faucet, the page keeps the connected wallet's Solana address in this tab's session storage until the faucet page reads it once to fill in its field, and removes it then; nothing is sent until you press the faucet's button\./);
   const handover = read(SRC, 'lib/faucet-handover.ts').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
@@ -271,10 +283,10 @@ test('what is encrypted, what is not, and what Delete wallet leaves, as the apps
     assert.match(plain, item);
   }
   // Retention: Delete wallet removes all of it but the app's language and the time its screen lock failed, which lapses,
-  // and the extension's language.
+  // and the extension's language and a wallet of the earlier version that still opens (only its move or removal ends it).
   assert.doesNotMatch(policy, /That history stays when a wallet is deleted/);
-  assert.match(text, /Deleting the wallet removes all of this: in the mobile app everything but the language setting and that screen-lock time, in the browser extension everything but the chosen language\./);
-  assert.match(policy, /Data on your device: until you delete the wallet \(the mobile app then keeps only its language setting and the screen-lock time, which lapses after seven days, and the extension only its chosen language\) or uninstall the app or the extension\./);
+  assert.match(text, /Deleting the wallet removes all of this: in the mobile app everything but the language setting and that screen-lock time, in the browser extension everything but the chosen language and a wallet of the earlier version 2\.1 that is still in the browser and opens, which stays until it is moved or removed\./);
+  assert.match(policy, /Data on your device: until you delete the wallet \(the mobile app then keeps only its language setting and the screen-lock time, which lapses after seven days, and the extension only its chosen language and a wallet of the earlier version 2\.1 that still opens, until it is moved or removed\) or uninstall the app or the extension\./);
 
   // The mobile app: recent pages are plain AsyncStorage JSON; connected sites are sealed; it keeps no activation code
   // (it burns nothing and uses no codes).
@@ -308,9 +320,10 @@ test('what is encrypted, what is not, and what Delete wallet leaves, as the apps
   // A reinstall on iOS: Keychain items left from before are wiped at the first start.
   assert.match(wm, /if \(state === 'none'\) \{\s*await this\._wipeKeychain\(\);\s*await deleteDeviceKeys\(\);/);
   // The extension: Delete wallet clears its whole chrome.storage.local (approvals included) but the settings key when it
-  // holds nothing but an allowed language.
+  // holds nothing but an allowed language, and the earlier version's keys while its wallet still opens (or cannot be read
+  // for certain); what that version left that opens nothing goes, its pages' database too.
   const vault = read(REPO, 'applications/qnet-wallet/dist/background/vault.js');
-  assert.match(vault, /async function eraseAll\(\) \{[\s\S]*?const language = \(await session\.storedLanguage\(\)\) !== null \? \[STORAGE_KEYS\.SETTINGS\] : \[\];\s*await clearArea\(storage\.local, \[\], language\);/);
+  assert.match(vault, /async function eraseAll\(\) \{[\s\S]*?const language = \(await session\.storedLanguage\(\)\) !== null \? \[STORAGE_KEYS\.SETTINGS\] : \[\];[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*const keepEarlier = await earlier\.readEarlierWallet\(\)\.then\(\(parsed\) => parsed !== null, \(\) => true\);\s*await clearArea\(storage\.local, \[\], keepEarlier \? \[\.\.\.language, \.\.\.earlier\.EARLIER_KEYS\] : language\);[\s\S]*?if \(!keepEarlier\) \{\s*await earlier\.deleteEarlierDatabase\(\)/);
   assert.match(read(REPO, 'applications/qnet-wallet/dist/background/session.js'),
     /export async function storedLanguage\(\) \{\s*try \{\s*const stored = [^;]+;\s*return hasExactKeys\(stored, \['language'\]\) && SUPPORTED_LANGUAGES\.includes\(stored\.language\) \? stored\.language : null;/);
 });
@@ -326,10 +339,9 @@ test('the extension\'s unencrypted data is listed as the extension stores it', (
   for (const item of [
     /the chosen language; the list of websites approved to see your addresses, each approval carrying a check value/,
     /stored in the clear next to the encrypted wallet, the wallet's public QNet Blockchain and Solana addresses, a random wallet identifier, when the wallet was created and whether its activation is for a light or a super node, which anyone who can read the browser profile sees without the password/,
-    /two records of public chain data, each with a check value made with a key from the encrypted wallet data: how far the searches for the wallet's activation burn have read the Solana history of the wallet \(its address and 1DEV account: the transactions listed and checked\)/,
-    /the network checkpoints the extension's light client verified/,
+    /three records of public chain data, each with a check value made with a key from the encrypted wallet data: how far the searches for the wallet's activation burn have read the Solana history of the wallet \(its address and 1DEV account: the transactions listed and checked\); the network checkpoints the extension's light client verified; and the last QNet Blockchain balance, token list and Solana balances it read and the highest network height it saw, so the wallet shows them at once after an unlock;/,
     /one record of public chain data with no check value, since the extension verifies it again in full each time it reads it: the checkpoint signed by the genesis nodes of QNet Blockchain that its light client walks from/,
-    /in the browser's session memory, which is not written to disk and is cleared when the browser closes: the key of the unlocked wallet with its addresses, until it locks; the count of wrong passwords; the result of its start-up self-test; and the recent approval requests of each website/,
+    /in the browser's session memory, which is not written to disk and is cleared when the browser closes: the key of the unlocked wallet with its addresses, until it locks; the balances and history it last showed and where the popup was, with the token, recipient and amount typed into its Send form, until it locks; the count of wrong passwords; the result of its start-up self-test; the recent approval requests of each website, for the limits on how often a site may ask; when a copied secret is due to be cleared from the clipboard \(a time, never the text\); and the latest certified block its light client saw and until when it asks no node for a new starting point, which is public chain data\./,
   ]) assert.match(plain, item);
   assert.doesNotMatch(plain, /2\.1|earlier version/);
   // What 2.1.x left is never written by this version: earlier.js only reads and removes it.
@@ -343,30 +355,65 @@ test('the extension\'s unencrypted data is listed as the extension stores it', (
   assert.match(vault, /const AAD_KEYS = Object\.freeze\(\['v', 'kdf', 'walletId', 'qnetAddress', 'solanaAddress', 'createdAt', 'activationNodeType',\s*'legacy'\]\);/);
   assert.doesNotMatch(vault, /LEGACY_AAD_KEYS|spellingBox/);
   assert.match(vault, /&& \(!Object\.hasOwn\(aad, 'legacy'\) \|\| aad\.legacy === null\)/);
-  // The kept burn searches (the wallet's) and the light client's anchors: MAC only.
+  // The kept burn searches (the wallet's), the light client's anchors and the chain cache: MAC only.
   assert.match(vault, /store\.put\(\{ v: 1, scans, mac \}, BURN_SCANS_KEY\)/);
   assert.match(vault, /export async function writeBurnScan\(owner, /);
   assert.match(vault, /store\.put\(\{ v: LIGHT_ANCHORS_VERSION, chain, anchors: copy, mac \}, LIGHT_ANCHORS_KEY\)/);
+  assert.match(vault, /store\.put\(\{ v: 1, cache, mac \}, CHAIN_CACHE_KEY\)/);
   // The genesis capsule its light client holds: no MAC, since the core verifies it again in full on every read.
   assert.match(vault, /store\.put\(\{ v: 1, chain: core\.chainIdentity\(\), record: copy \}, CAPSULE_KEY\)/);
+  // Every record the vault database is written under is named by the policy: a new one fails here until it is.
+  const vaultRecords = {
+    'VAULT_DB.KEY': 'stored in the clear next to the encrypted wallet',
+    BURN_SCANS_KEY: 'how far the searches for the wallet\'s activation burn have read the Solana history of the wallet',
+    LIGHT_ANCHORS_KEY: 'the network checkpoints the extension\'s light client verified',
+    CHAIN_CACHE_KEY: 'the last QNet Blockchain balance, token list and Solana balances it read and the highest network height it saw',
+    CAPSULE_KEY: 'the checkpoint signed by the genesis nodes of QNet Blockchain that its light client walks from',
+  };
+  const written = [...vault.matchAll(/store\.(?:put|add)\((?:\{[^{}]*\}|\w+), (VAULT_DB\.KEY|[A-Z_]+_KEY)\)/g)].map((m) => m[1]);
+  assert.equal(written.length, [...vault.matchAll(/store\.(?:put|add)\(/g)].length, 'every write names its key');
+  assert.deepEqual([...new Set(written)].sort(), Object.keys(vaultRecords).sort());
+  for (const phrase of Object.values(vaultRecords)) assert.ok(plain.includes(phrase), phrase);
+  // The one other key it declares is only removed: where 3.0.0 and 3.1.0 staged a restore.
+  const declared = [...vault.matchAll(/^const ([A-Z_]+_KEY) = '/gm)].map((m) => m[1]);
+  assert.deepEqual(declared.filter((key) => !Object.hasOwn(vaultRecords, key)), ['RESTORE_STAGING_KEY']);
   assert.doesNotMatch(read(REPO, 'applications/qnet-wallet/dist/ui/common.js'), /LEGACY_PASSWORD_EXPOSED_KEY|qnet_legacy_password_exposed/);
-  // Session memory: the unlocked session, the backoff, the self-test pass and the approval cooldowns.
+  // Session memory: the unlocked session, the backoff, the self-test pass, the approval cooldowns, the view cache with
+  // where the popup was and its Send draft, the clipboard's due time and the light client's hints. A session key the
+  // policy does not name fails here.
   const config = read(REPO, 'applications/qnet-wallet/dist/background/config.js');
   assert.match(config, /\/\/ chrome\.storage\.session \(TRUSTED_CONTEXTS\)\n\s*SESSION: 'qnet_session_v3',\n\s*BACKOFF: 'qnet_backoff_v3',\n\s*SELF_TEST: 'qnet_selftest_v3',\n\s*APPROVAL_COOLDOWN: 'qnet_approval_cooldown_v3',/);
-  assert.match(read(REPO, 'applications/qnet-wallet/dist/background/session.js'), /key: core\.base64Encode\(s\.vaultKey\),\s*walletId: s\.walletId,\s*qnetAddress: s\.qnetAddress,\s*solanaAddress: s\.solanaAddress,/);
+  const sessionKeys = config.slice(config.indexOf('// chrome.storage.session (TRUSTED_CONTEXTS)'));
+  const named = {
+    SESSION: 'the key of the unlocked wallet with its addresses',
+    BACKOFF: 'the count of wrong passwords',
+    SELF_TEST: 'the result of its start-up self-test',
+    APPROVAL_COOLDOWN: 'the recent approval requests of each website',
+    VIEW_CACHE: 'the balances and history it last showed and where the popup was, with the token, recipient and amount typed into its Send form',
+    CLIPBOARD: 'when a copied secret is due to be cleared from the clipboard (a time, never the text)',
+    LIGHT_HINTS: 'the latest certified block its light client saw and until when it asks no node for a new starting point',
+  };
+  assert.deepEqual([...sessionKeys.slice(0, sessionKeys.indexOf('});')).matchAll(/^\s*([A-Z_]+): '/gm)].map((m) => m[1]).sort(), Object.keys(named).sort());
+  for (const phrase of Object.values(named)) assert.ok(plain.includes(phrase), phrase);
+  const session = read(REPO, 'applications/qnet-wallet/dist/background/session.js');
+  assert.match(session, /key: core\.base64Encode\(s\.vaultKey\),\s*walletId: s\.walletId,\s*qnetAddress: s\.qnetAddress,\s*solanaAddress: s\.solanaAddress,/);
+  // Where the popup was and its Send draft live in the view cache, which every lock drops.
+  assert.match(session, /await rememberView\('popupState', \{ network, tab, draft: Object\.keys\(draft\)\.length > 0 \? draft : null \}\);/);
+  assert.match(config, /\/\/ when the clipboard is due to be emptied of a secret copied from a page \(clipboard\.js\); a time, never the text\n\s*CLIPBOARD: 'qnet_clipboard_v1',/);
 
   // The extension's document says the same, and no longer "Nothing else is stored".
   const doc = read(REPO, 'docs/applications/browser-wallet.md').replace(/\s+/g, ' ');
   assert.doesNotMatch(doc, /the self-test pass and the per-site approval cooldowns\. Nothing else is stored\./);
   assert.match(doc, /The record's associated data is stored in the clear/);
-  // It names the wallet 2.1.x left as kept by that version, untouched until moved or removed, never as written by this one.
-  assert.match(doc, /a wallet of the earlier version stays there \(and its second copy in its own IndexedDB database\), untouched, until it is moved or removed; Delete wallet removes it too/);
+  // It names the wallet 2.1.x left as kept by that version, untouched until moved or removed, never as written by this one;
+  // Delete and a reset keep it while it opens.
+  assert.match(doc, /a wallet of the earlier version stays there \(and its second copy in its own IndexedDB database\), untouched, until it is moved or removed; Delete wallet and a reset keep it while it opens, and remove what the earlier version left that opens nothing\./);
   const storageParagraph = doc.slice(doc.indexOf('`chrome.storage.local` holds'), doc.indexOf('`chrome.storage.session`'));
   assert.doesNotMatch(storageParagraph, /2\.1/);
 });
 
 test('the testnet faucet is covered: what it sends, what it keeps and for how long', () => {
-  assert.match(policy, /Testnet faucet\. The faucet\{full && ' on aiqnet\.io\/testnet'\} sends test tokens \(1DEV and SOL on Solana devnet\) to the Solana address you enter/);
+  assert.match(policy, /Testnet faucet\. The faucet\{full && <> on aiqnet\.io\/testnet \} sends test tokens \(1DEV and SOL on Solana devnet\) to the Solana address you enter/);
   assert.match(policy, /that transfer publicly links the faucet wallet to your address on Solana/);
   assert.match(policy, /the server keeps the address and the time of its last claim in memory for 24 hours, and then drops it; it is never written to disk/);
   assert.match(policy, /Testnet faucet claims \(the Solana address and the time of its last claim, and with a faucet pass the wallet's QNet Blockchain address and that time\): in server memory, 24 hours\./);
@@ -464,7 +511,9 @@ test('pages load images only from the site; token logos come through the site', 
   const proxy = read(SRC, 'proxy.ts');
   assert.match(proxy, /"img-src 'self' data:",/);
   const icon = read(SRC, 'components/TokenIcon.tsx');
-  assert.deepEqual(icon.match(/src=\{?[^\s>]+/g), ['src="/qnc-logo.png"', 'src={`/api/token/${contract}/logo`}']);
+  // 1DEV's icon is bundled as data (the policy allows data: images); nothing else is loaded from anywhere but the site.
+  assert.deepEqual(icon.match(/src=\{?[^\s>]+/g), ['src={ONE_DEV_SRC}', 'src="/qnc-logo.png"', 'src={`/api/token/${contract}/logo`}']);
+  assert.match(icon, /const ONE_DEV_SRC = 'data:image\/webp;base64,[A-Za-z0-9+/=]+';/);
 });
 
 test('Support says what a second send does in each wallet, never that it cannot charge twice', () => {

@@ -96,7 +96,7 @@ describe('the screens', () => {
   const styles = require('../src/screens/WalletScreen.styles').default;
 
   it('every screen keeps one centred column of at most 640', () => {
-    for (const k of ['scrollContentContainer', 'formContent', 'centerContent', 'lockColumn']) {
+    for (const k of ['scrollContentContainer', 'formContent', 'centerContent', 'fieldColumn']) {
       expect([k, styles[k].maxWidth, styles[k].alignSelf, styles[k].width]).toEqual([k, 640, 'center', '100%']);
     }
     // Nothing reads the window width: the layout is flex only.
@@ -109,7 +109,8 @@ describe('the screens', () => {
     expect(screen).not.toMatch(/paddingTop: 44/);
     expect(screen).not.toMatch(/paddingBottom: 50/);
     expect(screen).not.toMatch(/edges=\{Platform\.OS/);
-    expect(screen).toMatch(/const SCREEN_EDGES = \['top', 'left', 'right'\];/);
+    // The system navigation bar too: nothing on a full screen sits under it (owner 20.10: "Forgot?" under Android's bar).
+    expect(screen).toMatch(/const SCREEN_EDGES = \['top', 'left', 'right', 'bottom'\];/);
   });
 
   it('every modal turns with the device', () => {

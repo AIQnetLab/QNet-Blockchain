@@ -70,6 +70,7 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   assert.equal(APP.node_no_device, undefined, 'no_device');
   same(TEXTS.badge_online, APP.node_status_online, 'badge_online');
   same(TEXTS.badge_offline, APP.node_status_offline, 'badge_offline');
+  same(TEXTS.super_waiting, APP.node_waiting_admission, 'super_waiting');
   same(TEXTS.action_move, APP.node_move, 'action_move');
   if (APP.node_move_min !== undefined) same(TEXTS.balance_min, APP.node_move_min, 'balance_min');
   same(TEXTS.ui_app_node_tab, APP.tab_node, 'ui_app_node_tab');
@@ -85,9 +86,10 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   // A device that cannot prove its hardware: the page quotes the app's own sentence (light-node-messages section 1).
   for (const key of ['link_error_BIND_REFUSED', 'act_done_device']) assert.ok(norm(TEXTS[key]).includes(norm(APP.node_cant_run)), key);
   assert.ok(norm(TEXTS.balance).startsWith(norm(APP.node_balance)), 'balance');
-  for (const [key, value] of [['answered_yes', APP.node_answered_yes_untimed], ['answered_no', APP.node_answered_no]]) {
-    assert.ok(norm(TEXTS[key]).startsWith(norm(APP.node_answered)) && norm(TEXTS[key]).endsWith(norm(value)), key);
-  }
+  // The device's reading: the app's label over the app's answer.
+  same(TEXTS.device_answered, APP.node_answered, 'device_answered');
+  same(TEXTS.device_yes, APP.node_answered_yes_untimed, 'device_yes');
+  same(TEXTS.ro_not_answered, APP.node_answered_no, 'ro_not_answered');
   // Owner, 11.10: no count over a window of recent epochs; History lists the epochs themselves
   // (cabinet-layout.test.mjs).
   for (const key of ['counted', 'super_epochs']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);
@@ -97,7 +99,7 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   assert.equal(TEXTS.no_device, 'The node does not run on any device now.');
   assert.equal(TEXTS.badge_online, 'Online');
   assert.equal(TEXTS.badge_offline, 'Offline');
-  assert.equal(TEXTS.answered_no, 'Answered this epoch: Not yet');
+  assert.equal(TEXTS.ro_not_answered, 'Not yet');
   assert.equal(TEXTS.balance, 'Node balance: {amount} QNC');
   assert.equal(TEXTS.action_move, 'Move to wallet');
   assert.equal(TEXTS.balance_min, 'The node balance can be moved to the wallet once it reaches 1 QNC.');
@@ -111,7 +113,8 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
     // A status line opens with QNet Blockchain, never with "The network".
     assert.doesNotMatch(text, /(^|[.:!?] )The network\b/, key);
   }
-  assert.equal(TEXTS.eligibility, 'A light node runs on one phone or tablet at a time, in QNet Wallet; a super node runs on a server with the QNet Blockchain node software.');
+  // The line under My node's title for a visitor without a wallet repeated the connect screen's guides: gone (AUDIT 4.6).
+  assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'eligibility'), false);
 });
 
 test('every page, its metadata and the manifest name the system QNet Blockchain', () => {
@@ -125,8 +128,13 @@ test('every page, its metadata and the manifest name the system QNet Blockchain'
   const layout = code('app/layout.tsx');
   assert.equal([...layout.matchAll(/title: 'QNet Blockchain',/g)].length, 3);
   assert.match(layout, /siteName: 'QNet Blockchain',/);
-  for (const file of ['app/explorer/ExplorerClient.tsx', 'app/explorer/loading.tsx']) assert.match(code(file), /<h1>QNet Blockchain Explorer<\/h1>/, file);
-  assert.match(code('app/HomeClient.tsx'), /<span className="title-main">QNet Blockchain<\/span>/);
+  // The explorer's title is its band's one h1 (components/ui/PageHead.tsx), on the page and while it loads.
+  for (const file of ['app/explorer/ExplorerClient.tsx', 'app/explorer/loading.tsx']) assert.match(code(file), /<PageHead\s+title="QNet Blockchain Explorer"/, file);
+  assert.match(code('components/ui/PageHead.tsx'), /<h1 className="page-title"[^>]*>\{title\}<\/h1>/);
+  // The home headline and the header's wordmark: the name together, split into lines or weights only for the eye.
+  assert.match(code('app/HomeClient.tsx'), /const NAME = 'QNet Blockchain';/);
+  assert.match(code('app/HomeClient.tsx'), /<h1 id="hero-title" ref=\{h1\} className="display" aria-label=\{NAME\}/);
+  assert.match(code('components/Header.tsx'), /const NAME = 'QNet Blockchain';[\s\S]*className="brand" aria-label=\{NAME\}/);
   const manifest = JSON.parse(readFileSync(new URL('../public/manifest.json', SRC), 'utf8'));
   assert.equal(manifest.name, 'QNet Blockchain Explorer');
   assert.equal(manifest.short_name, 'QNet Blockchain');
@@ -155,13 +163,13 @@ test('the extension\'s buttons, tabs and fields are named as the extension names
 });
 
 // Owner, 13.10: the one exception is the node's "Total earned", the sum moved to the wallet plus the node balance
-// (NodeHistory.tsx Earned); its texts say that phrase and no other word of the kind.
+// (NodeHistory.tsx Earned); its reading's label says that phrase and no text says another word of the kind.
 test('no text speaks of earnings: the node balance is what it is', () => {
   for (const [key, text] of Object.entries(TEXTS)) {
-    const said = key.startsWith('earned_') ? text.replace(/^Total earned: /, '') : text;
+    const said = key === 'ro_total_earned' ? text.replace(/^Total earned$/, '') : text;
     assert.doesNotMatch(said, /reward|\bmining\b|\bearn|\bincome\b|\bprofit/i, key);
   }
-  assert.deepEqual(Object.keys(TEXTS).filter((k) => /\bearn/i.test(TEXTS[k])), ['earned_total', 'earned_reading', 'earned_unknown']);
+  assert.deepEqual(Object.keys(TEXTS).filter((k) => /\bearn/i.test(TEXTS[k])), ['ro_total_earned']);
 });
 
 // The page as the QNet app's view renders it: every `{full && …}` block (shown only outside that view) removed.
@@ -203,7 +211,7 @@ test('the Support page in the app\'s view names no platform and points to no act
 
 test('every key a page uses has its text, and they show text only through it', () => {
   const used = new Set();
-  const files = [...readdirSync(new URL('components/cabinet/', SRC)).map((n) => `components/cabinet/${n}`), 'app/support/page.tsx', 'components/SupportRequest.tsx', 'app/l/page.tsx', 'app/l/LinkButtons.tsx'];
+  const files = [...readdirSync(new URL('components/cabinet/', SRC)).map((n) => `components/cabinet/${n}`), 'app/support/page.tsx', 'components/SupportRequest.tsx', 'app/l/page.tsx', 'app/l/LinkButtons.tsx', 'app/send/page.tsx'];
   for (const file of files) {
     const text = read(file);
     for (const m of text.matchAll(/\b(?:t|rich)\('([a-z0-9_]+)'/g)) used.add(m[1]);
@@ -217,7 +225,7 @@ test('every key a page uses has its text, and they show text only through it', (
     assert.doesNotMatch(text, />\{(error|message)\}</, file);
   }
   // The pages' titles.
-  for (const dir of ['app/node/', 'app/docs/how-it-works/', 'app/support/', 'app/l/']) {
+  for (const dir of ['app/node/', 'app/docs/how-it-works/', 'app/support/', 'app/l/', 'app/send/']) {
     for (const name of readdirSync(new URL(dir, SRC), { recursive: true }).filter((n) => /\.tsx$/.test(n))) {
       for (const m of read(`${dir}${name.replace(/\\/g, '/')}`).matchAll(/pageTitle\(([^)]*)\)/g)) {
         for (const k of m[1].matchAll(/'([a-z0-9_]+)'/g)) used.add(k[1]);
@@ -235,13 +243,17 @@ test('every key a page uses has its text, and they show text only through it', (
 test('English only: no language switch, no locale choice, no second table, no right-to-left handling', () => {
   assert.equal(existsSync(new URL('i18n', SRC)), false);
   assert.equal(existsSync(new URL('components/LanguageMenu.tsx', SRC)), false);
+  const cookies = [];
   for (const file of sources('')) {
     const text = code(file);
-    assert.doesNotMatch(text, /LanguageMenu|lang-menu|qnet_lang|useI18n|I18nProvider|requestLocale|messagesOf|accept-language|document\.cookie/i, file);
+    assert.doesNotMatch(text, /LanguageMenu|lang-menu|qnet_lang|useI18n|I18nProvider|requestLocale|messagesOf|accept-language/i, file);
     assert.doesNotMatch(text, /\bdir=|\[dir=|unicode-bidi|<bdi\b|direction:\s*(ltr|rtl)/, file);
+    if (/document\.cookie/.test(text)) cookies.push(file);
   }
+  // No language cookie: the site's one cookie is the explorer's folded strip (privacy-claims.test.mjs).
+  assert.deepEqual(cookies, ['components/explorer/LatestBlocks.tsx']);
   // The pages that had a language: no select, no lang or dir of their own, the root's English only.
-  for (const file of ['components/cabinet/CabinetFrame.tsx', 'app/support/page.tsx', 'app/l/page.tsx', 'app/node/layout.tsx', 'app/support/layout.tsx']) {
+  for (const file of ['components/cabinet/CabinetFrame.tsx', 'app/support/page.tsx', 'app/l/page.tsx', 'app/send/page.tsx', 'app/node/layout.tsx', 'app/support/layout.tsx']) {
     const text = code(file);
     assert.doesNotMatch(text, /<select|\blang=|locale/, file);
   }
@@ -251,7 +263,7 @@ test('English only: no language switch, no locale choice, no second table, no ri
   assert.doesNotMatch(layout, /cookies\(\)|headers\(\)/);
   assert.match(layout, /export const dynamic = 'force-dynamic';/);
   // Every page title is static and English.
-  for (const page of ['app/node/page.tsx', 'app/node/activate/page.tsx', 'app/node/device/page.tsx', 'app/node/history/page.tsx', 'app/docs/how-it-works/page.tsx', 'app/support/layout.tsx', 'app/l/page.tsx']) {
+  for (const page of ['app/node/page.tsx', 'app/node/activate/page.tsx', 'app/node/device/page.tsx', 'app/node/history/page.tsx', 'app/docs/how-it-works/page.tsx', 'app/support/layout.tsx', 'app/l/page.tsx', 'app/send/page.tsx']) {
     assert.match(read(page), /export const metadata: Metadata = \{ title: pageTitle\(/, page);
   }
 });
@@ -259,6 +271,18 @@ test('English only: no language switch, no locale choice, no second table, no ri
 // The rules of one selector block of the site's stylesheet, as written: the first block that starts a line with
 // exactly that selector (in `within`, a media query's text, or the whole sheet).
 const CSS = read('app/globals.css');
+const CABINET = read('styles/cabinet.css');
+// One media query of My node's sheet, whole.
+function cabinetMedia(query) {
+  const at = CABINET.indexOf(`@media (${query}) {`);
+  assert.ok(at >= 0, query);
+  let depth = 0;
+  for (let i = CABINET.indexOf('{', at); i < CABINET.length; i++) {
+    if (CABINET[i] === '{') depth++;
+    else if (CABINET[i] === '}' && --depth === 0) return CABINET.slice(at, i + 1);
+  }
+  assert.fail(query);
+}
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 function block(selector, within = CSS) {
   const m = new RegExp(`^[ \\t]*${escape(selector)} \\{`, 'm').exec(within);
@@ -276,46 +300,50 @@ function media(query) {
   assert.fail(query);
 }
 
-test('the cabinet\'s buttons: primary filled, secondary outlined, one size, a finger-sized target, focus and disabled states', () => {
-  const button = block('.cabinet .qnet-button');
-  for (const rule of ['min-height: 44px;', 'border-radius: 8px;', 'padding: 0.625rem 1.25rem;', 'font-size: 0.8125rem;', 'letter-spacing: 0.06em;', 'background: #00e5f0;', 'max-width: 100%;']) {
-    assert.ok(button.includes(rule), rule);
+// B-SPEC 5.5: My node's actions are the site's own (components/ui/Action.tsx): solid for the one step to do now, text
+// for the others, act inside a line of data; never an outlined box, never a dimmed one. Each is a finger-sized target.
+test('the cabinet\'s actions: the site\'s solid, text and act, finger-sized targets, a disabled solid filled grey', () => {
+  for (const name of readdirSync(new URL('components/cabinet/', SRC)).filter((n) => n.endsWith('.tsx'))) {
+    const src = code(`components/cabinet/${name}`);
+    assert.doesNotMatch(src, /className=\{?["'`][^"'`]*\b(qnet-button|activate-[a-z-]+|cabinet-[a-z-]+)/, name);
+    for (const m of src.matchAll(/className="(btn[^"]*)"/g)) assert.match(m[1], /^btn btn-(solid|text)( btn-sm)?$/, `${name}: ${m[1]}`);
   }
-  assert.match(block('.cabinet .qnet-button.secondary'), /background: transparent;/);
-  assert.match(block('.cabinet .qnet-button:focus-visible'), /outline: 2px solid #00ffff;/);
-  assert.match(CSS, /\.cabinet \.qnet-button:disabled,\n\.cabinet \.qnet-button:disabled:hover \{\n {2}opacity: 0\.45;\n {2}cursor: not-allowed;/);
-  // A primary action is `qnet-button activate-primary`, a secondary one `qnet-button secondary`; nothing else.
-  for (const name of readdirSync(new URL('components/cabinet/', SRC))) {
-    for (const m of read(`components/cabinet/${name}`).matchAll(/className=\{?[`"]qnet-button([^`"]*)[`"]/g)) {
-      assert.match(m[1], /^ (activate-primary|secondary|secondary activate-copy|\$\{extension \? 'secondary' : 'activate-primary'\})$/, `${name}: ${m[1]}`);
-    }
-  }
-  // The pages' pills and the text buttons on their own line are as tall.
-  assert.match(block('.cabinet-nav-link'), /min-height: 44px;/);
-  assert.match(block('.cabinet .activate-link-button'), /min-height: 44px;/);
-  assert.match(block('.cabinet-input'), /min-height: 44px;[\s\S]*font-size: 1rem;/);
+  const base = read('styles/base.css');
+  assert.match(base, /\.btn-solid \{ background: var\(--signal\); color: var\(--ink\); padding: 17px 24px;/);
+  assert.match(base, /\.btn-solid:disabled, \.btn-solid\[aria-disabled='true'\] \{ background: var\(--fill-disabled\); color: var\(--fog\); cursor: not-allowed; \}/);
+  assert.match(base, /\.btn-text \{\n {2}color: var\(--paper\); padding: 15px 0;/);
+  // A disabled action is never dimmed by opacity.
+  assert.doesNotMatch(base + CABINET, /:disabled[^{]*\{[^}]*opacity/);
+  // The sections' rows, How it works's titles and the node types are 44 px or taller (the ways to connect are the solid
+  // and text actions); a field is 16 px (no zoom on a phone).
+  assert.match(CABINET, /\.cab-nav-a \{[^}]*min-height: 44px;/);
+  assert.match(CABINET, /\.cab-guide-t \{[^}]*min-height: 48px;/);
+  assert.match(CABINET, /\.cab-type \{[^}]*min-height: 64px;/);
+  assert.match(base, /\.field \{[^}]*font-size: 16px;/);
 });
 
-test('phones and tablets: the input row stacks, buttons take the row, the sections share one row, no row wider than the screen', () => {
-  const phone = media('max-width: 640px');
-  assert.match(block('.cabinet-row', phone), /flex-direction: column;/);
-  assert.match(block('.cabinet-row .qnet-button', phone), /width: 100%;/);
-  assert.match(block('.cabinet-actions', phone), /flex-direction: column;\n {4}align-items: stretch;/);
-  // Three or four sections (owner, 29.09): one row of equal pills, a little tighter below 420 px.
-  assert.match(block('.cabinet-nav', phone), /display: grid;\n {4}grid-auto-flow: column;\n {4}grid-auto-columns: minmax\(0, 1fr\);/);
-  assert.match(block('.cabinet-nav-link', media('max-width: 419px')), /padding-inline: 0\.25rem;\n {4}font-size: 0\.8125rem;/);
-  // Wider screens: one row that wraps.
-  assert.match(block('.cabinet-nav'), /flex-wrap: wrap;/);
-  assert.match(block('.cabinet-row'), /display: flex;\n {2}align-items: stretch;/);
-  // Flex children may shrink below their content, so a long address or the history table never widens the page.
-  assert.match(CSS, /\.cabinet > \*,\n\.cabinet \.activate-card > \*,[\s\S]*?\{\n {2}margin: 0;\n {2}min-width: 0;\n\}/);
-  assert.match(block('.cabinet-input'), /min-width: 0;/);
-  assert.match(block('.cabinet-table-wrap'), /overflow-x: auto;/);
-  // The history table's cells break between words, never inside an epoch or an amount; a wider table scrolls.
-  assert.match(block('.cabinet-table'), /overflow-wrap: normal;/);
-  assert.match(block('.activate-card'), /overflow-wrap: anywhere;/);
-  // The eligibility line stays readable on a phone (the explorer's own header shrinks its line to 0.7rem).
-  assert.match(block('.cabinet .explorer-header .section-subtitle', phone), /font-size: 0\.9375rem;/);
+// Owner 19.10 (B-SPEC, owner additions 7): phones and tablets genuinely convenient: the sections in a bar under the thumb
+// that never covers the page's end and steps aside for the menu and the account sheet, rows that stack, nothing wider
+// than the screen.
+test('phones and tablets: the sections under the thumb, rows that stack, buttons that take the row, nothing wider than the screen', () => {
+  const phone = cabinetMedia('max-width: 860px');
+  assert.match(phone, /\.cab-nav \{\n {4}position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;/);
+  // The bar's words keep the page's gutter from the screen's edges, above the home indicator.
+  assert.match(phone, /padding: 0 calc\(var\(--gut\) - 4px\) env\(safe-area-inset-bottom\);/);
+  assert.match(phone, /\.cab-nav-a \{ flex: 1 1 0; min-width: 0;[^}]*min-height: var\(--bar\);/);
+  assert.match(phone, /\.app-wrapper:has\(\.cab\[data-nav\]\) \{ padding-bottom: calc\(var\(--bar\) \+ env\(safe-area-inset-bottom\)\); \}/);
+  assert.match(phone, /html\[data-overlay\] \.cab-nav \{ visibility: hidden; \}/);
+  const narrow = cabinetMedia('max-width: 720px');
+  assert.match(narrow, /\.cab-field-row \{ flex-direction: column; align-items: stretch; \}/);
+  assert.match(narrow, /\.cab-send \.btn \{ grid-column: 1 \/ -1; width: 100%;/);
+  assert.match(narrow, /\.cab-facts > div \{ grid-template-columns: minmax\(0, 1fr\);/);
+  // Columns may shrink below their content, so a long address or a table never widens the page; a table scrolls in
+  // its own frame (DataTable).
+  assert.match(CABINET, /\.cab-main \{ grid-column: 4 \/ span 9; min-width: 0;/);
+  assert.match(CABINET, /\.cab-facts dd \{[^}]*min-width: 0;[^}]*overflow-wrap: anywhere;/);
+  // Tablets use the width: the two device actions side by side down to 720 px, the rail from 861 px.
+  assert.match(CABINET, /\.cab-acts \{ display: grid; grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
+  assert.match(narrow, /\.cab-acts \{ grid-template-columns: minmax\(0, 1fr\); \}/);
 });
 
 test('the wallet choice: kept as the address, its source and the Solana address it shared only; a QR answer is not a held wallet', () => {

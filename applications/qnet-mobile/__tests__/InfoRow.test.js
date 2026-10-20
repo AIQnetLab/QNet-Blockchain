@@ -12,12 +12,13 @@ import fs from 'fs';
 import path from 'path';
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 import {
   FIGURE_LINE, FIT_MIN_SCALE, FIT_ROOM, InfoField, InfoRow, LABEL_MIN_SCALE, ROW_FONT_CAP, SettingRow, TONES, figureFits,
   figureFitsIn, infoStyles,
 } from '../src/components/InfoRow';
 import { makeT } from '../src/i18n';
+import { FACES, color, space } from '../src/theme';
 
 const t = makeT('en');
 const flat = (s) => StyleSheet.flatten(s) || {};
@@ -28,6 +29,8 @@ const draw = (el) => {
 };
 const textsOf = (tree) => tree.root.findAllByType(Text);
 const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+// What a tap reaches: the element that holds the press handler.
+const pressables = (tree) => tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.props.accessibilityRole === 'button');
 
 describe('a row: the label and its value on one line', () => {
   it('both one line, shrinking to 80% at most, a larger text size counted up to 1.2 times; one element for a screen reader', () => {
@@ -54,16 +57,21 @@ describe('a row: the label and its value on one line', () => {
     expect(total.slice(1).map((n) => n.props.selectable)).toEqual([true, true]);
   });
 
-  it('one type per role: the label grey, the value white or in its tone, a total white and blue', () => {
+  it('one type per role: the label in Fog, the value in Paper or its tone, a figure and a total in the mono face', () => {
     const label = flat(textsOf(draw(<InfoRow label="Node" value="Online" tone="ok" />))[0].props.style);
-    expect(label).toMatchObject({ color: '#888888', fontSize: 14 });
-    expect(TONES).toEqual({ default: '#ffffff', accent: '#00d4ff', ok: '#34c759', warn: '#ff9500', bad: '#ff3b30' });
+    expect(label).toMatchObject({ color: color.fog, fontSize: 14, fontFamily: FACES.regular });
+    // Signal only for what can be acted on or moved now; Ember for what needs the user.
+    expect(TONES).toEqual({ default: color.paper, accent: color.signal, ok: color.paper, warn: color.ember, bad: color.ember });
     for (const tone of Object.keys(TONES)) {
       const value = flat(textsOf(draw(<InfoRow label="Node" value="x" tone={tone} />))[1].props.style);
-      expect([tone, value.color, value.fontSize, value.fontWeight]).toEqual([tone, TONES[tone], 15, '600']);
+      expect([tone, value.color, value.fontSize, value.fontFamily]).toEqual([tone, TONES[tone], 15, FACES.regular]);
     }
+    const figure = flat(textsOf(draw(<InfoRow label="Fee" value="0.0001 QNC" ltr fit />))[1].props.style);
+    expect([figure.fontSize, figure.fontFamily]).toEqual([15, FACES.data]);
     const [tl, tv] = textsOf(draw(<InfoRow label="Total" value="1.50015 QNC" total />)).map((n) => flat(n.props.style));
-    expect([tl.color, tl.fontWeight, tv.color, tv.fontWeight]).toEqual(['#ffffff', '600', TONES.accent, '700']);
+    expect([tl.color, tl.fontFamily, tv.color, tv.fontFamily]).toEqual([color.paper, FACES.semibold, color.paper, FACES.data]);
+    // A bundled face is named alone, never with a weight.
+    for (const st of [label, figure, tl, tv]) expect(st.fontWeight).toBeUndefined();
   });
 
   it('a figure shrinks to half its size, its label giving way far less, left to right in every language', () => {
@@ -132,41 +140,46 @@ describe('a field: the label over its value', () => {
       numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.5, maxFontSizeMultiplier: 1.2, selectable: true, testID: 'addr',
     });
     expect(value.props.children).toBe(ADDRESS);
-    expect(flat(value.props.style)).toMatchObject({ fontSize: 13, writingDirection: 'ltr' });
+    expect(flat(value.props.style)).toMatchObject({ fontSize: 14, writingDirection: 'ltr' });
     expect(flat(value.props.style).fontFamily).toMatch(/mono|courier/i);
   });
 
-  it('a hash shortened in its middle (not selectable, which would undo that), copied whole on a tap', () => {
+  it('a hash shortened in its middle (not selectable, which would undo that), copied whole on a tap; Copy answers Copied', () => {
     const onCopy = jest.fn();
     const hash = 'f'.repeat(64);
     const tree = draw(<InfoField t={t} label="Transaction" value={hash} mono middle onCopy={onCopy} copyTestID="copy" />);
-    const value = textsOf(tree)[1];
+    const value = textsOf(tree).find((n) => n.props.children === hash);
     expect(value.props).toMatchObject({ numberOfLines: 1, ellipsizeMode: 'middle', selectable: false });
-    expect(value.props.children).toBe(hash);
-    const button = tree.root.findAllByType(TouchableOpacity)[0];
-    expect(button.props).toMatchObject({ accessibilityRole: 'button', accessibilityHint: t('common_tap_to_copy'), testID: 'copy' });
-    act(() => { button.props.onPress(); });
+    const field = tree.root.find((n) => n.props.testID === 'copy' && typeof n.props.onPress === 'function');
+    expect(field.props).toMatchObject({ accessibilityRole: 'button', accessibilityHint: t('common_tap_to_copy') });
+    act(() => { field.props.onPress(); });
     expect(onCopy).toHaveBeenCalledTimes(1);
-    expect(textsOf(draw(<InfoField t={t} label="Transaction" value={hash} mono middle onCopy={onCopy} copied />))[0].props.children)
-      .toBe(t('common_copied'));
+    // The label line carries the Copy act at its end; the label itself stays the label.
+    const copyAct = tree.root.find((n) => n.props.kind === 'act');
+    expect([copyAct.props.label, copyAct.props.labels]).toEqual([t('common_copy'), [t('common_copy'), t('common_copied')]]);
+    act(() => { copyAct.props.onPress(); });
+    expect(onCopy).toHaveBeenCalledTimes(2);
+    const copied = draw(<InfoField t={t} label="Transaction" value={hash} mono middle onCopy={onCopy} copied />);
+    expect(textsOf(copied)[0].props.children).toBe('Transaction');
+    expect(copied.root.find((n) => n.props.kind === 'act').props).toMatchObject({ label: t('common_copied'), done: true });
   });
 
   it('a text read whole wraps; its label stays one line', () => {
     const [label, value] = textsOf(draw(<InfoField label="Memo" value="order 42 from the shop, paid in full" />));
     expect(label.props).toMatchObject({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.8, maxFontSizeMultiplier: 1.2 });
     expect(value.props.numberOfLines).toBeUndefined();
-    expect(flat(value.props.style)).toMatchObject({ color: '#ffffff', fontSize: 15, fontWeight: '600' });
+    expect(flat(value.props.style)).toMatchObject({ color: color.paper, fontSize: 15, fontFamily: FACES.regular });
   });
 
   it('a box of the caller\'s under the label (a recipient to confirm, a call\'s input), the label as every label', () => {
     const tree = draw(<InfoField label="To"><Text testID="box">d9fa 3703 74e2</Text></InfoField>);
     const [label, box] = textsOf(tree);
     expect(label.props).toMatchObject({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.8, maxFontSizeMultiplier: 1.2 });
-    expect(flat(label.props.style)).toMatchObject({ color: '#888888', fontSize: 14 });
+    expect(flat(label.props.style)).toMatchObject({ color: color.fog, fontSize: 14 });
     expect(box.props.testID).toBe('box');
     expect(textsOf(tree)).toHaveLength(2);
     // The box stays reachable for a screen reader: the field is not one element.
-    expect(tree.root.findAll((n) => n.type === View && flat(n.props.style).paddingVertical === 10)[0].props.accessible).toBe(false);
+    expect(tree.root.findAll((n) => n.type === View && flat(n.props.style).paddingVertical === space.s12)[0].props.accessible).toBe(false);
   });
 });
 
@@ -179,13 +192,16 @@ describe('a setting: its title and its value on one line', () => {
       expect(n.props).toMatchObject({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: LABEL_MIN_SCALE, maxFontSizeMultiplier: ROW_FONT_CAP });
     }
     expect(note.props.numberOfLines).toBeUndefined();
-    expect(flat(title.props.style)).toMatchObject({ color: '#ffffff', fontSize: 16, fontWeight: '600' });
-    expect(flat(value.props.style)).toMatchObject({ color: TONES.accent, fontSize: 14, fontWeight: '600' });
-    const button = tree.root.findAllByType(TouchableOpacity)[0];
-    expect(button.props.accessibilityRole).toBe('button');
-    act(() => { button.props.onPress(); });
+    expect(flat(title.props.style)).toMatchObject({ color: color.paper, fontSize: 16, fontFamily: FACES.semibold });
+    // The value in Signal without a box: the whole row is what a tap reaches.
+    expect(flat(value.props.style)).toMatchObject({ color: TONES.accent, fontSize: 16, fontFamily: FACES.semibold });
+    expect(flat(infoStyles.settingValueBox).borderWidth).toBeUndefined();
+    const [row] = pressables(tree);
+    expect(row.props.accessibilityRole).toBe('button');
+    expect(row.findAllByType(Text)).toHaveLength(3);
+    act(() => { row.props.onPress(); });
     expect(onPress).toHaveBeenCalledTimes(1);
-    // The title takes what the value's box leaves, the box at most half the row.
+    // The title takes what the value leaves, the value at most half the row.
     expect(flat(infoStyles.settingText).flex).toBe(1);
     expect(flat(infoStyles.settingValueBox)).toMatchObject({ flexShrink: 1, maxWidth: '50%' });
   });
@@ -198,7 +214,7 @@ describe('a setting: its title and its value on one line', () => {
     expect(origin.props.numberOfLines).toBe(2);
     expect(flat(origin.props.style).writingDirection).toBe('ltr');
     const plain = draw(<SettingRow title="Current Network" subtitle="QNet Blockchain testnet" />);
-    expect(plain.root.findAllByType(TouchableOpacity)).toHaveLength(0);
+    expect(pressables(plain)).toHaveLength(0);
     expect(textsOf(plain)).toHaveLength(2);
   });
 });
@@ -213,13 +229,13 @@ describe('right to left, and the one source of rows', () => {
 
   it('the screens build their rows from it; the hand-built rows and their styles are gone', () => {
     const uses = {
-      'src/screens/NodeTab.js': /import \{ InfoField, InfoRow \} from '\.\.\/components\/InfoRow';/,
-      'src/screens/HistoryTab.js': /import \{ InfoField, InfoRow \} from '\.\.\/components\/InfoRow';/,
+      'src/screens/NodeTab.js': /import \{ FIGURE_LINE, InfoRow \} from '\.\.\/components\/InfoRow';/,
+      'src/screens/HistoryTab.js': /import \{ FIGURE_LINE, InfoField, InfoRow, ROW_FONT_CAP \} from '\.\.\/components\/InfoRow';/,
       'src/screens/QNetLinkScreen.js': /import \{ InfoField, InfoRow \} from '\.\.\/components\/InfoRow';/,
       'src/browser/DappSheet.js': /import \{ InfoField, InfoRow \} from '\.\.\/components\/InfoRow';/,
       'src/components/SendReview.js': /import \{ InfoField, InfoRow \} from '\.\/InfoRow';/,
       'src/screens/SolanaSend.js': /import \{ InfoRow \} from '\.\.\/components\/InfoRow';/,
-      'src/screens/WalletScreen.js': /import \{ FIGURE_LINE, InfoRow, SettingRow, figureFitsIn \} from '\.\.\/components\/InfoRow';/,
+      'src/screens/WalletScreen.js': /import \{ FIGURE_LINE, InfoRow, LinkRow, SettingRow, figureFitsIn \} from '\.\.\/components\/InfoRow';/,
       'src/components/TxResultCard.js': /import \{ InfoField \} from '\.\/InfoRow';/,
     };
     for (const [file, re] of Object.entries(uses)) expect([file, re.test(read(file))]).toEqual([file, true]);
@@ -252,7 +268,7 @@ describe('right to left, and the one source of rows', () => {
     const translations = require('../src/i18n/translations').default;
     for (const [lang, table] of Object.entries(translations)) {
       // No label of a row ends in a colon: the row itself sets the label apart.
-      const colon = ['node_name', 'node_type', 'node_status_node', 'node_background', 'node_epoch_ends',
+      const colon = ['node_name', 'node_type', 'node_background', 'node_epoch_ends',
         'node_reputation', 'node_balance', 'node_answered', 'node_last_seen', 'node_heartbeats', 'node_not_admitted']
         .filter((k) => /[:：]\s*$/.test(table[k]));
       expect([lang, colon]).toEqual([lang, []]);

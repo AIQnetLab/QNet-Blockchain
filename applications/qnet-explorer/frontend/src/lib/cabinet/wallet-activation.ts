@@ -89,7 +89,7 @@ export interface ActivationView {
   // The wallet's light node on the network: pending (being recorded), no_device, device_pending (a device linked that has
   // not answered yet), online, offline; null without one.
   light: NodeState | null;
-  // Its super node: online, offline, or registered and waiting for the network's admission; `registered` while the
+  // Its super node: online, offline, or registered, not admitted to consensus yet; `registered` while the
   // network lists it and its status is not read yet.
   superNode: SuperState | 'registered' | null;
   // A super node not registered yet whose server the network sees (it is catching up before its registration).

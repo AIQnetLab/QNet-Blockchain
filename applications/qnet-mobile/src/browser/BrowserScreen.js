@@ -21,12 +21,15 @@
  */
 import React, { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet, Share, ScrollView, ActivityIndicator, Keyboard, findNodeHandle, AppState,
+  View, Text, TextInput, Pressable, StyleSheet, Share, ScrollView, ActivityIndicator, Keyboard, findNodeHandle, AppState,
 } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { WebView } from 'react-native-webview';
-import Svg, { Path, Circle } from 'react-native-svg';
+import Action from '../components/ui/Action';
+import Menu from '../components/ui/Menu';
+import { LinkRow } from '../components/InfoRow';
 import { providerScript, PAGE_OPENED_METHOD } from './providerScript';
+import { color, radius, size, space, themed } from '../theme';
 import { readBridgeMessage, responseScript, eventScript, PageSession, PAUSE_MEDIA_SCRIPT } from './bridge';
 import { createDappProvider, pageError, ProviderError, CODES, visibleLabel } from './dappProvider';
 import { createGrantStore } from './grants';
@@ -112,38 +115,15 @@ export function sendAnswer(r) {
 export const BOOKMARK_URL = EXPLORER_PAGE;
 const PENDING_PER_PAGE = 16;
 const NOTICE_MS = 4000;
-// Below this toolbar width (a 320 dp phone) Forward moves into the ⋮ menu, so the address keeps room for its domain.
-const COMPACT_TOOLBAR = 360;
+// The toolbar's height: the More menu drops from under it.
+const MENU_TOP = 46;
 // A page title as the tab overview shows it: its hidden characters replaced, cut as the recent pages cut it.
 const TITLE_MAX = 80;
 
-const ICON = '#9aa3b5';
-const glyph = (d, color = ICON, size = 22) => (
-  <Svg width={size} height={size} viewBox="0 0 24 24">
-    <Path d={d} stroke={color} strokeWidth={2} fill="none" strokeLinecap="round" strokeLinejoin="round" />
-  </Svg>
-);
-
-function LockGlyph({ color }) {
-  return (
-    <Svg width={13} height={13} viewBox="0 0 24 24">
-      <Path d="M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6z" stroke={color} strokeWidth={2.2} fill="none" strokeLinejoin="round" />
-    </Svg>
-  );
-}
-
-function MenuGlyph() {
-  return (
-    <Svg width={22} height={22} viewBox="0 0 24 24">
-      <Circle cx={12} cy={5.5} r={1.6} fill={ICON} />
-      <Circle cx={12} cy={12} r={1.6} fill={ICON} />
-      <Circle cx={12} cy={18.5} r={1.6} fill={ICON} />
-    </Svg>
-  );
-}
-
+// `walletMenu`: what the wallet header's More holds (components/ui/Menu items); its More is hidden on this tab, so the
+// toolbar's More carries them after the browser's own.
 const BrowserScreen = forwardRef(function BrowserScreen({
-  visible, wallet, credential, walletManager, t, onSheet, confirmAction, onSent, dev = false, rtl = false,
+  visible, wallet, credential, walletManager, t, onSheet, confirmAction, onSent, walletMenu = [], dev = false,
 }, ref) {
   // Each tab's page: its WebView, its page session (bound to the tab: an answer goes into that tab only) and its
   // unanswered requests (nav:doc → count). Dropped with the tab.
@@ -172,7 +152,6 @@ const BrowserScreen = forwardRef(function BrowserScreen({
   const menuButtonRef = useRef(null);
   const [notice, setNotice] = useState('');
   const [recent, setRecent] = useState([]);
-  const [barWidth, setBarWidth] = useState(0);
   // Android: a hidden web view that wipes what a cleared session left on the phone (webViewEvents.clearNeedsWipe); its
   // key while one is due, else 0.
   const [wiper, setWiper] = useState(0);
@@ -722,7 +701,6 @@ const BrowserScreen = forwardRef(function BrowserScreen({
   const showPage = !front.home && front.source !== null;
   const loading = nav.loading || !!pending;
   const full = !canAddTab(tabState);
-  const compact = barWidth > 0 && barWidth < COMPACT_TOOLBAR;
 
   const addressBar = () => {
     if (editing || !showPage) {
@@ -734,7 +712,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
           onSubmitEditing={submitAddress}
           onBlur={() => setEditing(false)}
           placeholder={t('browser_address_placeholder')}
-          placeholderTextColor="#667085"
+          placeholderTextColor={color.fog}
           autoFocus={editing}
           selectTextOnFocus
           autoCapitalize="none"
@@ -749,16 +727,15 @@ const BrowserScreen = forwardRef(function BrowserScreen({
         />
       );
     }
-    // An address still loading has no lock and no emphasis: only the page on screen gets them.
+    // An address still loading has no emphasis: only the page on screen gets it. No lock: every page is https.
     return (
-      <TouchableOpacity
+      <Pressable
         style={s.addressShown}
         onPress={() => { setInput(shownUrl); setEditing(true); }}
         accessibilityRole="button"
         accessibilityLabel={page ? page.host : t('browser_address_label')}
         testID={pending ? 'browser-address-loading' : 'browser-address'}
       >
-        {page && page.secure && !pending ? <LockGlyph color="#00d4ff" /> : null}
         <Text style={s.addressText} numberOfLines={1} ellipsizeMode="head">
           {page ? (
             <>
@@ -768,51 +745,28 @@ const BrowserScreen = forwardRef(function BrowserScreen({
             </>
           ) : shownUrl}
         </Text>
-      </TouchableOpacity>
+      </Pressable>
     );
   };
 
-  // `mirror`: an arrow that points the other way in a right-to-left language.
-  const toolButton = (label, d, onPress, disabled = false, mirror = false) => (
-    <TouchableOpacity
-      style={[s.tool, disabled && s.toolOff]}
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled }}
-      hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }}
-    >
-      <View style={mirror && rtl ? s.mirror : null}>{glyph(d)}</View>
-    </TouchableOpacity>
-  );
-
   const startPage = () => (
     <ScrollView style={s.start} contentContainerStyle={s.startBody} keyboardShouldPersistTaps="handled">
-      <TouchableOpacity style={s.tile} onPress={() => open(BOOKMARK_URL)} accessibilityRole="button" testID="bookmark-aiqnet">
-        <View style={s.tileMark}><Text style={s.tileMarkText}>Q</Text></View>
-        <View style={s.tileText}>
-          <Text style={s.tileTitle}>aiqnet.io</Text>
-          <Text style={s.tileSub} numberOfLines={2}>{t('browser_bookmark_explorer')}</Text>
-        </View>
-      </TouchableOpacity>
+      <View style={s.bookmark}>
+        <LinkRow title="aiqnet.io" note={t('browser_bookmark_explorer')} noteLines={2} onPress={() => open(BOOKMARK_URL)}
+          testID="bookmark-aiqnet" />
+      </View>
       <Text style={s.sectionTitle}>{t('browser_recent')}</Text>
       {recent.length === 0 ? <Text style={s.empty}>{t('browser_recent_empty')}</Text> : recent.map((e) => {
         const d = describeUrl(e.url);
         return (
-          <TouchableOpacity key={e.url} style={s.recentRow} onPress={() => open(e.url)} accessibilityRole="button">
-            <Text style={s.recentTitle} numberOfLines={1}>{e.title || (d ? d.host : e.url)}</Text>
-            <Text style={s.recentUrl} numberOfLines={1} ellipsizeMode="middle">{e.url}</Text>
-          </TouchableOpacity>
+          <LinkRow key={e.url} title={e.title || (d ? d.host : e.url)} titleLines={1} note={e.url} noteLines={1} ltrNote
+            onPress={() => open(e.url)} />
         );
       })}
-      <TouchableOpacity
-        style={s.clearButton}
-        onPress={() => confirmAction(t('browser_clear_title'), t('browser_clear_body'), clearData)}
-        accessibilityRole="button"
-      >
-        <Text style={s.clearText}>{t('browser_clear')}</Text>
-      </TouchableOpacity>
+      <View style={s.clearButton}>
+        <Action kind="destructive" label={t('browser_clear')}
+          onPress={() => confirmAction(t('browser_clear_title'), t('browser_clear_body'), clearData)} />
+      </View>
     </ScrollView>
   );
 
@@ -878,7 +832,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
               {description ? <Text style={s.errorDetail}>{String(description)}</Text> : null}
             </View>
           )}
-          renderLoading={() => <ActivityIndicator color="#00d4ff" style={s.loading} />}
+          renderLoading={() => <ActivityIndicator color={color.signal} style={s.loading} />}
           style={s.webview}
         />
       </View>
@@ -898,9 +852,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
     <View style={s.overview} accessibilityViewIsModal testID="browser-tab-overview">
       <View style={s.overviewHeader}>
         <Text style={s.overviewTitle} numberOfLines={1}>{t('browser_tabs_count', { count: tabs.length })}</Text>
-        <TouchableOpacity style={s.overviewDone} onPress={() => setOverview(false)} accessibilityRole="button">
-          <Text style={s.overviewDoneText}>{t('common_done')}</Text>
-        </TouchableOpacity>
+        <Action kind="act" label={t('common_done')} onPress={() => setOverview(false)} align="end" style={s.overviewDone} />
       </View>
       <ScrollView style={s.start} contentContainerStyle={s.overviewBody}>
         {tabs.map((tab) => {
@@ -908,8 +860,8 @@ const BrowserScreen = forwardRef(function BrowserScreen({
           const inFront = tab.id === active;
           return (
             <View key={tab.id} style={[s.tabRow, inFront && s.tabRowFront]}>
-              <TouchableOpacity
-                style={s.tabMain}
+              <Pressable
+                style={({ pressed }) => [s.tabMain, pressed && s.pressed]}
                 onPress={() => switchTo(tab.id)}
                 accessibilityRole="button"
                 accessibilityState={{ selected: inFront }}
@@ -917,34 +869,27 @@ const BrowserScreen = forwardRef(function BrowserScreen({
               >
                 <Text style={[s.tabTitle, inFront && s.tabTitleFront]} numberOfLines={1}>{title}</Text>
                 {host ? <Text style={s.tabHost} numberOfLines={1} ellipsizeMode="head">{host}</Text> : null}
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={s.tabClose}
+              </Pressable>
+              <Action
+                kind="quiet"
+                label={t('common_close')}
                 onPress={() => closeTabById(tab.id)}
-                accessibilityRole="button"
                 accessibilityLabel={t('browser_close_tab', { title })}
                 testID={`browser-tab-close-${tab.id}`}
-              >
-                {glyph('M6 6l12 12M18 6L6 18', ICON, 18)}
-              </TouchableOpacity>
+                align="end"
+                style={s.tabClose}
+              />
             </View>
           );
         })}
         {full ? <Text style={s.tabsNote}>{t('browser_tabs_full', { max: MAX_TABS })}</Text> : null}
         <View style={s.overviewActions}>
-          <TouchableOpacity
-            style={[s.overviewButton, full && s.toolOff]}
-            onPress={newTab}
-            disabled={full}
-            accessibilityRole="button"
-            accessibilityState={{ disabled: full }}
-            testID="browser-new-tab"
-          >
-            <Text style={s.overviewButtonText}>{t('browser_new_tab')}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={s.overviewButton} onPress={closeAll} accessibilityRole="button" testID="browser-close-all">
-            <Text style={s.overviewButtonText}>{t('browser_close_all_tabs')}</Text>
-          </TouchableOpacity>
+          <View style={s.overviewButton}>
+            <Action kind="text" align="center" label={t('browser_new_tab')} onPress={newTab} disabled={full} testID="browser-new-tab" />
+          </View>
+          <View style={s.overviewButton}>
+            <Action kind="text" align="center" label={t('browser_close_all_tabs')} onPress={closeAll} testID="browser-close-all" />
+          </View>
         </View>
       </ScrollView>
     </View>
@@ -952,23 +897,42 @@ const BrowserScreen = forwardRef(function BrowserScreen({
 
   const menuItems = [
     // On a tablet the share sheet is a popover: it points at the menu button it came from.
-    showPage ? [t('browser_share'), () => {
+    showPage ? { label: t('browser_share'), onPress: () => {
       setMenu(false);
       Share.share({ message: nav.url }, { anchor: findNodeHandle(menuButtonRef.current) || undefined }).catch(() => {});
-    }] : null,
-    showPage ? [t('browser_copy'), () => { setMenu(false); Clipboard.setString(nav.url); setNotice(t('browser_copied')); }] : null,
-    // A narrow toolbar has no Forward button (COMPACT_TOOLBAR): it is here instead, while there is a page to go to.
-    compact && showPage && nav.canGoForward ? [t('browser_forward'), () => { setMenu(false); goForward(); }] : null,
-    [t('browser_new_tab'), () => { setMenu(false); newTab(); }],
-    [t('browser_home'), () => {
+    } } : null,
+    showPage ? { label: t('browser_copy'), onPress: () => { setMenu(false); Clipboard.setString(nav.url); setNotice(t('browser_copied')); } } : null,
+    // Forward, while there is a page to go to; Stop while a page loads, Reload otherwise (the toolbar has Back only).
+    showPage && nav.canGoForward ? { label: t('browser_forward'), onPress: () => { setMenu(false); goForward(); } } : null,
+    showPage && loading ? { label: t('browser_stop'), onPress: () => {
+      setMenu(false);
+      update((st) => dropPending(st, active));
+      const web = webOf(active);
+      if (web) web.stopLoading();
+    } } : null,
+    showPage && !loading ? { label: t('browser_reload'), onPress: () => {
+      setMenu(false);
+      userNavigated(active);
+      const web = webOf(active);
+      if (web) web.reload();
+    } } : null,
+    { label: t('browser_new_tab'), onPress: () => { setMenu(false); newTab(); } },
+    { label: t('browser_home'), onPress: () => {
       // Its page stays loaded under the start page (the browsing session goes on) but no longer plays.
       pauseMedia(active);
       userNavigated(active);
       setMenu(false);
       update((st) => updateTab(st, active, { home: true }));
       setInput('');
-    }],
-    [t('browser_clear'), () => { setMenu(false); confirmAction(t('browser_clear_title'), t('browser_clear_body'), clearData); }],
+    } },
+    // What cannot be undone, in Ember.
+    { label: t('browser_clear'), warn: true, onPress: () => { setMenu(false); confirmAction(t('browser_clear_title'), t('browser_clear_body'), clearData); } },
+    // The wallet's own items after a rule; a switch keeps the menu open, as in the header's.
+    ...walletMenu.map((item, i) => ({
+      ...item,
+      divider: i === 0,
+      onPress: item.onPress && (() => { setMenu(false); item.onPress(); }),
+    })),
   ].filter(Boolean);
 
   // Android: the hidden web view that wipes a cleared session's data, only while no tab holds a page (so no tab is
@@ -1007,22 +971,11 @@ const BrowserScreen = forwardRef(function BrowserScreen({
   return (
     <View style={s.pane}>
       <View style={s.chrome} {...underOverview} testID="browser-chrome">
-        <View style={s.toolbar} onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}>
-          {toolButton(t('browser_back'), 'M15 5l-7 7 7 7', goBack, !showPage || !nav.canGoBack, true)}
-          {compact ? null : toolButton(t('browser_forward'), 'M9 5l7 7-7 7', goForward, !showPage || !nav.canGoForward, true)}
+        {/* Back, the address, the tab count and More, the same at every width; Forward, Reload and Stop are in More. */}
+        <View style={s.toolbar}>
+          <Action kind="act" label={t('browser_back')} onPress={goBack} disabled={!showPage || !nav.canGoBack} style={s.toolAct} />
           <View style={s.addressBox}>{addressBar()}</View>
-          {showPage && loading
-            ? toolButton(t('browser_stop'), 'M6 6l12 12M18 6L6 18', () => {
-              update((st) => dropPending(st, active));
-              const web = webOf(active);
-              if (web) web.stopLoading();
-            })
-            : toolButton(t('browser_reload'), 'M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6', () => {
-              userNavigated(active);
-              const web = webOf(active);
-              if (web) web.reload();
-            }, !showPage)}
-          <TouchableOpacity
+          <Pressable
             style={s.tool}
             onPress={openOverview}
             accessibilityRole="button"
@@ -1031,10 +984,11 @@ const BrowserScreen = forwardRef(function BrowserScreen({
             testID="browser-tabs"
           >
             <View style={s.tabCount}><Text style={s.tabCountText}>{tabs.length}</Text></View>
-          </TouchableOpacity>
-          <TouchableOpacity ref={menuButtonRef} style={s.tool} onPress={() => setMenu((m) => !m)} accessibilityRole="button" accessibilityLabel={t('browser_menu')}>
-            <MenuGlyph />
-          </TouchableOpacity>
+          </Pressable>
+          {/* The share sheet of a tablet points at this (Share's anchor). */}
+          <View ref={menuButtonRef} collapsable={false}>
+            <Action kind="act" label={t('common_more')} onPress={() => setMenu((m) => !m)} align="end" style={s.toolAct} />
+          </View>
         </View>
         {showPage && loading && progress < 1 ? (
           <View style={s.progressTrack}><View style={[s.progressBar, { width: `${Math.max(5, Math.round(progress * 100))}%` }]} /></View>
@@ -1047,18 +1001,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
         </View>
       </View>
       {wipeView()}
-      {menu ? (
-        <>
-          <TouchableOpacity style={s.menuBackdrop} activeOpacity={1} onPress={() => setMenu(false)} />
-          <View style={s.menuCard}>
-            {menuItems.map(([label, onPress]) => (
-              <TouchableOpacity key={label} style={s.menuItem} onPress={onPress} accessibilityRole="button">
-                <Text style={s.menuText}>{label}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </>
-      ) : null}
+      {menu ? <Menu items={menuItems} onClose={() => setMenu(false)} closeLabel={t('common_close')} top={MENU_TOP} level="pane" /> : null}
       {overview ? tabOverview() : null}
     </View>
   );
@@ -1066,101 +1009,92 @@ const BrowserScreen = forwardRef(function BrowserScreen({
 
 export default BrowserScreen;
 
-const s = StyleSheet.create({
-  pane: { flex: 1, backgroundColor: '#11131f' },
+const s = themed((type) => ({
+  pane: { flex: 1, backgroundColor: color.ink },
   chrome: { flex: 1 },
   toolbar: {
-    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 4, paddingVertical: 6, backgroundColor: '#16213e',
-    borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: 'rgba(0, 212, 255, 0.3)',
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: space.s4, paddingVertical: 6, backgroundColor: color.ink,
+    borderBottomWidth: 1, borderBottomColor: color.rule,
   },
-  tool: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
-  toolOff: { opacity: 0.35 },
-  addressBox: { flex: 1, minWidth: 0, marginHorizontal: 2 },
+  // The tab count and the two acts keep their targets through their reach (hitSlop), so the address keeps its room
+  // for a placeholder in every language on a 320 dp phone.
+  tool: { width: 40, height: 44, alignItems: 'center', justifyContent: 'center' },
+  toolAct: { paddingHorizontal: space.s4 },
+  addressBox: { flex: 1, minWidth: 0, marginHorizontal: space.s4 },
   addressInput: {
-    height: 36, borderRadius: 18, backgroundColor: '#0f1424', color: '#ffffff', paddingHorizontal: 12, paddingVertical: 0,
-    fontSize: 14, borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.35)',
+    ...type('field', 14), height: 36, borderRadius: radius.box, backgroundColor: color.fillField, color: color.paper,
+    paddingHorizontal: 10, paddingVertical: 0, borderWidth: 1, borderColor: color.edge,
   },
   addressShown: {
-    height: 36, borderRadius: 18, backgroundColor: '#0f1424', paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 6,
+    height: 36, borderRadius: radius.box, backgroundColor: color.fillField, borderWidth: 1, borderColor: color.edge,
+    paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 6,
   },
-  addressText: { flex: 1, fontSize: 14, writingDirection: 'ltr' },
-  addressPrefix: { color: '#8a93a6' },
-  addressDomain: { color: '#ffffff', fontWeight: '700' },
-  // The tab count: a small outlined square, like the tabs button of a phone's own browser.
+  addressText: { ...type('field', 14), flex: 1, writingDirection: 'ltr' },
+  addressPrefix: { color: color.fog },
+  addressDomain: { ...type('row', 14), color: color.paper },
+  // The tab count: a number in a small square (a datum, how many tabs are open).
   tabCount: {
-    minWidth: 20, height: 20, paddingHorizontal: 3, borderRadius: 5, borderWidth: 2, borderColor: ICON,
+    minWidth: 22, height: 22, paddingHorizontal: 3, borderRadius: radius.box, borderWidth: 1, borderColor: color.edge,
     alignItems: 'center', justifyContent: 'center',
   },
-  tabCountText: { color: ICON, fontSize: 11, fontWeight: '700' },
-  progressTrack: { height: 2, backgroundColor: 'transparent' },
-  progressBar: { height: 2, backgroundColor: '#00d4ff' },
-  idn: { color: '#ffaa00', fontSize: 12, paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#2a220d' },
-  notice: { color: '#ffffff', fontSize: 13, paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#23304f' },
+  tabCountText: { ...type('data', 11), color: color.paper },
+  progressTrack: { height: 2, backgroundColor: color.clear },
+  progressBar: { height: 2, backgroundColor: color.signal },
+  idn: {
+    ...type('note', 12), color: color.ember, paddingHorizontal: space.s12, paddingVertical: 6, backgroundColor: color.ink,
+    borderBottomWidth: 1, borderBottomColor: color.rule,
+  },
+  notice: {
+    ...type('note'), color: color.paper, paddingHorizontal: space.s12, paddingVertical: space.s8, backgroundColor: color.ink,
+    borderBottomWidth: 1, borderBottomColor: color.rule,
+  },
   content: { flex: 1 },
   web: { ...StyleSheet.absoluteFillObject },
   wiper: { position: 'absolute', top: 0, start: 0, width: 1, height: 1, opacity: 0 },
   shown: { zIndex: 1 },
   hidden: { opacity: 0 },
-  webview: { flex: 1, backgroundColor: '#ffffff' },
+  webview: { flex: 1, backgroundColor: color.web },
   loading: { position: 'absolute', top: 16, alignSelf: 'center' },
-  start: { flex: 1, backgroundColor: '#11131f' },
-  startBody: { padding: 16, paddingBottom: 32, width: '100%', maxWidth: 640, alignSelf: 'center' },
-  tile: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: '#1a1a2e', borderRadius: 14, padding: 14,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)', marginBottom: 20,
+  start: { flex: 1, backgroundColor: color.ink },
+  startBody: { padding: space.gut, paddingBottom: space.s32, width: '100%', maxWidth: size.column, alignSelf: 'center' },
+  // The start page's one bookmark, a row like the recent pages under it.
+  bookmark: { marginBottom: space.s24 },
+  sectionTitle: {
+    ...type('label'), color: color.fog, paddingBottom: space.s8, borderBottomWidth: 1, borderBottomColor: color.ruleStrong,
   },
-  tileMark: { width: 44, height: 44, borderRadius: 12, backgroundColor: '#00d4ff', alignItems: 'center', justifyContent: 'center', marginEnd: 12 },
-  tileMarkText: { color: '#11131f', fontSize: 22, fontWeight: '800' },
-  tileText: { flex: 1, minWidth: 0 },
-  tileTitle: { color: '#ffffff', fontSize: 16, fontWeight: '700' },
-  tileSub: { color: '#9aa3b5', fontSize: 13, marginTop: 2 },
-  sectionTitle: { color: '#9aa3b5', fontSize: 13, fontWeight: '700', marginBottom: 8, textTransform: 'uppercase' },
-  empty: { color: '#667085', fontSize: 13, marginBottom: 16 },
-  recentRow: { paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#2a3350' },
-  recentTitle: { color: '#ffffff', fontSize: 14 },
-  recentUrl: { color: '#667085', fontSize: 12, marginTop: 2, writingDirection: 'ltr' },
-  clearButton: {
-    marginTop: 20, alignSelf: 'flex-start', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)',
+  empty: { ...type('note'), color: color.fog, marginTop: space.s12, marginBottom: space.s16 },
+  clearButton: { marginTop: space.s24, alignSelf: 'flex-start' },
+  errorView: {
+    ...StyleSheet.absoluteFillObject, backgroundColor: color.ink, alignItems: 'flex-start', justifyContent: 'center',
+    padding: space.s24,
   },
-  clearText: { color: '#00d4ff', fontSize: 14, fontWeight: '600' },
-  errorView: { ...StyleSheet.absoluteFillObject, backgroundColor: '#11131f', alignItems: 'center', justifyContent: 'center', padding: 24 },
-  errorTitle: { color: '#ffffff', fontSize: 16, fontWeight: '700', marginBottom: 8, textAlign: 'center' },
-  errorText: { color: '#9aa3b5', fontSize: 13, textAlign: 'center' },
-  errorDetail: { color: '#667085', fontSize: 12, textAlign: 'center', marginTop: 8, writingDirection: 'ltr' },
-  mirror: { transform: [{ scaleX: -1 }] },
-  menuBackdrop: { ...StyleSheet.absoluteFillObject, zIndex: 50 },
-  menuCard: {
-    position: 'absolute', top: 46, end: 8, minWidth: 200, maxWidth: '90%', backgroundColor: '#16213e', borderRadius: 12,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)', paddingVertical: 4, zIndex: 51, elevation: 12,
-  },
-  menuItem: { paddingVertical: 12, paddingHorizontal: 16 },
-  menuText: { color: '#ffffff', fontSize: 15 },
+  errorTitle: { ...type('h3'), color: color.paper, marginBottom: space.s8 },
+  errorText: { ...type('body'), color: color.text },
+  errorDetail: { ...type('data', 12), color: color.fog, marginTop: space.s8, writingDirection: 'ltr' },
+  pressed: { backgroundColor: color.fillPress },
   // The tab overview covers the whole browser pane; the pages stay loaded under it.
-  overview: { ...StyleSheet.absoluteFillObject, backgroundColor: '#11131f', zIndex: 40, elevation: 10 },
+  overview: { ...StyleSheet.absoluteFillObject, backgroundColor: color.ink, zIndex: 40, elevation: 10 },
   overviewHeader: {
-    flexDirection: 'row', alignItems: 'center', minHeight: 48, paddingStart: 16, paddingEnd: 4, backgroundColor: '#16213e',
-    borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: 'rgba(0, 212, 255, 0.3)',
+    flexDirection: 'row', alignItems: 'center', minHeight: 48, paddingStart: space.gut, paddingEnd: space.s4,
+    backgroundColor: color.ink, borderBottomWidth: 1, borderBottomColor: color.rule,
   },
-  overviewTitle: { flex: 1, minWidth: 0, color: '#ffffff', fontSize: 16, fontWeight: '700' },
-  overviewDone: { minWidth: 44, minHeight: 44, paddingHorizontal: 12, alignItems: 'center', justifyContent: 'center' },
-  overviewDoneText: { color: '#00d4ff', fontSize: 15, fontWeight: '600' },
-  overviewBody: { padding: 16, paddingBottom: 32, width: '100%', maxWidth: 640, alignSelf: 'center' },
+  overviewTitle: { ...type('h3'), flex: 1, minWidth: 0, color: color.paper },
+  overviewDone: { paddingHorizontal: space.s12 },
+  overviewBody: { padding: space.gut, paddingBottom: space.s32, width: '100%', maxWidth: size.column, alignSelf: 'center' },
   tabRow: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: '#1a1a2e', borderRadius: 12, borderWidth: 1,
-    borderColor: '#2a3350', marginBottom: 10,
+    flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: color.rule,
+    borderStartWidth: 2, borderStartColor: color.clear,
   },
-  tabRowFront: { borderColor: '#00d4ff', backgroundColor: 'rgba(0, 212, 255, 0.08)' },
-  tabMain: { flex: 1, minWidth: 0, minHeight: 56, paddingVertical: 8, paddingStart: 14, justifyContent: 'center' },
-  tabTitle: { color: '#ffffff', fontSize: 15 },
-  tabTitleFront: { fontWeight: '700' },
-  tabHost: { color: '#667085', fontSize: 12, marginTop: 2, writingDirection: 'ltr' },
-  tabClose: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center', marginEnd: 4 },
-  tabsNote: { color: '#ffaa00', fontSize: 13, lineHeight: 19, marginTop: 2, marginBottom: 8 },
-  overviewActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 10 },
-  overviewButton: {
-    flexGrow: 1, flexBasis: 140, minHeight: 44, borderRadius: 10, paddingVertical: 10, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: 'rgba(0, 212, 255, 0.3)', alignItems: 'center', justifyContent: 'center',
+  tabRowFront: { borderStartColor: color.signal },
+  tabMain: {
+    flex: 1, minWidth: 0, minHeight: 56, paddingVertical: space.s8, paddingStart: space.s12, justifyContent: 'center',
+    alignItems: 'flex-start',
   },
-  overviewButtonText: { color: '#00d4ff', fontSize: 14, fontWeight: '600', textAlign: 'center' },
-});
+  tabTitle: { ...type('row', 15), color: color.paper },
+  tabTitleFront: { color: color.paper },
+  tabHost: { ...type('data', 12), color: color.fog, marginTop: 2, writingDirection: 'ltr' },
+  tabClose: { paddingHorizontal: space.s12 },
+  tabsNote: { ...type('note'), color: color.ember, marginTop: 2, marginBottom: space.s8 },
+  overviewActions: { flexDirection: 'row', flexWrap: 'wrap', gap: space.s12, marginTop: 10 },
+  overviewButton: { flexGrow: 1, flexBasis: 140 },
+}));

@@ -5,35 +5,44 @@
 // wallet"). The card hands over the connected wallet's Solana address without a URL (src/lib/faucet-handover.ts):
 // the field is filled in once, and nothing is sent before the visitor presses the button. It also hands over the faucet
 // pass the site gave for the QNet wallet being activated, sent with the claims (SITE M-13). A refused claim names the
-// time to try again.
+// time to try again. Waiting and a failure take the line under the form (B-SPEC 5.22); a claim that went through shows a
+// panel with a green check, the amounts, the address and the transactions until it is closed.
 
-import { useEffect, useState } from 'react';
-import Link from 'next/link';
+import { useEffect, useState, type FormEvent } from 'react';
+import Action from '@/components/ui/Action';
+import EntityLink from '@/components/ui/EntityLink';
+import TokenIcon from '@/components/TokenIcon';
+import PageHead from '@/components/ui/PageHead';
+import { Failed, Waiting } from '@/components/ui/RequestState';
+import Section from '@/components/ui/Section';
+import { clockAt } from '@/lib/format';
 import { retryAt, takeHandedOver, takeHandedPass } from '@/lib/faucet-handover';
+import { t } from '@/lib/texts';
 
 // Test SOL a claim asks for: the payment address's SOL and its 1DEV account's rent, with the wallet's network fees.
 const FAUCET_SOL = 0.005;
-
-const TIME = new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-const DAY_TIME = new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 // " Try again at 14:05." (the day too when it is not within the next twelve hours); empty when no time is known.
 function tryAgain(at: number | null, now: number): string {
   if (at === null) return '';
-  return ` Try again at ${at - now < 12 * 3_600_000 ? TIME.format(at) : DAY_TIME.format(at)}.`;
+  return ` Try again at ${clockAt(at, now)}.`;
+}
+
+interface Sent {
+  amounts: string;
+  address: string;
+  devTx: string;
+  solTx: string;
 }
 
 export default function TestnetPage() {
   const [lastFaucetClaim, setLastFaucetClaim] = useState<number | null>(null);
   const [faucetAddress, setFaucetAddress] = useState('');
-  const [showFaucetAlert, setShowFaucetAlert] = useState(false);
-  const [showSuccessAlert, setShowSuccessAlert] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
-  const [devTxHash, setDevTxHash] = useState('');
-  const [solTxHash, setSolTxHash] = useState('');
-  const [sentText, setSentText] = useState('');
-  // The address came from My node's payment card: the success note leads back there.
+  const [sent, setSent] = useState<Sent | null>(null);
+  // The address came from My node's payment card: the answer leads back there.
   const [fromNode, setFromNode] = useState(false);
   // The faucet pass from My node, for the claims of the wallet being activated.
   const [faucetPass, setFaucetPass] = useState<string | null>(null);
@@ -47,22 +56,23 @@ export default function TestnetPage() {
     setFaucetPass(takeHandedPass());
   }, []);
 
-  const handleFaucetClaim = async () => {
+  const handleFaucetClaim = async (e: FormEvent) => {
+    e.preventDefault();
+    if (isLoading) return;
     if (!faucetAddress.trim()) {
       setErrorMessage('Enter a Solana address first.');
       return;
     }
 
     const now = Date.now();
-    const cooldownPeriod = 24 * 60 * 60 * 1000;
-
-    if (lastFaucetClaim && (now - lastFaucetClaim) < cooldownPeriod) {
-      setShowFaucetAlert(true);
+    if (lastFaucetClaim && (now - lastFaucetClaim) < COOLDOWN_MS) {
+      setErrorMessage('Tokens go to an address once every 24 hours.' + tryAgain(lastFaucetClaim + COOLDOWN_MS, now));
       return;
     }
 
     setIsLoading(true);
     setErrorMessage('');
+    setSent(null);
 
     try {
       const address = faucetAddress.trim();
@@ -88,224 +98,104 @@ export default function TestnetPage() {
 
       if (devData.success || solData.success) {
         setLastFaucetClaim(now);
-        setDevTxHash(devData.txHash || '');
-        setSolTxHash(solData.txHash || '');
         // Name only what was sent: one of the two claims can fail while the other goes through.
-        setSentText(`${[devData.success && '1,500 1DEV', solData.success && `${FAUCET_SOL} SOL`].filter(Boolean).join(' + ')} sent to your address`);
-        setShowSuccessAlert(true);
+        setSent({
+          amounts: [devData.success && '1,500 1DEV', solData.success && `${FAUCET_SOL} SOL`].filter(Boolean).join(' + '),
+          address,
+          devTx: devData.txHash || '',
+          solTx: solData.txHash || '',
+        });
         setFaucetAddress('');
         if (!devData.success) setErrorMessage('1DEV: ' + (devData.error || 'failed') + tryAgain(devRetry, answered));
         if (!solData.success) setErrorMessage('SOL: ' + (solData.error || 'failed') + tryAgain(solRetry, answered));
       } else {
-        const err = [devData.error, solData.error].filter(Boolean).join(' | ') || 'Failed to send tokens. Please try again.';
+        // One reason once: both claims usually fail for the same one (an address of the wrong form).
+        const err = [...new Set([devData.error, solData.error].filter(Boolean))].join(' | ') || 'The faucet sent nothing. Try again.';
         // Both refused: the time both may go again.
         const both = devRetry !== null && solRetry !== null ? Math.max(devRetry, solRetry) : devRetry ?? solRetry;
         setErrorMessage(err + tryAgain(both, answered));
       }
-    } catch (error) {
-      setErrorMessage('Network error. Please check your connection.');
+    } catch {
+      setErrorMessage('The faucet could not be reached. Check your connection and try again.');
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="page-testnet">
-      <section className="explorer-section" data-section="testnet">
-        <div className="explorer-header">
-          <h2 className="section-title">QNet Blockchain testnet</h2>
-          <p className="section-subtitle">
-            Test network for development and experimentation
-          </p>
-        </div>
+    <div className="pg">
+      <PageHead title="QNet Blockchain testnet" lead="Test network for development and experimentation." />
 
-        <div style={{ maxWidth: '1000px', margin: '0 auto' }}>
-          <div className="explorer-card" id="faucet" style={{ padding: 'clamp(1.25rem, 5vw, 3rem)', scrollMarginTop: '90px' }}>
-            <div className="card-header" style={{ marginBottom: '2rem', textAlign: 'center', flexDirection: 'column', alignItems: 'center' }}>
-              <h3 style={{ fontSize: '1.8rem', marginBottom: '1rem' }}>Token Faucet</h3>
-              <div className="faucet-heading" style={{ fontSize: '1.1rem', color: '#e5e5e5', lineHeight: '1.5' }}>
-                Get 1,500 1DEV tokens + {FAUCET_SOL} SOL to test node activation on QNet Blockchain testnet
+      <Section id="faucet" title={t('ui_faucet_title')} lead={`Get 1,500 1DEV tokens + ${FAUCET_SOL} SOL to test node activation on QNet Blockchain testnet. They have no value.`} variant="tool">
+        <form onSubmit={handleFaucetClaim}>
+          <label className="label form-label" htmlFor="faucet-address">Your Solana testnet address</label>
+          <div className="form-row">
+            <input
+              id="faucet-address"
+              type="text"
+              className="field"
+              placeholder="Solana address"
+              value={faucetAddress}
+              onChange={(e) => setFaucetAddress(e.target.value)}
+              disabled={isLoading}
+              autoComplete="off"
+              spellCheck={false}
+              aria-invalid={errorMessage === 'Enter a Solana address first.' || undefined}
+              aria-describedby="faucet-answer"
+            />
+            <button type="submit" className="btn btn-solid" disabled={isLoading} aria-busy={isLoading || undefined}>
+              <span className="swap">
+                <span data-on={!isLoading}>{t('ui_faucet_button')}</span>
+                <span data-on={isLoading} aria-hidden={!isLoading}>Sending…</span>
+              </span>
+            </button>
+          </div>
+          {fromNode && (
+            <p className="note form-note">Your wallet&apos;s Solana address from My node is filled in. Check it, then press {t('ui_faucet_button')}.</p>
+          )}
+        </form>
+
+        <div className="req" id="faucet-answer">
+          {isLoading && <Waiting>Sending the tokens on Solana devnet</Waiting>}
+          {sent && (
+            // Stays until closed or the next claim, so the confirmation is not missed (owner 20.10).
+            <section className="faucet-sent" role="status" aria-labelledby="faucet-sent">
+              <div className="faucet-sent-head">
+                <svg className="faucet-sent-mark" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="11" />
+                  <path d="M6.8 12.4l3.4 3.4 7-7.2" />
+                </svg>
+                <h3 className="faucet-sent-title" id="faucet-sent">Test tokens sent</h3>
+                <Action kind="quiet" onClick={() => setSent(null)}>Close</Action>
               </div>
-            </div>
-
-            <div className="faucet-row" style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', alignItems: 'stretch', width: '100%' }}>
-              <input 
-                type="text" 
-                placeholder="Enter your Solana testnet address" 
-                className="qnet-input"
-                value={faucetAddress}
-                onChange={(e) => setFaucetAddress(e.target.value)}
-                disabled={isLoading}
-                style={{ flex: '1 1 260px', minWidth: 0, fontSize: '1rem', padding: '1rem', height: '3.5rem', boxSizing: 'border-box' }}
-              />
-              <button 
-                className="qnet-button" 
-                onClick={handleFaucetClaim}
-                disabled={isLoading || !faucetAddress.trim()}
-                style={{
-                  flex: '1 1 200px',
-                  fontSize: '1rem',
-                  padding: '1rem',
-                  fontWeight: 'bold',
-                  height: '3.5rem', 
-                  boxSizing: 'border-box',
-                  opacity: isLoading || !faucetAddress.trim() ? 0.6 : 1,
-                  cursor: isLoading || !faucetAddress.trim() ? 'not-allowed' : 'pointer'
-                }}
-              >
-                {isLoading ? 'SENDING...' : 'GET TEST TOKENS'}
-              </button>
-            </div>
-            
-            {fromNode && (
-              <p style={{ marginTop: '1rem', color: '#bdeff2', fontSize: '0.95rem' }}>
-                Your wallet&apos;s Solana address from My node is filled in. Check it, then press the button.
-              </p>
-            )}
-
-            {errorMessage && (
-              <div style={{
-                marginTop: '1rem',
-                padding: '1rem',
-                background: 'rgba(244, 67, 54, 0.1)',
-                border: '1px solid rgba(244, 67, 54, 0.3)',
-                borderRadius: '8px',
-                color: '#f44336',
-                wordBreak: 'break-word'
-              }}>
-                {errorMessage}
-              </div>
-            )}
-          </div>
+              <dl className="kv">
+                <div>
+                  <dt>Sent</dt>
+                  <dd>{sent.amounts}</dd>
+                </div>
+                <div>
+                  <dt>To</dt>
+                  <dd className="mono">{sent.address}</dd>
+                </div>
+                {sent.devTx && (
+                  <div>
+                    <dt className="ent-unit"><TokenIcon solana="1DEV" size="text" />1DEV transaction</dt>
+                    <dd><EntityLink kind="solana-tx" value={sent.devTx} /></dd>
+                  </div>
+                )}
+                {sent.solTx && (
+                  <div>
+                    <dt className="ent-unit"><TokenIcon solana="SOL" size="text" />SOL transaction</dt>
+                    <dd><EntityLink kind="solana-tx" value={sent.solTx} /></dd>
+                  </div>
+                )}
+              </dl>
+              {fromNode && <Action href="/node/activate">Back to your activation on My node</Action>}
+            </section>
+          )}
+          {errorMessage && <Failed>{errorMessage}</Failed>}
         </div>
-
-        {showFaucetAlert && (
-          <div style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0, 0, 0, 0.8)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000
-          }}>
-            <div style={{
-              background: '#1a1a1a',
-              border: '2px solid #ffaa00',
-              borderRadius: '12px',
-              padding: '2rem',
-              maxWidth: '400px',
-              textAlign: 'center'
-            }}>
-              <h3 style={{ color: '#ffaa00', marginBottom: '1rem' }}>Cooldown Active</h3>
-              <p style={{ color: '#e5e5e5', marginBottom: '2rem' }}>
-                Tokens are distributed once every 24 hours per address. Please wait before claiming again.
-              </p>
-              <button 
-                className="qnet-button"
-                onClick={() => setShowFaucetAlert(false)}
-                style={{ fontSize: '1rem', padding: '0.75rem 1.5rem' }}
-              >
-                OK
-              </button>
-            </div>
-          </div>
-        )}
-
-        {showSuccessAlert && (
-          <div style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0, 0, 0, 0.8)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000
-          }}>
-            <div style={{
-              background: '#1a1a1a',
-              border: '2px solid #00ffff',
-              borderRadius: '12px',
-              padding: '2rem',
-              maxWidth: '500px',
-              textAlign: 'center'
-            }}>
-              <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>Tokens sent!</h3>
-              <p style={{ color: '#e5e5e5', marginBottom: '1rem' }}>
-                {sentText}
-              </p>
-              {devTxHash && (
-                <div style={{
-                  background: 'rgba(0, 255, 255, 0.1)',
-                  border: '1px solid rgba(0, 255, 255, 0.3)',
-                  borderRadius: '8px',
-                  padding: '1rem',
-                  marginBottom: '0.75rem'
-                }}>
-                  <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>1DEV Transaction:</p>
-                  <p style={{ color: '#00ffff', fontSize: '0.85rem', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
-                    {devTxHash}
-                  </p>
-                  <a
-                    href={`https://explorer.solana.com/tx/${devTxHash}?cluster=devnet`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ color: '#00ffff', fontSize: '0.8rem', textDecoration: 'underline', marginTop: '0.4rem', display: 'inline-block' }}
-                  >
-                    View on Solana Explorer →
-                  </a>
-                </div>
-              )}
-              {solTxHash && (
-                <div style={{
-                  background: 'rgba(0, 255, 180, 0.08)',
-                  border: '1px solid rgba(0, 255, 180, 0.3)',
-                  borderRadius: '8px',
-                  padding: '1rem',
-                  marginBottom: '1rem'
-                }}>
-                  <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>SOL Transaction:</p>
-                  <p style={{ color: '#00ffb4', fontSize: '0.85rem', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
-                    {solTxHash}
-                  </p>
-                  <a
-                    href={`https://explorer.solana.com/tx/${solTxHash}?cluster=devnet`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ color: '#00ffb4', fontSize: '0.8rem', textDecoration: 'underline', marginTop: '0.4rem', display: 'inline-block' }}
-                  >
-                    View on Solana Explorer →
-                  </a>
-                </div>
-              )}
-              <button
-                className="qnet-button"
-                onClick={() => {
-                  setShowSuccessAlert(false);
-                  setDevTxHash('');
-                  setSolTxHash('');
-                }}
-                style={{ fontSize: '1rem', padding: '0.75rem 1.5rem' }}
-              >
-                OK
-              </button>
-              {fromNode && (
-                <p style={{ marginTop: '1rem' }}>
-                  <Link href="/node/activate" style={{ color: '#00ffff', textDecoration: 'underline' }}>
-                    Back to your activation on My node
-                  </Link>
-                </p>
-              )}
-            </div>
-          </div>
-        )}
-      </section>
+      </Section>
     </div>
   );
 }

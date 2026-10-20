@@ -1091,7 +1091,7 @@ test('the super node status: a yes from one node, a no from two, last seen, hear
   for (const bad of [null, 'Waiting', 1, true, { waiting: true }]) assert.equal(parseServerStatus(server({ admission: bad })).admission, null, String(bad));
   assert.equal(parseServerStatus(server({ registered: false, onchain_registered: false, admission: 'waiting' })).admission, null);
   assert.equal(parseServerStatus(server({ registered: false, onchain_registered: false, is_reward_eligible: true, peer_block_height: 5 })).onPace, null);
-  // Whether the network's eligible set lists the node: admitted, waiting for the network's admission, or not known.
+  // Whether the network's eligible set lists the node: admitted, not admitted to consensus yet, or not known.
   const eligibleOf = (set) => proxy(everyNode(at(server())), { eligible: async () => set });
   assert.equal((await json(await eligibleOf(new Set([ID, 'genesis_node_001'])).p.superStatus(get(url), ID))).admitted, true);
   assert.equal((await json(await eligibleOf(new Set(['genesis_node_001'])).p.superStatus(get(url), ID))).admitted, false);

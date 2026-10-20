@@ -7,11 +7,10 @@
  * wallet, one node type: services/QNetLink prepareOffer refuses a light consent for a wallet the site holds a super
  * node's burn for, and one it cannot read the record of).
  */
-import { EXPLORER_API } from '../config/nodes';
+import { EXPLORER_API, FIRST_CONTACT_MS } from '../config/nodes';
 
 const STATES = ['none', 'reserved', 'sending', 'recorded'];
 const TYPES = ['light', 'super'];
-const TIMEOUT_MS = 8000;
 
 // The site's record states that mean a node of `nodeType` is this wallet's and the network has not listed it yet:
 // recorded (the site holds its record, for good), or on its way (sent, not final yet).
@@ -24,7 +23,7 @@ const ON_ITS_WAY = new Set(['recorded', 'sending']);
 export async function readNodeRecordState(wallet) {
   if (typeof wallet !== 'string' || !/^[0-9a-z]{16,128}$/.test(wallet)) return null;
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctl.abort(), FIRST_CONTACT_MS);
   try {
     const response = await fetch(`${EXPLORER_API}/api/cabinet/activation/${encodeURIComponent(wallet)}`, {
       method: 'GET', headers: { Accept: 'application/json' }, credentials: 'omit', signal: ctl.signal,

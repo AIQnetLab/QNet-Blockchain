@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { LINK_PAGE_PATH } from '../hosts.ts';
+import { LINK_PAGES } from '../hosts.ts';
 
 const SRC = new URL('../../', import.meta.url);
 const code = (path) => readFileSync(new URL(path, SRC), 'utf8')
@@ -25,8 +25,9 @@ function files(dir) {
 // ("QNet Wallet is not installed") to a visitor who has the extension, and showed the site's navigation, with
 // every site script running beside the request in the URL. It now renders alone, on every host.
 test('the link page renders without the wallet context, the wallet control, the navigation or the footer', () => {
-  assert.equal(LINK_PAGE_PATH, '/l');
-  assert.ok(existsSync(new URL('app/l/page.tsx', SRC)));
+  // The transfer link's page (/send) renders the same way.
+  assert.deepEqual([...LINK_PAGES], ['/l', '/send']);
+  for (const page of LINK_PAGES) assert.ok(existsSync(new URL(`app${page}/page.tsx`, SRC)), page);
 
   const layout = code('app/layout.tsx');
   assert.match(layout, /<SiteShell onLinkHost=\{onLinkHost\}>\{children\}<\/SiteShell>/);
@@ -34,14 +35,17 @@ test('the link page renders without the wallet context, the wallet control, the 
 
   const shell = code('components/SiteShell.tsx');
   assert.match(shell, /const pathname = usePathname\(\);/);
-  const at = shell.indexOf('if (onLinkHost || pathname === LINK_PAGE_PATH) {');
+  const at = shell.indexOf('if (onLinkHost || LINK_PAGES.has(pathname)) {');
   assert.ok(at > 0, 'the link page branch');
   const linkBranch = shell.slice(at, shell.indexOf('\n  }\n', at));
   assert.match(linkBranch, /return \(\s*<div className="app-wrapper">\s*<main className="qnet-container">\{children\}<\/main>\s*<\/div>\s*\);/);
   assert.doesNotMatch(linkBranch, /AppProvider|Header|Footer|MatrixRain|Wallet/);
   // Everything else gets the shell, with the wallet context around the header and the page.
   const siteBranch = shell.slice(shell.indexOf('\n  }\n', at));
-  assert.match(siteBranch, /<AppProvider>\s*<div className="app-wrapper">\s*<MatrixRain \/>\s*<Header \/>\s*<main className="qnet-container">\{children\}<\/main>\s*<Footer \/>\s*<\/div>\s*<\/AppProvider>/);
+  // No canvas behind the whole page: the field lives in each page's head zone (components/ui/PageHead.tsx).
+  assert.match(siteBranch, /<AppProvider>\s*<div className="app-wrapper">\s*<DeviceClass \/>\s*<Header \/>\s*<main className="qnet-container">\{children\}<\/main>\s*<Footer \/>\s*<\/div>\s*<\/AppProvider>/);
+  assert.doesNotMatch(shell, /MatrixRain|<canvas|<Field/);
+  assert.match(code('components/ui/PageHead.tsx'), /<Field strength=\{strength\} kind=\{kind\} opacity=\{opacity\} \/>/);
 
   // The shell is the one place that mounts the wallet context.
   for (const url of files(SRC)) {
@@ -51,7 +55,7 @@ test('the link page renders without the wallet context, the wallet control, the 
   }
 
   // The link page itself imports nothing of the site's wallet state.
-  for (const file of ['app/l/page.tsx', 'app/l/LinkButtons.tsx']) {
+  for (const file of ['app/l/page.tsx', 'app/l/LinkButtons.tsx', 'app/send/page.tsx']) {
     assert.doesNotMatch(code(file), /AppContext|useWallet|ConnectWalletButton|Header|Footer/, file);
   }
 });
@@ -65,12 +69,12 @@ test('the link page renders without the wallet context, the wallet control, the 
 test('the link host renders nothing inside the site\'s shell, its 404 page included', () => {
   // The root layout decides from the request's own Host, on every page and on the 404 page.
   const layout = code('app/layout.tsx');
-  assert.match(layout, /const onLinkHost = requestHost\(\(await headers\(\)\)\.get\('host'\)\) === LINK_HOST;/);
+  assert.match(layout, /const request = await headers\(\);\s*const onLinkHost = requestHost\(request\.get\('host'\)\) === LINK_HOST;/);
   assert.match(layout, /import \{ LINK_HOST, requestHost \} from '@\/lib\/hosts';/);
   const shell = code('components/SiteShell.tsx');
   assert.match(shell, /export default function SiteShell\(\{ children, onLinkHost \}: \{ children: React\.ReactNode; onLinkHost: boolean \}\)/);
   // The bare branch is the first statement after the pathname: nothing of the shell renders before it.
-  assert.match(shell, /const pathname = usePathname\(\);\s*if \(onLinkHost \|\| pathname === LINK_PAGE_PATH\) \{\s*return \(\s*<div className="app-wrapper">\s*<main className="qnet-container">\{children\}<\/main>\s*<\/div>\s*\);\s*\}/);
+  assert.match(shell, /const pathname = usePathname\(\);\s*if \(onLinkHost \|\| LINK_PAGES\.has\(pathname\)\) \{\s*return \(\s*<div className="app-wrapper">\s*<main className="qnet-container">\{children\}<\/main>\s*<\/div>\s*\);\s*\}/);
   // A not-found page of the site's own, if one is added, brings no part of the shell with it.
   for (const file of ['app/not-found.tsx', 'app/global-error.tsx', 'app/error.tsx']) {
     if (existsSync(new URL(file, SRC))) assert.doesNotMatch(code(file), /AppProvider|<Header|<Footer|ConnectWalletButton|useWallet/, file);

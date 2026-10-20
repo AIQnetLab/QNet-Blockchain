@@ -192,7 +192,7 @@ describe('Export private key', () => {
     // After the password only the secret, Copy and Done: the one warning is said before it.
     expect(overlay).not.toMatch(/_warning/);
     const phrase = ws.slice(ws.indexOf('const renderSeedReveal = () =>'), ws.indexOf('const closeKeyReveal = () =>'));
-    expect(phrase).toMatch(/onPress=\{\(\) => copyRecoveryPhrase\(seedReveal\)\}/);
+    expect(phrase).toMatch(/onPress: \(\) => copyRecoveryPhrase\(seedReveal\)/);
     expect(phrase).not.toMatch(/seed_copy_warning|_warning'\)/);
     const dialog = ws.slice(ws.indexOf('{/* Export the recovery phrase or the private keys'), ws.indexOf('{/* Auto-Lock Time Picker Modal */}'));
     expect(dialog).toMatch(/t\(exportWhat === 'key' \? 'private_key_warning' : 'recovery_phrase_warning'\)/);
@@ -393,7 +393,7 @@ describe('the QNet Send screen sends any QNet token', () => {
     expect(choices).toMatch(/qrcTokens\.filter\(\(tk\) => tk\.contract && isTokenShown\(tk\.contract\)\)/);
     const sw = ws.slice(ws.indexOf('const switchQnetToken = (choice) =>'), ws.indexOf('const switchSolanaToken'));
     expect(sw).toMatch(/symbol: choice\.symbol, balance: choice\.balance, contract: choice\.contract, decimals: choice\.decimals/);
-    expect(ws).toMatch(/onPress=\{\(\) => switchQnetToken\(c\)\}/);
+    expect(ws).toMatch(/onChange=\{\(key\) => switchQnetToken\(sendChoices\.find\(\(c\) => c\.key === key\)\)\}/);
     // A token send goes through the same path as a token row's: the token's own decimals, qrc20Transfer, the fee in QNC.
     const send = ws.slice(ws.indexOf('const handleSendTransaction = async'), ws.indexOf('const pressSend = async'));
     expect(send).toMatch(/const isTokenSend = sendingToken\.network === 'qnet' && !!sendingToken\.contract;/);

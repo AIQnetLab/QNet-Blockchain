@@ -13,7 +13,8 @@
 //                                           LIGHT_REFRESH_BUDGET_S (default 300), never fails the build
 //   node scripts/light-pin.mjs              the same walk, unbounded unless --budget-s N; exits 1 short of the head
 //   node scripts/light-pin.mjs --write-pin  instead rewrites the pin block of src/server/light/pin.ts with a checkpoint
-//                                           --margin N (default 4) below the head, walked in that run from the
+//                                           --margin N (default 4) below the head, or at --index N (the index the
+//                                           wallets pinned, so both pins name one block), walked in that run from the
 //                                           committed pin with no store and no capsule, with NETWORK_ID (block 0's
 //                                           hash every answering genesis node names, refused when it is not the
 //                                           committed one) and GALC_V2_MINT_INTERVAL (--galc-interval N, default
@@ -25,7 +26,13 @@ import { fileURLToPath } from 'node:url';
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
-const option = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
+// A flag given without its value stops the run: it never falls back to the default unnoticed.
+const option = (name) => {
+  const i = args.indexOf(`--${name}`);
+  if (i < 0) return undefined;
+  if (args[i + 1] === undefined || args[i + 1].startsWith('--')) finish(1, `--${name} needs a value`);
+  return args[i + 1];
+};
 const build = flag('build');
 const say = (line) => console.log(`[light-pin] ${line}`);
 // A build goes on whatever happens here: the server walks from the store or the pin itself.
@@ -78,8 +85,8 @@ async function main() {
     const fresh = client(undefined, false);
     const galcInterval = number('galc-interval', GALC_V2_MINT_INTERVAL);
     say(`walking from pin ${WS_CHECKPOINT.index}, no store, no capsule (budget ${budgetText})`);
-    const r = await proveNewPin({ light: fresh, budgetMs, margin: number('margin', PIN_MARGIN), nodes, fetchText, pin: WS_CHECKPOINT,
-      networkId: NETWORK_ID, galcInterval });
+    const r = await proveNewPin({ light: fresh, budgetMs, margin: number('margin', PIN_MARGIN), index: number('index', undefined), nodes, fetchText,
+      pin: WS_CHECKPOINT, networkId: NETWORK_ID, galcInterval });
     if ('error' in r) finish(1, `no new pin: ${r.error} (highest verified ${fresh.highestVerifiedIndex()})`);
     const file = fileURLToPath(new URL('../src/server/light/pin.ts', import.meta.url));
     const next = replacePinBlock(readFileSync(file, 'utf8'), r.block);

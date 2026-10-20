@@ -246,9 +246,10 @@ test('the network\'s and the super node\'s answers are read exactly', () => {
   assert.deepEqual(parseSuperStatus(online), online);
   assert.equal(superState(online), 'online');
   assert.equal(superState(superS({ registered: true })), 'offline');
-  // Owner, 11.10: registered, its server answering and outside the network's eligible set is waiting for admission, not
-  // Offline. Offline wins: the network drops a silent admitted node from the set too, so a stopped server never reads
-  // as waiting; a barred node (also out of the set) reads Online with its own row. An unread set says nothing.
+  // Owner, 11.10: registered, its server answering and outside the network's eligible set is not admitted to consensus
+  // yet, not Offline. Offline wins: the network drops a silent admitted node from the set too, so a stopped server
+  // never reads as waiting; a barred node (also out of the set) reads Online with its own row. An unread set says
+  // nothing.
   assert.equal(superState({ ...online, admitted: false }), 'waiting');
   assert.equal(superState(superS({ registered: true, admitted: false })), 'offline');
   assert.equal(superState({ ...online, admitted: false, banned: true }), 'online');

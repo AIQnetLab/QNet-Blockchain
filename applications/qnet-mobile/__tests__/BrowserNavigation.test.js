@@ -198,7 +198,7 @@ describe('the WebView the browser renders', () => {
         visible: true, wallet: null, credential: '', walletManager: {}, t, onSheet: () => {}, confirmAction: () => {}, dev,
       }));
     });
-    const bookmark = tree.root.find((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function');
+    const bookmark = tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet' && typeof n.props.onPress === 'function')[0];
     await act(async () => { bookmark.props.onPress(); });
     return tree;
   }

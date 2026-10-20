@@ -1,0 +1,5 @@
+• A new look in the style of QNet Blockchain's site: rows and clear type instead of boxes and icons
+• Back, More, Copy and Scan are written as words
+• The Node tab shows your node's status next to its type and its full name
+• A request from the site waits for a slow connection instead of showing an error
+• Large amounts in History are written in full, as 42,578.81988

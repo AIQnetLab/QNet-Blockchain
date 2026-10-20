@@ -8,6 +8,8 @@
 // browser keeps the link), the page says what to do (SITE-14). Every text is the cabinet's own.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import Action from '@/components/ui/Action';
+import { Failed, Waiting } from '@/components/ui/RequestState';
 import type { LinkState } from '@/hooks/useLinkSession';
 import { t } from '@/lib/texts';
 import { androidIntentUrl } from '@/lib/qnet-link';
@@ -23,16 +25,17 @@ function Countdown({ until }: { until: number }) {
   return <>{t('link_waiting', { time: `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` })}</>;
 }
 
-// `small`: a second code beside a main one (the SOL of a payment address).
-export function QrCode({ text, label, small = false }: { text: string; label: string; small?: boolean }) {
+// A QR code: white with a 4-module quiet zone, drawn at `size` px so its box is reserved before it is drawn (the payment
+// address 196, a request 168).
+export function QrCode({ text, label, size = 168 }: { text: string; label: string; size?: number }) {
   const quiet = 4;
-  const { d, size } = useMemo(() => {
+  const { d, modules } = useMemo(() => {
     const matrix = qrMatrix(text);
-    return { d: qrPath(matrix, quiet), size: matrix.size + quiet * 2 };
+    return { d: qrPath(matrix, quiet), modules: matrix.size + quiet * 2 };
   }, [text]);
   return (
-    <svg className={small ? 'activate-qr activate-qr-small' : 'activate-qr'} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={label} shapeRendering="crispEdges">
-      <rect width={size} height={size} fill="#ffffff" />
+    <svg className="cab-qr" width={size} height={size} viewBox={`0 0 ${modules} ${modules}`} role="img" aria-label={label} shapeRendering="crispEdges">
+      <rect width={modules} height={modules} fill="#ffffff" />
       <path d={d} fill="#000000" />
     </svg>
   );
@@ -74,8 +77,8 @@ function OpenApp({ href }: { href: string }) {
   return (
     <>
       {/* A plain link (an intent: URL on Android), so the browser hands it to the system and the app. */}
-      <a className="qnet-button activate-primary" href={href} onClick={opened}>{t('link_open_app')}</a>
-      {notOpened && <p className="activate-error" role="status">{t('link_not_opened')}</p>}
+      <a className="btn btn-solid" href={href} onClick={opened}>{t('link_open_app')}</a>
+      {notOpened && <p className="rq-failed" role="status">{t('link_not_opened')}</p>}
     </>
   );
 }
@@ -97,45 +100,48 @@ export default function LinkWaiting({
   onCancel: () => void;
   onRetry: () => void;
 }) {
-  if (state.phase === 'starting') return <p className="activate-status" aria-live="polite">{t('link_preparing')}</p>;
+  if (state.phase === 'starting') return <Waiting>{t('link_preparing')}</Waiting>;
   if (state.phase === 'failed') {
     const text = state.failure === 'rate_limited'
       ? t('link_rate_limited', { minutes: Math.max(1, Math.ceil((state.retryAfterS ?? 60) / 60)) })
       : t(`link_${state.failure}`);
-    // An expired request is asked again with one tap, a new request with the same content (owner, 29.09).
-    return (
-      <>
-        <p className="activate-error" role="alert">{text}</p>
-        {state.failure === 'expired' ? (
-          <button type="button" className="qnet-button activate-primary" onClick={onRetry}>{t('link_ask_again')}</button>
-        ) : (
-          <button type="button" className="qnet-button secondary" onClick={onRetry}>{t('start_again')}</button>
-        )}
-      </>
-    );
+    // An expired request is asked again with one tap, a new request with the same content (owner, 29.09); its code's box
+    // stays in place, empty.
+    if (state.failure === 'expired') {
+      return (
+        <div className="cab-req">
+          {qr && <div className="cab-req-gone" aria-hidden="true" />}
+          <div className="cab-req-t">
+            <p className="rq-failed" role="alert">{text}</p>
+            <Action kind="solid" small onClick={onRetry}>{t('link_ask_again')}</Action>
+          </div>
+        </div>
+      );
+    }
+    return <Failed action={{ label: t('start_again'), onClick: onRetry }}>{text}</Failed>;
   }
   if (state.phase !== 'waiting') return null;
-  return (
-    <div className="activate-waiting">
-      {qr ? (
-        <>
-          <QrCode text={state.link} label={t('link_qr_label')} />
+  const wait = <Waiting action={{ label: t('cancel'), onClick: onCancel }}><Countdown until={state.expiresAt} /></Waiting>;
+  if (qr) {
+    return (
+      <div className="cab-req">
+        <figure className="cab-req-qr"><QrCode text={state.link} label={t('link_qr_label')} /></figure>
+        <div className="cab-req-t">
           <p>{t('link_scan')}</p>
-          <p className="activate-note">{t('link_qr_private')}</p>
+          <p className="note">{t('link_qr_private')}</p>
+          {wait}
           {/* The same QR session on this device: its answer still needs what a QR answer needs (the check number). */}
-          <a className="activate-link-button" href={openHref(state.link, android)}>{t('link_open_here')}</a>
-        </>
-      ) : (
-        <>
-          <OpenApp href={openHref(state.link, android)} />
-          <p className="activate-note">{t('link_open_note')}</p>
-          {onShowQr && (
-            <button type="button" className="activate-link-button" onClick={onShowQr}>{t('wallet_other_device')}</button>
-          )}
-        </>
-      )}
-      <p className="activate-status" aria-live="polite"><Countdown until={state.expiresAt} /></p>
-      <button type="button" className="qnet-button secondary" onClick={onCancel}>{t('cancel')}</button>
+          <a className="btn btn-text" href={openHref(state.link, android)}>{t('link_open_here')}</a>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="cab-req-phone">
+      <OpenApp href={openHref(state.link, android)} />
+      <p className="note">{t('link_open_note')}</p>
+      {wait}
+      {onShowQr && <button type="button" className="btn btn-text" onClick={onShowQr}>{t('wallet_other_device')}</button>}
     </div>
   );
 }

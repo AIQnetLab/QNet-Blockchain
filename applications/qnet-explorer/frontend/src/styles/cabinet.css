@@ -1,0 +1,377 @@
+/* cabinet.css: My node in concept B (B-SPEC 5.18–5.20, 6.7). Rows and space, no cards: the sections in a rail beside
+   the section on a computer, in a bar under the thumb on a phone; readouts, groups of rows, numbered steps. Tokens only. */
+
+/* ---------- The frame: the rail and the section ---------- */
+/* Until the wallet is known the area keeps a whole screen's room, so the footer never shows above content that fills in,
+   on a tall tablet in portrait too. */
+.cab {
+  display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); align-content: start;
+  min-height: calc(100svh - var(--hdr)); padding-top: clamp(36px, 4.5vw, 60px); padding-bottom: clamp(88px, 10vw, 140px);
+}
+.cab-side { grid-column: 1 / span 3; position: sticky; top: calc(var(--hdr) + 28px); align-self: start; min-width: 0; }
+.cab-main { grid-column: 4 / span 9; min-width: 0; padding-left: clamp(16px, 2.6vw, 40px); }
+.cab-wide { grid-column: 1 / -1; padding-left: 0; }
+.cab-view { animation: cab-in 160ms ease-out; }
+@keyframes cab-in { from { opacity: 0; } }
+.cab-view > :first-child { margin-top: 0; }
+.cab-lead-note { margin: 0 0 18px; }
+
+/* The rail's head: the node it shows, its state and id (or the address viewed, read only). */
+.cab-id { display: grid; gap: 14px; min-height: 50px; margin-bottom: 26px; }
+.cab-id-line { display: grid; gap: 4px; margin: 0; min-width: 0; }
+.cab-id-w { display: inline-flex; align-items: center; gap: 10px; font-size: 15.5px; font-weight: 600; color: var(--paper); }
+.cab-id .ent { font-size: var(--t-data); overflow: hidden; text-overflow: ellipsis; }
+/* Touch: the link's own clip would cut its 44 px target; its box is that tall, its line no taller. */
+@media (max-width: 720px), (pointer: coarse) {
+  .cab-id .ent { padding-block: 12px; margin-block: -12px; }
+}
+.cab-id .act { justify-self: start; }
+
+/* The sections: a track on the left, each with its datum; the current one marked on the track (an overlay). */
+.cab-nav { display: flex; flex-direction: column; border-left: 1px solid var(--rule); }
+.cab-nav-a {
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; column-gap: 12px;
+  min-height: 44px; padding: 13px 0 13px 20px;
+}
+.cab-nav-n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; font-weight: 560; color: var(--paper-78); transition: color var(--t-hover); }
+.cab-nav-a:hover .cab-nav-n, .cab-nav-a[aria-current='page'] .cab-nav-n { color: var(--paper); }
+.cab-nav-a[aria-current='page']::before { content: ''; position: absolute; left: -1px; top: 9px; bottom: 9px; width: 2px; background: var(--signal); }
+.cab-nav-d {
+  justify-self: end; min-width: 18ch; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
+  font-family: var(--font-mono); font-stretch: 80%; font-size: 12px; color: var(--fog);
+}
+.cab-nav-d[data-tone='signal'] { color: var(--signal); }
+.cab-nav-d[data-tone='ember'] { color: var(--ember); }
+
+/* ---------- The journey (only while a step after Activate is open) ---------- */
+.cab-journey {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: 6px; margin: 0 0 clamp(36px, 4vw, 52px); padding: 0; list-style: none;
+}
+.cab-journey li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; padding-top: 10px; border-top: 2px solid var(--rule); }
+.cab-journey-n { font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); color: var(--fog); }
+.cab-journey-t { font-size: 14.5px; color: var(--fog); }
+.cab-journey-k { font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); letter-spacing: .1em; text-transform: uppercase; }
+.cab-journey li[data-at='done'] { border-top-color: var(--signal); }
+.cab-journey li[data-at='done'] .cab-journey-t { color: var(--text); }
+.cab-journey li[data-at='done'] .cab-journey-k { color: var(--signal); }
+.cab-journey li[data-at='now'] { border-top-color: var(--ember); }
+.cab-journey li[data-at='now'] .cab-journey-t { color: var(--paper); }
+.cab-journey li[data-at='now'] .cab-journey-k { color: var(--ember); }
+
+/* ---------- Readouts, the state line, the miss ---------- */
+/* Two lines under each value from the start: the time left of the epoch and a state's sentence take them when they come. */
+.cab .readouts { --ro-sub-lines: 2; }
+.cab .ro-v .live-dot { width: 9px; height: 9px; margin-right: 12px; vertical-align: .18em; }
+/* An epoch in a value (Device's last answer) keeps the value's face. */
+.cab .ro-v .ent { font-stretch: inherit; letter-spacing: inherit; }
+.cab .ro-s .btn { margin-top: 8px; }
+.cab-state { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin: 0; font-size: 15.5px; color: var(--paper); }
+.cab-state .status { font-family: var(--font-mono); font-stretch: 80%; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }
+.cab-miss { max-width: 72ch; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--rule); }
+.cab-miss .label { margin-bottom: 8px; color: var(--ember); }
+.cab-miss p { margin: 0; }
+
+/* The last 12 epochs: one cell each, Paper counted, Ember not counted, an outline for the network's own. */
+.cab-strip { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; height: 30px; margin-top: 6px; }
+.cab-cell { display: block; min-width: 0; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: inset 0 0 0 1px var(--rule); }
+button.cab-cell { cursor: pointer; transition: opacity var(--t-hover); }
+.cab-cell[data-tone='counted'] { background: var(--paper); box-shadow: none; opacity: .82; }
+.cab-cell[data-tone='missed'] { background: var(--ember); box-shadow: none; }
+.cab-cell[data-tone='quiet'] { box-shadow: inset 0 0 0 1px var(--edge); }
+button.cab-cell:hover, button.cab-cell:focus-visible { opacity: 1; }
+.cab-strip-x { display: flex; justify-content: space-between; margin-top: 4px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); color: var(--fog); }
+
+/* ---------- Groups of rows, details, notes, the next step ---------- */
+.cab-group { margin-top: var(--block-gap); }
+.cab-group-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 20px; margin-bottom: 14px; }
+.cab-group-head .btn { padding-block: 10px; }
+.cab-h { margin: 0; font-weight: 620; font-size: clamp(20px, 1.6vw, 23px); line-height: 1.2; letter-spacing: -.012em; color: var(--paper); }
+.cab-group > p, .cab-group > .rq { margin: 0 0 12px; max-width: 68ch; }
+.cab-title { margin: 0 0 14px; font-weight: 720; font-stretch: 108%; font-size: clamp(28px, 3vw, 42px); line-height: 1.05; letter-spacing: -.03em; color: var(--paper); }
+.cab-title + .note { margin-bottom: 4px; }
+.cab-node + .cab-node { margin-top: var(--block-gap); padding-top: var(--block-gap); border-top: 1px solid var(--rule); }
+.cab-node-h {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; margin: 0 0 22px;
+  font-weight: 700; font-stretch: 106%; font-size: clamp(26px, 2.6vw, 36px); line-height: 1.1; letter-spacing: -.025em; color: var(--paper);
+}
+.cab-node-h .ent { font-size: var(--t-data); font-weight: 400; letter-spacing: 0; }
+
+.cab-facts { margin: 0; border-top: 1px solid var(--rule); }
+.cab-facts > div { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 5fr); align-items: baseline; column-gap: 24px; padding: 13px 0; border-bottom: 1px solid var(--rule); }
+.cab-facts dt { font-size: 14.5px; color: var(--fog); }
+.cab-facts dd { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 18px; min-width: 0; margin: 0; font-size: 15.5px; color: var(--paper); overflow-wrap: anywhere; }
+.cab-facts dd .ent { white-space: normal; overflow-wrap: anywhere; }
+.cab-code { font-size: 14px; letter-spacing: .02em; color: var(--paper); }
+.cab-code-line { margin: 0 0 12px; }
+
+.cab-notes { display: grid; gap: 8px; margin-top: 18px; }
+.cab-next { display: grid; gap: 12px; max-width: 68ch; margin-top: 24px; }
+.cab-next > p { margin: 0; }
+.cab-next-act { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 28px; margin-top: 6px; }
+.cab-next-act > .note { flex-basis: 100%; max-width: none; }
+.cab-sub { display: grid; gap: 10px; margin-top: 18px; }
+.cab-sub > p { margin: 0; }
+.cab-epoch-note, .cab-notice, .cab-keep { margin-top: 18px; }
+.cab-list { display: grid; gap: 6px; margin: 0; padding-left: 1.3em; font-size: var(--t-small); line-height: 1.5; color: var(--text); }
+.cab-list li::marker { font-family: var(--font-mono); font-stretch: 80%; font-size: 12px; color: var(--fog); }
+.cab-check-number { margin: 0; font-family: var(--font-mono); font-stretch: 80%; font-size: 18px; color: var(--paper); }
+
+/* ---------- The node balance ---------- */
+.cab-figure {
+  margin: 6px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--font-mono); font-stretch: 75%; font-weight: 300; font-size: var(--t-figure); line-height: 1; letter-spacing: -.04em; color: var(--paper);
+}
+/* The unit as large as the figure, its icon before it (EntityLink AmountUnit). */
+.cab-balance > .note { margin-top: 10px; }
+.cab-balance .readouts { margin-top: 26px; --ro-sub-lines: 1; }
+.cab-earned .readouts { --ro-sub-lines: 1; }
+.cab-balance > .body { max-width: 62ch; margin: 28px 0 0; padding-top: 28px; border-top: 1px solid var(--rule); }
+.cab-move { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); column-gap: clamp(24px, 4vw, 56px); row-gap: 22px; margin-top: 28px; padding-top: 28px; border-top: 1px solid var(--rule); }
+.cab-move > .body { margin: 0; }
+.cab-move-way { display: grid; gap: 10px; justify-items: start; }
+.cab-move-way + .cab-move-way { margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--rule); }
+.cab-ways-move .btn-solid, .cab-ways-move .btn-text { width: 100%; justify-content: space-between; }
+.cab-move-way .note { margin: 0; }
+
+/* Added per epoch: bars in Paper, moved in Fog, not counted a low Ember tick, not checked a low outline; a marker at
+   the newest move. Labels are text at fixed sizes. */
+.cab-pe { display: grid; grid-template-columns: 40px minmax(0, 1fr); column-gap: 12px; margin: 0; }
+.cab-pe-y { position: relative; height: 170px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); color: var(--fog); }
+.cab-pe-y span { position: absolute; right: 0; transform: translateY(-50%); }
+.cab-pe-bars {
+  position: relative; display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); align-items: end; gap: 6px;
+  height: 170px; border-bottom: 1px solid var(--rule-strong);
+}
+.cab-pe-bars::before { content: ''; position: absolute; left: 0; right: 0; top: 0; border-top: 1px dashed var(--rule); }
+.cab-pe-b { height: var(--h, 0); background: var(--paper); opacity: .86; }
+.cab-pe-b[data-kind='moved'] { background: var(--fog); opacity: .45; }
+.cab-pe-b[data-kind='missed'] { height: 4px; background: var(--ember); opacity: 1; }
+.cab-pe-b[data-kind='quiet'] { height: 4px; background: transparent; box-shadow: inset 0 0 0 1px var(--edge); opacity: 1; }
+.cab-pe-b[data-kind='none'] { height: 0; }
+.cab-pe-mark { position: absolute; top: -22px; bottom: 0; left: calc(var(--at) * (100% + 6px) - 3px); width: 0; border-left: 1px solid var(--signal); }
+.cab-pe-mark span {
+  position: absolute; top: 0; left: 8px; white-space: nowrap;
+  font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); letter-spacing: .08em; text-transform: uppercase; color: var(--signal);
+}
+.cab-pe-mark[data-flip] span { left: auto; right: 8px; }
+.cab-pe-x {
+  grid-column: 2; display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); gap: 6px; margin-top: 8px;
+  font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); color: var(--fog);
+}
+.cab-pe-x span { text-align: center; overflow-x: clip; }
+.cab-pe-key { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px 26px; margin-top: 20px; font-size: var(--t-sub); color: var(--text); }
+.cab-pe-key span { display: inline-flex; align-items: center; gap: 10px; }
+.cab-pe-key i { display: block; width: 10px; height: 10px; background: var(--paper); opacity: .86; }
+.cab-pe-key i[data-kind='moved'] { background: var(--fog); opacity: .45; }
+.cab-pe-key i[data-kind='missed'] { height: 4px; background: var(--ember); opacity: 1; }
+.cab-pe-key i[data-kind='quiet'] { height: 4px; background: transparent; box-shadow: inset 0 0 0 1px var(--edge); opacity: 1; }
+
+/* ---------- The epochs table and History ---------- */
+.cab-why { margin-right: 10px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); letter-spacing: .1em; text-transform: uppercase; color: var(--ember); }
+.cab-more { margin-top: 12px; min-height: 48px; }
+.cab-epochs .status { font-family: var(--font-mono); font-stretch: 80%; }
+/* The epochs keep room for every column: where the section is narrower, the table scrolls sideways in its frame and the
+   line under a row stays readable at the frame's left. */
+.cab-epochs .tbl-frame .tbl { min-width: 780px; }
+.cab-epochs .tbl-frame { overflow-x: auto; overscroll-behavior-x: contain; }
+.cab-epochs .tbl th { position: static; }
+.cab-epochs .tbl-detail-in { position: sticky; left: 0; max-width: 72ch; }
+
+/* ---------- The device ---------- */
+.cab-dev { padding-top: 26px; border-top: 1px solid var(--rule); }
+.cab-dev-top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 10px 24px; }
+.cab-dev-name { margin: 8px 0 0; font-weight: 660; font-stretch: 106%; font-size: clamp(26px, 2.6vw, 36px); line-height: 1.1; letter-spacing: -.025em; color: var(--paper); }
+.cab-dev .readouts { margin-top: 22px; --ro-sub-lines: 1; }
+.cab-dev-note { margin-top: 14px; }
+.cab-acts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: clamp(24px, 4vw, 56px); row-gap: 40px; margin-top: var(--block-gap); }
+.cab-act { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; min-width: 0; padding-top: 24px; border-top: 1px solid var(--rule); }
+.cab-act > p { margin: 0; }
+.cab-act .cab-next-act, .cab-act .cab-move-way { width: 100%; }
+
+/* ---------- A request to QNet Wallet: its QR code and waiting line, or the phone's button ---------- */
+.cab-req { display: grid; grid-template-columns: 168px minmax(0, 1fr); align-items: start; gap: 20px; }
+.cab-req-qr, .cab-pay-qr { margin: 0; }
+.cab-qr { display: block; max-width: 100%; height: auto; border-radius: var(--radius); }
+.cab-req-t { display: grid; gap: 10px; min-width: 0; }
+.cab-req-t > p { margin: 0; }
+.cab-req-gone { width: 168px; height: 168px; outline: 1px dashed var(--edge); outline-offset: -1px; border-radius: var(--radius); }
+.cab-req-phone { display: grid; gap: 12px; justify-items: start; }
+.cab-req-phone > p { margin: 0; }
+
+/* ---------- Connecting a wallet: one main action and the other ways; View by address and How it works apart ---------- */
+.cab-connect { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); row-gap: 56px; }
+.cab-connect-ways { grid-column: 1 / span 7; min-width: 0; outline: none; }
+.cab-connect-ways > .lead { margin-bottom: 28px; max-width: 52ch; }
+.cab-connect-ways > .note { margin-top: 22px; }
+.cab-connect-ways.cabinet-flash { animation: cab-flash 1.6s ease-out; }
+@keyframes cab-flash { from { outline: 2px solid var(--signal); outline-offset: 10px; } to { outline: 2px solid transparent; outline-offset: 10px; } }
+/* The main action: the one solid button and the line under it; a request in progress takes its place, its Open QNet
+   Wallet as wide as the button it replaces. */
+.cab-connect-main { display: grid; gap: 12px; justify-items: start; min-height: 88px; }
+.cab-connect-main > .btn-solid, .cab-connect-main .cab-req-phone > .btn-solid { min-width: 300px; justify-content: center; }
+/* The other ways: text actions under a rule, side by side while they fit. */
+.cab-connect-alt { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 32px; margin-top: 24px; padding-top: 4px; border-top: 1px solid var(--rule); }
+.cab-view-by { display: grid; row-gap: 8px; }
+.cab-field-row { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+.cab-field-row .field { flex: 1; }
+.cab-field-row .btn-text { padding-inline: 4px; }
+.cab-field-error { margin: 6px 0 0; font-size: var(--t-note); color: var(--ember); }
+.cab-form { display: grid; gap: 6px; margin-top: 12px; }
+
+/* Apart and quieter: labels for titles, each short guide opened by its title. */
+.cab-connect-more { grid-column: 9 / span 4; display: grid; align-content: start; row-gap: 44px; min-width: 0; }
+.cab-guides { display: grid; justify-items: start; min-width: 0; }
+.cab-guides > .label { margin-bottom: 10px; }
+.cab-guide { justify-self: stretch; border-top: 1px solid var(--rule); }
+.cab-guide:last-of-type { border-bottom: 1px solid var(--rule); }
+.cab-guide-t {
+  display: flex; align-items: center; min-height: 48px; list-style: none; cursor: pointer; font-size: 15px; font-weight: 560; color: var(--text);
+  text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .32em; text-decoration-color: var(--rule-strong);
+  transition: color var(--t-hover), text-decoration-color var(--t-hover);
+}
+.cab-guide-t::-webkit-details-marker { display: none; }
+.cab-guide-t:hover, .cab-guide[open] > .cab-guide-t { color: var(--paper); text-decoration-color: var(--signal); }
+.cab-guide > .note { margin: 0 0 16px; }
+.cab-guide ol { display: grid; gap: 7px; margin: 0 0 16px; padding: 0; list-style: none; counter-reset: g; }
+.cab-guide li { display: grid; grid-template-columns: 22px minmax(0, 1fr); counter-increment: g; font-size: 14.5px; line-height: 1.45; color: var(--text); }
+.cab-guide li::before { content: counter(g); padding-top: 2px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); color: var(--fog); }
+.cab-guides > .btn-text { margin-top: 6px; }
+
+/* ---------- Activate: numbered steps; the payment as one sentence, two ways and what arrived ---------- */
+.cab-steps { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--rule); }
+.cab-step { display: grid; grid-template-columns: 52px minmax(0, 1fr); column-gap: 12px; padding: 24px 0 28px; border-bottom: 1px solid var(--rule); }
+.cab-step-n { padding-top: 4px; font-family: var(--font-mono); font-stretch: 80%; font-size: 13px; color: var(--fog); }
+.cab-step-body { display: grid; gap: 12px; min-width: 0; }
+.cab-step-body > p { margin: 0; max-width: 64ch; }
+.cab-step-t { margin: 0; font-weight: 560; font-size: var(--t-h3); line-height: 1.2; letter-spacing: -.012em; color: var(--text); }
+.cab-step-k { margin-left: 10px; vertical-align: .2em; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); font-weight: 400; letter-spacing: .12em; text-transform: uppercase; }
+.cab-step[data-at='done'] .cab-step-n, .cab-step[data-at='done'] .cab-step-k { color: var(--signal); }
+.cab-step[data-at='now'] .cab-step-n, .cab-step[data-at='now'] .cab-step-k { color: var(--ember); }
+.cab-step[data-at='now'] .cab-step-t { color: var(--paper); }
+.cab-step-s { margin: 0; font-size: var(--t-small); line-height: 1.5; color: var(--fog); }
+
+.cab-pay { display: grid; gap: 14px; min-width: 0; }
+.cab-pay > p { margin: 0; }
+.cab-pay-h { max-width: 21ch; font-weight: 680; font-stretch: 104%; font-size: clamp(24px, 2.5vw, 34px); line-height: 1.12; letter-spacing: -.025em; color: var(--paper); }
+.cab-modes { margin-top: 6px; }
+.cab-send { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; align-items: center; column-gap: 18px; min-height: 76px; padding: 14px 0; border-bottom: 1px solid var(--rule); }
+.cab-send-k { font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); letter-spacing: .1em; color: var(--fog); }
+.cab-send-amt { font-family: var(--font-mono); font-stretch: 80%; font-size: 20px; letter-spacing: -.01em; color: var(--paper); }
+.cab-send[data-done] .cab-send-amt { color: var(--text); }
+.cab-send-st { white-space: nowrap; font-family: var(--font-mono); font-stretch: 80%; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--signal); }
+.cab-send-st.wait { white-space: normal; font-family: var(--f-sans); font-stretch: 100%; font-size: var(--t-note); letter-spacing: 0; text-transform: none; color: var(--paper); }
+.cab-modes [role='tabpanel'] > .note, .cab-modes [role='tabpanel'] > .rq { margin-top: 14px; }
+.cab-manual { display: grid; grid-template-columns: 196px minmax(0, 1fr); align-items: start; column-gap: 32px; row-gap: 22px; padding-top: 22px; }
+.cab-manual-t { display: grid; gap: 8px; min-width: 0; }
+.cab-manual-t > p { margin: 0; }
+.cab-amts { margin: 6px 0 0; border-top: 1px solid var(--rule); }
+.cab-amts > div { display: grid; grid-template-columns: 56px minmax(0, 1fr); align-items: baseline; column-gap: 18px; padding: 8px 0; border-bottom: 1px solid var(--rule); }
+.cab-amts dt { font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); letter-spacing: .1em; color: var(--fog); }
+.cab-amts dd { margin: 0; font-family: var(--font-mono); font-stretch: 80%; font-size: 18px; color: var(--paper); }
+.cab-meters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 24px; row-gap: 18px; margin-top: 12px; }
+.cab-meter { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.cab-meter-v { font-family: var(--font-mono); font-stretch: 80%; font-size: 15px; color: var(--paper); }
+.cab-receipt { display: grid; gap: 10px; margin-top: 6px; }
+.cab-receipt > p { margin: 0; }
+.cab-answer { display: grid; gap: 10px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--rule); }
+.cab-answer > p { margin: 0; }
+
+/* The node type to activate with the extension: rows, the chosen one marked on its left. */
+.cab-types { display: grid; margin: 14px 0; border-top: 1px solid var(--rule); }
+.cab-type {
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 16px; row-gap: 4px; min-height: 64px;
+  margin: 0; padding: 16px 0 16px 18px; border: 0; border-bottom: 1px solid var(--rule); background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  transition: background-color var(--t-hover);
+}
+.cab-type:hover { background: var(--fill-row); }
+.cab-type:disabled { cursor: not-allowed; }
+.cab-type[aria-checked='true']::before { content: ''; position: absolute; left: 0; top: 12px; bottom: 12px; width: 2px; background: var(--signal); }
+.cab-type-n { font-size: 17px; font-weight: 600; color: var(--paper-78); }
+.cab-type[aria-checked='true'] .cab-type-n { color: var(--paper); }
+.cab-type-d { grid-column: 1; font-size: 14.5px; color: var(--fog); }
+.cab-type-p { grid-column: 2; grid-row: 1 / span 2; align-self: center; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); color: var(--fog); }
+
+/* A super node's server steps: numbered, each with its commands and Copy. */
+.cab-cmds { margin: 0; padding: 0; list-style: none; counter-reset: c; border-top: 1px solid var(--rule); }
+.cab-cmds > li { display: grid; grid-template-columns: 30px minmax(0, 1fr); column-gap: 8px; row-gap: 10px; padding: 18px 0; border-bottom: 1px solid var(--rule); counter-increment: c; }
+.cab-cmds > li::before { content: counter(c); grid-row: 1 / span 9; padding-top: 3px; font-family: var(--font-mono); font-stretch: 80%; font-size: 13px; color: var(--fog); }
+.cab-cmds > li > * { grid-column: 2; margin: 0; min-width: 0; }
+.cab-cmd { display: grid; gap: 6px; justify-items: start; }
+.cab-cmd pre {
+  justify-self: stretch; max-width: 100%; margin: 0; padding: 14px 16px; overflow-x: auto; white-space: pre;
+  background: var(--fill-field); border: 1px solid var(--rule); border-radius: var(--radius);
+  font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); line-height: 1.6; color: var(--paper);
+}
+
+/* ---------- Narrower screens ---------- */
+@media (max-width: 1100px) {
+  .cab-connect-ways, .cab-connect-more { grid-column: 1 / -1; }
+  .cab-move { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* A narrow rail (tablets in landscape, small laptops): each section's datum under its name. */
+@media (min-width: 861px) and (max-width: 1180px) {
+  .cab-nav-a { grid-template-columns: minmax(0, 1fr); row-gap: 2px; container-type: inline-size; }
+  /* Never cut: set smaller by its length to fit the rail (CabinetNav NavDatum --d-len, .62 em a character). */
+  .cab-nav-d { justify-self: start; min-width: 0; max-width: 100%; text-align: left; overflow: visible; font-size: min(12px, calc(100cqi / var(--d-len, 1) / .62)); line-height: 19px; }
+}
+
+/* Phones and small tablets: the sections move to a bar under the thumb; the node's line stands over the section. */
+@media (max-width: 860px) {
+  .cab { grid-template-columns: minmax(0, 1fr); padding-top: 22px; }
+  .cab-side, .cab-main { grid-column: 1 / -1; }
+  .cab-side { position: static; }
+  .cab-main { padding-left: 0; }
+  .cab-id { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; min-height: 0; margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
+  .cab-id-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+  .cab-id-w { font-size: 14.5px; }
+  /* The bar's words keep the page's gutter from the screen's edges. */
+  .cab-nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; flex-direction: row; border: 0; border-top: 1px solid var(--rule-strong);
+    background: var(--ink-96); padding: 0 calc(var(--gut) - 4px) env(safe-area-inset-bottom);
+  }
+  .cab-nav-a { flex: 1 1 0; min-width: 0; grid-template-columns: minmax(0, 1fr); justify-items: center; align-content: center; row-gap: 3px; min-height: var(--bar); padding: 10px 4px 11px; container-type: inline-size; }
+  .cab-nav-n { font-size: 13.5px; font-weight: 600; }
+  /* The bar's datum is never cut: an amount leaves its unit out and the number is set smaller by its length to fit. */
+  .cab-nav-d { order: -1; justify-self: stretch; min-width: 0; max-width: 100%; overflow: visible; font-size: min(var(--t-th), calc(100cqi / var(--d-num, 1) / .62)); line-height: 15px; text-align: center; }
+  .cab-nav-u { display: none; }
+  .cab-nav-a[aria-current='page']::before { left: 14%; right: 14%; top: -1px; bottom: auto; width: auto; height: 2px; }
+  /* The bar keeps its room under the footer, and steps aside while the menu or the account sheet is open. */
+  .app-wrapper:has(.cab[data-nav]) { padding-bottom: calc(var(--bar) + env(safe-area-inset-bottom)); }
+  html[data-overlay] .cab-nav { visibility: hidden; }
+  .cab-dev .ro:nth-child(3) { grid-column: 1 / -1; }
+  .cab-journey-n, .cab-journey-k { display: none; }
+  .cab-journey-t { font-size: 13px; }
+}
+
+@media (max-width: 720px) {
+  .cab-facts > div { grid-template-columns: minmax(0, 1fr); row-gap: 3px; }
+  .cab-acts { grid-template-columns: minmax(0, 1fr); }
+  .cab-req { grid-template-columns: minmax(0, 1fr); }
+  .cab-step { grid-template-columns: 30px minmax(0, 1fr); column-gap: 8px; }
+  .cab-send { grid-template-columns: minmax(0, 1fr) auto; row-gap: 12px; }
+  .cab-send-k { display: none; }
+  .cab-send .btn { grid-column: 1 / -1; width: 100%; justify-content: space-between; }
+  .cab-send .cab-send-st.wait { grid-column: 1 / -1; }
+  .cab-manual { grid-template-columns: minmax(0, 1fr); }
+  .cab-meters { grid-template-columns: minmax(0, 1fr); }
+  .cab-connect-main > .btn-solid, .cab-connect-main .cab-req-phone > .btn-solid { width: 100%; min-width: 0; justify-content: center; }
+  .cab-field-row { flex-direction: column; align-items: stretch; }
+  .cab-field-row .btn { justify-content: center; }
+  .cab-pe { grid-template-columns: 36px minmax(0, 1fr); column-gap: 8px; }
+  .cab-pe-bars, .cab-pe-x { gap: 3px; }
+  .cab-pe-mark { left: calc(var(--at) * (100% + 3px) - 1.5px); }
+  .cab-pe-x span { visibility: hidden; overflow: visible; }
+  .cab-pe-x span:nth-child(4n + 1), .cab-pe-x span:last-child { visibility: visible; }
+  /* The last epoch ends at the chart's edge, never past it into the margin. */
+  .cab-pe-x span:last-child { display: flex; justify-content: flex-end; }
+  .cab-figure { font-size: clamp(30px, 9vw, 44px); }
+}
+
+/* Touch: each epoch's cell is a 44 px target. */
+@media (max-width: 720px), (pointer: coarse) {
+  .cab-strip { height: 44px; }
+}
+
+/* A phone opens QNet Wallet itself: the address and the amounts come before the code. */
+html[data-device='ios'] .cab-pay-qr, html[data-device='android'] .cab-pay-qr { order: 2; }

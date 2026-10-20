@@ -367,17 +367,19 @@ test('the device\'s account: whether the wake reached the device, or that it nev
 // follows. No row names the time of an answer. An address only viewed shows the state and the epochs only.
 test('the pages: the miss line in the device rows, no answer time, an address only viewed shown by its state and epochs only', () => {
   const rows = code('components/cabinet/NodeStatus.tsx');
-  assert.match(rows, /const miss = full \? deviceMiss\(status\) : shownMiss\(status\);\s*if \(!miss\) return null;\s*return <p>\{missText\(miss, status\.device\?\.platform \?\? null\)\}<\/p>;/);
+  // The epoch the line names is a link to its first block (owner 19.10), in the label and in the line (MissText).
+  assert.match(rows, /const miss = full \? deviceMiss\(status\) : shownMiss\(status\);\s*if \(!miss\) return null;\s*return \(\s*<div className="cab-miss">\s*<p className="label">\{rich\('device_miss_label', \{ epoch: <EpochNumber epoch=\{miss\.epoch\} \/> \}\)\}<\/p>\s*<p><MissText miss=\{miss\} platform=\{status\.device\?\.platform \?\? null\} \/><\/p>/);
   assert.match(rows, /const missed = !viewOnly && \(state === 'offline' \|\| \(full && state === 'online'\)\);/);
   assert.match(rows, /const named = viewOnly \? null : device;/);
-  assert.match(rows, /\{full && named && deviceName\(named\) && <p>\{deviceName\(named\)\}<\/p>\}/);
-  assert.match(rows, /\{full && !viewOnly && device\?\.linkedSince != null && /);
+  assert.match(rows, /\{named && deviceName\(named\) && <p className="cab-dev-name">\{deviceName\(named\)\}<\/p>\}/);
+  assert.match(rows, /\{!viewOnly && <Readout label=\{t\('device_since'\)\} value=\{device\?\.linkedSince != null \? DAY\.format\(device\.linkedSince \* 1000\) : null\} \/>\}/);
   assert.doesNotMatch(rows, /WakePlace|canWake/);
   assert.match(rows, /\{missed && <MissLine status=\{status\} full=\{full\} \/>\}\s*<\/>/);
   assert.doesNotMatch(rows, /lastAnswer\b|answerText|Date\.now\(\)\)\}<\/p>/);
   assert.equal(rows.match(/<MissLine /g)?.length, 1);
   assert.doesNotMatch(rows, /WakePanel/);
-  assert.match(code('components/cabinet/NodeHome.tsx'), /<DeviceRows status=\{status\} viewOnly=\{viewOnly\} \/>\s*\{\}\s*\{state === 'offline' && !viewOnly && <LinkDevice onLinked=\{reread\} relink \/>\}/);
+  // The Overview: beside the Offline state (its readout), the latest miss, then running the node on the phone again.
+  assert.match(code('components/cabinet/NodeHome.tsx'), /\{state === 'offline' && !viewOnly && <MissLine status=\{status\} full=\{false\} \/>\}\s*\{state === 'offline' && !viewOnly && <LinkDevice onLinked=\{reread\} relink \/>\}/);
   assert.match(code('components/cabinet/NodeDevices.tsx'), /<DeviceRows status=\{status\} full viewOnly=\{viewOnly\} \/>/);
   assert.match(code('server/cabinet/node-proxy.ts'), /kind !== 'read' \|\| unasked\.length === 0 \|\| !\(asksOtherOwners\(view\) \|\| offline\)\) return view;/);
   // The site keeps none of the precise fields anywhere: not in the route's parser, not in its cache.
@@ -432,19 +434,21 @@ test('the misses route: each owner\'s list read as last_miss is, merged per epoc
   }
 });
 
-// The line under an epoch not counted on History is the Device tab's line for that epoch's miss (missText), with the
+// The line under an epoch not counted on History is the Device tab's line for that epoch's miss (MissText), with the
 // device's platform from the light node's status; the Overview's newest epochs carry none (it names the latest miss
 // beside the device's state), and an address only viewed gets none (its history read carries no miss).
 test('History: one line under each epoch not counted, in the Device tab\'s words; none on the Overview\'s epochs or for a view', () => {
   const history = code('components/cabinet/NodeHistory.tsx');
-  assert.match(history, /function Table\(\{ rows, reasons = false \}: \{ rows: HistoryRow\[\]; reasons\?: boolean \}\) \{\s*const \{ devicePlatform \} = useCabinet\(\);/);
-  assert.match(history, /<tr className=\{`cabinet-epoch \$\{row\.result\}`\}>/);
-  assert.match(history, /\{reasons && row\.miss && <tr className="cabinet-epoch-why"><td colSpan=\{4\}>\{missText\(row\.miss, devicePlatform\)\}<\/td><\/tr>\}/);
-  assert.equal(history.match(/missText\(/g)?.length, 1);
+  assert.match(history, /function Table\(\{ rows, reasons = false, loading = 6 \}: \{ rows: HistoryRow\[\] \| null; reasons\?: boolean; loading\?: number \}\) \{\s*const \{ devicePlatform \} = useCabinet\(\);/);
+  // The line under a row is the table's own (DataTable detail), across the row and free to wrap.
+  assert.match(history, /detail=\{reasons \? \(row\) => \(row\.miss \? <><span className="cab-why">\{t\('history_why'\)\}<\/span><MissText miss=\{row\.miss\} platform=\{devicePlatform\} \/><\/> : null\) : undefined\}/);
+  assert.match(code('components/ui/DataTable.tsx'), /const more = detail\?\.\(row\) \?\? null;/);
+  assert.equal(history.match(/<MissText /g)?.length, 1);
   assert.match(history, /<Table rows=\{list\.rows\} reasons \/>/);
-  assert.match(history, /<Table rows=\{view\.rows\.slice\(0, 6\)\} \/>/);
+  assert.match(history, /<Table rows=\{view \? view\.rows\.slice\(0, 6\) : null\} \/>/);
   assert.match(code('components/cabinet/CabinetProvider.tsx'), /const devicePlatform = light\.state\.phase === 'ok' \? light\.state\.value\.device\?\.platform \?\? null : null;/);
-  assert.match(code('app/globals.css'), /\.cabinet-table \.cabinet-epoch-why td \{[^}]*border-block-start: none;/);
+  // The row over its line keeps no rule of its own; the line takes the row's.
+  assert.match(code('styles/base.css'), /\.tbl tr\[data-more\] td \{ border-bottom: 0; \}/);
   // The line for a row's miss, exactly as the Device tab words that miss.
   assert.equal(missText(told({ epoch: 159 }), 'ios'),
     'Epoch 159 was not counted: QNet Blockchain sent the device a wake, and no answer came before that epoch\'s check closed. The wake reached the device. '

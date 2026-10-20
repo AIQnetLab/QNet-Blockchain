@@ -104,6 +104,8 @@ describe('Android', () => {
     expect(app).toMatch(/if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.Q\) setEdgeToEdgeFeatureFlagOn\(\)/);
     expect(app.indexOf('setEdgeToEdgeFeatureFlagOn()')).toBeLessThan(app.indexOf('loadReactNative(this)'));
     expect(read('App.tsx')).toMatch(/<SafeAreaProvider initialMetrics=\{initialWindowMetrics\}>/);
+    // The status bar (time, network, battery) stays in view: the theme never asks for a full-screen window (owner 20.10).
+    expect(read('android/app/src/main/res/values/styles.xml')).not.toMatch(/windowFullscreen/);
     const activity = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
     const create = activity.slice(activity.indexOf('override fun onCreate('), activity.indexOf('override fun onPause('));
     expect(create.indexOf('super.onCreate(savedInstanceState)')).toBeLessThan(create.indexOf('WindowInsetsControllerCompat'));
@@ -123,11 +125,13 @@ describe('Android', () => {
       expect(size(`android/app/src/main/res/drawable-${density}/splash_logo.png`)).toEqual([192 * scale, 192 * scale]);
       expect(fs.existsSync(path.join(ROOT, `android/app/src/main/res/mipmap-${density}/splash_logo.png`))).toBe(false);
     }
-    // The app mark is drawn at 72 at most (the lock screen); React Native picks the variant for the screen's scale.
+    // The app mark is drawn at 64 at most (welcome, lock; 22 in the header); React Native picks the variant for the
+    // screen's scale.
     for (const [suffix, scale] of [['', 1], ['@2x', 2], ['@3x', 3], ['@4x', 4]]) {
-      expect(size(`assets/qnet_logo${suffix}.png`)).toEqual([72 * scale, 72 * scale]);
+      expect(size(`assets/qnet_logo${suffix}.png`)).toEqual([64 * scale, 64 * scale]);
     }
-    expect(read('src/screens/WalletScreen.styles.js')).toMatch(/lockLogo: \{\s*width: 72,\s*height: 72,/);
+    expect(read('src/screens/WalletScreen.styles.js')).toMatch(/lockLogo: \{\s*width: 64,\s*height: 64,/);
+    expect(read('src/screens/WalletScreen.styles.js')).toMatch(/headerMark: \{\s*width: 22,\s*height: 22,/);
   });
 });
 
@@ -181,7 +185,7 @@ describe('JavaScript', () => {
     expect(screen).not.toMatch(/Copy Recovery Phrase/);
     expect(screen).not.toMatch(/Clipboard\.setString\((mnemonic|seedText|copyText|stored\.code)/);
     // Two buttons (the new wallet's phrase, the phrase shown again from Settings), one path: DeviceSecurity copySecret.
-    expect(screen.match(/onPress=\{\(\) => copyRecoveryPhrase\(/g)).toHaveLength(2);
+    expect(screen.match(/onPress(=\{|: )\(\) => copyRecoveryPhrase\(/g)).toHaveLength(2);
     // The same path, and only that, takes a private key from Settings → Export private key to the clipboard.
     expect(screen.match(/copySecret\(/g)).toHaveLength(2);
     expect(screen).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) showCopied\(keyCopiedTimerRef, setKeyCopied, which, null\);/);

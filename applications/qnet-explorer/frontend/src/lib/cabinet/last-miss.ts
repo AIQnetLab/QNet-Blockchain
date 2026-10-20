@@ -177,12 +177,16 @@ function deliveryLine(miss: LastMiss): MessageKey | null {
   return miss.delivered ? 'delivery_reached' : 'delivery_not_reached';
 }
 
-// The miss's one line: what happened in that epoch, whether the wake reached the device when known, what to do.
-export function missText(miss: LastMiss, platform: DevicePlatform | null): string {
+// The miss's one line in two parts: what happened in that epoch (a text whose {epoch} names it, so a page can link
+// it), then whether the wake reached the device when known and what to do.
+export function missParts(miss: LastMiss, platform: DevicePlatform | null): { what: MessageKey; rest: string } {
   const notice = missNotice(miss, platform);
-  const parts = [t(notice.what, { epoch: number(miss.epoch) })];
   const delivery = deliveryLine(miss);
-  if (delivery !== null) parts.push(t(delivery));
-  parts.push(t(notice.todo));
-  return parts.join(' ');
+  return { what: notice.what, rest: [...(delivery === null ? [] : [t(delivery)]), t(notice.todo)].join(' ') };
+}
+
+// The miss's one line as words.
+export function missText(miss: LastMiss, platform: DevicePlatform | null): string {
+  const { what, rest } = missParts(miss, platform);
+  return `${t(what, { epoch: number(miss.epoch) })} ${rest}`;
 }

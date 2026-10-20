@@ -2,7 +2,8 @@
  * The app's own native security module (QNetSecurity; Kotlin on Android, Objective-C on iOS):
  * screen protection for secret screens, the recovery-phrase field's clipboard guard, the recovery phrase's Copy
  * with its timed clearing, the Android Keystore keys that seal the vault, the boot clock for the password lockout, a
- * local device-integrity check, and the wipe of the in-app browser's data. Nothing here talks to the network. Every call degrades to a harmless default when
+ * local device-integrity check, the wipe of the in-app browser's data, and the restart of the app's JS that a new layout
+ * direction takes. Nothing here talks to the network. Every call degrades to a harmless default when
  * the module is missing (unit tests, an older native build).
  */
 import { useEffect } from 'react';
@@ -206,6 +207,19 @@ export async function clearBrowserData() {
 export function setNativeTexts(texts) {
   if (!N || !N.setTexts || !texts) return;
   try { N.setTexts(texts); } catch (_) { /* the native defaults stay */ }
+}
+
+/**
+ * Starts the app's JS again from its bundle, as a cold start does (the wallet locks), so the layout direction set for
+ * the language takes effect (i18n/direction). Resolves whether the restart began; false without the native method.
+ */
+export async function reloadApp() {
+  if (!N || !N.reloadApp) return false;
+  try {
+    return !!(await N.reloadApp());
+  } catch (_) {
+    return false;
+  }
 }
 
 // ── Fresh device authentication ────────────────────────────────────────────────────────────────────

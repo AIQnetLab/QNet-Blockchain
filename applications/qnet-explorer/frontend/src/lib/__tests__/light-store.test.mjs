@@ -10,7 +10,9 @@ import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ATTACKER, CAPSULE_OPTIONS, ELIGIBLE, NODES, REG_ROOT, beaconOf, capsuleAt, genesisSig, network, pinAt, proofFor, read } from './light-helpers.mjs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { ATTACKER, CAPSULE_OPTIONS, ELIGIBLE, NODES, REG_ROOT, REPO, beaconOf, capsuleAt, genesisSig, network, pinAt, proofFor, read } from './light-helpers.mjs';
 import { PERSIST_PER_PARITY, createLightClient, pinIdentity, topPerParity } from '../../server/light/lineage.ts';
 import { fileCheckpointStore, memoryCheckpointStore, storeFileProblem } from '../../server/light/store.ts';
 import { agreedMacroblockHash, agreedNetworkId, macroblockHash, networkIdOf, proveNewPin, replacePinBlock, walkToHead } from '../../server/light/refresh.ts';
@@ -295,6 +297,41 @@ test('a new pin is a checkpoint the walk verified from the committed pin, its ha
   const few = Object.fromEntries(NODES.map((n, i) => [n, i < 3 ? () => 'throw' : headers()]));
   assert.match((await agreedMacroblockHash(108, NODES, network({ nodes: NODES, top: TOP, stateRootOf: rootOf, handlers: few }).fetchText)).error,
     /^2 nodes answered/);
+});
+
+test('a new pin at the index the wallets pinned, in place of the margin; none above the certified head', async () => {
+  const committed = { ...pinAt(K), hash: 'aa'.repeat(32) };
+  const run = async (index) => {
+    const net = network({ nodes: NODES, top: TOP, stateRootOf: rootOf, handlers: Object.fromEntries(NODES.map((n) => [n, headers()])) });
+    const r = await proveNewPin({ light: light(net, { pin: committed }), budgetMs: 60_000, pause: noPause, nodes: NODES, fetchText: net.fetchText,
+      pin: committed, margin: 1, index, ...pinRun });
+    return { net, r };
+  };
+  const { r } = await run(105);
+  assert.ok('block' in r, JSON.stringify(r.error));
+  assert.equal(r.index, 105);
+  assert.deepEqual(r.walk.targets, [105, 104]);
+  const pin = (await import(`data:text/javascript;base64,${Buffer.from(r.block).toString('base64')}`)).WS_CHECKPOINT;
+  assert.equal(pin.index, 105);
+  assert.equal(pin.hash, macroblockHash(header(105)));
+  assert.deepEqual(Object.keys(pin.anchors), ['104', '105']);
+  // Above the certified head: refused before any step is walked.
+  const above = await run(TOP + 1);
+  assert.equal(above.r.error, `macroblock ${TOP + 1} is above the certified head ${TOP}`);
+  assert.deepEqual(proofsAsked(above.net), []);
+  assert.equal((await run(105.5)).r.error, 'the index must be a whole number');
+  // At the committed pin or its successor (below the trust floor's pair): refused before any node is read.
+  for (const index of [K, K + 1]) {
+    const low = await run(index);
+    assert.equal(low.r.error, `the committed pin ${K} is as recent`, String(index));
+    assert.deepEqual(low.net.asked, [], String(index));
+  }
+  assert.match(read('applications/qnet-explorer/frontend/scripts/light-pin.mjs'), /index: number\('index', undefined\)/);
+  // --index with no value stops the tool before any node is read, never walking to the margin instead.
+  const tool = spawnSync(process.execPath, [fileURLToPath(new URL('applications/qnet-explorer/frontend/scripts/light-pin.mjs', REPO)), '--write-pin', '--index'],
+    { encoding: 'utf8', timeout: 60_000 });
+  assert.equal(tool.status, 1, tool.stderr);
+  assert.match(tool.stderr, /\[light-pin\] --index needs a value/);
 });
 
 test('the build runs the walk before next build, skipped under CI, never failing it; the site starts the follower', () => {

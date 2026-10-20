@@ -434,6 +434,8 @@ test('M-13: the payment card asks for the pass with its hold and hands it over; 
   assert.match(page, /setFaucetPass\(takeHandedPass\(\)\);/);
   assert.match(page, /const withPass = faucetPass \? \{ pass: faucetPass \} : \{\};/);
   assert.equal(page.match(/tokenType: '(?:1DEV|SOL)', \.\.\.withPass \}/g).length, 2);
-  assert.match(page, /return ` Try again at \$\{at - now < 12 \* 3_600_000 \? TIME\.format\(at\) : DAY_TIME\.format\(at\)\}\.`;/);
+  // The time through the site's one formats module (14:05, or Oct 20, 14:05 beyond the next twelve hours).
+  assert.match(page, /return ` Try again at \$\{clockAt\(at, now\)\}\.`;/);
+  assert.doesNotMatch(page, /Intl\.DateTimeFormat/);
   assert.match(page, /setErrorMessage\(err \+ tryAgain\(both, answered\)\);/);
 });

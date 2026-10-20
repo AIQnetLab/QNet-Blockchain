@@ -5,12 +5,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ANDROID_PLAY_PACKAGE, IOS_BUNDLE_ID, appleAppSiteAssociation, assetLinks, releaseGaps } from '../app-links.ts';
+import { ANDROID_PLAY_PACKAGE, IOS_BUNDLE_ID, IOS_TEAM_ID, appleAppSiteAssociation, assetLinks, releaseGaps } from '../app-links.ts';
 
-test('every app that opens link.aiqnet.io/l links is published', () => {
+test('every app that opens link.aiqnet.io/l and /send links is published', () => {
   assert.deepEqual(releaseGaps(), [], `missing: ${releaseGaps().join('; ')}`);
   assert.ok(assetLinks().some((s) => s.target.package_name === ANDROID_PLAY_PACKAGE));
-  assert.equal(appleAppSiteAssociation().applinks.details.length, 1);
+  const { details } = appleAppSiteAssociation().applinks;
+  assert.equal(details.length, 1);
+  assert.deepEqual(details[0].appIDs, [`${IOS_TEAM_ID}.${IOS_BUNDLE_ID}`]);
+  assert.deepEqual(details[0].components.map((c) => c['/']), ['/l', '/send']);
 });
 
 // The store records are created from the listing files: an App Store record under another bundle ID

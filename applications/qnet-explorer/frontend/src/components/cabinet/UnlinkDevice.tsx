@@ -11,6 +11,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useWallet } from '@/contexts/AppContext';
+import Action from '@/components/ui/Action';
+import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { t, type MessageKey } from '@/lib/texts';
@@ -19,6 +21,7 @@ import type { NodeStatusView } from '@/lib/cabinet/node-view';
 import type { ClaimFailure, LinkAnswer, UnlinkRequest } from '@/lib/qnet-link';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
+import { ActionBlock } from './parts';
 
 // What QNet Wallet's answer says, as its report.
 export function unlinkAnswerKey(answer: LinkAnswer): MessageKey {
@@ -61,14 +64,7 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
 
   // An address only viewed is never offered an unlink.
   if (viewOnly) return null;
-  if (!phoneFlows && !extension) {
-    return (
-      <div className="activate-card">
-        <h3 className="activate-step">{t(wallet ? 'unlink_title_wallet' : 'unlink_title')}</h3>
-        <p>{t('unlink_closed')}</p>
-      </div>
-    );
-  }
+  if (!phoneFlows && !extension) return <ActionBlock title={t(wallet ? 'unlink_title_wallet' : 'unlink_title')}><p>{t('unlink_closed')}</p></ActionBlock>;
   if (!walletHash || !choice) return null;
 
   const withExtension = async () => {
@@ -88,20 +84,16 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
     void qr.start('unlink', request);
   };
 
+  // Unlinking is never the solid action: it is not the step to do now.
   const app = phoneFlows && (
-    <div className="cabinet-choice">
+    <div className="cab-move-way">
       {!active || active.state.phase === 'idle' ? (
         <>
-          <button type="button" className={`qnet-button ${extension ? 'secondary' : 'activate-primary'}`} onClick={ask} disabled={!device}>
-            {t(wallet ? 'unlink_title_wallet' : 'unlink_button')}
-          </button>
-          {wallet && <p className="activate-note">{t('unlink_app_note')}</p>}
+          <Action kind="text" onClick={ask} disabled={!device}>{t(wallet ? 'unlink_title_wallet' : 'unlink_button')}</Action>
+          {wallet && <p className="note">{t('unlink_app_note')}</p>}
         </>
       ) : active.state.phase === 'done' ? (
-        <>
-          <p className={active.state.answer.status === 'ok' ? 'activate-result' : 'activate-note'} role="status">{t(unlinkAnswerKey(active.state.answer))}</p>
-          <button type="button" className="qnet-button secondary" onClick={active.cancel}>{t('start_again')}</button>
-        </>
+        <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{t(unlinkAnswerKey(active.state.answer))}</Answered>
       ) : (
         <LinkWaiting
           state={active.state}
@@ -115,30 +107,25 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
     </div>
   );
 
+  const again = { label: t('start_again'), onClick: () => setExt({ phase: 'idle' }) };
   return (
-    <div className="activate-card">
-      <h3 className="activate-step">{t(wallet ? 'unlink_title_wallet' : 'unlink_title')}</h3>
-      <p className="activate-note">{t(wallet ? 'unlink_lead_wallet' : 'unlink_lead')}</p>
+    <ActionBlock title={t(wallet ? 'unlink_title_wallet' : 'unlink_title')}>
+      <p>{t(wallet ? 'unlink_lead_wallet' : 'unlink_lead')}</p>
       {extension && (
-        <div className="cabinet-choice">
+        <div className="cab-move-way">
           {ext.phase === 'idle' && (
             <>
-              <button type="button" className="qnet-button activate-primary" onClick={() => void withExtension()}>{t('unlink_with_extension')}</button>
-              <p className="activate-note">{t('unlink_extension_note')}</p>
+              <Action kind="text" onClick={() => void withExtension()}>{t('unlink_with_extension')}</Action>
+              <p className="note">{t('unlink_extension_note')}</p>
             </>
           )}
-          {ext.phase === 'waiting' && <p className="activate-status" aria-live="polite">{t('wallet_extension_waiting')}</p>}
-          {ext.phase === 'done' && (
-            <p className={ext.answer.status === 'ok' ? 'activate-result' : 'activate-note'} role="status">{t(unlinkReport(ext.answer, 'extension'))}</p>
-          )}
-          {ext.phase === 'failed' && <p className="activate-error" role="alert">{t(failureKey(ext.failure, 'unlink'))}</p>}
-          {(ext.phase === 'done' || ext.phase === 'failed') && (
-            <button type="button" className="qnet-button secondary" onClick={() => setExt({ phase: 'idle' })}>{t('start_again')}</button>
-          )}
+          {ext.phase === 'waiting' && <Waiting>{t('wallet_extension_waiting')}</Waiting>}
+          {ext.phase === 'done' && <Answered action={again}>{t(unlinkReport(ext.answer, 'extension'))}</Answered>}
+          {ext.phase === 'failed' && <Failed action={again}>{t(failureKey(ext.failure, 'unlink'))}</Failed>}
         </div>
       )}
       {app}
-      <p className="activate-note">{t(wallet ? 'unlink_lost_wallet' : 'unlink_lost')}</p>
-    </div>
+      <p className="note">{t(wallet ? 'unlink_lost_wallet' : 'unlink_lost')}</p>
+    </ActionBlock>
   );
 }

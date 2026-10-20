@@ -169,28 +169,34 @@ test('the line: the total and its split when the history\'s balance is the one t
   // No answer: could not be read, with the balance the page shows when it shows one.
   assert.deepEqual(earnedView(null, '5000000000'), { kind: 'unknown', balanceNano: '5000000000' });
   assert.deepEqual(earnedView(null, null), { kind: 'unknown', balanceNano: null });
-  // The words, and amounts as the balance writes them.
-  assert.equal(TEXTS.earned_total, 'Total earned: {amount} QNC');
-  assert.equal(TEXTS.earned_split, 'Moved to the wallet: {moved} QNC · in the node balance: {balance} QNC');
-  assert.equal(TEXTS.earned_unknown, 'Total earned: could not be read.');
-  assert.equal(TEXTS.earned_unknown_split, 'Moved to the wallet: could not be read · in the node balance: {balance} QNC');
+  // The words, and amounts as the balance writes them: readings named "Total earned" and "Moved to the wallet".
+  assert.equal(TEXTS.ro_total_earned, 'Total earned');
+  assert.equal(TEXTS.ro_moved, 'Moved to the wallet');
+  assert.equal(TEXTS.earned_unknown, 'Could not be read.');
+  assert.equal(TEXTS.earned_reading, 'Reading the latest moves again…');
+  for (const key of ['earned_total', 'earned_split', 'earned_unknown_split']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);
   assert.equal(formatQnc('12345678901234'), '12,345.678901234');
 });
 
 test('the line on the Overview\'s balance of a light and a super node and on History, the same for a view', () => {
   const home = code('components/cabinet/NodeHome.tsx');
-  assert.equal(home.match(/<BalanceRow status=\{status\} \/>\s*<Earned nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\} \/>/g)?.length, 2);
+  // One node balance group for a light and a super node: the figure, then the total earned against the balance it shows.
+  assert.equal(home.match(/<Balance nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\}>/g)?.length, 2);
+  assert.match(home, /<p className="cab-figure">[\s\S]*?<\/p>[\s\S]*?<Earned nodeId=\{nodeId\} balanceNano=\{balanceNano\} \/>/);
   const history = code('components/cabinet/NodeHistory.tsx');
-  assert.match(history, /<p className="activate-note">\{t\('epoch_note'\)\}<\/p>\s*<Earned nodeId=\{nodeId\} balanceNano=\{null\} \/>\s*<Epochs nodeId=\{nodeId\} show="all" \/>/);
+  assert.match(history, /<div className="cab-earned"><Earned nodeId=\{nodeId\} balanceNano=\{null\} \/><\/div>\s*<Group>\s*<Epochs nodeId=\{nodeId\} show="all" \/>/);
   const line = history.slice(history.indexOf('export function Earned('), history.indexOf('function EpochCard('));
   // One shared read with the epochs (a view's on its own address, as theirs); read again while the balances differ, at
   // once and then after the site's copy.
   assert.match(line, /const \{ viewOnly \} = useCabinet\(\);\s*const \{ state, refresh \} = useNodeHistory\(nodeId, viewOnly\);/);
   assert.match(line, /const differs = earned !== null && balanceNano !== null && earned\.balanceNano !== balanceNano;/);
   assert.match(line, /\}, tries === 0 \? 0 : HISTORY_KEPT_MS \+ 1_000\);/);
-  assert.match(line, /const shown = earnedView\(earned, balanceNano, tries >= EARNED_RETRIES\);/);
-  assert.match(line, /<p>\{t\('earned_unknown'\)\}<\/p>/);
-  assert.match(line, /<p>\{t\('earned_total', \{ amount: formatQnc\(shown\.totalNano\) \}\)\}<\/p>/);
+  // Dashes while the history is read the first time, then its view.
+  assert.match(line, /const shown = state\.phase === 'loading' \? null : earnedView\(earned, balanceNano, tries >= EARNED_RETRIES\);/);
+  assert.match(line, /const sub = shown\?\.kind === 'reading' \? t\('earned_reading'\) : shown\?\.kind === 'unknown' \? t\('earned_unknown'\) : undefined;/);
+  assert.match(line, /<Readout label=\{t\('ro_total_earned'\)\} value=\{qnc\(total\?\.totalNano\)\} amount=\{\{\}\} sub=\{sub\} wide \/>/);
+  // History, which shows no balance of its own above, names the history's balance as a third reading.
+  assert.match(line, /\{balanceNano === null && <Readout label=\{t\('balance_title'\)\} value=\{qnc\(total\?\.balanceNano\)\}/);
   // Public chain data: a view only reads its own address, and the line shows the same.
   assert.equal(line.match(/viewOnly/g)?.length, 2, 'public chain data: no difference for a view');
   // The site keeps a page as long as the line waits for.

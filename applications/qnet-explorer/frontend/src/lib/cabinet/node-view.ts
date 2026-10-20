@@ -168,8 +168,8 @@ export function parseStatusView(body: unknown): NodeStatusView | null {
 }
 
 // A super node's admission as the node's status names it (development/qnet-integration/src/node/registration.rs
-// super_admission_label): in the set the network admits to the super node share this epoch, outside it (no super node
-// share while outside), or no admission rule this epoch.
+// super_admission_label): in the set the network admits to consensus and the super node share this epoch (one allowlist
+// decides both), outside it (no super node share while outside), or no admission rule this epoch.
 export const SUPER_ADMISSIONS = ['admitted', 'waiting', 'not_required'] as const;
 export type SuperAdmission = (typeof SUPER_ADMISSIONS)[number];
 
@@ -197,7 +197,7 @@ export interface SuperStatusView {
 }
 
 // `waiting`: registered, its server answers, and outside the network's admission (the node's `admission`, else outside
-// the eligible set): registered, waiting for the network to admit it (owner, 11.10).
+// the eligible set): registered, not admitted to consensus yet (owner, 11.10).
 export type SuperState = 'none' | 'online' | 'offline' | 'waiting';
 
 // The server is in step with the network within this many blocks (the node's own rule for a synced peer,

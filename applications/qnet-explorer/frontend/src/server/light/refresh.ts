@@ -2,8 +2,9 @@
 // from the pin, every step verified exactly as a request's walk verifies it (lineage.ts), rooted at a GALC v2 capsule
 // (galc.ts) when the nodes serve one and the walk from the site's own checkpoints is long; what it reaches, and the
 // capsule, go into the store, so the server started after the build resumes at the head. Asked for a new pin, it renders
-// the pin block of a checkpoint a few below the head, walked in that run from the committed pin by committee signatures
-// alone (no store, no capsule), with block 0's hash every answering genesis node names, for src/server/light/pin.ts.
+// the pin block of a checkpoint a few below the head (or at the index asked), walked in that run from the committed pin
+// by committee signatures alone (no store, no capsule), with block 0's hash every answering genesis node names, for
+// src/server/light/pin.ts.
 import jsSha3 from 'js-sha3';
 import type { CapsuleRefresh } from './galc.ts';
 import type { FetchText, LightClient, Pin } from './lineage.ts';
@@ -30,6 +31,8 @@ export interface WalkOptions {
   budgetMs: number;
   /** Macroblocks below the certified head the walk stops at (0: the head and the one below). */
   margin?: number;
+  /** The macroblock the walk stops at in place of `margin` (a new pin at the index the wallets pinned); none above the head. */
+  index?: number;
   /** False: no capsule is asked for first (a new pin's walk). */
   capsule?: boolean;
   now?: () => number;
@@ -37,7 +40,7 @@ export interface WalkOptions {
 }
 
 export interface WalkResult {
-  outcome: 'reached' | 'no_head' | 'budget' | 'refused';
+  outcome: 'reached' | 'no_head' | 'above_head' | 'budget' | 'refused';
   head: number | null;
   targets: number[];
   highestBefore: number;
@@ -48,7 +51,7 @@ export interface WalkResult {
 
 const wait = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 
-/** Walks both parity chains to `head - margin` and `head - margin - 1`, from the capsule when one roots them, then writes the store. */
+/** Walks both parity chains to `head - margin` (or `index`) and the one below, from the capsule when one roots them, then writes the store. */
 export async function walkToHead(o: WalkOptions): Promise<WalkResult> {
   const now = o.now ?? Date.now;
   const pause = o.pause ?? wait;
@@ -57,8 +60,9 @@ export async function walkToHead(o: WalkOptions): Promise<WalkResult> {
   const highestBefore = light.highestVerifiedIndex();
   const head = await light.certifiedHead();
   if (head === null) return { outcome: 'no_head', head, targets: [], highestBefore, highest: highestBefore, capsule: null };
+  const k = o.index ?? head - (o.margin ?? 0);
+  if (k > head) return { outcome: 'above_head', head, targets: [], highestBefore, highest: highestBefore, capsule: null };
   const capsule = o.capsule === false ? null : await light.refreshCapsule();
-  const k = head - (o.margin ?? 0);
   const targets = [k, k - 1].filter((t) => t >= light.trustFloorIndex());
   const deadline = now() + o.budgetMs;
   const reach = async (t: number): Promise<WalkResult['outcome']> => {
@@ -192,9 +196,9 @@ export interface NewPinOptions extends WalkOptions {
 }
 
 /**
- * A new pin `margin` macroblocks below the certified head, both of its anchors verified in this run by the walk from
- * the committed pin, and its hash named alike by the nodes for a header carrying the root the walk verified; block 0's
- * hash the nodes name must be the committed NETWORK_ID.
+ * A new pin `margin` macroblocks below the certified head (or at `index`), both of its anchors verified in this run by
+ * the walk from the committed pin, and its hash named alike by the nodes for a header carrying the root the walk
+ * verified; block 0's hash the nodes name must be the committed NETWORK_ID.
  */
 export async function proveNewPin(o: NewPinOptions): Promise<{ block: string; index: number; walk: WalkResult } | { error: string; walk?: WalkResult }> {
   await o.light.ready();
@@ -204,14 +208,19 @@ export async function proveNewPin(o: NewPinOptions): Promise<{ block: string; in
   if (o.light.heldCapsuleIndex() > 0) return { error: 'the light client holds a capsule: a new pin is walked from the committed pin by committee signatures alone' };
   if (o.light.highestVerifiedIndex() > o.pin.index) return { error: 'the light client holds checkpoints it did not verify in this run (a store): a new pin is walked from the committed pin' };
   if (!Number.isSafeInteger(o.galcInterval) || o.galcInterval < 1) return { error: 'the capsule cadence must be a whole number above 0' };
+  if (o.index !== undefined && !Number.isSafeInteger(o.index)) return { error: 'the index must be a whole number' };
+  // A pin whose anchors reach down to the committed one adds nothing: an index asked is refused before any node is read.
+  const asRecent = `the committed pin ${o.pin.index} is as recent`;
+  if (o.index !== undefined && o.index <= o.pin.index + 1) return { error: asRecent };
   const network = await agreedNetworkId(o.nodes, o.fetchText);
   if ('error' in network) return { error: network.error };
   if (network.networkId !== o.networkId) return { error: `the nodes serve block 0 ${network.networkId}, the committed NETWORK_ID is ${o.networkId}: another chain` };
   const walk = await walkToHead({ ...o, margin: o.margin ?? PIN_MARGIN, capsule: false });
+  if (walk.outcome === 'above_head') return { error: `macroblock ${o.index} is above the certified head ${walk.head}`, walk };
   if (walk.outcome !== 'reached' || walk.targets.length !== 2) return { error: `walk ${walk.outcome}`, walk };
   const [k, below] = walk.targets.map((t) => o.light.verifiedCheckpoint(t));
   if (!k || !below || k.index !== below.index + 1) return { error: 'the anchors are not verified', walk };
-  if (k.index <= o.pin.index + 1) return { error: `the committed pin ${o.pin.index} is as recent`, walk };
+  if (k.index <= o.pin.index + 1) return { error: asRecent, walk };
   const agreed = await agreedMacroblockHash(k.index, o.nodes, o.fetchText, k.stateRoot);
   if ('error' in agreed) return { error: agreed.error, walk };
   const date = o.date ?? new Date().toISOString().slice(0, 10);

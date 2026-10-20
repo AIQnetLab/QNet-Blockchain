@@ -6,7 +6,8 @@
  */
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const fs = require('fs');
 const path = require('path');
@@ -204,8 +205,7 @@ describe('MOB-BR-R4-02: a site\'s send signs only at the confirmed nonce + 1', (
 
 describe('the sheet of a site\'s send while an earlier transaction is unconfirmed', () => {
   const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).filter((c) => typeof c === 'string').join('')).join('\n');
-  const buttons = (tree) => tree.root.findAllByType(TouchableOpacity)
-    .map((b) => ({ label: b.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join(''), props: b.props }));
+  const buttons = (tree) => tree.root.findAllByType(Action).map((b) => ({ label: b.props.label, props: b.props }));
   const mounted = [];
   afterEach(async () => { await act(async () => { while (mounted.length) mounted.pop().unmount(); }); });
   const view = (preview) => ({

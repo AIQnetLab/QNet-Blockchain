@@ -25,3 +25,17 @@ export function epochOfKey(key: number): EpochSpan | null {
 export function epochOfHeight(height: number): number {
   return Math.floor(height / EPOCH_BLOCKS);
 }
+
+export interface EpochProgress {
+  epoch: number;
+  // Blocks to the epoch's end, 1 to EPOCH_BLOCKS, and the share of its blocks done.
+  left: number;
+  done: number;
+}
+
+// Where the head is in its epoch, the one rule for every epoch reading; null while the height is not known.
+export function epochProgress(height: number): EpochProgress | null {
+  if (!Number.isSafeInteger(height) || height <= 0) return null;
+  const left = EPOCH_BLOCKS - (height % EPOCH_BLOCKS);
+  return { epoch: epochOfHeight(height), left, done: (EPOCH_BLOCKS - left) / EPOCH_BLOCKS };
+}

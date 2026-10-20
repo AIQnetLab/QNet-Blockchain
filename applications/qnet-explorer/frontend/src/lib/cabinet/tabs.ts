@@ -1,7 +1,9 @@
 // My node's sections (the cabinet's tabs), each at its own address, and where a wallet is on the way to a running
 // node. Pure functions: the pages and the tests read the same rules.
 
+import type { AccountRow } from '../account-menu.ts';
 import type { NodeType } from '../qnet-link.ts';
+import { t, type MessageKey } from '../texts.ts';
 import { wayOf, type ActivationView, type ViewState } from './wallet-activation.ts';
 
 // Overview (status and next step, the node balance, the node's details, the latest epochs), Activate (only while it
@@ -57,6 +59,53 @@ export function visibleTabs(state: ViewState | null, openActivation: boolean, cu
   return TABS.filter((tab) => tab !== 'activate' || current === 'activate' || (!viewOnly && (state === 'none' || openActivation)));
 }
 
+// The states with no node on the network yet: the sections list Overview (and Activate while it is the way on); Device
+// and History join once a node exists, and their pages still open directly with their empty line.
+const NO_NODE_STATES: ReadonlySet<ViewState> = new Set<ViewState>(['none', 'reserved', 'sending', 'burned', 'recording']);
+
+const TAB_LABEL: Record<Tab, MessageKey> = {
+  overview: 'nav_overview',
+  activate: 'nav_activate',
+  device: 'nav_device',
+  history: 'nav_history',
+};
+
+export interface NavItem {
+  tab: Tab;
+  href: string;
+  label: string;
+  // One datum beside the name; null while it is not read ("—").
+  datum: string | null;
+  tone: AccountRow['tone'];
+}
+
+// My node's sections as the rail (web) and the thumb bar (phone) list them, each with one datum taken from the rows the
+// header's account menu shows (account-menu.ts accountRows), so the two never disagree: Overview the node balance (or
+// that there is no node), Device the device or the server, History the newest epoch, Activate its step while it is the
+// one to do now (`step`, journey().current).
+export function navItems(
+  state: ViewState | null, openActivation: boolean, current: Tab, viewOnly: boolean, rows: readonly Pick<AccountRow, 'key' | 'datum' | 'tone'>[], step: number | null,
+): NavItem[] {
+  const row = (key: AccountRow['key']) => rows.find((r) => r.key === key) ?? null;
+  const noNode = state !== null && NO_NODE_STATES.has(state);
+  const balance = row('balance');
+  const datum = (tab: Tab): Pick<NavItem, 'datum' | 'tone'> => {
+    switch (tab) {
+      case 'overview':
+        return balance ? { datum: balance.datum, tone: balance.tone } : { datum: noNode ? t('account_no_node') : row('node')?.datum ?? null, tone: null };
+      case 'device':
+        return { datum: row('device')?.datum ?? null, tone: null };
+      case 'history':
+        return { datum: row('history')?.datum ?? null, tone: row('history')?.tone ?? null };
+      case 'activate':
+        return step === 1 ? { datum: t('account_step', { step: 2, steps: JOURNEY.length }), tone: 'ember' } : { datum: null, tone: null };
+    }
+  };
+  return visibleTabs(state, openActivation, current, viewOnly)
+    .filter((tab) => !noNode || tab === 'overview' || tab === 'activate' || tab === current)
+    .map((tab) => ({ tab, href: TAB_HREF[tab], label: t(TAB_LABEL[tab]), ...datum(tab) }));
+}
+
 // Connect, Activate, then for a light node Link a device and Running, for a super node Run the server and Running.
 export const JOURNEY = ['connect', 'activate', 'link', 'running'] as const;
 export const SUPER_JOURNEY = ['connect', 'activate', 'server', 'running'] as const;
@@ -99,6 +148,14 @@ export function journey(connected: boolean, view: ActivationView | null): { done
       return at(3, null);
     }
   }
+}
+
+// The journey strip shows only while a step after Activate is open (Link a device or Run the server, or Running while the
+// device or server has not answered): never on Activate, whose numbered steps say where it is, and never once running.
+export function showJourney(tab: Tab, connected: boolean, view: ActivationView | null): boolean {
+  if (tab === 'activate') return false;
+  const { current } = journey(connected, view);
+  return current !== null && current >= 2;
 }
 
 // The section a bare /node opens for a wallet: Activate only when it has no node, no burn and nothing on its way (and it

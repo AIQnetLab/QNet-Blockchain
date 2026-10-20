@@ -32,7 +32,8 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
 
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text, TouchableOpacity } from 'react-native';
+import { Text } from 'react-native';
+import Action from '../src/components/ui/Action';
 
 const fs = require('fs');
 const path = require('path');
@@ -361,7 +362,7 @@ describe('MN2-08, MN2-09: the Node tab offers only what can work', () => {
         onMove={() => {}} onUse={() => {}} onCopy={() => {}} nodeTitle={() => ''} />);
     });
     const text = tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-    const ids = tree.root.findAllByType(TouchableOpacity).map((n) => n.props.testID);
+    const ids = tree.root.findAllByType(Action).map((n) => n.props.testID);
     return { text, ids };
   };
 

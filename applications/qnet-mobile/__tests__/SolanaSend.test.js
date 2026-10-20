@@ -510,7 +510,11 @@ describe('the Send screen itself, against the network in memory', () => {
     );
   }
   const texts = (tree) => tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
-  const byId = (tree, id) => tree.root.find((n) => n.props.testID === id && (typeof n.props.onPress === 'function' || n.type === TextInput));
+  // The element itself: an input, or the innermost pressable of an action (components/ui/Action wraps a Pressable).
+  const byId = (tree, id) => {
+    const all = tree.root.findAll((n) => n.props.testID === id && (typeof n.props.onPress === 'function' || n.type === TextInput));
+    return all[all.length - 1];
+  };
 
   it('review → fresh check → the signed transfer goes out → pending; the form shows the token, fee and total', async () => {
     const rpc = fakeRpc();
@@ -564,7 +568,7 @@ describe('the Send screen itself, against the network in memory', () => {
     await act(async () => { tree.unmount(); });
   });
 
-  it('the scan icon sits in the recipient field, named for screen readers, and opens the scan', async () => {
+  it('Scan sits in the recipient field, named for screen readers, and opens the scan', async () => {
     fakeRpc();
     const onScan = jest.fn();
     let tree;

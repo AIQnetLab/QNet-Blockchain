@@ -142,15 +142,17 @@ test('the provider watches the network while the wallet waits, and every page le
   // The Overview: Link your phone first, before the node's card; the sections take the listing's word.
   const home = code('components/cabinet/NodeHome.tsx');
   assert.match(home, /const state = lightSectionState\(status, view\);/);
-  assert.ok(home.indexOf("{state === 'no_device' && <LinkPhone onLinked={reread} />}") < home.indexOf("t('overview_title')"));
+  const summary = home.slice(home.indexOf('function Summary('), home.indexOf('function LightOverview('));
+  assert.ok(summary.indexOf("{state === 'no_device' && <LinkPhone onLinked={reread} />}") < summary.indexOf('<Balance '));
   // The Device tab takes the listing's word too; History lists the wallet's epochs without the light node's status.
   assert.match(code('components/cabinet/NodeDevices.tsx'), /const s = lightSectionState\(status, view\);/);
   assert.doesNotMatch(code('components/cabinet/NodeHistory.tsx'), /lightSectionState/);
-  // Link your phone: the steps so far, the phone's now, then the numbered steps with Link a device.
+  // Link your phone: the numbered steps with Link a device; where the wallet is on its way is the journey strip over the
+  // section (CabinetFrame), shown only while such a step is open, never a second list of checks here.
   const steps = code('components/cabinet/NextSteps.tsx');
   const linkPhone = steps.slice(steps.indexOf('export function LinkPhone('), steps.indexOf('export function NodeNext('));
-  assert.match(linkPhone, /<Step at="done">\{t\('next_step_burn'\)\}<\/Step>\s*<Step at="done">\{t\('next_step_record'\)\}<\/Step>\s*<Step at="now">\{t\('next_step_link'\)\}<\/Step>/);
-  assert.match(linkPhone, /<p className="activate-result" role="status">\{t\('next_link_lead'\)\}<\/p>/);
+  assert.match(linkPhone, /<Group title=\{t\('next_link_title'\)\}>\s*<p>\{t\('next_link_lead'\)\}<\/p>\s*<ol className="cab-list">\s*<PhoneReady \/>/);
+  assert.doesNotMatch(steps, /next_step_|cabinet-checks/);
   // The Activate page and the extension's answer follow the listing too.
   assert.match(code('components/cabinet/NodeActivate.tsx'), /\{!extensionAnswered && \(view\.state === 'node' \? <NodeNext \/> : <NoNode pending=\{view\.state === 'recording'\} overview \/>\)\}/);
   const next = steps.slice(steps.indexOf('export function NodeNext('));
@@ -159,8 +161,8 @@ test('the provider watches the network while the wallet waits, and every page le
   assert.match(ext, /const listed = choice\?\.qnet === qnet && view\.nodes\.includes\('light'\);/);
   // The record's card: what needs no record goes on meanwhile, and it says when the network does not answer.
   const recording = steps.slice(steps.indexOf('export function Recording('), steps.indexOf('function PhoneReady('));
-  assert.match(recording, /\{askAgain && \(\s*<>\s*<p>\{t\('next_phone_ready'\)\}<\/p>\s*<ol className="activate-facts">\s*<PhoneReady \/>/);
-  assert.match(recording, /\{view\.networkDown && choice\?\.qnet === qnet && <p className="activate-note" role="status">\{t\('next_network_down'\)\}<\/p>\}/);
+  assert.match(recording, /\{askAgain && \(\s*<>\s*<p>\{t\('next_phone_ready'\)\}<\/p>\s*<ol className="cab-list">\s*<PhoneReady \/>/);
+  assert.match(recording, /\{view\.networkDown && choice\?\.qnet === qnet && <p className="note" role="status">\{t\('next_network_down'\)\}<\/p>\}/);
   assert.match(TEXTS.next_recording, /every few seconds and moves on to linking your phone as soon as QNet Blockchain lists the node\.$/);
   assert.doesNotMatch(TEXTS.next_recording, /half minute/);
 });

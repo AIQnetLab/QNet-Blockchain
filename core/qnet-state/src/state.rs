@@ -1670,19 +1670,25 @@ impl StateMerkleTree {
         level[0]
     }
 
-    /// Sorted live entries of one bucket: RAM when the leaf set is complete, else
-    /// merged with the store (tombstones filtered) exactly like subtree_probe.
+    /// Sorted live entries of one bucket.
     fn bucket_entries(&self, bucket_key: &[u8; HASH_SIZE]) -> Vec<([u8; HASH_SIZE], [u8; HASH_SIZE])> {
         let (lo, hi) = Self::subtree_bounds(BUCKET_DEPTH, bucket_key);
+        self.live_leaves_in(&lo, &hi)
+    }
+
+    /// Sorted live leaves in [lo, hi]: RAM when the leaf set is complete, else the store
+    /// (tombstones filtered) overlaid with RAM. A complete set never reads the store, which may
+    /// still lag behind this tree's own queued deltas.
+    fn live_leaves_in(&self, lo: &[u8; HASH_SIZE], hi: &[u8; HASH_SIZE]) -> Vec<([u8; HASH_SIZE], [u8; HASH_SIZE])> {
         if self.leaves_complete || self.node_store.is_none() {
-            return self.leaves.range(lo..=hi).map(|(k, v)| (*k, *v)).collect();
+            return self.leaves.range(*lo..=*hi).map(|(k, v)| (*k, *v)).collect();
         }
         let store = self.node_store.as_ref().unwrap();
         let mut set: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
-            store.leaves_under(&lo, &hi, usize::MAX).into_iter()
+            store.leaves_under(lo, hi, usize::MAX).into_iter()
                 .filter(|(k, _)| !self.pending_leaf_dels.contains(k))
                 .collect();
-        for (k, v) in self.leaves.range(lo..=hi) {
+        for (k, v) in self.leaves.range(*lo..=*hi) {
             set.insert(*k, *v);
         }
         set.into_iter().collect()
@@ -1816,9 +1822,9 @@ impl StateMerkleTree {
                 // never observed: the caller's result is discarded.
                 let (lo, hi) = Self::subtree_bounds(depth, key);
                 let probe = REBUILD_SUBTREE_MAX_LEAVES.saturating_add(1);
-                let under = match self.node_store.clone() {
-                    Some(store) => store.leaves_under(&lo, &hi, probe).len(),
-                    None => self.leaves.range(lo..=hi).take(probe).count(),
+                let under = match self.node_store.as_ref() {
+                    Some(store) if !self.leaves_complete => store.leaves_under(&lo, &hi, probe).len(),
+                    _ => self.leaves.range(lo..=hi).take(probe).count(),
                 };
                 if under <= REBUILD_SUBTREE_MAX_LEAVES {
                     (self.rebuild_subtree(depth, key), true)
@@ -1836,18 +1842,7 @@ impl StateMerkleTree {
     /// a branch node missing from the node set; never taken in steady state.
     fn rebuild_subtree(&self, depth: usize, key: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
         let (lo, hi) = Self::subtree_bounds(depth, key);
-        let mut level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = self
-            .leaves
-            .range(lo..=hi)
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        if let Some(ref store) = self.node_store {
-            for (k, v) in store.leaves_under(&lo, &hi, usize::MAX) {
-                if !self.pending_leaf_dels.contains(&k) {
-                    level.entry(k).or_insert(v);
-                }
-            }
-        }
+        let level = self.live_leaves_in(&lo, &hi);
         if level.is_empty() {
             return self.default_hashes[depth];
         }
@@ -2086,8 +2081,9 @@ impl StateMerkleTree {
     }
 
     /// Read-only node_resolve for the parallel fold: caches are complete, so a miss
-    /// is authoritative and the store is never touched. Third field flags a missing
-    /// branch too large to rebuild in place (pass invalidated after join).
+    /// is authoritative and every read, the branch rebuild included, is answered from RAM.
+    /// Third field flags a missing branch too large to rebuild in place (pass invalidated
+    /// after join).
     fn node_resolve_ro(&self, depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], bool, bool) {
         if depth <= BUCKET_DEPTH {
             return (self.bucket_hash_at(&Self::bucket_of(key)), false, false);
@@ -5564,6 +5560,7 @@ mod parallel_apply_tests {
 #[cfg(test)]
 mod merkle_equiv_tests {
     use super::*;
+    use super::tests_support::MapNodeStore;
     use crate::Account;
     use std::collections::{BTreeMap, HashMap};
 
@@ -6021,7 +6018,7 @@ mod merkle_equiv_tests {
     /// runs (restart, reorg reconcile, cold join).
     #[test]
     fn full_reset_forgets_the_stores_prior_leaf_set() {
-        let store = std::sync::Arc::new(MockNodeStore::new());
+        let store = std::sync::Arc::new(MapNodeStore::default());
 
         let mut old = StateMerkleTree::new();
         old.set_node_store(store.clone());
@@ -6042,7 +6039,7 @@ mod merkle_equiv_tests {
         let after_reset = old.finalize();
 
         // The same single-account state built with no history behind it.
-        let fresh_store = std::sync::Arc::new(MockNodeStore::new());
+        let fresh_store = std::sync::Arc::new(MapNodeStore::default());
         let mut fresh = StateMerkleTree::new();
         fresh.set_node_store(fresh_store);
         let mut c = Account::new("kept".to_string());
@@ -6056,54 +6053,6 @@ mod merkle_equiv_tests {
         assert_eq!(store.all_leaves().len(), 1, "the abandoned leaves are gone from disk too");
     }
 
-    // In-memory MerkleNodeStore mock: a durable mirror behind a Mutex. Exercises
-    // the read-through/eviction path without any external dependency.
-    struct MockNodeStore {
-        inner: std::sync::Mutex<(
-            BTreeMap<[u8; 32], [u8; 32]>,          // leaves
-            HashMap<(u32, [u8; 32]), [u8; 32]>,    // nodes
-        )>,
-    }
-    impl MockNodeStore {
-        fn new() -> Self {
-            Self { inner: std::sync::Mutex::new((BTreeMap::new(), HashMap::new())) }
-        }
-    }
-    impl MerkleNodeStore for MockNodeStore {
-        fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
-            self.inner.lock().unwrap().0.get(key).copied()
-        }
-        fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]> {
-            self.inner.lock().unwrap().1.get(&(depth, *key)).copied()
-        }
-        fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
-            self.inner.lock().unwrap().0.iter().map(|(k, v)| (*k, *v)).collect()
-        }
-        fn wipe_for_full_reset(&self) -> Result<(), String> {
-            self.inner.lock().unwrap().0.clear();
-            Ok(())
-        }
-        fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])> {
-            self.inner.lock().unwrap().0.range(*lo..=*hi).take(limit).map(|(k, v)| (*k, *v)).collect()
-        }
-        fn put_batch(&self, d: &AcctDelta) -> Result<(), String> {
-            let mut g = self.inner.lock().unwrap();
-            // leaf_puts/leaf_dels are disjoint by contract → order-independent.
-            for k in &d.leaf_dels { g.0.remove(k); }
-            for (k, v) in &d.leaf_puts { g.0.insert(*k, *v); }
-            // Full rebuild → replace the entire node set with node_puts (the
-            // complete non-default set); otherwise apply the incremental delta
-            // (dels BEFORE puts so a re-put wins).
-            if d.wipe_nodes {
-                g.1.clear();
-            } else {
-                for (dp, k) in &d.node_dels { g.1.remove(&(*dp, *k)); }
-            }
-            for ((dp, k), v) in &d.node_puts { g.1.insert((*dp, *k), *v); }
-            Ok(())
-        }
-    }
-
     // CONSENSUS GUARD: the DB-backed tree (with a tiny cache cap forcing
     // read-through + eviction on every finalize) MUST produce a byte-identical
     // root to the plain in-mem tree for the SAME operation sequence. If they
@@ -6115,7 +6064,7 @@ mod merkle_equiv_tests {
     fn db_backed_root_equals_in_mem_root() {
         let mut tree_a = StateMerkleTree::new();                 // plain in-mem (store None)
         let mut tree_b = StateMerkleTree::new();                 // DB-backed, tiny cap
-        let store = std::sync::Arc::new(MockNodeStore::new());
+        let store = std::sync::Arc::new(MapNodeStore::default());
         tree_b.set_node_store(store.clone());
         tree_b.set_node_cache_cap(8); // force read-through + eviction each finalize
 
@@ -6198,7 +6147,7 @@ mod merkle_equiv_tests {
     // rebuilt purely from the persisted store.
     #[test]
     fn db_backed_removal_matches_in_mem() {
-        let store = std::sync::Arc::new(MockNodeStore::new());
+        let store = std::sync::Arc::new(MapNodeStore::default());
         let mut tb = StateMerkleTree::new();
         tb.set_node_store(store.clone());
         tb.set_node_cache_cap(4); // tiny cap → eviction + read-through + cold rebuilds
@@ -6213,15 +6162,23 @@ mod merkle_equiv_tests {
         // 2) remove a spread of leaves, each its own finalize (full rebuild path,
         //    since remove() does not populate dirty_paths). The store keeps stale
         //    copies that the all_leaves() overlay must subtract via the tombstone.
-        for i in (0..24usize).step_by(3) {
+        //    The gate closes before the last one with nothing queued ahead: that rebuild
+        //    leaves both caches complete, so it and steps 3-4 wait on the write-behind thread.
+        let removed: Vec<usize> = (0..24usize).step_by(3).collect();
+        for (n, &i) in removed.iter().enumerate() {
+            if n + 1 == removed.len() {
+                tb.flush_barrier();
+                store.close_gate();
+            }
             let addr = accts[i].address.clone();
             ta.remove(&addr);
             tb.remove(&addr);
             assert_eq!(ta.root(), tb.root(), "op remove {}: db-backed root diverged", i);
         }
+        assert!(tb.leaves_complete && tb.node_cache_complete, "a held queue blocks eviction");
 
         // 3) del-then-put in ONE finalize (re-create a removed leaf) — put wins.
-        //    remove_lazy populates dirty_paths → incremental leaf_get tombstone path.
+        //    remove_lazy populates dirty_paths → incremental path; the delta carries the put only.
         let re = accts[0].address.clone();
         let mut v = Account::new(re.clone()); v.balance = 999; v.nonce = 3;
         ta.remove_lazy(&re); ta.insert_lazy(&re, &v);
@@ -6242,15 +6199,74 @@ mod merkle_equiv_tests {
         //    from scratch (empty caches → recompute_root reads all_leaves()), must
         //    equal the in-mem root. This holds ONLY if every deletion was persisted
         //    as a leaf_del — otherwise the store still holds the removed leaves and
-        //    this cold root diverges. Models a cold-joining super-node.
-        let mut tc = StateMerkleTree::new();
-        tc.set_node_store(store.clone());
-        tc.dirty = true;
-        tc.pending_updates = 1;
-        let rc = tc.finalize();
+        //    this cold root diverges. Models a cold-joining super-node. A reader of the
+        //    store sees the writer's deltas only after the writer's flush_barrier.
+        let cold = |s: &std::sync::Arc<MapNodeStore>| {
+            let mut tc = StateMerkleTree::new();
+            tc.set_node_store(s.clone());
+            tc.dirty = true;
+            tc.pending_updates = 1;
+            let rc = tc.finalize();
+            (rc, tc)
+        };
+        let (held, probe) = cold(&store);
+        assert_ne!(ra, held, "with the writer's last three deltas queued the store lags behind it");
+        store.open_gate();
+        tb.flush_barrier();
+        probe.flush_barrier();
+        let (rc, _) = cold(&store);
         assert_eq!(ra, rc,
             "fresh tree rebuilt purely from the persisted store must equal in-mem root \
              (deletions persisted via leaf_dels, no resurrection)");
+    }
+
+    // The branch-missing recovery folds the subtree from RAM while the leaf set is complete: the
+    // store may still lag behind this tree's own queued deltas, and a leaf deleted in one of them
+    // would come back into the rebuilt subtree.
+    #[test]
+    fn branch_rebuild_ignores_the_store_while_own_deltas_are_queued() {
+        let store = std::sync::Arc::new(MapNodeStore::default());
+        let mut tb = StateMerkleTree::new();
+        tb.set_node_store(store.clone()); // default cap: no eviction, deltas go write-behind
+        let mut ta = StateMerkleTree::new();
+        let accts: Vec<Account> = (0..24u64).map(mk).collect();
+        for a in &accts { ta.insert_lazy(&a.address, a); tb.insert_lazy(&a.address, a); }
+        assert_eq!(ta.finalize(), tb.finalize());
+        tb.flush_barrier();
+        let high = |a: &Account| StateMerkleTree::hash_address(&a.address)[0] & 0x80 != 0;
+        let gone = accts.iter().find(|a| high(a)).expect("a leaf in the high half").clone();
+        let mut moved = accts.iter().find(|a| !high(a)).expect("a leaf in the low half").clone();
+
+        // The removal stays queued behind the gate: the store still holds the leaf.
+        store.close_gate();
+        ta.remove_lazy(&gone.address);
+        tb.remove_lazy(&gone.address);
+        assert_eq!(ta.finalize(), tb.finalize());
+        assert!(tb.leaves_complete && tb.node_cache_complete);
+        assert!(store.leaf(&StateMerkleTree::hash_address(&gone.address)).is_some());
+
+        // The same anomaly on both trees: the high half's top branch node is missing from RAM,
+        // so the next pass resolves it through the recovery rebuild.
+        let mut high_key = [0u8; HASH_SIZE];
+        high_key[0] = 0x80;
+        let top = (TREE_DEPTH as u32 - 1, high_key);
+        assert!(ta.intermediate_nodes.remove(&top).is_some());
+        assert!(tb.intermediate_nodes.remove(&top).is_some());
+        moved.balance += 1;
+        ta.insert_lazy(&moved.address, &moved);
+        tb.insert_lazy(&moved.address, &moved);
+
+        let mut fresh = StateMerkleTree::new();
+        for a in accts.iter().filter(|a| a.address != gone.address && a.address != moved.address) {
+            fresh.insert_lazy(&a.address, a);
+        }
+        fresh.insert_lazy(&moved.address, &moved);
+        let expected = fresh.finalize();
+        assert_eq!(ta.finalize(), expected, "the in-mem recovery rebuild is exact");
+        let rb = tb.finalize();
+        store.open_gate();
+        tb.flush_barrier();
+        assert_eq!(rb, expected, "the db-backed recovery rebuild must not bring back a queued deletion");
     }
 }
 

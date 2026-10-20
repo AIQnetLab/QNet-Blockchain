@@ -83,7 +83,7 @@ import { forgetKeys as forgetNodeDeviceKeys, NODE_DEVICE_KEY_SERVICE } from '../
 import { PING_KEY_PREFIX, forgetUnconfirmedBinding, pingKeyService, storePingKey } from '../services/PingKeys';
 import { createPasswordLimiter } from '../utils/passwordLimiter';
 import logger from '../utils/logger';
-import { tr } from '../i18n';
+import { LANGUAGE_KEY, tr } from '../i18n';
 
 /** Both copies of the vault are unreadable: nothing is deleted, the screen offers the recovery phrase. */
 export class VaultCorruptError extends Error {
@@ -2653,7 +2653,7 @@ export class WalletManager {
   static DEVICE_AUTH_BROKEN_MS = 7 * 24 * 3600_000;
   // What Delete wallet leaves on the device: the display language, and the mark of a screen lock that could not keep a
   // new wallet's secret (it lapses by itself), so the next wallet does not meet the same failure again.
-  static ERASE_ALLOW_LIST = ['qnet_language', WalletManager.DEVICE_AUTH_BROKEN_KEY];
+  static ERASE_ALLOW_LIST = [LANGUAGE_KEY, WalletManager.DEVICE_AUTH_BROKEN_KEY];
   // A wallet under the screen lock whose secret is gone moving to a password (reprotectWithPassword): the password wrap
   // of the vault it started from. A vault stored with another one is the moved one (_settlePasswordMove).
   static PASSWORD_MOVE_KEY = 'qnet_device_auth_to_password';
@@ -6970,9 +6970,9 @@ export class WalletManager {
    * as at least two genesis nodes each report it (MOBACT-R3-03). One node's by-wallet listing never links a server
    * node to the wallet: a lagging or compromised node could name one the wallet does not have, and a linked server
    * node takes the Node tab's place of this wallet's own light activation. true; false when two genesis nodes answer
-   * authoritatively that there is no such node; null when nothing can be told.
+   * authoritatively that there is no such node; null when nothing can be told. `timeoutMs`: each genesis node's answer.
    */
-  async confirmServerNode(walletAddress, { nodeType = null, nodeId = null } = {}) {
+  async confirmServerNode(walletAddress, { nodeType = null, nodeId = null, timeoutMs = 8000 } = {}) {
     if (!walletAddress) return null;
     const verdictOf = (list) => {
       let yes = 0;
@@ -6993,7 +6993,7 @@ export class WalletManager {
     };
     const answers = await this._fromGenesis(async (base) => {
       const ctl = new AbortController();
-      const guard = setTimeout(() => ctl.abort(), 8000);
+      const guard = setTimeout(() => ctl.abort(), timeoutMs);
       try {
         const r = await fetch(`${base}/api/v1/verify-activation`, {
           method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress }, signal: ctl.signal,
@@ -7604,7 +7604,6 @@ export class WalletManager {
         try {
           storedRewards = JSON.parse(storedRewardsStr);
         } catch (e) {
-          // console.error('Error parsing stored rewards:', e);
         }
       }
       
@@ -7629,7 +7628,6 @@ export class WalletManager {
         txHash: claimResult.tx_hash
       };
     } catch (error) {
-      // console.error('Error claiming rewards:', error);
       throw error;
     }
   }

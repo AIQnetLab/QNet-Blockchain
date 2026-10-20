@@ -112,8 +112,8 @@ recomputes it from its own live Solana `getTokenSupply` read rather than from a 
 Bucketing means attestors reading Solana at slightly different moments still agree on the cost except
 exactly on a boundary, where the registration simply retries. The supply figure treats the 1DEV
 genesis cap as 1,000,000,000 whole tokens at 6 decimals, deriving `total_burned = cap - current_supply`.
-The 1DEV mint is pinned per network profile in `network_config.rs`. The browser extension compiles both
-mints and burns against the devnet one; the node cabinet and the mobile app compile the devnet mint only. See
+The 1DEV mint is pinned per network profile in `network_config.rs`. The browser extension and the node cabinet
+compile both mints and use the devnet one; the mobile app compiles the devnet mint only. See
 [tokenomics-1dev](./tokenomics-1dev.md).
 
 ### Activation code

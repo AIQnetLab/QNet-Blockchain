@@ -69,7 +69,7 @@ test('the Device tab names the device as "{model} · {platform}", the platform a
   assert.equal(deviceName({ platform: null, model: null }), null);
   assert.equal(TEXTS.device_model_platform, '{model} · {platform}');
   const rows = read(SRC, 'components/cabinet/NodeStatus.tsx');
-  assert.match(rows, /\{full && named && deviceName\(named\) && <p>\{deviceName\(named\)\}<\/p>\}/);
+  assert.match(rows, /\{full \? \([\s\S]*?\{named && deviceName\(named\) && <p className="cab-dev-name">\{deviceName\(named\)\}<\/p>\}/);
   assert.doesNotMatch(rows, /device_platform_/);
 });
 

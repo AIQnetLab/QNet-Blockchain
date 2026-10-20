@@ -1,0 +1,407 @@
+/* The site's base: page, links, focus, layout helpers and the shared primitives of src/components/ui (B-SPEC 5). */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--ink);
+  margin: 0;
+  padding: 0;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* Menus never shift the page: the scrollbar's room is kept whether or not it shows. */
+  scrollbar-gutter: stable;
+  scroll-padding-top: calc(var(--hdr) + 16px);
+}
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--paper);
+  font: 400 var(--t-body)/1.6 var(--f-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: clip;
+}
+
+h1, h2, h3, h4, figure, dl, dd { margin: 0; }
+::selection { background: var(--signal); color: var(--ink); }
+
+/* Links: a link in text is Signal and always underlined; nothing else in text is Signal. A link with a class of its
+   own (a store row, a menu item, an entity) is a component with its own look. */
+a { color: inherit; text-decoration: none; }
+p a:not([class]), dd a:not([class]), li a:not([class]), .prose a, .link {
+  color: var(--signal);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: .22em;
+  text-decoration-color: var(--signal-line);
+  transition: text-decoration-color var(--t-hover), text-decoration-thickness var(--t-hover);
+}
+p a:not([class]):hover, dd a:not([class]):hover, li a:not([class]):hover, .prose a:hover, .link:hover { text-decoration-color: var(--signal); text-decoration-thickness: 2px; }
+
+/* Keyboard focus: the Signal ring on every interactive element. */
+:focus-visible { outline: var(--focus); outline-offset: 3px; }
+
+.wrap { width: 100%; max-width: var(--maxw); margin-inline: auto; padding-inline: var(--gut); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.mono { font-family: var(--font-mono); font-stretch: 87.5%; }
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---------- Type ---------- */
+.label { margin: 0; font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-label); line-height: 1.4; letter-spacing: .12em; text-transform: uppercase; color: var(--fog); font-weight: 400; }
+.h2 { font-weight: 720; font-stretch: 108%; font-size: var(--t-h2); line-height: .98; letter-spacing: -.035em; color: var(--paper); }
+.h3 { font-weight: 620; font-size: var(--t-h3); line-height: 1.2; letter-spacing: -.012em; color: var(--paper); }
+.lead { margin: 0; font-size: var(--t-lead); line-height: 1.5; color: var(--text); }
+.body { margin: 0; color: var(--text); }
+.note { margin: 0; font-size: var(--t-note); line-height: 1.5; color: var(--fog); max-width: 72ch; }
+.sig { color: var(--signal); }
+.em { color: var(--ember); }
+.fog { color: var(--fog); }
+
+/* ---------- Actions (components/ui/Action.tsx) ---------- */
+.btn {
+  display: inline-flex; align-items: center; gap: 12px; margin: 0; border: 0; background: none; color: inherit;
+  font: inherit; font-weight: 600; font-size: 15.5px; line-height: 1; white-space: nowrap; cursor: pointer;
+}
+/* Solid: one per view. */
+.btn-solid { background: var(--signal); color: var(--ink); padding: 17px 24px; border-radius: var(--radius); transition: background var(--t-hover); }
+.btn-solid:hover { background: var(--paper); }
+.btn-solid:active { background: var(--paper); box-shadow: inset 0 0 0 1px var(--ink); }
+.btn-solid:disabled, .btn-solid[aria-disabled='true'] { background: var(--fill-disabled); color: var(--fog); cursor: not-allowed; }
+.btn-sm { padding: 13px 18px; font-size: 14.5px; }
+/* Text: the secondary action, an underline always there, never an outlined box. */
+.btn-text {
+  color: var(--paper); padding: 15px 0; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .34em;
+  text-decoration-color: var(--signal-line); transition: text-decoration-color var(--t-hover);
+}
+.btn-text:hover { text-decoration-thickness: 2px; text-decoration-color: var(--signal); }
+.btn-text:disabled, .btn-text[aria-disabled='true'] { color: var(--fog); text-decoration-color: var(--rule-strong); cursor: not-allowed; }
+.btn[aria-busy='true'] { cursor: progress; }
+/* Act: a small action inside a line of data (Copy, Cancel, Close). */
+.act {
+  display: inline-flex; align-items: center; margin: 0; border: 0; background: none; padding: 10px 0; cursor: pointer; text-align: left;
+  font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-label); line-height: 1; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--signal); text-decoration: underline; text-decoration-color: var(--signal-line); text-underline-offset: .4em; white-space: nowrap;
+  transition: text-decoration-color var(--t-hover), color var(--t-hover);
+}
+.act:hover { text-decoration-color: var(--signal); }
+.act.quiet { color: var(--paper-78); text-decoration-color: var(--rule-strong); }
+.act.quiet:hover { color: var(--paper); text-decoration-color: var(--signal); }
+.act.done { color: var(--paper); text-decoration: none; }
+.act.blocked { color: var(--ember); text-decoration: none; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 32px; }
+/* Touch: a small control keeps its look and gets a target at least 44 px each way, centred on it, an overlay that moves
+   nothing (owner rule 7). */
+@media (max-width: 720px), (pointer: coarse) {
+  .btn { min-height: 44px; }
+  .act, a.ent, .ro-v a.unit, a.ro-v, .ex-sort { position: relative; }
+  .act::after, a.ent::after, .ro-v a.unit::after, a.ro-v::after, .ex-sort::after {
+    content: ''; position: absolute; left: 50%; top: 50%; width: max(calc(100% + 8px), 44px); height: 44px; transform: translate(-50%, -50%);
+  }
+}
+/* A label that changes keeps the widest label's width: every label sits in one grid cell, one is shown. */
+.swap { display: inline-grid; }
+.swap > * { grid-area: 1 / 1; }
+.swap > [data-on='false'] { visibility: hidden; }
+/* No pointer hovers on a phone: a live list's label (Status.tsx HoldLabel) keeps the width of the words a touch can show. */
+@media (max-width: 720px) {
+  .swap > [data-k='point'] { display: none; }
+}
+
+/* ---------- Live dot, ring, status words (components/ui/Status.tsx) ---------- */
+.live-dot { position: relative; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--signal); flex: none; }
+.live-dot::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: var(--signal); opacity: .5; animation: ping 2s ease-out infinite; }
+.ring { display: inline-block; width: 7px; height: 7px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--fog); flex: none; }
+@keyframes ping { 70%, 100% { transform: scale(3.2); opacity: 0; } }
+.status { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.status[data-tone='live'], .status[data-tone='done'] { color: var(--paper); }
+.status[data-tone='needs'] { color: var(--ember); }
+.status[data-tone='quiet'], .status[data-tone='none'] { color: var(--fog); }
+/* A transaction type: an 8 px square and the name in coloured text, never a filled pill. */
+.txtype {
+  display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; color: var(--paper);
+  font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-th); letter-spacing: .12em; text-transform: uppercase;
+}
+.txtype::before { content: ''; width: 8px; height: 8px; background: currentColor; flex: none; }
+.txtype[data-tone='mint'] { color: var(--mint); }
+.txtype[data-tone='lilac'] { color: var(--lilac); }
+.txtype[data-tone='ember'] { color: var(--ember); }
+.txtype[data-tone='fog'] { color: var(--fog); }
+
+/* ---------- Entity links (components/ui/EntityLink.tsx): one look for blocks, transactions, addresses, nodes ---------- */
+.ent { font-family: var(--font-mono); font-stretch: 80%; white-space: nowrap; color: var(--paper); }
+a.ent {
+  color: var(--signal); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .22em; text-decoration-color: var(--signal-line);
+  transition: text-decoration-color var(--t-hover), text-decoration-thickness var(--t-hover);
+}
+a.ent:hover { text-decoration-color: var(--signal); text-decoration-thickness: 2px; }
+.ent-full { font-family: var(--font-mono); font-stretch: 87.5%; font-size: 14px; color: var(--paper); overflow-wrap: anywhere; white-space: normal; }
+/* An address spaced at its own structure (19 hex · eon · 15 hex · check) by margins, so a selection copies it exactly;
+   the wrapper's negative margin takes back the first part's, so a wrapped line starts flush too. */
+.addr { display: inline-block; margin-left: -.45em; }
+.addr-part { display: inline-block; margin-left: .45em; }
+.addr-eon { color: var(--fog); }
+/* An underline does not reach into inline blocks: a link's parts carry their own. */
+a.ent .addr-part {
+  text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .22em; text-decoration-color: var(--signal-line);
+  transition: text-decoration-color var(--t-hover), text-decoration-thickness var(--t-hover);
+}
+a.ent:hover .addr-part { text-decoration-color: var(--signal); text-decoration-thickness: 2px; }
+/* A shortened entity where the page sizes the room (a table's flexible column, a side of From / To, a strip cell; the
+   .tbl-fit and .ent-fit boxes): whole when it fits, else its head as far as it fits, "…" and the tail of its short form,
+   never narrower than the short form (--ent-min). Elsewhere the short form. Nothing is measured, so nothing moves. */
+.ent-mid { display: none; }
+:is(.tbl-fit, .ent-fit) .ent-cut { display: inline-flex; max-width: 100%; min-width: var(--ent-min); vertical-align: bottom; }
+:is(.tbl-fit, .ent-fit) .ent-cut > .ent-short { display: none; }
+/* Its head and tail are two boxes: one selection takes the whole value, never one half. */
+:is(.tbl-fit, .ent-fit) .ent-cut > .ent-mid { display: flex; min-width: 0; text-decoration: inherit; user-select: all; }
+.ent-mid-h { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: inherit; }
+.ent-mid-t { flex: none; white-space: nowrap; text-decoration: inherit; }
+/* A unit or a token with its icon: the name on the text's baseline, the icon as tall as the capitals and figures with
+   its foot on that baseline, so it is centred on the text, never on the line box. A drawn icon's letter is laid over it,
+   so the icon has no baseline of its own. */
+.ent-unit { display: inline-flex; align-items: baseline; gap: .4em; }
+/* Next to a reading's figure the unit is the figure's own face: the same width and spacing, so QNC and 0 match. */
+:is(.ro-v, .cab-figure) .ent-unit { font-stretch: inherit; letter-spacing: inherit; }
+/* A token's icon in a line: 1.25 times the text, never under 20 px, centred on the figures beside it (owner 20.10). */
+.tok-text { position: relative; width: max(20px, 1.25em); height: max(20px, 1.25em); align-self: center; }
+.tok-text > span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+.ent-copy { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
+/* An amount: number, icon and unit in one row on one baseline, in one face and size, with fixed gaps; a right-aligned
+   column keeps the row at its right edge. */
+.amount { display: inline-flex; align-items: baseline; gap: .5em; font-family: var(--font-mono); font-stretch: 80%; white-space: nowrap; }
+.amount-v { color: var(--paper); }
+.dash { color: var(--fog); }
+
+/* ---------- Fields ---------- */
+.field {
+  width: 100%; min-width: 0; margin: 0; padding: 12px 14px; background: var(--fill-field); border: 1px solid var(--edge); border-radius: var(--radius);
+  color: var(--paper); font: inherit; font-size: 16px; transition: border-color var(--t-hover), background var(--t-hover);
+}
+.field:hover { border-color: var(--edge-hover); }
+.field:focus { background: var(--fill-field-focus); }
+.field::placeholder { color: var(--fog); opacity: 1; }
+.field:disabled { color: var(--fog); border-color: var(--rule); }
+.field[aria-invalid='true'] { border-color: var(--ember); }
+
+/* ---------- Readouts (components/ui/Readouts.tsx): each reading has its own top rule, open space between ---------- */
+.readouts { --ro-size: var(--t-readout); display: grid; grid-template-columns: repeat(var(--ro-cols, 4), minmax(0, 1fr)); column-gap: var(--ro-gap); row-gap: 28px; }
+.readouts[data-size='tool'] { --ro-size: var(--t-readout-tool); }
+.ro { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding-top: 16px; border-top: 1px solid var(--rule-strong); container-type: inline-size; }
+/* A value is never cut: a long one takes a smaller size from its length in characters (Readouts.tsx --ro-len, .6 em each)
+   and the reading's width, inside a line box of the full size, so nothing is measured and nothing moves. */
+.ro-v {
+  display: block; height: calc(var(--ro-size) * 1.1); font-family: var(--font-mono); font-stretch: 75%; font-weight: 300;
+  font-size: min(var(--ro-size), calc(100cqi / var(--ro-len, 1) / .6)); line-height: calc(var(--ro-size) * 1.1);
+  letter-spacing: -.03em; color: var(--paper); white-space: nowrap;
+}
+a.ro-v { color: var(--signal); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .18em; text-decoration-color: var(--signal-line); }
+a.ro-v:hover { text-decoration-color: var(--signal); }
+.ro-v .unit { font-size: .5em; letter-spacing: 0; color: var(--fog); margin-left: .3em; }
+.ro-v a.unit { color: var(--signal); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .22em; text-decoration-color: var(--signal-line); }
+.ro-v a.unit:hover { text-decoration-color: var(--signal); text-decoration-thickness: 2px; }
+.ro-v .dash { font-weight: 300; }
+/* The line under a value keeps room for `--ro-sub-lines` lines, so a value that rewraps it moves nothing. */
+.ro-s { margin: 0; min-height: calc(1.4em * var(--ro-sub-lines, 1)); font-size: var(--t-sub); line-height: 1.4; color: var(--fog); }
+.ro-s[data-tone='needs'] { color: var(--ember); }
+.ro-bar { position: relative; height: 2px; margin-top: 6px; background: var(--rule); overflow: hidden; }
+.ro-bar > i { position: absolute; inset: 0; background: var(--signal); transform-origin: left; transition: transform var(--t-progress) ease; }
+/* The newest value flashes Ember: an Ember copy over it fades by opacity, which costs no repaint. */
+.flash { position: relative; }
+.flash[data-new='true']::after { content: attr(data-v); position: absolute; left: 0; top: 0; color: var(--ember); opacity: 0; animation: emberfade var(--t-flash) ease-out; pointer-events: none; }
+@keyframes emberfade { 0%, 25% { opacity: 1; } 100% { opacity: 0; } }
+@media (max-width: 860px) {
+  .readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 20px; }
+  .readouts .ro[data-wide='true'] { grid-column: 1 / -1; }
+}
+
+/* ---------- Tables (components/ui/DataTable.tsx): fixed columns, fixed row heights, nothing jumps ---------- */
+.tbl-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+/* A live table's mark follows its title, as the strip's does; a datum (a filter, a count) stands at the right. */
+.tbl-head > .tbl-live { margin-right: auto; }
+.tbl-title { margin: 0; font-weight: 680; font-stretch: 104%; font-size: var(--t-table-title); line-height: 1.1; letter-spacing: -.025em; color: var(--paper); }
+.tbl-frame { position: relative; }
+.tbl {
+  width: 100%; table-layout: fixed; border-collapse: collapse; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); line-height: 1.4;
+}
+.tbl th {
+  position: sticky; top: var(--hdr); z-index: 5; background: var(--ink); height: 40px; padding: 0 14px 0 0; text-align: left; vertical-align: middle;
+  font-weight: 400; font-size: var(--t-th); letter-spacing: .12em; text-transform: uppercase; color: var(--fog); white-space: nowrap;
+  box-shadow: inset 0 -1px 0 var(--rule-strong);
+}
+.tbl td { height: var(--row); padding: 0 14px 0 0; border-bottom: 1px solid var(--rule); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.tbl tr[data-h='2'] td { height: var(--row-2); }
+.tbl th:last-child, .tbl td:last-child { padding-right: 0; }
+.tbl [data-align='right'] { text-align: right; }
+.tbl tbody tr { transition: background var(--t-hover); }
+.tbl tbody tr:hover { background: var(--fill-row); }
+/* On the cells: a live table keeps its row elements in place and makes new cells for a new record, so each lands tinted. */
+.tbl tbody tr[data-new='true'] > td { animation: rowin var(--t-flash) ease-out; }
+@keyframes rowin { from { background: var(--ember-tint); } to { background: transparent; } }
+.tbl td.tbl-empty { height: auto; padding: 22px 0; white-space: normal; font-family: var(--f-sans); font-stretch: 100%; font-size: var(--t-small); color: var(--fog); }
+.tbl tr.tbl-pad td { color: transparent; }
+/* A flexible column's cell (DataTable): its entities take the room it has (.ent-cut above). */
+.tbl-fit { min-width: 0; overflow-x: clip; text-overflow: ellipsis; }
+/* A long type name takes a second line inside the row's fixed height rather than being cut. */
+.tbl .txtype { white-space: normal; }
+.tbl-error { margin: 0 0 12px; font-size: var(--t-small); color: var(--ember); }
+.tbl-live { display: inline-flex; align-items: center; gap: 10px; }
+/* A line under a row (DataTable `detail`): across the table, wrapping freely, the row's rule under it instead. */
+.tbl tr[data-more] td { border-bottom: 0; }
+.tbl tr.tbl-detail td { height: auto; padding: 0 0 12px; white-space: normal; overflow: visible; font-family: var(--f-sans); font-stretch: 100%; font-size: var(--t-note); line-height: 1.5; color: var(--text); }
+.tbl tbody tr.tbl-detail:hover { background: none; }
+@media (max-width: 860px) {
+  /* In the sideways frame the line stays in view at its left edge, as wide as the frame (one column at this width). */
+  .tbl-frame[data-scroll='true'] .tbl tr.tbl-detail td { position: static; background: none; box-shadow: none; }
+  .tbl-frame[data-scroll='true'] .tbl-detail-in { position: sticky; left: 0; width: calc(100vw - 2 * var(--gut)); }
+}
+@media (max-width: 1180px) {
+  /* Phones and tablets: the table keeps its columns, never narrower than they need (DataTable --tbl-min), in a frame that
+     scrolls sideways; the page never does. Wider, every table fits its frame and its header stays under the site's. */
+  .tbl-frame[data-scroll='true'] { overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+  .tbl-frame[data-scroll='true'] .tbl { width: max(100%, var(--tbl-min, 100%)); }
+  .tbl-frame[data-scroll='true'] .tbl th { position: static; }
+  .tbl-frame[data-scroll='true'] .tbl th:first-child, .tbl-frame[data-scroll='true'] .tbl td:first-child { position: sticky; left: 0; z-index: 2; background: var(--ink); }
+  /* The header's own top offset would push its first cell down inside the frame, behind the first row. */
+  .tbl-frame[data-scroll='true'] .tbl th:first-child { top: auto; }
+  /* While columns are out of view: the sticky column's edge and a fade at the right, gone at the end. */
+  .tbl-frame[data-over='true'] .tbl td:first-child { box-shadow: inset -1px 0 0 var(--rule-strong); }
+  .tbl-frame[data-over='true'] .tbl th:first-child { box-shadow: inset -1px 0 0 var(--rule-strong), inset 0 -1px 0 var(--rule-strong); }
+  .tbl-frame[data-over='true']::after {
+    content: ''; position: absolute; top: 0; right: 0; bottom: 0; width: 24px; pointer-events: none;
+    background: linear-gradient(to right, transparent, var(--ink)); transition: opacity var(--t-hover);
+  }
+  .tbl-frame[data-over='true'][data-end='true']::after { opacity: 0; }
+}
+/* Touch: a row is the target of its first entity (an overlay of that link); the row's other links and actions stay above.
+   A header (the list's sort) is a 44 px target too. */
+@media (max-width: 720px), (pointer: coarse) {
+  .tbl th { height: 44px; }
+  .tbl tbody tr { position: relative; }
+  .tbl tbody td:first-child > a.ent { position: static; }
+  .tbl tbody td:first-child > a.ent::after { top: 0; bottom: 0; left: 0; right: 0; width: auto; height: auto; transform: none; }
+}
+/* A list of holders below a computer's width (DataTable `stack`): no sideways scroll, every value in view, rows of one
+   fixed height, each cell placed by its column key: on a tablet one line, on a phone two (rank and address; balance and
+   share). The header stays for screen readers; only a sort control shows. Lists of transactions and blocks stay tables
+   (owner 20.10): one line a row, scrolled sideways inside their frame with the first column pinned. */
+@media (max-width: 1180px) {
+  .tbl-frame[data-scroll][data-stack] { overflow: visible; }
+  .tbl-frame[data-scroll][data-stack]::after { display: none; }
+  .tbl-frame[data-scroll][data-stack] :is(.tbl, .tbl thead, .tbl tbody) { display: block; width: 100%; }
+  .tbl-frame[data-scroll][data-stack] .tbl colgroup { display: none; }
+  .tbl-frame[data-scroll][data-stack] .tbl thead tr { display: flex; justify-content: flex-end; }
+  .tbl-frame[data-scroll][data-stack] .tbl th { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); }
+  .tbl-frame[data-scroll][data-stack] .tbl th[aria-sort] { position: static; width: auto; height: 44px; overflow: visible; clip-path: none; box-shadow: none; }
+  .tbl-frame[data-scroll][data-stack] .tbl tbody tr { display: grid; align-content: center; border-bottom: 1px solid var(--rule); }
+  /* No cell keeps the sticky column's z-index: a grid item with one paints above the row, the first entity's overlay
+     with it, and would cover the row's other links. */
+  .tbl-frame[data-scroll][data-stack] .tbl tbody td {
+    display: flex; align-items: center; min-width: 0; height: auto; padding: 0; border: 0; position: static; z-index: auto; background: none; box-shadow: none;
+  }
+  .tbl-frame[data-scroll][data-stack] .tbl td > .tbl-fit { flex: 1; }
+  .tbl-frame[data-scroll][data-stack] .tbl :is(td[data-k='block'], td[data-k='time'], td[data-k='amount'], td[data-k='pct']) { justify-content: safe flex-end; }
+  .tbl-frame[data-scroll][data-stack] .tbl tbody tr:has(> .tbl-empty) { display: block; height: auto; }
+  .tbl-frame[data-scroll][data-stack='holders'] .tbl tbody tr {
+    grid-template-columns: auto minmax(0, 1fr) auto auto; grid-template-areas: 'rank address amount pct'; gap: 0 16px; height: var(--row);
+  }
+  .tbl-frame[data-scroll][data-stack='holders'] .tbl td[data-k='rank'] { grid-area: rank; min-width: 3ch; }
+  .tbl-frame[data-scroll][data-stack='holders'] .tbl td[data-k='address'] { grid-area: address; }
+  .tbl-frame[data-scroll][data-stack='holders'] .tbl td[data-k='amount'] { grid-area: amount; }
+  .tbl-frame[data-scroll][data-stack='holders'] .tbl td[data-k='pct'] { grid-area: pct; min-width: 7ch; }
+}
+@media (max-width: 720px) {
+  .tbl-frame[data-scroll][data-stack='holders'] .tbl tbody tr {
+    grid-template-columns: auto minmax(0, 1fr) auto; grid-template-rows: repeat(2, 20px); gap: 4px 14px;
+    grid-template-areas: 'rank address address' 'amount amount pct'; height: var(--row-2);
+  }
+}
+
+/* ---------- Pager ---------- */
+.pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 24px; margin-top: 16px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); color: var(--fog); }
+.pager-pages { display: flex; flex-wrap: wrap; align-items: center; }
+.pager-btn {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 36px; height: 44px; padding: 0 6px; margin: 0; border: 0; background: none; cursor: pointer;
+  font: inherit; color: var(--paper); text-decoration: underline; text-decoration-color: var(--rule-strong); text-underline-offset: .35em;
+}
+.pager-btn:hover { text-decoration-color: var(--signal); }
+.pager-btn[aria-current='page'] { background: var(--paper); color: var(--ink); text-decoration: none; }
+.pager-btn:disabled { color: var(--rule-strong); text-decoration: none; pointer-events: none; }
+/* Newer and Older: words, readable when there is no page that way (no underline then). */
+.pager-step { padding-inline: 10px; }
+.pager-step:first-child { padding-left: 0; }
+.pager-step:disabled { color: var(--fog); }
+.pager-gap { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 44px; }
+
+/* ---------- Tabs (components/ui/ViewTabs.tsx): underlined, the row scrolls sideways on a phone if it must ---------- */
+.tabs { display: flex; gap: 28px; border-bottom: 1px solid var(--rule); overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  position: relative; flex: none; min-height: 44px; margin: 0; padding: 12px 0; border: 0; background: none; cursor: pointer; white-space: nowrap;
+  font: inherit; font-size: 15px; line-height: 1.2; color: var(--fog); transition: color var(--t-hover);
+}
+.tab:hover, .tab[aria-selected='true'] { color: var(--paper); }
+/* The selected tab's line is an overlay on the row's rule: it never changes the tab's size. */
+.tab[aria-selected='true']::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--signal); }
+.tab:focus-visible { outline-offset: -2px; }
+
+/* ---------- Label and value rows (B-SPEC 5.14): rules between rows, the label above its value on a phone ---------- */
+.kv { margin: 0; border-top: 1px solid var(--rule); }
+.kv > div { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 5fr); column-gap: 24px; padding: 13px 0; border-bottom: 1px solid var(--rule); }
+.kv dt { font-size: 14.5px; line-height: 1.5; color: var(--fog); }
+.kv dd { font-size: 15.5px; line-height: 1.5; color: var(--paper); min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 720px) { .kv > div { grid-template-columns: minmax(0, 1fr); row-gap: 4px; } }
+
+/* ---------- A field row (B-SPEC 5.15): the label above, the field and its one solid submit, stacked on a phone ---------- */
+.form-label { display: block; margin-bottom: 10px; }
+.form-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; max-width: 820px; }
+.form-row .field { min-height: 56px; padding: 14px 16px; font-family: var(--font-mono); font-stretch: 87.5%; font-size: 16px; }
+.form-row .btn-solid { min-height: 56px; justify-content: center; }
+.form-note { margin: 12px 0 0; }
+@media (max-width: 720px) { .form-row { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---------- Skeleton (components/ui/Skeleton.tsx): the final geometry while a value loads, lines only ---------- */
+.skel { display: inline-block; vertical-align: middle; max-width: 100%; }
+.skel > i { display: block; height: 1px; margin-top: .7em; background: var(--rule); }
+.skel-block { display: block; }
+
+/* ---------- Sections and the page title band ---------- */
+.sec { position: relative; padding-block: var(--sec-pad); border-top: 1px solid var(--rule); }
+.sec[data-variant='tool'] { padding-block: var(--sec-pad-tool); }
+.sec-head { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); row-gap: 20px; align-items: end; margin-bottom: var(--sec-head-gap); }
+.sec-head > .h2 { grid-column: 1 / span 7; }
+.sec-head > .lead { grid-column: 8 / span 5; }
+@media (max-width: 960px) { .sec-head > .h2, .sec-head > .lead { grid-column: 1 / -1; } }
+
+.page-head { position: relative; isolation: isolate; padding-top: calc(var(--hdr) + clamp(36px, 5vw, 72px)); padding-bottom: clamp(26px, 3vw, 40px); border-bottom: 1px solid var(--rule); }
+.page-head-in { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 18px; }
+.page-head .kicker { margin: 0; }
+.page-title { margin: 0; font-weight: 760; font-stretch: 110%; font-size: var(--t-page); line-height: .98; letter-spacing: -.035em; color: var(--paper); overflow-wrap: anywhere; }
+.page-head .lead { max-width: 62ch; }
+.page-head-more { margin-top: 10px; }
+
+/* ---------- The field (components/field/Field.tsx): the hex rain inside a head zone ---------- */
+.field-zone { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+.field-canvas {
+  position: absolute; inset: 0; display: block; width: 100%; height: 100%;
+  -webkit-mask-image: linear-gradient(to bottom, var(--ink) 60%, transparent);
+  mask-image: linear-gradient(to bottom, var(--ink) 60%, transparent);
+}
+
+/* A part of the page out of view pauses its animations (one IntersectionObserver marks it). */
+.off *, .off *::before, .off *::after { animation-play-state: paused !important; }
+
+@keyframes blink { 50% { opacity: 0; } }
+.cursor { display: inline-block; width: .5em; height: .1em; margin-left: .12em; vertical-align: baseline; background: var(--signal); animation: blink 1.1s steps(1) infinite; }
+.wait { margin: 0; color: var(--paper); font-size: var(--t-small); }
+.wait::after { content: ''; display: inline-block; width: .5em; height: .12em; margin-left: .3em; background: var(--signal); animation: blink 1.1s steps(1) infinite; }
+
+/* ---------- Requests (components/ui/RequestState.tsx): waiting, answered or failed, in the asking control's slot ---------- */
+.rq { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 24px; }
+.rq > p { flex: 1 1 30ch; max-width: 68ch; line-height: 1.5; }
+.rq-answer { margin: 0; color: var(--paper); font-size: var(--t-small); }
+.rq-failed { margin: 0; color: var(--ember); font-size: var(--t-small); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; animation-iteration-count: 1 !important; transition-duration: .001s !important; scroll-behavior: auto !important; }
+}

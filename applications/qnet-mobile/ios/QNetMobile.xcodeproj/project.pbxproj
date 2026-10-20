@@ -7,6 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AA000050QNETFONTBLD00050 /* Archivo-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = AA000040QNETFONTREF00040 /* Archivo-Regular.ttf */; };
+		AA000051QNETFONTBLD00051 /* Archivo-SemiBold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = AA000041QNETFONTREF00041 /* Archivo-SemiBold.ttf */; };
+		AA000052QNETFONTBLD00052 /* Archivo-Title.ttf in Resources */ = {isa = PBXBuildFile; fileRef = AA000042QNETFONTREF00042 /* Archivo-Title.ttf */; };
+		AA000053QNETFONTBLD00053 /* MartianMono-Data.ttf in Resources */ = {isa = PBXBuildFile; fileRef = AA000043QNETFONTREF00043 /* MartianMono-Data.ttf */; };
+		AA000054QNETFONTBLD00054 /* MartianMono-Label.ttf in Resources */ = {isa = PBXBuildFile; fileRef = AA000044QNETFONTREF00044 /* MartianMono-Label.ttf */; };
+		AA000055QNETFONTBLD00055 /* MartianMono-Figure.ttf in Resources */ = {isa = PBXBuildFile; fileRef = AA000045QNETFONTREF00045 /* MartianMono-Figure.ttf */; };
 		0C80B921A6F3F58F76C31292 /* libPods-QNetMobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-QNetMobile.a */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
@@ -32,6 +38,12 @@
 		AA000022DILITHIUMFIPS022 /* fips202.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000021DILITHIUMFIPS021 /* fips202.c */; };/* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		AA000040QNETFONTREF00040 /* Archivo-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = Archivo-Regular.ttf; path = ../assets/native/fonts/Archivo-Regular.ttf; sourceTree = SOURCE_ROOT; };
+		AA000041QNETFONTREF00041 /* Archivo-SemiBold.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = Archivo-SemiBold.ttf; path = ../assets/native/fonts/Archivo-SemiBold.ttf; sourceTree = SOURCE_ROOT; };
+		AA000042QNETFONTREF00042 /* Archivo-Title.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = Archivo-Title.ttf; path = ../assets/native/fonts/Archivo-Title.ttf; sourceTree = SOURCE_ROOT; };
+		AA000043QNETFONTREF00043 /* MartianMono-Data.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = MartianMono-Data.ttf; path = ../assets/native/fonts/MartianMono-Data.ttf; sourceTree = SOURCE_ROOT; };
+		AA000044QNETFONTREF00044 /* MartianMono-Label.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = MartianMono-Label.ttf; path = ../assets/native/fonts/MartianMono-Label.ttf; sourceTree = SOURCE_ROOT; };
+		AA000045QNETFONTREF00045 /* MartianMono-Figure.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = MartianMono-Figure.ttf; path = ../assets/native/fonts/MartianMono-Figure.ttf; sourceTree = SOURCE_ROOT; };
 		13B07F961A680F5B00A75B9A /* QNetMobile.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QNetMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = QNetMobile/Images.xcassets; sourceTree = "<group>"; };
 		5E1A0000000000000000C001 /* GoogleService-Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = "GoogleService-Info.plist"; path = "QNetMobile/GoogleService-Info.plist"; sourceTree = "<group>"; };
@@ -83,6 +95,19 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		AA000060QNETFONTGRP00060 /* Fonts */ = {
+			isa = PBXGroup;
+			children = (
+				AA000040QNETFONTREF00040 /* Archivo-Regular.ttf */,
+				AA000041QNETFONTREF00041 /* Archivo-SemiBold.ttf */,
+				AA000042QNETFONTREF00042 /* Archivo-Title.ttf */,
+				AA000043QNETFONTREF00043 /* MartianMono-Data.ttf */,
+				AA000044QNETFONTREF00044 /* MartianMono-Label.ttf */,
+				AA000045QNETFONTREF00045 /* MartianMono-Figure.ttf */,
+			);
+			name = Fonts;
+			sourceTree = "<group>";
+		};
 		13B07FAE1A68108700A75B9A /* QNetMobile */ = {
 			isa = PBXGroup;
 			children = (
@@ -123,6 +148,7 @@
 			isa = PBXGroup;
 			children = (
 				13B07FAE1A68108700A75B9A /* QNetMobile */,
+				AA000060QNETFONTGRP00060 /* Fonts */,
 				832341AE1AAA6A7D00B99B32 /* Libraries */,
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
@@ -243,6 +269,12 @@
 				AF5ECC0B032181446EB6CD26 /* PrivacyInfo.xcprivacy in Resources */,
 				5E1A0000000000000000A002 /* InfoPlist.strings in Resources */,
 				5E1A0000000000000000C002 /* GoogleService-Info.plist in Resources */,
+				AA000050QNETFONTBLD00050 /* Archivo-Regular.ttf in Resources */,
+				AA000051QNETFONTBLD00051 /* Archivo-SemiBold.ttf in Resources */,
+				AA000052QNETFONTBLD00052 /* Archivo-Title.ttf in Resources */,
+				AA000053QNETFONTBLD00053 /* MartianMono-Data.ttf in Resources */,
+				AA000054QNETFONTBLD00054 /* MartianMono-Label.ttf in Resources */,
+				AA000055QNETFONTBLD00055 /* MartianMono-Figure.ttf in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -380,7 +412,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = QNetMobile/QNetMobile.entitlements;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				ENABLE_BITCODE = NO;
 								HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -420,7 +452,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = QNetMobile/QNetMobile.entitlements;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 								HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SOURCE_ROOT)/QNetMobile/DilithiumModule",
