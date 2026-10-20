@@ -9,11 +9,10 @@ import { LIMITS, SOLANA, STORAGE_KEYS, TIMINGS } from '../dist/background/config
 import { ProviderError, WalletError } from '../dist/background/errors.js';
 import { contentScriptSender, pageSender, until } from './helpers/chrome-mock.mjs';
 import {
-  ACCOUNTS, APP, BURN_TX, PASSWORD, SITE, activationRecord, createWorld, eventsOf, replyTo, settleAll,
+  ACCOUNTS, APP, BURN_TX, COOLDOWN_TEXT, ERROR_LINGER_MS, PASSWORD, SITE, activationRecord, answered, createWorld, eventsOf, replyTo,
+  settleAll,
 } from './helpers/provider-harness.mjs';
 
-const ERROR_LINGER_MS = 30000;
-const COOLDOWN_TEXT = 'Too many rejected requests from this site, try again later';
 // Rejections this far apart stay under the window budget of a minute (owner, 28.09: 5 a minute).
 const GAP = TIMINGS.APPROVAL_BUDGET_SHORT_MS / 3;
 // The rejections the provider stored for `origin` (its writes are queued: they land first).
@@ -22,7 +21,6 @@ async function storedRejections(w, origin) {
   return w.chrome.storage.session.dump()[STORAGE_KEYS.APPROVAL_COOLDOWN]?.[origin]?.rejections.length ?? 0;
 }
 const activate = (port, id, nodeType = 'light') => port.send({ id, method: 'qnet_activateNode', params: { nodeType } });
-const answered = (port, id) => port.posted.some((message) => message.id === id);
 const publicOf = (record) => {
   const { code, ...rest } = record;
   return { ...rest, codeMasked: `${code.slice(0, 6)}•••••-••••••-••••${code.slice(-2)}` };

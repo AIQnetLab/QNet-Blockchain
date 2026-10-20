@@ -2,6 +2,79 @@
 
 use super::*;
 
+/// The critical fill level: a Super node alerts and compacts (`DiskPressure`), a Light node cleans up and refuses
+/// further blocks.
+pub(crate) const STORAGE_CRITICAL_PCT: f64 = 95.0;
+/// Below this a Super node's critical state ends: just under STORAGE_CRITICAL_PCT, so a level at the line neither
+/// alerts on every save nor flaps.
+pub(crate) const STORAGE_CRITICAL_CLEAR_PCT: f64 = 94.0;
+/// While a Super node stays critical: one [CRIT] line this often.
+pub(crate) const STORAGE_CRITICAL_REPEAT_SECS: u64 = 600;
+
+/// A Super node's state at the critical fill level (`Storage::note_super_fill`). It never stops storing blocks for it:
+/// the disk also fills with data that is not the node's, and a node that stopped storing would stop applying blocks.
+#[derive(Debug, Default)]
+pub(crate) struct DiskPressure {
+    critical: bool,
+    last_alert: Option<u64>,
+    /// The episode's one emergency compaction has started: a disk filled by other data would make every further run
+    /// rewrite the database for nothing.
+    episode_compacted: bool,
+}
+
+/// What one fill reading asks of a Super node.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PressureStep {
+    pub(crate) alert: bool,
+    pub(crate) compact: bool,
+    pub(crate) cleared: bool,
+}
+
+impl DiskPressure {
+    /// The reaction to fill level `pct` at `now`: an episode runs from STORAGE_CRITICAL_PCT until the level falls below
+    /// STORAGE_CRITICAL_CLEAR_PCT, alerting at once and then once per STORAGE_CRITICAL_REPEAT_SECS, and compacting once.
+    pub(crate) fn step(&mut self, pct: f64, now: u64) -> PressureStep {
+        if self.critical && pct < STORAGE_CRITICAL_CLEAR_PCT {
+            *self = DiskPressure::default();
+            return PressureStep { cleared: true, ..PressureStep::default() };
+        }
+        if !self.critical && pct < STORAGE_CRITICAL_PCT {
+            return PressureStep::default();
+        }
+        self.critical = true;
+        // A stamp ahead of the clock (the clock was set back) counts as due.
+        let alert = self.last_alert.map_or(true, |t| t > now || now - t >= STORAGE_CRITICAL_REPEAT_SECS);
+        if alert { self.last_alert = Some(now); }
+        let compact = !self.episode_compacted;
+        self.episode_compacted = true;
+        PressureStep { alert, compact, cleared: false }
+    }
+}
+
+/// Percent of the data disk in use, as `df` reports it: used / (used + available to writers).
+/// None where the filesystem cannot be read.
+#[cfg(unix)]
+pub(crate) fn disk_used_pct(dir: &std::path::Path) -> Option<f64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `s` is a writable statvfs the call fills.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut s) } != 0 { return None; }
+    let used = (s.f_blocks as f64 - s.f_bfree as f64).max(0.0);
+    let usable = used + s.f_bavail as f64;
+    if usable <= 0.0 { None } else { Some(used / usable * 100.0) }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn disk_used_pct(_dir: &std::path::Path) -> Option<f64> { None }
+
+/// How full the node's storage is, in percent: the tighter of the operator cap and the disk itself.
+/// A cap larger than the disk (2000 GB configured on a 388 GB disk) can then never hide a full disk.
+pub(crate) fn storage_fill_pct(usage_bytes: u64, cap_bytes: u64, disk_pct: Option<f64>) -> f64 {
+    let of_cap = if cap_bytes == 0 { 0.0 } else { usage_bytes as f64 / cap_bytes as f64 * 100.0 };
+    of_cap.max(disk_pct.unwrap_or(0.0))
+}
+
 impl Storage {
     /// High-level compression utilities for archive data
     pub fn compress_archive_data(&self, data: &[u8]) -> IntegrationResult<Vec<u8>> {
@@ -65,29 +138,40 @@ impl Storage {
     
     /// PRODUCTION: Check storage usage and trigger emergency cleanup if needed
     pub fn check_storage_usage_and_cleanup(&self) -> IntegrationResult<bool> {
-        let data_dir = std::env::var("QNET_DATA_DIR").unwrap_or_else(|_| "./node_data".to_string());
-        
-        // Get actual disk usage
-        let actual_usage = self.get_directory_size(&data_dir)?;
-        
+        // Get actual disk usage of the directory the database lives in
+        let actual_usage = self.get_directory_size(&self.data_dir.to_string_lossy())?;
+
         // Update current usage tracking
         {
             let mut usage = self.current_storage_usage.write();
             *usage = actual_usage;
         }
-        
-        let usage_percentage = (actual_usage as f64 / self.max_storage_size as f64) * 100.0;
-        
-        println!("[INFO][STORAGE] storage_usage used_gb={:.1} total_gb={:.1} pct={:.1}%", 
-                actual_usage as f64 / (1024.0 * 1024.0 * 1024.0),
-                self.max_storage_size as f64 / (1024.0 * 1024.0 * 1024.0),
-                usage_percentage);
-        
+
+        let disk_pct = disk_used_pct(&self.data_dir);
+        let usage_percentage = storage_fill_pct(actual_usage, self.max_storage_size, disk_pct);
+
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] storage_usage used_gb={:.1} cap_gb={:.1} disk_used_pct={} pct={:.1}%",
+                     actual_usage as f64 / (1024.0 * 1024.0 * 1024.0),
+                     self.max_storage_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                     disk_pct.map_or("unknown".to_string(), |p| format!("{:.1}", p)),
+                     usage_percentage);
+        }
+
+        // A Super node's critical state follows every reading, so it also ends while no block arrives.
+        if self.storage_mode == StorageMode::Super {
+            self.note_super_fill(usage_percentage, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+        }
         // Trigger cleanup at different thresholds
         match usage_percentage {
-            p if p >= 95.0 => {
-                println!("[WARN][STORAGE] storage_critical_95pct_full triggering=emergency_cleanup");
-                self.emergency_cleanup()?;
+            p if p >= STORAGE_CRITICAL_PCT => {
+                if self.storage_mode != StorageMode::Super {
+                    println!("[WARN][STORAGE] storage_critical_95pct_full triggering=emergency_cleanup");
+                    let after = self.emergency_cleanup()?;
+                    if after >= STORAGE_CRITICAL_PCT {
+                        self.alert_critically_full(after, "refused");
+                    }
+                }
                 Ok(false) // Emergency state
             },
             p if p >= 85.0 => {
@@ -156,18 +240,9 @@ impl Storage {
         // 1. Clean transaction pool cache (this is OK - only removes duplicates)
         let removed_tx = self.transaction_pool.cleanup_old_duplicates()?;
         println!("[INFO][STORAGE] tx_duplicates_removed count={}", removed_tx);
-        
-        // 2. CRITICAL CORRECTION: DO NOT delete blockchain history!
-        // Instead, implement proper cache management
-        
-        // 3. PRODUCTION: Compress old data instead of deleting
-        // Note: Compression now happens automatically via adaptive compression
-        // Force RocksDB compaction to optimize storage efficiency
-        
-        // 4. Force RocksDB compaction to optimize storage efficiency
-        self.persistent.db.compact_range::<&[u8], &[u8]>(None, None);
-        println!("[INFO][STORAGE] db_compaction_done mode=standard");
-        
+
+        // No compaction below the critical level: the prunes compact the families they shed rows from, RocksDB's own
+        // compactions reclaim the rest, and a compaction of every family rewrites the whole database (`compact_for_room`).
         println!("[INFO][STORAGE] standard_cleanup_done history_preserved=true");
         Ok(())
     }
@@ -188,91 +263,110 @@ impl Storage {
             let removed = self.transaction_pool.evict_older_than(aggressive_cutoff);
             println!("[INFO][STORAGE] aggressive_tx_cache_cleaned older_than=6h removed={}", removed);
         }
-        
-        // 2. CRITICAL CORRECTION: DO NOT delete blockchain history!
-        // 3. PRODUCTION: Maximum compression instead of deletion
-        // Note: Compression now happens automatically via adaptive compression
-        
-        // 4. PRODUCTION: Force RocksDB compaction to reclaim space immediately
-        self.persistent.db.compact_range::<&[u8], &[u8]>(None, None);
-        println!("[INFO][STORAGE] db_compaction_done mode=aggressive");
-        
+
         println!("[INFO][STORAGE] aggressive_cleanup_done history_preserved=true");
         Ok(())
     }
     
-    /// Emergency cleanup (95%+ full) - remove all non-essential data
-    pub(super) fn emergency_cleanup(&self) -> IntegrationResult<()> {
-        println!("[WARN][STORAGE] emergency_cleanup_start reason=storage_critically_full");
-        
+    /// A Light node's emergency cleanup at the critical level, before a block save (`guard_fill_before_save`) and in the
+    /// hourly check: the emergency measures (`compact_for_room`), then a fresh fill reading, which decides the refusal.
+    pub(super) fn emergency_cleanup(&self) -> IntegrationResult<f64> {
         if !self.emergency_cleanup_enabled {
             return Err(IntegrationError::StorageError(
                 "Emergency cleanup disabled, cannot continue operation".to_string()
             ));
         }
-        
-        // PRODUCTION EMERGENCY MEASURES:
-        
-        // 1. Clear ALL transaction pool except last hour
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| IntegrationError::Other(format!("Time error: {}", e)))?
-            .as_secs();
-        let emergency_cutoff = current_time.saturating_sub(3600); // 1 hour only
-        
-        {
-            let removed = self.transaction_pool.evict_older_than(emergency_cutoff);
-            println!("[WARN][STORAGE] emergency_tx_pool_cleared kept=1h removed={}", removed);
+        self.compact_for_room(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+        let usage = self.get_directory_size(&self.data_dir.to_string_lossy())?;
+        *self.current_storage_usage.write() = usage;
+        let pct = storage_fill_pct(usage, self.max_storage_size, disk_used_pct(&self.data_dir));
+        if crate::node::is_warn() {
+            println!("[WARN][STORAGE] emergency_cleanup_done pct={:.1} accept_blocks={}",
+                     pct, if pct >= STORAGE_CRITICAL_PCT { "refused" } else { "yes" });
         }
-        
-        // 2. CRITICAL CORRECTION: DO NOT delete blockchain history even in emergency!
-        // Instead, maximum compression and cache optimization
-        println!("[WARN][STORAGE] emergency_compression_start target=blockchain_data");
-        
-        // Emergency compression of blockchain data
-        // Note: Compression now happens automatically via adaptive compression
-        
-        // 3. PRODUCTION: Force maximum compression on all remaining data
-        self.persistent.db.compact_range::<&[u8], &[u8]>(None, None);
-        println!("[INFO][STORAGE] db_compaction_done mode=emergency");
-        
-        // 4. CRITICAL CORRECTION: DO NOT delete transaction history from blockchain!
-        // Emergency optimization through compression only
-        println!("[WARN][STORAGE] emergency_optimize_start mode=compression history_preserved=true");
-        
-        println!("[WARN][STORAGE] emergency_cleanup_done node_status=operational");
-        
-        // Check if we're still critically full after cleanup
-        let post_cleanup_usage = self.get_directory_size(&std::env::var("QNET_DATA_DIR").unwrap_or_else(|_| "./node_data".to_string()))?;
-        let post_cleanup_percentage = (post_cleanup_usage as f64 / self.max_storage_size as f64) * 100.0;
-        
-        if post_cleanup_percentage >= 90.0 {
-            println!("[WARN][STORAGE] post_emergency_still_critical pct={:.1}%", post_cleanup_percentage);
-            println!("[WARN][STORAGE] admin_action_required urgency=immediate");
-            println!("[WARN][STORAGE] action_required step=1 msg=add_more_disk_space_immediately");
-            println!("[WARN][STORAGE] action_required step=2 msg=set_QNET_MAX_STORAGE_GB_500_or_higher");
-            println!("[WARN][STORAGE] action_required step=3 msg=monitor_disk_usage_closely");
-            println!("[WARN][STORAGE] action_required step=4 msg=consider_moving_to_larger_storage");
-            println!("[WARN][STORAGE] node_storage_critical accept_blocks=degraded");
-        } else {
-            println!("[INFO][STORAGE] emergency_cleanup_done pct={:.1}%", post_cleanup_percentage);
-            println!("[INFO][STORAGE] recommended_actions");
-            println!("[INFO][STORAGE] recommended step=1 msg=consider_increasing_QNET_MAX_STORAGE_GB_500");
-            println!("[INFO][STORAGE] recommended step=2 msg=plan_for_long_term_storage_growth");
-        }
-        
-        Ok(())
+        Ok(pct)
     }
     
-    /// Get current storage usage percentage
+    /// Current storage usage percentage: the tighter of the configured cap and the data disk itself.
     pub fn get_storage_usage_percentage(&self) -> IntegrationResult<f64> {
         let usage = *self.current_storage_usage.read();
-        Ok((usage as f64 / self.max_storage_size as f64) * 100.0)
+        Ok(storage_fill_pct(usage, self.max_storage_size, disk_used_pct(&self.data_dir)))
     }
-    
+
     /// Check if storage is critically full
     pub fn is_storage_critically_full(&self) -> IntegrationResult<bool> {
-        Ok(self.get_storage_usage_percentage()? >= 95.0)
+        Ok(self.get_storage_usage_percentage()? >= STORAGE_CRITICAL_PCT)
+    }
+
+    /// The fill guard before every block save (`save_microblock`, `save_block`, `save_macroblock`). A Super node keeps
+    /// storing at the critical level, alerts once an interval and compacts once an episode (`note_super_fill`); a Light
+    /// node, which keeps no blocks of its own, cleans up and refuses as it always did.
+    pub(super) fn guard_fill_before_save(&self, what: &str) -> IntegrationResult<()> {
+        let pct = self.get_storage_usage_percentage()?;
+        if self.storage_mode == StorageMode::Super {
+            self.note_super_fill(pct, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+            return Ok(());
+        }
+        if pct >= STORAGE_CRITICAL_PCT {
+            if crate::node::is_warn() {
+                println!("[WARN][STORAGE] storage_critically_full action=emergency_cleanup_before_save what={}", what);
+            }
+            if self.emergency_cleanup()? >= STORAGE_CRITICAL_PCT {
+                return Err(IntegrationError::StorageError(format!(
+                    "Cannot save {}: storage is critically full even after emergency cleanup. Add disk space.", what)));
+            }
+        }
+        Ok(())
+    }
+
+    /// A Super node's fill reading `pct` at `now` (`DiskPressure`): while critical, one [CRIT] line per
+    /// STORAGE_CRITICAL_REPEAT_SECS and one emergency compaction in all, and one line when the level falls below
+    /// STORAGE_CRITICAL_CLEAR_PCT.
+    pub(super) fn note_super_fill(&self, pct: f64, now: u64) {
+        let step = self.disk_pressure.lock().step(pct, now);
+        if step.alert {
+            self.alert_critically_full(pct, "still_stored");
+        }
+        if step.compact {
+            self.compact_for_room(now);
+        }
+        if step.cleared && crate::node::is_info() {
+            println!("[INFO][STORAGE] storage_critical_cleared pct={:.1}", pct);
+        }
+    }
+
+    /// The one [CRIT] line of the critical level: a Super node prints it once per STORAGE_CRITICAL_REPEAT_SECS
+    /// (`blocks=still_stored`), a Light node from the hourly check while it would refuse a save (`blocks=refused`).
+    fn alert_critically_full(&self, pct: f64, blocks: &str) {
+        println!("[CRIT][STORAGE] state=critically_full action=admin_required pct={:.1} disk_used_pct={} blocks={}",
+                 pct, disk_used_pct(&self.data_dir).map_or("unknown".to_string(), |p| format!("{:.1}", p)), blocks);
+    }
+
+    /// The emergency measures at the critical level, for a Super node (`note_super_fill`) and a Light node
+    /// (`emergency_cleanup`) alike: the transaction pool keeps its last hour, and a compaction of every family of the
+    /// three databases runs on its own thread, one at a time, so no block save waits for it.
+    fn compact_for_room(&self, now: u64) {
+        let removed = self.transaction_pool.evict_older_than(now.saturating_sub(3600));
+        if self.compacting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if crate::node::is_warn() {
+            println!("[WARN][STORAGE] emergency_compaction_start tx_pool_removed={}", removed);
+        }
+        let (job, running) = (self.persistent.full_compaction_job(), self.compacting.clone());
+        let spawned = std::thread::Builder::new().name("qnet-compact".to_string()).spawn(move || {
+            let started = std::time::Instant::now();
+            job();
+            running.store(false, Ordering::Release);
+            if crate::node::is_info() {
+                println!("[INFO][STORAGE] db_compaction_done mode=emergency families=all elapsed_ms={}",
+                         started.elapsed().as_millis());
+            }
+        });
+        if let Err(e) = spawned {
+            self.compacting.store(false, Ordering::Release);
+            println!("[ERR][STORAGE] emergency_compaction_spawn_failed err={}", e);
+        }
     }
     
     /// Get maximum storage size
@@ -368,7 +462,7 @@ impl Storage {
     /// - Pattern Recognition compression (89% for simple transfers)
     /// - EfficientMicroBlock format (hashes only + separate TX storage)
     /// - Adaptive Zstd compression (levels 3-22 based on age)
-    /// - Graceful degradation when disk full
+    /// - The fill guard (`guard_fill_before_save`)
     /// 
     /// This method exists for backward compatibility with node.rs
     ///
@@ -570,4 +664,144 @@ impl Storage {
     // reward_root, the on-chain verify, and the mobile app are all unchanged. Keys are zero-padded
     // for O(1) range-delete pruning.
 
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    // The cap alone (2000 GB configured on a 388 GB disk) could never reach the critical level before the
+    // disk filled. The disk decides whenever it is the tighter limit; the cap still binds when it is.
+    #[test]
+    fn a_full_disk_is_critical_whatever_the_cap() {
+        let gb = 1024u64 * 1024 * 1024;
+        assert!(storage_fill_pct(4 * gb, 2000 * gb, Some(96.0)) >= STORAGE_CRITICAL_PCT);
+        assert!(storage_fill_pct(4 * gb, 2000 * gb, Some(5.0)) < STORAGE_CRITICAL_PCT);
+        assert!(storage_fill_pct(1960 * gb, 2000 * gb, Some(5.0)) >= STORAGE_CRITICAL_PCT);
+        assert!((storage_fill_pct(4 * gb, 2000 * gb, None) - 0.2).abs() < 1e-9, "an unreadable disk leaves the cap alone");
+    }
+
+    // A critical episode lasts until the level falls below the clear line. It alerts at once and then once an interval,
+    // but compacts once: on a disk filled by other data every further run would rewrite the database for nothing.
+    #[test]
+    fn a_super_nodes_critical_episode_alerts_each_interval_and_compacts_once() {
+        let both = PressureStep { alert: true, compact: true, cleared: false };
+        let alert_only = PressureStep { alert: true, ..PressureStep::default() };
+        let (mut p, t, r) = (DiskPressure::default(), 1_800_000_000, STORAGE_CRITICAL_REPEAT_SECS);
+        assert_eq!(p.step(94.9, t), PressureStep::default(), "below the line: nothing");
+        assert_eq!(p.step(STORAGE_CRITICAL_PCT, t), both);
+        for dt in [1, 60, r - 1] {
+            assert_eq!(p.step(97.0, t + dt), PressureStep::default(), "within the interval, at +{dt}");
+        }
+        assert_eq!(p.step(94.5, t + 10), PressureStep::default(), "between the two lines it stays critical");
+        assert_eq!(p.step(96.0, t + r), alert_only, "the next interval alerts and does not compact again");
+        assert_eq!(p.step(96.0, t + 5 * r), alert_only, "nor does any later one");
+        assert_eq!(p.step(93.9, t + 5 * r + 1), PressureStep { cleared: true, ..PressureStep::default() });
+        assert_eq!(p.step(94.5, t + 5 * r + 2), PressureStep::default(), "cleared, under the line");
+        assert_eq!(p.step(95.0, t + 5 * r + 3), both, "a new episode alerts and compacts at once");
+        let mut q = DiskPressure::default();
+        q.step(99.0, t);
+        assert!(q.step(99.0, t - 5).alert, "a clock set back counts as due");
+    }
+
+    // A Super node at the critical level keeps storing blocks, alerts and starts one compaction off the save path; a
+    // Light node cleans up and refuses.
+    #[test]
+    fn a_super_node_at_the_critical_level_keeps_storing_blocks() {
+        let critical = |dir: &tempfile::TempDir| {
+            let mut s = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+            s.max_storage_size = 1_000;
+            *s.current_storage_usage.write() = 960;
+            s
+        };
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = critical(&dir);
+        assert_eq!(s.storage_mode, StorageMode::Super);
+        assert!(s.is_storage_critically_full().unwrap(), "96 % of the cap, whatever the disk");
+        let mut parent = [0u8; 32];
+        for h in 1..=3u64 {
+            let b = qnet_state::MicroBlock::new(h, 1_000 + h, parent, vec![], "genesis_node_001".to_string());
+            assert_eq!(s.save_microblock(h, &bincode::serialize(&b).unwrap()).expect("stored"), SaveOutcome::Stored, "h={h}");
+            parent = b.hash();
+        }
+        assert!(s.load_microblock_auto_format(3).unwrap().is_some() && s.should_store_full_blocks());
+        assert!(s.disk_pressure.lock().critical);
+        wait_for_compaction(&s);
+        let light_dir = tempfile::TempDir::new().expect("tempdir");
+        let mut light = critical(&light_dir);
+        light.storage_mode = StorageMode::Light;
+        let b = qnet_state::MicroBlock::new(1, 1_001, [0u8; 32], vec![], "genesis_node_001".to_string());
+        assert!(light.save_microblock(1, &bincode::serialize(&b).unwrap()).is_err(), "a Light node refuses as before");
+        wait_for_compaction(&light);
+        // Every block save path runs the one guard, and none compacts inline.
+        let blocks = include_str!("blocks.rs");
+        assert_eq!(blocks.matches("self.guard_fill_before_save(").count(), 3);
+        assert!(!blocks.contains("emergency_cleanup()"));
+    }
+
+    fn wait_for_compaction(s: &Storage) {
+        for _ in 0..400 {
+            if !s.compacting.load(Ordering::Acquire) { return; }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("the emergency compaction did not end");
+    }
+
+    /// The families of the three databases, default ones included, that hold files at level 0.
+    fn families_at_level0(s: &Storage) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for (db, names) in s.persistent.all_dbs() {
+            for name in crate::storage::persistent::with_default_family(names) {
+                let cf = db.cf_handle(name).expect("family");
+                if db.property_int_value_cf(&cf, "rocksdb.num-files-at-level0").ok().flatten().unwrap_or(0) > 0 {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    // The hourly check of a Super node at the critical level alerts and starts the one emergency compaction, which
+    // reaches every family of the three databases, and never runs the Light node's inline cleanup; a later reading under
+    // the clear line ends the critical state with no block saved.
+    #[test]
+    fn the_hourly_check_of_a_full_super_node_compacts_every_family_and_clears() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut s = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        s.emergency_cleanup_enabled = false; // the Light node's cleanup would now fail the check
+        let mut families = 0;
+        for (db, names) in s.persistent.all_dbs() {
+            for name in crate::storage::persistent::with_default_family(names) {
+                let cf = db.cf_handle(name).expect("family");
+                db.put_cf(&cf, b"compaction_probe", b"1").unwrap();
+                db.flush_cf(&cf).unwrap();
+                families += 1;
+            }
+        }
+        assert_eq!(families_at_level0(&s).len(), families);
+        let size = s.get_directory_size(&s.data_dir.to_string_lossy()).unwrap();
+        s.max_storage_size = size * 100 / 99;
+        assert!(!s.check_storage_usage_and_cleanup().expect("no inline cleanup on a Super node"));
+        let stamp = {
+            let p = s.disk_pressure.lock();
+            assert!(p.critical && p.last_alert.is_some() && p.episode_compacted, "one alert, one compaction");
+            p.last_alert
+        };
+        wait_for_compaction(&s);
+        assert_eq!(families_at_level0(&s), Vec::<&str>::new(), "every family compacted");
+        s.check_storage_usage_and_cleanup().expect("second reading");
+        assert_eq!(s.disk_pressure.lock().last_alert, stamp, "no second alert within the interval");
+        s.max_storage_size = size * 10;
+        if disk_used_pct(dir.path()).map_or(true, |d| d < STORAGE_CRITICAL_CLEAR_PCT) {
+            assert!(s.check_storage_usage_and_cleanup().expect("third reading"));
+            assert!(!s.disk_pressure.lock().critical, "cleared with no block saved");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_disk_reading_is_a_percentage() {
+        let p = disk_used_pct(std::path::Path::new(".")).expect("statvfs on the working directory");
+        assert!((0.0..=100.0).contains(&p), "{}", p);
+    }
 }

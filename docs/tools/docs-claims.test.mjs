@@ -253,12 +253,12 @@ test('SD-R2-13: the protocol names the app-access-risk verdict a licensed store 
 // DEV-R2-01: every rate-limit bucket the node defines has its row, with the node's numbers.
 test('DEV-R2-01: the rate-limit table is the node\'s ApiRateLimiter', () => {
   const rpc = read('development/qnet-integration/src/rpc/mod.rs');
-  // A bucket named by a constant (`certified_proofs::CERTIFIED_PROOF_BUCKET`, `galc_api::GALC_CAPSULE_BUCKET`) is read
-  // as that constant's value in its module.
+  // A bucket named by a constant (`certified_proofs::CERTIFIED_PROOF_BUCKET`, `galc_api::GALC_CAPSULE_BUCKET`,
+  // `light_bind::LIGHT_BIND_BUCKET`) is read as that constant's value in its module.
   const bucketName = (literal, module, constant) => literal
     ?? read(`development/qnet-integration/src/rpc/${module}.rs`).match(new RegExp(`const ${constant}: &str = "([a-z_]+)";`))?.[1];
   const configs = new Map([...rpc.matchAll(
-    /configs\.insert\((?:"([a-z_]+)"|(certified_proofs|galc_api)::([A-Z_]+))\.to_string\(\), RateLimitConfig \{\s*max_requests: (\w+),\s*window_seconds: (\d+),\s*block_duration: (\d+),?\s*\}\);/g,
+    /configs\.insert\((?:"([a-z_]+)"|(certified_proofs|galc_api|light_bind)::([A-Z_]+))\.to_string\(\), RateLimitConfig \{\s*max_requests: (\w+),\s*window_seconds: (\d+),\s*block_duration: (\d+),?\s*\}\);/g,
   )].map((m) => [bucketName(m[1], m[2], m[3]), { max: m[4], window: m[5], block: m[6] }]));
   // Every bucket the node inserts is read, so a bucket in a shape this pattern misses fails here.
   const inserts = (rpc.match(/configs\.insert\(/g) ?? []).length;
@@ -292,7 +292,12 @@ test('DEV-R2-01: the rate-limit table is the node\'s ApiRateLimiter', () => {
   assert.match(bind, /static BIND_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new\(5, 3600\);/);
   assert.match(unbind, /static UNBIND_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new\(5, 3600\);/);
   assert.match(bind, /static TOKEN_REFRESH_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new\(6, 3600\);/);
-  assert.match(table, /^\| failed light requests \(`FailLimiter`, one per route\) \| 60 refusals \| 60 s \| 60 s \| [^\n]*\(bind and unbind 5 an hour, the token refresh 6\) \|$/m);
+  assert.match(table, /^\| failed light requests \(`FailLimiter`, one per route\) \| 60 refusals \| 60 s \| 60 s \| [^\n]*\(bind and unbind 5 an hour, the token refresh 6, refused `rate_limited` with `retry_after_seconds`\) \|$/m);
+  // A per-node refusal names its wait (`lb::rate_limited_json`) at all three routes.
+  for (const [src, limit] of [[bind, 'BIND_NODE_LIMIT'], [unbind, 'UNBIND_NODE_LIMIT'],
+                              [read('development/qnet-integration/src/rpc/light_nodes.rs'), 'TOKEN_REFRESH_NODE_LIMIT']]) {
+    assert.match(src, new RegExp(`if let Err\\(wait\\) = ${limit}\\.spend\\(&req\\.node_id, now\\) \\{\\s*return Ok\\([^\\n]*lb::rate_limited_json\\(wait\\)`), limit);
+  }
 });
 
 // The explorer doc's production host: the deploy and its update script each make CABINET_READ_KEY and FAUCET_PASS_KEY
@@ -588,20 +593,19 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   // balance, owner 12.10).
   const cabinet = (file) => read(`applications/qnet-explorer/frontend/src/components/cabinet/${file}`);
   assert.match(cabinet('WalletChoice.tsx'), /\{t\(device\.phone \? 'connect_app_here' : 'connect_app_qr'\)\}/);
-  assert.match(cabinet('LinkWaiting.tsx'), /<a className="qnet-button activate-primary" href=\{href\} onClick=\{opened\}>\{t\('link_open_app'\)\}<\/a>/);
-  const frame = cabinet('CabinetFrame.tsx');
-  assert.match(frame, /overview: 'nav_overview',/);
-  assert.match(frame, /device: 'nav_device',/);
+  assert.match(cabinet('LinkWaiting.tsx'), /<a className="btn btn-solid" href=\{href\} onClick=\{opened\}>\{t\('link_open_app'\)\}/);
+  const tabs = read('applications/qnet-explorer/frontend/src/lib/cabinet/tabs.ts');
+  assert.match(tabs, /const TAB_LABEL: Record<Tab, MessageKey> = \{[^}]*overview: 'nav_overview',[^}]*device: 'nav_device',/);
   // The same button reads "Move the node to another device" while a device is linked (owner, 30.09).
   assert.match(cabinet('LinkDevice.tsx'), /const title: MessageKey = move \? 'devices_move_title' : 'action_link_device';/);
   // The button reads `label`: the title, except the Overview's Offline action (relink).
   assert.match(cabinet('LinkDevice.tsx'), /const label: MessageKey = relink \? \(device && !device\.phone \? 'relink_button_qr' : 'relink_button'\) : title;/);
-  assert.match(cabinet('LinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\{t\(label\)\}<\/button>/);
+  assert.match(cabinet('LinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\{t\(label\)\}<\/Action>/);
   const devices = cabinet('NodeDevices.tsx');
   assert.match(devices, /if \(s === 'none' \|\| s === 'pending'\) return <NoNode pending=\{s === 'pending'\} \/>;/);
   assert.match(devices, /<LinkDevice onLinked=/);
   assert.match(cabinet('NodeClaim.tsx'), /\{t\('claim_with_app'\)\}/);
-  assert.match(cabinet('NodeHome.tsx'), /import \{ Move \} from '\.\/NodeClaim';/);
+  assert.match(cabinet('NodeHome.tsx'), /import \{ Move\b[^}]*\} from '\.\/NodeClaim';/);
   const app = read('applications/qnet-mobile/src/i18n/locales/en.js');
   const sheet = (key) => app.match(new RegExp(`${key}: (?:'((?:[^'\\\\]|\\\\.)*)'|"([^"]*)")`)).slice(1).find((x) => x !== undefined).replace(/\\'/g, "'");
   const listing = read('applications/qnet-mobile/store-listing/app-store-listing.txt');
@@ -610,7 +614,7 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   for (const key of ['link_title_connect', 'link_title_reserve', 'link_title_link', 'link_title_claim', 'link_title_unlink']) assert.ok(notes.includes(`"${sheet(key)}"`), key);
   // Today's card (the device's own unbind) reads "Unlink this device"; once the network takes the wallet's own unbind,
   // "Unlink the device" (contract of 04.10).
-  assert.match(cabinet('UnlinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\s*\{t\(wallet \? 'unlink_title_wallet' : 'unlink_button'\)\}\s*<\/button>/);
+  assert.match(cabinet('UnlinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\s*\{t\(wallet \? 'unlink_title_wallet' : 'unlink_button'\)\}\s*<\/Action>/);
   assert.equal(label('unlink_title_wallet'), 'Unlink the device');
   assert.equal(label('unlink_button'), unlink);
   const demo = notes.match(/DEMO\. (.*)/)[1];
@@ -709,21 +713,28 @@ test('M24: the extension, explorer and SDK licence tables list exactly what thei
 });
 
 // SD-R2-06: which surface compiles which 1DEV mint, as the code has it.
-test('SD-R2-06: the mint documents say the app and the cabinet compile the devnet mint only', () => {
+test('SD-R2-06: the mint documents say the extension and the cabinet compile both mints, the app the devnet mint only', () => {
   const MAINNET = '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
   const DEVNET = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
   const mobile = read('applications/qnet-mobile/src/config/nodes.js');
   const cabinet = read('applications/qnet-explorer/frontend/src/lib/one-dev.ts');
   assert.ok(mobile.includes(DEVNET) && !mobile.includes(MAINNET), 'the app compiles a mainnet mint now: update the mint documents');
-  assert.ok(cabinet.includes(DEVNET) && !cabinet.includes(MAINNET), 'the cabinet compiles a mainnet mint now: update the mint documents');
+  // The cabinet's mint is the one of its release's cluster, from a table of both (as the extension's).
+  assert.ok(cabinet.includes(DEVNET) && cabinet.includes(MAINNET));
+  assert.match(cabinet, /export const ONE_DEV_MINT: string = ONE_DEV_MINTS\[BURN_CLUSTER\];/);
+  assert.match(read('applications/qnet-explorer/frontend/src/lib/qnet-link.ts'), /export const BURN_CLUSTER = 'devnet';/);
   const extension = read('applications/qnet-wallet/dist/background/config.js');
   assert.ok(extension.includes(DEVNET) && extension.includes(MAINNET));
   const tokenomics = flat('docs/economics/tokenomics-1dev.md');
-  assert.doesNotMatch(tokenomics, /the same literal the mobile and browser wallets compile in/);
-  assert.match(tokenomics, /The mobile app and the aiqnet\.io node cabinet compile the devnet mint only/);
+  assert.doesNotMatch(tokenomics, /the same literal the mobile and browser wallets compile in|node cabinet compile the devnet mint only/);
+  assert.match(tokenomics, /The browser extension and the aiqnet\.io node cabinet compile both mints, the same literals, and use the one of their Solana cluster \(devnet in every build today/);
+  assert.match(tokenomics, /The mobile app compiles the devnet mint only/);
   const activation = flat('docs/economics/node-activation.md');
-  assert.doesNotMatch(activation, /matching the literal both wallets compile in/);
-  assert.match(activation, /the node cabinet and the mobile app compile the devnet mint only/);
+  assert.doesNotMatch(activation, /matching the literal both wallets compile in|the node cabinet and the mobile app compile the devnet mint only/);
+  assert.match(activation, /The browser extension and the node cabinet compile both mints and use the devnet one; the mobile app compiles the devnet mint only/);
+  const contract = flat('docs/developers/1dev-burn-contract.md');
+  assert.doesNotMatch(contract, /the same literal in the mobile and browser wallets/);
+  assert.match(contract, /`MAINNET_1DEV_MINT` in the node, and the same literal in the browser extension \(`dist\/background\/config\.js`\) \|/);
 });
 
 // SD-R2-07: the README's activation paragraph says a Light node needs no code, as the rest of the page does.

@@ -60,7 +60,7 @@ export function untilActive(timeoutMs = 3000) {
 export function pendingLine(t, p) {
   const age = t('time_min', { n: Math.max(1, Math.round((Number(p.ageMs) || 0) / 60_000)) });
   const what = p.kind === 'transfer' && p.amountNano !== null
-    ? t('pending_line_transfer', { amount: qncText(String(p.amountNano), t.lang), to: p.to || '—' })
+    ? t('pending_line_transfer', { amount: qncText(String(p.amountNano)), to: p.to || '—' })
     : p.kind === 'call' ? t('pending_line_call', { method: p.method || '—', to: p.to || '—' })
       : p.kind === 'deploy' ? t('pending_line_deploy') : t('pending_line_other');
   return `${what} · ${age}`;
@@ -175,9 +175,9 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
     const host = site ? site.host : view.origin;
     if (kind === 'connect') return t('dapp_auth_connect', { site: host });
     if (kind === 'sign') return t('dapp_auth_sign', { site: host });
-    if (type === 'tokenTransfer') return t('dapp_auth_token', { amount: `${amountText(view.details.amount, t.lang)} ${view.details.symbol}` });
+    if (type === 'tokenTransfer') return t('dapp_auth_token', { amount: `${amountText(view.details.amount)} ${view.details.symbol}` });
     if (type === 'contractCall') return t('dapp_auth_call', { method: view.details.method, site: host });
-    return t('dapp_auth_send', { amount: amountText(formatNano(view.details.amountNano), t.lang) });
+    return t('dapp_auth_send', { amount: amountText(formatNano(view.details.amountNano)) });
   };
 
   const confirm = async () => {
@@ -334,7 +334,7 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
   const walletRows = () => (
     <>
       {needsPick || inFlight ? pendingBlock() : null}
-      {preview.balanceNano !== null ? figureRow(t('dapp_send_balance'), qncText(preview.balanceNano, t.lang)) : null}
+      {preview.balanceNano !== null ? figureRow(t('dapp_send_balance'), qncText(preview.balanceNano)) : null}
     </>
   );
 
@@ -366,9 +366,9 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
       <>
         {wholeField(t('dapp_send_to'), d.to)}
         {d.destroys ? <Text style={s.alert} testID="qnc-destroyed">{t('dapp_qnc_destroyed')}</Text> : null}
-        {figureRow(t('dapp_send_amount'), qncText(d.amountNano, t.lang))}
-        {figureRow(t('dapp_send_fee'), qncText(d.feeNano, t.lang))}
-        {figureRow(t('dapp_send_total'), qncText(d.totalNano, t.lang), { total: true })}
+        {figureRow(t('dapp_send_amount'), qncText(d.amountNano))}
+        {figureRow(t('dapp_send_fee'), qncText(d.feeNano))}
+        {figureRow(t('dapp_send_total'), qncText(d.totalNano), { total: true })}
         {preview ? (
           <>
             {walletRows()}
@@ -395,17 +395,17 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
         {d.reservedName ? <Text style={s.alert}>{t('tok_reserved_warning')}</Text> : null}
         {wholeField(t('dapp_send_to'), d.to)}
         {d.destroys ? <Text style={s.alert}>{t('dapp_token_destroyed')}</Text> : null}
-        {figureRow(t('dapp_send_amount'), `${amountText(d.amount, t.lang)} ${d.symbol}`)}
-        {figureRow(t('dapp_token_base'), amountText(d.amountBase, t.lang))}
-        {figureRow(t('dapp_send_fee'), qncText(d.feeNano, t.lang))}
+        {figureRow(t('dapp_send_amount'), `${amountText(d.amount)} ${d.symbol}`)}
+        {figureRow(t('dapp_token_base'), amountText(d.amountBase))}
+        {figureRow(t('dapp_send_fee'), qncText(d.feeNano))}
         {preview ? (
           <>
-            {depositNano !== null && depositNano !== '0' ? figureRow(t('dapp_token_deposit'), qncText(depositNano, t.lang)) : null}
-            {figureRow(t('dapp_send_total'), qncText(totalNano, t.lang), { total: true })}
+            {depositNano !== null && depositNano !== '0' ? figureRow(t('dapp_token_deposit'), qncText(depositNano)) : null}
+            {figureRow(t('dapp_send_total'), qncText(totalNano), { total: true })}
             {preview.listed ? null : <Text style={s.warning}>{t('dapp_token_unlisted')}</Text>}
             {walletRows()}
             {preview.tokenBalanceBase !== null
-              ? figureRow(t('dapp_token_balance'), `${amountText(formatTokenUnits(preview.tokenBalanceBase, d.decimals), t.lang)} ${d.symbol}`) : null}
+              ? figureRow(t('dapp_token_balance'), `${amountText(formatTokenUnits(preview.tokenBalanceBase, d.decimals))} ${d.symbol}`) : null}
             {d.destroys ? null : recipientWarnings(d.to)}
             {tokenShort ? <Text style={s.alert}>{t('dapp_token_insufficient')}</Text> : null}
             {shortLine(totalNano)}
@@ -432,8 +432,8 @@ export default function DappSheet({ view, actions, t, authenticate, accounts }) 
           </ScrollView>
         </InfoField>
         {d.argsText ? wholeField(t('dapp_call_input_text'), d.argsText, false) : null}
-        {figureRow(t('dapp_call_gas'), amountText(d.gasLimit, t.lang))}
-        {figureRow(t('dapp_call_max_fee'), qncText(d.feeNano, t.lang))}
+        {figureRow(t('dapp_call_gas'), amountText(d.gasLimit))}
+        {figureRow(t('dapp_call_max_fee'), qncText(d.feeNano))}
         {preview ? (
           <>
             {walletRows()}

@@ -3,7 +3,7 @@
 // address or an amount is nobody's business but the user's.
 import * as core from '../lib/qnet-core.js';
 import { PAYMENT_REQUEST, QNET, SOLANA, isPaymentRequestMemo } from '../background/config.js';
-import { UiError, call, copyText, currentLanguage, el, formatUnits, hardenSecretInput, parseUnits, t } from './common.js';
+import { DECIMALS, UiError, call, copyText, currentLanguage, el, formatUnits, hardenSecretInput, parseUnits, t } from './common.js';
 
 let idSeq = 0;
 const nextId = (prefix) => {
@@ -412,10 +412,10 @@ export function canonicalAmount(text, decimals) {
 }
 
 /**
- * Keeps an amount field's text as both wallets' Send forms keep it (core.amountInput, the mobile app's rule): digits and
- * at most one '.', no more than the asset's decimals; a figure pasted in the UI language's format is read as written
- * ("1,000" pasted in English or "1.000" in German is 1000), while typed text keeps the decimal comma ("1,5" is 1.5); a text
- * the rule refuses leaves the field as it was.
+ * Keeps an amount field's text as both wallets' Send forms keep it (core.amountInput, the mobile app's rule, the same in
+ * every language): digits and at most one '.', no more than the asset's decimals; a pasted figure is read as amounts are
+ * written ("1,000" pasted is 1000), while a typed ',' is the decimal point ("1,5" is 1.5); a text the rule refuses leaves
+ * the field as it was.
  * @param {HTMLInputElement} input
  * @param {() => number} decimalsOf the decimals of the asset the field is for now
  * @returns {void}
@@ -426,25 +426,26 @@ export function keepAmountCanonical(input, decimalsOf) {
     before = input.value;
   });
   input.addEventListener('input', () => {
-    const next = core.amountInput(input.value, decimalsOf(), { previous: before, lang: currentLanguage() }) ?? before;
+    const next = core.amountInput(input.value, decimalsOf(), { previous: before }) ?? before;
     if (next !== input.value) input.value = next;
     before = input.value;
   });
 }
 
 /**
- * A figure as the UI language writes it (core.amountText, the mobile app's rule: the whole part grouped, the language's
- * decimal mark, every digit kept): a canonical decimal or a whole number; any other value as its text.
+ * A figure in the one format of every language (core.amountText, the mobile app's rule: the whole part grouped with ','
+ * and the decimals after '.', 42,578.81988, every digit kept): a canonical decimal or a whole number; any other value as
+ * its text.
  * @param {string|number} value
  * @returns {string}
  */
 export function figureText(value) {
-  return core.amountText(value === null || value === undefined ? '' : String(value), currentLanguage());
+  return core.amountText(value === null || value === undefined ? '' : String(value));
 }
 
 /**
- * Base units as "<amount> <symbol>", the amount as the UI language writes it (figureText); a dash when the value is not a
- * u64 decimal string.
+ * Base units as "<amount> <symbol>", the amount in the one format of every language (figureText); a dash when the value
+ * is not a u64 decimal string.
  * @param {string|bigint} units
  * @param {number} decimals
  * @param {string} symbol
@@ -455,6 +456,80 @@ export function formatAmount(units, decimals, symbol) {
     return `${figureText(formatUnits(units, decimals))} ${symbol}`;
   } catch {
     return `— ${symbol}`;
+  }
+}
+
+/**
+ * Lamports as "<amount> SOL" (formatAmount).
+ * @param {string|bigint} lamports
+ * @returns {string}
+ */
+export function solAmount(lamports) {
+  return formatAmount(lamports, DECIMALS.SOL, 'SOL');
+}
+
+/**
+ * The tokens of the Solana send: SOL and the SPL tokens this wallet lists (a payment request names a token by its mint).
+ * @type {ReadonlyArray<{asset: string, symbol: string, decimals: number, mint: string|null}>}
+ */
+export const SOLANA_ASSETS = Object.freeze([
+  Object.freeze({ asset: 'sol', symbol: 'SOL', decimals: DECIMALS.SOL, mint: null }),
+  Object.freeze({ asset: '1dev', symbol: '1DEV', decimals: DECIMALS.ONE_DEV, mint: SOLANA.ONE_DEV_MINT }),
+]);
+
+/**
+ * A Solana send's token by its asset name ('sol', '1dev'); SOL for any other.
+ * @param {string} asset
+ * @returns {{asset: string, symbol: string, decimals: number, mint: string|null}}
+ */
+export const solanaAsset = (asset) => SOLANA_ASSETS.find((entry) => entry.asset === asset) ?? SOLANA_ASSETS[0];
+
+/**
+ * The rows of a quoted Solana send as its review shows them, [label, value, kind]: the token, its mint (kind 'address'),
+ * the amount (kind 'strong'), the network fee, the rent of the recipient's token account when the send creates it, the SOL
+ * spent in all (kind 'strong') and the network. The popup's Send review and the approval window of a site's transfer both
+ * draw these; a quote not read yet (feeLamports null) shows a dash for its figures.
+ * @param {{amountRaw: string, decimals?: number, feeLamports: string|null, rentLamports: string|null,
+ *   totalLamports: string|null}} quote
+ * @param {{symbol: string, decimals: number, mint: string|null}} token
+ * @returns {Array<[string, string, ('address'|'strong')?]>}
+ */
+export function solanaReviewRows(quote, token) {
+  const decimals = Number.isSafeInteger(quote.decimals) ? quote.decimals : token.decimals;
+  const read = typeof quote.feeLamports === 'string';
+  const rows = [[t('reviewToken'), token.symbol]];
+  if (token.mint !== null) rows.push([t('reviewMint'), token.mint, 'address']);
+  rows.push([t('reviewAmount'), formatAmount(quote.amountRaw, decimals, token.symbol), 'strong'],
+    [t('reviewFee'), read ? solAmount(quote.feeLamports) : '—']);
+  if (read && typeof quote.rentLamports === 'string' && quote.rentLamports !== '0') {
+    rows.push([t('reviewRent', [token.symbol]), solAmount(quote.rentLamports)]);
+  }
+  rows.push([t('reviewTotalSol'), read ? solAmount(quote.totalLamports) : '—', 'strong'],
+    [t('reviewNetwork'), t('solanaCluster', [SOLANA.CLUSTER])]);
+  return rows;
+}
+
+/**
+ * Why a quoted Solana send cannot go, in words with its numbers (SolanaQuote.shortfall), or null: the popup's review and
+ * the approval window of a site's transfer say it alike.
+ * @param {{shortfall: string|null, totalLamports: string, balanceLamports: string, tokenRaw: string|null,
+ *   rentFloorLamports: string}} quote
+ * @param {{symbol: string, mint: string|null}} token
+ * @param {number} decimals the token's
+ * @returns {string|null}
+ */
+export function solanaShortfall(quote, token, decimals) {
+  switch (quote.shortfall) {
+    case 'INSUFFICIENT_SOL':
+      return t('sendShortSol', [solAmount(quote.totalLamports), solAmount(quote.balanceLamports)]);
+    case 'INSUFFICIENT_TOKENS':
+      return t('sendShortTokens', [formatAmount(quote.tokenRaw ?? '0', decimals, token.symbol)]);
+    case 'AMOUNT_BELOW_RENT':
+      return t('sendBelowRent', [solAmount(quote.rentFloorLamports)]);
+    case 'SOL_BELOW_RENT':
+      return t(token.mint === null ? 'sendKeepRentSol' : 'sendKeepRentToken', [solAmount(quote.rentFloorLamports)]);
+    default:
+      return null;
   }
 }
 

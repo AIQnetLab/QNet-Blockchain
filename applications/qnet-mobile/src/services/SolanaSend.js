@@ -18,7 +18,6 @@ import { Buffer } from 'buffer';
 import { getSolanaRpcUrl, rotateSolanaRpc, ONE_DEV_MINT } from '../config/nodes';
 import { parseStrictJson } from '../utils/strictJson';
 import { amountText } from '../utils/amountFormat';
-import { currentLanguage } from '../i18n';
 import {
   SOL_DECIMALS, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_ACCOUNT_SIZE,
   associatedTokenAddress, base58Encode, decodeKey, fromBaseUnits, isOnCurve, serializeTransaction, toBaseUnits,
@@ -40,8 +39,8 @@ const MAX_ANSWER_CHARS = 512 * 1024;
 const RPC_TIMEOUT_MS = 8000;
 
 const fail = (code, params) => Object.assign(new Error(code), { code, params });
-/** Lamports as a screen shows them, in the figures of `lang` (the open screen's by default), with the symbol. */
-export const solText = (lamports, lang = currentLanguage()) => `${amountText(fromBaseUnits(BigInt(lamports), SOL_DECIMALS), lang)} SOL`;
+/** Lamports as every screen shows them, with the symbol ("0.000005 SOL"). */
+export const solText = (lamports) => `${amountText(fromBaseUnits(BigInt(lamports), SOL_DECIMALS))} SOL`;
 
 // ── RPC ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -223,8 +222,8 @@ export async function quoteSolanaSend({ from, to, symbol, amount, request = null
     const heldBase = source ? source.amount : 0n;
     if (!source || heldBase < amountBase) {
       throw fail('SOL_SHORT_TOKEN', {
-        need: `${amountText(base.amountText, currentLanguage())} ${token.symbol}`,
-        balance: `${amountText(fromBaseUnits(heldBase, token.decimals), currentLanguage())} ${token.symbol}`,
+        need: `${amountText(base.amountText)} ${token.symbol}`,
+        balance: `${amountText(fromBaseUnits(heldBase, token.decimals))} ${token.symbol}`,
       });
     }
     rent = destinationInfo ? 0n : accountRent;

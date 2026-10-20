@@ -423,8 +423,14 @@ impl ApiRateLimiter {
         });
 
         // Token refresh, bind, pending bind and unbind are signed by the device or the wallet and limited per
-        // NODE after their signatures verify; per address only their failed requests are counted, an IPv6
-        // address by its /64 (light_bind.rs `FailLimiter`, L-2), so they have no bucket here.
+        // NODE after their signatures verify; per address their failed requests are counted (light_bind.rs
+        // `FailLimiter`, L-2). Bind also counts every request here (A4): an exact re-send costs no signature check,
+        // so this is what holds one source's re-sends; wide for a carrier NAT and short, like the ping route's.
+        configs.insert(light_bind::LIGHT_BIND_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 60,
+            window_seconds: 60,
+            block_duration: 60,
+        });
 
         // A device challenge is 32 random bytes and a MAC; the app asks one per device message. Wide for a
         // carrier NAT; each enrolment it opens is limited again per address and per node (light_device.rs).
@@ -521,9 +527,7 @@ impl ApiRateLimiter {
             block_duration: 60,
         });
 
-        // Certified proofs and the certified state, keyed by an IPv4 address or an IPv6 /64
-        // (`certified_proofs::limiter_key`): one host holds a whole /64, so a full-address key would
-        // give it 2^64 buckets. Each proof also holds a slot of the proof pool (certified_proofs.rs).
+        // Certified proofs and the certified state. Each proof also holds a slot of the proof pool (certified_proofs.rs).
         configs.insert(certified_proofs::CERTIFIED_PROOF_BUCKET.to_string(), RateLimitConfig {
             max_requests: 600,
             window_seconds: 60,
@@ -589,8 +593,10 @@ impl ApiRateLimiter {
         }
     }
     
-    /// Check if request is allowed, returns (allowed, retry_after_seconds)
+    /// Check if request is allowed, returns (allowed, retry_after_seconds). Every bucket counts an IPv6 caller by its
+    /// /64 (`certified_proofs::limiter_key`): one host holds the whole /64.
     fn check_rate_limit(&self, ip: IpAddr, endpoint_type: &str) -> (bool, u64) {
+        let ip = limiter_key(ip);
         // SCALABILITY: Periodic cleanup of stale IP entries (every 1000 calls)
         static CLEANUP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = CLEANUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -652,6 +658,7 @@ impl ApiRateLimiter {
     /// Get remaining requests for an IP/endpoint
     #[allow(dead_code)]
     fn get_remaining(&self, ip: IpAddr, endpoint_type: &str) -> u32 {
+        let ip = limiter_key(ip);
         let config = self.configs.get(endpoint_type)
             .unwrap_or_else(|| self.configs.get("general").expect("General config must exist"));
         

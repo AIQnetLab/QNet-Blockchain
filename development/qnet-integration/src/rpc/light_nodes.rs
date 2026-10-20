@@ -14,9 +14,7 @@ pub(super) async fn handle_light_node_token_refresh(
     // The address's budget of failed requests (L-2): every refusal up to and including the signature check spends
     // it (`fail`); a refresh the bound device signed spends none, and is held by the node's own limit.
     if let Some(wait) = TOKEN_REFRESH_FAIL_LIMIT.blocked(remote_addr, now) {
-        let mut v = lb::Refusal::RateLimited.to_json();
-        v["retry_after_seconds"] = serde_json::json!(wait);
-        return Ok(warp::reply::json(&v));
+        return Ok(warp::reply::json(&lb::rate_limited_json(wait)));
     }
     let fail = |v: serde_json::Value| -> Result<warp::reply::Json, Rejection> {
         TOKEN_REFRESH_FAIL_LIMIT.charge(remote_addr, now);
@@ -163,8 +161,10 @@ pub(super) async fn handle_light_node_token_refresh(
     }
     // The node's budget is spent only by a refresh that changes the channel: a replay of a captured
     // refresh inside its window cannot use it up and lock out the device's real refresh.
-    if !unchanged && !TOKEN_REFRESH_NODE_LIMIT.allows(&req.node_id, now) {
-        return Ok(warp::reply::json(&lb::Refusal::RateLimited.to_json()));
+    if !unchanged {
+        if let Err(wait) = TOKEN_REFRESH_NODE_LIMIT.spend(&req.node_id, now) {
+            return Ok(warp::reply::json(&lb::rate_limited_json(wait)));
+        }
     }
     // Monotonic bump past the stored stamp: a genuinely newer event must supersede even
     // when this genesis's clock lags the one that stamped the old record. A v2 record is ordered by
@@ -1229,8 +1229,17 @@ pub(super) async fn handle_light_node_ping_response(
     if let Err(rate_limited) = check_api_rate_limit(remote_addr, "light_node_ping") {
         return Ok(rate_limited.into_response());
     }
+    // Junk spends none of the node-wide budget (A2): what point reads and a MAC refuse goes before it.
+    if let Some(junk) = answer_precheck(&params, &blockchain.get_storage(), blockchain.get_height().await) {
+        if crate::node::is_debug() {
+            let malformed = junk["error"].as_str() == Some("malformed ping-response");
+            println!("[DBG][LIGHT] answer_refused_before_budget node={} reason={}", params.get("node_id").map_or("", |s| s.as_str()),
+                     junk["reason"].as_str().unwrap_or(if malformed { "malformed" } else { "challenge_unrecognized" }));
+        }
+        return Ok(warp::reply::json(&junk).into_response());
+    }
     // Then the node-wide budget (M-6): past it a 503 with a wait that ends before the epoch's commit, before any
-    // storage read or ML-DSA-65 work. The permit is held while the answer is handled.
+    // ML-DSA-65 work. The permit is held while the answer is handled.
     let mut permit = None;
     if let Some(shed) = shed_past(&PING_ANSWER_BUDGET, remote_addr, &mut permit) {
         return Ok(shed);
@@ -1238,6 +1247,38 @@ pub(super) async fn handle_light_node_ping_response(
     let answer = answer_light_node_ping(params, blockchain).await.map(|r| r.into_response());
     drop(permit);
     answer
+}
+
+/// The checks of an answer that verify no signature (A2): its form (light-node-messages 5.8, step 1), a challenge that is
+/// this genesis's live stamp or a canonical anchor of the current epoch or of the one just ended (whose late answer the
+/// handler records), and a node the chain lists. Some(reply) refuses it with the handler's own answer; the handler runs
+/// every check again.
+pub(super) fn answer_precheck(params: &HashMap<String, String>, storage: &crate::storage::Storage, tip: u64) -> Option<Value> {
+    use crate::light_device::ping::{anchor_on_chain, Anchor};
+    let field = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+    let (node_id, signature, challenge) = (field("node_id"), field("signature"), field("challenge"));
+    let signed = match signature.strip_prefix("ping_dilithium:") {
+        Some(sigma) => !sigma.is_empty(),
+        None => crate::light_device::messages::parse_hwping_wire(signature).is_some(),
+    };
+    if !node_id.starts_with("light_") || node_id.len() > crate::light_binding::LIGHT_NODE_ID_MAX || !signed || challenge.is_empty() {
+        return Some(json!({ "success": false, "error": "malformed ping-response" }));
+    }
+    let epoch = tip / crate::light_device::EPOCH_BLOCKS;
+    if challenge.starts_with("selfattest:") {
+        let canonical = |a: &Anchor| storage.get_microblock_hash_hex(a.height).ok().flatten().as_deref() == Some(a.hash.as_str());
+        let current = Anchor::parse(challenge).map_or(false, |a| (a.epoch() == epoch && anchor_on_chain(storage, &a, tip))
+            || (a.epoch() + 1 == epoch && canonical(&a)));
+        if !current {
+            return Some(json!({ "success": false, "reason": "anchor_not_current", "error": "Invalid or stale self-attest anchor" }));
+        }
+    } else if !verify_challenge_stamp(node_id, challenge) {
+        return Some(json!({ "success": false, "error": "Unrecognized or expired challenge" }));
+    }
+    if !storage.is_node_registration_onchain(node_id) {
+        return Some(crate::light_binding::Refusal::NotRegistered.to_json());
+    }
+    None
 }
 
 async fn answer_light_node_ping(
@@ -1309,12 +1350,30 @@ async fn answer_light_node_ping(
     let current_slot = SimplifiedP2P::get_current_slot();
     let our_node_id = blockchain.get_node_id();
 
-    // Dedup per EPOCH (the reward unit is one attestation per epoch, not per slot) — BEFORE the
-    // Dilithium verify so repeat submissions cost no crypto at scale.
+    // The repair from a presented newer binding, and the refusal of a replaced device (`superseded`), come before the
+    // epoch's count and its commit gap (B2, B10): a genesis that missed a move is corrected by the new device's first
+    // answer, and the device it replaced learns so in the same epoch, whoever was counted first. A presented key or
+    // delegation this genesis does not hold costs up to two ML-DSA-65 checks here, before the dedup and steps 4 and 5.
+    if let Some(refused) = repair_from_presented(&params, &node_id, &challenge, &signature, &blockchain.get_storage(), tip, now) {
+        return Ok(refused);
+    }
+
+    // Dedup per EPOCH (the reward unit is one attestation per epoch, not per slot): a repeat answer costs no signature
+    // check here, except at a shard owner that holds no answer of the bound device since it took the binding: there each
+    // such reply is checked until one of that device verifies, so the status tells it from the device it replaced
+    // (`bound_answer_recorded`).
     if let Some(p2p) = blockchain.get_unified_p2p() {
         if p2p.has_attestation_in_window(&node_id) {
             if crate::node::is_debug() {
                 println!("[DBG][LIGHT] already_attested_epoch node={}", node_id);
+            }
+            let storage = blockchain.get_storage();
+            if owns_light_shard(&node_id) && bound_answer_recorded(&storage, &node_id) == Some(false)
+                && verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await.is_ok() {
+                note_answer(&storage, &node_id, &params, timing, anchor.as_ref(), now);
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT] bound_device_first_answer node={} counted_already=true", node_id);
+                }
             }
             return Ok(warp::reply::json(&json!({
                 "success": true,
@@ -1340,8 +1399,9 @@ async fn answer_light_node_ping(
         return Ok(warp::reply::json(&gap_reply(&node_id)));
     }
 
-    // Steps 4 and 5 before any ML-DSA-65 work: the device record here and the device's own signature over
-    // the anchor (nothing written; the shared verifier below runs them again and takes the counter).
+    // Steps 4 and 5 before the shared verifier's ML-DSA-65 work (only a presented key not held here was checked above):
+    // the device record here and the device's own signature over the anchor (nothing written; the shared verifier
+    // below runs them again and takes the counter).
     if let (Some(w), Some(a)) = (&hw, &anchor) {
         let checked = crate::light_device::ping::check_device_reply(&blockchain.get_storage(),
             crate::light_device::evidence::Verifier::production(), &node_id, a, w, now);
@@ -1351,61 +1411,6 @@ async fn answer_light_node_ping(
                 println!("[INFO][LIGHT] device_reply_refused node={} reason={}", node_id, r.as_str());
             }
             return Ok(warp::reply::json(&json!({ "success": false, "error": "The device check of this reply failed" })));
-        }
-    }
-
-    // Anti-poison: if the request presents its ping delegation, refresh the ping-key CF before verifying,
-    // so the node's own authenticated ping overwrites any pre-registration gossip poison. The overwrite is
-    // bound to (a) a cert that verifies under the node's committed on-chain key AND (b) a valid ping signature
-    // under the PRESENTED key — so a replay of an old (pp,cert) with a garbage ping sig cannot downgrade the
-    // stored key, while a node whose CF was poisoned heals it with its own correctly-signed ping.
-    // A presented key and delegation this genesis already holds, with the identity they were proven under, change
-    // nothing: the shared verifier below checks σ under them, once, instead of the delegation and σ here and σ again
-    // there (two of three ML-DSA-65 checks an answer).
-    let presented_known = match (params.get("ping_pubkey"), params.get("ping_delegation_cert")) {
-        (Some(pp), Some(cert)) if !pp.is_empty() => blockchain.get_storage().get_light_binding(&node_id)
-            .map_or(false, |b| b.ping_pubkey == *pp && b.cert == *cert && !b.identity_pubkey.is_empty()),
-        _ => false,
-    };
-    if let (false, Some(pp), Some(cert), Some(inner_ping_sig)) =
-        (presented_known, params.get("ping_pubkey"), params.get("ping_delegation_cert"), crate::light_device::ping::sigma_text(&signature)) {
-        if !pp.is_empty() && !cert.is_empty() {
-            let inner_ping_sig = inner_ping_sig.as_str();
-            // A light node's identity key lives on its device; the chain holds its hash. The device may
-            // present the key here, and it is admitted only if it hashes to that commitment - so the
-            // delegation below is still checked under a key the chain vouches for.
-            let presented = params.get("identity_pubkey").map(|s| s.as_str());
-            if let Some(onchain_pk_hex) = blockchain.get_storage().resolve_light_identity_pk(&node_id, presented) {
-                if crate::light_binding::verify_delegation(cert, pp, &node_id, &onchain_pk_hex).is_some()
-                    && verify_mobile_dilithium_signature(&challenge, inner_ping_sig, pp) {
-                    // Record the identity the delegation was proven under, so later attestations need
-                    // only the ping signature. The binding order holds (U8): a device whose binding
-                    // was replaced presents an older delegation, which is refused, and its answer is
-                    // not credited - it would fail under the stored key anyway, so say why.
-                    let storage = blockchain.get_storage();
-                    if let Ok(crate::storage::PingKeyWrite::Refused(
-                        verdict @ (crate::light_binding::Admit::Stale | crate::light_binding::Admit::V1AfterV2),
-                    )) = storage.save_light_ping_keys_identity(&node_id, pp, cert, &onchain_pk_hex)
-                    {
-                        let current = storage.get_light_ping_keys(&node_id).map(|(k, _)| k);
-                        if current.as_deref() != Some(pp.as_str()) {
-                            note_refusal(&storage, &node_id, tip, "superseded", now, &challenge, &signature);
-                            if crate::node::is_info() {
-                                println!("[INFO][LIGHT] superseded_device_refused node={} verdict={:?}", node_id, verdict);
-                            }
-                            return Ok(warp::reply::json(&json!({
-                                "success": false,
-                                "reason": "superseded",
-                                "error": "The node runs on another device"
-                            })));
-                        }
-                    }
-                } else if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] presented_ping_delegation_rejected node={}", node_id);
-                }
-            } else if crate::node::is_warn() {
-                println!("[WARN][LIGHT] identity_unresolved node={} presented={}", node_id, presented.is_some());
-            }
         }
     }
 
@@ -1573,15 +1578,7 @@ async fn answer_light_node_ping(
     
     println!("[LIGHT] 📡 Light node {} responded and attested in slot {}", node_id, current_slot);
 
-    // The node's last answer as its shard owner took it, with how long the push took to reach the device
-    // (`device.last_answer`); nothing of this epoch is left to record as a miss. The push receipts the answer
-    // carries refine the node's misses here (light-node-messages 5.10), never its crediting.
-    PUSH_LEDGER.answered(&node_id);
-    if owns_light_shard(&node_id) {
-        let receipts = PushReceipts::from_params(&params);
-        record_answer(&blockchain.get_storage(), &node_id, now, timing.measure(now), receipts.as_ref(), timing.answered_at,
-                      anchor.as_ref().map(|a| a.epoch()));
-    }
+    note_answer(&blockchain.get_storage(), &node_id, &params, timing, anchor.as_ref(), now);
 
     // A lease refresh riding in the reply (light-node-messages 5.6): run at this genesis in the background,
     // never relayed.
@@ -1603,6 +1600,75 @@ async fn answer_light_node_ping(
         "next_ping_window": now + (4 * 60 * 60),
         "timestamp": now
     })))
+}
+
+/// Anti-poison and the move's repair: an answer that presents its ping delegation refreshes the ping-key CF before it is
+/// verified, so the node's own authenticated answer overwrites pre-registration gossip poison, and a genesis that missed a
+/// move takes the newer binding from the new device's answer. The overwrite is bound to (a) a cert that verifies under
+/// the node's committed on-chain key AND (b) a valid ping signature under the PRESENTED key — so a replay of an old
+/// (pp,cert) with a garbage ping sig cannot downgrade the stored key. A presented key and delegation this genesis already
+/// holds, with the identity they were proven under, change nothing and cost no check here: the shared verifier checks σ
+/// under them once. Some(reply): the answer of a device whose binding was replaced (`superseded`).
+pub(super) fn repair_from_presented(params: &HashMap<String, String>, node_id: &str, challenge: &str, signature: &str,
+                                    storage: &crate::storage::Storage, tip: u64, now: u64) -> Option<warp::reply::Json> {
+    let (pp, cert) = (params.get("ping_pubkey")?, params.get("ping_delegation_cert")?);
+    if pp.is_empty() || cert.is_empty() { return None; }
+    if storage.get_light_binding(node_id).map_or(false, |b| b.ping_pubkey == *pp && b.cert == *cert && !b.identity_pubkey.is_empty()) {
+        return None;
+    }
+    let inner_ping_sig = crate::light_device::ping::sigma_text(signature)?;
+    // A light node's identity key lives on its device; the chain holds its hash. The device may present the key here,
+    // and it is admitted only if it hashes to that commitment - so the delegation is still checked under a key the
+    // chain vouches for.
+    let presented = params.get("identity_pubkey").map(|s| s.as_str());
+    let Some(onchain_pk_hex) = storage.resolve_light_identity_pk(node_id, presented) else {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] identity_unresolved node={} presented={}", node_id, presented.is_some());
+        }
+        return None;
+    };
+    if crate::light_binding::verify_delegation(cert, pp, node_id, &onchain_pk_hex).is_none()
+        || !verify_mobile_dilithium_signature(challenge, &inner_ping_sig, pp) {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] presented_ping_delegation_rejected node={}", node_id);
+        }
+        return None;
+    }
+    // Record the identity the delegation was proven under, so later attestations need only the ping signature. The
+    // binding order holds (U8): a device whose binding was replaced presents an older delegation, which is refused, and
+    // its answer is not credited - it would fail under the stored key anyway, so say why.
+    let verdict = match storage.save_light_ping_keys_identity(node_id, pp, cert, &onchain_pk_hex) {
+        Ok(crate::storage::PingKeyWrite::Refused(v @ (crate::light_binding::Admit::Stale | crate::light_binding::Admit::V1AfterV2))) => v,
+        Ok(crate::storage::PingKeyWrite::Applied) => {
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] binding_repaired_from_answer node={}", node_id);
+            }
+            return None;
+        }
+        _ => return None,
+    };
+    if storage.get_light_ping_keys(node_id).map(|(k, _)| k).as_deref() == Some(pp.as_str()) { return None; }
+    note_refusal(storage, node_id, tip, "superseded", now, challenge, signature);
+    if crate::node::is_info() {
+        println!("[INFO][LIGHT] superseded_device_refused node={} verdict={:?}", node_id, verdict);
+    }
+    Some(warp::reply::json(&json!({
+        "success": false,
+        "reason": "superseded",
+        "error": "The node runs on another device"
+    })))
+}
+
+/// The node's last answer as its shard owner took it, with how long the push took to reach the device
+/// (`device.last_answer`); nothing of this epoch is left to record as a miss. The push receipts the answer
+/// carries refine the node's misses here (light-node-messages 5.10), never its crediting.
+fn note_answer(storage: &crate::storage::Storage, node_id: &str, params: &HashMap<String, String>, timing: AnswerTiming,
+               anchor: Option<&crate::light_device::ping::Anchor>, now: u64) {
+    PUSH_LEDGER.answered(node_id);
+    if owns_light_shard(node_id) {
+        let receipts = PushReceipts::from_params(params);
+        record_answer(storage, node_id, now, timing.measure(now), receipts.as_ref(), timing.answered_at, anchor.map(|a| a.epoch()));
+    }
 }
 
 /// Handle next ping time request (for polling-based Light nodes)
@@ -1653,7 +1719,7 @@ pub(super) async fn handle_light_node_pending_challenge(
         return Ok(rate_limited);
     }
     let node_id = match params.get("node_id") {
-        Some(id) if id.starts_with("light_") && id.len() <= 128 => id.clone(),
+        Some(id) if id.starts_with("light_") && id.len() <= crate::light_binding::LIGHT_NODE_ID_MAX => id.clone(),
         _ => return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "node_id parameter required"
@@ -1869,6 +1935,8 @@ pub(crate) struct OwnersView {
     pub(crate) answered: bool,
     /// Some owner reports it active.
     pub(crate) active: bool,
+    /// Some owner holding the binding the asker named (`bound`, `answered_under`) took an answer of its device.
+    pub(crate) device_answered: bool,
 }
 
 impl OwnersView {
@@ -1881,6 +1949,7 @@ impl OwnersView {
             answered: verdicts.iter().any(|v| v["onchain_registered"].as_bool() == Some(true)
                 && v["answered_this_epoch"].as_bool() == Some(true)),
             active: verdicts.iter().any(|v| v["is_active"].as_bool() == Some(true)),
+            device_answered: verdicts.iter().any(|v| v["device"]["answered"].as_bool() == Some(true)),
         })
     }
 }
@@ -1890,8 +1959,9 @@ impl OwnersView {
 /// backup, or a relay was lost. So a genesis asks every owner of the node's shard but itself, at once, before it calls
 /// the node inactive; every genesis then gives one verdict. 60 s per-node cache (64k cap), an owner that failed is
 /// skipped for 15 s, at most 16 consultations in flight; None on no verdict (the caller keeps its own). `fwd=1` marks
-/// a proxied call, never recursed.
-pub(super) async fn shard_owners_view(node_id: &str) -> Option<OwnersView> {
+/// a proxied call, never recursed; `bound` names the sequence of the binding the caller holds, so an owner vouches for
+/// the bound device's answer only under that binding.
+pub(super) async fn shard_owners_view(node_id: &str, bound: Option<u64>) -> Option<OwnersView> {
     use crate::genesis_constants::GENESIS_NODE_IPS;
     fn cache() -> &'static dashmap::DashMap<String, (OwnersView, u64)> {
         static M: std::sync::OnceLock<dashmap::DashMap<String, (OwnersView, u64)>> = std::sync::OnceLock::new();
@@ -1918,8 +1988,9 @@ pub(super) async fn shard_owners_view(node_id: &str) -> Option<OwnersView> {
         .map(|n| n.saturating_sub(1));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let key = format!("{}:{}", node_id, bound.unwrap_or(0));
     // An expiry further off than its lifetime was set before this genesis's clock was set back: expired.
-    if let Some(e) = cache().get(node_id) { if e.value().1 > now && e.value().1 <= now + 60 { return Some(e.value().0); } }
+    if let Some(e) = cache().get(&key) { if e.value().1 > now && e.value().1 <= now + 60 { return Some(e.value().0); } }
     let owners: Vec<usize> = crate::node::light_shard_owners(shard).into_iter()
         .filter(|o| Some(*o) != our_idx)
         .filter(|o| owner_down().get(o).map_or(true, |d| *d.value() <= now || *d.value() > now + 15))
@@ -1929,7 +2000,10 @@ pub(super) async fn shard_owners_view(node_id: &str) -> Option<OwnersView> {
     let _permit = inflight().try_acquire().ok()?;
     let asks = owners.iter().map(|o| async move {
         let (ip, _) = GENESIS_NODE_IPS.get(*o)?;
-        let url = format!("http://{}:8001/api/v1/light-node/status?node_id={}&fwd=1", ip, node_id);
+        let url = match bound {
+            Some(seq) => format!("http://{}:8001/api/v1/light-node/status?node_id={}&fwd=1&bound={}", ip, node_id, seq),
+            None => format!("http://{}:8001/api/v1/light-node/status?node_id={}&fwd=1", ip, node_id),
+        };
         match client().get(&url).send().await {
             Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
             _ => None,
@@ -1943,7 +2017,7 @@ pub(super) async fn shard_owners_view(node_id: &str) -> Option<OwnersView> {
     }
     let replies: Vec<serde_json::Value> = replies.into_iter().flatten().collect();
     let view = OwnersView::of(&replies)?;
-    cache().insert(node_id.to_string(), (view, now + 60));
+    cache().insert(key, (view, now + 60));
     Some(view)
 }
 

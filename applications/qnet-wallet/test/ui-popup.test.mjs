@@ -2,8 +2,8 @@
 // also checked against the router's message table, so these tests fail when the page drifts from
 // CONTRACTS.md. Secrets: typed passwords are sent once and cleared at once; the phrase and a private key are shown at
 // once after the password and leave the page with their screen (owner, 06.10); the activation code is in Settings and
-// comes into the page only on Show or Copy; a secret reaches the clipboard only by its Copy button, and leaves it after a
-// minute (the code after TIMINGS.CLIPBOARD_CLEAR_MS).
+// comes into the page only on Show or Copy; a secret reaches the clipboard only by its Copy button, and the worker empties
+// it after a minute (the code after TIMINGS.CLIPBOARD_CLEAR_MS), the popup open or not.
 import { afterEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import * as core from '../dist/lib/qnet-core.js';
@@ -67,6 +67,11 @@ function handlers(overrides = {}) {
     // the session's view cache, empty until a test fills it, and the Solana History (decision 39)
     'wallet.cached': () => ({ qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null }),
     'solana.history': () => ({ items: [], cursor: null }),
+    // the user acting on the popup, and where the popup is (batch 19.10)
+    'wallet.touch': () => ({ touched: true }),
+    'wallet.remember': () => ({ remembered: true }),
+    // the worker's clipboard clear (clipboard.js); the popup never asks it to clear now (the erase does that)
+    'clipboard.schedule': ({ afterMs }) => ({ scheduled: afterMs > 0 }),
     // no handler for node.unlinkView or node.unlink: the popup no longer asks about the light node's device (owner,
     // 06.10), so a request for either is a violation in every test
     ...overrides,
@@ -92,7 +97,6 @@ afterEach(() => {
   if (page) {
     assert.deepEqual(page.violations, [], 'every request matches the router table');
     page.close();
-    page = null;
   }
   mock.timers.reset();
 });
@@ -455,7 +459,8 @@ describe('popup: lock, wipe and events', () => {
     assert.equal(page.location.reloads, 1);
   });
 
-  it("a 'wiped' event takes a copy this page made and has yet to clear off the clipboard (R16)", async () => {
+  // R16: the worker's erase empties a copied secret before it announces the wipe; the page writes nothing on 'wiped'.
+  it("a 'wiped' event reloads once and leaves the clipboard to the worker's erase (R16)", async () => {
     await openWallet({
       'activation.status': () => ({ activation: activationRecord('light'), pending: null, busy: false }),
       'activation.copy': () => ({ code: CODE }),
@@ -465,40 +470,52 @@ describe('popup: lock, wipe and events', () => {
     assert.equal(page.clipboard.text, CODE);
     page.emit('wiped');
     await page.settle();
-    assert.equal(page.clipboard.text, '');
+    assert.deepEqual(page.clipboard.writes, [CODE]);
+    assert.deepEqual(page.callsOf('clipboard.clearNow'), []);
     assert.equal(page.location.reloads, 1);
   });
 
-  // R4-ESM-01: the worker announces the wipe before it deletes the database and answers vault.wipe, so this popup
-  // reloads inside the event, before the delete's own continuation: the clipboard must be emptied there.
-  it('Delete wallet empties the clipboard although the worker announces the wipe before it answers (R4-ESM-01)', async () => {
-    await openWallet({
-      'activation.status': () => ({ activation: activationRecord('light'), pending: null, busy: false }),
-      'activation.copy': () => ({ code: CODE }),
-      'vault.wipe': async () => {
-        page.emit('wiped');
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        return { wiped: true };
-      },
-    });
+  // The worker's delete starts with an ordinary lock and announces the wipe only once the vault is deleted: the popup
+  // that asked keeps its Delete screen through that lock, and starts over on 'wiped' or on the delete's answer.
+  async function openDelete(wipe, status = unlockedStatus) {
+    await openWallet({ 'vault.wipe': wipe, 'vault.status': () => status() });
     await page.click('[data-tab="settings"]');
-    await page.click('[data-action="copy-code"]');
-    assert.equal(page.clipboard.text, CODE);
     await page.click('[data-action="delete-wallet"]');
     type(page.$('input[name="password"]'), PASSWORD);
     type(page.$('input[name="confirm"]'), 'DELETE');
-    // a real reload ends the page: whatever the clipboard holds when it is asked for stays there
-    const atReload = [];
-    const reload = page.location.reload.bind(page.location);
-    page.location.reload = () => {
-      atReload.push(page.clipboard.text);
-      reload();
-    };
+  }
+
+  it('Delete wallet: the lock its erase starts with keeps the screen; the wipe announced after it reloads once', async () => {
+    await openDelete(async () => {
+      page.emit('locked');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(page.$('[data-action="confirm-delete"]'), 'still the Delete screen while the erase runs');
+      assert.equal(page.$('input[name="password"]').getAttribute('type'), 'password');
+      page.emit('wiped');
+      return { wiped: true };
+    });
+    const statusReads = page.callsOf('vault.status').length;
     await page.click('[data-action="confirm-delete"]');
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await new Promise((resolve) => setTimeout(resolve, 30));
     await page.settle();
-    assert.deepEqual(atReload, [''], 'emptied before the one reload: the activation code does not outlive the wallet');
+    assert.equal(page.location.reloads, 1);
+    assert.equal(page.callsOf('vault.status').length, statusReads, 'the lock sent the page nowhere');
     assert.equal(page.localStorage.length, 0);
+  });
+
+  it('a delete that did not finish leaves the wallet locked, and the lock screen says it was not deleted', async () => {
+    let erased = false;
+    await openDelete(() => {
+      erased = true;
+      page.emit('locked');
+      fail('INTERNAL');
+    }, () => (erased ? lockedStatus() : unlockedStatus()));
+    await page.click('[data-action="confirm-delete"]');
+    await page.settle();
+    assert.equal(page.location.reloads, 0, 'no wipe was announced: nothing reloads');
+    assert.ok(page.$('[data-action="unlock"]'), 'the lock screen');
+    assert.match(page.text(), /The wallet was not deleted\. Unlock it and try again\./);
+    assert.equal(page.$('input[name="password"]').value, '');
   });
 });
 
@@ -1518,7 +1535,7 @@ describe('popup: activate', () => {
   });
 
   // Owner, 06.10: the code is in Settings, beside the recovery phrase and the private key: one plain row with Show and Copy,
-  // no warning, no timer and no password (decision 33). Copy copies at once and the clipboard is cleared after
+  // no warning, no timer and no password (decision 33). Copy copies at once and the worker clears the clipboard after
   // TIMINGS.CLIPBOARD_CLEAR_MS, silently; leaving Settings drops the code.
   it('Settings shows the activation code as one plain row: masked, Show and Copy, no warning, no timer, no password', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
@@ -1557,9 +1574,11 @@ describe('popup: activate', () => {
     assert.deepEqual(page.clipboard.writes, [SUPER_CODE], 'copied at once: no warning first');
     assert.equal(page.callsOf('activation.copy').length, 2, 'read once, then kept while Settings is shown');
     assert.doesNotMatch(shownText(section), /clipboard|Before you copy|server/i);
+    assert.deepEqual(page.callsOf('clipboard.schedule').map((entry) => entry.params).at(-1), { afterMs: TIMINGS.CLIPBOARD_CLEAR_MS },
+      'the worker clears it, silently, the popup open or not');
     mock.timers.tick(TIMINGS.CLIPBOARD_CLEAR_MS);
     await page.settle();
-    assert.equal(page.clipboard.text, '', 'the clipboard is cleared, silently');
+    assert.deepEqual(page.clipboard.writes, [SUPER_CODE], 'no timer of the page writes the clipboard');
     // leaving Settings drops the code; a Copy alone reads it again and does not show it
     await page.click('[data-tab="assets"]');
     await page.click('[data-tab="settings"]');
@@ -2016,7 +2035,7 @@ describe('popup: settings', () => {
     assert.ok(!page.text().includes('abandon'));
   });
 
-  it('copies the phrase only by its Copy button and clears the clipboard after a minute, silently', async () => {
+  it('copies the phrase only by its Copy button and has the worker clear the clipboard after a minute, silently', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
     await openWallet({ 'vault.reveal': () => ({ mnemonic: core.KAT.mnemonic }) });
     await page.click('[data-tab="settings"]');
@@ -2030,17 +2049,19 @@ describe('popup: settings', () => {
     await page.click('[data-action="copy-phrase"]');
     assert.equal(page.clipboard.text, core.KAT.mnemonic, 'the words in one line, as an import takes them');
     assert.match(page.text(), /Recovery phrase copied/);
-    mock.timers.tick(59_999);
-    assert.equal(page.clipboard.text, core.KAT.mnemonic);
-    mock.timers.tick(1);
+    assert.deepEqual(page.callsOf('clipboard.schedule').map((entry) => entry.params).at(-1), { afterMs: 60_000 },
+      'the worker clears it after 60 s, the popup open or not');
+    mock.timers.tick(60_000);
     await page.settle();
-    assert.equal(page.clipboard.text, '', 'cleared after 60 s');
+    assert.deepEqual(page.clipboard.writes, [core.KAT.mnemonic], 'no timer of the page writes the clipboard');
     // the Copy button goes with the screen
     await page.click('[data-action="done"]');
     assert.equal(page.$('[data-action="copy-phrase"]'), null);
   });
 
-  it('a phrase the Copy button put on the clipboard goes with the wallet when it is deleted (R16)', async () => {
+  // R16: the worker's erase empties the clipboard of the copy it still has to clear (vault.eraseAll, clipboard.clearNow);
+  // the popup, which reloads on 'wiped', writes nothing itself.
+  it('a phrase the Copy button put on the clipboard is left to the worker\'s erase when the wallet is deleted (R16)', async () => {
     await openWallet({
       'vault.reveal': () => ({ mnemonic: core.KAT.mnemonic }),
       'vault.wipe': () => ({ wiped: true }),
@@ -2056,7 +2077,9 @@ describe('popup: settings', () => {
     type(page.$('input[name="password"]'), PASSWORD);
     type(page.$('input[name="confirm"]'), 'DELETE');
     await page.click('[data-action="confirm-delete"]');
-    assert.equal(page.clipboard.text, '');
+    assert.deepEqual(page.callsOf('clipboard.schedule').map((entry) => entry.params), [{ afterMs: 60_000 }]);
+    assert.deepEqual(page.callsOf('clipboard.clearNow'), [], 'the erase is the worker\'s');
+    assert.deepEqual(page.clipboard.writes, [core.KAT.mnemonic]);
     assert.equal(page.location.reloads, 1);
   });
 
@@ -2148,7 +2171,7 @@ describe('popup: settings', () => {
     await page.click('[data-action="revoke"]');
     assert.deepEqual(page.callsOf('sites.revoke').map((entry) => entry.params), [{ origin: 'https://aiqnet.io' }]);
     assert.equal(page.$$('[data-action="revoke"]').length, 1);
-    assert.match(page.text(), /Version3\.1\.5/);
+    assert.match(page.text(), /Version3\.1\.6/);
   });
 
   it('checks a new password locally, then changes it with the current one', async () => {
@@ -2598,9 +2621,8 @@ describe('popup: activate, one code per wallet (decision 35)', () => {
     await page.click('[data-action="copy-code"]');
     assert.equal(page.clipboard.text, 'QNET-SFEFD9-706058-537636', 'copied at once, no warning');
     assert.doesNotMatch(page.text(), /start nothing alone|burn’s receipt/);
-    mock.timers.tick(TIMINGS.CLIPBOARD_CLEAR_MS);
-    await page.settle();
-    assert.equal(page.clipboard.text, '', 'and cleared, silently');
+    assert.deepEqual(page.callsOf('clipboard.schedule').map((entry) => entry.params).at(-1), { afterMs: TIMINGS.CLIPBOARD_CLEAR_MS },
+      'and cleared by the worker, silently');
   });
 
   it('a burn aiqnet.io refuses, or holds elsewhere, goes back to the overview with the reason, never "maybe sent"', async () => {
@@ -2917,7 +2939,7 @@ describe('popup: balances at once (owner, 06.10)', () => {
     assert.equal(page.$('.asset-status').textContent, '');
   });
 
-  it('every figure takes the UI language\'s group and decimal marks; a figure pasted in its format is read as written', async () => {
+  it('every figure is in one format in every language (comma groups, a decimal point); a pasted figure is read the same way', async () => {
     await openWallet({
       'settings.get': () => ({ autoLockMinutes: 15, language: 'de' }),
       'qnet.balance': () => ({ balanceNano: '12345678500000000', spendableNano: '12345678500000000', nonce: '1', verified: false, verification: 'live', blockHeight: 1 }),
@@ -2925,17 +2947,20 @@ describe('popup: balances at once (owner, 06.10)', () => {
     // the German table is a module the page imports: the wallet comes once it is loaded
     for (let turn = 0; turn < 400 && page.$('.token-amount') === null; turn += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     await page.settle();
-    assert.equal(page.$('.token-amount').textContent, '12.345.678,5 QNC');
+    assert.equal(page.$('.token-amount').textContent, '12,345,678.5 QNC');
     await page.click('[data-tab="send"]');
-    assert.match(page.text(), /12\.345\.678,5 QNC/);
+    assert.match(page.text(), /12,345,678\.5 QNC/);
     const amount = page.$('input[name="amount"]');
+    type(amount, '42,578.81988');
+    assert.equal(amount.value, '42578.81988', 'a copied amount is read as the wallet writes it, in German too');
+    type(amount, '');
     type(amount, '1.000');
-    assert.equal(amount.value, '1000', 'a paste of 1.000 in German is a thousand');
+    assert.equal(amount.value, '1.000', 'a pasted point is the decimal point in German too');
     type(amount, '');
     type(amount, '1');
     type(amount, '1,');
     type(amount, '1,5');
-    assert.equal(amount.value, '1.5', 'a typed comma is the decimal mark');
+    assert.equal(amount.value, '1.5', 'a typed comma is the decimal point');
   });
 
   it('the send form says nothing is available while no live figure was read', async () => {
@@ -3348,9 +3373,8 @@ describe('popup: private key export (owner, 06.10)', () => {
     await page.click('[data-action="copy-key"]');
     assert.equal(page.clipboard.text, QNET_KEY);
     assert.match(page.text(), /Private key copied\./);
-    mock.timers.tick(60_000);
-    await page.settle();
-    assert.equal(page.clipboard.text, '', 'cleared after 60 s, silently');
+    assert.deepEqual(page.callsOf('clipboard.schedule').map((entry) => entry.params).at(-1), { afterMs: 60_000 },
+      'the worker clears it after 60 s, silently');
     // Done: the key leaves the page with the screen
     await page.click('[data-action="done"]');
     assert.ok(!page.text().includes(QNET_KEY));
@@ -3368,5 +3392,163 @@ describe('popup: header and tab bar gutter (owner, 06.10)', () => {
     assert.match(rule('.tabs'), /overflow-x: auto;/);
     assert.match(rule('.tab'), /white-space: nowrap;/);
     assert.match(rule('.tab'), /flex: 1 0 auto;/);
+  });
+});
+
+describe('popup: the user\'s activity and where the popup was (batch 19.10)', () => {
+  const remembered = () => page.callsOf('wallet.remember').map((entry) => entry.params);
+  const cachedWith = (popupState) => () => ({
+    qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null, qnetTokens: null, popupState,
+  });
+
+  // The auto-lock counts from the user's last action: a press or a key on the popup is one (wallet.touch), at most every
+  // TIMINGS.ACTIVITY_TOUCH_MS; the popup's own reads are none.
+  it('opening the popup and a press or a key on it note the user\'s activity, at most every 30 s; its reads never do', async () => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
+    await openWallet();
+    assert.equal(page.callsOf('wallet.touch').length, 1, 'the user opened the popup');
+    fire(page.document, 'pointerdown');
+    fire(page.document, 'keydown', { key: 'a' });
+    await page.settle();
+    assert.equal(page.callsOf('wallet.touch').length, 1, 'not more often than every TIMINGS.ACTIVITY_TOUCH_MS');
+    const reads = page.callsOf('qnet.balance').length;
+    mock.timers.tick(TIMINGS.ACTIVITY_TOUCH_MS);
+    await page.settle();
+    assert.ok(page.callsOf('qnet.balance').length > reads, 'the balance read itself again');
+    assert.equal(page.callsOf('wallet.touch').length, 1, 'a read is no activity');
+    fire(page.document, 'pointerdown');
+    await page.settle();
+    assert.equal(page.callsOf('wallet.touch').length, 2);
+    page.close();
+    // the lock screen has no session to extend
+    await openWallet({ 'vault.status': () => lockedStatus() });
+    fire(page.document, 'keydown', { key: 'a' });
+    await page.settle();
+    assert.equal(page.callsOf('wallet.touch').length, 0);
+  });
+
+  it('remembers the network, the tab and the Send form\'s draft while it is typed, and leaves the draft\'s drop after a send to the worker', async () => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
+    await openWallet({
+      'qnet.preview': ({ to }) => ({
+        from: ADDRESSES.qnet, to, amountNano: '1500000000', feeNano: '31500', totalNano: '1500031500', nonce: '4',
+        balanceNano: '12500000000', verified: false, verification: 'none',
+        recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
+      }),
+      'qnet.send': () => ({ status: 'submitted', nonce: '4' }),
+    });
+    assert.deepEqual(remembered(), [], 'opening remembers nothing new');
+    await page.click('[data-tab="send"]');
+    assert.deepEqual(remembered(), [{ network: 'qnet', tab: 'send' }]);
+    type(page.$('input[name="to"]'), RECIPIENT);
+    type(page.$('input[name="amount"]'), '1.5');
+    assert.equal(remembered().length, 1, 'kept once the typing paused');
+    mock.timers.tick(TIMINGS.DRAFT_REMEMBER_MS);
+    await page.settle();
+    assert.deepEqual(remembered(), [{ network: 'qnet', tab: 'send' },
+      { network: 'qnet', tab: 'send', asset: 'QNC', to: RECIPIENT, amount: '1.5' }]);
+    await page.click('[data-action="review"]');
+    await page.click('[data-action="confirm-send"]');
+    assert.match(page.text(), /Sent/);
+    // the worker drops the draft once the send went, the popup open or closed (router `sends`); the page writes nothing
+    assert.equal(remembered().length, 2);
+    await page.click('.network-switch [data-value="solana"]');
+    assert.deepEqual(remembered().at(-1), { network: 'solana', tab: 'send' });
+    await page.click('[data-tab="history"]');
+    assert.deepEqual(remembered().at(-1), { network: 'solana', tab: 'history' });
+  });
+
+  it('a draft typed just before the popup closes is kept at once; a payment request\'s form keeps none', async () => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
+    await openWallet();
+    await page.click('.network-switch [data-value="solana"]');
+    await page.click('[data-tab="send"]');
+    type(page.$('input[name="to"]'), SOLANA_RECIPIENT);
+    type(page.$('input[name="amount"]'), '0.25');
+    fire(page.window, 'pagehide');
+    await page.settle();
+    assert.deepEqual(remembered().at(-1), { network: 'solana', tab: 'send', asset: 'sol', to: SOLANA_RECIPIENT, amount: '0.25' });
+    page.close();
+    await openWallet();
+    await page.click('.network-switch [data-value="solana"]');
+    await page.click('[data-tab="send"]');
+    const to = page.$('input[name="to"]');
+    const event = new FakeEvent('paste');
+    event.clipboardData = { getData: (kind) => (kind === 'text' ? `solana:${SOLANA_RECIPIENT}?amount=1&memo=order-7` : '') };
+    to.dispatchEvent(event);
+    await page.settle();
+    assert.equal(to.value, SOLANA_RECIPIENT);
+    mock.timers.tick(TIMINGS.DRAFT_REMEMBER_MS);
+    await page.settle();
+    assert.deepEqual(remembered().at(-1), { network: 'solana', tab: 'send' }, 'no recipient or amount without the request\'s memo');
+  });
+
+  it('a draft typed just before the form goes (Review) is kept with the values it had', async () => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_750_000_000_000 });
+    await openWallet({
+      'qnet.preview': ({ to }) => ({
+        from: ADDRESSES.qnet, to, amountNano: '2000000000', feeNano: '31500', totalNano: '2000031500', nonce: '4',
+        balanceNano: '12500000000', verified: false, verification: 'none',
+        recipient: { known: true, lookalike: false, incomingOnly: false, historyRead: true },
+      }),
+    });
+    await page.click('[data-tab="send"]');
+    type(page.$('input[name="to"]'), RECIPIENT);
+    type(page.$('input[name="amount"]'), '2');
+    await page.click('[data-action="review"]');
+    assert.ok(page.$('[data-action="confirm-send"]'), 'the review');
+    assert.deepEqual(remembered().at(-1), { network: 'qnet', tab: 'send', asset: 'QNC', to: RECIPIENT, amount: '2' });
+    mock.timers.tick(TIMINGS.DRAFT_REMEMBER_MS);
+    await page.settle();
+    assert.deepEqual(remembered().at(-1), { network: 'qnet', tab: 'send', asset: 'QNC', to: RECIPIENT, amount: '2' },
+      'no later write of the emptied form');
+  });
+
+  it('opens where it was in this session: the network, the tab and the Send form with its draft, once', async () => {
+    await openWallet({
+      'wallet.cached': cachedWith({ network: 'solana', tab: 'send', draft: { asset: '1dev', to: SOLANA_RECIPIENT, amount: '12.5' } }),
+    });
+    assert.equal(page.$('[data-tab="send"]').getAttribute('aria-selected'), 'true');
+    assert.ok(page.$('.wallet').classList.contains('net-solana'));
+    assert.equal(page.$('input[name="to"]').value, SOLANA_RECIPIENT);
+    assert.equal(page.$('input[name="amount"]').value, '12.5');
+    assert.equal(page.$('.tab-body [data-value="1dev"]').getAttribute('aria-pressed'), 'true');
+    assert.deepEqual(remembered(), [], 'opening there writes nothing');
+    await page.click('[data-tab="assets"]');
+    await page.click('[data-tab="send"]');
+    assert.equal(page.$('input[name="to"]').value, '', 'the draft is drawn once');
+    page.close();
+    // a token the token list does not name: only the recipient comes back, never its amount as QNC
+    await openWallet({
+      'wallet.cached': cachedWith({ network: 'qnet', tab: 'send', draft: { asset: RECIPIENT, to: RECIPIENT, amount: '5' } }),
+    });
+    assert.equal(page.$('input[name="to"]').value, RECIPIENT);
+    assert.equal(page.$('input[name="amount"]').value, '');
+    assert.equal(page.$('select[name="asset"]').value, 'QNC');
+    page.close();
+    // no state kept (a new session): the wallet's first view
+    await openWallet({ 'wallet.cached': cachedWith(null) });
+    assert.equal(page.$('[data-tab="assets"]').getAttribute('aria-selected'), 'true');
+  });
+
+  it('Export private key: the account cannot be switched while its key is asked for', async () => {
+    let release = null;
+    await openWallet({
+      'vault.exportKey': ({ network }) => new Promise((resolve) => {
+        release = () => resolve({ network, address: ADDRESSES[network], privateKey: network === 'qnet' ? 'cd'.repeat(32) : 'solkey' });
+      }),
+    });
+    await page.click('[data-tab="settings"]');
+    await page.click('[data-action="export-key"]');
+    type(page.$('input[name="password"]'), PASSWORD);
+    page.$('[data-action="export"]').click();
+    await new Promise((resolve) => setImmediate(resolve));
+    const solana = page.$('.tab-body [data-value="solana"]');
+    assert.equal(solana.disabled, true, 'the switch waits for the answer');
+    solana.click();
+    release();
+    await page.settle();
+    assert.equal(page.$('.key-box').textContent, 'cd'.repeat(32), 'the key asked for is shown');
+    assert.deepEqual(page.callsOf('vault.exportKey').map((entry) => entry.params.network), ['qnet']);
   });
 });

@@ -10,6 +10,15 @@ pub(crate) fn tip_reconcile_target(local_h: u64, attempts: u32, fin_floor: u64) 
     local_h.saturating_sub(1u64 << attempts.min(40)).max(fin_floor).max(1)
 }
 
+/// Whether the producer loop looks for the window's macroblock at `microblock_height`, `since_trigger` blocks past the
+/// last boundary: from two checkpoints after it, since the seal lands with the first, and never at a boundary.
+pub(crate) fn mb_gap_check_due(microblock_height: u64, since_trigger: u64) -> bool {
+    microblock_height >= 90
+        && since_trigger >= 2 * ROTATION_INTERVAL_BLOCKS
+        && since_trigger % ROTATION_INTERVAL_BLOCKS == 0
+        && microblock_height % 90 != 0
+}
+
 /// Of the TXs one sender numbers the same, keeps the first: the second applies Ok without debiting (the
 /// idempotent branch), so it pays nothing, earns nothing and only occupies block space. Returns the hashes
 /// it drops; they are not in the block, so the post-save cleanup must leave them pooled (not confirmed),
@@ -5986,11 +5995,11 @@ impl BlockchainNode {
                         // node re-produced the same height. Two distinct cases:
                         //   DeclinedRollback — a rollback is already driving to a lower target and
                         //     will rebuild state; just drop the block.
-                        //   NotStoredMode — this node's storage keeps no blocks (a Super only reaches
-                        //     this through disk-pressure degradation). A fork recovery cannot fix a
-                        //     full disk, so escalating would spin forever; it is an operational fault
-                        //     and the node must stop producing, not silently re-produce over an
-                        //     inline apply nothing reversed.
+                        //   NotStoredMode — this node's storage keeps no blocks (a Light storage mode;
+                        //     a Super stores at any fill level). A fork recovery cannot fix that, so
+                        //     escalating would spin forever; it is an operational fault and the node
+                        //     must stop producing, not silently re-produce over an inline apply
+                        //     nothing reversed.
                         //   error — the store is the suspect; force fork recovery to rebuild state
                         //     from a durable point (the durable rows written before the save are not
                         //     covered by the block journal, so an in-RAM undo would not be enough).
@@ -6660,42 +6669,9 @@ impl BlockchainNode {
                     if is_info() {
                         println!("[INFO][MB] macroblock_boundary height={} consensus=background", microblock_height);
                     }
-                    
-                    // PRODUCTION: Check macroblock status asynchronously (non-blocking)
-                    let storage_check = storage.clone();
-                    let p2p_check = unified_p2p.clone();
-                    let expected_macroblock = microblock_height / 90;
-                    let check_height = microblock_height;
-                    // Store current trigger value for async check (before update)
-                    let current_trigger = last_macroblock_trigger;
-                    
-                    tokio::spawn(async move {
-                        // Give consensus 5 more seconds to complete (total 35s from block 61)
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    // The window's macroblock seals when its boundary checkpoint commits, one checkpoint
+                    // after the boundary; the gap check below looks for it after two.
 
-                        let sc = storage_check.clone();
-                        let macroblock_exists = tokio::task::spawn_blocking(move || {
-                            sc.get_macroblock_by_height(expected_macroblock)
-                                .map(|mb| mb.is_some())
-                                .unwrap_or(false)
-                        }).await.unwrap_or(false);
-
-                        if macroblock_exists {
-                            if is_info() { println!("[INFO][MB] created h={}", expected_macroblock); }
-                        } else {
-                            let blocks_without_finalization = check_height.saturating_sub(current_trigger);
-                            println!("[WARN][MB] Macroblock #{} not ready after {} blocks — waiting for canonical n−f BFT consensus at next boundary",
-                                     expected_macroblock, blocks_without_finalization);
-                            // v14.7.2: No PFP degradation. Missing macroblocks are recovered
-                            // by the regular n−f commit/reveal consensus at the next 90-block
-                            // boundary, or by direct sync from peers.
-                            // Nudge the single sync coordinator to backfill the missing macroblock
-                            // object; the next n−f boundary or its macroblock pass repairs it.
-                            crate::sync_manager::nudge_sync_check();
-                            let _ = (storage_check, p2p_check);
-                        }
-                    });
-                    
                     // CRITICAL: Update trigger to the END of current macroblock period
                     // For consensus at block 151-180, set trigger to 180 (not 151!)
                     last_macroblock_trigger = last_macroblock_trigger + 90;
@@ -6705,16 +6681,11 @@ impl BlockchainNode {
                     if is_debug() { println!("[DBG][MB] continue h={}", microblock_height + 1); }
                 }
                 
-                // v14.7.2: Periodic macroblock-gap sync. No PFP degradation —
-                // canonical n−f BFT consensus runs at every 90-block boundary.
-                // Direct peer sync fills missing macroblocks created by the
-                // canonical consensus already performed by the quorum.
-                if microblock_height >= 90 {
+                // Macroblock-gap sync: direct peer sync fills a macroblock the quorum sealed and this node
+                // lacks (`mb_gap_check_due`: a check at the first checkpoint races the seal).
+                {
                     let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
-                    if blocks_since_trigger >= ROTATION_INTERVAL_BLOCKS
-                        && blocks_since_trigger % ROTATION_INTERVAL_BLOCKS == 0
-                        && (microblock_height % 90) != 0
-                    {
+                    if mb_gap_check_due(microblock_height, blocks_since_trigger) {
                         let expected_macroblock = if last_macroblock_trigger > 0 {
                             last_macroblock_trigger / 90
                         } else {
@@ -6726,7 +6697,7 @@ impl BlockchainNode {
                             .unwrap_or(false);
 
                         if !macroblock_exists {
-                            println!("[WARN][MB] mb_gap_sync blocks_without_mb={}", blocks_since_trigger);
+                            if is_warn() { println!("[WARN][MB] mb_gap_sync blocks_without_mb={}", blocks_since_trigger); }
                             // Nudge the single sync coordinator to fill the macroblock gap.
                             crate::sync_manager::nudge_sync_check();
                         } else {
@@ -6814,5 +6785,30 @@ fn behind_log(gap: u64, local: u64, network: u64, frontier: u64, gate: bool) {
     if is_warn() {
         println!("[WARN][SYNC] behind={} local={} network={} frontier={} gate={}",
                  gap, local, network, frontier, if gate { "finality" } else { "none" });
+    }
+}
+
+#[cfg(test)]
+mod macroblock_gap_tests {
+    use super::*;
+
+    /// The window's macroblock seals with the boundary checkpoint's commit, one checkpoint after the boundary. The gap
+    /// check runs once a window, two checkpoints after it; at the first checkpoint, and 5 s after the boundary as before,
+    /// it raced the seal and reported (and nudged the sync for) every window.
+    #[test]
+    fn the_gap_check_runs_two_checkpoints_after_the_boundary_only() {
+        let boundary = 900;
+        let due: Vec<u64> = (boundary..boundary + 90).filter(|h| mb_gap_check_due(*h, h - boundary)).collect();
+        assert_eq!(due, vec![boundary + 2 * ROTATION_INTERVAL_BLOCKS], "once a window");
+        assert!(!mb_gap_check_due(boundary + ROTATION_INTERVAL_BLOCKS, ROTATION_INTERVAL_BLOCKS), "the first checkpoint races the seal");
+        assert!(!mb_gap_check_due(boundary + 90, 90), "never at a boundary");
+        assert!(!mb_gap_check_due(60, 60), "nor before the first window");
+        // The boundary itself schedules nothing: no spawned check, no nudge.
+        let src = include_str!("production.rs");
+        let code = &src[..src.find("mod macroblock_gap_tests").unwrap()];
+        let b = code.find("println!(\"[INFO][MB] macroblock_boundary height={} consensus=background\", microblock_height);").unwrap();
+        let arm = &code[b..b + code[b..].find("last_macroblock_trigger = last_macroblock_trigger + 90;").unwrap()];
+        assert!(!arm.contains("tokio::spawn") && !arm.contains("nudge_sync_check"), "{arm}");
+        assert!(code.contains("if mb_gap_check_due(microblock_height, blocks_since_trigger) {"));
     }
 }

@@ -2,7 +2,7 @@
  * QNetSecurityModule.m — iOS side of the QNetSecurity native module (Android: SecurityModule.kt).
  *
  * - Secret screens: while one is shown and the screen is being captured (recording, mirroring, AirPlay) the
- *   window is covered. The app-switcher snapshot is covered by AppDelegate on every resign-active.
+ *   window is covered. The app-switcher snapshot is covered by SceneDelegate on every resign-active.
  * - The recovery-phrase field: the pasteboard's change count, and clearing what was copied while it was open.
  * - The recovery phrase's Copy: this device only, expiring after a set time, cleared at once by Delete wallet.
  * - The device seal of a password wallet's wrap: a P-256 key in the Secure Enclave, this device only, usable while it

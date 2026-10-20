@@ -2539,7 +2539,8 @@ impl SimplifiedP2P {
             // binding this node already holds (or, with no v2 binding, as before).
             let applied = crate::node::try_get_storage().map_or(false, |s| crate::rpc::apply_pulled_push_record(
                 s, crate::node::try_get_p2p().map(|p| p.as_ref()), &node, token, pt, endpoint,
-                v["ts"].as_u64().unwrap_or(0), v["seq"].as_u64().unwrap_or(0), v["writer"].as_str().unwrap_or("")));
+                v["ts"].as_u64().unwrap_or(0), v["seq"].as_u64().unwrap_or(0), v["writer"].as_str().unwrap_or(""),
+                v["platform"].as_str().unwrap_or(""), v["model"].as_str().unwrap_or("")));
             if applied {
                 if crate::node::is_info() {
                     println!("[INFO][LIGHT] push_channel_pulled node={} from={} push={}", node, src_ip, pt);

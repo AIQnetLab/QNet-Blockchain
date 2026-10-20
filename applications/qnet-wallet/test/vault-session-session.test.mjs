@@ -4,6 +4,9 @@
 // shared and survives a failing storage write.
 import { after, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { WalletError } from '../dist/background/errors.js';
+import { createRouter } from '../dist/background/router.js';
+import { pageSender } from './helpers/chrome-mock.mjs';
 import {
   KAT_EON, KAT_MNEMONIC, KAT_SOLANA, PASSWORD, fakeClock, loadWorker, rejectsWith, reset,
 } from './helpers/vault-session-env.mjs';
@@ -102,7 +105,7 @@ describe('session: start and lock', () => {
     });
     const unsubscribe2 = session.onLockChange((change) => reasons.push(change.reason));
     try {
-      for (const reason of ['user', 'timeout', 'idle', 'startup', 'wipe', 'error', 'nonsense']) await session.lock(reason);
+      for (const reason of ['user', 'timeout', 'idle', 'startup', 'erase', 'error', 'nonsense', 'wipe']) await session.lock(reason);
     } finally {
       unsubscribe();
       unsubscribe2();
@@ -111,11 +114,27 @@ describe('session: start and lock', () => {
     assert.equal(mirror(), undefined);
     assert.equal(await session.isUnlocked(), false);
     assert.deepEqual(env.alarms[0], { op: 'clear', name: AUTO_LOCK_ALARM });
-    assert.deepEqual(reasons, ['user', 'timeout', 'idle', 'startup', 'wipe', 'error', 'error']);
+    // 'wipe' is no lock: only announceWipe says the wallet is gone, once it is (vault.eraseAll)
+    assert.deepEqual(reasons, ['user', 'timeout', 'idle', 'startup', 'erase', 'error', 'error', 'error']);
     await rejectsWith(session.requireUnlocked(), 'LOCKED');
     await rejectsWith(session.getAddresses(), 'LOCKED');
     await rejectsWith(session.withVaultKey(() => 1), 'LOCKED');
     assert.deepEqual(await session.lockNow(), { locked: true });
+  });
+
+  it('announceWipe tells every listener the wallet is gone, with the sites its grants named, and changes no state', async () => {
+    await start();
+    const changes = [];
+    const unsubscribe = session.onLockChange((change) => changes.push(change));
+    try {
+      session.announceWipe(['https://aiqnet.io', 7]);
+    } finally {
+      unsubscribe();
+    }
+    assert.deepEqual(changes, [{ locked: true, reason: 'wipe', origins: ['https://aiqnet.io'] }]);
+    assert.ok(Object.isFrozen(changes[0]) && Object.isFrozen(changes[0].origins));
+    assert.equal(await session.isUnlocked(), true, 'vault.eraseAll locks before it; the announcement itself locks nothing');
+    await session.lock('user');
   });
 
   it('lock never throws, even when storage and alarms fail (EXT-SEC-M1)', async () => {
@@ -459,7 +478,7 @@ describe('session: password backoff', () => {
 // session's wallet, dropped by every lock and every new session.
 describe('session: the view cache', () => {
   const BALANCE = { balanceNano: '12500000000', spendableNano: '12500000000', nonce: '3', verified: true, verification: 'proof', blockHeight: 9 };
-  const NONE = { qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null, qnetTokens: null };
+  const NONE = { qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null, qnetTokens: null, popupState: null };
   const stored = () => env.chrome.storage.session.dump()[STORAGE_KEYS.VIEW_CACHE];
 
   // the views kept only for the session (the history pages); the balances kept across sessions, in the vault's chain
@@ -479,6 +498,54 @@ describe('session: the view cache', () => {
     await env.chrome.storage.session.set({ [STORAGE_KEYS.VIEW_CACHE]: { ...stored(), walletId: '00000000-0000-4000-8000-000000000000' } });
     const other = await restartedSession();
     assert.deepEqual(await other.fresh.cachedViews(), NONE);
+  });
+
+  // where the popup is (wallet.remember): a view of the session like the others, its draft only when the form holds one
+  it('keeps where the popup is, with the Send form draft, until the next lock', async () => {
+    await start();
+    assert.deepEqual(await session.rememberPopup({ network: 'qnet', tab: 'send', asset: 'QNC', to: 'abc', amount: '1.5' }),
+      { remembered: true });
+    assert.deepEqual((await session.cachedViews()).popupState,
+      { network: 'qnet', tab: 'send', draft: { asset: 'QNC', to: 'abc', amount: '1.5' } });
+    await session.rememberPopup({ network: 'solana', tab: 'history' });
+    assert.deepEqual((await session.cachedViews()).popupState, { network: 'solana', tab: 'history', draft: null });
+    assert.deepEqual(stored().values.popupState, { network: 'solana', tab: 'history', draft: null });
+    await session.lock('user');
+    await rejectsWith(session.rememberPopup({ network: 'qnet', tab: 'assets' }), 'LOCKED');
+    await start(key(8));
+    assert.equal((await session.cachedViews()).popupState, null, 'a new session opens on the first view');
+  });
+
+  // The popup may close while a send runs: the worker, not the page, drops the draft it was typed from.
+  it('a send that went drops the draft through the router, the popup open or not; a refused one keeps it', async () => {
+    const DRAFT = { network: 'qnet', tab: 'send', asset: 'QNC', to: KAT_EON, amount: '1.5' };
+    let refuse = false;
+    const router = createRouter({
+      runtime: env.chrome.runtime,
+      handlers: {
+        'qnet.send': async () => {
+          if (refuse) throw new WalletError('FEE_CHANGED');
+          return { status: 'submitted', nonce: '7' };
+        },
+      },
+    });
+    const ask = (type, params) => router.handleUiMessage({ type, id: 'r1', params }, pageSender(env.chrome.runtime, 'popup'));
+    const SEND = { to: KAT_EON, amount: '1.5', expectedFeeNano: '150000', expectedNonce: '7' };
+    await start();
+    assert.equal((await ask('wallet.remember', DRAFT)).ok, true);
+    refuse = true;
+    assert.equal((await ask('qnet.send', SEND)).ok, false);
+    assert.deepEqual((await session.cachedViews()).popupState.draft, { asset: 'QNC', to: KAT_EON, amount: '1.5' });
+    refuse = false;
+    assert.equal((await ask('qnet.send', SEND)).ok, true);
+    assert.deepEqual((await session.cachedViews()).popupState, { network: 'qnet', tab: 'send', draft: null });
+    assert.deepEqual(stored().values.popupState, { network: 'qnet', tab: 'send', draft: null }, 'a restarted worker reads it so');
+    // a state without a draft stays as it is; nothing is written while locked
+    await session.forgetDraft();
+    assert.deepEqual((await session.cachedViews()).popupState, { network: 'qnet', tab: 'send', draft: null });
+    await session.lock('user');
+    await session.forgetDraft();
+    assert.equal(stored(), undefined);
   });
 
   it('every lock and every new session drop it; nothing is kept or read while locked', async () => {

@@ -5,6 +5,12 @@ use super::*;
 /// Window whose heartbeat this node last withheld (log once per window).
 static HB_WITHHELD_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The boot's integrity probe: the hash of the tip body as the chain stores it (`load_microblock_auto_format`), None
+/// when the body is missing. The legacy per-height hash key is no longer written for every block.
+pub(crate) fn stored_tip_hash(storage: &crate::storage::Storage, height: u64) -> crate::errors::IntegrationResult<Option<[u8; 32]>> {
+    Ok(storage.load_microblock_auto_format(height)?.map(|tip| tip.hash()))
+}
+
 impl BlockchainNode {
     /// The boot rollback target and verdict: `QNET_ROLLBACK_TO_LAST_SEALED` resolves to the certified floor
     /// (`certified_rollback_floor`, the last certified point this node holds), an explicit target below that
@@ -325,6 +331,9 @@ impl BlockchainNode {
                     ));
                 }
             }
+        } else if preflight_already_done {
+            // The binary ran and passed the pre-flight before building the node.
+            if is_info() { println!("[INFO][NODE] preflight_already_passed"); }
         } else {
             // Internal dev flag - not for operators
             if is_warn() { println!("[WARN][NODE] preflight_skipped dev_mode"); }
@@ -1292,10 +1301,10 @@ impl BlockchainNode {
                          network_type, height, 1000 - height); }
             }
             
-            // Check data integrity (but don't delete!)
-            match storage.get_block_hash(height) {
+            // Check data integrity (but don't delete!): the tip body the chain is stored as.
+            match stored_tip_hash(&storage, height) {
                 Ok(Some(hash)) => {
-                    if is_info() { println!("[INFO][NODE] integrity_ok hash={}...", &hash[..8]); }
+                    if is_info() { println!("[INFO][NODE] integrity_ok hash={}...", hex::encode(&hash[..4])); }
                 }
                 Ok(None) => {
                     if is_warn() { println!("[WARN][NODE] block_missing h={} possible_corruption", height); }
@@ -2086,8 +2095,8 @@ impl BlockchainNode {
             match crate::genesis_config::load_genesis(&blockchain.storage, &genesis_config).await {
                 crate::genesis_config::GenesisResult::Loaded { block, source } => {
                     if is_info() { println!("[INFO][GENESIS] loaded source={} txs={}", source, block.transactions.len()); }
-                    // Apply genesis state (PK registrations, initial balances)
-                    crate::genesis_config::apply_genesis_state(&block, &blockchain.state, &blockchain.storage).await;
+                    // A warm node's state already holds the genesis transactions (replayed and verified above).
+                    crate::genesis_config::ingest_loaded_genesis(&block, &blockchain.state, &blockchain.storage).await;
                     coordinator_handle.try_send(crate::consensus_state::ConsensusEvent::GenesisLoaded {
                         timestamp: block.timestamp,
                     });
@@ -4154,5 +4163,26 @@ impl BlockchainNode {
         });
         }
     }
-    
+
+}
+
+#[cfg(test)]
+mod boot_probe_tests {
+    use super::*;
+
+    /// The boot tells a present tip from a missing one by its body. The legacy per-height hash key it read before is
+    /// written only by the old block format, so every warm boot reported `block_missing` for a tip it held.
+    #[test]
+    fn the_boot_probe_reads_the_tip_body() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let tip = qnet_state::MicroBlock::new(1, 1_001, [0u8; 32], vec![], "genesis_node_001".to_string());
+        storage.save_microblock(1, &bincode::serialize(&tip).unwrap()).expect("save");
+        assert_eq!(stored_tip_hash(&storage, 1).expect("read"), Some(tip.hash()));
+        assert_eq!(storage.get_block_hash(1).expect("read"), None, "the key the probe read before");
+        assert_eq!(stored_tip_hash(&storage, 2).expect("read"), None, "a missing body");
+        let src = include_str!("lifecycle.rs");
+        let code = &src[..src.find("mod boot_probe_tests").unwrap()];
+        assert!(code.contains("match stored_tip_hash(&storage, height) {"), "the boot runs this probe");
+    }
 }

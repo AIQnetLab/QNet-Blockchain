@@ -15,10 +15,10 @@ use sha3::{Digest, Sha3_256};
 
 /// A binding sequence may run this far ahead of this node's clock.
 pub const FUTURE_SEQ_SLACK_SECS: u64 = 600;
-/// The same bound for a copy of a binding another genesis took (heal, pull, gossip, token sync). That
-/// genesis held the sequence to its own clock, and genesis clocks differ, so a copy is held only to a
-/// bound no honest binding reaches: it still refuses a sequence written in milliseconds.
-pub const COPY_FUTURE_SEQ_SLACK_SECS: u64 = 86_400;
+/// The same bound for a copy of a binding another genesis took (heal, pull, gossip, token sync). A fresh binding's
+/// sequence is its attach time, within FRESH_TS_WINDOW_SECS of the taking genesis's clock, so the rest of the slack
+/// covers the spread between genesis clocks; a copy refused here is taken by a later copy once the clock reaches it.
+pub const COPY_FUTURE_SEQ_SLACK_SECS: u64 = FUTURE_SEQ_SLACK_SECS;
 /// An attach or a token refresh is fresh within this many seconds of this node's clock.
 pub const FRESH_TS_WINDOW_SECS: u64 = 300;
 /// How old a registration consent may be when the node takes it, at submit and at `/bind` (U5): the
@@ -33,6 +33,9 @@ pub const FIRST_BIND_GRACE_SECS: u64 = PENDING_TTL_SECS;
 /// Pending bindings one genesis keeps; the oldest goes first. Best effort: a lost entry is re-sent by
 /// the app under U3.
 pub const PENDING_CAP: usize = 20_000;
+
+/// The longest light node id a request may name, at every route that takes one: the pseudonym is far shorter.
+pub const LIGHT_NODE_ID_MAX: usize = 128;
 
 /// ML-DSA-65 sizes in hex.
 pub const MLDSA65_PK_HEX: usize = 1952 * 2;
@@ -586,6 +589,13 @@ impl Refusal {
     }
 }
 
+/// A limit's refusal with the seconds until the request may be sent again.
+pub fn rate_limited_json(retry_after: u64) -> serde_json::Value {
+    let mut v = Refusal::RateLimited.to_json();
+    v["retry_after_seconds"] = serde_json::json!(retry_after.max(1));
+    v
+}
+
 /// The fresh-binding rule of `/light-node/bind`: a sequence above everything stored and not ahead of
 /// this node's clock. Re-sending the stored binding (the same key at the same sequence) is accepted
 /// as a no-op, because the app posts one binding to two genesis nodes and gossip may beat it.
@@ -1068,11 +1078,13 @@ mod tests {
         assert_eq!(admit_copy(Some(&stored), "pp", &format_v2_cert(100, "ef"), now), Admit::Same);
         assert_eq!(admit_copy(Some(&stored), "new", &format_v2_cert(101, "ab"), now), Admit::Apply);
         assert_eq!(admit_copy(Some(&stored), "old", "legacycert", now), Admit::V1AfterV2);
-        // A binding another genesis took ahead of this node's clock is still a copy to take; only a
-        // sequence no clock produces is refused.
-        assert_eq!(admit_copy(Some(&stored), "new", &format_v2_cert(now + 3600, "ab"), now), Admit::Apply);
+        // A binding another genesis took ahead of this node's clock is still a copy to take, up to the bound the taking
+        // genesis applies (A3): a copy a day ahead, which the bind route never takes, is refused.
+        assert_eq!(COPY_FUTURE_SEQ_SLACK_SECS, 600);
+        assert_eq!(admit_copy(Some(&stored), "new", &format_v2_cert(now + COPY_FUTURE_SEQ_SLACK_SECS, "ab"), now), Admit::Apply);
         assert_eq!(admit_copy(Some(&stored), "new", &format_v2_cert(now + COPY_FUTURE_SEQ_SLACK_SECS + 1, "ab"), now),
                    Admit::FutureSeq);
+        assert_eq!(admit_copy(Some(&stored), "new", &format_v2_cert(now + 3600, "ab"), now), Admit::FutureSeq);
         assert_eq!(admit_copy(Some(&stored), "new", &format_v2_cert(now * 1000, "ab"), now), Admit::FutureSeq);
         assert_eq!(admit_copy(Some(&stored), "new", "v2.x.ab", now), Admit::Malformed);
         let floored = row("", 0, 200, true);
@@ -1130,6 +1142,10 @@ mod tests {
             assert_eq!(j["success"], serde_json::json!(false));
             assert_eq!(j["reason"].as_str(), Some(r.as_str()));
         }
+        // A limit's refusal names its wait, at least a second.
+        let limited = rate_limited_json(1200);
+        assert_eq!((limited["reason"].as_str(), limited["retry_after_seconds"].as_u64()), (Some("rate_limited"), Some(1200)));
+        assert_eq!(rate_limited_json(0)["retry_after_seconds"].as_u64(), Some(1));
     }
 
     #[test]

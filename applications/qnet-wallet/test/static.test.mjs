@@ -116,7 +116,7 @@ describe('static: manifest', () => {
     assert.deepEqual(resources, [], 'no web-accessible resources at all');
     for (const entry of resources) assert.ok(!(entry.resources ?? []).some((name) => /\.html?$/i.test(name) || name.includes('*')));
     for (const origin of MANIFEST.host_permissions) assert.match(origin, /^https:\/\/[a-z0-9.-]+\/\*$/);
-    assert.deepEqual([...MANIFEST.permissions].sort(), ['alarms', 'idle', 'storage']);
+    assert.deepEqual([...MANIFEST.permissions].sort(), ['alarms', 'clipboardWrite', 'idle', 'offscreen', 'storage']);
   });
 
   // www.aiqnet.io and explorer.aiqnet.io only redirect: they serve no page the provider could run in (R4-ERP-02); the games

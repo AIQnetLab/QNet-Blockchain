@@ -37,6 +37,35 @@ describe('the iOS project', () => {
     expect(plist).toContain('<key>UILaunchStoryboardName</key>');
   });
 
+  it('runs one window scene, its delegate built into the app, which Split View, Slide Over and Stage Manager show', () => {
+    const plist = read('ios/QNetMobile/Info.plist');
+    const manifest = /<key>UIApplicationSceneManifest<\/key>\s*<dict>([\s\S]*?)\n\t<\/dict>/.exec(plist)[1];
+    expect(manifest).toMatch(/<key>UIApplicationSupportsMultipleScenes<\/key>\s*<false\/>/);
+    const roles = /<key>UISceneConfigurations<\/key>\s*<dict>\s*<key>([^<]+)<\/key>\s*<array>([\s\S]*?)<\/array>\s*<\/dict>/.exec(manifest);
+    expect(roles[1]).toBe('UIWindowSceneSessionRoleApplication');
+    const configs = roles[2].split('</dict>').filter((c) => c.includes('<dict>'));
+    expect(configs).toHaveLength(1);
+    expect(configs[0]).toMatch(/<key>UISceneDelegateClassName<\/key>\s*<string>\$\(PRODUCT_MODULE_NAME\)\.SceneDelegate<\/string>/);
+    // The window is made in code: no storyboard, and no scene class other than the default window scene.
+    expect(configs[0]).not.toMatch(/UISceneStoryboardFile|UISceneClassName/);
+    expect(read('ios/QNetMobile/SceneDelegate.swift')).toMatch(/^class SceneDelegate: UIResponder, UIWindowSceneDelegate \{$/m);
+    expect(pbx).toMatch(/SceneDelegate\.swift in Sources \*\/,/);
+    expect(pbx).toMatch(/path = QNetMobile\/SceneDelegate\.swift;/);
+  });
+
+  it('starts React Native once per process, in the scene\'s window or, for a background launch with no scene, one it takes later', () => {
+    const app = read('ios/QNetMobile/AppDelegate.swift');
+    const scene = read('ios/QNetMobile/SceneDelegate.swift');
+    // One start site, in the app delegate; the launch itself makes no window.
+    expect(`${app}\n${scene}`.match(/startReactNative\(/g)).toHaveLength(1);
+    expect(app).toMatch(/func runReactNative\(in window: UIWindow, launchOptions: \[UIApplication\.LaunchOptionsKey: Any\]\?\) \{\s*window\.backgroundColor = AppDelegate\.launchColor\s*self\.window = window\s*reactNativeFactory\?\.startReactNative\(withModuleName: "QNetMobile", in: window, launchOptions: launchOptions\)/);
+    expect(app).not.toMatch(/UIWindow\(frame:/);
+    expect(app).toMatch(/DispatchQueue\.main\.async \{\s*guard self\.window == nil, application\.connectedScenes\.isEmpty else \{ return \}\s*self\.runReactNative\(in: UIWindow\(\), launchOptions: nil\)/);
+    // A scene connecting while React Native runs takes its window instead of starting a second root.
+    expect(scene).toMatch(/if let running = app\.window \{\s*(\/\/[^\n]*\n\s*)*running\.windowScene = windowScene/);
+    expect(scene).toMatch(/let created = UIWindow\(windowScene: windowScene\)\s*self\.window = created\s*app\.runReactNative\(in: created, launchOptions: SceneDelegate\.launchOptions\(connectionOptions\)\)/);
+  });
+
   it('has every iPad icon, each at its pixel size', () => {
     const dir = 'ios/QNetMobile/Images.xcassets/AppIcon.appiconset';
     const images = JSON.parse(read(`${dir}/Contents.json`)).images;

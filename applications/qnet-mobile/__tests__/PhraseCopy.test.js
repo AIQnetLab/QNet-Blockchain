@@ -1,6 +1,7 @@
 // The recovery phrase's Copy: on an explicit tap only, taken off the clipboard after 60 seconds if it is still there,
 // and at once when the wallet is deleted. The native side does the timing (iOS: a local-only pasteboard item with an
-// expiry; Android: a sensitive clip and a native timer); without it, the plain clipboard and a JS timer.
+// expiry; Android: a sensitive clip, a timer and an alarm that outlives the process); without it, the plain clipboard
+// and a JS timer.
 const fs = require('fs');
 const path = require('path');
 const Clipboard = require('@react-native-clipboard/clipboard').default;
@@ -99,14 +100,30 @@ describe('Delete wallet', () => {
 });
 
 describe('the native halves', () => {
-  it('Android: a clip marked sensitive, cleared by a native timer if it is still the one copied', () => {
+  it('Android: a clip marked sensitive, cleared if it is still the one copied, also after the process ended', () => {
     const kt = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
     expect(kt).toMatch(/private const val CLIP_IS_SENSITIVE = "android\.content\.extra\.IS_SENSITIVE"/);
     expect(kt).toMatch(/fun copySecret\(text: String, seconds: Double, promise: Promise\)/);
     expect(kt).toMatch(/clip\.description\.extras = PersistableBundle\(\)\.apply \{ putBoolean\(CLIP_IS_SENSITIVE, true\) \}/);
+    expect(kt).toMatch(/SecretClip\.copied\(reactContext, stamp, seconds\)/);
     expect(kt).toMatch(/main\.postDelayed\(secretCopyExpiry, \(seconds \* 1000\)\.toLong\(\)/);
     expect(kt).toMatch(/fun clearSecretCopy\(promise: Promise\)/);
-    expect(kt).toMatch(/description == null \|\| description\.timestamp == stamp/);
+    expect(kt).toMatch(/SecretClip\.check\(reactContext, force = true\)/);
+    // A resume checks a copy a process that ended left behind; the phrase itself is never held in the module.
+    expect(kt).toMatch(/override fun onHostResume\(\) \{[\s\S]*?SecretClip\.check\(reactContext, force = false\)/);
+    expect(kt).not.toMatch(/secretCopyText/);
+    // Kept on the device: the clip's timestamp, the due time and the boot, never the text; an alarm that outlives the
+    // process clears it (the decision itself: android/app/src/test/.../SecretClipTest.kt).
+    const clip = read('android/app/src/main/java/com/qnetmobile/SecretClip.kt');
+    expect(clip).toMatch(/fun copied\(context: Context, stamp: Long\?, seconds: Double\)/);
+    expect(clip).not.toMatch(/putString/);
+    expect(clip).toMatch(/setAndAllowWhileIdle\(AlarmManager\.ELAPSED_REALTIME, dueAt, alarm\(context\)\)/);
+    // A clipboard it cannot read is cleared when due (SecretClipTest), a clip copied since in another app too: the copy
+    // hint promises that the clipboard, not only the phrase, is cleared.
+    expect(require('../src/i18n/locales/en').default.seed_copy_warning).toMatch(/The clipboard is cleared in \{seconds\} seconds\./);
+    expect(clip).toMatch(/class SecretClipReceiver : BroadcastReceiver\(\) \{\s*override fun onReceive\(context: Context, intent: Intent\) \{\s*SecretClip\.check\(context, force = false\)/);
+    const manifest = read('android/app/src/main/AndroidManifest.xml');
+    expect(manifest).toMatch(/<receiver\s+android:name="\.SecretClipReceiver"\s+android:exported="false" \/>/);
   });
 
   it('iOS: this device only, with the expiry on the pasteboard item; Delete wallet clears it if nothing came after', () => {

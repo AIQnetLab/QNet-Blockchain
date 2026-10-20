@@ -73,6 +73,7 @@ timeout: an approval waits for the user, up to the wallet's own 10-minute limit.
 | `qnet_getActivation` | none | what the extension knows of the wallet's activation (its code, a burn on its way, or whether its search found none), see [QNet Link v1](../protocols/qnet-link-v1.md) section 10 | never; extension only, and only for `https://aiqnet.io` (a connected site, at most 30 reads a minute) |
 | `qnet_claimNodeBalance` | `{nodeId}`: the wallet's light or super node id | the `claim` answer of [QNet Link v1](../protocols/qnet-link-v1.md) section 14.7, without `v` and `intent` | extension only, and only for `https://aiqnet.io`; moves the node balance of that node, which must be the wallet's own (else `WALLET_MISMATCH`) |
 | `qnet_unlinkNodeDevice` | none | the `unlink` answer of [QNet Link v1](../protocols/qnet-link-v1.md) section 14.7, without `v` and `intent` | extension only, and only for `https://aiqnet.io`; ends the wallet's own light node on the device that runs it |
+| `qnet_sendSolanaTransfer` | `{to, mint, amount}`: a Solana address other than the wallet's own, `mint` `null` for SOL or the 1DEV mint, `amount` in whole tokens as a decimal string | `{status: 'submitted', signature}`, or `{status: 'error', error}` when nothing was sent | every time, showing the transfer read-only; extension only, and only for `https://aiqnet.io`; a call without params is -32602 at once |
 
 "None" means the params are absent, `null`, `[]` or `{}`; anything else is -32602.
 `qnet_signMessage`, `qnet_sendTransaction` and `qnet_getTransactionStatus` need the site to be

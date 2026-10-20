@@ -13,6 +13,24 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     "merkle_leaves", "merkle_nodes", "wallet_token", "reward_agg",
 ];
 
+/// Compacts the named families of `db` one at a time beside RocksDB's own compactions, so writes never wait behind a
+/// manual one. Above level 0 RocksDB runs it in steps of at most max_compaction_bytes, which bounds the extra disk it
+/// holds while it runs.
+fn compact_families<'a>(db: &DB, names: impl IntoIterator<Item = &'a str>) {
+    let mut opts = rocksdb::CompactOptions::default();
+    opts.set_exclusive_manual_compaction(false);
+    for name in names {
+        if let Some(cf) = db.cf_handle(name) {
+            db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &opts);
+        }
+    }
+}
+
+/// A DB's families as `all_dbs` lists them, preceded by the default family every DB also opens.
+pub(super) fn with_default_family(names: &'static [&'static str]) -> impl Iterator<Item = &'static str> {
+    std::iter::once("default").chain(names.iter().copied())
+}
+
 impl PersistentStorage {
     /// Save raw data with a custom key
     pub fn save_raw(&self, key: &str, data: &[u8]) -> IntegrationResult<()> {
@@ -833,11 +851,7 @@ impl PersistentStorage {
     /// keys as tombstones but doesn't physically reclaim disk space until
     /// compaction runs. This must be called after cleanup operations.
     pub fn compact_cfs(&self, cf_names: &[&str]) -> IntegrationResult<()> {
-        for cf_name in cf_names {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
-            }
-        }
+        compact_families(&self.db, cf_names.iter().copied());
         if crate::node::is_info() {
             println!("[INFO][STORAGE] compaction_triggered cfs={} names={}",
                      cf_names.len(), cf_names.join(","));
@@ -2154,12 +2168,24 @@ impl PersistentStorage {
     }
 
     /// The main DB, the tree DB and the aux DB, each with its column families.
-    fn all_dbs(&self) -> [(&DB, &[&'static str]); 3] {
+    pub(super) fn all_dbs(&self) -> [(&Arc<DB>, &'static [&'static str]); 3] {
         [
-            (&*self.db, ALL_COLUMN_FAMILIES),
-            (&*self.tree.db, &super::tree_db::TREE_CFS[..]),
-            (self.aux.db(), &super::aux_db::AUX_CFS[..]),
+            (&self.db, ALL_COLUMN_FAMILIES),
+            (&self.tree.db, &super::tree_db::TREE_CFS),
+            (self.aux.db_arc(), &super::aux_db::AUX_CFS),
         ]
+    }
+
+    /// A compaction of every family of the three DBs, the default ones included, as a job a thread of its own runs
+    /// (`Storage::compact_for_room`).
+    pub(crate) fn full_compaction_job(&self) -> impl FnOnce() + Send + 'static {
+        let dbs: Vec<(Arc<DB>, &'static [&'static str])> =
+            self.all_dbs().iter().map(|(db, names)| (Arc::clone(db), *names)).collect();
+        move || {
+            for (db, names) in &dbs {
+                compact_families(db, with_default_family(*names));
+            }
+        }
     }
 
     /// What RocksDB is doing right now, as k=v for a stall report: write stop / delayed-write

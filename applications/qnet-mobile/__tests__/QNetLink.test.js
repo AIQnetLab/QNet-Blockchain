@@ -439,6 +439,75 @@ describe('what each intent offers before anything is signed', () => {
       .toMatchObject({ error: 'NETWORK' });
   });
 
+  // A move request opened on the phone that already runs the node said "moves to this device", bound it again with a
+  // new key and spent one of the node's moves. The network naming this device's binding (its ping-key status), with
+  // nothing the Node tab offers Use this device for, offers only to tell the website: nothing is signed or sent.
+  it('link: the node already runs here (the network names this device\'s binding): nothing moves', async () => {
+    const LOCAL = { nodeId: W.nodeId, seq: 1790000000 };
+    const ask = (n) => prepareOffer(link, { wallet: WALLET, session: session({ burnTx: null, walletHash: W.walletHash, check: false }), node: n });
+    const here = node({ binding: jest.fn(async () => LOCAL), pingStatus: jest.fn(async () => ({ bindingSeqAgreed: LOCAL.seq, keyOurs: true })) });
+    const offer = await ask(here);
+    expect(offer).toEqual({ kind: 'link', mode: 'here', nodeId: W.nodeId, qnet: W.address, seq: LOCAL.seq });
+    expect(here.binding).toHaveBeenCalledWith(W.nodeId);
+    const answer = await performIntent(link, offer, { node: here });
+    expect(answer).toEqual({ status: 'linked', qnet: W.address, nodeId: W.nodeId, seq: String(LOCAL.seq), already: true });
+    expect(here.useDevice).not.toHaveBeenCalled();
+    // The screen's mark never reaches the wire: the row's keys alone.
+    const v = byName('link-ok-check');
+    expect(JSON.parse(buildPlaintext(viewOf(v), answer))).toEqual({
+      v: 1, intent: 'link', status: 'linked', qnet: W.address, nodeId: W.nodeId, seq: String(LOCAL.seq),
+    });
+    // Another binding named, a refused key, or no word on it: the move as before.
+    for (const signed of [{ bindingSeqAgreed: LOCAL.seq + 9 }, { bindingSeqAgreed: null, keyOurs: false }, null]) {
+      expect(await ask(node({ binding: async () => LOCAL, pingStatus: async () => signed }))).toMatchObject({ kind: 'link', mode: 'device' });
+    }
+    expect(await ask(node({ binding: async () => null, pingStatus: jest.fn() }))).toMatchObject({ kind: 'link', mode: 'device' });
+    // Held here, but in a state the Node tab offers Use this device for (no device key, revoked, overdue, a check that
+    // ended), or one that cannot be told: the request binds again, which mends it, rather than saying nothing changed.
+    const signedHere = { bindingSeqAgreed: LOCAL.seq, keyOurs: true };
+    for (const offersUse of [async () => true, async () => { throw new Error('down'); }]) {
+      expect(await ask(node({ binding: async () => LOCAL, pingStatus: async () => signedHere, offersUse })))
+        .toMatchObject({ kind: 'link', mode: 'device' });
+    }
+    const counted = jest.fn(async () => false);
+    expect(await ask(node({ binding: async () => LOCAL, pingStatus: async () => signedHere, offersUse: counted })))
+      .toMatchObject({ kind: 'link', mode: 'here' });
+    expect(counted).toHaveBeenCalledWith(W.nodeId, signedHere, LOCAL);
+  });
+
+  // The Node tab's own view decides it (NodeTab nodeView offerUse), with the device check this device knows.
+  it('the actions\' offersUse is the Node tab\'s Use this device offer for that status', async () => {
+    const { nodeLinkActions } = require('../src/services/NodeLinkActions');
+    const actions = nodeLinkActions({ walletManager: {}, credential: 'c', height: () => 0 });
+    const base = {
+      onChain: true, features: ['device_v1', 'status_signed'], deviceBoundAgreed: true, bindingSeqAgreed: 7, deviceTags: [],
+      nonce: null, signed: { deviceState: 'active' }, needsReactivation: false, lastMiss: null, counted: null, device: null,
+    };
+    const hw = { nodeId: W.nodeId, seq: 7, hw: true, boundAt: null };
+    expect(await actions.offersUse(W.nodeId, base, hw)).toBe(false);
+    // No device key with the binding: Use this device gives it one.
+    expect(await actions.offersUse(W.nodeId, base, { ...hw, hw: false })).toBe(true);
+    // A pause with no end (the device's certificate chain revoked).
+    expect(await actions.offersUse(W.nodeId, { ...base, signed: { deviceState: 'paused', pausedUntil: null } }, hw)).toBe(true);
+    // A check-pending key with a rotation due, judged by the height the screen reads (the Node tab's), never a missing
+    // one: past the grace it is overdue, within it the running check is waited for, and with no height read a new
+    // binding mends it either way (the tab, once it reads the height, could offer Use this device).
+    const { ROTATION_GRACE_EPOCHS } = require('../src/screens/NodeTab');
+    const { EPOCH_BLOCKS } = require('../src/crypto/NodePreimages');
+    const rotating = { ...base, signed: { deviceState: 'check_pending', rotationDue: 10, refreshWindow: { from: 1, to: 2 } } };
+    const at = (epoch) => nodeLinkActions({ walletManager: {}, credential: 'c', height: async () => epoch * EPOCH_BLOCKS });
+    expect(await at(10 + ROTATION_GRACE_EPOCHS + 1).offersUse(W.nodeId, rotating, hw)).toBe(true);
+    expect(await at(10 + ROTATION_GRACE_EPOCHS).offersUse(W.nodeId, rotating, hw)).toBe(false);
+    expect(await at(0).offersUse(W.nodeId, rotating, hw)).toBe(true);
+    const failing = nodeLinkActions({ walletManager: {}, credential: 'c', height: async () => { throw new Error('down'); } });
+    expect(await failing.offersUse(W.nodeId, rotating, hw)).toBe(true);
+    // No rotation due: the height does not enter into it.
+    const { rotationDue, ...unrotated } = rotating.signed; // eslint-disable-line no-unused-vars
+    expect(await at(0).offersUse(W.nodeId, { ...rotating, signed: unrotated }, hw)).toBe(false);
+    // The wallet screen reads the height the Node tab reads, not a figure only that tab sets.
+    expect(read('src/screens/WalletScreen.js')).toMatch(/height: \(\) => fetchCachedBlockHeight\(\)\.then\(\(\) => estimatedHeight\(heightRead\(\)\)\),/);
+  });
+
   // R6, one wallet one node: the consent to a light registration is never given for a wallet the network holds a super
   // or genesis node for, even one no device of this install linked; without two genesis nodes' answer, none either.
   it('link: no consent while the network holds a super node for the wallet, or cannot say', async () => {
@@ -808,21 +877,32 @@ describe('the unlink request', () => {
     device: { platform: 'ios', linkedSince: 1790035200, lastAnswerEpoch: 7, state: 'offline' }, ...over,
   });
 
-  it('on the device that runs the node: its own unbind, unless two owners name another binding (contract 1.9b)', async () => {
+  // On the phone the node moved away from, two owners refuse its ping key and name no binding to it. Its sheet said
+  // "this device" while the wallet-key fallback withdrew the other phone's binding: it is the wallet form, whose sheet
+  // speaks of the device the node runs on.
+  it('on the device that runs the node: its own unbind, unless two owners name another binding or refuse its ping key (contract 1.9b)', async () => {
     const here = { kind: 'unlink', mode: 'here', qnet: W.address, nodeId: W.nodeId, since: BOUND_AT };
-    // The network names this binding, or gives no verdict on it: this device's own unbind, the network's view not read.
-    for (const signed of [{ bindingSeqAgreed: BOUND_AT }, { bindingSeqAgreed: null }, null]) {
+    // The network names this binding, or gives no verdict on it (no key to sign with, one refusal): this device's own
+    // unbind, the network's view not read.
+    for (const signed of [
+      { bindingSeqAgreed: BOUND_AT }, { bindingSeqAgreed: BOUND_AT, keyOurs: true }, { bindingSeqAgreed: null },
+      { bindingSeqAgreed: null, keyOurs: null }, null,
+    ]) {
       const n = node({ binding: jest.fn(async () => LOCAL), pingStatus: jest.fn(async () => signed), status: jest.fn() });
-      expect(await offerWith(n)).toEqual(here);
+      expect([signed, await offerWith(n)]).toEqual([signed, here]);
       expect(n.binding).toHaveBeenCalledWith(W.nodeId);
       expect(n.status).not.toHaveBeenCalled();
     }
-    // Two owners name a newer binding: the one here is stale, and the wallet key unlinks the device that holds it.
-    const stale = node({
-      binding: async () => LOCAL, pingStatus: async () => ({ bindingSeqAgreed: BOUND_AT + 9 }),
-      status: jest.fn(async () => linkedView()), unlinkByWallet: jest.fn(),
-    });
-    expect(await offerWith(stale)).toMatchObject({ kind: 'unlink', mode: 'wallet' });
+    // Two owners name a newer binding, or refuse this device's ping key and name none: the one here is stale or
+    // replaced, and the wallet key unlinks the device that holds the node.
+    for (const signed of [{ bindingSeqAgreed: BOUND_AT + 9 }, { bindingSeqAgreed: null, keyOurs: false }]) {
+      const n = node({
+        binding: async () => LOCAL, pingStatus: async () => signed, status: jest.fn(async () => linkedView()), unlinkByWallet: jest.fn(),
+      });
+      expect([signed, await offerWith(n)]).toEqual([signed, {
+        kind: 'unlink', mode: 'wallet', qnet: W.address, nodeId: W.nodeId, platform: 'ios', since: 1790035200,
+      }]);
+    }
   });
 
   it('on any other device that holds the wallet: the wallet key, once two genesis nodes serve it', async () => {
@@ -933,23 +1013,57 @@ describe('the unlink request', () => {
       viewOf(c))).toBe('unbound');
   });
 
-  it('the Node side: the unbind of PushService.stopLightNode, only for this device\'s own binding, then the tab reads again', async () => {
+  it('the Node side: the unbind of PushService.stopLightNode, the wallet key only for this device\'s own bindings, then the tab reads again', async () => {
     jest.resetModules();
-    const push = { localBinding: jest.fn(async () => ({ nodeId: W.nodeId, seq: 7 })), stopLightNode: jest.fn(async () => ({ unbound: true })) };
+    let waiting = null;
+    const push = {
+      localBinding: jest.fn(async () => ({ nodeId: W.nodeId, seq: 7 })), stopLightNode: jest.fn(async () => ({ unbound: true })),
+      readUnconfirmedBinding: jest.fn(async () => waiting),
+    };
+    const statuses = [];
+    const light = {
+      readNodeStatus: jest.fn(async () => statuses.shift()),
+      postUnbind: jest.fn(async () => ({ ok: true, answer: { success: true, unbound: true } })),
+    };
     jest.doMock('../src/services/PushService', () => push);
-    jest.doMock('../src/services/LightNode', () => ({ readNodeStatus: jest.fn() }));
+    jest.doMock('../src/services/LightNode', () => light);
     jest.doMock('../src/services/NodeDeviceKey', () => ({ checkDevice: jest.fn() }));
     jest.doMock('../src/services/NodeRecordRead', () => ({ readNodeRecordState: jest.fn() }));
     const { nodeLinkActions } = require('../src/services/NodeLinkActions');
+    const wm = {
+      signNodeStatus: jest.fn(async () => ({ signer: 'wallet', sig: 'ab', identityPublicKey: 'pk' })),
+      signNodeUnbind: jest.fn(async () => ({ sig: 'cd', identityPublicKey: 'ef' })),
+    };
     const onUnlinked = jest.fn();
-    const actions = nodeLinkActions({ walletManager: {}, credential: 'x', onUnlinked });
+    const actions = nodeLinkActions({ walletManager: wm, credential: 'c', onUnlinked });
     expect(await actions.binding(W.nodeId)).toEqual({ nodeId: W.nodeId, seq: 7 });
     expect(await actions.unlink(W.nodeId)).toEqual({ unbound: true });
     expect(push.stopLightNode).toHaveBeenCalledTimes(1);
     expect(onUnlinked).toHaveBeenCalledTimes(1);
+    expect(light.readNodeStatus).not.toHaveBeenCalled();
     push.localBinding.mockResolvedValueOnce(null);
     expect(await actions.unlink(W.nodeId)).toEqual({ unbound: false });
     expect(push.stopLightNode).toHaveBeenCalledTimes(1);
+    // The ping-key unbind not taken (no ping key here any more, a refusal): the wallet form, for this device's own only.
+    push.stopLightNode.mockResolvedValue({ unbound: false });
+    const view = { onChain: true, features: ['unbind_wallet'], deviceBoundAgreed: true };
+    // Another device's binding is the network's (seq 9): nothing is signed, and the answer says the network did not take it.
+    statuses.push(view, { ...view, bindingSeqAgreed: 9 });
+    expect(await actions.unlink(W.nodeId)).toEqual({ unbound: false });
+    expect(wm.signNodeUnbind).not.toHaveBeenCalled();
+    expect(light.postUnbind).not.toHaveBeenCalled();
+    // This device's own (seq 7), its ping key gone: the wallet key withdraws it.
+    statuses.push(view, { ...view, bindingSeqAgreed: 7 });
+    expect(await actions.unlink(W.nodeId)).toEqual({ unbound: true });
+    expect(wm.signNodeUnbind).toHaveBeenCalledWith('c', W.nodeId, 7, expect.any(Number));
+    // A binding sent from here with no answer that the network holds (seq 11) is this device's too: it is withdrawn.
+    waiting = { nodeId: W.nodeId, seq: 11 };
+    wm.signNodeUnbind.mockClear();
+    statuses.push(view, { ...view, bindingSeqAgreed: 11 });
+    expect(await actions.unlink(W.nodeId)).toEqual({ unbound: true });
+    expect(wm.signNodeUnbind).toHaveBeenCalledWith('c', W.nodeId, 11, expect.any(Number));
+    expect(push.readUnconfirmedBinding).toHaveBeenCalledWith(W.nodeId);
+    expect(onUnlinked).toHaveBeenCalledTimes(4);
     jest.dontMock('../src/services/PushService');
     jest.dontMock('../src/services/LightNode');
     jest.dontMock('../src/services/NodeDeviceKey');
@@ -960,7 +1074,7 @@ describe('the unlink request', () => {
     const t = require('../src/i18n').makeT('en');
     const screen = read('src/screens/QNetLinkScreen.js');
     expect(screen).toMatch(/unlink: 'link_title_unlink',/);
-    expect(screen).toMatch(/\{Number\.isSafeInteger\(o\.since\) \? <InfoRow label=\{t\('link_unlink_since'\)\} value=\{dayText\(o\.since\)\} ltr \/> : null\}/);
+    expect(screen).toMatch(/\{Number\.isSafeInteger\(o\.since\) \? <InfoRow label=\{t\('link_unlink_since'\)\} value=\{day\(o\.since \* 1000\)\} ltr \/> : null\}/);
     expect(screen).toMatch(/t\(a\.unbound === true \? 'link_result_unlinked' : 'link_result_unlinked_unconfirmed'\)/);
     expect(t('link_title_unlink')).toBe("Unlink this wallet's node from this device");
     // The sheet names no website and no other place: it says what happens on this device.
@@ -971,16 +1085,24 @@ describe('the unlink request', () => {
 });
 
 describe('only a verified link reaches the app', () => {
-  it('Android: one App Link filter, https://link.aiqnet.io/l exactly, verified, and no custom scheme', () => {
+  it('Android: one App Link filter, verified, https://link.aiqnet.io with the paths /l and /send exactly; no custom scheme', () => {
     const manifest = read('android/app/src/main/AndroidManifest.xml');
     const filters = [...manifest.matchAll(/<intent-filter([^>]*)>([\s\S]*?)<\/intent-filter>/g)];
     const views = filters.filter((f) => f[2].includes('android.intent.action.VIEW'));
     expect(views).toHaveLength(1);
     const [, attrs, body] = views[0];
     expect(attrs).toMatch(/android:autoVerify="true"/);
-    const data = [...body.matchAll(/<data ([^>]*)\/>/g)].map((m) => m[1]);
-    expect(data).toEqual(['android:scheme="https" android:host="link.aiqnet.io" android:path="/l" ']);
-    expect(manifest).not.toMatch(/pathPrefix|pathPattern|android:scheme="(?!https")/);
+    // The <data> elements of one filter combine: every scheme, host and path they name, together.
+    const values = (name) => [...body.matchAll(new RegExp(`android:${name}="([^"]*)"`, 'g'))].map((m) => m[1]);
+    expect([...new Set(values('scheme'))]).toEqual(['https']);
+    expect([...new Set(values('host'))]).toEqual(['link.aiqnet.io']);
+    expect(values('path').sort()).toEqual(['/l', '/send']);
+    expect([...body.matchAll(/<category android:name="([^"]*)"/g)].map((m) => m[1]).sort())
+      .toEqual(['android.intent.category.BROWSABLE', 'android.intent.category.DEFAULT']);
+    // A devnet build claims no scheme: another site's mainnet payment request never lands in its devnet Send.
+    expect(manifest).not.toMatch(/pathPrefix|pathPattern|android:port|android:scheme="(?!https")|solana"/);
+    // singleTask hands a link to the running activity (Linking's 'url' event); the restored-intent reset stays.
+    expect(manifest).toMatch(/android:launchMode="singleTask"/);
   });
 
   it('Android: an activity restored or relaunched from recents does not hand its old link over again', () => {
@@ -989,19 +1111,35 @@ describe('only a verified link reaches the app', () => {
     expect(activity).toMatch(/intent\.data = null\s*\}\s*super\.onCreate/);
   });
 
-  it('iOS: Universal Links for link.aiqnet.io only, forwarded to Linking; no custom URL scheme', () => {
+  it('iOS: Universal Links for link.aiqnet.io only, forwarded by the scene to Linking, at launch too; no custom URL scheme', () => {
     const entitlements = read('ios/QNetMobile/QNetMobile.entitlements');
     const domains = /<key>com\.apple\.developer\.associated-domains<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(entitlements)[1];
     expect([...domains.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1])).toEqual(['applinks:link.aiqnet.io']);
-    const app = read('ios/QNetMobile/AppDelegate.swift');
-    expect(app).toMatch(/RCTLinkingManager\.application\(application, continue: userActivity/);
+    // A devnet build claims no scheme: another site's mainnet payment request never lands in its devnet Send.
     expect(read('ios/QNetMobile/Info.plist')).not.toMatch(/CFBundleURLTypes/);
+    // Under the scene life cycle the app delegate gets no link: the scene forwards Universal Links, nothing else.
+    const app = read('ios/QNetMobile/AppDelegate.swift');
+    expect(app).not.toMatch(/continue userActivity|open url|RCTLinkingManager/);
+    const scene = read('ios/QNetMobile/SceneDelegate.swift');
+    expect(scene).toMatch(/func scene\(_ scene: UIScene, continue userActivity: NSUserActivity\) \{\s*continueLink\(userActivity\)/);
+    expect(scene).toMatch(/private func continueLink\(_ activity: NSUserActivity\) \{\s*guard activity\.activityType == NSUserActivityTypeBrowsingWeb else \{ return \}\s*_ = RCTLinkingManager\.application\(UIApplication\.shared, continue: activity,/);
+    expect(scene).not.toMatch(/openURLContexts|urlContexts|solana/i);
+    expect(scene.match(/RCTLinkingManager\.application\(/g)).toHaveLength(1);
+    // The link that launches the app goes where Linking's getInitialURL reads it: the activity dictionary under the
+    // keys React Native reads.
+    const linking = read('node_modules/react-native/Libraries/LinkingIOS/RCTLinkingManager.mm');
+    expect(linking).toMatch(/userActivityDictionary\[@"UIApplicationLaunchOptionsUserActivityKey"\]/);
+    expect(scene).toMatch(/UIApplication\.LaunchOptionsKey\.userActivityType\.rawValue: NSUserActivityTypeBrowsingWeb,\s*"UIApplicationLaunchOptionsUserActivityKey": activity,/);
+    expect(scene).toMatch(/return \[\.userActivityDictionary: entry\]/);
+    // A scene connecting while React Native already runs hands its link over as one that comes while the app runs.
+    expect(scene).toMatch(/self\.window = running\s*connectionOptions\.userActivities\.forEach \{ continueLink\(\$0\) \}\s*return/);
   });
 
   it('the screen takes links only from the OS, through the parser', () => {
     const screen = read('src/screens/WalletScreen.js');
     expect([...screen.matchAll(/setLinkRequest\(/g)].length).toBe(5);
-    expect(screen).toMatch(/const link = parseLink\(url\);\s*if \(!link\) \{/);
+    // A link the in-app browser handed over is refused first; then a transfer link (services/transferLink), then QNet Link.
+    expect(screen).toMatch(/LINK_FROM_OUTSIDE_MS\)\) \{[^}]*\}\s*if \(openTransferLink\(url\)\) return;\s*const link = parseLink\(url\);\s*if \(!link\) \{/);
     expect(screen).toMatch(/takeInitialUrl\(Linking\)\.then\(receive\)/);
   });
 });

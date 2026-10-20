@@ -1,0 +1,14 @@
+# Assets once the first balance read answered: the QNC row shows a figure instead of its dash.
+appId: com.qnetmobile
+---
+- tapOn:
+    id: "tab-assets"
+- extendedWaitUntil:
+    visible: '(QNC )?[0-9][0-9,]*(\.[0-9]+)?'
+    timeout: 40000
+- waitForAnimationToEnd:
+    timeout: 3000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "shot/01-wallet"

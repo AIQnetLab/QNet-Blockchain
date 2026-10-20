@@ -269,7 +269,9 @@ Play's IARC questionnaire the same way where it asks about web access.
   devices. Answer Data safety as above in the same release (App activity → Installed apps), and
   keep the privacy policy's device-check section saying the same.
 - Screenshots from the current build, the six scenes of `app-store-listing.txt` on iPhone, iPad, Android phones and
-  7" and 10" Android tablets. Play rejects a side longer than twice the other. Each screenshot folder under
+  7" and 10" Android tablets; the iPhone and iPad ones are the `app-store-screenshots` artifact of a manual run of
+  `ios-build.yml` with its `screenshots` input, from the wallet of the repository secret `QNET_SCREENSHOT_PHRASE`
+  (`docs/applications/mobile-wallet.md`, Platforms and build). Play rejects a side longer than twice the other. Each screenshot folder under
   `fastlane/metadata/android/en-US/images/` (`phoneScreenshots`, `sevenInchScreenshots`, `tenInchScreenshots`) carries
   `build.txt` with the versionCode the images were taken from; `__tests__/StoreListing.test.js` refuses a folder of
   images from any other build, so no tool uploads screenshots of an earlier app (the old top-tab build's four were

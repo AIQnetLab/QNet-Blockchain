@@ -172,11 +172,11 @@ impl AuxWriter {
         self.queued_bytes.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
     pub(crate) fn db(&self) -> &DB {
         &self.db
     }
 
-    #[cfg(test)]
     pub(crate) fn db_arc(&self) -> &Arc<DB> {
         &self.db
     }

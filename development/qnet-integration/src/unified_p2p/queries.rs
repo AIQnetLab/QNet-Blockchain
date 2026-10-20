@@ -1897,13 +1897,6 @@ impl SimplifiedP2P {
             if crate::node::is_info() {
                 println!("[INFO][P2P] regional_connect peers={}", connected_peers.len());
             }
-            
-            // v2.51: No need to copy back - already using DashMap directly
-            {
-                if crate::node::is_warn() {
-                    println!("[WARN][P2P] Failed to update connected_peers after establishment");
-                }
-            }
         });
         
         if crate::node::is_info() {

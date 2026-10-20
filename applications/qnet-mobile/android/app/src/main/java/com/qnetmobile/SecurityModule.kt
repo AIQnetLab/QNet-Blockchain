@@ -8,19 +8,21 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
 import android.os.SystemClock
-import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.text.InputType
 import android.util.Base64
 import android.view.ActionMode
+import android.view.Gravity
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
@@ -35,12 +37,17 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityNodeProvider
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.view.inspector.WindowInspector
 import android.widget.EditText
-import android.widget.Toast
+import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.FragmentActivity
+import com.facebook.drawee.backends.pipeline.Fresco
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.LifecycleEventListener
 import com.facebook.react.bridge.Promise
@@ -85,10 +92,12 @@ import javax.crypto.spec.SecretKeySpec
  *   removed, which would leave the vault unopenable with the right password. The older seal (v1) is still opened, so
  *   a vault it sealed moves to the new one; it is never made again.
  * - Guarded screens drop every touch another app's window obscures, in part too (MPLAT-R5-02).
- * - The recovery phrase's Copy: a clip marked sensitive, cleared after a set time by a native timer if it is still there.
+ * - The recovery phrase's Copy: a clip marked sensitive, cleared after a set time if it is still there, also after the
+ *   process ended (SecretClip).
  * - The boot clock for the password lockout, and a local integrity check. Nothing here uses the network.
  * - The names the device's model is built from for a node's binding (JS: DeviceModel).
- * - Deleting or replacing the wallet: the in-app browser's cookies, site storage and HTTP cache (clearWebData).
+ * - Deleting or replacing the wallet: the in-app browser's cookies, site storage and HTTP cache, and the app's image
+ *   cache (clearWebData).
  */
 class SecurityModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
@@ -122,6 +131,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
         // ClipDescription.EXTRA_IS_SENSITIVE (API 33), which earlier versions' clipboard previews read under this name.
         private const val CLIP_IS_SENSITIVE = "android.content.extra.IS_SENSITIVE"
         private const val OBSCURED_NOTICE_MS = 3000L
+        private const val OBSCURED_NOTICE_COLOR = 0xF21E2235.toInt()
 
         /** Whether a secret screen holds FLAG_SECURE (MainActivity keeps it on its way to the background). */
         @Volatile @JvmStatic var secretScreenOn = false
@@ -207,6 +217,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
     override fun onHostResume() {
         reapply()
         reactContext.currentActivity?.let { activity -> activity.runOnUiThread { runCatching { watchSecretFields(activity) } } }
+        main.post { SecretClip.check(reactContext, force = false) }
     }
 
     /** Texts the native side shows by itself, in the app's language (JS: DeviceSecurity.setNativeTexts). */
@@ -219,8 +230,8 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
     // filterTouchesWhenObscured drops a touch only when another app's window covers the touch point itself. An overlay
     // that covers the recipient or the amount while leaving the button free gives the button's touch only
     // FLAG_WINDOW_IS_PARTIALLY_OBSCURED (API 29+), and below API 31 nothing hides such an overlay. While the guard is on,
-    // every gesture that starts or continues with either flag is dropped (one already under way is cancelled, so no
-    // press it began completes), and a short notice says why.
+    // every gesture that starts or continues through another app's window (obscuredByOtherApp) is dropped (one already
+    // under way is cancelled, so no press it began completes), and a short notice inside the window says why.
 
     private fun watchObscuredTouches(activity: Activity) {
         val window = activity.window ?: return
@@ -229,17 +240,70 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
         window.callback = ObscuredTouchFilter(current)
     }
 
-    private fun obscured(event: MotionEvent): Boolean {
+    private fun obscured(event: MotionEvent, activity: Activity?): Boolean {
         val flags = event.flags
-        if (flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED != 0) return true
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && flags and MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED != 0
+        val sdk = Build.VERSION.SDK_INT
+        val partialOnly = flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED == 0 &&
+            flags and MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED != 0
+        val own = partialOnly && sdk >= Build.VERSION_CODES.Q && sdk < Build.VERSION_CODES.S && ownWindowShown(activity)
+        return obscuredByOtherApp(sdk, flags, own)
     }
 
+    // A window of this process other than the activity's (a text handle, the paste toolbar), listed by WindowInspector.
+    private fun ownWindowShown(activity: Activity?): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        val decor = activity?.window?.decorView ?: return false
+        return runCatching {
+            WindowInspector.getGlobalWindowViews().any { it !== decor && it.isAttachedToWindow && it.windowVisibility == View.VISIBLE }
+        }.getOrDefault(false)
+    }
+
+    private var obscuredNotice: TextView? = null
+    private val hideObscuredNotice = Runnable {
+        obscuredNotice?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        obscuredNotice = null
+    }
+
+    // The notice is a view inside the wallet's own window: a toast is a window of its own, which would mark the next
+    // touches obscured and keep them dropped.
     private fun noticeObscured(activity: Activity) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastObscuredNotice < OBSCURED_NOTICE_MS) return
         lastObscuredNotice = now
-        runCatching { Toast.makeText(activity, obscuredText, Toast.LENGTH_LONG).show() }
+        runCatching {
+            val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
+            val dp = activity.resources.displayMetrics.density
+            val notice = obscuredNotice?.takeIf { it.parent === content } ?: obscuredNoticeView(activity, dp).also {
+                hideObscuredNotice.run()
+                content.addView(it, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+                obscuredNotice = it
+            }
+            // Above the navigation bar and the keyboard: the window draws behind both.
+            val below = ViewCompat.getRootWindowInsets(content)
+                ?.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())?.bottom ?: 0
+            val margin = (16 * dp).toInt()
+            (notice.layoutParams as FrameLayout.LayoutParams).setMargins(margin, 0, margin, below + margin)
+            notice.text = obscuredText
+            notice.requestLayout()
+            main.removeCallbacks(hideObscuredNotice)
+            main.postDelayed(hideObscuredNotice, OBSCURED_NOTICE_MS)
+        }
+    }
+
+    private fun obscuredNoticeView(activity: Activity, dp: Float) = TextView(activity).apply {
+        setTextColor(Color.WHITE)
+        textSize = 14f
+        gravity = Gravity.CENTER
+        setPadding((16 * dp).toInt(), (12 * dp).toInt(), (16 * dp).toInt(), (12 * dp).toInt())
+        background = GradientDrawable().apply {
+            setColor(OBSCURED_NOTICE_COLOR)
+            cornerRadius = 12 * dp
+        }
+        elevation = 6 * dp
+        // Touches pass through it, and a screen reader reads it as it appears.
+        isClickable = false
+        isFocusable = false
+        accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
     }
 
     private inner class ObscuredTouchFilter(private val inner: Window.Callback) : Window.Callback by inner {
@@ -253,7 +317,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
                 dropping = false
                 delivered = false
             }
-            if (!dropping && guardOn && obscured(event)) {
+            if (!dropping && guardOn && obscured(event, reactContext.currentActivity)) {
                 dropping = true
                 if (delivered) {
                     val cancel = MotionEvent.obtain(event)
@@ -433,12 +497,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
     private val seedClipListener = ClipboardManager.OnPrimaryClipChangedListener { main.post { clearSeedCopy() } }
 
     private fun clearClipboardNow() {
-        val cm = clipboard() ?: return
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) cm.clearPrimaryClip()
-            else cm.setPrimaryClip(ClipData.newPlainText("", ""))
-        } catch (_: Throwable) {
-        }
+        clipboard()?.clearNow()
     }
 
     // A paste into the field that the screen saw land: the clip goes without being read, so Android shows neither a
@@ -501,13 +560,10 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
 
     // ── The recovery phrase's Copy ───────────────────────────────────────────────────────────────
     // An explicit tap puts the phrase on the clipboard, marked sensitive so the system's clipboard preview hides it.
-    // After `seconds` it is cleared if it is still the clip copied. The timer is native, so it also runs while the app
-    // is in the background, where Android lets an app write the clipboard but not read it: a clipboard it cannot read
-    // then is cleared all the same. Delete wallet clears it at once (clearSecretCopy).
+    // After `seconds` it is cleared if it is still the clip copied (SecretClip: a timer while the process lives, an alarm
+    // that outlives it). Delete wallet clears it at once (clearSecretCopy), a copy an earlier process made too.
 
-    private var secretCopyText: String? = null
-    private var secretCopyStamp: Long? = null // the clip's timestamp as the clipboard gave it back (API 26+)
-    private val secretCopyExpiry = Runnable { clearSecretCopyNow() }
+    private val secretCopyExpiry = Runnable { SecretClip.check(reactContext, force = false) }
 
     @ReactMethod
     fun copySecret(text: String, seconds: Double, promise: Promise) {
@@ -521,9 +577,8 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
                 val clip = ClipData.newPlainText("", text)
                 clip.description.extras = PersistableBundle().apply { putBoolean(CLIP_IS_SENSITIVE, true) }
                 cm.setPrimaryClip(clip)
-                secretCopyText = text
-                secretCopyStamp =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) cm.primaryClipDescription?.timestamp else null
+                val stamp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) cm.primaryClipDescription?.timestamp else null
+                SecretClip.copied(reactContext, stamp, seconds)
                 main.removeCallbacks(secretCopyExpiry)
                 main.postDelayed(secretCopyExpiry, (seconds * 1000).toLong().coerceAtLeast(0L))
                 promise.resolve(true)
@@ -536,30 +591,9 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun clearSecretCopy(promise: Promise) {
         main.post {
-            clearSecretCopyNow()
+            main.removeCallbacks(secretCopyExpiry)
+            SecretClip.check(reactContext, force = true)
             promise.resolve(null)
-        }
-    }
-
-    private fun clearSecretCopyNow() {
-        main.removeCallbacks(secretCopyExpiry)
-        val text = secretCopyText ?: return
-        val stamp = secretCopyStamp
-        secretCopyText = null
-        secretCopyStamp = null
-        val cm = clipboard() ?: return
-        try {
-            // A description or clip that cannot be read (the app is in the background) counts as still the phrase.
-            val still = if (stamp != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val description = cm.primaryClipDescription
-                description == null || description.timestamp == stamp
-            } else {
-                val clip = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(reactContext)?.toString()
-                clip == null || clip == text
-            }
-            if (still) clearClipboardNow()
-        } catch (_: Throwable) {
-            clearClipboardNow()
         }
     }
 
@@ -572,8 +606,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
         map.putDouble("wall", System.currentTimeMillis().toDouble())
         // The system's count of device starts names this boot exactly, where wall minus mono moves with every time
         // correction (JS: AnswerGate.sameBoot); -1 where the system keeps none.
-        val boots = runCatching { Settings.Global.getInt(reactContext.contentResolver, Settings.Global.BOOT_COUNT, -1) }
-        map.putDouble("boots", boots.getOrDefault(-1).toDouble())
+        map.putDouble("boots", bootCount(reactContext).toDouble())
         promise.resolve(map)
     }
 
@@ -1294,12 +1327,14 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
      * Part of deleting or replacing the wallet (L-6): what the in-app browser left in the app's private storage goes now,
      * not when the next page opens: every cookie, every site's storage (localStorage, IndexedDB, service workers), the
      * web view HTTP cache and saved form data, as a web view created with `incognito` wipes them. iOS does the same
-     * (QNetSecurityModule.m clearWebData). Best effort: resolves false when the system has no web view to ask.
+     * (QNetSecurityModule.m clearWebData). The app's own images (an asset icon from the network) leave the image cache,
+     * memory and disk. Best effort: resolves false when the system has no web view to ask.
      */
     @ReactMethod
     fun clearWebData(promise: Promise) {
         main.post {
             try {
+                runCatching { if (Fresco.hasBeenInitialized()) Fresco.getImagePipeline().clearCaches() }
                 val cookies = android.webkit.CookieManager.getInstance()
                 cookies.removeAllCookies(null)
                 cookies.flush()
@@ -1316,4 +1351,15 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
             }
         }
     }
+}
+
+/**
+ * Whether a touch on a guarded window came through another app's window: one over the touch point itself, or (API 29+)
+ * one over part of the window. Below API 31 the app's own popups (a text handle, the paste toolbar) mark touches
+ * partially obscured as well, so there that mark counts only while no window of the app's own is shown.
+ */
+internal fun obscuredByOtherApp(sdk: Int, flags: Int, ownWindowShown: Boolean): Boolean {
+    if (flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED != 0) return true
+    if (sdk < Build.VERSION_CODES.Q || flags and MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED == 0) return false
+    return sdk >= Build.VERSION_CODES.S || !ownWindowShown
 }

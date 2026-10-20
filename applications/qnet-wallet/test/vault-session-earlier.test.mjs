@@ -282,17 +282,32 @@ describe('vault: the pages\' copy of the earlier wallet (M-4)', () => {
     assert.equal(pagesLeft(), true, 'an unreadable copy is kept');
   });
 
-  it('removeEarlier and a wipe delete the pages\' database too; a copy without a phrase goes with a new vault', async () => {
+  // Batch 19.10: Delete wallet and Reset keep an earlier wallet that still opens (only its own Remove or its move takes it);
+  // what an earlier version left that opens nothing goes with them.
+  it('removeEarlier deletes the pages\' database too; a wipe keeps an earlier wallet that opens, and takes one that opens nothing', async () => {
     await seed2x(await encryptAs2x(wallet2x(), OLD_PASSWORD));
     seedPages(await pagesCopy(KAT_MNEMONIC, OLD_PASSWORD));
     await vault.importVault({ mnemonic: KAT_MNEMONIC, password: PASSWORD });
     assert.equal(pagesLeft(), true, 'an import keeps both copies until the user confirms');
-    assert.deepEqual(await vault.removeEarlier(), { removed: true });
-    assert.deepEqual(await localKeys(), []);
-    assert.equal(pagesLeft(), false);
-    seedPages(await pagesCopy(KAT_MNEMONIC, OLD_PASSWORD));
+    const kept2x = await localKeys();
+    assert.ok(kept2x.includes('encryptedWallet'));
+    await env.chrome.storage.local.set({ [config.STORAGE_KEYS.SETTINGS]: { language: 'de' } });
     assert.deepEqual(await vault.wipe({ password: PASSWORD, confirm: 'DELETE' }), { wiped: true });
-    assert.equal(pagesLeft(), false, 'Delete wallet leaves no earlier copy behind');
+    assert.equal(pagesLeft(), true, 'Delete wallet keeps the earlier wallet: its pages\' copy');
+    assert.deepEqual(await localKeys(), [...kept2x, config.STORAGE_KEYS.SETTINGS].sort(),
+      'its record and the keys 2.x wrote beside it, and the language; nothing of the deleted vault');
+    assert.equal((await vault.getStatus()).earlier, true, 'the first screen offers to move it');
+    await vault.importVault({ mnemonic: KAT_MNEMONIC, password: PASSWORD });
+    assert.deepEqual(await vault.removeEarlier(), { removed: true });
+    assert.deepEqual(await localKeys(), [config.STORAGE_KEYS.SETTINGS]);
+    assert.equal(pagesLeft(), false);
+    // what opens nothing goes with Delete wallet: a 2.x key with no wallet record, and a copy without its phrase's cipher
+    await env.chrome.storage.local.set({ walletExists: true });
+    seedPages({ salt: 'not base64' });
+    assert.equal((await vault.getStatus()).earlier, false);
+    assert.deepEqual(await vault.wipe({ password: PASSWORD, confirm: 'DELETE' }), { wiped: true });
+    assert.deepEqual(await localKeys(), [config.STORAGE_KEYS.SETTINGS]);
+    assert.equal(pagesLeft(), false, 'Delete wallet leaves no copy that opens nothing');
     seedPages(await pagesCopy(null, OLD_PASSWORD));
     assert.equal((await vault.getStatus()).earlier, false, 'a copy without the phrase opens nothing');
     await vault.createVault({ mnemonic: KAT_MNEMONIC, password: PASSWORD });

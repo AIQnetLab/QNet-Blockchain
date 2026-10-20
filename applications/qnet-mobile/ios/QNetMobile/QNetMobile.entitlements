@@ -15,7 +15,7 @@
 		<string>$(AppIdentifierPrefix)com.qnetmobile</string>
 		<string>$(AppIdentifierPrefix)com.qnet.mobile</string>
 	</array>
-	<!-- QNet Link: Universal Links for https://link.aiqnet.io/l only (link.aiqnet.io/.well-known/apple-app-site-association) -->
+	<!-- QNet Link and transfer links: Universal Links for https://link.aiqnet.io/l and /send (link.aiqnet.io/.well-known/apple-app-site-association) -->
 	<key>com.apple.developer.associated-domains</key>
 	<array>
 		<string>applinks:link.aiqnet.io</string>

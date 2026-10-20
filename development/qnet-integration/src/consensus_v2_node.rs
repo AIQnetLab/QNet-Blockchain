@@ -1122,14 +1122,18 @@ fn drain_pending(
     let mut retained_gated = 0usize;
     for data in std::mem::take(pending) {
         match bincode::deserialize::<ConsensusMsg>(&data) {
-            // At/below the committed frontier ⇒ can never matter again; prune. (This is what expires an
-            // adopt-buffered proposal whose window already finalized via the other voters.)
-            Ok(m) if msg_index(&m) <= committed => {}
             // DEAD ROUND (audit F5/F6): the engine votes only proposals with index == current view
             // (on_proposal strict equality) — once the view rotated past it, a buffered Proposal can
             // never produce a vote; the post-TC re-proposal arrives with a NEW index via the live path.
-            // Pruning here is what bounds retained adopt-candidates to the CURRENT round only.
-            Ok(ConsensusMsg::Proposal(p)) if p.index < cur => {}
+            // Pruning here is what bounds retained adopt-candidates to the CURRENT round only. The one
+            // kept is the checkpoint a held certificate names: the votes certified it while its window
+            // was not derived here, and finality needs it. Its content is the certificate's, so no gate.
+            Ok(ConsensusMsg::Proposal(p)) if p.index < cur => {
+                if let Some(e) = driver.adopt_certified(&p) { effs.extend(e); }
+            }
+            // At/below the committed frontier ⇒ can never matter again; prune. (This is what expires an
+            // adopt-buffered proposal whose window already finalized via the other voters.)
+            Ok(m) if msg_index(&m) <= committed => {}
             Ok(m) if msg_index(&m) <= cur => {
                 // Certs carry O(committee) ML-DSA sigs — NEVER verify inline on this loop (same rule
                 // as the live path, audit F7): dispatch to the bounded off-loop worker; on success it
@@ -3467,5 +3471,49 @@ mod pre_content_exchange_tests {
         assert_eq!(z.next_window(), 92);
         let effs = feed(&mut z, &storage, &p2p, &c, &ConsensusMsg::Proposal(far), &mut Vec::new());
         assert!(matches!(effs.as_slice(), [Effect::CatchUpTo { .. }]), "the latched proposer is answered: {:?}", effs);
+    }
+
+    /// The node that receives last: a proposal held because its window is not derived here, then its
+    /// certificate is adopted (formed from the votes or relayed - the drain after either is the same).
+    /// The held copy is the certified checkpoint, so the drain keeps it and the parent commits on the
+    /// spot instead of after a pull a dozen seconds later. Also when the proposal lands after the
+    /// certificate: the next drain keeps it.
+    #[tokio::test]
+    async fn a_held_proposal_its_certificate_names_is_kept_and_commits_the_parent() {
+        let c: Vec<String> = (0..4).map(|i| format!("n{}", i)).collect();
+        let base = cp(10, None, 90, "n0");
+        let qc10 = qc_of(&base);
+        let next = cp(11, Some(&qc10), 91, &c[leader_index(11, &base.hash(), c.len())]);
+        let qc11 = ConsensusMsg::Qc(qc_of(&next));
+        let me = c.iter().find(|m| **m != next.proposer).expect("a receiver").clone();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Arc::new(Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let p2p = Arc::new(SimplifiedP2P::new("test_late_checkpoint".into(), crate::unified_p2p::NodeType::Super,
+                                              crate::unified_p2p::Region::Europe, 8122));
+        let finalized = |effs: &[Effect]| effs.iter().any(|e| matches!(e, Effect::Finalize { index: 10, head_height, .. } if *head_height == 90 * K));
+
+        // Proposal first (held for content), then the certificate.
+        let mut d = ConsensusDriver::new(me.clone(), c.clone(), [7u8; 32]);
+        let _ = d.sync(&base, &qc10);
+        let mut pending = Vec::new();
+        let _ = feed(&mut d, &storage, &p2p, &c, &ConsensusMsg::Proposal(next.clone()), &mut pending);
+        assert_eq!(pending.len(), 1, "held for content");
+        let effs = feed(&mut d, &storage, &p2p, &c, &qc11, &mut pending);
+        assert!(finalized(&effs), "the parent commits when the certificate lands: {:?}", effs);
+        assert_eq!((d.current_index(), d.committed_index(), d.frontier_blind()), (12, 10, None));
+        assert!(pending.is_empty(), "the held copy left the buffer as the certified checkpoint");
+
+        // Certificate first, then the proposal, still without a derived window: kept by the next drain.
+        let mut d = ConsensusDriver::new(me.clone(), c.clone(), [7u8; 32]);
+        let _ = d.sync(&base, &qc10);
+        let mut pending = Vec::new();
+        let _ = feed(&mut d, &storage, &p2p, &c, &qc11, &mut pending);
+        assert_eq!((d.committed_index(), d.frontier_blind()), (0, Some(11)));
+        let _ = feed(&mut d, &storage, &p2p, &c, &ConsensusMsg::Proposal(next.clone()), &mut pending);
+        assert_eq!(pending.len(), 1);
+        let effs = feed(&mut d, &storage, &p2p, &c, &qc11, &mut pending);
+        assert!(finalized(&effs), "kept by the next drain: {:?}", effs);
+        assert_eq!((d.committed_index(), d.frontier_blind()), (10, None));
+        assert!(pending.is_empty());
     }
 }

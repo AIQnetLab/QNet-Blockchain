@@ -6,9 +6,10 @@
 import * as core from '../lib/qnet-core.js';
 import * as activation from './activation.js';
 import { U64_MAX, isPositiveAmount } from './amount.js';
+import * as clipboard from './clipboard.js';
 import {
-  AUTO_LOCK_CHOICES, DECIMALS, DEV_BUILD, LIMITS, PAYMENT_REQUEST, PROVIDER, SUPPORTED_LANGUAGES, UI_PAGES, VIEW_EVENT_CHANNEL,
-  VIEW_EVENTS, isPaymentRequestMemo,
+  AUTO_LOCK_CHOICES, DECIMALS, DEV_BUILD, LIMITS, PAYMENT_REQUEST, POPUP_TABS, PROVIDER, SOLANA, SUPPORTED_LANGUAGES, TIMINGS, UI_PAGES,
+  VIEW_EVENT_CHANNEL, VIEW_EVENTS, isDraftField, isPaymentRequestMemo,
 } from './config.js';
 import {
   PROVIDER_ERROR_CODES, ProviderError, UNSUPPORTED_CALL_FIELDS, WalletError, toProviderError, toUiError,
@@ -48,6 +49,8 @@ const PATTERN_RE = /^(https?):\/\/(\*|(?:\*\.)?[a-z0-9.-]+)(?::([0-9]{1,5}))?\/.
 const DEFAULT_PORTS = Object.freeze({ 'https:': '443', 'http:': '80' });
 // A token amount before the token's decimals are known: a canonical decimal of at most 18 fraction digits.
 const TOKEN_AMOUNT_RE = /^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/;
+// A site's Solana transfer amount: plain decimal whole tokens, no trailing fraction zero (the site's own rule).
+const TRANSFER_AMOUNT_RE = /^(0|[1-9][0-9]{0,19})(\.[0-9]{0,17}[1-9])?$/;
 const CONTRACT_METHOD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 // A contract call's input: hex of whole bytes (either case, taken as lowercase), at most CALL_ARGS_MAX_BYTES; '' is none.
 export const CALL_ARGS_MAX_BYTES = 4096;
@@ -81,9 +84,10 @@ export function isCanonicalOrigin(origin) {
 }
 
 /**
- * Whether an origin may call qnet_activateNode, qnet_getActivation, qnet_claimNodeBalance and qnet_unlinkNodeDevice:
- * exactly PROVIDER.ACTIVATION_ORIGIN; the dev build also plain HTTP localhost and 127.0.0.1 on any port. Any other origin
- * a manifest names (a test or dev overlay) may connect but never ask for a burn, a move of the node balance or an unlink.
+ * Whether an origin may call qnet_activateNode, qnet_getActivation, qnet_claimNodeBalance, qnet_unlinkNodeDevice and
+ * qnet_sendSolanaTransfer: exactly PROVIDER.ACTIVATION_ORIGIN; the dev build also plain HTTP localhost and 127.0.0.1 on any
+ * port. Any other origin a manifest names (a test or dev overlay) may connect but never ask for a burn, a move of the node
+ * balance, an unlink or a Solana transfer.
  * @param {unknown} origin
  * @param {boolean} [dev] DEV_BUILD
  * @returns {boolean}
@@ -97,6 +101,10 @@ export function isActivationOrigin(origin, dev = DEV_BUILD) {
 // lone surrogates, size and origin all fail here, before any approval window opens.
 const isSignableMessage = (origin, message) => core.buildOffchainMessage(origin, message).length > 0;
 const assetAmountOk = (p) => isPositiveAmount(p.amount, p.asset === 'sol' ? DECIMALS.SOL : DECIMALS.ONE_DEV);
+// qnet_sendSolanaTransfer: SOL (mint null) or this build's 1DEV, at most the token's decimals; the wallet's own address
+// is refused in provider.js, which knows the session.
+const transferCheck = (p) => (p.mint === null || p.mint === SOLANA.ONE_DEV_MINT)
+  && isPositiveAmount(p.amount, p.mint === null ? DECIMALS.SOL : DECIMALS.ONE_DEV);
 
 const F = Object.freeze({
   password: string({ max: LIMITS.PASSWORD_MAX_CHARS }),
@@ -118,6 +126,7 @@ const F = Object.freeze({
   blockHeight: integer(0, Number.MAX_SAFE_INTEGER),
   dappMessage: string({ max: core.OFFCHAIN_MESSAGE_MAX_BYTES }),
   tokenAmount: string({ max: 40, pattern: TOKEN_AMOUNT_RE, check: (v) => /[1-9]/.test(v) }),
+  transferAmount: string({ max: 39, pattern: TRANSFER_AMOUNT_RE }),
   contractMethod: string({ max: 64, pattern: CONTRACT_METHOD_RE }),
   callArgs: string({ min: 0, max: 2 * CALL_ARGS_MAX_BYTES, pattern: CALL_ARGS_RE }),
   gasLimit: integer(1, core.MAX_GAS_LIMIT),
@@ -173,6 +182,11 @@ export function normalizeTransaction(raw) {
 
 const POPUP = ['popup'];
 const ALL_PAGES = ['popup', 'setup', 'approve'];
+// The pages that copy a secret (clipboard.schedule).
+const COPYING_PAGES = ['popup', 'setup'];
+// A Send form's draft as the popup keeps it (wallet.remember): config.isDraftField, the page's own rule.
+const draftField = (name) => optional(string({ max: 64, check: (value) => isDraftField(name, value) }));
+const DRAFT_FIELDS = Object.freeze({ asset: draftField('asset'), to: draftField('to'), amount: draftField('amount') });
 
 // The popup's view cache (decision 39): every balance, and every history page read from the newest (no cursor), is kept
 // for the session (session.rememberView), and the popup draws it at once the next time while it reads again.
@@ -183,13 +197,14 @@ const remembered = (name, handler, kept = () => true) => async (params, meta) =>
   return result;
 };
 
-function uiEntry(pages, params, handler, { unlocked = false, activity = false, check = null } = {}) {
-  return Object.freeze({ pages: Object.freeze(pages), params: Object.freeze(params), handler, unlocked, activity, check });
+function uiEntry(pages, params, handler, { unlocked = false, activity = false, sends = false, check = null } = {}) {
+  return Object.freeze({ pages: Object.freeze(pages), params: Object.freeze(params), handler, unlocked, activity, sends, check });
 }
 
 /**
  * Every type an extension page may send. pages: which ui/*.html may send it. unlocked: the router
- * calls session.requireUnlocked() first. activity: a success extends the auto-lock deadline.
+ * calls session.requireUnlocked() first. activity: a success extends the auto-lock deadline. sends: a success is a
+ * send that went, and the popup's Send form draft is dropped (session.forgetDraft), the popup open or not.
  * check: a cross-field rule over the normalized params. Handlers are called as handler(params, meta)
  * with meta = {page, sender}.
  */
@@ -216,6 +231,18 @@ export const UI_MESSAGES = Object.freeze({
   'vault.resetBegin': uiEntry(POPUP, {}, vault.beginReset),
   'vault.reset': uiEntry(POPUP, { token: F.resetToken, confirm: oneOf('ERASE') }, vault.resetVault),
   'wallet.addresses': uiEntry(['popup', 'approve'], {}, session.getAddresses, { unlocked: true }),
+  // the user pressed or typed in the popup (at most every TIMINGS.ACTIVITY_TOUCH_MS): only the activity rule acts on it,
+  // so the auto-lock counts from the user's last action, never from a read
+  'wallet.touch': uiEntry(POPUP, {}, async () => ({ touched: true }), { unlocked: true, activity: true }),
+  // where the popup is (network, tab, the Send form's draft), to open there again in this session
+  'wallet.remember': uiEntry(POPUP, { network: oneOf('qnet', 'solana'), tab: oneOf(...POPUP_TABS), ...DRAFT_FIELDS },
+    session.rememberPopup, { unlocked: true }),
+  // a secret copied from a page leaves the clipboard after afterMs (0: a later copy replaced it), and setup's end clears it
+  // now; the worker does it, so a closed page clears too (clipboard.js)
+  'clipboard.schedule': uiEntry(COPYING_PAGES, {
+    afterMs: integer(0, Math.max(TIMINGS.CLIPBOARD_CLEAR_MS, TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS)),
+  }, clipboard.schedule),
+  'clipboard.clearNow': uiEntry(['setup'], {}, clipboard.clearNow),
   // the balances and first history pages this session read, for the popup to draw at once (decision 39)
   'wallet.cached': uiEntry(POPUP, {}, session.cachedViews, { unlocked: true }),
   'qnet.balance': uiEntry(POPUP, {}, remembered('qnetBalance', qnet.getBalance), { unlocked: true }),
@@ -230,7 +257,7 @@ export const UI_MESSAGES = Object.freeze({
   'qnet.tokenSend': uiEntry(POPUP, {
     token: F.qnetAddress, to: F.qnetAddress, amount: F.tokenAmount, expectedFeeNano: F.u64, expectedDepositNano: F.u64,
     expectedNonce: optional(F.u64),
-  }, qnet.tokenSend, { unlocked: true, activity: true }),
+  }, qnet.tokenSend, { unlocked: true, activity: true, sends: true }),
   // the History detail: whether two pinned nodes list a transaction in a block
   'qnet.txLookup': uiEntry(POPUP, { hash: string({ min: 16, max: 128, pattern: TX_HASH_RE }) }, qnet.txLookup, { unlocked: true }),
   'qnet.preview': uiEntry(POPUP, { to: F.qnetAddress, amount: F.qncAmount, replaceNonce: optional(F.u64) }, qnet.preview,
@@ -239,7 +266,7 @@ export const UI_MESSAGES = Object.freeze({
   'qnet.sendWarm': uiEntry(POPUP, { to: optional(F.qnetAddress) }, qnet.sendWarm, { unlocked: true }),
   'qnet.send': uiEntry(POPUP, {
     to: F.qnetAddress, amount: F.qncAmount, expectedFeeNano: F.u64, expectedNonce: optional(F.u64), replaceNonce: optional(F.u64),
-  }, qnet.send, { unlocked: true, activity: true }),
+  }, qnet.send, { unlocked: true, activity: true, sends: true }),
   // the sent screen of a QNC or token transfer follows its transaction, known by its nonce, until it is in a block
   'qnet.sentStatus': uiEntry(POPUP, { nonce: F.u64 }, qnet.sentStatus, { unlocked: true }),
   'solana.balances': uiEntry(POPUP, {}, remembered('solanaBalances', solana.getBalances), { unlocked: true }),
@@ -253,7 +280,7 @@ export const UI_MESSAGES = Object.freeze({
   'solana.send': uiEntry(POPUP, {
     asset: F.asset, to: F.solanaAddress, amount: F.assetAmount, ...REQUEST_FIELDS, expectedFeeLamports: F.u64,
     expectedRentLamports: F.u64,
-  }, solana.send, { unlocked: true, activity: true, check: assetAmountOk }),
+  }, solana.send, { unlocked: true, activity: true, sends: true, check: assetAmountOk }),
   // the send form's Max, and the status of a send the popup follows after solana.send
   'solana.max': uiEntry(POPUP, { asset: F.asset, to: optional(F.solanaAddress) }, solana.maxAmount, { unlocked: true }),
   'solana.status': uiEntry(POPUP, { signature: F.solanaSignature, lastValidBlockHeight: optional(nullable(F.blockHeight)) },
@@ -300,7 +327,8 @@ function providerEntry(params, check = null, origins = null) {
 /**
  * The provider allow-list. params null: no params (undefined, null, [] or {}); a function: the params'
  * normalizer (normalizeTransaction). origins: when set, an origin it refuses gets 4100 before the params are
- * read. All dispatch to provider.handleRequest(ctx, method, params). Solana signing is not offered to dApps.
+ * read. All dispatch to provider.handleRequest(ctx, method, params). The only Solana signing a dApp gets is aiqnet.io's
+ * one transfer the user reviews and confirms in the window (qnet_sendSolanaTransfer).
  */
 export const PROVIDER_METHODS = Object.freeze({
   qnet_requestAccounts: providerEntry(null),
@@ -319,6 +347,10 @@ export const PROVIDER_METHODS = Object.freeze({
   // Unlink from the cabinet: the wallet key ends the wallet's own light node on its device, no params, the activation
   // origin only (decision 38)
   qnet_unlinkNodeDevice: providerEntry(null, null, isActivationOrigin),
+  // Send from the wallet (decision 52): one SOL or 1DEV transfer aiqnet.io names, reviewed and confirmed in the window;
+  // a call without params is the site's probe, refused here with -32602 before anything else
+  qnet_sendSolanaTransfer: providerEntry({ to: F.solanaAddress, mint: nullable(F.solanaAddress), amount: F.transferAmount },
+    transferCheck, isActivationOrigin),
 });
 
 /** The only provider results allowed to carry a SECRET_RESULT_KEYS name: the activation code for aiqnet.io. */
@@ -599,6 +631,7 @@ function disconnectQuietly(port) {
  * @param {Record<string, Function>} [options.handlers] per-type overrides of UI_MESSAGES handlers
  * @param {() => Promise<unknown>} [options.requireUnlocked] default session.requireUnlocked
  * @param {() => Promise<void>} [options.touch] default session.touch
+ * @param {() => Promise<void>} [options.forgetDraft] default session.forgetDraft
  * @param {(ctx: object, method: string, params: object) => Promise<unknown>} [options.providerRequest]
  *   default provider.handleRequest
  * @param {(ctx: object) => Promise<void>} [options.providerPortClosed] default provider.onPortClosed
@@ -619,6 +652,7 @@ export function createRouter(options = {}) {
   const handlers = options.handlers ?? {};
   const requireUnlocked = options.requireUnlocked ?? session.requireUnlocked;
   const touch = options.touch ?? session.touch;
+  const forgetDraft = options.forgetDraft ?? session.forgetDraft;
   const providerRequest = options.providerRequest ?? provider.handleRequest;
   const providerPortClosed = options.providerPortClosed ?? provider.onPortClosed;
   const tabsApi = () => (Object.hasOwn(options, 'tabs') ? options.tabs : globalThis.chrome?.tabs ?? null);
@@ -696,6 +730,13 @@ export function createRouter(options = {}) {
           await touch();
         } catch (error) {
           log.warn('touch failed', error?.code ?? error?.name);
+        }
+      }
+      if (entry.sends) {
+        try {
+          await forgetDraft();
+        } catch (error) {
+          log.warn('draft not dropped', error?.code ?? error?.name);
         }
       }
       return { id, ok: true, result };

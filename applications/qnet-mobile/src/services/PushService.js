@@ -24,6 +24,9 @@ import { mayAnswer, noteOpen } from './AnswerGate';
 import * as Receipts from './PushReceipts';
 import { BG_REFRESH_STATUS_KEY } from './BackgroundPriority';
 import { deviceModel, withDeviceModel } from './DeviceModel';
+import {
+  PING_KEY_PREFIX, UNCONFIRMED_BIND_KEY, UNCONFIRMED_PING_SERVICE, forgetUnconfirmedBinding, pingKeyService, storePingKey,
+} from './PingKeys';
 import { LEGACY_MOVE } from '../config/legacy';
 import logger from '../utils/logger';
 
@@ -162,16 +165,18 @@ async function giveBackToken(push) {
   } catch (_) { /* the next teardown gives it back */ }
 }
 
-// The ping key of `nodeId` on this device, or null.
-async function pingKeyOf(nodeId) {
+// The secret a Keychain item `service` holds on this device, or null.
+async function keychainSecret(service) {
   try {
-    const Keychain = require('react-native-keychain');
-    const entry = await Keychain.getGenericPassword({ service: `qnet_ping_sk_${nodeId}` });
+    const entry = await require('react-native-keychain').getGenericPassword({ service });
     return entry && entry.password ? entry.password : null;
   } catch (_) {
     return null;
   }
 }
+
+// The ping key of `nodeId` on this device, or null.
+const pingKeyOf = (nodeId) => keychainSecret(pingKeyService(nodeId));
 
 /**
  * This device's binding of `nodeId`: { nodeId, seq, pushType, hw, boundAt } (seq 0 for a binding older builds made; `hw`
@@ -312,12 +317,16 @@ function enrolRefusal(e) {
   return 'network';
 }
 
-/** The ping key's signature of the node's signed-status request, or null when this device holds no ping key for it. */
-export async function signStatusWithPingKey(nodeId, ts) {
-  const sk = await pingKeyOf(nodeId);
+// The signature of the node's signed-status request by the ping key `sk`, or null with no key.
+async function signStatusBy(sk, nodeId, ts) {
   if (!sk) return null;
   const { signDetached } = require('../crypto/DilithiumCrypto');
   return { signer: 'ping', sig: await signDetached(statusPreimage(nodeId, ts), sk) };
+}
+
+/** The ping key's signature of the node's signed-status request, or null when this device holds no ping key for it. */
+export async function signStatusWithPingKey(nodeId, ts) {
+  return signStatusBy(await pingKeyOf(nodeId), nodeId, ts);
 }
 
 /**
@@ -343,6 +352,16 @@ export async function adoptBinding({ nodeId, walletAddress, push, seq, pingPubli
     await configureBackgroundFetch();
   }
   selfAttestIfNeeded(nodeId, true).catch(() => {});
+}
+
+// A binding the node took (`binding`: adoptBinding's arguments) becomes this device's: the device schedule starts over for
+// it, since a status read before it described the device before (MN-5), and one that carried this device's enrolment
+// (`enrolled`) keeps its signed body (`bindBlob`) for enrolAgainIfUnleased.
+async function takeBinding(binding, { features, answer, enrolled, bindBlob }) {
+  await adoptBinding(binding);
+  await Enrolment.noteBinding(binding.nodeId, features, answer);
+  if (enrolled) await noteEnrolAgain(binding.nodeId, binding.seq, binding.walletAddress, bindBlob);
+  else await dropEnrolAgain();
 }
 
 // The /bind fields of a binding a WalletManager signed (light-node-messages section 4), without any device block. The
@@ -376,7 +395,8 @@ function bindBody(nodeId, b, push, seq, ts, model = null) {
  * caller read it (else the one this device last knew). Resolves { ok: true, seq } or { ok: false, reason, ref?,
  * unknown? }: a /bind refusal reason, 'not_registered' or 'network', with the support reference of a refused enrolment
  * (refusalRef); `unknown` when the binding went out, got no answer, and no status told whether the node took it
- * (MN-R4-04). It waits for an enrolment of this device that is running (inEnrolLane).
+ * (MN-R4-04): it then waits with its ping key until the network names one (settleUnconfirmedBinding). It waits for an
+ * enrolment of this device that is running (inEnrolLane).
  */
 export function bindThisDevice(args) {
   return inEnrolLane(args.nodeId, () => bindNow(args), { wait: true });
@@ -388,21 +408,111 @@ export const BIND_RECHECK_MS = [2000, 6000];
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Whether the node took the binding `seq` that got no answer: { taken: true, status } when a signed status names it,
- * { taken: false, known: true } when every signed status names another binding, { taken: false, known: false } when no
- * signed status came.
+ * Whether the node took the binding `seq` that got no answer: { taken: false, known: true } when two owners name a newer
+ * binding alike (B, `bindingSeqAgreed`), { taken: true, status } when B or an owner's signed answer names `seq`,
+ * { taken: false, known: false } otherwise: no signed status came, or the owners still name the binding before, as an
+ * owner the binding has not reached yet does too, so only a later status tells (settleUnconfirmedBinding).
  */
 async function bindOutcome(nodeId, seq, signStatus) {
-  let known = false;
   for (const ms of BIND_RECHECK_MS) {
     await pause(ms);
     const s = await readNodeStatus(nodeId, { signStatus }).catch(() => null);
-    const bound = s && s.signed ? s.signed.bindingSeq : null;
-    if (bound === seq) return { taken: true, status: s };
-    if (Number.isSafeInteger(bound) && bound > seq) return { taken: false, known: true };
-    if (Number.isSafeInteger(bound)) known = true;
+    const B = s && Number.isSafeInteger(s.bindingSeqAgreed) ? s.bindingSeqAgreed : null;
+    if (B !== null && B > seq) return { taken: false, known: true };
+    if (B === seq || (s && s.signed && s.signed.bindingSeq === seq)) return { taken: true, status: s };
   }
-  return { taken: false, known };
+  return { taken: false, known: false };
+}
+
+// A binding sent with no answer that no status settled yet: its ping key in a Keychain item of its own, beside this
+// device's current binding, and what adopting it takes. One at a time: a later one replaces it. teardownLightNode leaves
+// it, as a reply refused as `superseded` may be the network taking it.
+export { UNCONFIRMED_BIND_KEY };
+
+async function keepUnconfirmed(keepKey, rec) {
+  await keepKey(UNCONFIRMED_PING_SERVICE);
+  await AsyncStorage.setItem(UNCONFIRMED_BIND_KEY, JSON.stringify({ ...rec, at: Date.now() }));
+}
+
+// The waiting binding's record, whichever node it names, or null.
+async function waitingRecord() {
+  try {
+    const rec = JSON.parse((await AsyncStorage.getItem(UNCONFIRMED_BIND_KEY)) || 'null');
+    return rec && typeof rec.nodeId === 'string' && Number.isSafeInteger(rec.seq) && rec.seq > 0
+      && Number.isSafeInteger(rec.at) ? rec : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * The binding of `nodeId` this device sent with no answer and keeps until the network names one: { nodeId,
+ * walletAddress, seq, push, pingPublicKey, cert, identityPublicKey, features, enrolled, bindBlob, at } (`at` ms), or null.
+ */
+export async function readUnconfirmedBinding(nodeId) {
+  const rec = await waitingRecord();
+  return rec && rec.nodeId === nodeId ? rec : null;
+}
+
+/**
+ * Settles the binding of `nodeId` this device sent with no answer (readUnconfirmedBinding) by a status naming the binding
+ * two owners hold alike (B, `bindingSeqAgreed`) and whether two say a device is bound (D): B its sequence, D not false:
+ * it becomes this device's binding, as an answered one does (its ping key, push token, wakes; the binding before goes).
+ * B above it, D false, or B still below it BIND_SETTLE_MS after it went: the node does not hold it, and it goes with its
+ * key. No B decides nothing. Before forgetIfReplaced, which would end the binding it replaces as another device's.
+ * True when it became this device's binding.
+ */
+export function settleUnconfirmedBinding(nodeId, status) {
+  return inEnrolLane(nodeId, () => settleUnconfirmedNow(nodeId, status));
+}
+
+async function settleUnconfirmedNow(nodeId, status) {
+  const rec = await readUnconfirmedBinding(nodeId);
+  const B = rec && status && Number.isSafeInteger(status.bindingSeqAgreed) ? status.bindingSeqAgreed : null;
+  if (B === null) return false;
+  const D = status.deviceBoundAgreed;
+  const age = Date.now() - rec.at;
+  // Still the binding before, within the settle time: owners the binding has not reached yet name it too.
+  if (B < rec.seq && D !== false && age >= 0 && age < BIND_SETTLE_MS) return false;
+  const sk = B === rec.seq && D !== false ? await keychainSecret(UNCONFIRMED_PING_SERVICE) : null;
+  if (sk) {
+    const tagged = rec.enrolled === true
+      && (await settleByTag(status.nonce, status.deviceTags || []).catch(() => null)) === 'pending';
+    await takeBinding({
+      nodeId, walletAddress: rec.walletAddress, push: rec.push, seq: rec.seq, pingPublicKey: rec.pingPublicKey,
+      cert: rec.cert, identityPublicKey: rec.identityPublicKey, hw: tagged,
+      keepKey: () => storePingKey(pingKeyService(nodeId), sk),
+    }, { features: rec.features || [], answer: null, enrolled: rec.enrolled === true, bindBlob: rec.bindBlob });
+    await forgetUnconfirmedBinding();
+    // The token it carries may be gone since (a teardown deleted it, or Firebase replaced it): without the stamp the
+    // adoption wrote, a changed token goes to the owners now, signed by the moved key, not an hour later. Not waited
+    // for: the tab reads the node again meanwhile.
+    if (rec.push && rec.push.token) {
+      await AsyncStorage.removeItem('qnet_last_token_refresh_ts');
+      refreshFcmTokenOnServer(nodeId).catch(() => {});
+    }
+    return true;
+  }
+  // The node does not hold it, or its key is gone (a restore): nothing answers for it.
+  await forgetUnconfirmedBinding();
+  await giveBackToken(rec.push);
+  return false;
+}
+
+/**
+ * A wake (a push, a background fetch) settles the binding sent with no answer that waits here before anything answers:
+ * its status is signed with that binding's own ping key, which an owner takes only from the binding it holds, so a
+ * binding the network took answers from this wake on. One it did not take waits for the Node tab, as no wake signs with
+ * the wallet key (contract 4). Resolves the node id it made this device's binding, or null.
+ */
+async function settleWaitingInWake(deadline) {
+  const rec = await waitingRecord();
+  if (!rec) return null;
+  const signStatus = async (id, ts) => signStatusBy(await keychainSecret(UNCONFIRMED_PING_SERVICE), id, ts);
+  const status = await readNodeStatus(rec.nodeId, { signStatus, timeoutMs: 5000, deadline }).catch(() => null);
+  if (!status || !(await settleUnconfirmedBinding(rec.nodeId, status))) return null;
+  logger.log('[LightNode] a wake took the binding sent with no answer, which the network holds: seq', rec.seq);
+  return rec.nodeId;
 }
 
 /**
@@ -472,6 +582,11 @@ async function bindNow({ signer, credential, nodeId, device = null, interactive 
         Object.assign(body, enrolment.fields);
       }
       const r = await postBind(nodeId, body, { first: enrolment && enrolment.url });
+      // The delegation as the node's own records carry it: its sequence in front (light-node-messages section 8).
+      const adopt = (hw, answer) => takeBinding({
+        nodeId, walletAddress: b.wallet, push, seq, pingPublicKey: b.pingPublicKey, cert: `v2.${seq}.${b.delegation}`,
+        identityPublicKey: b.identityPublicKey, keepKey: b.keep, hw,
+      }, { features: status.features, answer, enrolled: !!enrolment, bindBlob: withoutDevice(body) });
       // Sent and unanswered: the node may have taken it. Its signed status tells; a binding it took is kept here as
       // taken, its device key waiting for the device tag, as the link sheet keeps one (MN-R4-04).
       if (!r.ok && r.reason === 'network') {
@@ -480,31 +595,28 @@ async function bindNow({ signer, credential, nodeId, device = null, interactive 
           await Enrolment.settle(enrolment, false, { unanswered: true });
           const tagged = !!enrolment
             && (await settleByTag(outcome.status.nonce, outcome.status.deviceTags).catch(() => null)) === 'pending';
-          await adoptBinding({
-            nodeId, walletAddress: b.wallet, push, seq, pingPublicKey: b.pingPublicKey, cert: `v2.${seq}.${b.delegation}`,
-            identityPublicKey: b.identityPublicKey, keepKey: b.keep, hw: tagged,
-          });
-          await Enrolment.noteBinding(nodeId, status.features, null);
-          if (enrolment) await noteEnrolAgain(nodeId, seq, b.wallet, withoutDevice(body));
-          else await dropEnrolAgain();
+          await adopt(tagged, null);
           return { ok: true, seq };
         }
-        await Enrolment.settle(enrolment, false);
-        await giveBackToken(push);
-        return outcome.known ? r : { ...r, unknown: true };
+        if (outcome.known) {
+          await Enrolment.settle(enrolment, false);
+          await giveBackToken(push);
+          return r;
+        }
+        // Nothing tells yet: the binding waits beside this device's current one, its ping key kept, until the network
+        // names one (settleUnconfirmedBinding); never wiped while the node may hold it.
+        await Enrolment.settle(enrolment, false, { unanswered: true });
+        await keepUnconfirmed(b.keep, {
+          nodeId, walletAddress: b.wallet, seq, push: { type: push.type, token: push.token || null },
+          pingPublicKey: b.pingPublicKey, cert: `v2.${seq}.${b.delegation}`, identityPublicKey: b.identityPublicKey,
+          features: status.features, enrolled: !!enrolment, bindBlob: withoutDevice(body),
+        }).catch(() => giveBackToken(push));
+        return { ...r, unknown: true };
       }
       const committed = await Enrolment.settle(enrolment, r.ok);
       if (r.ok) {
-        await adoptBinding({
-          nodeId, walletAddress: b.wallet, push, seq, pingPublicKey: b.pingPublicKey,
-          // The delegation as the node's own records carry it: its sequence in front (light-node-messages section 8).
-          // `hw` only when the key the node took is this install's current key now (MN-R2-03).
-          cert: `v2.${seq}.${b.delegation}`, identityPublicKey: b.identityPublicKey, keepKey: b.keep, hw: committed,
-        });
-        // The schedule starts over for this binding: the status read before it described the device before (MN-5).
-        await Enrolment.noteBinding(nodeId, status.features, r.answer);
-        if (enrolment) await noteEnrolAgain(nodeId, seq, b.wallet, withoutDevice(body));
-        else await dropEnrolAgain();
+        // `hw` only when the key the node took is this install's current key now (MN-R2-03).
+        await adopt(committed, r.answer);
         return { ok: true, seq };
       }
       // An assertion by a key the network no longer holds: that key is forgotten and a new one attested, once.
@@ -857,20 +969,41 @@ export function refreshLeaseFromTab(nodeId) {
  * once: the ping key, the push token, the wakes and the records go before the network answers, so no answer can be sent
  * from here again whatever the network does. The node stays registered on the chain. The network gets at most
  * UNBIND_WAIT_MS; the release may take RELEASE_WAIT_MS of it at most, so the unbind, which never depends on the release
- * (node batch V4), always has the rest. `forgetDevice` (wallet delete and erase): the device key goes too.
- * `waitForNetwork` false resolves once the device stopped, with `sent` (the network's answer, true when it took the
+ * (node batch V4), always has the rest. A binding of the same node sent from here with no answer, which the network may
+ * hold, ends too, its unbind signed by its own ping key beside the current one's (the network refuses the one it does
+ * not hold), and it goes with that key. `forgetDevice` (wallet delete and erase): the device key goes too.
+ * `waitForNetwork` false resolves once the device stopped, with `sent` (the network's answer, true when it took an
  * unbind) still running: { unbound: null, sent }. Otherwise resolves { unbound }.
  */
 const UNBIND_WAIT_MS = 8000;
 const RELEASE_WAIT_MS = 3000;
 export async function stopLightNode({ waitForNetwork = true, forgetDevice = false } = {}) {
-  let sent = Promise.resolve(false);
+  const unbinds = [];
+  const deadline = Date.now() + UNBIND_WAIT_MS;
+  const post = (nodeId, body, first = null) => unbinds.push(untilDeadline(
+    postUnbind(nodeId, body, { deadline, first }).then((r) => r.ok, () => false), deadline, false));
+  const nodeId = await AsyncStorage.getItem('qnet_ping_node_id').catch(() => null);
+  // The waiting binding of this device's node, or of the node it waits for when none runs here; another node's (a
+  // record of another wallet that a foreign-record check stops) is not this end's.
+  const waiting = await waitingRecord();
+  if (waiting && (!nodeId || waiting.nodeId === nodeId)) {
+    try {
+      const waitingSk = await keychainSecret(UNCONFIRMED_PING_SERVICE);
+      if (waitingSk) {
+        const { signDetached } = require('../crypto/DilithiumCrypto');
+        const ts = Math.floor(Date.now() / 1000);
+        const sig = await signDetached(unbindPreimage(waiting.nodeId, waiting.seq, ts), waitingSk);
+        post(waiting.nodeId, { node_id: waiting.nodeId, seq: waiting.seq, ts, signer: 'ping', sig });
+      }
+    } catch (error) {
+      logger.warn('[LightNode] unbind of the waiting binding failed:', (error && error.message) || error);
+    }
+    await forgetUnconfirmedBinding();
+  }
   try {
-    const nodeId = await AsyncStorage.getItem('qnet_ping_node_id');
     const binding = nodeId ? await localBinding(nodeId) : null;
     const sk = binding && binding.seq > 0 ? await pingKeyOf(nodeId) : null;
     if (sk) {
-      const deadline = Date.now() + UNBIND_WAIT_MS;
       const { signDetached } = require('../crypto/DilithiumCrypto');
       // The device record ends with the binding (section 5.7): its release goes to the owner that issued its challenge.
       // An owner that does not give the release's challenge in time leaves the unbind without it.
@@ -882,12 +1015,12 @@ export async function stopLightNode({ waitForNetwork = true, forgetDevice = fals
       const sig = await signDetached(unbindPreimage(nodeId, binding.seq, ts), sk);
       const body = { node_id: nodeId, seq: binding.seq, ts, signer: 'ping', sig };
       if (release) body.device_release = release.device_release;
-      sent = untilDeadline(postUnbind(nodeId, body, { deadline, first: release && release.url }).then((r) => r.ok, () => false),
-        deadline, false);
+      post(nodeId, body, release && release.url);
     }
   } catch (error) {
     logger.warn('[LightNode] unbind failed:', (error && error.message) || error);
   }
+  const sent = Promise.all(unbinds).then((taken) => taken.some(Boolean));
   await teardownLightNode({ forgetDevice });
   if (!waitForNetwork) return { unbound: null, sent };
   return { unbound: await sent };
@@ -912,6 +1045,7 @@ export async function onBackgroundFetch(taskId) {
       logger.log('[BackgroundFetch] the app is not open since the device started, or was swiped away: no answer until it is opened');
       return;
     }
+    await settleWaitingInWake(deadline);
     await selfAttestIfNeeded(undefined, false, deadline);
     await refreshTokenIfOwed(deadline);
     await maintainDevice(deadline);
@@ -942,8 +1076,8 @@ export async function onBackgroundFetch(taskId) {
 async function configureBackgroundFetch() {
   try {
     // stopOnTerminate, startOnBoot and enableHeadless are Android options. On iOS the wake is a
-    // BGAppRefreshTask: the OS picks the time (at least 15 minutes apart) and never wakes a force-quit app.
-    // No wake after a restart: nothing answers until the app is opened in the new boot (AnswerGate), and this
+    // BGAppRefreshTask: the OS picks the time (at least 15 minutes apart). A wake of an app closed from the app
+    // switcher, or not opened since a restart, answers nothing until the app is opened (AnswerGate), and this
     // configure runs again then.
     const status = await BackgroundFetch.configure({
       minimumFetchInterval: 30,
@@ -1258,7 +1392,7 @@ async function signedAnswer(pingNodeId, challenge) {
   // No password needed. Full quantum safety for ping responses.
   let keychainEntry = null;
   try {
-    keychainEntry = await Keychain.getGenericPassword({ service: `qnet_ping_sk_${pingNodeId}` });
+    keychainEntry = await Keychain.getGenericPassword({ service: pingKeyService(pingNodeId) });
   } catch (keychainErr) {
     if (keychainErr.message && !keychainErr.message.includes('no item')) {
       logger.warn('[Push] Keychain unavailable for ping:', keychainErr.message);
@@ -1899,8 +2033,8 @@ export async function teardownLightNode({ keepToken = false, forgetDevice = fals
       let services = [];
       // Listing only; items behind Face ID are skipped rather than prompted for (ping keys have no such lock).
       try { services = (await Keychain.getAllGenericPasswordServices({ skipUIAuth: true })) || []; } catch (_) { services = []; }
-      const own = pingNodeId ? [`qnet_ping_sk_${pingNodeId}`] : [];
-      for (const service of new Set([...own, ...services.filter((s) => String(s).startsWith('qnet_ping_sk_'))])) {
+      const own = pingNodeId ? [pingKeyService(pingNodeId)] : [];
+      for (const service of new Set([...own, ...services.filter((s) => String(s).startsWith(PING_KEY_PREFIX))])) {
         try { await Keychain.resetGenericPassword({ service }); } catch (_) {}
       }
     } catch (e) {}
@@ -2034,7 +2168,7 @@ export async function handlePushMessage(data) {
   let nodeId = null;
   try { nodeId = await AsyncStorage.getItem('qnet_ping_node_id'); } catch (_) { nodeId = null; }
   const epoch = pushEpochOf(data);
-  const recorded = !!nodeId && epoch !== null;
+  let recorded = !!nodeId && epoch !== null;
   if (recorded) await receiptsWithin(Receipts.noteReceived(nodeId, epoch, evidence));
   // A light node is counted only while the wallet runs on its device: not opened since the device started, or swiped away
   // since it was last opened, it answers no push until it is opened again (AnswerGate).
@@ -2045,6 +2179,14 @@ export async function handlePushMessage(data) {
   }
   // The answer and a fallback self-attest share one deadline inside the 25 s a background push gets.
   const deadline = Date.now() + WAKE_PUSH_MS;
+  // A binding sent from here with no answer that the network took: this push is answered and recorded for it (the
+  // adoption starts that binding's record of pushes afresh).
+  const adopted = await settleWaitingInWake(deadline);
+  if (adopted && epoch !== null) {
+    nodeId = adopted;
+    recorded = true;
+    await receiptsWithin(Receipts.noteReceived(nodeId, epoch, evidence));
+  }
   if (data?.action === 'ping_response' && data?.challenge && data?.node_id) {
     logger.log('[Push] ping received');
     const ok = await respondToChallenge(data.node_id, data.challenge, data.response_url,
@@ -2519,13 +2661,9 @@ export async function checkServerNodeStatus(nodeId = null, walletAddress = null,
           heartbeatCount: result.heartbeat_count || 0,
           requiredHeartbeats: requiredHeartbeats || 9, // Super nodes only
           isRewardEligible: result.is_reward_eligible,
-          // Whether the network admits the registered node to consensus: false only on the node's word (a rule that
-          // holds outside super nodes at registration), undefined when it says nothing (an older node: shown as before);
-          // false makes NodeTab say it waits for admission instead of Offline.
-          consensusAdmitted: typeof result.consensus_admitted === 'boolean' ? result.consensus_admitted : undefined,
-          // A super node's admission to the epoch's rewarded set, as the node reports it: 'admitted', 'waiting'
-          // (registered, no super share while outside) or 'not_required' (no admission rule governs the epoch);
-          // undefined when it says nothing (an older node) or something else. Shown on the Node tab when it says.
+          // A super node's admission to the epoch's consensus-admitted set, as the node reports it: 'admitted',
+          // 'waiting' (registered, not admitted to consensus yet: NodeTab says so instead of Offline) or 'not_required'
+          // (no admission rule governs the epoch); undefined when it says nothing (an older node) or something else.
           admission: ADMISSION_STATES.includes(result.admission) ? result.admission : undefined,
           reputation: result.reputation, // BLOCKCHAIN reputation from DeterministicReputationState
           currentBlockHeight: result.current_block_height,

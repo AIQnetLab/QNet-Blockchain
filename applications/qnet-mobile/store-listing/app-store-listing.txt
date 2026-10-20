@@ -123,10 +123,12 @@ until the French encryption declaration exists), so no documentation and ITSAppU
 ====================
 SCREENSHOTS
 ====================
-The same six scenes on iPhone 6.9" (1320×2868) and iPad 13" (2064×2752), taken from the build under review on each
-layout: Assets with a QNC balance; the send confirmation; History; the Node tab linked to this device (Online, answered
-this epoch, a modest node balance, Move to wallet); the in-app browser on the explorer; Receive with the
-QR. Never the web cabinet, a burn, a price or a code; captions name features only.
+The same six scenes on iPhone 6.9" (1320×2868, else 1290×2796) and iPad 13" (2064×2752, else 2048×2732), from the
+build under review on each layout, made by a manual run of ios-build.yml with its screenshots input (run artifact
+app-store-screenshots; docs/applications/mobile-wallet.md, Platforms and build): Assets with a QNC balance; the send
+review; Receive with the QR; History; the Node tab as a simulator shows it (a node linked to a phone is shown as linked
+to another device); Settings with the language list. Never the web cabinet, a burn, a price or a code; captions name
+features only.
 
 ====================
 NOT PREPARED YET

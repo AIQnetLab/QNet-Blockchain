@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
+import androidx.core.view.WindowInsetsControllerCompat
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
@@ -18,14 +19,23 @@ class MainActivity : ReactActivity() {
   override fun getMainComponentName(): String = "QNetMobile"
 
   override fun onCreate(savedInstanceState: Bundle?) {
-    // A QNet Link is a one-time request: an activity restored, or relaunched from recents, still carries the
-    // intent that first started it, and must not hand that link to the app again.
+    // A link (QNet Link, a transfer link) is a one-time request: an activity restored, or relaunched from recents, still
+    // carries the intent that first started it, and must not hand that link to the app again.
     if (savedInstanceState != null || (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
       intent.data = null
     }
     super.onCreate(savedInstanceState)
     // The recents screen shows no snapshot of the wallet (API 33+); secret screens add FLAG_SECURE on top.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) setRecentsScreenshotEnabled(false)
+    // From API 29 the window is edge to edge (MainApplication; set up by super.onCreate), with the bars' look picked from
+    // the system's light or dark mode. The app is dark on every screen: light icons on both bars, and no system scrim
+    // over the app's own bottom bar. Below API 29 the bars keep the app's own dark colours.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      val bars = WindowInsetsControllerCompat(window, window.decorView)
+      bars.isAppearanceLightStatusBars = false
+      bars.isAppearanceLightNavigationBars = false
+      window.isNavigationBarContrastEnforced = false
+    }
   }
 
   /**
@@ -36,21 +46,26 @@ class MainActivity : ReactActivity() {
   override fun onPause() {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     super.onPause()
-    TaskState.left()
+    TaskState.left(this)
   }
 
   /**
-   * The app is open: a light node answers again (TaskState clears the mark a swipe from the recent apps set), and the
-   * watch that notices the next swipe starts. Starting it may be refused (a system that limits the app): the record of
-   * the process's end still tells on Android 11+.
+   * The app is open: a light node answers again (TaskState clears every sign of a swipe from the recent apps), and the
+   * watch that notices the next swipe starts.
    */
   override fun onResume() {
     super.onResume()
     TaskState.opened(this)
-    runCatching { startService(Intent(this, TaskWatchService::class.java)) }
+    TaskState.watch(this)
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && !SecurityModule.secretScreenOn) {
       window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
     }
+  }
+
+  // Android 7 to 10 keep no record of a removed task's end: the finishing activity notes it first (TaskState.finished).
+  override fun onDestroy() {
+    if (isFinishing && !isChangingConfigurations) TaskState.finished(this)
+    super.onDestroy()
   }
 
   /**

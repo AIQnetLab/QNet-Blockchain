@@ -1,0 +1,15 @@
+# Receive with the QR code of this wallet's QNet Blockchain address, opened from Assets and left by Back.
+appId: com.qnetmobile
+---
+- tapOn: "Receive"
+- extendedWaitUntil:
+    visible:
+      id: "receive-address"
+    timeout: 10000
+- waitForAnimationToEnd:
+    timeout: 3000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "shot/03-receive"
+- tapOn: ".*Back"

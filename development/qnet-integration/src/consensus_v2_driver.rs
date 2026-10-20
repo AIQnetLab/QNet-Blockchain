@@ -660,6 +660,21 @@ impl ConsensusDriver {
         if claimed > ours { Some(claimed) } else { None }
     }
 
+    /// A proposal at an index the view has left that is exactly the checkpoint a certificate held here
+    /// names (the certificate formed from the votes before the proposal was usable). The certificate
+    /// proves the quorum signed these bytes, so it is kept like a catch-up pair and the commit it
+    /// implies runs. None when no held certificate names it; nothing is voted either way.
+    pub fn adopt_certified(&mut self, cp: &Checkpoint) -> Option<Vec<Effect>> {
+        let h = cp.hash();
+        let qc = self.eng.qc_at(cp.index).filter(|q| q.checkpoint_hash == h)?.clone();
+        if self.proposals.contains_key(&(cp.index, h)) { return Some(Vec::new()); }
+        if crate::node::is_info() {
+            println!("[INFO][BFT2] late_checkpoint_kept idx={} head={} committed={}",
+                     cp.index, cp.window_head_height, self.eng.committed_index);
+        }
+        Some(self.sync(cp, &qc))
+    }
+
     /// Catch-up: ingest a VERIFIED committed checkpoint + QC.
     pub fn sync(&mut self, cp: &Checkpoint, qc: &QuorumCertificate) -> Vec<Effect> {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }
@@ -683,8 +698,12 @@ impl ConsensusDriver {
             ConsensusMsg::Proposal(cp) => {
                 // The engine refuses any index but its current one (checkpoint_consensus on_proposal), so a
                 // proposal at another index can draw no vote and is not stored. One that is merely early
-                // is buffered and replayed by the node loop, so nothing is lost.
+                // is buffered and replayed by the node loop, so nothing is lost. One that is late but is
+                // the checkpoint a held certificate names is kept for finality.
                 if cp.index != self.eng.current_index {
+                    if cp.index < self.eng.current_index {
+                        if let Some(effs) = self.adopt_certified(cp) { return effs; }
+                    }
                     if crate::node::is_warn() {
                         println!("[WARN][BFT2] proposal_dropped reason=index idx={} ours={} head={}",
                                  cp.index, self.eng.current_index, cp.window_head_height);
@@ -2862,6 +2881,33 @@ mod tests {
         let claim = mk_cp(nodes[0].d.current_index(), Some(QcRef { checkpoint_hash: [9u8; 32], index: 12 }), 180, "n1");
         let effs = nodes[0].d.handle(&ConsensusMsg::Proposal(claim));
         assert!(matches!(effs.as_slice(), [Effect::CatchUp { qc_index: 12, .. }]), "got {:?}", effs);
+    }
+
+    // The votes certify a checkpoint before its proposal reaches this node (it is the last to receive).
+    // The late proposal is that certified checkpoint: kept, its parent commits and finalizes at once,
+    // and the frontier is not blind. A proposal no held certificate names stays refused.
+    #[test]
+    fn a_late_proposal_its_certificate_names_is_kept_and_commits_the_parent() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let base = mk_cp(10, None, 90, "n0");
+        let base_qc = mk_qc(&c, &base, 3);
+        let late = mk_cp(11, Some(QcRef::from(&base_qc)), 120, &c[leader_index(11, &base.hash(), 4)]);
+        let me = c.iter().find(|m| **m != late.proposer).expect("a receiver").clone();
+        let mut d = ConsensusDriver::new(me.clone(), c.clone(), [7u8; 32]);
+        let _ = d.sync(&base, &base_qc);
+        for v in c.iter().filter(|m| **m != me) {
+            let effs = d.handle(&ConsensusMsg::Vote(Vote { checkpoint_hash: late.hash(), index: 11, voter: v.clone(), signature: Vec::new() }));
+            assert!(!effs.iter().any(|e| matches!(e, Effect::Finalize { .. })), "no commit before the checkpoint is held");
+        }
+        assert_eq!((d.current_index(), d.committed_index(), d.frontier_blind()), (12, 0, Some(11)));
+        let mut stray = late.clone();
+        stray.state_root = [9u8; 32];
+        assert!(d.handle(&ConsensusMsg::Proposal(stray)).is_empty(), "no certificate names it");
+        let effs = d.handle(&ConsensusMsg::Proposal(late.clone()));
+        assert!(effs.iter().any(|e| matches!(e, Effect::Finalize { index: 10, head_height: 90, .. })), "got {:?}", effs);
+        assert!(!effs.iter().any(|e| matches!(e, Effect::Vote { .. })), "a late checkpoint is never voted");
+        assert_eq!((d.committed_index(), d.frontier_blind(), d.next_window()), (10, None, 5));
+        assert!(d.handle(&ConsensusMsg::Proposal(late)).is_empty(), "a repeat changes nothing");
     }
 
     // Every node's view timer fires; the resulting timeouts (and any TC they form) are delivered.

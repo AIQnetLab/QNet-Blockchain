@@ -4,12 +4,13 @@
  * phone's lock, after the user opened it at least once since the device last started, and not swiped away since.
  *
  * - In front: it answers, and this boot is noted as opened.
- * - Swiped away since it was last opened: no answer (./TaskState, Android; iOS starts a force-quit app for no push and
- *   no fetch until it is opened or the device restarts). Android cannot see every swipe (L-7): on Android 8 to 10 a
- *   swipe more than about a minute after the app left the front, without the battery exemption, and on any version a
- *   swipe after the system had already ended the app's process, leave no mark. The node answers then, by the owner's
- *   rule that it answers when the app cannot tell; only a foreground service could see them, and the app runs none.
- *   An empty list of the app's recent tasks is no sign: the system trims it without a swipe.
+ * - Swiped away since it was last opened: no answer (./TaskState: Android marks the removed task; iOS marks the scene
+ *   closed from the app switcher, which UIKit reports at the next launch, a background one for a push or a fetch
+ *   included; its rare discard of a scene it can no longer display holds the node the same way until the next open).
+ *   Android also counts the task missing from the recent apps while the system's time limit would keep it there (the
+ *   system's trim of a list past 48 tasks within that time counts too); a swipe no running process noted, first asked
+ *   about after that time (or on a device that keeps recent apps by count alone), leaves no mark (L-7), and the node
+ *   answers then (TaskState.kt).
  * - Started again since it was last opened: no answer. Both systems may start the app in the background after a
  *   restart, for a data push or a scheduled fetch, without the user opening it. Both name the boot exactly (Android its
  *   start count, iOS its boot session id), so setting the clock never stops the node on either.

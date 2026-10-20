@@ -372,23 +372,8 @@ impl BlockchainNode {
                         // Normal operation
                     },
                     Ok(false) => {
+                        // The critical level's [CRIT] line comes from the check itself (`state=critically_full`).
                         println!("[WARN][STORAGE] node={} state=warning_or_emergency", node_id);
-                        
-                        // Check if critically full
-                        match storage.is_storage_critically_full() {
-                            Ok(true) => {
-                                println!("[CRIT][STORAGE] node={} state=critically_full action=admin_required", node_id);
-                                
-                                // Emergency slowdown to prevent crash
-                                tokio::time::sleep(Duration::from_secs(10)).await;
-                            },
-                            Ok(false) => {
-                                // Warning state, continue monitoring
-                            },
-                            Err(e) => {
-                                println!("[ERR][STORAGE] node={} action=check_critical err={}", node_id, e);
-                            }
-                        }
                     },
                     Err(e) => {
                         println!("[ERR][STORAGE] node={} action=monitoring err={}", node_id, e);

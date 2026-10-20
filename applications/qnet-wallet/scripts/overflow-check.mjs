@@ -212,6 +212,9 @@ const popupBase = {
   'qnet.tokens': tokens,
   'qnet.sendWarm': { started: true },
   'qnet.sentStatus': { status: 'in_block' },
+  'wallet.touch': { touched: true },
+  'wallet.remember': { remembered: true },
+  'clipboard.schedule': { scheduled: true },
 };
 
 const tab = (name) => ['click', `[data-tab="${name}"]`];
@@ -670,6 +673,13 @@ const POPUP = [
     steps: [tab('settings'), ['click', '[data-action="delete-wallet"]'], ['check', 'delete'], ['type', 'input[name="confirm"]', 'DELETE'], pw(),
       ['click', '[data-action="confirm-delete"]'], ['check', 'delete-wrong-password']],
   },
+  {
+    // a delete whose database could not be deleted: the wallet stays, locked, and the lock screen says so (decision 51)
+    name: 'delete-not-finished',
+    responses: { 'vault.wipe': { $error: 'INTERNAL' }, 'vault.status': { $seq: [unlocked, locked] } },
+    steps: [tab('settings'), ['click', '[data-action="delete-wallet"]'], ['type', 'input[name="confirm"]', 'DELETE'], pw(),
+      ['click', '[data-action="confirm-delete"]'], ['waitFor', '[data-action="unlock"]'], ['check', 'lock-delete-not-finished']],
+  },
 ];
 
 const earlierVault = { ...noVault, earlier: true };
@@ -783,6 +793,16 @@ const unlinkDetails = (extra = {}) => ({
 const claimDetails = (extra = {}) => ({
   mode: 'claim', reason: null, nodeId: NODE_ID, nodeType: 'light', wallet: A.qnet, amountNano: '123456789012345678', ...extra,
 });
+// a site's Solana transfer (qnet_sendSolanaTransfer, decision 52): 1DEV to an address with no token account yet
+const transferDetails = (extra = {}) => ({
+  to: SOL_RECIPIENT, asset: '1dev', mint: MINT, amount: '1234567.123456', amountRaw: '1234567123456', feeLamports: '5000',
+  rentLamports: '2039280', totalLamports: '2044280', balanceLamports: '123456789012345', tokenRaw: '9876543210987654',
+  rentFloorLamports: '890880', recipient: { known: false, lookalike: false }, shortfall: null, mode: 'confirm', reason: null, ...extra,
+});
+const TRANSFER_UNREAD = {
+  feeLamports: null, rentLamports: null, totalLamports: null, balanceLamports: null, tokenRaw: null, rentFloorLamports: null, recipient: null,
+  shortfall: null,
+};
 // a send or an activation arms after CONFIRM_ARM_VALUE_MS; a press before that starts the wait over
 const ARMED = TIMINGS.CONFIRM_ARM_VALUE_MS + 400;
 // no password: the unlocked session and the armed press confirm (a burn also needs its acknowledgement)
@@ -1027,6 +1047,50 @@ const APPROVE = [
     responses: { 'approval.get': approvalView('unlinkNodeDevice', unlinkDetails()), 'approval.resolve': { resolved: true, status: 'error', error } },
     steps: [...confirmArmed, ['waitFor', '.ap-error'], ['wait', 50], ['check', `unlink-outcome-${error}`]],
   })),
+  // Send from the wallet (qnet_sendSolanaTransfer, decision 52): the request read-only, the armed Send, the outcome
+  {
+    name: 'solana-transfer',
+    responses: {
+      'approval.get': approvalView('solanaTransfer', transferDetails()),
+      'approval.resolve': { resolved: true, status: 'submitted', error: null, signature: core.KAT.activation.burnTx },
+    },
+    steps: [['check', 'solana-transfer'], ...confirmArmed, ['waitFor', '.ap-ok'], ['check', 'solana-transfer-sent']],
+  },
+  {
+    name: 'solana-transfer-sol',
+    responses: {
+      'approval.get': approvalView('solanaTransfer', transferDetails({
+        asset: 'sol', mint: null, amount: '123456.123456789', amountRaw: '123456123456789', rentLamports: '0', totalLamports: '123456123461789',
+        tokenRaw: null, recipient: { known: false, lookalike: true },
+      })),
+    },
+    steps: [['check', 'solana-transfer-sol']],
+  },
+  {
+    name: 'solana-transfer-progress',
+    responses: { 'approval.get': approvalView('solanaTransfer', transferDetails()), 'approval.resolve': { $pending: true } },
+    steps: [...confirmArmed, ['waitFor', '.progress'], ['check', 'solana-transfer-progress']],
+  },
+  {
+    name: 'solana-transfer-reading',
+    responses: { 'approval.get': approvalView('solanaTransfer', transferDetails({ ...TRANSFER_UNREAD, mode: null, reason: null })) },
+    steps: [['check', 'solana-transfer-reading']],
+  },
+  ...['INSUFFICIENT_SOL', 'INSUFFICIENT_TOKENS', 'SOL_BELOW_RENT', 'AMOUNT_BELOW_RENT'].map((reason) => ({
+    name: `solana-transfer-unavailable-${reason}`,
+    responses: { 'approval.get': approvalView('solanaTransfer', transferDetails({ mode: 'unavailable', reason, shortfall: reason })) },
+    steps: [['check', `solana-transfer-unavailable-${reason}`]],
+  })),
+  ...['INVALID_RECIPIENT', 'SOLANA_UNAVAILABLE', 'INVALID_ADDRESS'].map((reason) => ({
+    name: `solana-transfer-unavailable-${reason}`,
+    responses: { 'approval.get': approvalView('solanaTransfer', transferDetails({ ...TRANSFER_UNREAD, mode: 'unavailable', reason })) },
+    steps: [['check', `solana-transfer-unavailable-${reason}`]],
+  })),
+  ...['TX_FAILED', 'SOL_BELOW_RENT', 'SOLANA_UNAVAILABLE'].map((error) => ({
+    name: `solana-transfer-outcome-${error}`,
+    responses: { 'approval.get': approvalView('solanaTransfer', transferDetails()), 'approval.resolve': { resolved: true, status: 'error', error } },
+    steps: [...confirmArmed, ['waitFor', '.ap-error'], ['wait', 50], ['check', `solana-transfer-outcome-${error}`]],
+  })),
 ];
 
 // oneLine: the widths at which a whole address must stay on one line
@@ -1034,7 +1098,7 @@ const PAGES = [
   { page: 'popup', html: 'ui/popup.html', widths: [360], height: 600, scenarios: POPUP, base: popupBase, oneLine: [360] },
   {
     page: 'setup', html: 'ui/setup.html', widths: [360, 800], height: 900, scenarios: SETUP,
-    base: { 'vault.status': noVault }, oneLine: [800],
+    base: { 'vault.status': noVault, 'clipboard.schedule': { scheduled: true }, 'clipboard.clearNow': { cleared: true } }, oneLine: [800],
   },
   { page: 'approve', html: `ui/approve.html?id=${APPROVAL_ID}`, widths: [400, 360], height: 640, scenarios: APPROVE, base: {}, oneLine: [400, 360] },
 ];

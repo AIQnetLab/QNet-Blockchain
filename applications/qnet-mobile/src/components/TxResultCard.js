@@ -2,7 +2,7 @@ import React from 'react';
 import { View, Text, TouchableOpacity, Linking } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { explorerTxUrl } from '../config/nodes';
-import { currentLanguage, tr } from '../i18n';
+import { tr } from '../i18n';
 import { amountText } from '../utils/amountFormat';
 import styles from '../screens/WalletScreen.styles';
 import { InfoField } from './InfoRow';
@@ -21,7 +21,7 @@ const ICON = {
  * Three outcomes, because a transaction really has three: it applied, it was refused, or nobody
  * answered and the chain has not decided yet. `pending` exists so an unanswered submit is never
  * reported as a refusal — it still shows its amount, since it may well have gone through. The amount comes as a
- * canonical figure and is shown in the figures of the language.
+ * canonical figure and is shown as every screen writes amounts (utils/amountFormat).
  */
 export default function TxResultCard({
   state = 'success', title, amount, symbol, counterparty, counterpartyLabel, note, hash, error,
@@ -51,7 +51,7 @@ export default function TxResultCard({
 
       {!failed && amount !== undefined && amount !== null && amount !== '' ? (
         <Text style={[styles.txResultAmount, styles.ltr]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.3}>
-          {amountText(amount, t.lang || currentLanguage())}{symbol ? ` ${symbol}` : ''}
+          {amountText(amount)}{symbol ? ` ${symbol}` : ''}
         </Text>
       ) : null}
 

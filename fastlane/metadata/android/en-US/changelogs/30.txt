@@ -1,0 +1,4 @@
+• A node on this device is not counted after the app is closed from the recent apps, until the app is opened again
+• Amounts read the same in every language, as 42,578.81988
+• A copied recovery phrase or private key is cleared on time, also after the app is closed
+• Unlock with the device's screen lock where it has one, otherwise with a password

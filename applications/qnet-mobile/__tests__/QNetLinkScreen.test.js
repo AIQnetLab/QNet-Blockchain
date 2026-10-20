@@ -436,6 +436,41 @@ describe('the link and claim sheets', () => {
     await act(async () => { refused.unmount(); });
   });
 
+  // The node already runs here. The sheet says so and discloses no device check (nothing is checked or bound); Confirm
+  // asks for the authentication before the website learns anything, and the done screen says nothing changed.
+  it('the node already runs here: said so, nothing to bind; Confirm only tells the website', async () => {
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'link', mode: 'here', nodeId: NODE_ID, qnet: ADDRESSES.qnet, seq: 1790000000 });
+    QNetLink.performIntent.mockResolvedValue({ status: 'linked', qnet: ADDRESSES.qnet, nodeId: NODE_ID, seq: '1790000000', already: true });
+    const tree = await mount(LINK_L);
+    const shown = texts(tree);
+    expect(shown).toContain(t('link_link_here_body'));
+    for (const s of [t('link_link_existing_body'), t('link_device_check_body'), t('link_cant_run_sheet')]) expect(shown).not.toContain(s);
+    await wait(ARMED);
+    await act(async () => { await press(button(tree, 'Confirm')); });
+    expect(props.authenticate).toHaveBeenCalledWith(t('link_auth_here'));
+    expect(texts(tree)).toContain(t('link_result_already_here'));
+    expect(texts(tree)).not.toContain(t('link_result_linked'));
+    await act(async () => { tree.unmount(); });
+  });
+
+  // A refused move said only "did not link this device". The reason goes under it: the time a
+  // limit ends when the node names it, a clock that is off.
+  it('a refused move says why: the limit with its end, a clock that is off', async () => {
+    for (const [answer, key] of [
+      [{ status: 'error', error: 'BIND_REFUSED', reason: 'rate_limited', retryAfterSeconds: null }, t('node_use_err_limit')],
+      [{ status: 'error', error: 'BIND_REFUSED', reason: 'expired' }, t('node_use_err_clock')],
+      [{ status: 'error', error: 'BIND_REFUSED', reason: 'future_seq' }, t('node_use_err_clock')],
+    ]) {
+      QNetLink.prepareOffer.mockResolvedValue({ ...consentOffer(), mode: 'device' });
+      QNetLink.performIntent.mockResolvedValue(answer);
+      const tree = await mount(LINK_L);
+      await wait(ARMED);
+      await act(async () => { await press(button(tree, 'Confirm')); });
+      expect([answer.reason, texts(tree).includes(t('link_err_BIND_REFUSED')), texts(tree).includes(key)]).toEqual([answer.reason, true, true]);
+      await act(async () => { tree.unmount(); });
+    }
+  });
+
   it('the claim sheet names the light node and shows the amount the app read, and the done screen the move', async () => {
     QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, nodeType: 'light', qnet: ADDRESSES.qnet, amountNano: 12500000000 });
     QNetLink.performIntent.mockResolvedValue({

@@ -116,6 +116,11 @@ body.page-setup {
   text-align: start;
 }
 
+/* a typed phrase while another window has the focus (setup.js BLUR_COVER): masked, never emptied */
+.window-blurred .blur-mask {
+  -webkit-text-security: disc;
+}
+
 @media (max-width: 480px) {
   .setup-card {
     padding: 16px;

@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import * as core from '../dist/lib/qnet-core.js';
-import { LIMITS } from '../dist/background/config.js';
+import { LIMITS, SOLANA } from '../dist/background/config.js';
 import { ProviderError, WalletError } from '../dist/background/errors.js';
 import {
   CALL_ARGS_MAX_BYTES, PROVIDER_METHODS, PROVIDER_RESULT_KEY_EXCEPTIONS, RESULT_KEY_EXCEPTIONS, SECRET_RESULT_KEYS, UI_MESSAGES, createRouter,
@@ -57,6 +57,12 @@ const VALID = Object.freeze({
   'wallet.addresses': {},
   // the popup's view cache and the Solana History (decision 39)
   'wallet.cached': {},
+  // the user acting on the popup, and where the popup is with its Send form's draft (batch 19.10)
+  'wallet.touch': {},
+  'wallet.remember': { network: 'solana', tab: 'send', asset: '1dev', to: SOL, amount: '12.5' },
+  // a secret copied from a page leaves the clipboard by the worker's hand
+  'clipboard.schedule': { afterMs: 60000 },
+  'clipboard.clearNow': {},
   'qnet.balance': {},
   'qnet.history': { cursor: null, limit: 20 },
   'qnet.preview': { to: QNET, amount: '1.5' },
@@ -110,7 +116,7 @@ const firstPage = (type) => UI_MESSAGES[type].pages[0];
 
 function harness({ manifest = APP_MANIFEST, unlocked = true, handlers = {}, providerRequest, touchFails = false } = {}) {
   const runtime = createRuntime({ manifest });
-  const h = { runtime, calls: [], providerCalls: [], closed: [], unlockChecks: 0, touches: 0 };
+  const h = { runtime, calls: [], providerCalls: [], closed: [], unlockChecks: 0, touches: 0, draftDrops: 0 };
   const stubs = {};
   for (const type of Object.keys(UI_MESSAGES)) {
     stubs[type] = async (params, meta) => {
@@ -127,6 +133,10 @@ function harness({ manifest = APP_MANIFEST, unlocked = true, handlers = {}, prov
     },
     touch: async () => {
       h.touches += 1;
+      if (touchFails) throw new Error('storage gone');
+    },
+    forgetDraft: async () => {
+      h.draftDrops += 1;
       if (touchFails) throw new Error('storage gone');
     },
     providerRequest: providerRequest ?? (async (ctx, method, params) => {
@@ -167,7 +177,8 @@ describe('router: message table', () => {
     for (const type of SPEC_TYPES) assert.ok(Object.hasOwn(UI_MESSAGES, type), type);
     assert.deepEqual(Object.keys(PROVIDER_METHODS).sort(), [
       'qnet_accounts', 'qnet_activateNode', 'qnet_chainId', 'qnet_claimNodeBalance', 'qnet_disconnect', 'qnet_getActivation',
-      'qnet_getTransactionStatus', 'qnet_requestAccounts', 'qnet_sendTransaction', 'qnet_signMessage', 'qnet_unlinkNodeDevice',
+      'qnet_getTransactionStatus', 'qnet_requestAccounts', 'qnet_sendSolanaTransfer', 'qnet_sendTransaction', 'qnet_signMessage',
+      'qnet_unlinkNodeDevice',
     ]);
   });
 
@@ -185,6 +196,10 @@ describe('router: message table', () => {
     }
     // the activation window reads the light node's registration after its answer; nothing else reaches it from there
     assert.deepEqual(UI_MESSAGES['activation.registration'].pages, ['popup', 'approve']);
+    for (const type of ['wallet.touch', 'wallet.remember']) assert.deepEqual(UI_MESSAGES[type].pages, ['popup'], type);
+    // the pages that copy a secret (the approval window copies none); setup's end empties the clipboard at once
+    assert.deepEqual(UI_MESSAGES['clipboard.schedule'].pages, ['popup', 'setup']);
+    assert.deepEqual(UI_MESSAGES['clipboard.clearNow'].pages, ['setup']);
   });
 
   it('requires an unlocked session for every type that reads the wallet or spends', () => {
@@ -198,6 +213,19 @@ describe('router: message table', () => {
     }
     // the unlink signs: a success extends the auto-lock deadline as the popup's other node actions do
     assert.equal(UI_MESSAGES['node.unlink'].activity, true);
+    // the user acting on the popup extends it; where the popup is never does, and neither does a read
+    assert.equal(UI_MESSAGES['wallet.touch'].unlocked, true);
+    assert.equal(UI_MESSAGES['wallet.touch'].activity, true);
+    assert.equal(UI_MESSAGES['wallet.remember'].unlocked, true);
+    assert.equal(UI_MESSAGES['wallet.remember'].activity, false);
+    for (const type of ['qnet.balance', 'qnet.history', 'qnet.tokens', 'solana.balances', 'solana.history', 'wallet.cached']) {
+      assert.equal(UI_MESSAGES[type].activity, false, type);
+    }
+    // a clipboard clear needs no session: setup copies the new phrase before a vault exists
+    for (const type of ['clipboard.schedule', 'clipboard.clearNow']) {
+      assert.equal(UI_MESSAGES[type].unlocked, false, type);
+      assert.equal(UI_MESSAGES[type].activity, false, type);
+    }
   });
 });
 
@@ -401,6 +429,31 @@ describe('router: UI message schema', () => {
       ['solana.status', { ...VALID['solana.status'], lastValidBlockHeight: -1 }, 'lastValidBlockHeight'],
       ['solana.status', { ...VALID['solana.status'], lastValidBlockHeight: '300' }, 'lastValidBlockHeight'],
       ['solana.status', { ...VALID['solana.status'], commitment: 'processed' }, 'commitment'],
+      // where the popup is: one of its networks and tabs, a draft whose recipient has an address's length and letters, so
+      // a phrase, a private key or an activation code pasted into the field is never kept
+      ['wallet.remember', { tab: 'send' }, 'network'],
+      ['wallet.remember', { network: 'qnet', tab: 'node' }, 'tab'],
+      ['wallet.remember', { network: 'solana', tab: 'send', to: core.KAT.mnemonic }, 'to'],
+      ['wallet.remember', { network: 'solana', tab: 'send', to: 'abandon ability able about above absent absorb' }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', to: 'cd'.repeat(32) }, 'to'],
+      ['wallet.remember', { network: 'solana', tab: 'send', to: core.base58Encode(new Uint8Array(64).fill(7)) }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', to: core.KAT.activation.code }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', to: QNET.slice(0, 20) }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', to: 'a\nb' }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', to: 'a\u0000b' }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', to: '' }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', amount: '1e3' }, 'amount'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', asset: 'QNC token' }, 'asset'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', asset: 'a'.repeat(65) }, 'asset'],
+      ['wallet.remember', { network: 'solana', tab: 'send', to: 'a'.repeat(2049) }, 'to'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', amount: '1'.repeat(41) }, 'amount'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', amount: '1.2.3' }, 'amount'],
+      ['wallet.remember', { network: 'qnet', tab: 'send', request: 'solana:x' }, 'request'],
+      ['clipboard.schedule', {}, 'afterMs'],
+      ['clipboard.schedule', { afterMs: -1 }, 'afterMs'],
+      ['clipboard.schedule', { afterMs: 60001 }, 'afterMs'],
+      ['clipboard.schedule', { afterMs: '60000' }, 'afterMs'],
+      ['clipboard.clearNow', { text: '' }, 'text'],
       ['settings.set', { autoLockMinutes: 0 }, 'autoLockMinutes'],
       ['settings.set', { autoLockMinutes: 120 }, 'autoLockMinutes'],
       ['settings.set', { autoLockMinutes: '15' }, 'autoLockMinutes'],
@@ -506,6 +559,10 @@ describe('router: UI message schema', () => {
     for (const language of ['zh-CN', 'ar', 'ru', 'pt']) {
       assert.equal((await h.ui('popup', 'settings.set', { language })).ok, true, language);
     }
+    // a draft's recipient: an address of either network
+    for (const to of [QNET, SOL, core.solanaAddressFromPublicKey(new Uint8Array(32))]) {
+      assert.equal((await h.ui('popup', 'wallet.remember', { network: 'qnet', tab: 'send', to })).ok, true, to);
+    }
   });
 });
 
@@ -534,6 +591,22 @@ describe('router: UI dispatch', () => {
     assert.equal(failing.touches, 0);
     const brokenTouch = harness({ touchFails: true });
     assert.equal((await brokenTouch.ui('popup', 'qnet.send', VALID['qnet.send'])).ok, true);
+  });
+
+  // The worker drops the popup's Send draft once a send went, so a popup closed while it ran never opens on it again.
+  it('drops the Send draft after a send that went, and only then', async () => {
+    const SENDS = ['qnet.send', 'qnet.tokenSend', 'solana.send'];
+    assert.deepEqual(Object.keys(UI_MESSAGES).filter((type) => UI_MESSAGES[type].sends).sort(), SENDS.sort());
+    const h = harness();
+    for (const type of SENDS) await h.ui('popup', type, VALID[type]);
+    assert.equal(h.draftDrops, 3);
+    for (const type of ['qnet.preview', 'solana.quote', 'wallet.remember']) await h.ui('popup', type, VALID[type]);
+    assert.equal(h.draftDrops, 3, 'no read or remember drops it');
+    const failing = harness({ handlers: { 'solana.send': async () => { throw new WalletError('FEE_CHANGED'); } } });
+    await failing.ui('popup', 'solana.send', VALID['solana.send']);
+    assert.equal(failing.draftDrops, 0, 'a send that did not go keeps the draft');
+    const broken = harness({ touchFails: true });
+    assert.equal((await broken.ui('popup', 'qnet.tokenSend', VALID['qnet.tokenSend'])).ok, true, 'the send still answers');
   });
 
   it('returns fixed error messages and never the thrown text', async () => {
@@ -831,6 +904,42 @@ describe('router: provider port', () => {
     }
     assert.deepEqual(h.providerCalls.map((call) => [call.ctx.origin, call.method, call.params]),
       Array.from({ length: 4 }, () => [SITE, 'qnet_unlinkNodeDevice', {}]));
+  });
+
+  // Decision 52: aiqnet.io's one SOL or 1DEV transfer; the site's probe is a call without params, refused with -32602 here
+  it('serves qnet_sendSolanaTransfer to https://aiqnet.io only: 4100 elsewhere before the params, -32602 for the probe and any other shape', async () => {
+    const h = harness();
+    const MINT = SOLANA.ONE_DEV_MINT;
+    for (const url of ['https://games.aiqnet.io/', `${APP}/node`]) {
+      const other = h.connect(url);
+      for (const params of [undefined, { to: SOL, mint: null, amount: '0.001' }]) {
+        assert.equal(errorOf(await ask(other, { id: 'a', method: 'qnet_sendSolanaTransfer', params })).code, 4100, url);
+      }
+    }
+    const port = h.connect(`${SITE}/node/activate`);
+    // the probe: no params of any empty form reaches the provider, opens nothing and counts nothing
+    for (const params of [undefined, null, [], {}]) {
+      assert.equal(errorOf(await ask(port, { id: 'probe', method: 'qnet_sendSolanaTransfer', params })).code, -32602, JSON.stringify(params));
+    }
+    const other = core.solanaAddressFromPublicKey(new Uint8Array(32).fill(7));
+    for (const params of [
+      { to: SOL, mint: other, amount: '1' }, { to: SOL, mint: null, amount: '0' }, { to: SOL, mint: MINT, amount: '1.50' },
+      { to: SOL, mint: MINT, amount: '1e3' }, { to: SOL, mint: MINT, amount: '1,500' }, { to: SOL, mint: MINT, amount: '0.0000001' },
+      { to: SOL, mint: null, amount: '0.0000000001' }, { to: SOL, mint: null, amount: '0.001', memo: 'x' },
+      { to: SOL, mint: null, amount: '0.001', references: [other] }, { to: SOL, amount: '0.001' }, { mint: null, amount: '1' },
+      { to: SOL, mint: null, amount: 1 }, { to: SOL, mint: null, amount: '-1' }, { to: SOL, mint: null, amount: '01' }, { to: SOL, mint: null, amount: '.5' },
+      { to: QNET, mint: null, amount: '1' }, { to: SOL, mint: MINT.toLowerCase(), amount: '1' }, ['x'], 'x',
+    ]) {
+      assert.equal(errorOf(await ask(port, { id: 'p', method: 'qnet_sendSolanaTransfer', params })).code, -32602, JSON.stringify(params));
+    }
+    assert.equal(h.providerCalls.length, 0, 'nothing invalid reaches the provider');
+    const asked = [{ to: SOL, mint: MINT, amount: '1500' }, { to: SOL, mint: MINT, amount: '0.000001' }, { to: SOL, mint: null, amount: '0.001' },
+      { to: SOL, mint: null, amount: '0.000000001' }, { to: SOL, mint: MINT, amount: '500.5' }];
+    for (const params of asked) {
+      assert.equal((await ask(port, { id: 'ok', method: 'qnet_sendSolanaTransfer', params })).ok, true, JSON.stringify(params));
+    }
+    assert.deepEqual(h.providerCalls.map((call) => [call.ctx.origin, call.method, call.params]),
+      asked.map((params) => [SITE, 'qnet_sendSolanaTransfer', params]));
   });
 
   it('lets an activation code out to the dApp from qnet_activateNode and qnet_getActivation only', async () => {

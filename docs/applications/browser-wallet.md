@@ -10,8 +10,9 @@ Wallet on a phone or tablet linked from aiqnet.io, and a super node, which is ac
 with the QNet Blockchain node software. It can end the light node on whatever device runs it: the wallet key signs the node's
 unbind when aiqnet.io's Device tab asks it. It also exposes a provider to aiqnet.io and games.aiqnet.io, so
 that pages can connect to the wallet and ask for QNC transfers, built-in token transfers and contract calls, and, on
-aiqnet.io itself, ask it to activate a node, to move the balance of the wallet's light or super node into the wallet
-and to unlink the node's device. Its own popup offers no move of a node balance: aiqnet.io's My node asks for it, and
+aiqnet.io itself, ask it to activate a node, to move the balance of the wallet's light or super node into the wallet,
+to unlink the node's device, and to send SOL or 1DEV to an address it names, which the user confirms in the window. Its
+own popup offers no move of a node balance: aiqnet.io's My node asks for it, and
 QNet Wallet's Node tab moves it too. Its windows speak the mobile wallet's eleven languages.
 
 ## Layout
@@ -23,6 +24,8 @@ QNet Wallet's Node tab moves it too. Its windows speak the mobile wallet's eleve
 | `dist/background/router.js` | The only message entry: checks the sender and the exact shape of every message and every result |
 | `dist/background/vault.js` | The encrypted vault in IndexedDB, and next to it the light client's anchors and the chain cache (both with a MAC of the vault key) and the genesis capsule the light client holds |
 | `dist/background/session.js` | Unlock, lock, auto-lock, password backoff, the popup's view cache of the session and the balances kept across sessions |
+| `dist/background/clipboard.js` | The clipboard clear after a page copied the recovery phrase, a private key or the activation code: the due time, its own alarm, and the empty text written through the offscreen document |
+| `dist/background/platform.js` | The chrome.* helpers `session.js` and `clipboard.js` share: the API read at call time, every call as a promise, one-shot alarms |
 | `dist/background/keys.js` | Per-operation key derivation and signing, the password-gated private key export |
 | `dist/background/qnet.js` | QNet Blockchain node requests, the balance and nonce at a node's live tip and their certified check, QNC transfers, the wallet's built-in tokens and their transfers (the popup's and a site's), contract calls, history, the chain the wallet follows, the requests to aiqnet.io's record of burns |
 | `dist/background/solana.js` | Solana RPC, SOL and 1DEV transfers, the Solana history, the burn transaction and the burn matcher |
@@ -32,7 +35,7 @@ QNet Wallet's Node tab moves it too. Its windows speak the mobile wallet's eleve
 | `dist/background/config.js`, `amount.js`, `errors.js`, `events.js`, `log.js` | Build constants of the release channel, integer amount parsing, fixed error codes, notices to open pages, the logger (silent in the store build) |
 | `dist/content/relay.js` | Content script (isolated world) between the page and the service worker |
 | `dist/inject/provider.js` | Content script in the page's world: the provider object |
-| `dist/ui/popup.*`, `setup.*`, `approve.*` | The popup, the setup tab and the approval window |
+| `dist/ui/popup.*`, `setup.*`, `approve.*`, `offscreen.*` | The popup, the setup tab, the approval window, and the offscreen document that empties the clipboard for `clipboard.js` (no interface) |
 | `dist/ui/common.js`, `kit.js`, `qr.js` | Safe DOM helpers and the language switch, UI components, the local QR encoder |
 | `dist/ui/i18n/` | The texts of every page in each language (`en.js` is the source) and the loader |
 | `dist/lib/qnet-core.js` | The crypto bundle, built by `tools/crypto-bundle` |
@@ -95,7 +98,10 @@ the dApp approvals to lock and delete. Static checks cover every shipped file: n
 
 ## Manifest
 
-- `permissions`: `storage`, `alarms`, `idle`. No other permission.
+- `permissions`: `storage`, `alarms`, `idle`, `offscreen` and `clipboardWrite`. No other permission. The last two let the
+  service worker empty the clipboard of a copied recovery phrase, private key or activation code through an offscreen
+  document after the popup closed (see Vault and session); the browser shows `clipboardWrite` as a permission to change
+  copied data when the extension is installed, and asks for it again when an installed one updates to it.
 - `host_permissions`: `https://node1.aiqnet.io/*` … `https://node5.aiqnet.io/*`,
   `https://aiqnet.io/*` (the explorer archive, aiqnet.io's record of wallet burns, and the tabs of aiqnet.io an event
   reaches when their port is closed) and the Solana RPC of the release channel (`https://api.devnet.solana.com/*`
@@ -170,7 +176,8 @@ lifetime, and the next worker start runs it again.
   to `chrome.storage.session` with access restricted to trusted contexts, so a restarted worker stays
   unlocked until the lock deadline.
 - **Lock.** The auto-lock is 5, 15 (default), 30 or 60 minutes, or Never, and runs on `chrome.alarms`. Only
-  actions extend it, never reads. Never sets no inactivity timer. Whatever the choice, the wallet also locks when
+  actions extend it, never reads: opening the popup and a press or a key on it count as one (told to the service worker
+  at most every 30 seconds), as do signing, the settings and showing a secret. Never sets no inactivity timer. Whatever the choice, the wallet also locks when
   the browser starts or closes, when the screen locks, and on the Lock button. Locking clears the key from memory and from session storage; open
   pages clear their fields, and the popup shows the lock screen.
 - **Keys.** Private keys are derived for one operation, used, and overwritten with zeros. No page
@@ -185,7 +192,9 @@ lifetime, and the next worker start runs it again.
   canonicalizes it, as the mobile wallet does (see Identity and derivation). The tab reports success only
   after the vault has been written, read back, decrypted with the new password and its addresses re-derived.
   The success screen shows both addresses and stays until the user presses Done, which closes the tab; no timer
-  closes it. There is no download of the phrase.
+  closes it. There is no download of the phrase. While another window has the focus, a phrase typed into Import is
+  masked until the focus is back and the shown words go back behind Show the words; no typed phrase or password is
+  emptied by it (a screen lock, a hidden tab and ten idle minutes still empty them).
 - **A wallet of the earlier version.** The store's 2.1.x kept its wallet, encrypted with its password (PBKDF2-SHA256 and
   AES-GCM), in the extension's `chrome.storage.local`, and a second copy of its recovery phrase in the extension's
   IndexedDB; it updates into this version under the same store item. Its password change re-encrypted only the second
@@ -204,25 +213,33 @@ lifetime, and the next worker start runs it again.
   a lock, the popup closing).
 - **Copying the phrase.** The words cannot be selected, copied or dragged out of setup's word grid. Both screens that
   show them have a **Copy** button that copies only on an explicit click; on the setup screen the warning next to it
-  says that anyone who can read the clipboard can take the wallet and that the clipboard is cleared in 60 seconds if the
-  page stays open, and Settings clears it the same way without a text. The copy is the canonical words on one line. After 60 seconds the page empties the clipboard if nothing was
-  copied from it since (a page without the focus then does it as soon as it has the focus again); setup also
-  empties it when the wallet is set up, since the user may close the tab right after, and deleting or resetting the
-  wallet empties it at once when it still holds a copy the popup made and has yet to clear (an activation code, the
-  phrase or a private key); anything else on the clipboard stays, such as a phrase about to be imported after a reset.
-  A page cannot read the clipboard, and a closed page cannot clear it: the popup closes as soon as the user clicks
-  elsewhere.
+  says that anyone who can read the clipboard can take the wallet and that the wallet clears the clipboard after 60
+  seconds, and Settings clears it the same way without a text. The copy is the canonical words on one line.
+- **Clearing the clipboard.** The service worker empties it, whether or not the page that copied is still open: the
+  popup closes as soon as the user clicks elsewhere. After a copy of the phrase or a private key (60 seconds) or of the
+  activation code (45 seconds) the page tells the service worker, which keeps only the due time (never the text, in
+  memory and `chrome.storage.session`) and an alarm; when it fires, the worker opens an offscreen document that writes an
+  empty text to the clipboard and closes it. The browser fires such an alarm no sooner than 30 seconds after it was set
+  (a minute before Chrome 120), so the code's 45 seconds become a minute there. A later copy from any of the wallet's
+  pages (an address), also from a popup opened after the one that copied the secret closed, drops the clear, since the
+  secret is no longer on the clipboard. Nothing reads the clipboard, so whatever is
+  on it when the time is up is emptied. Setup has it emptied at once when the wallet is set up, and deleting or
+  resetting the wallet empties it as part of the erase when a clear is still due; anything else on the clipboard stays,
+  such as a phrase about to be imported after a reset.
 - **Delete** needs the word `DELETE` typed and the password; Enter in the password field deletes as the button does,
-  and a wrong password empties only the password field, so the typed `DELETE` stays. It deletes the vault database,
-  clears `chrome.storage.local` (all but the chosen interface language, which holds no wallet data) and
-  `chrome.storage.session`, takes the popup's own pending copy off the clipboard, disconnects every site, and the open
-  pages reload.
+  and a wrong password empties only the password field, so the typed `DELETE` stays. It locks the wallet, deletes the
+  vault database, clears `chrome.storage.local` (all but the chosen interface language, which holds no wallet data, and
+  a wallet of the earlier version that still opens) and `chrome.storage.session`, and empties the clipboard of a copied
+  secret still due to be cleared. Only once the vault record is gone are the open pages told: they reload, and every
+  site the wallet's grants named, or that is connected now, is disconnected, also when the service worker restarted
+  since it last read the grants. A delete whose database could not be deleted tells nothing: the wallet stays,
+  locked, and the popup shows the lock screen with "The wallet was not deleted. Unlock it and try again."
 - **Forgot password.** The lock screen offers "Forgot password?", which opens one screen, Reset wallet: the extension
   cannot recover the password, and setting a new one takes a reset; one danger warning says that the reset removes the
   wallet from this browser and that only its recovery phrase brings it back. It asks for no recovery phrase, no
   password and no typed word: Back returns to the lock screen, and **Reset wallet** erases the locked wallet, as
-  Delete erases it (the vault database, `chrome.storage.local` but the interface language and
-  `chrome.storage.session`, the earlier version's copies, the password backoff; every site is disconnected), whatever
+  Delete erases it (the vault database, `chrome.storage.local` but the interface language and an earlier version's
+  wallet that still opens, `chrome.storage.session`, the password backoff; every site is disconnected), whatever
   the stored record holds. The press first asks
   the service worker for a one-time token, bound to that popup and valid for one minute, then sends the reset with it
   and a fixed confirmation; only the popup may send either request, and no site, content script or other extension
@@ -239,10 +256,10 @@ when that version's service worker stopped in the middle, is deleted at the next
 unlock. `chrome.storage.local` holds
 the site grants (each carrying a MAC, see below) and the chosen language (a display preference only); a wallet of the
 earlier version stays there (and its second copy in its own IndexedDB database), untouched, until it is moved or
-removed; Delete wallet removes it too (see Vault and session).
+removed; Delete wallet and a reset keep it while it opens, and remove what the earlier version left that opens nothing.
 `chrome.storage.session`, which the browser keeps in memory only, holds the unlocked session, the
-password backoff counter, the self-test pass, the per-site approval cooldowns, the popup's view cache (gone with every
-lock), and the light client's hints (the certified head it saw last
+password backoff counter, the self-test pass, the per-site approval cooldowns, the popup's view cache and where the popup
+was (gone with every lock), the due time of a clipboard clear, and the light client's hints (the certified head it saw last
 and until when no node is asked for a capsule), so that a service worker woken from sleep goes on from there. The extension pages keep
 nothing in `localStorage` or `sessionStorage`, and empty both when they open. Nothing else is stored; `CONTRACTS.md` section 7 is the full
 map.
@@ -434,7 +451,10 @@ Errors carry a fixed code and message, never the thrown text.
   checks, each only when its macroblock is at most 4 walk steps away, waits for none of them and shows their verdicts
   from the next read on; a row whose proof is another row's or folds to another root stays unverified for good, whatever
   the nodes list. Each row is one
-  transaction, laid out and worded as the mobile wallet's History: the asset's icon (QNC, the token's letter for a
+  transaction: a token transfer this wallet sent, which the archive lists twice under one hash (its contract call and
+  the token's own row), is one row, the token row, with the network fee the call paid in its detail, also when the two
+  fall on different pages; a call that wrote no token event keeps its own row. Rows are laid out and worded as the mobile
+  wallet's History: the asset's icon (QNC, the token's letter for a
   built-in token) with a small round badge of what happened at its lower corner, a disc in the amount's colour with a
   dark glyph (sent: an arrow up and out, white; received: an arrow down, green; to yourself: a loop, swap: two arrows,
   node: a hexagon, all three blue; contract: code brackets, grey; burn: a flame, amber; a white cross on red when
@@ -444,7 +464,7 @@ Errors carry a fixed code and message, never the thrown text.
   characters of the address; "Node" and its id for the light node registration this wallet submitted; "From: node
   balance"; "Contract" and its id for a contract call or deploy; nothing for a transfer to yourself), and the amount
   with its sign (incoming green, outgoing plain, to yourself blue, muted when nothing moved; none for a contract call,
-  nor for a registration or deploy that moves no QNC), written compactly in the language's marks by the mobile wallet's rule (grouped below
+  nor for a registration or deploy that moves no QNC), written compactly by the mobile wallet's rule, in the one format of every language (grouped below
   100,000 with at most two decimals from 1,000, four from 1 and eight below 1; K, M, B, T from 100,000 with at most two;
   powers of ten from 10^18) and its exact figure in the detail. The archive gives a node registration no recipient: it
   is one "Node registered" row, never a transfer of 0 QNC, confirmed when two pinned nodes list a registration with its
@@ -486,6 +506,14 @@ Errors carry a fixed code and message, never the thrown text.
   What is drawn from the cache carries a quiet "Updating…" until the read behind it ends; a read that fails leaves the
   figure with "Could not update: this is the last balance the wallet read." The popup reads the other network's
   balances and both first history pages in the background once the screen's own read is done, so a switch between QNet Blockchain and Solana shows its numbers at once.
+- **Where the popup was.** The popup opens again on the network and the tab it showed last in this session, and on the
+  Send tab with the form's draft (the asset, the recipient and the amount as typed), drawn once. The service worker keeps
+  them with the view cache, so a lock drops them; the draft is written half a second after the last change and when the
+  popup closes, and is never kept while a payment request fills the form (its memo and references are not kept). The
+  service worker drops it once a send went, also when the popup closed while the send ran, so the popup never opens on
+  a transfer it already sent. A recipient is kept only when it has an address's length and letters (45 for QNet
+  Blockchain, 32 to 44 for Solana), so a recovery phrase, a private key or a code pasted there by mistake is never
+  stored. A token the token list no longer names brings back only the recipient.
 - **The chain the wallet follows.** The chain cache also keeps the highest network head the wallet saw (the head two
   nodes report, kept in steps of 10 macroblocks). A head 10 or more macroblocks below it means the nodes serve another
   chain (a restarted test network: the live network never goes back, and a lagging node is a few blocks behind): the
@@ -737,8 +765,9 @@ a phone or tablet (decision 36).
   another burn over it.
 - **The code** is in Settings, beside the recovery phrase and the private key: one plain row with the code masked,
   **Show** and **Copy**, no warning and no timer. The code comes into the page only when the user presses one of them
-  (no password while the wallet is unlocked) and leaves it with Settings. Copy copies at once, and the popup clears the
-  clipboard after 45 seconds if nothing was copied since and it is still open. A Light code is the
+  (no password while the wallet is unlocked) and leaves it with Settings. Copy copies at once, and the service worker
+  empties the clipboard 45 seconds later (a minute before Chrome 120), whether the popup is open or not (see Clearing the
+  clipboard). A Light code is the
   burn's receipt: the wallet records the node on QNet Blockchain (below), and the node runs in QNet Wallet on a phone
   or tablet linked on aiqnet.io/node with the same recovery phrase; the node never needs the code. A Super node runs only on a server with the
   QNet Blockchain node software; nothing of it is linked to a phone. Its code goes into the server's environment variables with the
@@ -890,6 +919,37 @@ amount above zero for a part the node's quote stopped short of, with `stoppedAtE
 `NO_NODE`, `NETWORK`, `CLAIM_REFUSED`, `CLAIM_BUSY` or `INTERNAL`; a reject is 4001. The network credits the move once
 a block includes it. The popup itself has no move of a node balance; History shows a move as "From: node balance".
 
+### Send from your wallet for aiqnet.io
+
+The Funding step of aiqnet.io/node/activate shows the payment address and buttons that send what it still lacks, first
+the 1DEV, then the SOL. With the extension they call `qnet_sendSolanaTransfer` (CONTRACTS.md decision 52) with
+`{to, mint, amount}`: `to` a Solana address other than the wallet's own, `mint` null for SOL or exactly the build's 1DEV
+mint, `amount` a plain decimal in whole tokens above zero with at most the token's decimals (9 for SOL, 6 for 1DEV) and
+no trailing zero in the fraction (`'500'`, `'0.5'`, `'0.001'`). Only `https://aiqnet.io` may ask (4100 for any other
+origin, games.aiqnet.io included); no grant is needed. A call without params answers -32602 at once, before anything is
+read, opened or counted: that is how the site learns the extension takes the transfer (an extension without the method
+answers 4200). Any other shape, another mint, too many decimals, a key other than these three, or the wallet's own
+address is -32602. Without a wallet the answer is `{status: 'error', error: 'NO_WALLET'}` at once.
+
+Otherwise the approval window opens: "Send from your wallet", with the origin as the browser reported it and the Solana
+Send review, read-only, with the same rows as the popup's: the recipient with the first-send and look-alike warnings,
+the token and its mint, the amount as asked, the network fee, the rent of the recipient's 1DEV account when the transfer
+creates it, the SOL spent in all and the network, then the wallet's SOL (and 1DEV) balance. Nothing in it can be edited,
+and nothing the site sends afterwards changes it: one request is one transfer, and a second request is a second window.
+Send arms after 1.5 seconds like any transaction; there is no password (a locked wallet unlocks first). A balance that
+cannot cover the transfer, its fee and any rent shows why, with its numbers, and one Close. When Solana does not answer,
+the window says so and reads again every 3 seconds, up to five times, then every 20 seconds; the review appears as soon
+as a read succeeds. Send signs and sends exactly the reviewed transfer (one System Transfer, or a TransferChecked after
+the idempotent creation of the recipient's associated account); a changed fee or an expired blockhash reviews again in
+the same window. The window then shows the signature, or why nothing was transferred, until it is closed (at most 30
+seconds); closing it never stops a sent transfer, and the next request's window opens after it.
+
+The answer is `{status: 'submitted', signature}` as soon as the transaction was sent, or `{status: 'error', error}` with
+`INSUFFICIENT_SOL`, `INSUFFICIENT_TOKENS`, `SOLANA_UNAVAILABLE`, `TX_FAILED`, `NO_WALLET` or `INTERNAL`, which means
+nothing was transferred (`TX_FAILED` also when the transaction was sent and failed on chain: it moved no tokens, though
+its network fee is spent); a reject or a closed window is 4001. The site never waits on the answer: it reads the payment
+address's balance for what arrived.
+
 ## Page provider
 
 On `https://aiqnet.io` and `https://games.aiqnet.io`, and on no other site, the extension gives pages a
@@ -922,16 +982,17 @@ learns the page's origin from the browser, never from a message.
 | `qnet_getActivation` | none | `https://aiqnet.io` only, no window. `{status: 'exists', qnet, solana, nodeType, burnTx, burnAmount, code, paidOnSite}`, `{status: 'pending', qnet, solana, nodeType, burnTx, burnAmount}`, `{status: 'searching'\|'none'\|'unusable', qnet, solana}`, `{status: 'unknown', qnet, solana, reason}`, `{status: 'no_wallet'\|'locked'\|'not_connected'}` (see The wallet's activation for aiqnet.io) |
 | `qnet_claimNodeBalance` | `{nodeId}` | `https://aiqnet.io` only; the wallet's light or super node. `{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}`, `{status: 'empty', qnet, nodeId}` or `{status: 'error', error}` after an approval (see Move to wallet from aiqnet.io) |
 | `qnet_unlinkNodeDevice` | none | `https://aiqnet.io` only. `{status: 'ok', qnet, nodeId, unbound: true}` or `{status: 'error', error}` after an approval (see Unlink the node's device) |
+| `qnet_sendSolanaTransfer` | `{to, mint, amount}` (`mint` null for SOL or the 1DEV mint, `amount` in whole tokens) | `https://aiqnet.io` only. `{status: 'submitted', signature}` or `{status: 'error', error}` after an approval that shows the transfer read-only; without params -32602 at once (see Send from your wallet for aiqnet.io) |
 
 Errors reject with a numeric `code`:
 
 | Code | Meaning |
 | --- | --- |
 | 4001 | The user rejected the request, closed the window, the approval timed out, the origin has too many waiting, or the origin started 20 `qnet_getTransactionStatus` reads, or 30 `qnet_getActivation` reads, within the last minute |
-| 4100 | The origin is not connected, or the wallet is locked when signing; `qnet_getTransactionStatus` for any account but the connected, unlocked one; `qnet_activateNode`, `qnet_getActivation`, `qnet_claimNodeBalance` and `qnet_unlinkNodeDevice` from any origin but `https://aiqnet.io` |
+| 4100 | The origin is not connected, or the wallet is locked when signing; `qnet_getTransactionStatus` for any account but the connected, unlocked one; `qnet_activateNode`, `qnet_getActivation`, `qnet_claimNodeBalance`, `qnet_unlinkNodeDevice` and `qnet_sendSolanaTransfer` from any origin but `https://aiqnet.io` |
 | 4200 | The method is not offered |
 | 4900 | The connection to the wallet closed |
-| -32602 | Invalid parameters; a `contractCall` that names `value` or `accessList` is refused with the text `Unsupported parameter` and `data: {reason: 'UNSUPPORTED_PARAM'}`, since the network accepts neither on a call today (the only error with data) |
+| -32602 | Invalid parameters (a `qnet_sendSolanaTransfer` without params, or to the wallet's own address, among them); a `contractCall` that names `value` or `accessList` is refused with the text `Unsupported parameter` and `data: {reason: 'UNSUPPORTED_PARAM'}`, since the network accepts neither on a call today (the only error with data) |
 | -32603 | Internal error |
 
 `accountsChanged` carries `{qnet, solana}` on unlock and connect, and `{}` on lock, revoke,
@@ -1019,7 +1080,8 @@ since.
 ## Settings
 
 Auto-lock (5, 15, 30 or 60 minutes, or Never), connected sites with revoke, reveal recovery phrase, export the private
-key of the QNet Blockchain or the Solana account (see Identity and derivation), the activation code once the wallet has one (see
+key of the QNet Blockchain or the Solana account (see Identity and derivation; the account cannot be switched while its
+password is checked), the activation code once the wallet has one (see
 Activate), change password, language, about (version, release channel, networks, signing state), removal of what the
 earlier version left while it is there (see Vault and session), and delete wallet.
 
@@ -1032,6 +1094,14 @@ lock glyph in the header's text colour, at the header's button size, named "Lock
 and for screen readers.
 
 ## Store release notes
+
+3.1.6: a copied recovery phrase, private key or activation code leaves the clipboard on time also after the popup
+closes, which takes the new permission to modify data you copy and paste. The popup opens where it was, with a Send
+form as it was typed, and the auto-lock counts from the last thing done in the popup. Deleting or resetting the wallet
+keeps a wallet of version 2.1 that is still in the browser, and says so when the wallet could not be deleted. A token
+transfer shows as one row in History. Amounts read the same in every language (42,578.81988). aiqnet.io's node
+activation can ask for the 1DEV and SOL it needs: the transfer opens in the wallet's window, filled in and fixed, and is
+sent only after the user confirms it there.
 
 3.1.2: the first screen offers **Create a new wallet** and **Import an existing wallet**, each going straight to its
 step. Forgot password no longer asks for the recovery phrase: **Reset wallet** removes the wallet from this browser, and
@@ -1051,13 +1121,13 @@ English, Simplified Chinese, Russian, Spanish, Korean, Japanese, Portuguese (Bra
 Arabic and Italian, with the mobile app's terms for wallet, recovery phrase, activation code and node.
 The first start follows the browser's language when it is one of these, else English; Settings →
 Language changes it, and the choice is kept as a display preference only. Arabic pages run right to
-left, while addresses, codes, transaction hashes, amounts and recovery words stay left to right. Amounts take the
-language's group and decimal marks (2,047,243.4405 in English, 2 047 243,4405 in Russian, 2.047.243,4405 in German;
-Spanish and Italian leave a four-digit whole part ungrouped), every digit kept. An amount field holds the figure as
-digits and one decimal point, with no more places than the asset has (the mobile wallet's rule): a typed comma is the
-decimal mark, spaces and apostrophes are dropped, a comma and a point together take the last one as the decimal mark
-and the other as grouping in threes, and a figure pasted in the language's format is read as written (a copied "1,000"
-in English or "1.000" in German is 1000, while "1,000" typed is 1.000). Error
+left, while addresses, codes, transaction hashes, amounts and recovery words stay left to right. Amounts are written
+in one format in every language: the whole part grouped by three with a comma and the decimals after a point
+(42,578.81988), in Latin digits, every digit kept. An amount field holds the figure as digits and one decimal point,
+with no more places than the asset has (the mobile wallet's rule, the same in every language): a typed comma is the
+decimal point, spaces and apostrophes are dropped, a comma and a point together take the last one as the decimal point
+and the other as grouping in threes, and a pasted figure is read as amounts are written (a copied "1,000" is 1000,
+while "1,000" typed is 1.000). Error
 codes from the service worker are shown in the chosen language. Brand and token names (QNet Blockchain, Solana, 1DEV, QNC, SOL), the recovery words, addresses, codes and the environment variable names are never
 translated. The extension's name and description in the browser and the store come from
 `dist/_locales` in the same languages.

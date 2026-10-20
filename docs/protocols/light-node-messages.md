@@ -145,11 +145,24 @@ so that the wallet key stays locked. `pp` is its public key.
   re-send of a binding already pending needs no evidence. When the genesis's store of pending bindings (20,000) or
   its memory of them is full, expired entries go first, then the network holding the most (an IPv4 /24, an IPv6 /64)
   loses its oldest entry, and a binding from a network that would then hold the most is refused `rate_limited`.
-- `/light-node/bind` (a pending binding included), `/light-node/unbind` and the token refresh count per address only
+- `/light-node/bind` (a pending binding included), `/light-node/unbind` and the token refresh count per address
   the requests they refuse before or at the signature check (a pending binding with no burn seen included), an IPv6
   address by its /64: 60 such refusals within 60 s block the address for 60 s, answered `rate_limited` with
-  `retry_after_seconds`. A request whose signatures verify spends nothing there and is limited per node instead (bind
-  and unbind 5 an hour, the token refresh 6; bind and the token refresh count only a request that changes something).
+  `retry_after_seconds`. `/light-node/bind` also counts every request per address, an exact re-send included: 60 within
+  60 s block the address for 60 s. A request whose signatures verify is limited per node (bind and unbind 5 an hour,
+  the token refresh 6; bind and the token refresh count only a request that changes something), answered `rate_limited`
+  with `retry_after_seconds`, the seconds until the oldest request of the hour leaves it. A genesis checks the signatures
+  of one exact `/light-node/bind` request once: a re-send of it costs no signature check.
+- The genesis nodes copy each binding among themselves: the gossip, the token sync of its push record with the
+  device's attach or token refresh, the identity pull, and the device's own reply (section 5.10). A copy is taken only
+  newer than the binding held and at most 600 s ahead of the taking node's clock (a copy refused for its clock is taken
+  by a later one); from gossip a node takes at most 10 newer bindings of one light node an hour, counting only copies
+  whose delegation verifies (a full hour refuses before the check). The token sync of a
+  binding's attach (a move, a first binding) asks a genesis that did not take it again 15 s, 60 s, 5 min, 30 min and 2 h
+  later, while the binding is still the newest at the sender, and a token refresh once more after 15 s; a genesis
+  holds at most 4,096 such syncs waiting at once, and one past that heals by its own pull. The pull of a push record
+  carries the binding's `platform` and `model`, and an attach that arrives after a later token refresh of its binding
+  still gives them.
 - `h` is the height of a canonical block of the current epoch at most the node's tip and `hash` its 64-hex hash.
 - In the claim quote `N` is the node whose balance moves: the wallet's light node id, or its super node id `S` when the
   claim is the super node's (the cabinet's `claim` request and the extension's `qnet_claimNodeBalance` name it, [QNet
@@ -531,7 +544,14 @@ clock cancels out; a value outside `[0, 28,800]` s, a `sent_at` more than 120 s 
 The reply may present the node's `ping_pubkey`, `ping_delegation_cert` and `identity_pubkey`. A genesis that already
 holds that key and delegation with the identity they were proven under checks the reply's `σ` once, under them; it
 checks a presented key it does not hold (after a bind or a key rotation, or one a gossiped row poisoned) before the
-reply. A reply refused by the checks of section 5.8 is answered `{"success": false, "reason": "<code>", "error":
+reply, and before it looks at whether the epoch already counted the node or the commit window opened: a genesis that
+missed a move takes the newer binding from the new device's first reply, and a device whose binding was replaced is
+answered `{"success": false, "reason": "superseded", "error": "..."}` in the same epoch, whichever device was counted
+first. A reply after the epoch counted the node is answered `{"success": true, "node_id": N, "already_attested": true,
+"timestamp": t}`; a shard owner holding no answer of the device bound now since it took the binding checks each such
+reply until one of that device verifies and keeps it as the node's last answer, so the status tells that device from
+the one it replaced (section 7).
+A reply refused by the checks of section 5.8 is answered `{"success": false, "reason": "<code>", "error":
 "..."}`; with `"reason": "ping_signature"` the genesis holds no ping key of the node, or another one, and the reply is
 sent again with the delegation.
 
@@ -556,8 +576,13 @@ its answer of each of them was taken, as there is nothing to refine. Numbers may
 It is unsigned display data read only once the answer verified and counted: it never changes crediting.
 
 **Overload.** A genesis bounds the replies it handles at once and in one second (twice the most pushes it sends a
-second), and `GET /api/v1/height` likewise (four times). Past the bound, after the per-address limit and before any
-storage read or signature check, it answers HTTP 503 with a `Retry-After` header and
+second), and `GET /api/v1/height` likewise (four times). Before the bound counts a reply, after the per-address limit
+(an IPv6 address by its /64), the checks that verify no signature refuse junk without spending it: a reply not of a
+form of section 5.8 or naming no light node id (`{"success": false, "error": "malformed ping-response"}`), an anchor
+that is not a canonical block of the current epoch or of the one just ended (`anchor_not_current`), a challenge that is
+not this genesis's live stamp for the node (`{"success": false, "error": "Unrecognized or expired challenge"}`), and a
+node the chain does not list (`not_registered`). Past the bound, before any signature check, it answers HTTP 503 with a
+`Retry-After` header and
 
 ```
 {"success": false, "reason": "overloaded", "error": "...", "retry_after_seconds": n}
@@ -716,13 +741,17 @@ preimage and serves it with the list; each genesis checks the stored serials eve
 
 `device` is `null` while the node is not on chain, otherwise
 `{"platform": "android" | "ios" | "unknown" | null, "model": "<model>" | null, "linked_since": s | null,
-"last_answer_epoch": n | null, "state": "online" | "offline" | "unlinked" | "other_device_pending",
+"last_answer_epoch": n | null, "answered": b, "state": "online" | "offline" | "unlinked" | "other_device_pending",
 "last_miss": {"epoch": n, "reason": "<reason>", "delivered": b | null} | null}`. Anyone can read the public form for any
 wallet's node, so it carries no time of an answer, a wake or a delivery and nothing of what the app did: those are in
-the signed form only (below). `state` is `unlinked` while no
-device is bound, `online` while one is and the node does not need reactivation, `other_device_pending` while the device was linked
-less than one epoch (14,400 s) ago by its binding's sequence and nothing counted the node in this epoch or the two
-before, and `offline` otherwise. `platform` is `null` while no device is bound; otherwise the platform the device
+the signed form only (below). `answered` is true when the device bound now answered since the answering genesis took
+its binding, not only the node: an answer of that device the genesis kept (a shard owner keeps each one that verified,
+section 5.10), a count of the node in an epoch that began at or after the genesis took the binding, or another owner
+holding the same binding that kept such an answer (below); it is false while no device is bound and right after a move
+while the node still counts by the device it replaced. `state` is `unlinked`
+while no device is bound, `online` while the device bound now answered and the node does not need reactivation,
+`other_device_pending` while that device has not answered and was linked less than one epoch (14,400 s) ago by its
+binding's sequence, whatever the device it replaced did, and `offline` otherwise. `platform` is `null` while no device is bound; otherwise the platform the device
 record of this binding proved, else the hint the bind named (`"platform": "android" | "ios"` in the `/light-node/bind`
 body, unsigned and never a reason to refuse), else `unknown` (also at a genesis that took the binding from a peer
 before the token sync reached it). `model` is the model the bind named (section 4), `null` while no device is bound,
@@ -798,9 +827,12 @@ and one in which the node's shard committed no row, is in neither number, and `l
 node was never counted in that window. `needs_reactivation` is true only when neither the committed index of the two
 finished epochs before, nor this epoch's answers, nor an owner counts the node, past its first three epochs; an epoch
 of those two that the answering genesis did not derive, or in which the node's shard committed no row, says nothing of
-the device and never makes it true. Before it reports an on-chain node inactive, a genesis asks every other owner of
-the node's light shard at once (the owner that took this epoch's answer may be any of the three), and reports it
-answered when an owner that sees it on chain took its answer, active when any owner reports it active.
+the device and never makes it true. Before it reports an on-chain node inactive, or a bound device whose answer it has
+not seen, a genesis asks every other owner of the node's light shard at once (the owner that took this epoch's answer
+may be any of the three), and reports it answered when an owner that sees it on chain took its answer, active when any
+owner reports it active, and `device.answered` when an owner holding the same binding took that device's answer. The
+asking genesis names its binding's sequence (`bound`); an owner answers `device.answered` true only for a binding of
+that sequence it holds too, and only to a genesis.
 
 **Signed:** `POST /api/v1/light-node/status` with `{"node_id": N, "ts": ts, "signer": "ping" | "wallet", "sig": "<hex>"}`,
 the signed-status message of section 4 within ±300 s, returns the public fields and `binding_seq`, `bound_at`,
@@ -855,8 +887,8 @@ adds `ref` once the key is known, `retry_after_seconds` when a later retry can p
 pause.
 
 `/light-node/bind` refusals carry a stable `reason`: `not_registered`, `identity_mismatch`, `stale_seq`,
-`future_seq`, `bad_signature`, `expired`, `rate_limited`, `bad_request` (malformed push fields, a consent whose burn is
-not a 64-byte signature, or `seq`/`ts` other than the consent's `T`), and for the device block `device_unsupported` (the device
+`future_seq`, `bad_signature`, `expired`, `rate_limited` (with `retry_after_seconds`), `bad_request` (malformed push
+fields, a consent whose burn is not a 64-byte signature, or `seq`/`ts` other than the consent's `T`), and for the device block `device_unsupported` (the device
 cannot prove its hardware), `device_not_genuine`, `device_app_unrecognized`, `device_emulator`,
 `device_compromised`, `device_desktop`, `device_secondary_user`, `device_unlicensed`, `device_stale`,
 `device_key_in_use`, `device_slot_paused`, `device_rate_limited`. `check_pending` is a state, not a refusal. A claim
@@ -868,12 +900,14 @@ The other routes' `reason` values:
 - `/light-node/unbind`: `bad_request` (also a ping form with `identity_pubkey`, and a wallet form without it or with
   `device_release`), `expired`, `not_registered`, `identity_mismatch` (wallet form: a `K` the registration does not
   vouch for or whose address is not the node's), `stale_seq` (no device bound, a legacy binding, or a signature over
-  another sequence than the stored one's), `bad_signature` (also a device whose binding was replaced), `rate_limited`.
+  another sequence than the stored one's), `bad_signature` (also a device whose binding was replaced), `rate_limited`
+  (with `retry_after_seconds`).
 
 - token refresh: `stale_seq`, `bind_v2_required` (a legacy refresh for a node with a v2 binding), `bad_signature`,
-  `expired` (outside ±300 s, or older than the message that last set the channel), `rate_limited`, `not_registered`,
-  `bad_request`.
-- ping reply: `superseded` when a later binding replaced this device's.
+  `expired` (outside ±300 s, or older than the message that last set the channel), `rate_limited` (with
+  `retry_after_seconds`), `not_registered`, `bad_request`.
+- ping reply: `superseded` when a later binding replaced this device's; `not_registered` when the chain does not list
+  the node (section 5.10).
 - the legacy `/light-node/register` for a node on chain: `bind_v2_required` when the node has a v2 binding, told only to
   a caller that presents the node's committed key and that key's signature over the wallet address; any other caller
   gets the inert `already_registered`, whatever is bound. For a node not on chain yet, a wallet that derives from

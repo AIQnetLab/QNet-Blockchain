@@ -30,6 +30,8 @@ const NO_COPY_EVENTS = ['copy', 'cut', 'contextmenu', 'dragstart', 'selectstart'
 
 // A phrase left in this tab this long without a key press or a click is dropped (R2-ESM-07).
 const IDLE_FORGET_MS = 10 * 60 * 1000;
+// The class the page root carries while another window has the focus: a typed phrase is masked under it (setup.css).
+const BLUR_COVER = 'window-blurred';
 // The revealed word grid hides itself after this long: time to write the words down, then "Show the words"
 // again (the popup's reveal hides after TIMINGS.REVEAL_AUTO_HIDE_MS; writing 24 words takes longer).
 const WORDS_VISIBLE_MS = Math.max(TIMINGS.REVEAL_AUTO_HIDE_MS, 2 * 60 * 1000);
@@ -44,6 +46,8 @@ let backoffUntil = null;
 // How the screen shown now hides the phrase or password it holds (the word grid, a typed phrase), for the
 // screen lock, a hidden tab and the grid's auto-hide (R2-ESM-07, as the popup's reveal).
 let hideSecrets = null;
+// What another window taking the focus hides beyond the mask (BLUR_COVER): the word grid goes back behind its button.
+let hideOnBlur = null;
 let revealTimer = null;
 let idleTimer = null;
 // The step the popup asked for (?flow=), taken once vault.status answered (a retry after a failed read keeps it).
@@ -51,6 +55,7 @@ let requestedFlow = new URLSearchParams(location.search).get('flow');
 
 function show(node) {
   hideSecrets = null;
+  hideOnBlur = null;
   clearTimeout(revealTimer);
   wipeInputs(root);
   clear(root);
@@ -127,9 +132,14 @@ async function boot() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) hideSecrets?.();
   });
-  // another window has the focus (a screen share or recording may still show this one): the word grid goes back
-  // behind "Show the words" and a typed phrase is cleared, as the popup's reveal hides (R3-EXT-UI-01)
-  window.addEventListener('blur', () => hideSecrets?.());
+  // another window has the focus (a screen share or recording may still show this one): a typed phrase is masked until
+  // this window has the focus again and the word grid goes back behind "Show the words" (R3-EXT-UI-01); nothing typed
+  // is emptied by it, only by the screen lock, a hidden tab and the idle timer
+  window.addEventListener('blur', () => {
+    root.classList.add(BLUR_COVER);
+    hideOnBlur?.();
+  });
+  window.addEventListener('focus', () => root.classList.remove(BLUR_COVER));
   for (const type of ['keydown', 'pointerdown']) window.addEventListener(type, restartIdle, { capture: true });
   restartIdle();
   let language = languageForTag(globalThis.navigator?.language) ?? DEFAULT_LANGUAGE;
@@ -332,8 +342,10 @@ function renderCreate(failure = null) {
     for (const type of NO_COPY_EVENTS) grid.addEventListener(type, (event) => event.preventDefault());
     wordsBox.append(grid, phraseCopy(words));
     written.input.disabled = false;
-    // hidden again on a screen lock or a hidden tab, and after the reveal time: "Show the words" again
+    // hidden again on a screen lock, a hidden tab or another window taking the focus, and after the reveal time: "Show
+    // the words" again
     hideSecrets = () => renderCreate(failure);
+    hideOnBlur = hideSecrets;
     clearTimeout(revealTimer);
     revealTimer = setTimeout(() => hideSecrets?.(), WORDS_VISIBLE_MS);
   }, { kind: 'primary', action: 'reveal-words' });
@@ -348,9 +360,9 @@ function renderCreate(failure = null) {
 }
 
 /**
- * The Copy button of the shown words (an explicit click only) with the warning next to it: the phrase leaves the
- * clipboard after TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS if nothing was copied since (or when this tab gets the focus back
- * after that), and at the end of setup.
+ * The Copy button of the shown words (an explicit click only) with the warning next to it: the worker empties the
+ * clipboard TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS later unless a later copy from a page replaced the phrase, whether or not
+ * this tab is still open or has the focus, and at once at the end of setup.
  * @param {string[]} words
  * @returns {HTMLElement}
  */
@@ -358,7 +370,7 @@ function phraseCopy(words) {
   const message = messageLine();
   const copy = button(t('copy'), async () => {
     try {
-      await copyText(words.join(' '), { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS, untilFocused: true });
+      await copyText(words.join(' '), { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS });
     } catch {
       message.show(t('copyFailed'));
       return;
@@ -410,6 +422,8 @@ function renderVerifyBackup(words) {
 function renderImport(failure = null) {
   forget();
   const input = textArea({ name: 'phrase', rows: 4, placeholder: t('setupImportPlaceholder') });
+  // masked, not emptied, while another window has the focus
+  input.classList.add('blur-mask');
   const message = messageLine();
   if (failure) message.show(failure);
   let pasted = false;
@@ -448,7 +462,7 @@ function renderImport(failure = null) {
     pending.words = canonical.split(' ');
     renderPassword('import');
   });
-  // a pasted phrase does not wait in a hidden, unfocused, idle or screen-locked tab
+  // a pasted phrase does not wait in a hidden, idle or screen-locked tab
   hideSecrets = () => {
     input.value = '';
     leave();
@@ -556,11 +570,11 @@ async function submitMigrate(newPassword) {
 }
 
 /**
- * Drops every reference to the phrase and password, wipes inputs and the DOM, empties the clipboard of a phrase
- * its Copy button put there and nothing replaced, and shows the two addresses (a click copies one). The screen stays
- * until the user presses Done, which closes the tab: no timer closes it (owner, 28.09). While what an earlier version
- * kept is still in this browser (a wallet imported or created beside it), it offers to remove it, behind one
- * confirmation (kit.earlierRemoval).
+ * Drops every reference to the phrase and password, wipes inputs and the DOM, has the worker empty the clipboard of a
+ * phrase its Copy button put there and nothing replaced (common.clearCopiedNow), and shows the two addresses (a click
+ * copies one). The screen stays until the user presses Done, which closes the tab: no timer closes it (owner, 28.09).
+ * While what an earlier version kept is still in this browser (a wallet imported or created beside it), it offers to
+ * remove it, behind one confirmation (kit.earlierRemoval).
  * @param {{qnet: string, solana: string}} addresses
  * @returns {void}
  */

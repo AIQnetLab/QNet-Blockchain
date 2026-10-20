@@ -1,5 +1,6 @@
 // Just enough DOM to run ui/approve.js in node: elements that ui/common.js el() builds, events with
-// isTrusted and AbortSignal removal, focus, and a window that records close(). No HTML is ever parsed.
+// isTrusted and AbortSignal removal, focus, and a window that records close(); and the loader that runs a fresh
+// ui/approve.js in such a page. No HTML is ever parsed.
 import { createEvent } from './chrome-mock.mjs';
 
 class EventTargetStub {
@@ -149,3 +150,32 @@ export function createPage({ query, runtime, send }) {
   };
   return { document, window, chrome, app };
 }
+
+let pageSeq = 0;
+
+/** Installs `page` as the global window, document and chrome, then runs a fresh copy of ui/approve.js in it. */
+export async function loadApprovePage(page) {
+  Object.assign(globalThis, { window: page.window, document: page.document, chrome: page.chrome });
+  pageSeq += 1;
+  await import(`../../dist/ui/approve.js?page=${pageSeq}`);
+  return page;
+}
+
+/** The approve window of the approval `shown` (provider-harness world.shown()), talking to the world's router. */
+export function openApprovePage(world, shown) {
+  return loadApprovePage(createPage({
+    query: `?id=${shown.id}`,
+    runtime: world.chrome.runtime,
+    send: (message) => world.router.handleUiMessage(message, shown.sender),
+  }));
+}
+
+/** For afterEach: removes the globals loadApprovePage installed. */
+export function resetPageGlobals() {
+  delete globalThis.window;
+  delete globalThis.document;
+  delete globalThis.chrome;
+}
+
+/** The texts of the page's elements that carry `className`, in document order. */
+export const texts = (page, className) => page.app.byClass(className).map((element) => element.textContent);

@@ -35,6 +35,7 @@ const DeviceKey = require('../src/services/NodeDeviceKey');
 const E = require('../src/services/DeviceEnrolment');
 const Push = require('../src/services/PushService');
 const { writeLinkPending, readLinkPending } = require('../src/services/LightNode');
+const { lightShardOwnerUrls } = require('../src/config/nodes');
 const { nodeView, refusalText, ROTATION_GRACE_EPOCHS } = require('../src/screens/NodeTab');
 const { performIntent, buildPlaintext } = require('../src/services/QNetLink');
 const { nodeLinkActions } = require('../src/services/NodeLinkActions');
@@ -269,7 +270,7 @@ describe('MN-R4-03: an unanswered key is settled by every read, and its binding 
 });
 
 describe('MN-R4-04: a "Use this device" with no answer is checked against the node\'s status', () => {
-  const bind = (after) => onFakeClock(async () => {
+  const bind = (after, sig = signer()) => onFakeClock(async () => {
     let posted = null;
     answers = (url, body) => {
       if (url.includes('/device-challenge')) return challenge;
@@ -279,7 +280,7 @@ describe('MN-R4-04: a "Use this device" with no answer is checked against the no
       return { success: true };
     };
     DeviceKey.enrolEvidence.mockResolvedValue(enrolled('qnet_dev_n'));
-    const r = await Push.bindThisDevice({ signer: signer(), credential: {}, nodeId: NODE, device: DEVICE, interactive: true, epoch: EPOCH });
+    const r = await Push.bindThisDevice({ signer: sig, credential: {}, nodeId: NODE, device: DEVICE, interactive: true, epoch: EPOCH });
     return { r, posted };
   });
 
@@ -293,19 +294,238 @@ describe('MN-R4-04: a "Use this device" with no answer is checked against the no
     expect(JSON.parse(await AsyncStorage.getItem(Push.ENROL_AGAIN_KEY))).toMatchObject({ seq: posted });
   });
 
-  it('the node\'s status still names the binding before: not taken, its key goes, and the answer is a plain network one', async () => {
-    const { r } = await bind(() => ({ ...signedPub(), binding_seq: SEQ, device_state: 'active' }));
+  // The owners still naming the binding before is what an owner the binding has not reached yet says too, so it decides
+  // nothing: the binding waits with its ping key beside this device's current one.
+  it('the owners still name the binding before: unknown, and the binding waits with its ping key, nothing adopted', async () => {
+    const keep = jest.fn(async () => {});
+    const { r, posted } = await bind(() => ({ ...signedPub(), binding_seq: SEQ, device_state: 'active' }), { ...signer(), prepareLightNodeBinding: async (cred, { seq }) => ({
+      ...(await signer().prepareLightNodeBinding(cred, { seq })), keep,
+    }) });
+    expect(r).toMatchObject({ ok: false, reason: 'network', unknown: true });
+    expect(keep).toHaveBeenCalledWith('qnet_ping_next');
+    expect(DeviceKey.keepUnanswered).toHaveBeenCalledWith(expect.objectContaining({ handle: 'qnet_dev_n' }));
+    expect(DeviceKey.dropPendingKey).not.toHaveBeenCalled();
+    expect(await info()).toBe(null);
+    expect(await Push.readUnconfirmedBinding(NODE)).toMatchObject({
+      nodeId: NODE, walletAddress: WALLET, seq: posted, cert: `v2.${posted}.del`, pingPublicKey: PP, enrolled: true,
+      bindBlob: expect.objectContaining({ seq: posted, ping_pubkey: PP }),
+    });
+    expect((await Push.readUnconfirmedBinding(NODE)).bindBlob.device).toBeUndefined();
+  });
+
+  it('two owners name a newer binding: not taken, its key goes, and the answer is a plain network one', async () => {
+    const { r } = await bind((posted) => ({ ...signedPub(), binding_seq: posted ? posted + 5 : SEQ, device_state: 'active' }));
     expect(r).toEqual({ ok: false, reason: 'network', retryAfterSeconds: null });
     expect(DeviceKey.dropPendingKey).toHaveBeenCalledWith(expect.objectContaining({ handle: 'qnet_dev_n' }));
     expect(await info()).toBe(null);
+    expect(await Push.readUnconfirmedBinding(NODE)).toBe(null);
+  });
+
+  // A binding without a device block goes to every owner. An owner that answers without taking it (pending: it promotes
+  // the binding once it applies the registration) says nothing of an owner whose reply was lost: the binding waits with
+  // its ping key, never wiped while the network may hold it.
+  it('owners that answer pending, beside owners whose reply was lost, or all of them: the binding waits with its key', async () => {
+    for (const lost of [true, false]) {
+      const keep = jest.fn(async () => {});
+      const owners = lightShardOwnerUrls(NODE);
+      await AsyncStorage.clear();
+      calls.length = 0;
+      const out = await onFakeClock(async () => {
+        let posted = null;
+        answers = (url, body) => {
+          if (url.includes('/light-node/status') && !body) return pub({ features: ['status_signed', 'bind_v2'] });
+          if (url.endsWith('/light-node/status')) return { ...signedPub(), binding_seq: SEQ };
+          if (url.endsWith('/light-node/bind')) {
+            posted = body.seq;
+            if (lost && !url.startsWith(owners[0])) return new Error('the answer was lost');
+            return { success: true, bound: false, pending: true, seq: body.seq };
+          }
+          return { success: true };
+        };
+        const sig = { ...signer(), prepareLightNodeBinding: async (cred, { seq }) => ({ ...(await signer().prepareLightNodeBinding(cred, { seq })), keep }) };
+        const r = await Push.bindThisDevice({ signer: sig, credential: {}, nodeId: NODE, epoch: EPOCH });
+        return { r, posted };
+      });
+      expect([lost, out.r]).toEqual([lost, expect.objectContaining({ ok: false, reason: 'network', unknown: true })]);
+      // Every owner was asked once: a pending answer moves on to the next owner, as a lost reply does.
+      expect(calls.filter((c) => c.url.endsWith('/light-node/bind')).map((c) => owners.find((u) => c.url.startsWith(u))))
+        .toEqual(owners);
+      expect(keep).toHaveBeenCalledWith('qnet_ping_next');
+      expect(await Push.readUnconfirmedBinding(NODE)).toMatchObject({ seq: out.posted, enrolled: false });
+      expect(await info()).toBe(null);
+    }
   });
 
   it('no status after it either: the outcome is unknown, and the tab says so rather than "try again"', async () => {
-    const { r } = await bind((posted) => (posted ? new Error('down') : { ...signedPub(), binding_seq: SEQ }));
+    const { r, posted } = await bind((posted) => (posted ? new Error('down') : { ...signedPub(), binding_seq: SEQ }));
     expect(r).toMatchObject({ ok: false, reason: 'network', unknown: true });
+    expect(await Push.readUnconfirmedBinding(NODE)).toMatchObject({ seq: posted });
     const t = (k) => k;
     expect(refusalText(t, { reason: 'network', unknown: true })).toBe('node_use_unknown');
     expect(refusalText(t, { reason: 'network' })).toBe('node_use_err_network');
+  });
+});
+
+describe('a binding sent with no answer is settled by the binding the network names', () => {
+  const T = Math.floor(Date.now() / 1000) - 60;
+  const stash = (over = {}) => AsyncStorage.setItem(Push.UNCONFIRMED_BIND_KEY, JSON.stringify({
+    nodeId: NODE, walletAddress: WALLET, seq: T, push: { type: 'fcm', token: 'tok' }, pingPublicKey: PP, cert: `v2.${T}.del`,
+    identityPublicKey: 'id', features: ['device_v1', 'bind_v2'], enrolled: true,
+    bindBlob: { node_id: NODE, seq: T, ping_pubkey: PP }, at: Date.now() - 60000, ...over,
+  }));
+  const named = (B, D = true) => ({ bindingSeqAgreed: B, deviceBoundAgreed: D, nonce: NONCE, deviceTags: [TAG] });
+  const resetNext = () => Keychain.resetGenericPassword.mock.calls.some(([o]) => o && o.service === 'qnet_ping_next');
+
+  it('the network names it: it becomes this device\'s binding, its key moves to the node\'s item, the binding before goes', async () => {
+    await linkedHere({ hw: true, seq: SEQ });
+    await stash();
+    Keychain.getGenericPassword.mockImplementation(async ({ service }) => (service === 'qnet_ping_next' ? { password: 'next-sk' } : false));
+    DeviceKey.settleByTag.mockResolvedValue('pending');
+    expect(await Push.settleUnconfirmedBinding(NODE, named(T))).toBe(true);
+    expect(await info()).toMatchObject({ nodeId: NODE, seq: T, hw: true });
+    expect(await AsyncStorage.getItem(`qnet_ping_cert_${NODE}`)).toBe(`v2.${T}.del`);
+    expect(Keychain.setGenericPassword).toHaveBeenCalledWith('ping', 'next-sk', expect.objectContaining({ service: `qnet_ping_sk_${NODE}` }));
+    expect(DeviceKey.settleByTag).toHaveBeenCalledWith(NONCE, [TAG]);
+    expect(JSON.parse(await AsyncStorage.getItem(Push.ENROL_AGAIN_KEY))).toMatchObject({ seq: T });
+    expect(await Push.readUnconfirmedBinding(NODE)).toBe(null);
+    expect(resetNext()).toBe(true);
+  });
+
+  it('the binding before, within the settle time: it waits; past it, or a newer binding, or none bound: it goes with its key', async () => {
+    await stash();
+    expect(await Push.settleUnconfirmedBinding(NODE, named(SEQ))).toBe(false);
+    expect(await Push.settleUnconfirmedBinding(NODE, { bindingSeqAgreed: null, deviceBoundAgreed: null })).toBe(false);
+    expect(await Push.readUnconfirmedBinding(NODE)).toMatchObject({ seq: T });
+    expect(resetNext()).toBe(false);
+    for (const [over, status] of [
+      [{ at: Date.now() - 11 * 60000 }, named(SEQ)], [{}, named(T + 5)], [{}, named(T, false)], [{}, named(SEQ, false)]]) {
+      await stash(over);
+      Keychain.resetGenericPassword.mockClear();
+      expect(await Push.settleUnconfirmedBinding(NODE, status)).toBe(false);
+      expect([status, await Push.readUnconfirmedBinding(NODE)]).toEqual([status, null]);
+      expect(resetNext()).toBe(true);
+    }
+    expect(await info()).toBe(null);
+  });
+
+  // The end of the binding before it (refused as superseded) deleted the push token it carries, or Firebase replaced it:
+  // the token Firebase reports now goes to the owners at once, signed by the moved key, not an hour later.
+  it('adopted with a push token that changed since: the current one goes to the owners at once', async () => {
+    const messaging = require('@react-native-firebase/messaging').default;
+    await linkedHere({ hw: true, seq: SEQ });
+    await stash();
+    await Push.teardownLightNode();
+    expect(messaging().deleteToken).toHaveBeenCalled();
+    Keychain.getGenericPassword.mockResolvedValue({ password: 'next-sk' });
+    expect(await Push.settleUnconfirmedBinding(NODE, named(T))).toBe(true);
+    // Sent beside the tab's next read, not waited for.
+    for (let i = 0; i < 50 && !calls.some((c) => c.url.endsWith('/light-node/token-refresh')); i++) await new Promise((r) => setTimeout(r, 10));
+    const refresh = calls.find((c) => c.url.endsWith('/light-node/token-refresh'));
+    expect(refresh && refresh.body).toMatchObject({ node_id: NODE, push_type: 'fcm', device_token: 'test-fcm-token', seq: T });
+    expect(await AsyncStorage.getItem('qnet_last_sent_fcm_token')).toBe('test-fcm-token');
+    // The token it carries is still the one Firebase reports: nothing goes.
+    calls.length = 0;
+    await stash({ push: { type: 'fcm', token: 'test-fcm-token' } });
+    expect(await Push.settleUnconfirmedBinding(NODE, named(T))).toBe(true);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(calls.some((c) => c.url.endsWith('/light-node/token-refresh'))).toBe(false);
+  });
+
+  it('named, but its key is gone (a restore): it goes, and nothing is adopted', async () => {
+    await stash();
+    Keychain.getGenericPassword.mockResolvedValue(false);
+    expect(await Push.settleUnconfirmedBinding(NODE, named(T))).toBe(false);
+    expect(await Push.readUnconfirmedBinding(NODE)).toBe(null);
+    expect(await info()).toBe(null);
+  });
+
+  it('the end of the current binding here leaves it: a reply refused as superseded may be the network taking it', async () => {
+    await linkedHere({ hw: true, seq: SEQ });
+    await stash();
+    await Push.teardownLightNode({ keepToken: true });
+    expect(await info()).toBe(null);
+    expect(await Push.readUnconfirmedBinding(NODE)).toMatchObject({ seq: T });
+    expect(resetNext()).toBe(false);
+    // Another node's record is not this one's.
+    expect(await Push.readUnconfirmedBinding('light_mobile_0000000000000000')).toBe(null);
+  });
+
+  // A wake settles it too, before anything answers: its status goes signed with the waiting binding's own key, which an
+  // owner takes only from the binding it holds (as check_signed_status does), so a push answers for a binding the
+  // network took without the app being opened.
+  describe('in a wake', () => {
+    const Dilithium = require('../src/crypto/DilithiumCrypto');
+    const messaging = require('@react-native-firebase/messaging').default;
+    const H = Number(V.device.ping.height);
+    const HASH = V.device.ping.hash;
+    let keychain;
+    beforeEach(() => {
+      keychain = { qnet_ping_next: 'next-sk' };
+      Keychain.getGenericPassword.mockImplementation(async ({ service }) => (keychain[service] ? { password: keychain[service] } : false));
+      Keychain.setGenericPassword.mockImplementation(async (user, password, { service }) => { keychain[service] = password; return true; });
+      Keychain.resetGenericPassword.mockImplementation(async ({ service }) => { delete keychain[service]; return true; });
+      Dilithium.signDetached.mockImplementation(async (message, sk) => `sig-${sk}`);
+      Dilithium.signWithDilithium.mockImplementation(async (message, sk) => `sig-${sk}`);
+    });
+    afterEach(() => {
+      Keychain.setGenericPassword.mockResolvedValue(true);
+      Keychain.resetGenericPassword.mockResolvedValue(true);
+      Dilithium.signWithDilithium.mockResolvedValue('sig');
+    });
+    // The owners hold binding `held` with ping key `heldKey`: a status or an answer signed by any other key is refused.
+    const owners = (held, heldKey) => (url, body) => {
+      if (url.includes('/light-node/status') && !body) return pub();
+      if (url.endsWith('/light-node/status')) {
+        return body.signer === 'ping' && body.sig === `sig-${heldKey}`
+          ? { ...signedPub(), binding_seq: held, device_state: 'active' } : { success: false, reason: 'bad_signature' };
+      }
+      if (url.endsWith('/api/v1/height')) return { height: H + 2 };
+      if (url.includes('/api/v1/microblock/')) return { previous_hash: Array.from(Buffer.from(HASH, 'hex')) };
+      if (url.endsWith('/ping-response')) {
+        return body.signature === `ping_dilithium:sig-${heldKey}` ? { success: true } : { success: false, reason: 'superseded' };
+      }
+      return { success: true };
+    };
+    const answered = () => calls.filter((c) => c.url.endsWith('/ping-response'));
+
+    it('a push on a device with no binding before it: the network took it, so the push is answered and recorded for it', async () => {
+      await stash();
+      answers = owners(T, 'next-sk');
+      expect(await Push.handlePushMessage({ action: 'epoch', anchor: `${H}:${HASH}` })).toBe(true);
+      // The status was signed with the waiting binding's key, and the answer with the key moved to the node's item.
+      expect(calls.some((c) => c.url.endsWith('/light-node/status') && c.body && c.body.sig === 'sig-next-sk')).toBe(true);
+      expect(answered().length).toBeGreaterThan(0);
+      expect(answered().every((c) => c.body.node_id === NODE && c.body.signature === 'ping_dilithium:sig-next-sk')).toBe(true);
+      expect(await info()).toMatchObject({ nodeId: NODE, seq: T });
+      expect(keychain[`qnet_ping_sk_${NODE}`]).toBe('next-sk');
+      expect(await Push.readUnconfirmedBinding(NODE)).toBe(null);
+      const receipts = JSON.parse(await AsyncStorage.getItem('qnet_push_receipts'));
+      expect(receipts).toMatchObject({ nodeId: NODE, epochs: [expect.objectContaining({ epoch: EPOCH, outcome: 'answered' })] });
+    });
+
+    it('a background fetch beside the binding before: the binding taken answers, never the replaced key, and the push token stays', async () => {
+      await linkedHere({ hw: false, seq: SEQ });
+      keychain[`qnet_ping_sk_${NODE}`] = 'old-sk';
+      await stash();
+      answers = owners(T, 'next-sk');
+      await Push.onBackgroundFetch('t-settle');
+      expect(require('react-native-background-fetch').default.finish).toHaveBeenCalledWith('t-settle');
+      expect(answered().length).toBeGreaterThan(0);
+      expect(answered().every((c) => c.body.signature === 'ping_dilithium:sig-next-sk')).toBe(true);
+      expect(await info()).toMatchObject({ nodeId: NODE, seq: T });
+      expect(messaging().deleteToken).not.toHaveBeenCalled();
+    });
+
+    it('the owners hold another binding: the waiting key is refused, nothing is adopted or answered, and it waits', async () => {
+      await stash();
+      answers = owners(T + 5, 'other-sk');
+      expect(await Push.handlePushMessage({ action: 'epoch', anchor: `${H}:${HASH}` })).toBe(false);
+      expect(calls.some((c) => c.url.endsWith('/light-node/status') && c.body && c.body.sig === 'sig-next-sk')).toBe(true);
+      expect(answered()).toEqual([]);
+      expect(await info()).toBe(null);
+      expect(await Push.readUnconfirmedBinding(NODE)).toMatchObject({ seq: T });
+      expect(keychain.qnet_ping_next).toBe('next-sk');
+    });
   });
 });
 

@@ -3,10 +3,12 @@ name: iOS build
 # Compiles the wallet for the iOS simulator on a clean macOS runner, unsigned: proof that the Xcode
 # project, the pods and the native ML-DSA module build outside one developer's machine, once the checks job
 # passed (dependency audit, unit tests, light-client pin). A manual run, or a push whose commit message carries
-# [testflight], also archives a signed Release build and uploads it to TestFlight (the testflight job).
+# [testflight], also archives a signed Release build and uploads it to TestFlight (the testflight job). A manual run
+# with the screenshots input also takes the App Store screenshots of the simulator build (the screenshots job).
 #
-# Both macOS jobs resolve the pods after npm ci and the patches, compare the result with ios/Podfile.lock and
-# keep the resolved lock as an artifact: the committed lock is replaced by that file, never edited by hand.
+# The simulator and testflight jobs resolve the pods after npm ci and the patches, compare the result with
+# ios/Podfile.lock and keep the resolved lock as an artifact: the committed lock is replaced by that file, never
+# edited by hand.
 
 on:
   push:
@@ -25,6 +27,10 @@ on:
         description: 'Also archive, sign and upload the build to TestFlight'
         type: boolean
         default: true
+      screenshots:
+        description: 'Also take the App Store screenshots on an iPhone 6.9" and an iPad 13" simulator'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -190,6 +196,26 @@ jobs:
           echo "::error::QNet Wallet does not run 40 s after launch on the simulator"
           exit 1
 
+      # The screenshots job installs this same build, once it survived its launch. A tar keeps the app's file modes,
+      # which an artifact alone does not. Neither step can fail this job and so skip TestFlight: without the artifact
+      # the screenshots job stops at its fetch.
+      - name: Pack the simulator app for the screenshots
+        if: github.event_name == 'workflow_dispatch' && inputs.screenshots
+        continue-on-error: true
+        run: |
+          APP=$(find build/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' | head -n 1)
+          tar -czf "$RUNNER_TEMP/simulator-app.tgz" -C "$(dirname "$APP")" "$(basename "$APP")"
+
+      - name: Keep the simulator app for the screenshots
+        if: github.event_name == 'workflow_dispatch' && inputs.screenshots
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-app
+          path: ${{ runner.temp }}/simulator-app.tgz
+          retention-days: 1
+          if-no-files-found: error
+
       # The job summary is readable without signing in to GitHub, the raw log is not: on failure the
       # compiler errors and the tail of the log go there, so a failed run explains itself to anyone.
       - name: Summarise the failure
@@ -215,6 +241,100 @@ jobs:
           path: |
             applications/qnet-mobile/xcodebuild.log
             applications/qnet-mobile/build/Logs
+          if-no-files-found: ignore
+
+  # The App Store screenshots of the simulator job's build, on a manual run with the screenshots input: an iPhone of the
+  # 6.9" display size and an iPad of the 13" one (scripts/store-screenshots.js, flows in store-screenshots/). The
+  # recovery phrase is the secret QNET_SCREENSHOT_PHRASE, given only to the step that uses it; without it the run uses a
+  # new wallet.
+  screenshots:
+    needs: simulator
+    if: github.event_name == 'workflow_dispatch' && inputs.screenshots
+    runs-on: macos-26
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: applications/qnet-mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: npm
+          cache-dependency-path: applications/qnet-mobile/package-lock.json
+
+      # The script makes the run's phrase with the app's own phrase library when the secret is not set.
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      # The flow runner needs Java 17 or later.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # One fixed release, its archive checked against the SHA-256 the release publishes, and no install script: a newer
+      # runner never changes the screenshots of an unchanged repository, and nothing unpinned runs on the runner that
+      # later holds the recovery phrase.
+      - name: Install the flow runner
+        env:
+          MAESTRO_VERSION: 2.11.0
+          MAESTRO_SHA256: 5384593cb4e7a106489e75a821d157dd43f4e438df6bc308b72e82c685e1283a
+          MAESTRO_CLI_NO_ANALYTICS: '1'
+          MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED: 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/maestro.zip" "https://github.com/mobile-dev-inc/maestro/releases/download/cli-$MAESTRO_VERSION/maestro.zip"
+          ACTUAL=$(shasum -a 256 "$RUNNER_TEMP/maestro.zip" | cut -d ' ' -f 1)
+          if [ "$ACTUAL" != "$MAESTRO_SHA256" ]; then
+            echo "::error::the flow runner archive has SHA-256 $ACTUAL, the release $MAESTRO_VERSION published $MAESTRO_SHA256"
+            exit 1
+          fi
+          unzip -q "$RUNNER_TEMP/maestro.zip" -d "$RUNNER_TEMP/maestro-release"
+          rm -rf "$HOME/.maestro/bin" "$HOME/.maestro/lib"
+          mkdir -p "$HOME/.maestro"
+          cp -R "$RUNNER_TEMP/maestro-release/maestro/." "$HOME/.maestro/"
+          rm -rf "$RUNNER_TEMP/maestro.zip" "$RUNNER_TEMP/maestro-release"
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          INSTALLED=$("$HOME/.maestro/bin/maestro" --version | tail -n 1)
+          echo "Flow runner: Maestro $INSTALLED" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$INSTALLED" != "$MAESTRO_VERSION" ]; then
+            echo "::error::the flow runner is $INSTALLED, the flows are pinned to $MAESTRO_VERSION"
+            exit 1
+          fi
+
+      - name: Fetch the simulator app
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-simulator-app
+          path: ${{ runner.temp }}/simulator-app
+
+      - name: Take the screenshots
+        env:
+          QNET_SCREENSHOT_PHRASE: ${{ secrets.QNET_SCREENSHOT_PHRASE }}
+        run: |
+          tar -xzf "$RUNNER_TEMP/simulator-app/simulator-app.tgz" -C "$RUNNER_TEMP/simulator-app"
+          APP=$(find "$RUNNER_TEMP/simulator-app" -maxdepth 1 -name '*.app' | head -n 1)
+          node scripts/store-screenshots.js capture --app "$APP" --out "$RUNNER_TEMP/app-store-screenshots"
+
+      - name: Check the screenshot sizes
+        run: node scripts/store-screenshots.js check "$RUNNER_TEMP/app-store-screenshots"
+
+      - name: Keep the screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-store-screenshots
+          path: ${{ runner.temp }}/app-store-screenshots
+          if-no-files-found: error
+
+      # A failed capture or check keeps whatever the run took: the scenes, and failed/ with the screen where the flows
+      # stopped. Nothing there shows the recovery phrase: every capture comes after the import.
+      - name: Keep what a failed run took
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-store-screenshots-failed
+          path: ${{ runner.temp }}/app-store-screenshots
           if-no-files-found: ignore
 
   # A signed Release archive of the QNetMobile scheme, uploaded to TestFlight, on a manual or [testflight] run.

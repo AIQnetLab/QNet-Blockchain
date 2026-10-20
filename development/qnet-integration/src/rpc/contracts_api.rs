@@ -1090,7 +1090,12 @@ pub(super) async fn handle_ws_connection_with_cleanup(
                     }
                 }
                 Err(e) => {
-                    if is_warn() { println!("[WARN][WS] receive_error err={}", e); }
+                    let err = e.to_string();
+                    if ws_client_dropped(&err) {
+                        if is_info() { println!("[INFO][WS] client_disconnected reason=dropped err={}", err); }
+                    } else if is_warn() {
+                        println!("[WARN][WS] receive_error err={}", err);
+                    }
                     break;
                 }
             }
@@ -1109,6 +1114,14 @@ pub(super) async fn handle_ws_connection_with_cleanup(
     drop(slot);
     let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
     if is_info() { println!("[INFO][WS] connection_closed total={} unique_ips={}", total, unique_ips); }
+}
+
+/// A client that went away without a close frame (app killed, network switch): the same end as a close
+/// frame, not a fault of this node.
+fn ws_client_dropped(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("connection reset") || e.contains("broken pipe") || e.contains("without closing handshake")
+        || e.contains("connection closed") || e.contains("unexpected eof")
 }
 
 /// The send half of a WebSocket connection: forwards the broadcaster's events that `wanted` keeps, and every
@@ -1617,6 +1630,18 @@ mod logs_tests {
 #[cfg(test)]
 mod ws_slot_tests {
     use super::*;
+
+    // A client that vanished is a disconnect, logged like a close frame; anything else stays a warning.
+    #[test]
+    fn a_dropped_client_is_a_disconnect_not_a_receive_fault() {
+        for e in ["IO error: Connection reset by peer (os error 104)", "Broken pipe (os error 32)",
+                  "WebSocket protocol error: Connection reset without closing handshake", "Connection closed normally"] {
+            assert!(ws_client_dropped(e), "{}", e);
+        }
+        for e in ["Space limit exceeded: Message too long", "UTF-8 encoding error", "WebSocket protocol error: Unmasked frame"] {
+            assert!(!ws_client_dropped(e), "{}", e);
+        }
+    }
 
     fn limiter() -> &'static WsRateLimiter { Box::leak(Box::new(WsRateLimiter::new())) }
     fn limiter_with_total(max_total: u32) -> &'static WsRateLimiter {

@@ -86,7 +86,7 @@ fn is_hex_len(s: &str, len: usize) -> bool {
 /// The shape checked wherever an unbind arrives: a light node id, a raw ML-DSA-65 signature, and the signer's
 /// own fields (the wallet form: a sequence, K, and no device key or delegation).
 fn unbind_shape_ok(node_id: &str, signer: &str, seq: u64, sig: &str, identity: &str, ping_pk: &str, cert: &str) -> bool {
-    if !node_id.starts_with("light_") || node_id.len() > 128 || !is_hex_len(sig, lb::MLDSA65_SIG_HEX) {
+    if !node_id.starts_with("light_") || node_id.len() > lb::LIGHT_NODE_ID_MAX || !is_hex_len(sig, lb::MLDSA65_SIG_HEX) {
         return false;
     }
     match signer {
@@ -262,57 +262,21 @@ pub(crate) fn apply_unbind(
 
 pub(super) static UNBIND_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new(5, 3600);
 
-/// When a peer that did not take the unbind is asked again: a restart or a roll is over within minutes,
-/// a longer outage within hours. After that the peer takes it from the withdrawn row (served by the
-/// identity pull) when its push to the stopped device fails.
-const UNBIND_SYNC_RETRY_SECS: [u64; 5] = [15, 60, 300, 1800, 7200];
-
 /// Send the unbind to the other genesis nodes over the internal channel; each re-verifies it. A genesis
-/// that has not applied the registration yet, or could not be reached, is asked again on the schedule.
+/// that has not applied the registration yet, or could not be reached, is asked again on the schedule
+/// (`GENESIS_SYNC_RETRY_SECS`); after that it takes the withdrawn row from the identity pull when its push to the
+/// stopped device fails.
 pub(super) async fn sync_unbind_to_genesis_peers(mut proof: UnbindProof, our_ip: String) {
     const PATH: &str = "/api/v1/internal/light-unbind-sync";
     proof.origin_ip = our_ip.clone();
-    let mut pending: Vec<&str> = crate::genesis_constants::GENESIS_NODE_IPS.iter()
-        .map(|(ip, _)| *ip).filter(|ip| *ip != our_ip && !ip.is_empty()).collect();
-    for (attempt, wait) in std::iter::once(0).chain(UNBIND_SYNC_RETRY_SECS).enumerate() {
-        if pending.is_empty() { return; }
-        if wait > 0 { tokio::time::sleep(std::time::Duration::from_secs(wait)).await; }
-        let mut again = Vec::new();
-        for ip in pending {
-            // TLS only (L-1): a peer it does not reach is asked again on the schedule, and takes the withdrawn row from
-            // the identity pull meanwhile.
-            match genesis_internal_call_tls(ip, PATH, |c, url| c.post(url).json(&proof)).await {
-                Ok(r) if r.status().is_success() => {
-                    if crate::node::is_info() {
-                        println!("[INFO][LIGHT] unbind_synced_to ip={} node={} attempt={}", ip, proof.node_id, attempt);
-                    }
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    let reason = r.json::<Value>().await.ok()
-                        .and_then(|v| v["reason"].as_str().map(|s| s.to_string())).unwrap_or_default();
-                    // A refusal on the proof itself will not change; anything else is asked again.
-                    let settled = [Refusal::BadRequest, Refusal::BadSignature, Refusal::IdentityMismatch]
-                        .iter().any(|r| r.as_str() == reason);
-                    if !settled { again.push(ip); }
-                    if crate::node::is_warn() {
-                        println!("[WARN][LIGHT] unbind_sync_rejected ip={} status={} reason={} attempt={}", ip, status, reason, attempt);
-                    }
-                }
-                Err(e) => {
-                    again.push(ip);
-                    if crate::node::is_warn() {
-                        println!("[WARN][LIGHT] unbind_sync_failed ip={} err={} attempt={}", ip, e.without_url(), attempt);
-                    }
-                }
-            }
-        }
-        pending = again;
-    }
-    if !pending.is_empty() && crate::node::is_warn() {
-        println!("[WARN][LIGHT] unbind_sync_gave_up node={} peers={:?} action=peers_take_it_from_the_withdrawn_row",
-                 proof.node_id, pending);
-    }
+    // TLS only (L-1). A refusal of the proof itself will not change; anything else is asked again.
+    let proof = &proof;
+    let send = move |ip: &'static str| async move {
+        genesis_internal_call_tls(ip, PATH, |c, url| c.post(url).json(proof)).await
+    };
+    let settled = |reason: &str| [Refusal::BadRequest, Refusal::BadSignature, Refusal::IdentityMismatch]
+        .iter().any(|r| r.as_str() == reason);
+    sync_to_genesis_peers("unbind", &proof.node_id, &our_ip, &GENESIS_SYNC_RETRY_SECS, send, settled, || true).await;
 }
 
 /// Ask the other genesis nodes for a withdrawal of this node's binding that this genesis missed, and take
@@ -401,9 +365,7 @@ pub(super) async fn handle_light_node_unbind(
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     // The address's budget of failed requests (L-2): an unbind that verifies spends none of it.
     if let Some(wait) = UNBIND_FAIL_LIMIT.blocked(remote_addr, now) {
-        let mut v = Refusal::RateLimited.to_json();
-        v["retry_after_seconds"] = json!(wait);
-        return Ok(warp::reply::json(&v));
+        return Ok(warp::reply::json(&lb::rate_limited_json(wait)));
     }
     let storage = blockchain.get_storage();
     let proof = match check_unbind(&storage, &req, now) {
@@ -417,8 +379,8 @@ pub(super) async fn handle_light_node_unbind(
         }
     };
     // Spent only after the signature verified: a request that verifies always withdraws something.
-    if !UNBIND_NODE_LIMIT.allows(&req.node_id, now) {
-        return Ok(warp::reply::json(&Refusal::RateLimited.to_json()));
+    if let Err(wait) = UNBIND_NODE_LIMIT.spend(&req.node_id, now) {
+        return Ok(warp::reply::json(&lb::rate_limited_json(wait)));
     }
     // The release reads the record at the binding's own sequence, so it runs before the withdrawal. The wallet
     // form carries none: the record ends with its binding (`binding_released`).

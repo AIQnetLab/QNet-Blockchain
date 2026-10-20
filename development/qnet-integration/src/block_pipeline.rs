@@ -4980,7 +4980,7 @@ impl BlockPipeline {
                 // cannot reverse it — the reorg's own prune scans do, and they only catch rows that
                 // exist when they run. The claim is what orders us against them: held until the save
                 // below completes, so a rollback either sees us and drains, or bars us outright.
-                // Degraded to Light: save_microblock will answer NotStoredMode, and unlike a rollback
+                // A Light storage mode: save_microblock will answer NotStoredMode, and unlike a rollback
                 // nothing ever prunes what we would write here — the registry rows and seals would
                 // accumulate for blocks this node never applied and diverge its registry_root for good.
                 if !ctx.storage.should_store_full_blocks() {
@@ -5154,10 +5154,10 @@ impl BlockPipeline {
                             format!("save_declined_rollback h={} target={}", height, target)))
                     }
                     Ok(crate::storage::SaveOutcome::NotStoredMode) => {
-                        // This node's storage keeps no blocks — a Super only reaches this through
-                        // disk-pressure degradation. It is NOT a race a fork recovery can repair, so
-                        // it must not escalate (that would spin recovery forever while the disk stays
-                        // full); it is a loud operational fault. The block is simply not applied.
+                        // This node's storage keeps no blocks (a Light storage mode; a Super stores at
+                        // any fill level). It is NOT a race a fork recovery can repair, so it must not
+                        // escalate (that would spin recovery forever); it is a loud operational fault.
+                        // The block is simply not applied.
                         println!("[ERR][STORAGE] block_not_stored h={} reason=storage_mode_keeps_no_blocks action=not_applied", height);
                         Err(crate::errors::IntegrationError::StorageError(
                             format!("save_declined_not_stored h={}", height)))

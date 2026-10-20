@@ -525,19 +525,22 @@ describe('a device whose walk steps all fail', () => {
     await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: true, index: KC });
     refuseVotes();
     const hooks = { onCapsuleDropped: jest.fn(), onLineageReset: jest.fn() };
-    await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, hooks)).resolves.toBe(false);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, hooks)).resolves.toBe(false);
+      expect(warn.mock.calls.some(([m]) => String(m).startsWith(`[ERR][LIGHT] qc_invalid j=${KC + 1}`))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
     expect(hooks.onCapsuleDropped).not.toHaveBeenCalled();
     expect(hooks.onLineageReset).not.toHaveBeenCalled();
     expect(lc.heldCapsuleIndex()).toBe(KC);
-    expect(lc.capsuleRefusal()).toBeNull();
-    expect(lc.lastStepFailure().nodes.map((n) => n.reason)).toEqual(expect.arrayContaining(['qc_invalid']));
     // Its first step above the capsule stays failed for the TTL: a second check fetches nothing for it.
     calls.length = 0;
     await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, hooks)).resolves.toBe(false);
     expect(indicesAsked()).not.toContain(KC + 1);
     for (let i = 0; i < 6; i++) await expect(lc.refreshCapsule(nodes)).resolves.toEqual({ ok: false, reason: 'current' });
     expect(capsuleAsks()).toEqual([]);
-    expect(lc.nodeReadStates(N).map((n) => n.capsuleMiss)).toEqual([0, 0, 0, 0, 0]);
     // Once the device verifies again, the kept capsule roots the walk at once.
     verifyDilithium.mockImplementation(verify);
     const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 61_000);
@@ -570,13 +573,11 @@ describe('a capsule refused here', () => {
     await expect(lc.verifyMacroblockStateRoot(stateRootOf(head), head * 90, nodes, { onCapsuleDropped: dropped })).resolves.toBe(true);
     expect(dropped).toHaveBeenCalledTimes(1);
     expect(lc.heldCapsuleIndex()).toBe(0);
-    expect(lc.capsuleRefusal()).toMatchObject({ index: KC });
     calls.length = 0;
     for (let i = 0; i < 6; i++) {
       await expect(lc.refreshCapsule(nodes, { headHint: head, force: true })).resolves.toEqual({ ok: false, reason: 'refused' });
     }
     expect(capsuleAsks()).toEqual([]);
-    expect(lc.nodeReadStates(N).map((n) => n.capsuleMiss)).toEqual([0, 0, 0, 0, 0]);
     // A newer capsule can exist: every node is asked again, and it is taken.
     const next = capsuleAt(KC + 10);
     serve({ capsule: () => next, head: KC + 10 });

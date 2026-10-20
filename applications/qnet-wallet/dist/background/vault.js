@@ -3,6 +3,7 @@
 // Password verification is a successful AES-GCM decrypt, nothing else.
 import * as core from '../lib/qnet-core.js';
 import { U64_MAX } from './amount.js';
+import * as clipboard from './clipboard.js';
 import { AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES, LIMITS, STORAGE_KEYS, TIMINGS, VAULT_DB } from './config.js';
 import { WalletError } from './errors.js';
 import * as keys from './keys.js';
@@ -985,25 +986,52 @@ async function clearArea(area, keep = [], spare = []) {
 const dropRestoreStaging = () => withDb(false, (db) => (hasStore(db)
   ? transact(db, 'readwrite', (store) => store.delete(RESTORE_STAGING_KEY)) : undefined));
 
-// Lock (reason 'wipe'), delete the database, clear chrome.storage.local (and the earlier version's database) and
-// session, check nothing is left. The chosen interface language stays: it is no wallet data, and the welcome screen and
-// the next wallet's setup keep speaking it.
+// The origins the stored site grants name, read before an erase clears them, so every site that was connected hears the
+// disconnect even when this worker has read no grant since it started (provider.onWipe). Only told, never trusted: no MAC
+// check is needed for that.
+async function grantedOrigins(local) {
+  try {
+    const stored = (await local.get(STORAGE_KEYS.SITES))?.[STORAGE_KEYS.SITES];
+    return stored !== null && typeof stored === 'object' && !Array.isArray(stored) ? Object.keys(stored) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Lock (reason 'erase'), delete the database, clear chrome.storage.local and session, empty the clipboard of a secret a
+// page copied (clipboard.clearNow), then announce the wipe (session.announceWipe: the pages hear 'wiped', the sites the
+// disconnect) once the record is verified gone, never before: a failure before that leaves the wallet in place, locked,
+// and announces nothing. What stays: the chosen interface language (no wallet data; the welcome screen and the next
+// setup keep speaking it), and a wallet of the earlier version that still opens (earlier.readEarlierWallet), which only
+// its own Remove or its move takes.
 async function eraseAll() {
-  await session.lock('wipe');
-  await deleteVaultDatabase();
-  // Failed attempts on the deleted vault must not delay the next one (a reset checks no password);
-  // the backoff also lives in session memory, which the storage clear below does not reach.
-  await session.recordPasswordSuccess();
   const storage = globalThis.chrome?.storage;
   if (!storage?.local || !storage?.session) throw internal();
-  const language = (await session.storedLanguage()) !== null ? [STORAGE_KEYS.SETTINGS] : [];
-  await clearArea(storage.local, [], language);
-  // the earlier version's pages' copy goes with its record, which the clear above removed
-  await earlier.deleteEarlierDatabase().catch((error) => log.error('earlier database not deleted', error?.code ?? error?.name));
-  // The crypto self-test pass (keys.startKeys) and the light client's hints (qnet.js: the certified head last seen) are
-  // not wallet data and may land after the clear.
-  await clearArea(storage.session, [STORAGE_KEYS.SELF_TEST, STORAGE_KEYS.LIGHT_HINTS]);
-  if ((await readRawRecord()) !== null) throw internal();
+  const origins = await grantedOrigins(storage.local);
+  await session.lock('erase');
+  await deleteVaultDatabase();
+  let gone = false;
+  try {
+    // Failed attempts on the deleted vault must not delay the next one (a reset checks no password);
+    // the backoff also lives in session memory, which the storage clear below does not reach.
+    await session.recordPasswordSuccess();
+    const language = (await session.storedLanguage()) !== null ? [STORAGE_KEYS.SETTINGS] : [];
+    // an earlier wallet that could not be read for certain stays too: it is never removed by guess
+    const keepEarlier = await earlier.readEarlierWallet().then((parsed) => parsed !== null, () => true);
+    await clearArea(storage.local, [], keepEarlier ? [...language, ...earlier.EARLIER_KEYS] : language);
+    // what an earlier version left that opens nothing goes with it, its pages' copy too
+    if (!keepEarlier) {
+      await earlier.deleteEarlierDatabase().catch((error) => log.error('earlier database not deleted', error?.code ?? error?.name));
+    }
+    await clipboard.clearNow();
+    // The crypto self-test pass (keys.startKeys), the light client's hints (qnet.js: the certified head last seen) and a
+    // clipboard clear a page asks for meanwhile are not wallet data and may land after the clear.
+    await clearArea(storage.session, [STORAGE_KEYS.SELF_TEST, STORAGE_KEYS.LIGHT_HINTS, STORAGE_KEYS.CLIPBOARD]);
+  } finally {
+    gone = (await readRawRecord().catch(() => undefined)) === null;
+    if (gone) session.announceWipe(origins);
+  }
+  if (!gone) throw internal();
 }
 
 // ---------------------------------------------------------------- API
@@ -1286,12 +1314,14 @@ export async function reveal(params) {
 }
 
 /**
- * Handler of `vault.wipe` (R16): password check, then lock (reason 'wipe'), close every connection,
- * await deleteDatabase (success, blocked, error handled), clear chrome.storage.local and session,
- * verify the vault is gone. The router already required confirm === 'DELETE'.
+ * Handler of `vault.wipe` (R16): password check, then eraseAll: lock (reason 'erase'), close every connection, await
+ * deleteDatabase (success, blocked, error handled), clear chrome.storage.local and session, empty the clipboard of a
+ * secret a page copied, verify the vault is gone and only then announce the wipe ('wiped'). The router already required
+ * confirm === 'DELETE'.
  * @param {{password: string, confirm: 'DELETE'}} params
  * @returns {Promise<{wiped: true}>}
- * @throws {WalletError} NO_VAULT, BACKOFF, BAD_PASSWORD, INTERNAL when the database could not be deleted
+ * @throws {WalletError} NO_VAULT, BACKOFF, BAD_PASSWORD (nothing locked or erased); INTERNAL when the database could not
+ *   be deleted (the wallet stays, locked, and no wipe is announced) or something else stayed (the wipe was announced)
  */
 export async function wipe(params) {
   return exclusive(async () => {
@@ -1354,8 +1384,9 @@ export async function beginReset(_params, meta) {
  * any page but the popup; take the token vault.resetBegin issued to that popup document (any call spends it); require
  * `confirm` RESET_CONFIRM; refuse an unlocked wallet (its password is known: Delete wallet takes it), checked in the
  * same queue as unlock so that an unlock finishing first is seen; then erase as vault.wipe does after its password
- * check (eraseAll: lock 'wipe', the vault database, chrome.storage.local and session, the earlier version's database,
- * the password backoff), whatever the record holds: one that does not parse goes too (R2-ESM-05).
+ * check (eraseAll: lock 'erase', the vault database, chrome.storage.local and session but the language and an earlier
+ * version's wallet that still opens, the password backoff, then the wipe announced), whatever the record holds: one
+ * that does not parse goes too (R2-ESM-05).
  * @param {{token: string, confirm: 'ERASE'}} params
  * @param {{page: string, sender: object}} meta the router's sender info
  * @returns {Promise<{wiped: true}>}

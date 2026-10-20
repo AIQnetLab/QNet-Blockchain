@@ -1,5 +1,6 @@
 // Deleting or replacing the wallet wipes what the in-app browser left on the device (L-6): cookies, site storage and the
-// web caches, the same on Android and iOS, best effort, and never holding up the erase.
+// web caches, the same on Android and iOS, best effort, and never holding up the erase. Android also clears the app's
+// image cache, and its own network reads are never cached on disk.
 const fs = require('fs');
 const path = require('path');
 
@@ -65,6 +66,22 @@ describe('the native halves, alike', () => {
     expect(fn).toMatch(/WebStorage\.getInstance\(\)\.deleteAllData\(\)/);
     expect(fn).toMatch(/clearCache\(true\)/);
     expect(fn).toMatch(/catch \(_: Throwable\) \{\s*promise\.resolve\(false\)/);
+    // The app's own images (an asset icon from the network) leave the image cache, memory and disk.
+    expect(fn).toMatch(/runCatching \{ if \(Fresco\.hasBeenInitialized\(\)\) Fresco\.getImagePipeline\(\)\.clearCaches\(\) \}/);
+    // React Native's HTTP cache is never written (the cache-less client) and goes once at start, not here.
+    expect(kt).not.toMatch(/http-cache|HTTP_CACHE_DIR/);
+  });
+
+  it('Android: the app\'s own network reads are never kept on disk; a cache an earlier build left is deleted at start', () => {
+    const app = read('android/app/src/main/java/com/qnetmobile/MainApplication.kt');
+    // React Native's client caches 10 MB of answers under cacheDir/http-cache; the factory's client has no cache.
+    expect(app).toMatch(/OkHttpClientProvider\.setOkHttpClientFactory \{ OkHttpClientProvider\.createClientBuilder\(\)\.build\(\) \}/);
+    expect(app.indexOf('setOkHttpClientFactory')).toBeLessThan(app.indexOf('loadReactNative(this)'));
+    expect(app).toMatch(/Thread \{ File\(cacheDir, HTTP_CACHE_DIR\)\.deleteRecursively\(\) \}\.start\(\)/);
+    expect(app).toMatch(/const val HTTP_CACHE_DIR = "http-cache"/);
+    const provider = read('node_modules/react-native/ReactAndroid/src/main/java/com/facebook/react/modules/network/OkHttpClientProvider.kt');
+    expect(provider).toMatch(/val cacheDirectory = File\(context\.cacheDir, "http-cache"\)/);
+    expect(provider).toMatch(/return factory\?\.createNewNetworkModuleClient\(\) \?: createClientBuilder\(context\)\.build\(\)/);
   });
 
   it('iOS: every kind of data in the default web data store', () => {

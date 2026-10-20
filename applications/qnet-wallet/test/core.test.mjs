@@ -652,20 +652,23 @@ describe('token rules and the window\'s text rule', () => {
 });
 
 describe('amounts (compiled from the mobile source)', () => {
-  it('writes a figure as the language does, every digit kept, and passes any other text through', () => {
-    assert.equal(core.amountText('2047243.4405', 'en'), '2,047,243.4405');
-    assert.equal(core.amountText('2047243.4405', 'ru'), '2\u00a0047\u00a0243,4405');
-    assert.equal(core.amountText('2047243.4405', 'de'), '2.047.243,4405');
-    assert.equal(core.amountText('1234', 'es'), '1234');
-    assert.equal(core.amountText('18446744073709551615', 'en'), '18,446,744,073,709,551,615');
-    assert.equal(core.amountText('+0.000000001', 'fr'), '+0,000000001');
-    for (const text of ['—', '1e+21', '.5']) assert.equal(core.amountText(text, 'en'), text);
+  it('writes a figure in one format for every language (comma groups, point decimals), every digit kept', () => {
+    assert.equal(core.amountText('42578.81988'), '42,578.81988');
+    assert.equal(core.amountText('2047243.4405'), '2,047,243.4405');
+    assert.equal(core.amountText('1234'), '1,234');
+    assert.equal(core.amountText('18446744073709551615'), '18,446,744,073,709,551,615');
+    assert.equal(core.amountText('+0.000000001'), '+0.000000001');
+    // a language passed by an older caller changes nothing
+    for (const lang of ['ru', 'de', 'fr', 'es', 'ar']) assert.equal(core.amountText('42578.81988', lang), '42,578.81988', lang);
+    for (const text of ['—', '1e+21', '.5']) assert.equal(core.amountText(text), text);
   });
 
-  it('reads a figure pasted in the language\'s format as written; typed text keeps the decimal comma', () => {
-    assert.equal(core.amountInput('1,000', 9, { previous: '', lang: 'en' }), '1000');
-    assert.equal(core.amountInput('1.000', 9, { previous: '', lang: 'de' }), '1000');
-    assert.equal(core.amountInput('1,000', 9, { previous: '1,00', lang: 'en' }), '1.000');
+  it('reads a pasted figure as amounts are written, the same in every language; a typed comma is the decimal point', () => {
+    assert.equal(core.amountInput('1,000', 9, { previous: '' }), '1000');
+    assert.equal(core.amountInput('42,578.81988', 9, { previous: '' }), '42578.81988');
+    assert.equal(core.amountInput('1,000', 9, { previous: '1,00' }), '1.000');
+    // a pasted '.' is always the decimal point: a language's own group mark never turns 1.000 into a thousand
+    assert.equal(core.amountInput('1.000', 9, { previous: '', lang: 'de' }), '1.000');
     assert.equal(core.amountInput('1,000.5', 9), '1000.5');
     assert.equal(core.amountInput('1.2.3', 9), null);
   });
@@ -682,8 +685,8 @@ describe('bundle surface', () => {
     // the token rules a token transfer's approval shows (compiled from the mobile utils/tokenSafety.js), and the text rule
     // of the approval window (message.js)
     'contractShortId', 'destroysTokens', 'tokenLabel', 'usesReservedName', 'isVisibleText',
-    // amounts as the language writes them, and the amount field's reading of a typed or pasted figure (compiled from the
-    // mobile utils/amountFormat.js and utils/sendAmount.js)
+    // amounts in one format for every language, and the amount field's reading of a typed or pasted figure (compiled
+    // from the mobile utils/amountFormat.js and utils/sendAmount.js)
     'amountInput', 'amountText',
     // the light node messages (compiled from the mobile NodePreimages.js; test/light-node-vectors.test.mjs)
     'claimPayloadPreimage', 'claimQuotePreimage', 'consentPreimage', 'lightNodeId', 'ownerBindPreimage', 'publicKeySha3',

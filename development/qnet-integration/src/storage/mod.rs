@@ -925,135 +925,6 @@ impl StorageTierConfig {
     }
 }
 
-// ============================================================================
-// GRACEFUL DEGRADATION SYSTEM
-// ============================================================================
-// When storage fills up, nodes automatically degrade to lower tiers:
-// Super → Full → Light
-// This ensures the node keeps running even with limited storage.
-// ============================================================================
-
-/// Storage health status
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StorageHealth {
-    /// Storage is healthy (< 70% full)
-    Healthy,
-    /// Storage is getting full (70-85% full) - start aggressive pruning
-    Warning,
-    /// Storage is almost full (85-95% full) - emergency pruning
-    Critical,
-    /// Storage is full (>= 95%) - graceful degradation
-    Full,
-}
-
-impl StorageHealth {
-    pub fn from_percentage(percentage: f64) -> Self {
-        match percentage {
-            p if p < 70.0 => StorageHealth::Healthy,
-            p if p < 85.0 => StorageHealth::Warning,
-            p if p < 95.0 => StorageHealth::Critical,
-            _ => StorageHealth::Full,
-        }
-    }
-    
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            StorageHealth::Healthy => "HEALTHY",
-            StorageHealth::Warning => "WARNING",
-            StorageHealth::Critical => "CRITICAL",
-            StorageHealth::Full => "FULL",
-        }
-    }
-}
-
-/// Graceful degradation manager
-/// Automatically downgrades node storage tier when disk fills up
-pub struct GracefulDegradation {
-    /// Original storage mode (what user configured)
-    original_mode: StorageMode,
-    /// Current effective mode (may be degraded)
-    current_mode: StorageMode,
-    /// Whether degradation is active
-    is_degraded: bool,
-    /// Timestamp when degradation started
-    degraded_since: Option<u64>,
-}
-
-impl GracefulDegradation {
-    pub fn new(mode: StorageMode) -> Self {
-        Self {
-            original_mode: mode,
-            current_mode: mode,
-            is_degraded: false,
-            degraded_since: None,
-        }
-    }
-    
-    /// Check if we need to degrade based on storage health
-    pub fn check_and_degrade(&mut self, health: StorageHealth) -> Option<StorageMode> {
-        match health {
-            StorageHealth::Full => {
-                // Degrade to next lower tier
-                // v3.18: Only Light and Super modes (Full removed)
-                let new_mode = match self.current_mode {
-                    StorageMode::Super => {
-                        println!("[WARN][STORAGE] degradation super_to_light reason=storage_full");
-                        StorageMode::Light
-                    },
-                    StorageMode::Light => {
-                        // Already at lowest tier, can't degrade further
-                        println!("[WARN][STORAGE] Already at Light mode, cannot degrade further!");
-                        return None;
-                    }
-                };
-                
-                self.current_mode = new_mode;
-                self.is_degraded = true;
-                self.degraded_since = Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                );
-                
-                Some(new_mode)
-            },
-            StorageHealth::Healthy if self.is_degraded => {
-                // Storage is healthy again, try to restore original mode
-                // Only restore if we've been degraded for at least 1 hour
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                if let Some(since) = self.degraded_since {
-                    if now - since > 3600 {
-                        let mode_name = match self.original_mode {
-                            StorageMode::Light => "light",
-                            StorageMode::Super => "super",
-                        };
-                        println!("[INFO][STORAGE] restored_mode mode={} reason=storage_healthy", mode_name);
-                        self.current_mode = self.original_mode;
-                        self.is_degraded = false;
-                        self.degraded_since = None;
-                        return Some(self.original_mode);
-                    }
-                }
-                None
-            },
-            _ => None,
-        }
-    }
-    
-    pub fn get_current_mode(&self) -> StorageMode {
-        self.current_mode
-    }
-    
-    pub fn is_degraded(&self) -> bool {
-        self.is_degraded
-    }
-}
-
 // LightNodeRotation — DEPRECATED, no-op. Light nodes are pure API clients
 // (max_storage_bytes = 0, no local header chain); this earlier
 // header-rotation buffer now runs against an empty buffer. Struct retained
@@ -1224,8 +1095,8 @@ pub enum SaveOutcome {
     Stored,
     /// Declined because a rollback is driving the chain to a lower target; re-requested afterwards.
     DeclinedRollback,
-    /// This node's effective storage mode keeps no blocks. Never true for a healthy Super node —
-    /// a Super reaches it only through disk-pressure degradation.
+    /// This node's storage mode keeps no blocks (a Light node). Never true for a Super node, which
+    /// stores blocks at any fill level (`guard_fill_before_save`).
     NotStoredMode,
 }
 
@@ -1247,6 +1118,8 @@ pub struct Storage {
     max_storage_size: u64,
     /// Current storage usage in bytes
     current_storage_usage: Arc<RwLock<u64>>,
+    /// The directory the database lives in; its filesystem is the disk the full guard reads.
+    data_dir: std::path::PathBuf,
     /// Emergency cleanup enabled
     emergency_cleanup_enabled: bool,
     /// Node storage mode configuration
@@ -1258,8 +1131,10 @@ pub struct Storage {
     /// Tiered storage configuration (v3.18+ has only two roles: Light
     /// and Super).
     tier_config: StorageTierConfig,
-    /// Graceful degradation manager
-    graceful_degradation: Arc<RwLock<GracefulDegradation>>,
+    /// A Super node's state at the critical fill level (`note_super_fill`).
+    disk_pressure: parking_lot::Mutex<compression::DiskPressure>,
+    /// An emergency compaction is running on its own thread (`compact_for_room`).
+    compacting: Arc<AtomicBool>,
     /// DEPRECATED — legacy header-rotation buffer from the historical
     /// "headers-persisted" Light tier. Current Light nodes are pure
     /// mobile API clients with zero on-device chain storage, so this
@@ -1410,10 +1285,6 @@ impl Storage {
         Ok(sum)
     }
 
-    // ========================================================================
-    // GRACEFUL DEGRADATION & STORAGE HEALTH
-    // ========================================================================
-    
     /// v3.0: Flush all RocksDB column families to disk
     /// CRITICAL: Call this before graceful shutdown to prevent data loss
     /// This ensures WAL is flushed to SST files
@@ -1428,47 +1299,6 @@ impl Storage {
         self.persistent.flush_all_background()
     }
 
-    /// Get current storage health status
-    pub fn get_storage_health(&self) -> IntegrationResult<StorageHealth> {
-        let percentage = self.get_storage_usage_percentage()?;
-        Ok(StorageHealth::from_percentage(percentage))
-    }
-    
-    /// Check storage health and apply graceful degradation if needed
-    /// Returns true if mode was changed
-    pub fn check_and_apply_degradation(&self) -> IntegrationResult<bool> {
-        let health = self.get_storage_health()?;
-        
-        let mut degradation = self.graceful_degradation.write();
-        
-        if let Some(new_mode) = degradation.check_and_degrade(health) {
-            // Log the change
-            println!("[WARN][STORAGE] Storage mode changed due to disk space:");
-            println!("[WARN][STORAGE]    Health: {}", health.as_str());
-            println!("[WARN][STORAGE]    New mode: {:?}", new_mode);
-            
-            // If degraded to Light mode, need to cleanup full block data
-            if new_mode == StorageMode::Light {
-                println!("[WARN][STORAGE] Cleaning up full block data (keeping headers only)...");
-                // Note: Actual cleanup happens in background to not block
-            }
-            
-            return Ok(true);
-        }
-        
-        Ok(false)
-    }
-    
-    /// Get effective storage mode (may be degraded from original)
-    pub fn get_effective_storage_mode(&self) -> StorageMode {
-        self.graceful_degradation.read().get_current_mode()
-    }
-    
-    /// Check if storage is currently degraded
-    pub fn is_storage_degraded(&self) -> bool {
-        self.graceful_degradation.read().is_degraded()
-    }
-    
     // ========================================================================
     // LIGHT NODE ROTATION (Auto-cleanup old headers)
     // ========================================================================
@@ -1518,9 +1348,7 @@ impl Storage {
     
     /// Check if this node should store full block data (vs headers only)
     pub fn should_store_full_blocks(&self) -> bool {
-        // Check effective mode (may be degraded)
-        let effective_mode = self.get_effective_storage_mode();
-        effective_mode != StorageMode::Light
+        self.storage_mode != StorageMode::Light
     }
     
     // NOTE: save_microblock_tiered() removed - logic integrated into main save_microblock()

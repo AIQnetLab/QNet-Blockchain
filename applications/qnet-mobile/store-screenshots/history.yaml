@@ -1,0 +1,26 @@
+# History: the rows of the wallet of QNET_SCREENSHOT_PHRASE, or the empty list of a new wallet.
+appId: com.qnetmobile
+---
+- tapOn:
+    id: "tab-history"
+- runFlow:
+    when:
+      true: ${MAESTRO_QNET_OWN_WALLET == 'true'}
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: "history-row"
+          timeout: 40000
+- runFlow:
+    when:
+      true: ${MAESTRO_QNET_OWN_WALLET != 'true'}
+    commands:
+      - extendedWaitUntil:
+          visible: "No transactions yet"
+          timeout: 40000
+- waitForAnimationToEnd:
+    timeout: 3000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "shot/04-history"

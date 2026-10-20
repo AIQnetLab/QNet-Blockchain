@@ -326,6 +326,58 @@ describe('integration: one wallet from setup to delete', () => {
     assert.deepEqual((await ask('sites.list')).result.sites.map((s) => s.origin), [SITE]);
   });
 
+  // Decision 52: the payment address step's "Send from your wallet": one transfer aiqnet.io names, confirmed in the window
+  it('aiqnet.io asks a 1DEV and then a SOL transfer to a fresh address; each window confirms and Solana sees exactly that transfer', async () => {
+    const fresh = core.mnemonicToSeed('letter advice cage absurd amount doctor acoustic avoid letter advice cage above');
+    const to = core.deriveSolanaKeypair(fresh).address;
+    core.zeroize(fresh);
+    const { TOKEN, ASSOCIATED_TOKEN, SYSTEM } = core.SOLANA_PROGRAMS;
+    const before = network.solanaTxs.length;
+
+    port.send({ id: 'probe', method: 'qnet_sendSolanaTransfer' });
+    assert.equal((await replyTo(port, 'probe')).error.code, -32602, 'the site\'s probe: the method is there');
+    port.send({ id: 'd', method: 'qnet_sendSolanaTransfer', params: { to, mint: config.SOLANA.ONE_DEV_MINT, amount: '500' } });
+    const oneDev = await approvalWindow(4);
+    const view = (await oneDev.get()).result;
+    assert.equal(view.kind, 'solanaTransfer');
+    assert.deepEqual([view.details.mode, view.details.amountRaw, view.details.rentLamports], ['confirm', '500000000', '2039280']);
+    await oneDev.resolve(true);
+    const sent = (await replyTo(port, 'd')).result;
+    assert.deepEqual(Object.keys(sent).sort(), ['signature', 'status']);
+    assert.equal(sent.status, 'submitted');
+    assert.equal(network.solanaTxs.length, before + 1);
+    const tx = network.solanaTxs[before];
+    assert.equal(tx.signature, sent.signature);
+    const destination = core.associatedTokenAddress(to, config.SOLANA.ONE_DEV_MINT);
+    const [create, move] = tx.decoded.instructions;
+    assert.equal(tx.decoded.instructions.length, 2, 'the account create and the transfer, nothing else');
+    assert.equal(create.program, ASSOCIATED_TOKEN);
+    assert.deepEqual([...create.data], [1], 'CreateIdempotent');
+    assert.equal(create.accounts[2], to, 'the account belongs to the address the site named');
+    assert.equal(move.program, TOKEN);
+    assert.equal(move.data[0], 12, 'TransferChecked');
+    assert.equal(new DataView(move.data.buffer, move.data.byteOffset + 1, 8).getBigUint64(0, true), 500_000_000n);
+    assert.equal(move.data[9], 6);
+    assert.deepEqual(move.accounts, [network.ata, config.SOLANA.ONE_DEV_MINT, destination, WALLET.solana]);
+    // the window stays on what was sent until the user closes it; the next request's window opens after it
+    const shownWindow = browser.windows[4].id;
+    assert.equal(browser.openWindows.has(shownWindow), true);
+    browser.openWindows.delete(shownWindow);
+    browser.chrome.windows.onRemoved.dispatch(shownWindow);
+
+    port.send({ id: 'l', method: 'qnet_sendSolanaTransfer', params: { to, mint: null, amount: '0.005' } });
+    const sol = await approvalWindow(5);
+    assert.equal((await sol.get()).result.details.mode, 'confirm');
+    await sol.resolve(true);
+    assert.equal((await replyTo(port, 'l')).result.status, 'submitted');
+    const [system] = network.solanaTxs[before + 1].decoded.instructions;
+    assert.equal(network.solanaTxs[before + 1].decoded.instructions.length, 1);
+    assert.equal(system.program, SYSTEM);
+    assert.deepEqual(system.accounts, [WALLET.solana, to]);
+    assert.equal(new DataView(system.data.buffer, system.data.byteOffset + 4, 8).getBigUint64(0, true), 5_000_000n);
+    assert.deepEqual((await ask('sites.list')).result.sites.map((s) => s.origin), [SITE], 'no grant was asked for or added');
+  });
+
   it('Lock in the popup locks the worker, tells the site, and only the password unlocks', async () => {
     await popup.click('[data-action="lock"]');
     await popup.until(() => popup.$('[data-action="unlock"]') !== null, 'the lock screen');
@@ -352,9 +404,10 @@ describe('integration: one wallet from setup to delete', () => {
     await browser.chrome.storage.local.set({ [STORAGE_KEYS.SITES]: old });
     port.send({ id: 'a3', method: 'qnet_accounts' });
     assert.deepEqual((await replyTo(port, 'a3')).result, {});
+    const windows = browser.windows.length;
     port.send({ id: 's2', method: 'qnet_signMessage', params: { message: 'again' } });
     assert.equal((await replyTo(port, 's2')).error.code, 4100);
-    assert.equal(browser.windows.length, 4, 'no window for a site without a grant');
+    assert.equal(browser.windows.length, windows, 'no window for a site without a grant');
   });
 
   it('Settings: the phrase shows at once after the password and goes with Done; Delete wipes every store', async () => {

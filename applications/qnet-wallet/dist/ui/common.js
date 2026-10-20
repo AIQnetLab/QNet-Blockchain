@@ -262,55 +262,54 @@ export function t(key, substitutions = []) {
   });
 }
 
-let clipboardSeq = 0;
-// The copy made with clearAfterMs that nothing replaced or cleared yet, or null.
-let pendingSeq = null;
+// This page made a copy with clearAfterMs that no later copy from it replaced yet (clearCopiedNow).
+let copyPending = false;
 
-// Empties the clipboard unless this page copied something else since `seq` (then that copy is the one on it).
-function clearIfStill(seq) {
-  if (seq !== clipboardSeq) return Promise.resolve();
-  clipboardSeq += 1;
-  pendingSeq = null;
-  return navigator.clipboard.writeText('').catch(() => {});
+// Tells the worker, which empties the clipboard when the time is up whether or not this page is still open
+// (clipboard.schedule); a failure is logged, the copy itself stands.
+async function scheduleClear(afterMs) {
+  try {
+    await call('clipboard.schedule', { afterMs });
+  } catch (error) {
+    log.warn('clipboard clear not scheduled', error?.code);
+  }
 }
 
 /**
- * Writes text to the clipboard after an explicit click. With clearAfterMs, overwrites the clipboard
- * with '' after that delay if it still holds the text (best effort, while the page has focus: R14); with
- * untilFocused too, a page without the focus at that moment clears it as soon as it gets the focus back
- * (the recovery phrase). copyText('') empties the clipboard (wallet deletion, R16).
+ * Writes text to the clipboard after an explicit click. With clearAfterMs (a secret: R14), the worker empties the
+ * clipboard after that delay unless a later copy from a wallet page replaced it (clipboard.schedule), also once this page
+ * is closed. Every copy without one tells the worker too, from whichever page or popup made it, and drops a clear still
+ * pending: the secret is no longer on the clipboard. Nothing reads the clipboard back (that needs the clipboardRead
+ * permission). copyText('') empties the clipboard now (a phrase pasted into Import).
  * @param {string} text
- * @param {{clearAfterMs?: number, untilFocused?: boolean}} [options]
+ * @param {{clearAfterMs?: number}} [options]
  * @returns {Promise<void>}
  */
 export async function copyText(text, options = {}) {
   if (typeof text !== 'string') throw new UiError('INTERNAL');
   await navigator.clipboard.writeText(text);
-  clipboardSeq += 1;
-  const seq = clipboardSeq;
   const delay = options.clearAfterMs;
-  pendingSeq = null;
-  if (text === '' || !Number.isSafeInteger(delay) || delay <= 0) return;
-  pendingSeq = seq;
-  // Reading the clipboard back would need the clipboardRead permission (or a prompt), so "still holds
-  // the text" means: nothing was copied from this page since. A closed page cannot clear at all.
-  setTimeout(() => {
-    if (seq !== clipboardSeq) return;
-    if (document.hasFocus()) {
-      clearIfStill(seq);
-      return;
-    }
-    if (options.untilFocused === true) window.addEventListener('focus', () => clearIfStill(seq), { once: true });
-  }, delay);
+  const timed = text !== '' && Number.isSafeInteger(delay) && delay > 0;
+  copyPending = timed;
+  // sent at once in either case; only a secret's copy waits for the worker's answer, an address shows "Copied" at once
+  const told = scheduleClear(timed ? delay : 0);
+  if (timed) await told;
 }
 
 /**
- * Empties the clipboard now when it still holds a copy this page made with clearAfterMs (best effort; the page
- * needs the focus). Anything else on the clipboard is left alone. Resolves once the write is done.
+ * Empties the clipboard now when it still holds a copy this page made with clearAfterMs (the worker writes it:
+ * clipboard.clearNow, which needs no focus). Anything else on the clipboard is left alone. Resolves once the worker
+ * answered; never rejects.
  * @returns {Promise<void>}
  */
-export function clearCopiedNow() {
-  return pendingSeq !== null ? clearIfStill(pendingSeq) : Promise.resolve();
+export async function clearCopiedNow() {
+  if (!copyPending) return;
+  copyPending = false;
+  try {
+    await call('clipboard.clearNow');
+  } catch (error) {
+    log.warn('clipboard not cleared', error?.code);
+  }
 }
 
 const REVEAL_KEYS = new Set([' ', 'Enter']);

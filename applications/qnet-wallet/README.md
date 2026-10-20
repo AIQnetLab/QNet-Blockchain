@@ -7,8 +7,8 @@ account's private key behind the password as it shows the recovery phrase, burns
 wallet), records the wallet's light node on QNet Blockchain after that burn, and connects to aiqnet.io and
 games.aiqnet.io through a per-site, approval-gated provider that lets a page ask for QNC transfers, built-in token
 transfers and contract calls, and lets aiqnet.io ask for the burn, for a move of the balance of the wallet's light or
-super node into the wallet and for the unlink of the light node's device, each shown and confirmed in the wallet's own
-window. Its own popup has no move of a node balance: aiqnet.io's My node and QNet Wallet's Node tab offer it. It never
+super node into the wallet, for the unlink of the light node's device and for one SOL or 1DEV transfer to an address it
+names, each shown and confirmed in the wallet's own window. Its own popup has no move of a node balance: aiqnet.io's My node and QNet Wallet's Node tab offer it. It never
 runs a node: a light node runs in QNet Wallet on a phone or tablet, a super node on your own server with the QNet Blockchain
 node software; the wallet key can end the light node on whatever device runs it.
 
@@ -22,7 +22,7 @@ npm run build            # dist/lib/qnet-core.js
 npm test                 # offline tests: bundle, modules, pages, the whole extension, the package
 npm run test:live        # read-only checks against Solana devnet and the QNet Blockchain nodes
 npm run build:dev        # dist-dev/: dist plus localhost content-script matches (git-ignored); again after every dist change, npm test refuses a stale one
-npm run package          # qnet-wallet-3.1.5.zip: the store package (git-ignored)
+npm run package          # qnet-wallet-3.1.6.zip: the store package (git-ignored)
 npm run check:overflow   # headless Chrome: every screen in every language, nothing overflows
 ```
 

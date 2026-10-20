@@ -267,6 +267,34 @@ describe('the WebView the browser renders', () => {
     await act(async () => { tree.unmount(); });
   });
 
+  // A payment request (solana:) a page goes to is refused at every gate: the library's whitelist keeps it from the
+  // browser's hook, the Android client refuses it natively, and the hook itself says it stays blocked.
+  it('a solana: navigation is refused and never opens anything', async () => {
+    const { Linking } = require('react-native');
+    const open = jest.spyOn(Linking, 'openURL').mockResolvedValue(true);
+    const tree = await openPage(false);
+    const web = tree.root.findByType(WebView).props;
+    const { createOnShouldStartLoadWithRequest } = jest.requireActual('react-native-webview/lib/WebViewShared');
+    const hook = jest.fn(web.onShouldStartLoadWithRequest);
+    const decided = [];
+    const gate = createOnShouldStartLoadWithRequest((ok, u) => decided.push([ok, u]), web.originWhitelist, hook);
+    const request = 'solana:9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin?amount=0.001';
+    await act(async () => { gate({ nativeEvent: { url: request, lockIdentifier: 1, isTopFrame: true } }); });
+    expect(decided).toEqual([[false, request]]);
+    expect(hook).not.toHaveBeenCalled();
+    let allowed;
+    await act(async () => { allowed = web.onShouldStartLoadWithRequest({ url: request, isTopFrame: true }); });
+    expect(allowed).toBe(false);
+    expect(navigationDecision(request)).toMatchObject({ allow: false });
+    const patch = require('fs').readFileSync(require('path').join(__dirname, '..', 'patches', 'react-native-webview+14.0.1.patch'), 'utf8');
+    const native = /isAllowedNavigation\(Uri uri, boolean isMainFrame\) \{([\s\S]*?)\r?\n\+ {4}\}\r?\n/.exec(patch)[1];
+    expect(native).toMatch(/default:\s*\+\s*return false;/);
+    expect(native).not.toMatch(/solana/i);
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
+    await act(async () => { tree.unmount(); });
+  });
+
   it('the patched library blocks what is outside the whitelist instead of opening another app', () => {
     const { Linking } = require('react-native');
     const open = jest.spyOn(Linking, 'openURL').mockResolvedValue(true);

@@ -1,0 +1,21 @@
+# Settings with the language list open: Auto-Lock is first set back to its default (autolock.yaml turned it to Never),
+# a shorter time asking for nothing, then a tap on the current language, English, opens the list.
+appId: com.qnetmobile
+---
+- tapOn:
+    id: "tab-settings"
+- tapOn: "Never"
+- tapOn: "1 minute"
+- extendedWaitUntil:
+    notVisible: "Never"
+    timeout: 10000
+- tapOn: "English"
+- extendedWaitUntil:
+    visible: "Русский"
+    timeout: 10000
+- waitForAnimationToEnd:
+    timeout: 3000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "shot/06-settings"

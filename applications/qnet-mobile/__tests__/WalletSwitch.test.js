@@ -56,6 +56,21 @@ describe('storing a different wallet clears what the previous one left', () => {
     expect(await AsyncStorage.getItem('qnet_wallet_address')).toBe(B.sol);
   });
 
+  // A teardown leaves a binding of the previous wallet's node sent with no answer (it may be the network taking it), and
+  // its ping key: the next wallet does not keep them.
+  it("the previous wallet's binding still waiting for the network goes with its ping key", async () => {
+    const Keychain = require('react-native-keychain');
+    const { UNCONFIRMED_BIND_KEY } = require('../src/services/PingKeys');
+    await AsyncStorage.multiSet([
+      ['qnet_address', A.qnet], ['qnet_wallet_address', A.sol],
+      [UNCONFIRMED_BIND_KEY, JSON.stringify({ nodeId: 'light_mobile_1111222233334444', walletAddress: A.qnet, seq: 7, at: 1 })],
+    ]);
+    Keychain.resetGenericPassword.mockClear();
+    await new WalletManager().storeWallet(walletOf(B, { mnemonic: TEST_MNEMONIC }), 'bravo-lantern-94');
+    expect(await AsyncStorage.getItem(UNCONFIRMED_BIND_KEY)).toBeNull();
+    expect(Keychain.resetGenericPassword).toHaveBeenCalledWith({ service: 'qnet_ping_next' });
+  });
+
   it("keeps the new wallet's light-node identity key, which the wipe would otherwise remove", async () => {
     await AsyncStorage.multiSet([['qnet_address', A.qnet], ['qnet_wallet_address', A.sol], ['qnet_identity_pk_old', 'aa']]);
     const wm = new WalletManager();

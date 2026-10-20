@@ -1,0 +1,13 @@
+# The App Store scenes of QNet Wallet on a fresh simulator, run by scripts/store-screenshots.js: the wallet is imported
+# and kept open, then each scene is opened and captured by that script (control.js "shot/<name>"), in the listing's order.
+appId: com.qnetmobile
+name: App Store screenshots
+---
+- runFlow: import.yaml
+- runFlow: autolock.yaml
+- runFlow: wallet.yaml
+- runFlow: send.yaml
+- runFlow: receive.yaml
+- runFlow: history.yaml
+- runFlow: node.yaml
+- runFlow: settings.yaml

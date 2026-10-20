@@ -796,7 +796,20 @@ impl Storage {
         let stored = self.get_fcm_entry(node_id);
         if let Some(stored) = &stored {
             let displaces = own && stored.seq == 0 && !stored.writer.is_empty() && !stored.writer.eq_ignore_ascii_case(writer);
-            if !displaces && (seq, ts) < (stored.seq, stored.updated_at) { return Ok(false); }
+            if !displaces && (seq, ts) < (stored.seq, stored.updated_at) {
+                // An older write of the same binding (its attach, after a later token refresh) still gives the
+                // platform and the model the record lacks; the channel stays as it is.
+                if seq > 0 && stored.seq == seq
+                    && ((stored.platform.is_empty() && !platform.is_empty()) || (stored.model.is_empty() && !model.is_empty())) {
+                    let raw = self.persistent.db.get_cf(&fcm_cf, node_id.as_bytes())?.unwrap_or_default();
+                    if let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                        if stored.platform.is_empty() && !platform.is_empty() { data["platform"] = serde_json::json!(platform); }
+                        if stored.model.is_empty() && !model.is_empty() { data["model"] = serde_json::json!(model); }
+                        self.persistent.db.put_cf(&fcm_cf, node_id.as_bytes(), data.to_string().as_bytes())?;
+                    }
+                }
+                return Ok(false);
+            }
         }
         // A channel of a withdrawn binding (a refresh that raced its unbind) is not written back.
         if seq > 0 && row.map_or(false, |b| seq <= b.floor) {

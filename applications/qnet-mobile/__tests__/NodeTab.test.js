@@ -17,6 +17,7 @@ import {
 } from '../src/services/LightNode';
 import { lightShardOwnerUrls } from '../src/config/nodes';
 import { hasKey, makeT } from '../src/i18n';
+import { reasonText } from '../src/utils/bindRefusal';
 
 const AsyncStorage = require('@react-native-async-storage/async-storage');
 
@@ -135,15 +136,26 @@ describe('the state, from the status alone', () => {
     // No reference rides on a notice: nothing on the card asks the user to quote one (owner, 05.10).
   });
 
-  it('a refusal of "Use this device" in words', () => {
-    expect(refusalText(t, null)).toBe(null);
-    expect(refusalText(t, { reason: 'device_emulator' })).toBe(t('node_cant_run'));
-    expect(refusalText(t, { reason: 'device_compromised' })).toBe(t('node_cant_run_now'));
-    expect(refusalText(t, { reason: 'bad_signature' })).toBe(t('node_use_err_key'));
-    expect(refusalText(t, { reason: 'network' })).toBe(t('node_use_err_network'));
-    expect(refusalText(t, { reason: 'rate_limited' })).toBe(t('node_use_err_limit'));
+  // The Node tab and the QNet Link sheet say why a binding was refused in the same words (utils/bindRefusal reasonText);
+  // for a reason with none of its own the tab says a network failure, the sheet nothing (its error line says it).
+  it('a refusal of "Use this device" in words, the QNet Link sheet\'s too', () => {
+    for (const [reason, key] of [
+      ['device_emulator', 'node_cant_run'], ['device_compromised', 'node_cant_run_now'], ['bad_signature', 'node_use_err_key'],
+      ['device_secondary_user', 'node_main_profile'], ['rate_limited', 'node_use_err_limit'],
+      // A phone clock off the network's refused the move as "try again", which never helps.
+      ['expired', 'node_use_err_clock'], ['future_seq', 'node_use_err_clock'],
+      // A device refusal this build has no text for is a device that cannot run the node now, not a network failure.
+      ['device_something_new', 'node_cant_run_now'],
+    ]) {
+      expect([reason, reasonText(t, { reason }), refusalText(t, { reason })]).toEqual([reason, t(key), t(key)]);
+    }
     const at = new Date(2026, 8, 26, 10, 0, 0).getTime();
     expect(refusalText(t, { reason: 'rate_limited', retryAfterSeconds: 3600 }, at)).toBe(t('node_move_limit', { time: '11:00' }));
+    expect(reasonText(t, { reason: 'device_rate_limited', retryAfterSeconds: 120 }, at)).toBe(t('node_move_limit', { time: '10:02' }));
+    for (const reason of ['network', 'stale_seq', null, undefined]) {
+      expect([reason, reasonText(t, { reason }), refusalText(t, { reason })]).toEqual([reason, null, t('node_use_err_network')]);
+    }
+    expect([reasonText(t, null), refusalText(t, null)]).toEqual([null, null]);
   });
 });
 
@@ -187,6 +199,23 @@ describe('what each state shows', () => {
     expect(nodeView({ status: status({ onChain: false }), pending: { expired: false } })).toEqual({ state: 'linking' });
   });
 
+  // A binding sent from a phone that held none, with no answer: with no binding sequence in the status (signed answers
+  // that do not agree, no signed status) it is still being linked here, never "runs here", and asks for no device key.
+  it('a waiting binding on a phone with none, no binding sequence named: being linked, the waiting line, no device-key advice', () => {
+    const now = Date.now();
+    const waiting = { ...LOCAL, boundAt: Math.floor(now / 1000) - 3600, hw: false, unconfirmed: true };
+    const features = ['device_v1', 'bind_v2'];
+    expect(bindingVerdict(status(), waiting, now)).toBe('linking');
+    expect(nodeView({ status: status({ features }), local: waiting, now }))
+      .toMatchObject({ state: 'here', notice: { key: 'node_linked_waiting' }, reenrol: false, offerUse: false });
+    // This device's own binding with no sequence named stands as before.
+    expect(bindingVerdict(status(), { ...waiting, unconfirmed: undefined }, now)).toBe('here');
+    const tree = render({ light: light({ local: waiting, status: status({ features }) }) });
+    expect(shown(tree)).toContain(t('node_linked_waiting'));
+    expect(shown(tree)).not.toContain(t('node_device_again'));
+    expect(buttons(tree)).not.toContain('node-use');
+  });
+
   it('checking and unreachable keep the balance and Move of the node this device runs (owner, 05.10)', () => {
     for (const [l, key] of [
       [light({ local: LOCAL, status: null, balanceNano: 4_714_356_375_000 }), 'node_checking'],
@@ -201,22 +230,27 @@ describe('what each state shows', () => {
   });
 
   // Owner, 11.10: one wallet, one node. A light node bound to another device, or to none, is not this device's to show:
-  // the tab says what a wallet without a node says, with no balance, no button and no word about binding or activation.
-  it('another device, no device, or no binding here: what a wallet without a node shows, nothing to press', () => {
+  // no balance, no button and no word about binding or activation. A node on another device says so ("This wallet has
+  // no node." on the phone the node left was false), which covers a reinstall here, as the network cannot tell it from
+  // another device; any other says what a wallet without a node says.
+  it('another device, no device, or no binding here: one sentence, nothing to press', () => {
     const S = LOCAL.seq;
-    for (const l of [
-      light({ balanceNano: 2 * 1e9 }), // bound elsewhere, no binding here
-      light({ status: status({ deviceBound: false }), balanceNano: 2 * 1e9 }), // bound to no device
-      light({ local: LOCAL, status: status({ bindingSeqAgreed: S + 5 }), balanceNano: 2 * 1e9 }), // taken over
-      light({ local: LOCAL, status: status({ bindingSeqAgreed: S, deviceBound: false }), balanceNano: 2 * 1e9 }), // unlinked
-      light({ status: status({ deviceBoundAgreed: null }), balanceNano: 2 * 1e9 }), // no verdict, no binding here
-      light({ status: status({ onChain: null }), balanceNano: 2 * 1e9 }), // network not reached, no binding here
+    for (const [l, key] of [
+      [light({ balanceNano: 2 * 1e9 }), 'node_elsewhere'], // bound elsewhere, no binding here (or a reinstall here)
+      [light({ status: status({ deviceBound: false }), balanceNano: 2 * 1e9 }), 'node_none'], // bound to no device
+      [light({ local: LOCAL, status: status({ bindingSeqAgreed: S + 5 }), balanceNano: 2 * 1e9 }), 'node_elsewhere'], // taken over
+      [light({ local: LOCAL, status: status({ bindingSeqAgreed: S, deviceBound: false }), balanceNano: 2 * 1e9 }), 'node_none'], // unlinked
+      [light({ status: status({ deviceBoundAgreed: null }), balanceNano: 2 * 1e9 }), 'node_none'], // no verdict, no binding here
+      [light({ status: status({ onChain: null }), balanceNano: 2 * 1e9 }), 'node_none'], // network not reached, no binding here
     ]) {
       const tree = render({ light: l, refusal: { reason: 'device_unsupported' } });
-      expect(shown(tree)).toBe(`${t('node_title')}\n${t('node_none')}`);
+      expect(shown(tree)).toBe(`${t('node_title')}\n${t(key)}`);
       expect(buttons(tree)).toEqual([]);
       expect(lightShownHere(l, nodeView(l))).toBe(false);
     }
+    expect(t('node_elsewhere')).toBe("This wallet's node is linked to another device, or to this device before QNet Wallet was reinstalled.");
+    // The node on no device keeps what a wallet without a node says: the site's sentence only (owner, 11.10).
+    expect(hasKey('node_no_device')).toBe(false);
     // Not read yet: still being checked; bound here or being linked here: shown.
     expect(lightShownHere(null, { state: 'checking' })).toBe(true);
     expect(lightShownHere(light({ local: LOCAL }), nodeView(light({ local: LOCAL })))).toBe(true);
@@ -358,11 +392,11 @@ describe('what each state shows', () => {
     expect(off).not.toContain(t('node_last_seen'));
   });
 
-  // Owner, 11.10: a coming network rule holds outside super nodes back from consensus while registrations stay open. Such
-  // a node, registered and not admitted (its status's consensus_admitted false), says so in place of Offline, and what
-  // it earned moves all the same. A node that says nothing of admission is not waiting.
-  it('a super node registered and not admitted yet: waiting for admission, never Offline, its balance movable', () => {
-    const waiting = serverStatus({ isOnline: false, lastSeen: 0, lastSeenAgoSeconds: undefined, consensusAdmitted: false });
+  // Owner, 11.10: a network rule holds outside super nodes back from consensus while registrations stay open. Such a
+  // node, registered and not admitted (its status's admission 'waiting'), says so in place of Offline, and what it
+  // earned moves all the same. A node that says nothing of admission is not waiting.
+  it('a super node registered and not admitted to consensus yet: said so, never Offline, its balance movable', () => {
+    const waiting = serverStatus({ isOnline: false, lastSeen: 0, lastSeenAgoSeconds: undefined, admission: 'waiting' });
     const tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: waiting, epochs: null }, light: null });
     const text = shown(tree);
     expect(text).toContain(`${t('node_status_node')}\n${t('node_waiting_admission')}`);
@@ -371,10 +405,10 @@ describe('what each state shows', () => {
     expect(text).not.toContain(t('node_server_offline'));
     expect(text).toContain('2 QNC');
     expect(tree.root.find((n) => n.props.testID === 'node-move' && typeof n.props.onPress === 'function').props.disabled).toBe(false);
-    expect(t('node_waiting_admission')).toBe('Registered — waiting for admission to QNet Blockchain');
+    expect(t('node_waiting_admission')).toBe('Registered, not admitted to consensus yet');
     expect(waitingAdmission(waiting)).toBe(true);
-    for (const s of [serverStatus({ isOnline: false }), serverStatus({ consensusAdmitted: true }), serverStatus({ registered: false, consensusAdmitted: false }),
-      serverStatus({ admission: 'admitted' }), serverStatus({ admission: 'not_required' }), serverStatus({ registered: false, admission: 'waiting' }), null]) {
+    for (const s of [serverStatus({ isOnline: false }), serverStatus({ admission: 'admitted' }),
+      serverStatus({ admission: 'not_required' }), serverStatus({ registered: false, admission: 'waiting' }), null]) {
       expect(waitingAdmission(s)).toBe(false);
     }
     // The node's admission 'waiting' (what live nodes report) is the same state, as the site shows it: online or not.
@@ -552,7 +586,12 @@ describe('what each state shows', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'screens', 'WalletScreen.js'), 'utf8');
     expect(src).toMatch(/const SIGNED_STATUS_MS = 5 \* 60_000;/);
     expect(src).toMatch(/if \(!server \|\| lightShownRef\.current\) loadLightNodeStatus\(\{ fresh: false \}\);\s*\}, NODE_STATUS_MS\);/);
-    expect(src).toMatch(/const sign = !!local && \(fresh \|\| !same \|\| Date\.now\(\) - last\.at >= SIGNED_STATUS_MS\);/);
+    // While a binding with no answer waits, every read asks for the network's word on it.
+    expect(src).toMatch(/const sign = !!unconfirmed \|\| \(!!local && \(fresh \|\| !same \|\| Date\.now\(\) - last\.at >= SIGNED_STATUS_MS\)\);/);
+    // It is settled by this read's word only, before the check that would end the binding it replaced.
+    expect(src.indexOf('settleUnconfirmedBinding(nodeId, status)')).toBeGreaterThan(-1);
+    expect(src.indexOf('settleUnconfirmedBinding(nodeId, status)')).toBeLessThan(src.indexOf('kept.verdict) {'));
+    expect(src.indexOf('settleUnconfirmedBinding(nodeId, status)')).toBeLessThan(src.indexOf('forgetIfReplaced(nodeId, status, local.seq)'));
     // The last signed answer stands only for the binding it was read for, and a teardown only for that binding.
     expect(src).toMatch(/const same = !!local && last\.nodeId === nodeId && last\.seq === local\.seq;/);
     expect(src).toMatch(/forgetIfReplaced\(nodeId, status, local\.seq\)/);

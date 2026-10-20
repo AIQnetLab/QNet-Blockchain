@@ -31,11 +31,14 @@ describe('Android', () => {
     expect(read('android/app/src/main/java/com/qnetmobile/MainActivity.kt')).toMatch(/setRecentsScreenshotEnabled\(false\)/);
     const security = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
     for (const marker of ['FLAG_SECURE', 'setHideOverlayWindows', 'ACCESSIBILITY_DATA_SENSITIVE_YES',
-      'filterTouchesWhenObscured', 'IME_FLAG_NO_PERSONALIZED_LEARNING', 'clearPrimaryClip',
+      'filterTouchesWhenObscured', 'IME_FLAG_NO_PERSONALIZED_LEARNING', 'clipboard()?.clearNow()',
       'setInvalidatedByBiometricEnrollment(true)', 'AUTH_BIOMETRIC_STRONG', 'BiometricPrompt.CryptoObject',
       'setIsStrongBoxBacked(true)']) {
       expect(security).toContain(marker);
     }
+    // One way to empty the clipboard, for the phrase field and the copied secret alike.
+    expect(read('android/app/src/main/java/com/qnetmobile/SecretClip.kt')).toMatch(/internal fun ClipboardManager\.clearNow\(\) \{[\s\S]*?clearPrimaryClip\(\)/);
+    expect(security).not.toMatch(/clearPrimaryClip|setPrimaryClip\(ClipData\.newPlainText\("", ""\)\)/);
     // MVA-R4-01: no vault key is bound to the screen lock (keystore2 deletes such keys when the lock is removed).
     expect(security).not.toMatch(/setUnlockedDeviceRequired\(/);
     expect(read('android/app/src/main/java/com/qnetmobile/DilithiumPackage.kt')).toContain('SecurityModule(reactContext)');
@@ -78,14 +81,67 @@ describe('Android', () => {
     expect(rules.join('\n')).toMatch(/-assumenosideeffects class android\.util\.Log/);
     expect(read('android/app/build.gradle')).toMatch(/minifyEnabled true/);
   });
+
+  it('R8 optimises in full mode: no blanket keep of a library its own rules cover, no flag R8 ignores', () => {
+    const rules = read('android/app/proguard-rules.pro').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    // React Native's own consumer rules keep what it reaches by reflection or JNI; Hermes' Java side ships none.
+    expect(rules.filter((l) => l.startsWith('-keep'))).toEqual(['-keep class com.facebook.hermes.** { *; }']);
+    expect(rules.join('\n')).not.toMatch(/-optimizationpasses|-dontpreverify|-dontskipnonpubliclibraryclasses|-dontoptimize|-verbose/);
+    const gradle = read('android/app/build.gradle');
+    expect(gradle).toMatch(/shrinkResources true/);
+    expect(gradle).toMatch(/proguardFiles getDefaultProguardFile\("proguard-android-optimize\.txt"\), "proguard-rules\.pro"/);
+    // Full mode is the default of the Android Gradle plugin in use; nothing turns it off.
+    expect(read('android/gradle.properties')).not.toMatch(/android\.enableR8\.fullMode\s*=\s*false/);
+    expect(read('node_modules/react-native/gradle/libs.versions.toml')).toMatch(/^agp = "8\./m);
+  });
+
+  it('edge to edge from API 29, as Android 15+ enforces it; the bars keep the dark app\'s look on every version', () => {
+    // React Native's switch, turned on at start from API 29 only: below it React Native would give the navigation bar
+    // a light scrim in light mode (its modal sheets too), so there the app keeps its own dark bars. With it the activity
+    // and its modals draw behind both bars and the screens take the insets from SafeAreaProvider (App.tsx).
+    expect(read('android/gradle.properties')).toMatch(/^edgeToEdgeEnabled=false\s*$/m);
+    const app = read('android/app/src/main/java/com/qnetmobile/MainApplication.kt');
+    expect(app).toMatch(/if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.Q\) setEdgeToEdgeFeatureFlagOn\(\)/);
+    expect(app.indexOf('setEdgeToEdgeFeatureFlagOn()')).toBeLessThan(app.indexOf('loadReactNative(this)'));
+    expect(read('App.tsx')).toMatch(/<SafeAreaProvider initialMetrics=\{initialWindowMetrics\}>/);
+    const activity = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
+    const create = activity.slice(activity.indexOf('override fun onCreate('), activity.indexOf('override fun onPause('));
+    expect(create.indexOf('super.onCreate(savedInstanceState)')).toBeLessThan(create.indexOf('WindowInsetsControllerCompat'));
+    expect(create).toMatch(/if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.Q\) \{\s*val bars = WindowInsetsControllerCompat\(window, window\.decorView\)\s*bars\.isAppearanceLightStatusBars = false\s*bars\.isAppearanceLightNavigationBars = false\s*window\.isNavigationBarContrastEnforced = false/);
+    // The colour setters Android 15 deprecates are never called by the app's own code.
+    for (const f of ['MainActivity.kt', 'MainApplication.kt', 'SecurityModule.kt', 'TaskState.kt', 'SecretClip.kt']) {
+      expect([f, /statusBarColor|navigationBarColor|setStatusBarColor|setNavigationBarColor|LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES/.test(read(`android/app/src/main/java/com/qnetmobile/${f}`))]).toEqual([f, false]);
+    }
+  });
+
+  it('bitmaps are no larger than they are shown: the launch mark per density, the app mark per scale', () => {
+    const size = (p) => { const b = fs.readFileSync(path.join(ROOT, p)); return [b.readUInt32BE(16), b.readUInt32BE(20)]; };
+    // The launch screen draws the mark at 192 dp: one drawable per density at exactly that size (no mipmap copies, so
+    // a device receives only its own density's).
+    expect(read('android/app/src/main/res/drawable/launch_screen.xml')).toMatch(/android:width="192dp"\s+android:height="192dp"\s+android:drawable="@drawable\/splash_logo"/);
+    for (const [density, scale] of [['mdpi', 1], ['hdpi', 1.5], ['xhdpi', 2], ['xxhdpi', 3], ['xxxhdpi', 4]]) {
+      expect(size(`android/app/src/main/res/drawable-${density}/splash_logo.png`)).toEqual([192 * scale, 192 * scale]);
+      expect(fs.existsSync(path.join(ROOT, `android/app/src/main/res/mipmap-${density}/splash_logo.png`))).toBe(false);
+    }
+    // The app mark is drawn at 72 at most (the lock screen); React Native picks the variant for the screen's scale.
+    for (const [suffix, scale] of [['', 1], ['@2x', 2], ['@3x', 3], ['@4x', 4]]) {
+      expect(size(`assets/qnet_logo${suffix}.png`)).toEqual([72 * scale, 72 * scale]);
+    }
+    expect(read('src/screens/WalletScreen.styles.js')).toMatch(/lockLogo: \{\s*width: 72,\s*height: 72,/);
+  });
 });
 
 describe('iOS', () => {
   it('the app-switcher snapshot is covered and the push token is never printed', () => {
     const app = read('ios/QNetMobile/AppDelegate.swift');
-    expect(app).toMatch(/func applicationWillResignActive/);
-    expect(app).toMatch(/func applicationDidBecomeActive/);
-    expect(app).not.toMatch(/print\(/);
+    // Under the scene life cycle UIKit calls only the scene's resign and activation: the cover lives there.
+    const scene = read('ios/QNetMobile/SceneDelegate.swift');
+    expect(scene).toMatch(/func sceneWillResignActive\(_ scene: UIScene\) \{\s*guard SceneDelegate\.privacyCover == nil, let window = window else \{ return \}[\s\S]*?window\.addSubview\(cover\)/);
+    expect(scene).toMatch(/func sceneDidBecomeActive\(_ scene: UIScene\) \{\s*SceneDelegate\.privacyCover\?\.removeFromSuperview\(\)/);
+    // The window outlives a scene that disconnects while covered: the cover is the process's, never one delegate's.
+    expect(scene).toMatch(/private static var privacyCover: UIView\?/);
+    expect(app).not.toMatch(/applicationWillResignActive|applicationDidBecomeActive|privacyCover/);
+    for (const f of [app, scene, read('ios/QNetMobile/TaskState.swift')]) expect(f).not.toMatch(/print\(|NSLog/);
     const plist = read('ios/QNetMobile/Info.plist');
     expect(plist).toMatch(/<key>RCTAsyncStorageExcludeFromBackup<\/key>\s*<true\/>/);
     // ATS with no exception at all: no local-network or arbitrary-load opening.
@@ -112,7 +168,9 @@ describe('iOS', () => {
       .filter((r) => /\.(m|c|swift|plist|storyboard|xcprivacy)$/.test(r.file));
     expect(refs.length).toBeGreaterThan(10);
     for (const r of refs) expect(fs.existsSync(path.join(ROOT, 'ios', r.file))).toBe(true);
-    expect(pbx).toMatch(/QNetSecurityModule\.m in Sources \*\/,/);
+    for (const f of ['QNetSecurityModule.m', 'SceneDelegate.swift', 'TaskState.swift', 'QNetTaskState.m']) {
+      expect([f, new RegExp(`${f.replace('.', '\\.')} in Sources \\*/,`).test(pbx)]).toEqual([f, true]);
+    }
   });
 });
 

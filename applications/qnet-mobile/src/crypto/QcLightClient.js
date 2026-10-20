@@ -2016,40 +2016,6 @@ export function refreshCapsule(nodesProvider, opts = {}) {
 }
 
 /** The K of the held capsule, or 0. */
-/** Each node's read state for the diagnostics: its own backoff, this device's budget wait, a capsule miss (ms left). */
-export function nodeReadStates(bases) {
-  const now = Date.now();
-  return bases.map((b) => ({ base: b, backoff: Math.max(0, (_nodeBackoff.get(b) || 0) - now), wait: readWait(b, now),
-    capsuleMiss: Math.max(0, ((_capsuleMiss.get(b) || {}).until || 0) - now) }));
-}
-
-/** The capsule refused here within the TTL, for the diagnostics: { index, ageMs }, or null. */
-export function capsuleRefusal() {
-  return capsuleRefusedNow(null) ? { index: _capsuleRefused.index, ageMs: Date.now() - _capsuleRefused.at } : null;
-}
-
-/**
- * The walk step that failed last, for the diagnostics: { j, nodes: [{ base, reason, ageMs }] } of its failures still
- * within FAIL_TTL_MS, or null.
- */
-export function lastStepFailure() {
-  const now = Date.now();
-  let last = null;
-  for (const [key, f] of _failedCache) {
-    if (now - f.at >= FAIL_TTL_MS) continue;
-    if (!last || f.at > last.at) last = { j: Number(key.slice(0, key.indexOf('|'))), at: f.at };
-  }
-  if (!last) return null;
-  const nodes = [];
-  for (const [key, f] of _failedCache) {
-    const sep = key.indexOf('|');
-    if (Number(key.slice(0, sep)) === last.j && now - f.at < FAIL_TTL_MS) {
-      nodes.push({ base: key.slice(sep + 1), reason: f.reason, ageMs: now - f.at });
-    }
-  }
-  return { j: last.j, nodes };
-}
-
 export function heldCapsuleIndex() {
   return _capsule ? _capsule.index : 0;
 }

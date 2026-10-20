@@ -918,7 +918,7 @@ impl PushTally {
     }
 
     /// The summary line: `offered` nodes, the pushes sent and what came of them. At WARN when a push failed or was
-    /// shed, else at INFO.
+    /// shed, else at INFO. A gone token is the device's own state, handled by the re-registration path.
     pub(crate) fn summary(&self, slot: u64, offered: usize) -> (bool, String) {
         let get = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
         let (accepted, failed, gone, polled, shed) = (get(&self.accepted), get(&self.failed), get(&self.gone), get(&self.polled), get(&self.shed));
@@ -927,7 +927,7 @@ impl PushTally {
         if let Some(e) = self.first_err.get() {
             line.push_str(&format!(" first_err=\"{}\"", e));
         }
-        (failed + gone + shed > 0, line)
+        (failed + shed > 0, line)
     }
 
     pub(crate) fn log(&self, slot: u64, offered: usize) {
@@ -1849,7 +1849,8 @@ pub(crate) fn wake_precheck(storage: &crate::storage::Storage, node_id: &str, an
 /// The binding row, the push record and the epoch's answers reach a non-owner only by chance, so everything else
 /// is the owners' to answer.
 pub(crate) fn wake_registered(storage: &crate::storage::Storage, node_id: &str) -> Result<(), WakeAnswer> {
-    if !node_id.starts_with("light_") || node_id.len() > 128 || !storage.is_node_registration_onchain(node_id) {
+    if !node_id.starts_with("light_") || node_id.len() > crate::light_binding::LIGHT_NODE_ID_MAX
+        || !storage.is_node_registration_onchain(node_id) {
         return Err(WakeAnswer::NotRegistered);
     }
     Ok(())
@@ -2209,7 +2210,7 @@ mod tests {
         assert!(light_push_target(&s, &node, 7), "still pushed: by a challenge");
         assert!(push_record_degraded(&s, &node), "and pulled again");
         // The pulled record of the binding held here heals it.
-        assert!(crate::rpc::apply_pulled_push_record(&s, None, &node, "tok_b", "fcm", None, 200, 200, ""));
+        assert!(crate::rpc::apply_pulled_push_record(&s, None, &node, "tok_b", "fcm", None, 200, 200, "", "", ""));
         assert_eq!(push_channel(&s, &node), Some(PushChannel::Fcm("tok_b".into())));
         assert!(!push_record_degraded(&s, &node));
 
@@ -2285,7 +2286,7 @@ mod tests {
         assert_eq!(wake_precheck(&s, &node, false), Ok(Some(PushChannel::Fcm("tok_1".into()))));
         assert!(!light_poll_allowed(&s, &node), "a pushed device");
         // A pulled copy stamped by another genesis is taken the same way.
-        assert!(crate::rpc::apply_pulled_push_record(&s, None, &node, "tok_2", "fcm", None, 7, 0, &writer));
+        assert!(crate::rpc::apply_pulled_push_record(&s, None, &node, "tok_2", "fcm", None, 7, 0, &writer, "", ""));
         assert_eq!(push_channel(&s, &node), Some(PushChannel::Fcm("tok_2".into())));
     }
 
@@ -2308,7 +2309,7 @@ mod tests {
         assert_eq!(push_channel(&s, &node), None, "the plant links nothing");
         assert!(push_record_degraded(&s, &node));
         // The owner's record displaces it whatever the times: a pull of the owner's copy, or its app's refresh.
-        assert!(crate::rpc::apply_pulled_push_record(&s, None, &node, "tok_o", "fcm", None, 100, 0, &own));
+        assert!(crate::rpc::apply_pulled_push_record(&s, None, &node, "tok_o", "fcm", None, 100, 0, &own, "", ""));
         assert_eq!(push_channel(&s, &node), Some(PushChannel::Fcm("tok_o".into())));
         // Another key's record is refused, later or not, and by the legacy sync too.
         assert!(!s.save_fcm_token_by(&node, "tok_m2", "fcm", None, 900, &planted).unwrap());
@@ -2349,7 +2350,7 @@ mod tests {
             origin_ip: String::new(), ts: Some(5), seq: None, proof: None, writer: None, platform: None, model: None,
         };
         assert_eq!(apply_token_sync(&s, None, &sync, 10), SyncOutcome::Refused("bad_endpoint"));
-        assert!(!crate::rpc::apply_pulled_push_record(&s, None, node, "", "unifiedpush", Some(bad), 5, 0, ""));
+        assert!(!crate::rpc::apply_pulled_push_record(&s, None, node, "", "unifiedpush", Some(bad), 5, 0, "", "", ""));
         assert!(s.get_fcm_entry(node).is_none(), "neither path stored it");
         // A record an older binary stored unchecked: no channel, so the device gets a challenge instead.
         s.save_fcm_token(node, "", "unifiedpush", Some(bad), 6).unwrap();
@@ -2769,7 +2770,8 @@ mod tests {
         let h = &src[src.find("async fn handle_light_node_ping_response(").unwrap()..];
         let h = &h[..h.find("pub(super) async fn handle_light_node_next_ping(").unwrap()];
         assert_eq!(h.matches("note_refusal(").count(), 3, "the device check, a replaced device and the shared verifier");
-        assert_eq!(h.matches("now, &challenge, &signature);").count(), 3, "each with the reply, for the σ check");
+        assert_eq!(h.matches("now, &challenge, &signature);").count() + h.matches("now, challenge, signature);").count(), 3,
+                   "each with the reply, for the σ check");
     }
 
     /// M-7: a refusal the node's state decides before any signature is checked (`no_device_record`,
@@ -3317,19 +3319,23 @@ mod tests {
         assert_eq!(stored_row(&s, third).unwrap().misses[0].reason, MissReason::WokenNoAnswer);
         assert!(record_answer(&s, third, now, Delivery::default(), Some(&nothing), Some(5), Some(e + 1)));
         assert_eq!(stored_row(&s, third).unwrap().misses[0].reason, MissReason::NotDelivered);
-        // The ingress passes the answer's anchor epoch.
-        assert!(include_str!("light_nodes.rs").contains("receipts.as_ref(), timing.answered_at,\r\n                      anchor.as_ref().map(|a| a.epoch()));")
-                || include_str!("light_nodes.rs").contains("receipts.as_ref(), timing.answered_at,\n                      anchor.as_ref().map(|a| a.epoch()));"));
-
-        // The ingress reads the report only on the counted path, after the shared verifier, at a shard owner.
+        // The ingress passes the answer's anchor epoch, and reads the report only from an answer that verified, at a
+        // shard owner (`note_answer`): on the counted path after the shared verifier and the attestation, or as the
+        // bound device's first answer of an epoch already counted, once its signature verified.
         let src = include_str!("light_nodes.rs");
-        let h = &src[src.find("async fn handle_light_node_ping_response(").unwrap()..];
-        let h = &h[..h.find("pub(super) async fn handle_light_node_next_ping(").unwrap()];
-        let read = h.find("PushReceipts::from_params(&params)").expect("read");
-        assert_eq!(h.matches("PushReceipts::").count(), 1);
-        assert!(h.find("if let Err(r) = verify_light_node_signature(").unwrap() < read);
-        assert!(h.find("gossip_light_node_attestation").unwrap() < read);
-        assert!(h[..read].rfind("if owns_light_shard(&node_id) {").unwrap() > h.find("PUSH_LEDGER.answered(&node_id);").unwrap());
+        let note = &src[src.find("fn note_answer(").unwrap()..src.find("pub(super) async fn handle_light_node_next_ping(").unwrap()];
+        let read = note.find("PushReceipts::from_params(params)").expect("read");
+        assert!(note[..read].contains("PUSH_LEDGER.answered(node_id);") && note[..read].contains("if owns_light_shard(node_id) {"));
+        assert!(note.contains("receipts.as_ref(), timing.answered_at, anchor.map(|a| a.epoch()));"));
+        let h = &src[src.find("async fn handle_light_node_ping_response(").unwrap()..src.find("fn repair_from_presented(").unwrap()];
+        assert_eq!(h.matches("PushReceipts::").count(), 0, "read in note_answer alone");
+        let counted = h.find("note_answer(&blockchain.get_storage(), &node_id, &params, timing, anchor.as_ref(), now);").expect("counted");
+        assert!(h.find("if let Err(r) = verify_light_node_signature(").unwrap() < counted);
+        assert!(h.find("gossip_light_node_attestation").unwrap() < counted);
+        let first = h.find("note_answer(&storage, &node_id, &params, timing, anchor.as_ref(), now);").expect("first answer");
+        let dedup = h.find("if p2p.has_attestation_in_window(&node_id) {").unwrap();
+        assert!(dedup < first && h[dedup..first].contains("verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await.is_ok()"));
+        assert!(h[dedup..first].contains("bound_answer_recorded(&storage, &node_id) == Some(false)"), "only until the device answered here");
     }
 
     /// A reply anchored in the ended epoch is that node's late answer when the anchor is canonical and its ping
@@ -3656,17 +3662,64 @@ mod tests {
         let r = shed_reply(123);
         assert_eq!(r.status(), warp::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers().get("Retry-After").and_then(|v| v.to_str().ok()), Some("123"));
-        // Before any storage read or signature work, after the address's own limit, on both routes.
+        // Before any signature work, after the address's own limit and the checks that read no key (A2), on both routes.
         let nodes = include_str!("light_nodes.rs");
         let h = &nodes[nodes.find("pub(super) async fn handle_light_node_ping_response(").unwrap()..];
-        let h = &h[..h.find("async fn answer_light_node_ping(").unwrap()];
+        let h = &h[..h.find("pub(super) fn answer_precheck(").unwrap()];
         let limit = h.find("check_api_rate_limit(remote_addr, \"light_node_ping\")").unwrap();
+        let junk = h.find("answer_precheck(&params, &blockchain.get_storage(), blockchain.get_height().await)").unwrap();
         let shed = h.find("shed_past(&PING_ANSWER_BUDGET, remote_addr, &mut permit)").unwrap();
-        assert!(limit < shed && shed < h.find("answer_light_node_ping(params, blockchain)").unwrap());
+        assert!(limit < junk && junk < shed && shed < h.find("answer_light_node_ping(params, blockchain)").unwrap());
+        let pre = &nodes[nodes.find("pub(super) fn answer_precheck(").unwrap()..nodes.find("async fn answer_light_node_ping(").unwrap()];
+        assert!(!pre.contains("verify_mobile_dilithium_signature") && !pre.contains("verify_light_node_signature")
+                && !pre.contains("verify_delegation"), "no signature check before the budget");
         let m = include_str!("mod.rs");
         let height = &m[m.find("let chain_height = api_v1").unwrap()..];
         let height = &height[..height.find("blockchain.get_height().await").unwrap()];
         assert!(height.contains("shed_past(&HEIGHT_READ_BUDGET, remote_addr, &mut permit)"));
+    }
+
+    /// A2: what point reads and a MAC refuse spends none of the answer route's budget: a malformed reply, a stamp this
+    /// genesis did not issue for the node, an anchor that is not canonical in the current epoch or the one just ended, and
+    /// a node the chain does not list. A live stamp of a registered node and a canonical anchor go on to the handler.
+    #[test]
+    fn junk_answers_are_refused_before_the_node_wide_budget() {
+        let (s, _d) = storage();
+        let node = "light_mobile_precheck000000";
+        let tip = 500 * EPOCH_BLOCKS + 100;
+        let hash = |h: u64| format!("{:064x}", h);
+        let (cur_h, prev_h) = (tip - 50, 499 * EPOCH_BLOCKS + 10);
+        for h in [cur_h, prev_h] { s.save_microblock_hash(h, &hex::decode(hash(h)).unwrap()).unwrap(); }
+        let p = |node: &str, sig: &str, ch: &str| -> HashMap<String, String> {
+            [("node_id", node), ("signature", sig), ("challenge", ch)].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let sig = "ping_dilithium:00ff";
+        let anchor = |h: u64, hash: String| format!("selfattest:{}:{}", h, hash);
+        let current = anchor(cur_h, hash(cur_h));
+        let malformed = json!({ "success": false, "error": "malformed ping-response" });
+        let cur = current.as_str();
+        for (n, sg, ch) in [(node, "", cur), (node, "ping_dilithium:", cur), (node, "compact_bin:AAAA", cur),
+                            ("genesis_node_001", sig, cur), (node, sig, "")] {
+            assert_eq!(answer_precheck(&p(n, sg, ch), &s, tip), Some(malformed.clone()), "{n} {sg} {ch}");
+        }
+        assert_eq!(answer_precheck(&p(&format!("light_{}", "a".repeat(200)), sig, &current), &s, tip), Some(malformed.clone()));
+        // A node the chain does not list yet.
+        assert_eq!(answer_precheck(&p(node, sig, &current), &s, tip).map(|v| v["reason"].clone()), Some(json!("not_registered")));
+        s.save_node_registration_at_height_burn_vrf(node, "light", "wallet_x", 70.0, 100, "", None).unwrap();
+        assert_eq!(answer_precheck(&p(node, sig, &current), &s, tip), None, "a canonical anchor of the current epoch");
+        // The epoch just ended goes on while canonical: the handler records its late answer.
+        assert_eq!(answer_precheck(&p(node, sig, &anchor(prev_h, hash(prev_h))), &s, tip), None);
+        let stale = |ch: String| answer_precheck(&p(node, sig, &ch), &s, tip).map(|v| v["reason"].clone());
+        for ch in [anchor(cur_h, hash(1)), anchor(prev_h, hash(2)), anchor(498 * EPOCH_BLOCKS + 5, hash(3)), anchor(tip + 5, hash(4)),
+                   "selfattest:12:zz".to_string()] {
+            assert_eq!(stale(ch.clone()), Some(json!("anchor_not_current")), "{ch}");
+        }
+        // A stamp: only one this genesis issued for this very node.
+        let (stamp, _) = make_challenge_stamp(node);
+        assert_eq!(answer_precheck(&p(node, sig, &stamp), &s, tip), None);
+        let (foreign, _) = make_challenge_stamp("light_mobile_someoneelse000");
+        assert_eq!(answer_precheck(&p(node, sig, &foreign), &s, tip).map(|v| v["error"].clone()),
+                   Some(json!("Unrecognized or expired challenge")));
     }
 
     /// L-5: handing a polling challenge out marks nothing; the device counts as having fetched it only for a poll its

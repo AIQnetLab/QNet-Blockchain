@@ -8,7 +8,11 @@ import TSBackgroundFetch
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate, MessagingDelegate {
+  // The one window React Native runs in for the life of the process; the scene shows it (SceneDelegate.swift).
   var window: UIWindow?
+
+  // The launch screen's colour (#11131f = rgb(17, 19, 31)): behind React Native's root and on the app-switcher cover.
+  static let launchColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
 
   var reactNativeDelegate: ReactNativeDelegate?
   var reactNativeFactory: RCTReactNativeFactory?
@@ -33,20 +37,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     reactNativeDelegate = delegate
     reactNativeFactory = factory
 
-    window = UIWindow(frame: UIScreen.main.bounds)
-    
-    // Set dark background color to match launch screen (#11131f = rgb(17, 19, 31))
-    window?.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
-
-    factory.startReactNative(
-      withModuleName: "QNetMobile",
-      in: window,
-      launchOptions: launchOptions
-    )
-    
-    // Set root view background to match launch screen
-    if let rootView = window?.rootViewController?.view {
-      rootView.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
+    // The scene starts React Native. A launch the system makes in the background (a push, the periodic wake) may
+    // connect no scene: React Native then starts in a window no scene shows yet, so the JS still runs.
+    DispatchQueue.main.async {
+      guard self.window == nil, application.connectedScenes.isEmpty else { return }
+      self.runReactNative(in: UIWindow(), launchOptions: nil)
     }
 
     // Registers the periodic wake with BGTaskScheduler, which accepts a launch handler only while the app
@@ -55,16 +50,21 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
     return true
   }
-  
-  // A Universal Link (https://link.aiqnet.io/l, verified by iOS against that host's apple-app-site-association) goes
-  // to React Native's Linking. The app registers no custom URL scheme, so nothing else arrives this way.
-  func application(
-    _ application: UIApplication,
-    continue userActivity: NSUserActivity,
-    restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
-  ) -> Bool {
-    guard userActivity.activityType == NSUserActivityTypeBrowsingWeb else { return false }
-    return RCTLinkingManager.application(application, continue: userActivity, restorationHandler: restorationHandler)
+
+  // React Native's one root, started once per process in `window`; `launchOptions` carries the link that opened the
+  // app, where Linking reads it (getInitialURL).
+  func runReactNative(in window: UIWindow, launchOptions: [UIApplication.LaunchOptionsKey: Any]?) {
+    window.backgroundColor = AppDelegate.launchColor
+    self.window = window
+    reactNativeFactory?.startReactNative(withModuleName: "QNetMobile", in: window, launchOptions: launchOptions)
+    window.rootViewController?.view.backgroundColor = AppDelegate.launchColor
+  }
+
+  // The user closed the app's scene from the app switcher; UIKit reports it at the next launch when the app was not
+  // running, a background launch included. The node answers nothing until the app is opened again (TaskState.swift).
+  func application(_ application: UIApplication, didDiscardSceneSessions sceneSessions: Set<UISceneSession>) {
+    guard application.applicationState != .active else { return }
+    QNetTaskState.markClosed()
   }
 
   // No third-party keyboard ever receives what is typed in the wallet (MPLAT-R2-02). iOS forces the system
@@ -79,24 +79,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
   // The token is handled by React Native Firebase; it is never logged.
   func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {}
-
-  // The app-switcher snapshot is taken after resign-active, so an opaque cover goes on first and comes off
-  // when the app is active again: no balance, address or recovery phrase is ever in the snapshot.
-  private var privacyCover: UIView?
-
-  func applicationWillResignActive(_ application: UIApplication) {
-    guard privacyCover == nil, let window = window else { return }
-    let cover = UIView(frame: window.bounds)
-    cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    cover.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
-    window.addSubview(cover)
-    privacyCover = cover
-  }
-
-  func applicationDidBecomeActive(_ application: UIApplication) {
-    privacyCover?.removeFromSuperview()
-    privacyCover = nil
-  }
 
   // Handle APNs device token — required for FCM to work on iOS
   func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {

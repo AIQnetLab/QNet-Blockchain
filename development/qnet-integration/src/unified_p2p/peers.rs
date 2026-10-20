@@ -2402,10 +2402,26 @@ impl SimplifiedP2P {
                     }
                     return;
                 };
+                // A3: newer bindings of one node from gossip are held to their own hourly limit; the node's owners take
+                // one past it from the token sync, the identity pull or the device. A full window refuses before the
+                // delegation check, and only a copy whose delegation verifies spends a slot, so junk cannot fill it.
+                let copy_limited = |wait: u64| {
+                    if crate::node::is_info() {
+                        println!("[INFO][GOSSIP] light_binding_copy_rate_limited node={} retry_after={}", node_id, wait);
+                    }
+                };
+                if let Err(wait) = crate::rpc::BINDING_COPY_NODE_LIMIT.check(&node_id, now_secs) {
+                    copy_limited(wait);
+                    return;
+                }
                 if crate::light_binding::verify_delegation(&ping_delegation_cert, &ping_pubkey, &node_id, &identity).is_none() {
                     if crate::node::is_warn() {
                         println!("[WARN][GOSSIP] light_binding_delegation_invalid node={}", node_id);
                     }
+                    return;
+                }
+                if let Err(wait) = crate::rpc::BINDING_COPY_NODE_LIMIT.spend(&node_id, now_secs) {
+                    copy_limited(wait);
                     return;
                 }
                 match storage.save_light_ping_keys_identity(&node_id, &ping_pubkey, &ping_delegation_cert, &identity) {

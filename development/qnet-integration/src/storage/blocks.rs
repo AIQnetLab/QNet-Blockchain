@@ -102,10 +102,11 @@ impl Storage {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(sliding_window);
             
-        println!("[WARN][STORAGE] Node configured as {:?} mode:", storage_mode);
-        println!("[WARN][STORAGE]    Max storage: {} GB", max_storage_size / (1024 * 1024 * 1024));
-        println!("[WARN][STORAGE]    Sliding window: {} blocks", 
-                if sliding_window_size == u64::MAX { "unlimited".to_string() } else { sliding_window_size.to_string() });
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] config mode={:?} max_storage_gb={} sliding_window={}",
+                     storage_mode, max_storage_size / (1024 * 1024 * 1024),
+                     if sliding_window_size == u64::MAX { "unlimited".to_string() } else { sliding_window_size.to_string() });
+        }
         
         // SAFETY WARNING: Check aggressive pruning settings
         // v3.18: Aggressive pruning check (only for Light nodes, Super nodes are archival)
@@ -143,9 +144,6 @@ impl Storage {
             pattern_stats: HashMap::new(),
         };
         
-        // Initialize graceful degradation manager
-        let graceful_degradation = GracefulDegradation::new(storage_mode);
-        
         // Initialize the deprecated light-node header-rotation buffer.
         // Light tier is now a pure-API-client role (zero on-device chain
         // storage), so this buffer is a no-op in production — kept only
@@ -167,12 +165,14 @@ impl Storage {
             transaction_pool,
             max_storage_size,
             current_storage_usage: Arc::new(RwLock::new(0)),
+            data_dir: std::path::PathBuf::from(data_dir),
             emergency_cleanup_enabled: true,
             storage_mode,
             sliding_window_size,
             pattern_recognizer: Arc::new(RwLock::new(pattern_recognizer)),
             tier_config,
-            graceful_degradation: Arc::new(RwLock::new(graceful_degradation)),
+            disk_pressure: parking_lot::Mutex::new(super::compression::DiskPressure::default()),
+            compacting: Arc::new(AtomicBool::new(false)),
             light_rotation: Arc::new(RwLock::new(light_rotation)),
             recent_microblocks: Arc::new(dashmap::DashMap::new()),
             history_archive: once_cell::sync::OnceCell::new(),
@@ -182,12 +182,12 @@ impl Storage {
         // measurement of this data directory.
         {
             let (usage, max) = (storage.current_storage_usage.clone(), storage.max_storage_size);
-            let dir = std::path::PathBuf::from(data_dir);
+            let (dir, probe_dir) = (storage.data_dir.clone(), storage.data_dir.clone());
             storage.persistent.views.set_disk_probes(
-                Box::new(move || max > 0 && (*usage.read() as f64 / max as f64) * 100.0 >= 95.0),
-                Box::new(move || if max == 0 { None } else {
-                    super::proof_views::dir_size(&dir).map(|s| s as f64 / max as f64 * 100.0)
-                }),
+                Box::new(move || super::compression::storage_fill_pct(*usage.read(), max, super::compression::disk_used_pct(&probe_dir))
+                    >= super::compression::STORAGE_CRITICAL_PCT),
+                Box::new(move || super::proof_views::dir_size(&dir)
+                    .map(|s| super::compression::storage_fill_pct(s, max, super::compression::disk_used_pct(&dir)))),
             );
         }
         if storage.storage_mode == StorageMode::Super && std::env::var("QNET_ARCHIVE").as_deref() == Ok("1") {
@@ -218,20 +218,7 @@ impl Storage {
     }
     
     pub async fn save_block(&self, block: &qnet_state::Block) -> IntegrationResult<()> {
-        // Check if storage is critically full before accepting new blocks
-        if self.is_storage_critically_full()? {
-            // Try emergency cleanup first
-            println!("[WARN][STORAGE] Storage critically full - attempting emergency cleanup before save_block");
-            self.emergency_cleanup()?;
-            
-            // Re-check after cleanup
-            if self.is_storage_critically_full()? {
-                return Err(IntegrationError::StorageError(
-                    "Cannot save block: Storage is critically full even after emergency cleanup. Increase QNET_MAX_STORAGE_GB or add more disk space.".to_string()
-                ));
-            }
-        }
-        
+        self.guard_fill_before_save("block")?;
         self.persistent.save_block(block).await
     }
     
@@ -423,45 +410,11 @@ impl Storage {
             }
         }
 
-        // =====================================================================
-        // TIERED STORAGE + GRACEFUL DEGRADATION (v2.19.9)
-        // =====================================================================
-        // This method now includes:
-        // 1. Storage health check with graceful degradation
-        // 2. Tiered storage based on node type (Light / Super)
-        // 3. Light-node short-circuit: writes are no-ops (pure API client,
-        //    no on-device chain storage). All chain-data persistence below
-        //    runs only on Super nodes.
-        // =====================================================================
-        
-        // Step 1: Check for graceful degradation (every 100 blocks to reduce overhead)
-        if height % 100 == 0 {
-            let _ = self.check_and_apply_degradation();
-        }
-        
-        // Step 2: Check if storage is critically full
-        if self.is_storage_critically_full()? {
-            println!("[WARN][STORAGE] Storage critically full - attempting emergency cleanup");
-            self.emergency_cleanup()?;
-            
-            // If still full after cleanup, try graceful degradation
-            if self.is_storage_critically_full()? {
-                // Force degradation check
-                let _ = self.check_and_apply_degradation();
-                
-                // If STILL full after degradation, error out
-                if self.is_storage_critically_full()? && self.get_effective_storage_mode() == StorageMode::Light {
-                return Err(IntegrationError::StorageError(
-                        "Cannot save microblock: Storage full even after degradation to Light mode. Add disk space!".to_string()
-                    ));
-                }
-            }
-        }
-        
-        // Step 3: Use effective storage mode (may be degraded)
-        let effective_mode = self.get_effective_storage_mode();
-        
-        match effective_mode {
+        // Tiered storage by node type: a Super node stores every block, at the critical fill level too
+        // (`guard_fill_before_save`); a Light node is a pure API client and stores none.
+        self.guard_fill_before_save("microblock")?;
+
+        match self.storage_mode {
             StorageMode::Light => {
                 // ═══════════════════════════════════════════════════════════════════════════
                 // LIGHT MODE (v3.19): Pure API client - NO local storage
@@ -596,7 +549,7 @@ impl Storage {
     /// different body than the one stored, the certified body, which replaces it (a node that kept
     /// its own losing block below finality has no other way back: the rollback is refused there).
     pub fn backfill_finalized_block(&self, height: u64, data: &[u8]) -> IntegrationResult<bool> {
-        if !can_save_block(height) || self.get_effective_storage_mode() == StorageMode::Light {
+        if !can_save_block(height) || self.storage_mode == StorageMode::Light {
             return Ok(false);
         }
         let mb = match bincode::deserialize::<qnet_state::MicroBlock>(data) {
@@ -1196,18 +1149,8 @@ impl Storage {
     
     
     pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
-        // Check if storage is critically full before accepting new macroblocks
-        if self.is_storage_critically_full()? {
-            println!("[WARN][STORAGE] storage_critically_full action=emergency_cleanup_before_save_macroblock");
-            self.emergency_cleanup()?;
-            
-            if self.is_storage_critically_full()? {
-                return Err(IntegrationError::StorageError(
-                    "Cannot save macroblock: Storage is critically full. Increase QNET_MAX_STORAGE_GB.".to_string()
-                ));
-            }
-        }
-        
+        self.guard_fill_before_save("macroblock")?;
+
         // Save the macroblock
         self.persistent.save_macroblock(height, macroblock).await?;
         

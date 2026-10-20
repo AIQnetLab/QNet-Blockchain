@@ -4,6 +4,7 @@ pub(crate) mod production;
 mod monitoring;
 mod activation;
 mod sync;
+pub use sync::main_runtime;
 mod transactions;
 mod consensus;
 mod leader;
@@ -778,6 +779,9 @@ static CLOCK_DRIFT_PEAK_SECS: AtomicU64 = AtomicU64::new(0);
 /// quorum. Consensus timing safety is structural (slot-anchored timestamps),
 /// not a product of this monitor.
 pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
+    // Blocks applied while catching up after a restart lag the wall clock by the downtime and say
+    // nothing about the live schedule: only a synchronized node samples.
+    if !coordinator_is_synchronized() { return; }
     // Signed drift in seconds. Positive = our clock ahead of network.
     let abs_drift_secs: u64 = if local_now >= block_ts {
         local_now - block_ts
@@ -1107,6 +1111,19 @@ pub(crate) fn microblock_pk_digest(txs: &[qnet_state::Transaction]) -> [u8; 32] 
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     out
+}
+
+#[cfg(test)]
+mod pacing_monitor_tests {
+    // Before the coordinator reports synchronized (no coordinator in a test process), a block lagging the
+    // wall clock by a restart's downtime is not sampled: the boot catch-up printed one PACING warning per restart.
+    #[test]
+    fn catch_up_blocks_do_not_feed_the_pacing_monitor() {
+        assert!(!super::coordinator_is_synchronized());
+        let before = super::get_clock_drift_ema_secs();
+        super::observe_clock_drift(1_000, 1_100);
+        assert_eq!(super::get_clock_drift_ema_secs(), before);
+    }
 }
 
 #[cfg(test)]

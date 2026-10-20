@@ -1,8 +1,10 @@
 // A worker for the provider tests: the real router and provider state machine over chrome-mock, with
-// fakes for the session, vault binding, signer and QNet node (areas A and B are not needed). Approval
+// fakes for the session, vault binding, signer, QNet node and Solana send (areas A and B are not needed). Approval
 // windows, timers and view broadcasts are recorded so tests can drive them.
 import { readFile } from 'node:fs/promises';
 import * as core from '../../dist/lib/qnet-core.js';
+import { parseUnits } from '../../dist/background/amount.js';
+import { DECIMALS, SOLANA } from '../../dist/background/config.js';
 import { WalletError } from '../../dist/background/errors.js';
 import { createProviderService } from '../../dist/background/provider.js';
 import { createRouter } from '../../dist/background/router.js';
@@ -30,6 +32,10 @@ export const ACCOUNTS = Object.freeze({ qnet: core.KAT.qnetAddress, solana: core
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 // The fake vault.unlock accepts only this password.
 export const PASSWORD = 'correct horse battery staple';
+// How long a window stays on an outcome nobody closes (provider.js ERROR_LINGER_MS).
+export const ERROR_LINGER_MS = 30000;
+// The text of the 4001 an origin in its approval cooldown gets, written out independently of errors.js.
+export const COOLDOWN_TEXT = 'Too many rejected requests from this site, try again later';
 
 const seed = core.mnemonicToSeed(core.KAT.mnemonic);
 export const KEYPAIR = core.deriveQnetKeypair(seed);
@@ -66,9 +72,12 @@ export function grantEntry(origin, { walletId = WALLET_ID, sitesKey, grantedAt =
   return { grantedAt, chains, walletId, mac };
 }
 
+/** Whether anything posted to `port` answers `id` yet. */
+export const answered = (port, id) => port.posted.some((m) => m.id === id);
+
 /** Resolves with the first message posted to `port` that answers `id`. */
 export async function replyTo(port, id) {
-  await until(() => port.posted.some((m) => m.id === id));
+  await until(() => answered(port, id));
   return port.posted.find((m) => m.id === id);
 }
 
@@ -145,11 +154,22 @@ export function createWorld(options = {}) {
     unlinkViewError: null,
     unlinkOutcome: null,
     unlinkError: null,
+    // solana.quote / send (qnet_sendSolanaTransfer, decision 52): the wallet's balances, the fee, the rent of a recipient's new
+    // 1DEV account, the recipient check, and what quote or send fail with or send answers instead
+    lamports: '2000000000',
+    oneDevRaw: '5000000000',
+    solanaFee: '5000',
+    tokenAccountRent: '2039280',
+    solanaRecipient: { known: false, lookalike: false },
+    solanaQuote: null,
+    solanaQuoteError: null,
+    solanaSendError: null,
+    solanaSendAnswer: null,
   };
   const log = {
     windows: [], removed: [], views: [], signCalls: [], sendCalls: [], unlockAttempts: [], recipientChecks: [], maxOpen: 0,
     siteViews: [], activations: [], contractReads: [], recipientReads: [], callPreviews: [], callSends: [], statusReads: [], claimViews: 0,
-    claims: 0, claimNodeIds: [], siteActivations: 0, unlinkViews: 0, unlinks: 0,
+    claims: 0, claimNodeIds: [], siteActivations: 0, unlinkViews: 0, unlinks: 0, solanaQuotes: [], solanaSends: [],
   };
   const openWindows = new Set();
   const timers = [];
@@ -346,6 +366,36 @@ export function createWorld(options = {}) {
     },
   };
 
+  // What solana.js would answer for a send of SOL or 1DEV (planTransfer's numbers and shortfalls; state.solanaQuote
+  // overrides fields), and a sent transfer's signature unless the test sets state.solanaSendAnswer or state.solanaSendError.
+  const solana = {
+    quote: async ({ asset, to, amount }) => {
+      log.solanaQuotes.push({ asset, to, amount });
+      if (!state.unlocked) throw new WalletError('LOCKED');
+      if (state.solanaQuoteError) throw state.solanaQuoteError;
+      const decimals = asset === 'sol' ? DECIMALS.SOL : DECIMALS.ONE_DEV;
+      const amountRaw = parseUnits(amount, decimals);
+      const rent = asset === 'sol' ? 0n : BigInt(state.tokenAccountRent);
+      const total = BigInt(state.solanaFee) + rent + (asset === 'sol' ? amountRaw : 0n);
+      const tokenRaw = asset === 'sol' ? null : state.oneDevRaw;
+      let shortfall = null;
+      if (BigInt(state.lamports) < total) shortfall = 'INSUFFICIENT_SOL';
+      else if (tokenRaw !== null && BigInt(tokenRaw) < amountRaw) shortfall = 'INSUFFICIENT_TOKENS';
+      return {
+        asset, to, mint: asset === 'sol' ? null : SOLANA.ONE_DEV_MINT, decimals, amountRaw: amountRaw.toString(), feeLamports: state.solanaFee,
+        createsRecipientAccount: rent > 0n, rentLamports: rent.toString(), totalLamports: total.toString(), balanceLamports: state.lamports,
+        tokenRaw, rentFloorLamports: '890880', shortfall, references: [], memo: null, recipient: { ...state.solanaRecipient },
+        ...(state.solanaQuote ?? {}),
+      };
+    },
+    send: async (params) => {
+      log.solanaSends.push({ ...params });
+      if (!state.unlocked) throw new WalletError('LOCKED');
+      if (state.solanaSendError) throw state.solanaSendError;
+      return state.solanaSendAnswer ?? { signature: BURN_TX, status: 'confirmed', lastValidBlockHeight: 5000 };
+    },
+  };
+
   world.provider = createProviderService({
     chrome,
     session,
@@ -354,6 +404,7 @@ export function createWorld(options = {}) {
     qnet,
     activation,
     nodes,
+    solana,
     emit: (origin, event, data) => world.router.emitProviderEvent(origin, event, data),
     notifyViews: (event) => log.views.push(event),
     now: options.now,

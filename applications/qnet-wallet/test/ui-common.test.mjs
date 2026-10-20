@@ -190,71 +190,80 @@ describe('ui common: worker messages', () => {
 });
 
 describe('ui common: clipboard and reveal', () => {
-  it('copyText() clears the clipboard after the delay when nothing else was copied and the page has focus', async () => {
+  // The worker empties the clipboard (clipboard.js), the page open or not: the page only tells it, and never writes the
+  // clipboard on a timer of its own.
+  const answerAll = (message) => ({
+    id: message.id, ok: true, result: message.type === 'clipboard.clearNow' ? { cleared: true } : { scheduled: message.params.afterMs > 0 },
+  });
+  const asked = () => sent.map((message) => [message.type, message.params]);
+
+  it('copyText() with clearAfterMs leaves the clear to the worker, and a later copy without one drops it', async () => {
     mock.timers.enable({ apis: ['setTimeout'] });
+    reply = answerAll;
     await common.copyText('QNET-L00000-000000-000000', { clearAfterMs: TIMINGS.CLIPBOARD_CLEAR_MS });
     assert.equal(dom.clipboard.text, 'QNET-L00000-000000-000000');
-    mock.timers.tick(TIMINGS.CLIPBOARD_CLEAR_MS - 1);
-    assert.equal(dom.clipboard.text, 'QNET-L00000-000000-000000');
-    mock.timers.tick(1);
+    assert.deepEqual(asked(), [['clipboard.schedule', { afterMs: TIMINGS.CLIPBOARD_CLEAR_MS }]]);
+    mock.timers.tick(TIMINGS.CLIPBOARD_CLEAR_MS);
+    fire(dom.window, 'focus');
     await Promise.resolve();
-    assert.equal(dom.clipboard.text, '');
+    assert.deepEqual(dom.clipboard.writes, ['QNET-L00000-000000-000000'], 'the page writes no clear of its own');
 
-    await common.copyText('first', { clearAfterMs: 1000 });
+    // the secret is no longer on the clipboard once this page copied something else: its clear is dropped
     await common.copyText('an address');
-    mock.timers.tick(1000);
-    assert.equal(dom.clipboard.text, 'an address', 'a later copy is not cleared by the earlier timer');
-
-    await common.copyText('second', { clearAfterMs: 1000 });
-    dom.document.focused = false;
-    mock.timers.tick(1000);
-    assert.equal(dom.clipboard.text, 'second', 'without focus the page cannot write the clipboard');
-    dom.document.focused = true;
+    assert.deepEqual(asked().at(-1), ['clipboard.schedule', { afterMs: 0 }]);
+    // every plain copy says so: the page cannot know whether another page's clear is pending
+    const count = sent.length;
+    await common.copyText('another address');
+    assert.equal(sent.length, count + 1);
+    assert.deepEqual(asked().at(-1), ['clipboard.schedule', { afterMs: 0 }]);
+    // a new secret copy replaces an earlier one's clear
+    await common.copyText('the recovery phrase', { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS });
+    assert.deepEqual(asked().at(-1), ['clipboard.schedule', { afterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS }]);
     await common.copyText('');
-    assert.equal(dom.clipboard.text, '', "copyText('') empties the clipboard");
+    assert.equal(dom.clipboard.text, '', "copyText('') empties the clipboard at once");
+    assert.deepEqual(asked().at(-1), ['clipboard.schedule', { afterMs: 0 }]);
     await assert.rejects(common.copyText(null));
-  });
 
-  it('copyText() with untilFocused clears on the next focus a copy the deadline found without the focus', async () => {
-    mock.timers.enable({ apis: ['setTimeout'] });
-    await common.copyText('the recovery phrase', { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS, untilFocused: true });
-    dom.document.focused = false;
-    mock.timers.tick(TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS);
-    assert.equal(dom.clipboard.text, 'the recovery phrase', 'without focus the page cannot write the clipboard');
-    dom.document.focused = true;
-    fire(dom.window, 'focus');
-    assert.equal(dom.clipboard.text, '', 'cleared as soon as the page has the focus again');
-
-    // a later copy of this page is never cleared by the earlier copy's wait for the focus
-    await common.copyText('the recovery phrase', { clearAfterMs: 1000, untilFocused: true });
-    dom.document.focused = false;
-    mock.timers.tick(1000);
-    dom.document.focused = true;
-    await common.copyText('an address');
-    fire(dom.window, 'focus');
-    assert.equal(dom.clipboard.text, 'an address');
-
-    // without untilFocused the deadline without the focus gives up, as before
-    await common.copyText('a code', { clearAfterMs: 1000 });
-    dom.document.focused = false;
-    mock.timers.tick(1000);
-    dom.document.focused = true;
-    fire(dom.window, 'focus');
+    // a worker that does not answer: the copy stands, and copyText still resolves
+    reply = () => {
+      throw new Error('worker gone');
+    };
+    await common.copyText('a code', { clearAfterMs: TIMINGS.CLIPBOARD_CLEAR_MS });
     assert.equal(dom.clipboard.text, 'a code');
+    reply = answerAll;
+    await common.copyText('');
   });
 
-  it('clearCopiedNow() empties a copy still waiting for its timer, and nothing else', async () => {
-    mock.timers.enable({ apis: ['setTimeout'] });
-    await common.copyText('the recovery phrase', { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS, untilFocused: true });
-    common.clearCopiedNow();
-    assert.equal(dom.clipboard.text, '');
-    const writes = dom.clipboard.writes.length;
-    common.clearCopiedNow();
-    mock.timers.tick(TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS);
-    assert.equal(dom.clipboard.writes.length, writes, 'nothing pending: no write, and the old timer writes nothing either');
+  // The popup that copied a secret may be closed by the time another one, or the setup tab, copies an address: that copy
+  // still drops the secret's clear, so the worker never empties the clipboard of what the user copied last.
+  it('a plain copy from a page that copied no secret drops a clear another page left pending', async () => {
+    reply = answerAll;
+    const fresh = await import('../dist/ui/common.js?page=after-the-popup-closed');
+    await fresh.copyText('an address');
+    assert.equal(dom.clipboard.text, 'an address');
+    assert.deepEqual(asked(), [['clipboard.schedule', { afterMs: 0 }]]);
+    await fresh.clearCopiedNow();
+    assert.equal(sent.length, 1, 'this page made no copy with a clear: nothing to clear now');
+  });
+
+  it('clearCopiedNow() has the worker clear a copy this page made with a clear, and nothing else', async () => {
+    reply = answerAll;
+    await common.copyText('the recovery phrase', { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS });
+    sent.length = 0;
+    dom.document.focused = false;
+    await common.clearCopiedNow();
+    assert.deepEqual(asked(), [['clipboard.clearNow', {}]], 'asked of the worker, which needs no focus');
+    await common.clearCopiedNow();
+    assert.equal(sent.length, 1, 'nothing pending: the worker is not asked again');
     await common.copyText('an address');
-    common.clearCopiedNow();
-    assert.equal(dom.clipboard.text, 'an address', 'a copy without a timer is not cleared');
+    await common.clearCopiedNow();
+    assert.deepEqual(asked().slice(1), [['clipboard.schedule', { afterMs: 0 }]], 'a copy without a clear is not cleared');
+    assert.equal(dom.clipboard.text, 'an address');
+    // a refusal is logged, never thrown
+    await common.copyText('the recovery phrase', { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS });
+    reply = (message) => ({ id: message.id, ok: false, error: { code: 'INTERNAL', message: 'x' } });
+    await assert.doesNotReject(common.clearCopiedNow());
+    dom.document.focused = true;
   });
 
   it('holdToReveal() shows the secret only while held and forgets it after the delay', () => {
@@ -327,39 +336,29 @@ describe('ui kit', () => {
     for (const [text, decimals, expected] of cases) assert.equal(kit.canonicalAmount(text, decimals), expected, text);
   });
 
-  it('formatAmount() and figureText() write a figure as the UI language does, every digit kept (core.amountText)', async () => {
-    const shown = {
-      en: '18,446,744,073.709551615 QNC',
-      ru: '18 446 744 073,709551615 QNC',
-      fr: '18 446 744 073,709551615 QNC',
-      de: '18.446.744.073,709551615 QNC',
-      es: '18.446.744.073,709551615 QNC',
-      ar: '18,446,744,073.709551615 QNC',
-    };
-    for (const [language, text] of Object.entries(shown)) {
+  it('formatAmount() and figureText() write a figure in one format for every language, every digit kept (core.amountText)', async () => {
+    for (const language of ['en', 'ru', 'fr', 'de', 'es', 'it', 'pt', 'ja', 'ko', 'zh-CN', 'ar']) {
       await common.loadLocale(language);
-      assert.equal(kit.formatAmount('18446744073709551615', 9, 'QNC'), text, language);
+      assert.equal(kit.formatAmount('18446744073709551615', 9, 'QNC'), '18,446,744,073.709551615 QNC', language);
+      assert.equal(kit.formatAmount('42578819880000', 9, 'QNC'), '42,578.81988 QNC', language);
+      assert.equal(kit.figureText(1500), '1,500', language);
     }
-    await common.loadLocale('es');
-    assert.equal(kit.figureText(1500), '1500', 'Spanish leaves four digits as they are');
-    assert.equal(kit.figureText(15000), '15.000');
     await common.loadLocale('en');
-    assert.equal(kit.figureText(1500), '1,500');
     assert.equal(kit.formatAmount('12500000000', 9, 'QNC'), '12.5 QNC');
     assert.equal(kit.formatAmount('x', 9, 'QNC'), '— QNC');
     assert.equal(kit.figureText(null), '');
     assert.equal(kit.figureText('—'), '—');
   });
 
-  it('keepAmountCanonical() keeps an amount field canonical: a paste in the language\'s format is read as written, a typed comma is the decimal mark', async () => {
+  it('keepAmountCanonical() keeps an amount field canonical by one rule in every language: a pasted 1,000 is a thousand, a typed comma is the decimal point', async () => {
     const input = common.el('input');
     let decimals = 9;
     kit.keepAmountCanonical(input, () => decimals);
     type(input, '1,000');
-    assert.equal(input.value, '1000', 'a pasted 1,000 in English is a thousand');
+    assert.equal(input.value, '1000', 'a pasted 1,000 is a thousand');
     type(input, '');
     for (const typed of ['1', '1,', '1,5']) type(input, typed);
-    assert.equal(input.value, '1.5', 'typed one character at a time, a comma is the decimal mark');
+    assert.equal(input.value, '1.5', 'typed one character at a time, a comma is the decimal point');
     type(input, '1.5 QNC');
     assert.equal(input.value, '1.5', 'what is no figure goes');
     type(input, '1.2.3,4');
@@ -367,18 +366,20 @@ describe('ui kit', () => {
     decimals = 2;
     type(input, '1.2345');
     assert.equal(input.value, '1.23', 'no more decimals than the asset has');
-    await common.loadLocale('de');
-    type(input, '');
-    type(input, '1.000');
-    assert.equal(input.value, '1000', 'a pasted 1.000 in German is a thousand');
-    type(input, '');
-    type(input, '2.500,75');
-    assert.equal(input.value, '2500.75');
-    type(input, '');
-    type(input, '1,000');
-    assert.equal(input.value, '1.00', 'in German a pasted comma is the decimal mark (two decimals kept)');
+    for (const language of ['de', 'ru', 'fr', 'es', 'ar']) {
+      await common.loadLocale(language);
+      decimals = 9;
+      type(input, '');
+      type(input, '42,578.81988');
+      assert.equal(input.value, '42578.81988', `${language}: a copied amount is read as every screen writes it`);
+      type(input, '');
+      type(input, '1,000');
+      assert.equal(input.value, '1000', `${language}: a pasted 1,000 is a thousand in every language`);
+      type(input, '');
+      type(input, '1.000');
+      assert.equal(input.value, '1.000', `${language}: a pasted point is the decimal point in every language`);
+    }
     // Arabic-Indic digits are read as digits
-    await common.loadLocale('ar');
     type(input, '');
     type(input, '١٫٥');
     assert.equal(input.value, '1.5');

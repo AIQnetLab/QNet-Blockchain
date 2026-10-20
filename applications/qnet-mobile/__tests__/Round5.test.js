@@ -295,13 +295,32 @@ describe('MPLAT-R5-02: a touch through another app\'s window is dropped, even on
   it('the guard wraps the window\'s touch dispatch and drops obscured and partially obscured gestures', () => {
     const kt = KT();
     const filter = kt.slice(kt.indexOf('private fun obscured('), kt.indexOf('override fun onHostPause'));
-    expect(filter).toMatch(/MotionEvent\.FLAG_WINDOW_IS_OBSCURED/);
-    expect(filter).toMatch(/Build\.VERSION_CODES\.Q && flags and MotionEvent\.FLAG_WINDOW_IS_PARTIALLY_OBSCURED != 0/);
-    expect(filter).toMatch(/if \(!dropping && guardOn && obscured\(event\)\)/);
+    expect(filter).toMatch(/return obscuredByOtherApp\(sdk, flags, own\)/);
+    expect(filter).toMatch(/if \(!dropping && guardOn && obscured\(event, reactContext\.currentActivity\)\)/);
     expect(filter).toMatch(/cancel\.action = MotionEvent\.ACTION_CANCEL/); // a press already under way does not complete
+    // The decision (android/app/src/test/.../ObscuredTouchTest.kt): a window over the touch point always counts; the
+    // partial mark from API 29, and on Android 10 and 11 only while no window of the app's own (a text handle, the paste
+    // toolbar) is shown, which WindowInspector lists.
+    const decide = kt.slice(kt.indexOf('internal fun obscuredByOtherApp('));
+    expect(decide).toMatch(/if \(flags and MotionEvent\.FLAG_WINDOW_IS_OBSCURED != 0\) return true/);
+    expect(decide).toMatch(/return sdk >= Build\.VERSION_CODES\.S \|\| !ownWindowShown/);
+    expect(filter).toMatch(/WindowInspector\.getGlobalWindowViews\(\)\.any \{ it !== decor/);
     expect(kt).toMatch(/guardOn = guard\s*\n\s*if \(guard\) watchObscuredTouches\(activity\)/);
     expect(kt).toMatch(/if \(texts\.hasKey\("obscuredTouch"\)\)/);
     expect(SCREEN()).toMatch(/obscuredTouch: t\('native_obscured_touch'\)/);
+  });
+
+  it('the notice is a view inside the wallet\'s own window: no toast, whose own window would keep marking touches', () => {
+    const kt = KT();
+    expect(kt).not.toMatch(/Toast/);
+    const notice = kt.slice(kt.indexOf('private fun noticeObscured('), kt.indexOf('private inner class ObscuredTouchFilter'));
+    expect(notice).toMatch(/activity\.findViewById<ViewGroup>\(android\.R\.id\.content\)/);
+    expect(notice).toMatch(/content\.addView\(it, FrameLayout\.LayoutParams\(/);
+    // Above the navigation bar and the keyboard, passing touches through, read by a screen reader as it appears.
+    expect(notice).toMatch(/WindowInsetsCompat\.Type\.systemBars\(\) or WindowInsetsCompat\.Type\.ime\(\)/);
+    expect(notice).toMatch(/isClickable = false/);
+    expect(notice).toMatch(/accessibilityLiveRegion = View\.ACCESSIBILITY_LIVE_REGION_POLITE/);
+    expect(notice).toMatch(/main\.postDelayed\(hideObscuredNotice, OBSCURED_NOTICE_MS\)/);
   });
 });
 

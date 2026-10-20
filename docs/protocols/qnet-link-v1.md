@@ -24,6 +24,9 @@ different intents, so an app refuses a request of the revision it does not imple
 anything (section 14.3). The messages the app signs are defined in
 [Light node messages](light-node-messages.md).
 
+**Transfer link** (section 15): the link on the same host with which a page asks QNet Wallet for one SOL or 1DEV
+transfer, filled into the app's Solana Send for the user to confirm; no relay session and no answer.
+
 Parties: the **site** (a page of aiqnet.io in a browser tab), the **relay** (API routes of the same
 site), the **app** (QNet Wallet on a phone or tablet, `io.aiqnet.wallet`), the **extension** (QNet Wallet in the
 browser).
@@ -125,10 +128,11 @@ https://link.aiqnet.io/l#v1.<id>.<sitePub>.connect
 - The site draws the link as a QR code on a desktop (encoded in the page, no remote service). On a
   phone its "Open QNet Wallet" button is the link, except on Android, where it is the `intent:` URL of
   4.1. The site never puts the link, the id or a result in its own URL, in storage or in a log.
-- The link host is verified for the app: Android App Links (`https`, host `link.aiqnet.io`, path exactly
-  `/l`, `android:autoVerify="true"`, `https://link.aiqnet.io/.well-known/assetlinks.json`) and iOS
-  Universal Links (`applinks:link.aiqnet.io`, `https://link.aiqnet.io/.well-known/apple-app-site-association`
-  with the component `"/": "/l"`), both served as `application/json` without redirects. The app takes a
+- The link host is verified for the app: Android App Links (`https`, host `link.aiqnet.io`, paths exactly
+  `/l` and the transfer link's `/send` (section 15), `android:autoVerify="true"`,
+  `https://link.aiqnet.io/.well-known/assetlinks.json`) and iOS Universal Links (`applinks:link.aiqnet.io`,
+  `https://link.aiqnet.io/.well-known/apple-app-site-association` with the components `"/": "/l"` and
+  `"/": "/send"`), both served as `application/json` without redirects. The app takes a
   link only from the system, through that filter (Android) or as a Universal Link (iOS), and parses it
   as above: no other host, path or scheme reaches its confirmation screen.
 - `https://link.aiqnet.io/l` is a page for a visitor who reached it in a browser (app not installed, an app too
@@ -821,7 +825,8 @@ One JSON object with `v` = `1`, `intent` equal to the session's, `status`, and e
   ([Light node messages](light-node-messages.md) section 4), signed by QNet Wallet with the wallet's own Solana key at
   the consent's `T`.
 - `link` `linked`: the node was on the chain and this device is linked now; `seq` is the binding's sequence (decimal
-  string). A `burnTx` in the request was not used.
+  string): the new binding's, or, when nothing was sent because the node already ran here, the sequence of the binding
+  this device holds. A `burnTx` in the request was not used.
 - `claim` `ok`: the claim of the request's node was submitted; `nodeId` is the request's. `txHash` is 64 lowercase hex. `stoppedAtEpoch` is `null` for a claim of
   the whole balance; for a part (the node's quote stopped before the whole balance, and more epochs remain to claim
   later), it is the first epoch the claim did not take, as a decimal string. `amountNano` (decimal string) is at
@@ -957,14 +962,19 @@ Example (vector `link-linked`):
      `burner`, the wallet's Solana key (its stored key, which must give that address) also signs the owner bind v1 of the
      same registration with the same `T`, checked against the key before it goes, as `consent.ownerSig`; the binding
      and the device block are the same, and the owner bind goes only into the answer.
-   - `link`, node on the chain: the enrolment with `seq = max(now, binding_seq + 1)` on `/light-node/bind`; answer
-     `linked`.
+   - `link`, node on the chain: when the status signed with this device's ping key names this device's binding at two
+     owners and the Node tab offers nothing for it (no Use this device: the binding holds the device key where the
+     network takes them, the device is not revoked, its key is not past the rotation grace (with no block height read, a
+     key whose rotation is due counts as past it), no device check ended), the
+     node runs here already: nothing is signed, checked or sent, and the answer is `linked` with that binding's `seq`.
+     Otherwise the enrolment with `seq = max(now, binding_seq + 1)` on `/light-node/bind`; answer `linked`.
    - `claim`: the claim of light-node-messages section 4 (quote, then payload) for the request's `nodeId`: the quote
      signs `q1337|claim_rewards:{nodeId}:{W}` and `/rewards/claim` carries `node_id` = `nodeId`; `ok` or `empty`.
    - `unlink` on the device that runs the node: the ping key signs the unbind for the binding's sequence (`POST
      /api/v1/light-node/unbind`, with the device key's release when the node holds that key, light-node-messages section
-     5.7), within 8 seconds; then the push token, the wakes, the ping key and the device schedule go, whatever the
-     answer; answer `ok` with `unbound`. The Node tab has no button that does this.
+     5.7), within 8 seconds; a binding this device sent with no answer that the network may hold is unbound beside it
+     with its own ping key; then the push token, the wakes, the ping keys and the device schedule go, whatever the
+     answer; answer `ok` with `unbound` (either unbind taken). The Node tab has no button that does this.
    - `unlink` by the wallet key: the status signed with the wallet key gives the sequence S two genesis nodes report
      alike for a bound device; the wallet key signs `q1337|light_unbind_wallet:{N}:{S}:{ts}` and `POST
      /api/v1/light-node/unbind` carries `{node_id, seq, ts, signer: "wallet", sig, identity_pubkey}`; a node that took it
@@ -1106,3 +1116,39 @@ it is read in and the failing check.
 [`light-node-own-burn.vectors.json`](light-node-own-burn.vectors.json) holds the `link` request with `burner` (its
 bytes and `reqHash`), the answer with `consent.ownerSig` and the body the site submits, for each wallet of
 `light-node.vectors.json` ([Light node messages](light-node-messages.md) section 10).
+
+## 15. Transfer link
+
+A page of aiqnet.io asks QNet Wallet on a phone or tablet for one SOL or 1DEV transfer to an address it names (a
+payment address of the node cabinet), with a link of the verified link host. Only QNet Wallet opens it, so a request
+made on the test network never reaches a wallet app that reads it on another Solana cluster. It has no relay session
+and no answer: the page reads the arrival from the recipient's balance.
+
+```
+https://link.aiqnet.io/send#to=<address>&mint=<mint>&amount=<amount>
+https://link.aiqnet.io/send#to=<address>&amount=<amount>
+```
+
+- `to`: the recipient, a Solana address (section 3). `mint`: the release's 1DEV mint; without it the link asks for
+  SOL. `amount`: in whole tokens, `^(0|[1-9]\d{0,19})(\.\d{0,17}[1-9])?$` and not `0`, with at most the token's
+  decimals (SOL 9, 1DEV 6).
+- Parsers MUST match the whole string, without trimming, case folding or percent-decoding: `to`, `mint` (optional)
+  and `amount` each exactly once, in this order, and no other key; anything else on the path `/send` (a query, a
+  further path, an empty fragment) is a link that cannot be read. Length: at most 172 characters.
+- Verified as the `/l` link (section 4); on Android the site's button is the `intent:` URL of section 4.1 with
+  `/send#...` in place of `/l#...`. `https://link.aiqnet.io/send` in a browser is a page that says to install QNet
+  Wallet or send the tokens by hand and links back; it MUST NOT read the fragment into a request.
+- A `solana:` request link opens whichever wallet app claims that scheme, on that app's cluster: a build for the
+  Solana mainnet MAY take it as a transfer link; a devnet build claims no custom scheme and takes none.
+
+App behaviour (`src/services/transferLink.js`):
+
+1. Accept the link only as the system delivers it, as section 14.8 item 1; one handed over by a page of the in-app
+   browser is refused, and the in-app browser never loads the link host (section 14.8 item 9).
+2. A link that cannot be read, or whose amount has more decimals than its token, shows "This payment request cannot
+   be read"; a mint the wallet does not list, "This wallet does not hold the requested token"; nothing opens.
+3. Otherwise the Solana Send form of the token opens with the recipient and the amount filled in and the line "Filled
+   in from a link. Check the address and the amount."; the user reviews, may change them, and confirms as for any
+   send. Nothing is signed or sent before that.
+4. While the wallet is locked or not there yet, a QNet Link request is on screen or a Send form is open, the request
+   waits and opens once that is over; at most one waits, a newer link replacing it.

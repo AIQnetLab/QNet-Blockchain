@@ -1093,6 +1093,13 @@ const styles = StyleSheet.create({
   sendBalanceNotes: {
     paddingBottom: 10,
   },
+  // The line over a Send form a payment request from a link filled in (SolanaSend fromLink).
+  sendFromLink: {
+    color: '#ffaa00',
+    fontSize: 13,
+    textAlign: 'center',
+    marginBottom: 12,
+  },
   percentageButtons: {
     flexDirection: 'row',
     justifyContent: 'space-between',

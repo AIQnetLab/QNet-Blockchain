@@ -1071,7 +1071,12 @@ mod tests {
             assert_eq!(t.provider_answers(), (10, 10));
             assert_eq!(t.provider_err(), None, "a gone token is no refusal");
             assert_eq!(h.after_tick(10, 10), (true, false), "tick {tick}: every token gone, the provider worked");
+            assert!(t.summary(tick, 11).0, "shed pushes keep the tick at WARN");
         }
+        let t = PushTally::default();
+        t.failed(&fcm, true, gone_err);
+        t.took(&up);
+        assert!(!t.summary(3, 2).0, "a gone-only tick is INFO");
         // Refusals of any other kind are no answer; the summary line is as before.
         let t = PushTally::default();
         t.failed(&up, false, "status 500 Internal Server Error");
@@ -1584,10 +1589,16 @@ mod tests {
         let r = |onchain: bool, answered: bool, active: bool| json!({"onchain_registered": onchain, "answered_this_epoch": answered, "is_active": active});
         assert_eq!(OwnersView::of(&[]), None);
         assert_eq!(OwnersView::of(&[json!({"success": false})]), None, "no verdict");
-        assert_eq!(OwnersView::of(&[r(true, false, false), r(true, true, true)]), Some(OwnersView { answered: true, active: true }));
-        assert_eq!(OwnersView::of(&[r(true, false, false), r(true, false, false)]), Some(OwnersView { answered: false, active: false }));
-        assert_eq!(OwnersView::of(&[r(false, true, false)]), Some(OwnersView { answered: false, active: false }),
+        let view = |answered: bool, active: bool| OwnersView { answered, active, device_answered: false };
+        assert_eq!(OwnersView::of(&[r(true, false, false), r(true, true, true)]), Some(view(true, true)));
+        assert_eq!(OwnersView::of(&[r(true, false, false), r(true, false, false)]), Some(view(false, false)));
+        assert_eq!(OwnersView::of(&[r(false, true, false)]), Some(view(false, false)),
                    "an owner that does not see the node on chain says nothing of its answer");
+        // The bound device's answer, as an owner holding the asker's binding reports it (`answered_under`).
+        let mut held = r(true, true, true);
+        held["device"] = json!({"answered": true});
+        assert_eq!(OwnersView::of(&[r(true, false, false), held]).map(|v| v.device_answered), Some(true));
+        assert_eq!(OwnersView::of(&[r(true, true, true)]).map(|v| v.device_answered), Some(false), "an owner without the field");
         let src = include_str!("light_nodes.rs");
         let f = &src[src.find("pub(super) async fn shard_owners_view(").unwrap()..];
         assert!(f.contains("crate::node::light_shard_owners(shard).into_iter()") && f.contains("futures::future::join_all(asks)"));

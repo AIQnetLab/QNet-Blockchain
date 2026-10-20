@@ -40,6 +40,8 @@ export const ERROR_MESSAGES = Object.freeze({
   // a contract account has no key and no contract sends QNC or a built-in token on: what reaches one stays there
   RECIPIENT_IS_CONTRACT: 'The recipient is a contract: nothing can ever move what is sent to it',
   RECIPIENT_UNCHECKED: 'The recipient could not be checked',
+  // a site's transfer to the wallet's own address would only spend a fee
+  INVALID_RECIPIENT: 'The recipient is this wallet itself',
   // Solana
   INSUFFICIENT_SOL: 'Not enough SOL for the transaction and its network fee',
   INSUFFICIENT_TOKENS: 'Not enough 1DEV',
@@ -123,7 +125,7 @@ const PROVIDER_MESSAGES = Object.freeze({
 const PROVIDER_INPUT_CODES = new Set([
   'INVALID_PARAMS', 'INVALID_REQUEST', 'INVALID_ADDRESS', 'INVALID_AMOUNT', 'INVALID_INTEGER',
   'INVALID_MESSAGE', 'MESSAGE_TOO_LONG', 'PROTOCOL_PREFIX', 'INVALID_TRANSFER', 'INVALID_METHOD', 'INVALID_ARGS', 'INVALID_GAS_LIMIT',
-  'UNSUPPORTED_PARAM', 'RECIPIENT_IS_CONTRACT',
+  'UNSUPPORTED_PARAM', 'RECIPIENT_IS_CONTRACT', 'INVALID_RECIPIENT',
 ]);
 // The fields of a contract call the network does not accept today (UNSUPPORTED_PARAM names which one).
 export const UNSUPPORTED_CALL_FIELDS = Object.freeze(['value', 'accessList']);

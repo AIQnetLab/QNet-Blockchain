@@ -1,0 +1,66 @@
+# A fresh install: Import Existing Wallet with a password (a simulator has no screen lock) and the recovery phrase, each
+# pasted from the simulator's pasteboard, which store-screenshots.js fills on request; nothing secret is typed here.
+appId: com.qnetmobile
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "Import Existing Wallet"
+    timeout: 90000
+- tapOn: "Import Existing Wallet"
+- extendedWaitUntil:
+    visible: "Step 1: Create a password.*"
+    timeout: 20000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "pasteboard/password"
+- runFlow:
+    file: paste.yaml
+    env:
+      FIELD: "Enter password"
+- runFlow:
+    file: paste.yaml
+    env:
+      FIELD: "Confirm password"
+- extendedWaitUntil:
+    visible: ".*Passwords match"
+    timeout: 10000
+# A tap on text outside the fields closes the keyboard over Next.
+- tapOn: "Step 1: Create a password.*"
+- tapOn: "Next"
+- extendedWaitUntil:
+    visible: "Step 2: Enter your recovery phrase"
+    timeout: 20000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "pasteboard/phrase"
+- runFlow:
+    file: paste.yaml
+    env:
+      FIELD: "Enter the 12 or 24 word recovery phrase"
+- extendedWaitUntil:
+    visible: "Words: (12|24) ✓"
+    timeout: 15000
+- tapOn: "Step 2: Enter your recovery phrase"
+# The terms checkbox has no text of its own: it is the element left of the sentence, and shows ✓ once ticked.
+- tapOn:
+    leftOf: "I accept the .*"
+- extendedWaitUntil:
+    visible:
+      text: "✓"
+      leftOf: "I accept the .*"
+    timeout: 5000
+- tapOn:
+    text: "Import Wallet"
+    below: "I accept the .*"
+# A screen holding the phrase locks a minute after the last touch the app recorded (at most one each 5 s), whatever
+# Auto-Lock says: every wait after the paste stays well under that, this longest one included.
+- extendedWaitUntil:
+    visible:
+      id: "tab-assets"
+    timeout: 40000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "pasteboard/clear"

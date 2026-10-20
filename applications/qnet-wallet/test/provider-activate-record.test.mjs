@@ -5,29 +5,10 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { TIMINGS } from '../dist/background/config.js';
 import { until } from './helpers/chrome-mock.mjs';
-import { createPage } from './helpers/provider-dom.mjs';
-import { NODE_ID, SITE, createWorld, replyTo, settleAll } from './helpers/provider-harness.mjs';
+import { openApprovePage, resetPageGlobals } from './helpers/provider-dom.mjs';
+import { ERROR_LINGER_MS, NODE_ID, SITE, createWorld, replyTo, settleAll } from './helpers/provider-harness.mjs';
 
-const ERROR_LINGER_MS = 30000;
-
-let pageSeq = 0;
-async function openPage(world, shown) {
-  const page = createPage({
-    query: `?id=${shown.id}`,
-    runtime: world.chrome.runtime,
-    send: (message) => world.router.handleUiMessage(message, shown.sender),
-  });
-  Object.assign(globalThis, { window: page.window, document: page.document, chrome: page.chrome });
-  pageSeq += 1;
-  await import(`../dist/ui/approve.js?record=${pageSeq}`);
-  return page;
-}
-
-afterEach(() => {
-  delete globalThis.window;
-  delete globalThis.document;
-  delete globalThis.chrome;
-});
+afterEach(resetPageGlobals);
 
 describe('qnet_activateNode: the light node\'s record on the QNet network', () => {
   it('after a light answer the window shows the record and stays up to REGISTRATION_WINDOW_MS; the site result is unchanged', async (t) => {
@@ -56,7 +37,7 @@ describe('qnet_activateNode: the light node\'s record on the QNet network', () =
     w.state.registration = { nodeId: NODE_ID, state: 'queued', attempts: 0, lastError: null, txHash: null, updatedAt: 1, automatic: true };
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     assert.ok(!page.app.textContent.includes('Then the wallet records its light node on QNet Blockchain'));
     const [ack] = page.app.querySelectorAll('input');

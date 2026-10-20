@@ -24,10 +24,9 @@ import {
   highestVerifiedIndex, exportVerifiedAnchors, importVerifiedAnchors, chainIdentity, isRateLimitBody,
   certifiedStateRootAt, certifiedHeadHint, markNodeOld, nodeMarkedOld, trustFloorIndex, verifiedCheckpointTime,
   stepsToVerify, refreshCapsule, followStep, exportCapsule, importCapsule, clearCapsule, heldCapsuleIndex,
-  OWN_ROOT_WALK_STEPS, verifyCapsuleSignatures, nodeReadStates, capsuleRefusal, lastStepFailure,
+  OWN_ROOT_WALK_STEPS,
 } from '../crypto/QcLightClient';
 import { NETWORK_ID } from '../config/genesisConsensus';
-import { boundedGetJson } from '../utils/boundedFetch';
 import {
   agreedEndpoints, mergeEndpoints, readPoolUrls, loadDiscovered, saveDiscovered, DISCOVERY_INTERVAL_MS,
   MIN_GENESIS_AGREEMENT,
@@ -81,6 +80,7 @@ import {
   state as deviceAuthStoreState,
 } from '../services/DeviceAuthStore';
 import { forgetKeys as forgetNodeDeviceKeys, NODE_DEVICE_KEY_SERVICE } from '../services/NodeDeviceKey';
+import { PING_KEY_PREFIX, forgetUnconfirmedBinding, pingKeyService, storePingKey } from '../services/PingKeys';
 import { createPasswordLimiter } from '../utils/passwordLimiter';
 import logger from '../utils/logger';
 import { tr } from '../i18n';
@@ -2944,46 +2944,8 @@ export class WalletManager {
     const r = await refreshCapsule(() => shuffledGenesisNodes(), {
       headHint: head, proofNodes: () => this._lineageNodes(),
     });
-    this._lastCapsule = { ok: !!(r && r.ok), reason: (r && (r.reason || (r.ok ? 'ok' : null))) || 'none', index: r && r.index, at: Date.now() };
     if (r && r.ok) await this._saveCapsule();
     return r;
-  }
-
-  /**
-   * The light client's state in one line for a support screenshot (long press on the title): the capsule held, the
-   * last capsule answer and the last walk to a certified root, with the steps a walk to the head still takes, and the
-   * live figure the next send of `address` would be checked against.
-   */
-  async lightClientDiagnostics(address = null) {
-    const c = this._lastCapsule || {};
-    const w = this._lastWalk || {};
-    const age = (at) => (at ? Math.round((Date.now() - at) / 1000) + 's ago' : 'never');
-    const lines = ['capsule held: ' + (heldCapsuleIndex() || 'none'),
-      'capsule ask: ' + (c.reason || 'never') + (c.index ? ' K=' + c.index : '') + ' (' + age(c.at) + ')',
-      'walk: ' + (w.ok === undefined ? 'never' : w.ok ? 'ok' : (w.why || 'failed')) + (w.index ? ' to ' + w.index : '') + ' (' + age(w.at) + ')',
-      'verified up to: ' + highestVerifiedIndex(), 'steps left: ' + (this.walkSteps() ?? 'none')];
-    const kept = address ? WalletManager.liveFigures.get(address) : null;
-    lines.push('send check base: ' + (kept ? 'live at ' + kept.figure.blockHeight + ' (' + age(kept.at) + ')' : 'none yet'));
-    const refused = capsuleRefusal();
-    if (refused) lines.push('capsule refused: K=' + refused.index + ' (' + age(Date.now() - refused.ageMs) + ')');
-    const step = lastStepFailure();
-    if (step) {
-      lines.push('step ' + step.j + ' failed: ' + step.nodes.map((n) => n.base.replace('https://', '').split('.')[0] + ' ' + n.reason).join(', '));
-    }
-    // The same read and the same signature check the walk uses, done now: which of the two fails on this device.
-    for (const n of nodeReadStates(GENESIS_NODES)) {
-      lines.push(n.base.replace('https://', '') + ': backoff ' + Math.round(n.backoff / 1000) + 's, budget ' + Math.round(n.wait / 1000) + 's, miss ' + Math.round(n.capsuleMiss / 1000) + 's');
-    }
-    try {
-      const t0 = Date.now();
-      const cap = await boundedGetJson(GENESIS_NODES[0] + '/api/v1/galc/capsule', { timeoutMs: 30000, maxBytes: 64 * 1024 });
-      lines.push('capsule read: ok K=' + (cap && cap.mb_index) + ' in ' + (Date.now() - t0) + ' ms');
-      const sig = await verifyCapsuleSignatures(cap);
-      lines.push('capsule signatures on this device: ' + sig.valid.length + ' valid');
-    } catch (e) {
-      lines.push('capsule read: ' + String((e && (e.code || e.message)) || e).slice(0, 120));
-    }
-    return lines.join(String.fromCharCode(10));
   }
 
   // A walk to `index` of more than OWN_ROOT_WALK_STEPS steps first asks for a capsule (at most CAPSULE_WAIT_MS, as long
@@ -4049,7 +4011,7 @@ export class WalletManager {
       for (const service of services) {
         let accessible = null;
         if (service === LIMITER_SERVICE) accessible = Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY;
-        else if (service.startsWith('qnet_ping_sk_')) accessible = Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY;
+        else if (service.startsWith(PING_KEY_PREFIX)) accessible = Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY;
         if (!accessible) continue;
         const item = await Keychain.getGenericPassword({ service });
         if (item && item.password) await Keychain.setGenericPassword(item.username, item.password, { service, accessible });
@@ -4218,13 +4180,15 @@ export class WalletManager {
 
   // Forget the wallet that was on this device. Work still in flight for it (a sync, a registration)
   // sees the generation change and writes nothing. The light-node identity is torn down by the caller
-  // (PushService.teardownLightNode), the vault itself by the caller or by storeWallet overwriting it. The in-app
+  // (PushService.teardownLightNode), the vault itself by the caller or by storeWallet overwriting it; a binding of that
+  // wallet's node still waiting for the network's word goes here with its ping key, which a teardown leaves. The in-app
   // browser's cookies, site storage and caches go too (L-6), best effort and not waited for.
   async wipeWalletScope() {
     this._walletGen++;
     this.closeSession();
     clearBrowserData().catch(() => {});
     await this._limiter.reset();
+    await forgetUnconfirmedBinding();
     const all = await AsyncStorage.getAllKeys();
     const doomed = all.filter(k => WalletManager.WALLET_SCOPED_KEYS.includes(k) ||
       WalletManager.WALLET_SCOPED_PREFIXES.some(p => k.startsWith(p)));
@@ -6062,7 +6026,6 @@ export class WalletManager {
     if (index < head - lag || index > head + lag) return { ok: false, reason: 'unconfirmed' };
     await this._capsuleFirst(index, network);
     const r = await certifiedStateRootAt(index, () => this._lineageNodes(), this._lineageHooks());
-    this._lastWalk = { ok: !!r.ok, why: r.ok ? null : r.reason, index, at: Date.now() };
     this._saveVerifiedAnchors().catch(() => {});
     return r.ok ? { ok: true, stateRoot: r.stateRoot } : { ok: false, reason: 'unconfirmed', why: r.reason };
   }
@@ -7314,12 +7277,10 @@ export class WalletManager {
       pingPublicKey: ping.publicKey,
       delegation,
       attachSig,
-      keep: async () => {
+      // `service`: the node's ping key (the default), or the item of a binding that waits for the network's word.
+      keep: async (service = pingKeyService(k.nodeId)) => {
         if (!pingSk || gen !== this._walletGen) throw new Error('The binding is no longer this wallet\'s');
-        await Keychain.setGenericPassword('ping', pingSk, {
-          service: `qnet_ping_sk_${k.nodeId}`,
-          accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
-        });
+        await storePingKey(service, pingSk);
         pingSk = null;
       },
       wipe: () => { pingSk = null; },

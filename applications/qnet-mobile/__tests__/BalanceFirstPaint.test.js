@@ -78,6 +78,8 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
   showPlayDialog: jest.fn(async () => 'ok'),
 }));
 jest.mock('../src/services/PushService', () => ({
+  readUnconfirmedBinding: jest.fn(async () => null),
+  settleUnconfirmedBinding: jest.fn(async () => false),
   LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
   readdressIfOwed: jest.fn(async () => false),
   localBinding: jest.fn(async () => null),

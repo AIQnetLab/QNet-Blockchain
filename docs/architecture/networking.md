@@ -383,7 +383,7 @@ in plain (`genesis_internal_call_tls`); a copy that fails is logged at WARN and 
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | `verify_peer_authenticity` | Authenticates a bootstrap candidate before it enters the peer table |
 | `GET /api/v1/microblock/{height}` | `check_block_exists_on_network` | Corroborates a height against several peers at once |
-| `GET /api/v1/light-node/status?node_id={id}&fwd=1` | `shard_owners_view` | Takes a light node's activity verdict and this epoch's answer from every other owner genesis of its shard, at once |
+| `GET /api/v1/light-node/status?node_id={id}&fwd=1[&bound={seq}]` | `shard_owners_view` | Takes a light node's activity verdict, this epoch's answer and, under the binding of sequence `bound`, whether its bound device answered, from every other owner genesis of its shard, at once |
 | `GET /api/v1/internal/light-reach-get?epoch={e}&shard={s}` | `pull_reach_records` | Fetches another owner's reach record of a shard's epoch (the devices it reached, or held by the dormant rule, that gave it no answer), which the dormant rule of every owner reads |
 | `GET /api/v1/internal/fcm-token-get?node_id={id}` | `maybe_pull_push_channel` | Refills a genesis's missing or polling push-channel record for a node of its shard from the genesis that attested it |
 | `GET /api/v1/internal/light-ping-keys-get?node_id={id}` | `maybe_pull_light_identity` | Fetches a light node's ping key and delegation when a relayed attestation fails to verify locally |
@@ -402,12 +402,13 @@ fewer, 5 up to 100, 7 above that — chosen at random and queried in parallel wi
 global budget. Each response body is parsed and checked before it counts, so a peer that answers 200 with empty or
 malformed content does not register as holding the block.
 
-Before it reports a light node as inactive, a node consults every owner genesis of the node's shard but itself, at
-once: the owner that took this epoch's answer may be any of the three (the primary was down or restarting when the
-device answered a backup, or a relay was lost). The node is answered when an owner that sees it on chain says so, and
-active when any owner says so; the view is cached for 60 s per node, an owner that failed is skipped for 15 s, at most
-16 consultations are in flight under a 2 s timeout, and `fwd=1` marks a proxied request, which an owner answers from
-its own view. Each owner pulls the other two owners' reach records of the two epochs before the current one, once
+Before it reports a light node as inactive, or a bound device whose answer it has not seen, a node consults every owner
+genesis of the node's shard but itself, at once: the owner that took this epoch's answer may be any of the three (the
+primary was down or restarting when the device answered a backup, or a relay was lost). The node is answered when an
+owner that sees it on chain says so, and active when any owner says so; its bound device answered when an owner holding
+the binding the request names by its sequence (`bound`) says so, which an owner tells a genesis address only. The view
+is cached for 60 s per node and binding, an owner that failed is skipped for 15 s, at most 16 consultations are in
+flight under a 2 s timeout, and `fwd=1` marks a proxied request, which an owner answers from its own view. Each owner pulls the other two owners' reach records of the two epochs before the current one, once
 each (the epoch just ended once 30 blocks of the next passed, so every owner decided it), over TLS, retrying every
 300 s while an owner answers `not_decided`; at most twelve pulls an epoch. The two
 internal pulls run on a genesis for nodes of its own shards, once per node and epoch: the push-channel record is applied
@@ -443,9 +444,13 @@ failure is non-fatal. Inbound QUIC reachability on UDP 10876 requires an explici
 host-mapped container port.
 
 Live inbound connections are additionally indexed by the peer's advertised listen address in
-`INBOUND_CONN_BY_LISTEN_ADDR`. Such a connection lives under an ephemeral source port in the transport pool, so a send
+`INBOUND_CONN_BY_LISTEN_ADDR`. Such a connection lives under its source address in the transport pool, so a send
 targeting the advertised port would miss and re-dial a port NAT cannot accept inbound; consulting this index pushes
-shreds and blocks back over the existing connection instead.
+shreds and blocks back over the existing connection instead. The signed-head fan-out (a `HealthPing` to every connected
+peer each `HEALTH_PING_INTERVAL_SECS` 15) enumerates both: every pooled connection, plus each live indexed connection
+whose peer the pool no longer lists, so a peer that dialled in keeps receiving this node's head. A closing connection
+removes a pool or index entry only while that entry still holds it: both ends bind UDP 10876, so a peer's connections
+in the two directions share one key, and the connection that replaced a restarted peer's old one stays.
 
 ## IP privacy
 

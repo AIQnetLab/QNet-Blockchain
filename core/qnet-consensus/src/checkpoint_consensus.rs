@@ -126,10 +126,14 @@ impl CheckpointConsensus {
     /// Highest certified index (the safety lock).
     pub fn locked_index(&self) -> u64 { self.locked_index }
 
+    /// The certificate held at `index`, if any.
+    pub fn qc_at(&self, index: u64) -> Option<&QuorumCertificate> {
+        self.qcs.get(&index).or_else(|| self.high_qc.as_ref().filter(|q| q.index == index))
+    }
+
     /// Hash of the certificate held at `index`, if any.
     pub fn qc_hash_at(&self, index: u64) -> Option<Hash> {
-        self.qcs.get(&index).map(|q| q.checkpoint_hash)
-            .or_else(|| self.high_qc.as_ref().filter(|q| q.index == index).map(|q| q.checkpoint_hash))
+        self.qc_at(index).map(|q| q.checkpoint_hash)
     }
 
     /// Entry counts of the per-round maps, for the memory census.
@@ -293,8 +297,12 @@ impl CheckpointConsensus {
     /// commits the parent, advances the view.
     pub fn adopt_qc(&mut self, qc: &QuorumCertificate) -> Vec<Action> {
         if self.qcs.contains_key(&qc.index) && qc.index < self.current_index {
-            // already known and not advancing — idempotent
-            if self.high_qc.as_ref().map(|q| q.index).unwrap_or(0) >= qc.index { return Vec::new(); }
+            // Already known and not advancing: nothing moves but the 2-chain commit, which needs the
+            // certified checkpoint, and that can arrive after the certificate (catch-up, a late proposal).
+            if self.high_qc.as_ref().map(|q| q.index).unwrap_or(0) >= qc.index {
+                if self.qcs.get(&qc.index).map(|q| q.checkpoint_hash) != Some(qc.checkpoint_hash) { return Vec::new(); }
+                return self.commit_parent_of(qc).into_iter().collect();
+            }
         }
         self.qcs.entry(qc.index).or_insert_with(|| qc.clone());
         // The certificate now HOLDS this index's votes, and `on_vote` refuses any further vote at a
@@ -306,17 +314,21 @@ impl CheckpointConsensus {
             self.high_qc = Some(qc.clone());
         }
         if qc.index > self.locked_index { self.locked_index = qc.index; }
-        // 2-chain: QC(i) on C_i whose parent_qc.index == i-1 ⇒ C_{i-1} is final.
-        if let Some(cp) = self.proposals.get(&(qc.index, qc.checkpoint_hash)) {
-            if let Some(p) = commits_parent(cp, qc) {
-                if p > self.committed_index { self.committed_index = p; out.push(Action::Commit(p)); }
-            }
-        }
+        out.extend(self.commit_parent_of(qc));
         if qc.index >= self.current_index {
             self.current_index = qc.index + 1;
             out.push(Action::EnterView(self.current_index));
         }
         out
+    }
+
+    /// 2-chain: QC(i) on C_i whose parent_qc.index == i-1 ⇒ C_{i-1} is final. Needs C_i held; the
+    /// commit frontier only moves forward.
+    fn commit_parent_of(&mut self, qc: &QuorumCertificate) -> Option<Action> {
+        let p = commits_parent(self.proposals.get(&(qc.index, qc.checkpoint_hash))?, qc)?;
+        if p <= self.committed_index { return None; }
+        self.committed_index = p;
+        Some(Action::Commit(p))
     }
 
     /// Local view timer fired ⇒ broadcast our timeout (carries high_qc index), preceded by a helper timeout
@@ -722,6 +734,51 @@ mod tests {
         }
         assert_eq!(eng.committed_index, 4); // C1..C4 final; C5 awaits its child
         assert_eq!(eng.current_index, 6);
+    }
+
+    /// n0 missed C2's proposal and formed QC(2) from the other members' votes. Returns (C2, QC2).
+    fn certified_without_the_checkpoint(eng: &mut CheckpointConsensus, c: &[NodeId]) -> (Checkpoint, QuorumCertificate) {
+        let c1 = propose(c, 1, None, hh(0));
+        eng.on_proposal(&c1, &hh(0));
+        vote_all(eng, c, &c1);
+        let c2 = propose(c, 2, eng.high_qc.clone(), c1.hash());
+        let mut acts = Vec::new();
+        for voter in &c[1..] {
+            acts.extend(eng.on_vote(&Vote { checkpoint_hash: c2.hash(), index: 2, voter: voter.clone(), signature: Vec::new() }));
+        }
+        assert!(!acts.iter().any(|a| matches!(a, Action::Commit(_))), "nothing commits without C2 held");
+        let qc2 = eng.high_qc.clone().expect("QC(2) formed from the votes");
+        assert_eq!((qc2.index, eng.current_index, eng.committed_index), (2, 3, 0));
+        (c2, qc2)
+    }
+
+    // The certified checkpoint arriving after its certificate (catch-up, a late proposal) commits its
+    // parent then, not one round later on the next held checkpoint.
+    #[test]
+    fn a_checkpoint_that_arrives_after_its_certificate_commits_its_parent() {
+        let c = committee(4);
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        let (c2, qc2) = certified_without_the_checkpoint(&mut eng, &c);
+        assert_eq!(eng.sync_checkpoint(&c2, &qc2), vec![Action::Commit(1)]);
+        assert_eq!(eng.committed_index, 1);
+        // Later copies of either half change nothing.
+        assert!(eng.sync_checkpoint(&c2, &qc2).is_empty());
+        assert!(eng.adopt_qc(&qc2).is_empty());
+        assert_eq!((eng.committed_index, eng.current_index), (1, 3));
+    }
+
+    // The re-evaluation follows the certificate the engine holds at that index, never another one.
+    #[test]
+    fn a_second_certificate_at_a_held_index_commits_nothing() {
+        let c = committee(4);
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        let (c2, _) = certified_without_the_checkpoint(&mut eng, &c);
+        let mut other = c2.clone();
+        other.state_root = hh(99);
+        let forged = QuorumCertificate { checkpoint_hash: other.hash(), index: 2, signers: Vec::new(), sig_merkle_root: hh(0), sigs: Vec::new() };
+        assert!(eng.sync_checkpoint(&other, &forged).is_empty());
+        assert_eq!(eng.committed_index, 0);
+        assert_eq!(eng.qc_hash_at(2), Some(c2.hash()));
     }
 
     // Multi-node simulation: 4 engines exchange real proposals/votes; assert every

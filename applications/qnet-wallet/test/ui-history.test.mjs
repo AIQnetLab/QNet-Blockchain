@@ -43,6 +43,8 @@ function handlers(overrides = {}) {
     'qnet.tokens': () => ({ tokens: [], complete: true }),
     'wallet.cached': () => ({ qnetBalance: null, qnetHistory: null, solanaBalances: null, solanaHistory: null }),
     'solana.history': () => ({ items: [], cursor: null }),
+    'wallet.touch': () => ({ touched: true }),
+    'wallet.remember': () => ({ remembered: true }),
     ...overrides,
   };
 }
@@ -130,6 +132,40 @@ describe('popup: History rows (owner, 06.10)', () => {
     assert.equal(page.$$('.history-row')[2].getAttribute('aria-label'),
       `Node registered, Node ${NODE_ID}, ${new Date(at(2026, 10, 6, 10)).toLocaleString('en')}`);
     assert.equal(page.$$('.history-row')[6].getAttribute('aria-label'), 'Contract deployed');
+  });
+
+  // The archive lists a token transfer this wallet sent twice under one hash: its contract call's row and the token's own
+  // row. History shows one row, the token row, with the fee the call paid; a call that wrote no token event keeps its row.
+  it('QNet: a token transfer this wallet sent is one row, the token row with its call\'s fee, across a page boundary too', async () => {
+    const HASH = 'ab'.repeat(32);
+    const call = qnetItem({ n: 1, hash: HASH, direction: 'out', from: ADDRESSES.qnet, to: TOKEN, amountNano: '0', feeNano: '4509375',
+      kind: 'call', timestamp: NOW - 1000 });
+    const token = qnetItem({ n: 1, hash: HASH, direction: 'out', from: ADDRESSES.qnet, to: PEER, amountNano: '0', kind: 'token',
+      token: { contract: TOKEN, symbol: 'GOLD', decimals: 6 }, amountBase: '2500000', timestamp: NOW - 1000 });
+    const lone = qnetItem({ n: 2, direction: 'out', from: ADDRESSES.qnet, to: TOKEN, amountNano: '0', feeNano: '4509375', kind: 'call',
+      timestamp: NOW - 2000 });
+    const expected = [
+      { title: 'Sent', badge: 'sent', amount: '−2.5 GOLD', party: `To: ${short(PEER)}`, status: null },
+      { title: 'Contract call', badge: 'call', amount: null, party: `Contract ${short(TOKEN)}`, status: null },
+    ];
+    await openHistory({ 'qnet.history': () => ({ items: [call, token, lone], cursor: null, pending: [] }) });
+    assert.deepEqual(rows(), expected);
+    page.$$('[data-action="open-detail"]')[0].click();
+    await page.settle();
+    const detail = Object.fromEntries(page.$$('.history-detail dt').map((node, i) => [node.textContent, page.$$('.history-detail dd')[i].textContent]));
+    assert.equal(detail['Network fee'], '0.004509375 QNC', 'the fee the transfer cost');
+    assert.equal(detail.Token, 'GOLD');
+    page.close();
+    mock.timers.reset();
+
+    // the call's row on one page, the token row on the next (More)
+    await openHistory({
+      'qnet.history': ({ cursor }) => (cursor === 'older' ? { items: [token, lone], cursor: null, pending: [] }
+        : { items: [call], cursor: 'older', pending: [] }),
+    });
+    assert.deepEqual(rows(), [{ title: 'Contract call', badge: 'call', amount: null, party: `Contract ${short(TOKEN)}`, status: null }]);
+    await page.click('[data-action="more"]');
+    assert.deepEqual(rows(), expected);
   });
 
   it('QNet: a node registration this wallet did not submit names no node, and its detail has no recipient', async () => {
@@ -261,18 +297,15 @@ describe('popup: History rows (owner, 06.10)', () => {
     assert.equal(page.$('.history-detail .detail-amount').textContent, '+340,282,366,920,938,463,463,374,607,431,768.211455 GOLD');
   });
 
-  it('a row takes the UI language\'s marks: German groups with a dot and writes a decimal comma, Spanish leaves four digits', async () => {
+  it('a row writes its figures in one format for every language: comma groups and a decimal point (owner, 19.10)', async () => {
     const items = [
       qnetItem({ n: 1, amountNano: '98765432100000', timestamp: NOW - 1000 }),
       qnetItem({ n: 2, direction: 'out', from: ADDRESSES.qnet, to: PEER, amountNano: '123456700000000', timestamp: NOW - 2000 }),
       qnetItem({ n: 3, amountNano: '1234500000000', timestamp: NOW - 3000 }),
       qnetItem({ n: 4, amountNano: '1', timestamp: NOW - 4000 }),
     ];
-    const shown = {
-      de: [['+98.765,43', 'QNC'], ['\u2212123,46K', 'QNC'], ['+1.234,5', 'QNC'], ['+<0,00000001', 'QNC']],
-      es: [['+98.765,43', 'QNC'], ['\u2212123,46K', 'QNC'], ['+1234,5', 'QNC'], ['+<0,00000001', 'QNC']],
-    };
-    for (const [language, expected] of Object.entries(shown)) {
+    const expected = [['+98,765.43', 'QNC'], ['−123.46K', 'QNC'], ['+1,234.5', 'QNC'], ['+<0.00000001', 'QNC']];
+    for (const language of ['de', 'es', 'ru', 'fr', 'ar']) {
       mock.timers.enable({ apis: ['Date'], now: NOW });
       page = await openPage('popup', {
         handlers: handlers({
@@ -286,7 +319,7 @@ describe('popup: History rows (owner, 06.10)', () => {
       assert.deepEqual(page.$$('.history-row .amount').map((node) => [...node.children].map((part) => part.textContent)), expected, language);
       page.$$('[data-action="open-detail"]')[0].click();
       await page.settle();
-      assert.equal(page.$('.history-detail .detail-amount').textContent, '+98.765,4321 QNC', language);
+      assert.equal(page.$('.history-detail .detail-amount').textContent, '+98,765.4321 QNC', language);
       assert.deepEqual(page.violations, [], language);
       page.close();
       page = null;

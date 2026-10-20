@@ -9,6 +9,9 @@ set -uo pipefail
 KEY="${SSH_KEY:-$HOME/.ssh/qnet_server}"
 INTERVAL="${INTERVAL:-1800}"
 WINDOW="${WINDOW:-31m}"
+# One bounded read per node per cycle: `docker logs --since` alone decodes every retained json-file log from its
+# start, so its cost grows with the container's age (docs/operators/genesis-host-checks.md, section 7).
+TAIL="${TAIL:-100000}"
 STATE=/tmp/watch-fleet.kinds
 
 NODES=(
@@ -30,12 +33,14 @@ while true; do
     out=$(timeout 45 ssh -i "$KEY" -p "$port" -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$ip" "
       H=\$(curl -s -m 6 http://127.0.0.1:8001/api/v1/node/health 2>/dev/null)
       echo \"HEALTH \$H\"
+      L=\$(docker logs --tail $TAIL --since $WINDOW $c 2>&1)
+      echo \"LINES \$(printf '%s\n' \"\$L\" | wc -l)\"
       echo '---CRIT---'
-      docker logs $c --since $WINDOW 2>&1 | grep -E '\[(CRIT|ERR)\]' | sed 's/[0-9]\{5,\}/N/g' | sort | uniq -c | sort -rn | head -6
+      printf '%s\n' \"\$L\" | grep -E '\[(CRIT|ERR)\]' | sed 's/[0-9]\{5,\}/N/g' | sort | uniq -c | sort -rn | head -6
       echo '---SYMPTOM---'
-      docker logs $c --since $WINDOW 2>&1 | grep -oE '\[WARN\]\[($SYMPTOM)[A-Z0-9_-]*\]' | sort | uniq -c | sort -rn | head -8
+      printf '%s\n' \"\$L\" | grep -oE '\[WARN\]\[($SYMPTOM)[A-Z0-9_-]*\]' | sort | uniq -c | sort -rn | head -8
       echo '---KINDS---'
-      docker logs $c --since $WINDOW 2>&1 | grep -oE '\[(CRIT|ERR|WARN)\]\[[A-Z0-9_-]+\]' | sort -u
+      printf '%s\n' \"\$L\" | grep -oE '\[(CRIT|ERR|WARN)\]\[[A-Z0-9_-]+\]' | sort -u
     " 2>/dev/null)
 
     if [ -z "$out" ]; then echo "  $id  UNREACHABLE"; continue; fi
@@ -46,6 +51,8 @@ while true; do
     rd=$(echo "$out" | grep '^HEALTH' | grep -o '"max_timeout_round_seen":[0-9]*' | head -1 | cut -d: -f2)
     sd=$(echo "$out" | grep '^HEALTH' | grep -o '"max_slot_delay_secs":[0-9]*' | head -1 | cut -d: -f2)
     printf "  %s h=%-8s %-13s fo=%-4s round=%-4s slot_delay=%s\n" "$id" "${h:-?}" "${st:-?}" "${fo:-?}" "${rd:-?}" "${sd:-?}"
+    n=$(echo "$out" | grep '^LINES' | head -1 | cut -d' ' -f2)
+    [ "${n:-0}" -ge "$TAIL" ] && echo "      window cut to the last $TAIL lines: raise TAIL to read all of $WINDOW"
 
     crit=$(echo "$out" | sed -n '/---CRIT---/,/---SYMPTOM---/p' | grep -vE '^---' | sed '/^\s*$/d')
     [ -n "$crit" ] && echo "$crit" | sed 's/^/      ERR\/CRIT: /'

@@ -101,6 +101,8 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
 }));
 
 jest.mock('../src/services/PushService', () => ({
+  readUnconfirmedBinding: jest.fn(async () => null),
+  settleUnconfirmedBinding: jest.fn(async () => false),
   LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
   readdressIfOwed: jest.fn(async () => false),
   localBinding: jest.fn(async (id) => (mockState.bound && id === mockLIGHT ? { nodeId: mockLIGHT, seq: 1790000000, pushType: 'fcm' } : null)),
@@ -112,7 +114,7 @@ jest.mock('../src/services/PushService', () => ({
   selfAttestIfNeeded: jest.fn(async () => false),
   checkServerNodeStatus: jest.fn(async () => ({
     success: true, registered: true, nodeId: mockSUPER, nodeType: 'super', isOnline: mockState.online, lastSeen: 0,
-    heartbeatCount: 0, requiredHeartbeats: 9, pendingRewards: 0, reputation: 70, consensusAdmitted: mockState.admitted,
+    heartbeatCount: 0, requiredHeartbeats: 9, pendingRewards: 0, reputation: 70, admission: mockState.admission,
   })),
   getAllNodesByWallet: jest.fn(async () => ({ success: true, nodes: [] })),
   getWalletNodeEvents: jest.fn(async () => ({ success: true, nodes: [{ nodeId: mockSUPER, nodeType: 'super', height: 5 }] })),
@@ -262,7 +264,7 @@ beforeEach(async () => {
   jest.spyOn(global, 'setTimeout');
   AppState.currentState = 'active';
   Object.assign(mockState, {
-    node: { nodeType: 'super', pseudonym: mockSUPER }, online: true, admitted: undefined, bound: false,
+    node: { nodeType: 'super', pseudonym: mockSUPER }, online: true, admission: undefined, bound: false,
     qnc: certified(1, 100), qncReads: 0, claims: [], pendingCalls: 0, pending: BEFORE, claimListed: false, tokenBalance: null,
     live: null, liveReads: 0, nodes: [], claimInBlock: null, received: null, listed: null, holdings: null, liveToken: null, tip: null,
     claimResult: { success: true, amount: 4, amountNano: '4000000000', prevWatermark: 100, lastEpoch: 103, txHash: mockHASH, pending: true },
@@ -644,8 +646,8 @@ describe('an added token whose read failed is never a 0 nobody read (owner, 11.1
 });
 
 describe('a super node registered and not admitted to consensus yet (owner, 11.10)', () => {
-  it('says it waits for network admission, never Offline, and its balance moves', async () => {
-    Object.assign(mockState, { online: false, admitted: false });
+  it('says it is registered and not admitted to consensus yet, never Offline, and its balance moves', async () => {
+    Object.assign(mockState, { online: false, admission: 'waiting' });
     const tree = await unlocked();
     await tab(tree, 'node');
     const text = texts(tree);

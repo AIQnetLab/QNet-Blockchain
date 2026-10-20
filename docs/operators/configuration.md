@@ -111,7 +111,7 @@ caps are compile-time constants of the eclipse defence, identical on every node 
 |----------|---------|---------|---------|
 | `QNET_DATA_DIR` | RocksDB data directory. Must be the mounted volume. | `/app/data` (set by the image); otherwise auto-selected | `/app/data` |
 | `QNET_ARCHIVE` | `1` keeps a history archive: every finalized epoch is written to one segment file under `<data dir>/archive` before its bodies are pruned, and served over `/api/v1/archive`. Super nodes only; off-consensus. | unset | `1` |
-| `QNET_MAX_STORAGE_GB` | Storage ceiling in GB. When it is reached the node runs emergency cleanup and, if still full, refuses to save further blocks. | `2000` for Super | `2000` |
+| `QNET_MAX_STORAGE_GB` | Storage ceiling in GB. The fill level is the fuller of the data against this ceiling and the data disk itself. At 95 % a Super node keeps storing blocks, logs `[CRIT][STORAGE] state=critically_full` every 600 s until the level falls below 94 % and starts one compaction of every column family in that episode, on its own thread; a Light node takes the same emergency measures before a save and, if still full, refuses to save further blocks. | `2000` for Super | `2000` |
 | `QNET_ACCOUNT_CACHE_CAPACITY` | Account read-through cache entries. Sizes RAM, not correctness — a cold entry reloads from the store. | `500000` | `500000` |
 | `QNET_MERKLE_NODE_CACHE_CAP` | Merkle node read-through cache entries. Same caveat. | `2000000` | `2000000` |
 

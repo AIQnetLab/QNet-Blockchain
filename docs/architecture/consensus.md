@@ -451,7 +451,13 @@ the step quadratic in committee size.
 
 A replica votes for a proposal only if `cp.index > last_voted_index` **and** `proposal.parent_qc.index >= locked_index`,
 where `locked_index` is the highest certified index it has seen. The commit rule is 2-chain: given child checkpoint `C_i`
-and its QC at index `i`, if `C_i.parent_qc.index == i-1` then index `i-1` becomes final.
+and its QC at index `i`, if `C_i.parent_qc.index == i-1` then index `i-1` becomes final. The rule is evaluated whenever
+the second of the two halves arrives: a node can form or adopt `QC(i)` from the votes before it holds `C_i` (the proposal
+reached it before its own window was derived, so it was held for content), and when `C_i` then arrives — as a held
+proposal, a late live copy or a catch-up pair — the commit of `i-1` runs at once. A proposal at an index the view has left
+is kept for this only when its hash is the one the certificate held at that index names; nothing is voted for it, and the
+certificate, not the node's content gate, is its authority, exactly as for a catch-up pair. Finalize still re-checks the
+committed window's state root and body hashes against local storage.
 
 Ahead of that, the node layer refuses any proposal whose `parent_qc` is not byte-equal to its own `high_qc` reference.
 The parent link is a claim, not a source of truth: leader election is `SHA3(index || parent_hash)`, so a committee

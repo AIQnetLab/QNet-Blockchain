@@ -72,6 +72,8 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
 }));
 
 jest.mock('../src/services/PushService', () => ({
+  readUnconfirmedBinding: jest.fn(async () => null),
+  settleUnconfirmedBinding: jest.fn(async () => false),
   BG_REFRESH_STATUS_KEY: 'qnet_bg_refresh_status',
   LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
   readdressIfOwed: jest.fn(async () => false),
@@ -105,6 +107,9 @@ jest.mock('../src/services/NodeRecordRead', () => ({
   ...jest.requireActual('../src/services/NodeRecordRead'),
   readNodeRecordState: jest.fn(async () => mockState.record),
 }));
+
+// The linking schedule's reads come at once here, so a test sees the next one without waiting ten seconds.
+jest.mock('../src/utils/requestPace', () => ({ ...jest.requireActual('../src/utils/requestPace'), linkingReadMs: () => 50 }));
 
 jest.mock('../src/services/HistoryCache', () => ({ loadCachedHistory: jest.fn(async () => []), saveCachedHistory: jest.fn(async () => {}) }));
 jest.mock('react-native-qrcode-svg', () => {
@@ -226,8 +231,8 @@ describe('the wallet\'s nodes on the Node tab', () => {
     const tree = await nodeTab();
     expect(mockState.saved.filter((r) => r.nodeType === 'super')).toEqual([]);
     expect(texts(tree)).not.toContain(mockSUPER);
-    // Its light node is bound to another device: the tab says what a wallet without a node says.
-    expect(texts(tree)).toContain(t('node_none'));
+    // Its light node is bound to another device: the tab says that, and nothing else of it.
+    expect(texts(tree)).toContain(t('node_elsewhere'));
     expect(texts(tree)).not.toContain(mockLIGHT);
   });
 
@@ -250,4 +255,71 @@ describe('the wallet\'s nodes on the Node tab', () => {
     expect(texts(tree)).toContain(t('node_none'));
     expect(texts(tree)).not.toMatch(/not on the QNet network yet|has not joined/);
   });
+});
+
+// A binding of "Use this device" or the link sheet sent with no answer (PushService readUnconfirmedBinding) waits beside
+// this device's current binding until the network names one; the tab reads for it and shows it as being linked here.
+describe('a binding sent with no answer, on the Node tab', () => {
+  const Push = require('../src/services/PushService');
+  const { readNodeStatus } = require('../src/services/LightNode');
+  const OLD = 1790000000;
+  const WAITING = OLD + 100;
+  const record = () => ({ nodeId: mockLIGHT, walletAddress: mockQNET, seq: WAITING, enrolled: false, at: Date.now() - 60_000 });
+  afterEach(() => {
+    Push.readUnconfirmedBinding.mockImplementation(async () => null);
+    Push.settleUnconfirmedBinding.mockImplementation(async () => false);
+    Push.localBinding.mockImplementation(async () => null);
+  });
+
+  it('every read while it waits is signed, and it is settled before the check that would end the binding it replaces', async () => {
+    Push.localBinding.mockImplementation(async (id) => (id === mockLIGHT
+      ? { nodeId: mockLIGHT, seq: OLD, pushType: 'fcm', hw: false, boundAt: null } : null));
+    Push.readUnconfirmedBinding.mockImplementation(async (id) => (id === mockLIGHT ? record() : null));
+    // The network names the waiting binding: it becomes this device's, and the tab reads again.
+    let settled = false;
+    Push.settleUnconfirmedBinding.mockImplementation(async () => {
+      if (settled) return false;
+      settled = true;
+      return true;
+    });
+    mockState.lightStatus = lightStatus({ bindingSeqAgreed: WAITING });
+    readNodeStatus.mockClear();
+    Push.forgetIfReplaced.mockClear();
+    await nodeTab();
+    const first = Push.settleUnconfirmedBinding.mock.calls[0];
+    expect(first[0]).toBe(mockLIGHT);
+    expect(first[1]).toMatchObject({ bindingSeqAgreed: WAITING });
+    expect(Push.forgetIfReplaced).toHaveBeenCalled();
+    expect(Push.settleUnconfirmedBinding.mock.invocationCallOrder[0]).toBeLessThan(Push.forgetIfReplaced.mock.invocationCallOrder[0]);
+    const lightReads = readNodeStatus.mock.calls.filter(([id]) => id === mockLIGHT);
+    expect(lightReads.length).toBeGreaterThanOrEqual(2);
+    expect(lightReads.every(([, o]) => o && typeof o.signStatus === 'function')).toBe(true);
+  });
+
+  it('on a phone with no binding: "being linked here" while the owners name the binding before or none, and read again soon', async () => {
+    const { AppState } = require('react-native');
+    const saved = AppState.currentState;
+    AppState.currentState = 'active'; // the linking schedule reads in front only
+    Push.readUnconfirmedBinding.mockImplementation(async (id) => (id === mockLIGHT ? record() : null));
+    try {
+      await waitingShown();
+    } finally {
+      AppState.currentState = saved;
+    }
+  });
+  async function waitingShown() {
+    for (const B of [OLD, null]) {
+      mockState.lightStatus = lightStatus({ bindingSeqAgreed: B });
+      readNodeStatus.mockClear();
+      const tree = await nodeTab();
+      const text = texts(tree);
+      expect([B, text.includes(mockLIGHT), text.includes(t('node_linked_waiting'))]).toEqual([B, true, true]);
+      expect(text).not.toContain(t('node_device_again'));
+      // The linking schedule runs from when it went out: another read follows without the five-minute wait.
+      const before = readNodeStatus.mock.calls.filter(([id]) => id === mockLIGHT).length;
+      await act(async () => { await new Promise((r) => setTimeout(r, 300)); });
+      expect(readNodeStatus.mock.calls.filter(([id]) => id === mockLIGHT).length).toBeGreaterThan(before);
+      await act(async () => { mounted.pop().unmount(); });
+    }
+  }
 });

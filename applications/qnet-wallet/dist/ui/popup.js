@@ -5,25 +5,26 @@
 // they do (seen); there is no Refresh button.
 import * as core from '../lib/qnet-core.js';
 import {
-  AUTO_LOCK_CHOICES, AUTO_LOCK_NEVER, DEFAULT_LANGUAGE, LIMITS, QNET, RECORD_ORIGIN, RELEASE_CHANNEL, SOLANA, SUPPORTED_LANGUAGES,
-  TIMINGS, WALLET_VERSION, languageForTag,
+  AUTO_LOCK_CHOICES, AUTO_LOCK_NEVER, DEFAULT_LANGUAGE, LIMITS, POPUP_TABS, QNET, RECORD_ORIGIN, RELEASE_CHANNEL, SOLANA,
+  SUPPORTED_LANGUAGES, TIMINGS, WALLET_VERSION, isDraftField, languageForTag,
 } from '../background/config.js';
 import {
-  DECIMALS, UiError, call, clear, clearCopiedNow, clearPageStorage, copyText, currentLanguage, el, formatUnits, loadLocale, log,
+  DECIMALS, UiError, call, clear, clearPageStorage, copyText, currentLanguage, el, formatUnits, loadLocale, log,
   onWalletEvent, openSetup, refuseAutoFocus, refuseFramed, shortAddress, t, wipeInputs,
 } from './common.js';
 import { LANGUAGE_NAMES } from './i18n/index.js';
 import {
   addressCopy, addressText, button, canonicalAmount, checkbox, codeText, countdown, earlierRemoval, errorCode, errorText, field, figureText,
   formatAmount, formatDay, formatTime, heading, keepAmountCanonical, kvList, looksLikeKnownAddress, messageLine, newPasswordFields, notice,
-  noticeList, onEnter, openTab, parseSolanaRecipient, passwordInput, qnetTxUrl, segmented, solanaTxUrl, textInput, valueCopy, whileBusy,
+  noticeList, onEnter, openTab, parseSolanaRecipient, passwordInput, qnetTxUrl, SOLANA_ASSETS, segmented, solanaAsset, solanaReviewRows,
+  solanaShortfall, solanaTxUrl, textInput, valueCopy, whileBusy,
 } from './kit.js';
 import { qrMatrix } from './qr.js';
 
 refuseFramed();
 refuseAutoFocus();
 
-const TABS = Object.freeze(['assets', 'send', 'receive', 'history', 'activate', 'settings']);
+const TABS = POPUP_TABS;
 const NETWORK_TABS = new Set(['assets', 'send', 'receive', 'history']);
 const HISTORY_PAGE_SIZE = 20;
 // Solana History reads each transaction once, so its pages are smaller (LIMITS.SOLANA_HISTORY_PAGE_MAX at most).
@@ -57,6 +58,8 @@ const state = {
   unlocking: false,
   // true while Activate shows its overview; an 'activation' event may then refresh it
   activateIdle: false,
+  // true while this popup's own Delete wallet runs: its answer, not the lock it starts with, decides what shows
+  deleting: false,
 };
 let shell = null;
 let viewSeq = 0;
@@ -320,8 +323,12 @@ async function boot() {
   // what an earlier version kept in this page's storage (a copy of its password among it) goes at once (M-4)
   clearPageStorage();
   onWalletEvent(handleWalletEvent);
-  window.addEventListener('pagehide', wipeView);
+  window.addEventListener('pagehide', () => {
+    rememberNow();
+    wipeView();
+  });
   document.addEventListener('visibilitychange', onVisibility);
+  for (const type of ['pointerdown', 'keydown']) document.addEventListener(type, noteActivity, true);
   let language = languageForTag(globalThis.navigator?.language) ?? DEFAULT_LANGUAGE;
   try {
     const settings = await call('settings.get');
@@ -361,8 +368,66 @@ async function route() {
     log.warn('view cache unavailable', error?.code);
     seen = {};
   }
+  restorePopup(seen.popupState);
   renderWallet();
+  // the popup opened by the user: an action, as a press or a key on it is
+  noteActivity();
   prefetch().catch((error) => log.warn('prefetch failed', error?.name));
+}
+
+// ---------------------------------------------------------------- where the popup was, and the user's activity
+
+// The popup opens again where it was in this session (wallet.remember, kept with the view cache and dropped by every
+// lock): the network, the tab, and on the Send tab the form's draft, drawn once (sendDraft). The worker drops the draft
+// once a send went, the popup open or not (router `sends`); a payment request's form keeps none (its references and memo
+// are never kept).
+let sendDraft = null;
+let rememberTimer = null;
+let rememberDue = null;
+
+function restorePopup(kept) {
+  sendDraft = null;
+  if (kept === null || typeof kept !== 'object') return;
+  if (kept.network === 'qnet' || kept.network === 'solana') state.network = kept.network;
+  if (TABS.includes(kept.tab)) state.tab = kept.tab;
+  if (state.tab === 'send' && kept.draft && typeof kept.draft === 'object') sendDraft = { network: state.network, ...kept.draft };
+}
+
+// The draft kept for the Send form of `network`, once: the next form of that network starts empty.
+function takeDraft(network) {
+  const draft = sendDraft?.network === network ? sendDraft : null;
+  sendDraft = null;
+  return draft;
+}
+
+function rememberPopup(form = null) {
+  clearTimeout(rememberTimer);
+  rememberTimer = null;
+  rememberDue = null;
+  if (state.screen !== 'wallet') return;
+  call('wallet.remember', { network: state.network, tab: state.tab, ...(form ?? {}) })
+    .catch((error) => log.warn('popup state not kept', error?.code));
+}
+
+// A Send form's draft, written TIMINGS.DRAFT_REMEMBER_MS after its last change (and at once when the popup closes):
+// `read` gives its fields.
+function rememberDraftSoon(read) {
+  clearTimeout(rememberTimer);
+  rememberDue = () => rememberPopup(read());
+  rememberTimer = setTimeout(rememberDue, TIMINGS.DRAFT_REMEMBER_MS);
+}
+
+function rememberNow() {
+  if (rememberDue !== null) rememberDue();
+}
+
+// A press or a key on the popup is the user acting: it moves the auto-lock deadline (wallet.touch, at most every
+// TIMINGS.ACTIVITY_TOUCH_MS), as an action does; the popup's own reads never do.
+let lastTouch = 0;
+function noteActivity() {
+  if (state.screen !== 'wallet' || Date.now() - lastTouch < TIMINGS.ACTIVITY_TOUCH_MS) return;
+  lastTouch = Date.now();
+  call('wallet.touch').catch((error) => log.warn('activity not noted', error?.code));
 }
 
 // The numbered words, one per line.
@@ -370,17 +435,14 @@ function phraseText(mnemonic) {
   return mnemonic.split(' ').map((word, index) => `${index + 1}. ${word}`).join('\n');
 }
 
-// The wallet of this browser is gone (a delete here or in another view): the view is dropped, a copy this page made
-// and still has to clear (an activation code, the recovery phrase or a private key from Settings) leaves the clipboard
-// (best effort) so it does not outlive the wallet (R16), then the page starts over. Anything else on the clipboard
-// stays: Reset leads straight to Import, whose recovery phrase may be on it. The worker announces the wipe before it
-// answers the delete, so this is the only place the popup that asked for it is sure to run before it reloads
-// (R4-ESM-01). Once per page, whichever of the two gets here first.
+// The wallet of this browser is gone (a delete here or in another view; the worker announces it only once the vault is
+// deleted): the view is dropped and the page starts over. The worker's erase already emptied the clipboard of a secret a
+// page copied and had yet to clear (R16); anything else on it stays: Reset leads straight to Import, whose recovery
+// phrase may be on it. Once per page, whichever of the 'wiped' event and the delete's answer gets here first.
 let wiping = null;
 function wipeAndReload() {
   wiping ??= (async () => {
     wipeView();
-    await clearCopiedNow();
     location.reload();
   })();
   return wiping;
@@ -390,7 +452,8 @@ function handleWalletEvent(event) {
   switch (event) {
     case 'locked':
       seen = {};
-      if (state.screen === 'wallet') {
+      // this popup's own delete starts with a lock: its answer says whether the wallet went (renderDelete)
+      if (state.screen === 'wallet' && !state.deleting) {
         wipeView();
         state.addresses = null;
         route();
@@ -439,11 +502,13 @@ function renderWelcome() {
 /**
  * Password field (hardened), unlock button, backoff countdown from BACKOFF.retryAfterMs.
  * @param {{backoffUntil: number|null}} status
+ * @param {string|null} [note] why the wallet is locked now (a delete that did not finish)
  * @returns {void}
  */
-function renderLock(status) {
+function renderLock(status, note = null) {
   const password = passwordInput('password', t('lockPasswordPlaceholder'));
   const message = messageLine();
+  if (note) message.show(note, 'warn');
   const unlock = button(t('lockUnlock'), null, { kind: 'primary', action: 'unlock', block: true });
   const forgot = button(t('lockForgot'), () => renderReset(), { kind: 'ghost', action: 'forgot-password' });
   showScreen('lock', el('div', { className: 'lock-screen' },
@@ -521,9 +586,9 @@ async function lockNow() {
  * "Forgot password?" → Reset wallet (owner, 11.10): the extension cannot recover the password, so a new one takes a
  * reset, which removes the wallet from this browser; only its recovery phrase brings it back (Import, from the first
  * screen). One warning, Back and Reset wallet, nothing typed: the press asks vault.resetBegin for the one-time token
- * the worker requires, then sends vault.reset with it and the fixed confirmation. The worker announces the wipe before
- * it answers, and the page starts over at the first screen, as after Delete wallet. The worker resets only a locked
- * wallet: one unlocked meanwhile opens instead.
+ * the worker requires, then sends vault.reset with it and the fixed confirmation. The worker announces the wipe once the
+ * vault is deleted, before it answers, and the page starts over at the first screen, as after Delete wallet; a reset that
+ * did not finish says why here. The worker resets only a locked wallet: one unlocked meanwhile opens instead.
  * @returns {void}
  */
 function renderReset() {
@@ -549,7 +614,7 @@ function renderReset() {
       else message.show(errorText(error));
       return;
     }
-    // the 'wiped' event usually got here first; either way this page's pending copy leaves before the reload (R16)
+    // the 'wiped' event usually got here first
     clearPageStorage();
     await wipeAndReload();
   });
@@ -628,12 +693,14 @@ function selectNetwork(network) {
   if (!shell || state.network === network) return;
   state.network = network;
   shell.frame.className = `wallet net-${network}`;
+  rememberPopup();
   if (NETWORK_TABS.has(state.tab)) renderTab();
 }
 
 function selectTab(tab) {
   if (!shell) return;
   state.tab = tab;
+  rememberPopup();
   for (const [name, tabButton] of shell.tabButtons) tabButton.setAttribute('aria-selected', String(name === tab));
   // a tab bar wider than the popup (a long language) scrolls: the chosen tab is brought into view
   shell.tabButtons.get(tab)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
@@ -851,8 +918,32 @@ async function renderSend() {
     else renderTokenReview(input, preview);
     return;
   }
-  if (state.network === 'qnet') renderQnetForm();
-  else renderSolanaForm();
+  if (state.network === 'qnet') renderQnetForm(qnetPrefill(takeDraft('qnet')));
+  else renderSolanaForm(solanaPrefill(takeDraft('solana')));
+}
+
+// A Send form's fields as wallet.remember keeps them (config.isDraftField drops one it would refuse), or null when it holds
+// no recipient and no amount.
+function draftFields(asset, toText, amountText) {
+  const fields = Object.fromEntries(Object.entries({ asset, to: toText.trim(), amount: amountText })
+    .filter(([name, value]) => isDraftField(name, value)));
+  return fields.to === undefined && fields.amount === undefined ? null : fields;
+}
+
+// A kept QNet draft as the form's prefill: a token the token list no longer names keeps only the recipient, since the
+// amount was in that token's units.
+function qnetPrefill(draft) {
+  if (draft === null) return {};
+  if (draft.asset === undefined || draft.asset === QNC_ASSET) return { to: draft.to, amount: draft.amount };
+  const token = seenTokens().find((known) => known.contract === draft.asset) ?? null;
+  return token === null ? { to: draft.to } : { asset: draft.asset, token, to: draft.to, amount: draft.amount };
+}
+
+// A kept Solana draft as the form's prefill: an asset the form does not list keeps only the recipient.
+function solanaPrefill(draft) {
+  if (draft === null) return {};
+  return SOLANA_ASSETS.some((entry) => entry.asset === draft.asset) ? { asset: draft.asset, to: draft.to, amount: draft.amount }
+    : { to: draft.to };
 }
 
 // A review whose form is no longer shown when it finishes is kept for the Send tab, and said so (heldReview).
@@ -957,6 +1048,11 @@ function renderQnetForm(prefill = {}) {
     message.clear();
     showAsset();
   });
+  // the draft is kept while it is typed, for the popup to open with it again (rememberDraftSoon)
+  const draftNow = () => draftFields(asset, to.value, amount.value);
+  for (const [node, type] of [[to, 'input'], [amount, 'input'], [picker, 'change']]) {
+    node.addEventListener(type, () => rememberDraftSoon(draftNow));
+  }
   const isCurrent = showTab(el('div', { className: 'stack' },
     heading(t('sendQnetTitle')),
     field(t('sendAsset'), picker),
@@ -967,6 +1063,8 @@ function renderQnetForm(prefill = {}) {
     message.node,
     next));
   drawPicker();
+  // a draft typed just before the form goes (Review, another tab) is kept with the values it had
+  onDispose(rememberNow);
   const review = async () => {
     message.clear();
     const recipient = to.value.trim();
@@ -1316,12 +1414,6 @@ const pendingLine = (text) => el('div', { className: 'row pending-line' },
   el('div', { className: 'spinner', attrs: { 'aria-hidden': 'true' } }),
   el('span', { className: 'muted small', text }));
 
-// The tokens of the Solana send: SOL and the SPL tokens this wallet lists (a payment request names a token by its mint).
-const SOLANA_ASSETS = Object.freeze([
-  Object.freeze({ asset: 'sol', symbol: 'SOL', decimals: DECIMALS.SOL, mint: null }),
-  Object.freeze({ asset: '1dev', symbol: '1DEV', decimals: DECIMALS.ONE_DEV, mint: SOLANA.ONE_DEV_MINT }),
-]);
-const solanaAsset = (asset) => SOLANA_ASSETS.find((entry) => entry.asset === asset) ?? SOLANA_ASSETS[0];
 // A recipient text the Solana send refuses, by kit.parseSolanaRecipient's reason.
 const REQUEST_REFUSED = Object.freeze({ invalid: 'sendRequestInvalid', token: 'sendRequestInvalid', amount: 'sendRequestAmount' });
 const PAYMENT_REQUEST_RE = /^\s*solana:/i;
@@ -1401,10 +1493,14 @@ function renderSolanaForm(prefill = {}) {
     const { decimals, symbol } = solanaAsset(asset);
     available.textContent = t('sendAvailable', [formatAmount(asset === 'sol' ? balances.lamports : balances.oneDev.raw, decimals, symbol)]);
   };
+  // the draft is kept while it is typed (rememberDraftSoon); a payment request's form keeps none
+  const draftNow = () => (request !== null ? null : draftFields(asset, to.value, amount.value));
+  const keepDraft = () => rememberDraftSoon(draftNow);
   const assetSwitch = segmented(SOLANA_ASSETS.map((entry) => [entry.asset, entry.symbol]), asset, (value) => {
     asset = value;
     amountLabel.textContent = t('sendAmount', [solanaAsset(asset).symbol]);
     showAvailable();
+    keepDraft();
   }, t('sendAsset'));
   const drawRequest = () => {
     clear(requestBox);
@@ -1422,6 +1518,7 @@ function renderSolanaForm(prefill = {}) {
     message.node,
     next));
   drawRequest();
+  onDispose(rememberNow);
 
   // A payment request fills the form, and the user still reviews and confirms; a refused text fills nothing.
   const applyRecipient = (text) => {
@@ -1457,6 +1554,7 @@ function renderSolanaForm(prefill = {}) {
     drawRequest();
     if (parsed.request) message.show(t('sendRequestFilled'), 'info');
     else message.clear();
+    keepDraft();
   };
   to.addEventListener('paste', (event) => {
     const pasted = event.clipboardData?.getData('text');
@@ -1469,7 +1567,9 @@ function renderSolanaForm(prefill = {}) {
       request = null;
       drawRequest();
     }
+    keepDraft();
   });
+  amount.addEventListener('input', keepDraft);
 
   max.addEventListener('click', async () => {
     message.clear();
@@ -1477,7 +1577,10 @@ function renderSolanaForm(prefill = {}) {
     const params = validAddress(core.isValidSolanaAddress, typed) ? { asset, to: typed } : { asset };
     try {
       const result = await whileBusy([max, next], () => call('solana.max', params));
-      if (isCurrent() && params.asset === asset) amount.value = result.amount;
+      if (isCurrent() && params.asset === asset) {
+        amount.value = result.amount;
+        keepDraft();
+      }
     } catch (error) {
       if (isCurrent()) message.show(errorText(error));
     }
@@ -1523,22 +1626,6 @@ function renderSolanaForm(prefill = {}) {
   readFresh();
 }
 
-// Why a quoted Solana send cannot go, in words with its numbers (SolanaQuote.shortfall), or null.
-function solanaShortfall(quote, token, decimals) {
-  const sol = (raw) => formatAmount(raw, DECIMALS.SOL, 'SOL');
-  switch (quote.shortfall) {
-    case 'INSUFFICIENT_SOL':
-      return t('sendShortSol', [sol(quote.totalLamports), sol(quote.balanceLamports)]);
-    case 'INSUFFICIENT_TOKENS':
-      return t('sendShortTokens', [formatAmount(quote.tokenRaw ?? '0', decimals, token.symbol)]);
-    case 'AMOUNT_BELOW_RENT':
-      return t('sendBelowRent', [sol(quote.rentFloorLamports)]);
-    case 'SOL_BELOW_RENT':
-      return t(token.mint === null ? 'sendKeepRentSol' : 'sendKeepRentToken', [sol(quote.rentFloorLamports)]);
-    default:
-      return null;
-  }
-}
 
 /**
  * The Solana review: from, to, the token and its mint, the amount, the network fee, the rent of the recipient's token
@@ -1555,20 +1642,15 @@ function solanaShortfall(quote, token, decimals) {
 function renderSolanaReview(input, quote, { note = null, request = null } = {}) {
   const token = solanaAsset(input.asset);
   const decimals = Number.isSafeInteger(quote.decimals) ? quote.decimals : token.decimals;
-  const sol = (raw) => formatAmount(raw, DECIMALS.SOL, 'SOL');
   const message = messageLine();
   const back = button(t('back'), () => renderSolanaForm({ ...input, request }), { action: 'back' });
   const send = button(t('sendConfirm'), null, { kind: 'primary', action: 'confirm-send' });
   const rows = [
     [t('reviewFrom'), ownAddress(state.addresses.solana, 'solana')],
     [t('reviewTo'), addressText(quote.to)],
-    [t('reviewToken'), token.symbol],
+    ...solanaReviewRows(quote, token).map(([label, value, kind]) => [label, kind === 'address' ? addressText(value) : value]),
+    ...requestRows(request, quote),
   ];
-  if (token.mint !== null) rows.push([t('reviewMint'), addressText(token.mint)]);
-  rows.push([t('reviewAmount'), formatAmount(quote.amountRaw, decimals, token.symbol)], [t('reviewFee'), sol(quote.feeLamports)]);
-  if (quote.createsRecipientAccount) rows.push([t('reviewRent', [token.symbol]), sol(quote.rentLamports)]);
-  rows.push([t('reviewTotalSol'), sol(quote.totalLamports)], [t('reviewNetwork'), t('solanaCluster', [SOLANA.CLUSTER])]);
-  rows.push(...requestRows(request, quote));
   const shortfall = solanaShortfall(quote, token, decimals);
   const isCurrent = showTab(el('div', { className: 'stack' },
     heading(t('reviewTitle')),
@@ -1818,8 +1900,8 @@ const trimZeros = (text) => text.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')
  * An amount as a row writes it, by the app's rule so both histories read the same (owner, 06.10): below 100,000
  * grouped, with at most 8 decimals below 1 (dust reads "<0.00000001"), 4 from 1 and 2 from 1,000 (98,765.43); from
  * 100,000 with a suffix and at most 2 decimals (123.46K, 18.45B, 4200T); from 10^18 (a token of 128-bit supply) in
- * powers of ten (3.4e32). The figures take the UI language's group and decimal marks (figureText; 98.765,43 in German),
- * a suffixed figure of four digits stays as it is (4200T). Never longer than 11 characters; the detail gives the exact
+ * powers of ten (3.4e32). The figures are in the one format of every language (figureText: 98,765.43), a suffixed figure
+ * of four digits stays as it is (4200T). Never longer than 11 characters; the detail gives the exact
  * figure.
  * @param {string} decimal an unsigned decimal string (formatUnits)
  * @returns {string}
@@ -2218,6 +2300,23 @@ async function renderHistory() {
   }
 }
 
+// One row per token transfer: the archive lists a token transfer this wallet sent twice under one hash, its contract
+// call's row and the token's own row. The token row stays, with the fee the call paid (a token row carries none), and
+// the call's row goes; a call with no token row (a transfer that failed at apply wrote no event) keeps its own. Over the
+// whole list drawn, so a pair split by a page boundary is one row too.
+function oneRowPerTransfer(rows) {
+  const tokenHashes = new Set(rows.filter((row) => row.kind === 'token' && row.hash).map((row) => row.hash));
+  if (tokenHashes.size === 0) return rows;
+  const fees = new Map();
+  for (const row of rows) {
+    if (row.kind !== 'token' && tokenHashes.has(row.hash) && row.direction !== 'in' && row.feeNano && row.feeNano !== '0') {
+      fees.set(row.hash, row.feeNano);
+    }
+  }
+  return rows.filter((row) => row.kind === 'token' || !tokenHashes.has(row.hash))
+    .map((row) => (row.kind === 'token' && row.feeNano === '0' && fees.has(row.hash) ? { ...row, feeNano: fees.get(row.hash) } : row));
+}
+
 // The QNet history's pages: the first one, More (older), the refresh of every row listed so far, and a cached page shown.
 function qnetHistoryPages(list, message, more, isCurrent, rowOf) {
   const draw = historyDrawer(list, message, more, rowOf);
@@ -2226,10 +2325,11 @@ function qnetHistoryPages(list, message, more, isCurrent, rowOf) {
   // archive rows asked for so far (the first page and each More), and those listed
   let asked = 0;
   let listed = 0;
+  // `items` keeps the rows as listed, so a later page's token row still finds an earlier page's call row
   const shown = (rows, nextCursor) => {
     items = rows;
     cursor = nextCursor;
-    draw(rows, nextCursor);
+    draw(oneRowPerTransfer(rows), nextCursor);
   };
   const head = (page, limit) => {
     asked = limit;
@@ -2848,8 +2948,8 @@ function aboutSection() {
 /**
  * The activation code (owner, 06.10: moved from the Activate tab, beside the recovery phrase and the private key): one
  * plain row, the code masked with Show and Copy, no warning and no timer. activation.copy gives it (no password: the
- * unlocked session, decision 33); the page holds it only while Settings is shown. A copy leaves the clipboard after
- * TIMINGS.CLIPBOARD_CLEAR_MS if nothing was copied since and the popup is still open, silently.
+ * unlocked session, decision 33); the page holds it only while Settings is shown. The worker empties the clipboard
+ * TIMINGS.CLIPBOARD_CLEAR_MS after a copy unless a later copy replaced it, the popup open or not, silently.
  * @param {string} masked
  * @returns {{node: Element, start: () => void}} start: called once the section is on screen
  */
@@ -2988,8 +3088,9 @@ function renderReveal() {
 }
 
 // The phrase, shown at once after the password (owner, 06.10), then Copy and Done: no press-and-hold, no timer and no
-// clipboard text. A copy leaves the clipboard after TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS if nothing was copied since and this
-// popup is still open (silently), and when the wallet is deleted; the phrase leaves the page with the screen.
+// clipboard text. The worker empties the clipboard TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS after a copy unless a later copy
+// replaced it, the popup open or not (silently), and when the wallet is deleted; the phrase leaves the page with the
+// screen.
 function showPhrase(mnemonic) {
   showSecret({ text: phraseText(mnemonic), copyText: mnemonic, title: t('revealTitle'), className: 'phrase mono revealed',
     copyAction: 'copy-phrase', copiedText: t('phraseCopied') });
@@ -3002,7 +3103,7 @@ function showSecret({ text, copyText: value, title, className, copyAction, copie
   const copy = button(t('copy'), async () => {
     if (secret === null) return;
     try {
-      await copyText(secret, { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS, untilFocused: true });
+      await copyText(secret, { clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS });
     } catch {
       copied.show(t('copyFailed'));
       return;
@@ -3059,7 +3160,9 @@ function renderExportKey(network = state.network) {
     message.clear();
     let result;
     try {
-      result = await whileBusy([next, back], () => call('vault.exportKey', { password: value, network: account }));
+      // the account is not switched while its key is asked for: the key shown is the one asked for
+      result = await whileBusy([next, back, ...choice.querySelectorAll('.seg')],
+        () => call('vault.exportKey', { password: value, network: account }));
     } catch (error) {
       if (isCurrent()) message.show(errorText(error));
       return;
@@ -3140,19 +3243,45 @@ function renderDelete() {
     if (confirmation.value !== WIPE_WORD || password.value === '') return;
     const value = password.value;
     password.value = '';
+    state.deleting = true;
     try {
       await whileBusy([wipe, back], () => call('vault.wipe', { password: value, confirm: WIPE_WORD }));
     } catch (error) {
-      update();
-      if (isCurrent()) message.show(errorText(error));
+      state.deleting = false;
+      await deleteFailed(error, () => {
+        update();
+        if (isCurrent()) message.show(errorText(error));
+      });
       return;
     }
-    // the 'wiped' event usually got here first; either way this page's pending copy leaves before the reload (R16)
+    state.deleting = false;
+    // the 'wiped' event usually got here first
     clearPageStorage();
     await wipeAndReload();
   };
   wipe.addEventListener('click', submit);
   onEnter(password, submit);
+}
+
+// A delete the worker refused before it began (a wrong password, the backoff) leaves the wallet unlocked: `stay` says why
+// on the Delete screen. One that began and did not finish (the database could not be deleted) left the wallet in place
+// but locked, and no wipe was announced: the lock screen says the wallet was not deleted.
+async function deleteFailed(error, stay) {
+  let status = null;
+  try {
+    status = await call('vault.status');
+  } catch (failure) {
+    log.warn('status unavailable', failure?.code);
+  }
+  if (status?.unlocked === true) {
+    stay();
+    return;
+  }
+  log.warn('delete did not finish', errorCode(error));
+  seen = {};
+  state.addresses = null;
+  if (status?.exists === true) renderLock(status, t('deleteNotFinished'));
+  else route();
 }
 
 boot();

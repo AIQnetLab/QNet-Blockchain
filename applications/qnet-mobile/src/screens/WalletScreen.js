@@ -61,6 +61,8 @@ import {
   settleUnansweredKey,
   refreshLeaseFromTab,
   readdressIfOwed,
+  readUnconfirmedBinding,
+  settleUnconfirmedBinding,
 } from '../services/PushService';
 import { readNodeStatus, readLinkPending } from '../services/LightNode';
 import { openBackgroundSettings, readBackground } from '../services/BackgroundPriority';
@@ -100,6 +102,7 @@ import SendReview, { recipientWarnings } from '../components/SendReview';
 import SolanaSendForm, { cleanAmountInput, useSolanaSends } from './SolanaSend';
 import { SOLANA_TOKENS, solanaHistoryRow, solanaToken } from '../services/SolanaSend';
 import { solanaScanToForm } from '../utils/solanaRequest';
+import { readTransferLink } from '../services/transferLink';
 import { groupAddress } from '../utils/addressDisplay';
 import { createGrantStore } from '../browser/grants';
 import { describeOrigin, handedOverByBrowser } from '../browser/url';
@@ -455,9 +458,9 @@ const WalletScreen = () => {
   // Every string on screen comes from the translator (i18n); a new one per language, so memoized rows and tabs
   // follow a change. Arabic lays the screen out right to left.
   const t = useMemo(() => makeT(language), [language]);
-  // A canonical figure (decimal text or a number) as the app's language writes it (utils/amountFormat), with its symbol;
+  // A canonical figure (decimal text or a number) as every screen writes it (utils/amountFormat), with its symbol;
   // fields, signing and the history cache keep the canonical text.
-  const shownAmount = (value, symbol) => `${amountText(value, t.lang)}${symbol ? ` ${symbol}` : ''}`;
+  const shownAmount = (value, symbol) => `${amountText(value)}${symbol ? ` ${symbol}` : ''}`;
   const rtl = isRTL(language);
   const dirStyle = rtl ? styles.dirRtl : styles.dirLtr;
   const backArrow = rtl ? '→' : '←';
@@ -604,6 +607,10 @@ const WalletScreen = () => {
   // up: from then on a different link waits in linkQueueRef until this one is closed (R4-MOBLINK-01).
   const [linkRequest, setLinkRequest] = useState(null);
   const linkQueueRef = useRef(null);
+  // A transfer request from a link waiting to open (openTransferLink): { value }; the Send screen it filled in
+  // says so (`sendFromLink`).
+  const [solanaLink, setSolanaLink] = useState(null);
+  const [sendFromLink, setSendFromLink] = useState(false);
   const activeSinceRef = useRef(Date.now()); // when the app last came to the front (0 while it is not)
   // The in-app browser (browser/BrowserScreen): mounted on the first visit to its tab and kept (behind the lock
   // screen too) until the wallet on the phone changes; `browserGen` gives the next wallet a new session.
@@ -788,10 +795,23 @@ const WalletScreen = () => {
     return () => { live = false; };
   }, [wallet, walletDeviceAuth, activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // QNet Link: URLs come only from the OS (App Links / Universal Links for https://link.aiqnet.io/l; on Android
-  // also a site's intent: URL naming this package, which arrives through the same filter as the link itself).
+  // Whether `url` is a transfer request (services/transferLink: a payment address's button on a phone), which then fills
+  // the Solana Send screen for the user to review and confirm, or says why it cannot; nothing is sent by itself. One
+  // waits at most, a newer one replacing it, while the wallet is locked or absent, a QNet Link request is on screen or a
+  // Send screen is open.
+  const openTransferLink = (url) => {
+    const read = readTransferLink(url);
+    if (!read) return false;
+    const tr = tRef.current || ((k) => k);
+    if (read.value) setSolanaLink({ value: read.value });
+    else showAlert(tr('link_refused_title'), tr(read.note));
+    return true;
+  };
+
+  // QNet Link: URLs come only from the OS (App Links / Universal Links for https://link.aiqnet.io/l and /send; on
+  // Android also a site's intent: URL naming this package, which arrives through the same filter as the link itself).
   // One that is not exactly a link opens nothing and fetches nothing. A new link replaces a request not being
-  // carried out.
+  // carried out. A /send link is a transfer request (openTransferLink).
   useEffect(() => {
     const receive = (url) => {
       if (!url) return;
@@ -803,6 +823,7 @@ const WalletScreen = () => {
         showAlert(tr('link_refused_title'), tr('browser_link_refused'));
         return;
       }
+      if (openTransferLink(url)) return;
       const link = parseLink(url);
       if (!link) {
         showAlert(tr('link_refused_title'), tr('link_invalid'));
@@ -823,7 +844,7 @@ const WalletScreen = () => {
     takeInitialUrl(Linking).then(receive);
     const sub = Linking.addEventListener('url', (e) => receive(e && e.url));
     return () => sub.remove();
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A page in the in-app browser may ask for a confirmation only while the app is in front. The moment the app last
   // came to the front tells a link another app opened from one handed over while it stayed in front.
@@ -902,9 +923,12 @@ const WalletScreen = () => {
   // status is read again on a short schedule, on every tab, in front only (requestPace.linkingReadMs: every 10 s for the
   // first two minutes after the link, then every minute), not every NODE_STATUS_MS: the tab turns from "linking" to the
   // node as soon as the chain records it. A QNet Link 'ok' reads it at once, which starts this.
+  // A binding of "Use this device" or the link sheet sent with no answer is read for on the same schedule until the
+  // network names one (PushService.settleUnconfirmedBinding).
   const linkPending = lightNodeStatus && lightNodeStatus.pending;
-  const linkingSince = linkPending && !linkPending.expired && !(lightNodeStatus.status && lightNodeStatus.status.onChain === true)
-    && Number.isSafeInteger(linkPending.createdAt) ? linkPending.createdAt : null;
+  const linkingSince = (linkPending && !linkPending.expired && !(lightNodeStatus.status && lightNodeStatus.status.onChain === true)
+    && Number.isSafeInteger(linkPending.createdAt) ? linkPending.createdAt : null)
+    || (lightNodeStatus && Number.isSafeInteger(lightNodeStatus.unconfirmedAt) ? lightNodeStatus.unconfirmedAt : null);
   useEffect(() => {
     if (!linkingSince || !appActive || !wallet) return undefined;
     let timer = null;
@@ -936,11 +960,13 @@ const WalletScreen = () => {
     const nodeId = walletManager.generateLightNodePseudonym(owner);
     try {
       let local = await localBinding(nodeId);
+      // A binding sent with no answer waits for the network's word, which every read while it waits asks for.
+      const unconfirmed = await readUnconfirmedBinding(nodeId);
       const last = signedStatusAtRef.current;
       // The last signed answer stands only for the binding it was read for: a new binding (Use this device, a link)
       // must never be judged by what the node said about the one before.
       const same = !!local && last.nodeId === nodeId && last.seq === local.seq;
-      const sign = !!local && (fresh || !same || Date.now() - last.at >= SIGNED_STATUS_MS);
+      const sign = !!unconfirmed || (!!local && (fresh || !same || Date.now() - last.at >= SIGNED_STATUS_MS));
       const readAt = Date.now();
       // The status is signed with this device's ping key; with none here, or one two owners refuse (a binding that was
       // replaced or withdrawn holds no ping key of this device), the open wallet's key asks instead, so the binding the
@@ -960,7 +986,7 @@ const WalletScreen = () => {
           ? { bindingSeqAgreed: status.bindingSeqAgreed, deviceBoundAgreed: status.deviceBoundAgreed }
           : (same ? last.verdict : null);
         signedStatusAtRef.current = {
-          nodeId, seq: local.seq, at: Date.now(), signed: status.signed, keyOurs: status.keyOurs, signer: status.signer,
+          nodeId, seq: local ? local.seq : null, at: Date.now(), signed: status.signed, keyOurs: status.keyOurs, signer: status.signer,
           nonce: status.nonce, deviceTags: status.deviceTags, noStatusKey: status.noStatusKey, verdict: verdict || null,
         };
       } else if (same && status.onChain === true) {
@@ -968,6 +994,12 @@ const WalletScreen = () => {
           ...status, signed: last.signed, keyOurs: last.keyOurs, signer: last.signer || null,
           nonce: last.nonce, deviceTags: last.deviceTags, noStatusKey: last.noStatusKey,
         };
+      }
+      // First the binding sent with no answer, by this read's word only: once the network names it, it is this device's
+      // binding (read again); the check below would end the binding it replaced as one another device took over.
+      if (unconfirmed && await settleUnconfirmedBinding(nodeId, status)) {
+        loadLightNodeStatus({ fresh: true });
+        return;
       }
       // No binding sequence in this read (no signed answer, a refused key, no network): the last verdict read for this
       // device's binding stands, both of its halves; with none, the binding stands (NodeTab bindingVerdict).
@@ -1024,7 +1056,14 @@ const WalletScreen = () => {
       if (local && status.signed && status.signed.deviceState === 'check_pending') {
         try { check = await nodeCheckState(nodeId, local.seq); } catch (_) { check = null; }
       }
-      const next = { nodeId, status, local, pending, check, answeredAt };
+      // A binding sent with no answer that still waits: read for on the linking schedule, and, with no binding here before
+      // it, shown as one being linked here (NodeTab bindingVerdict: `unconfirmed`); the device key that went with it waits
+      // for its tag.
+      const waiting = unconfirmed ? await readUnconfirmedBinding(nodeId) : null;
+      const shown = local || (waiting ? {
+        nodeId, seq: waiting.seq, boundAt: Math.floor(waiting.at / 1000), hw: waiting.enrolled === true, unconfirmed: true,
+      } : null);
+      const next = { nodeId, status, local: shown, pending, check, answeredAt, unconfirmedAt: waiting ? waiting.at : null };
       // "Could not ask" is not "no node": the last verdict stays on screen while the network is unreachable.
       setLightNodeStatus((prev) => (status.onChain === null && !pending && prev && prev.nodeId === nodeId
         && prev.status && prev.status.onChain !== null ? { ...prev, stale: true } : next));
@@ -1032,7 +1071,7 @@ const WalletScreen = () => {
       readBackground().then((bg) => setBgState((prev) => (JSON.stringify(prev) === JSON.stringify(bg) ? prev : bg)))
         .catch(() => {});
       // The balance only of a node this device shows (bound here, or being linked here: NodeTab lightShownHere).
-      if (status.onChain === true && (local || pending)) loadLightBalance(nodeId, owner, { force: rewards });
+      if (status.onChain === true && (shown || pending)) loadLightBalance(nodeId, owner, { force: rewards });
       // A latest miss the owners put down to no push address (or a binding made without a push token) sends this device's
       // push token again, as an open of the app does.
       if (local && status.onChain === true && linkedHere(status, local)) readdressIfOwed(nodeId, status).catch(() => {});
@@ -1475,6 +1514,7 @@ const WalletScreen = () => {
     setSendAddress('');
     setSendAmount('');
     setSolanaRequest(null);
+    setSendFromLink(false);
     setTxResult(null);
     setShowScan(false);
     setShowSendScreen(true);
@@ -1494,6 +1534,18 @@ const WalletScreen = () => {
     if (value.amount) setSendAmount(value.amount);
     else if (value.symbol) setSendAmount((prev) => cleanAmountInput(prev, solanaToken(value.symbol).decimals));
   };
+
+  // A transfer request from a link (openTransferLink) opens once the wallet is open, no QNet Link request is on screen
+  // and no Send screen is open: the Solana Send screen of its token, filled in as a scan fills it, over the Assets tab.
+  useEffect(() => {
+    if (!solanaLink || !wallet || linkRequest || showSendScreen) return;
+    const { value } = solanaLink;
+    setSolanaLink(null);
+    selectTab('assets');
+    openSendModal(value.symbol, value.symbol === '1DEV' ? tokenBalances['1dev'] : balance, 'solana');
+    applySolanaScan(value);
+    setSendFromLink(true);
+  }, [solanaLink, wallet, linkRequest, showSendScreen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The tokens the QNet Send screen offers: QNC, then the QNet tokens the Assets list shows, each with the figure it shows.
   const qnetSendChoices = () => [
@@ -1636,6 +1688,7 @@ const WalletScreen = () => {
     setSendAddress('');
     setSendAmount('');
     setSolanaRequest(null);
+    setSendFromLink(false);
   };
 
   /**
@@ -1652,7 +1705,7 @@ const WalletScreen = () => {
     if (r.note) return r.note;
     if (r.move) {
       const n = moveNote(moveOutcome(transit, r.txHash), r.stoppedAtEpoch);
-      return t(n.key, n.appliedNano !== undefined ? { amount: qncText(n.appliedNano, t.lang) } : { epoch: n.epoch });
+      return t(n.key, n.appliedNano !== undefined ? { amount: qncText(n.appliedNano) } : { epoch: n.epoch });
     }
     if (r.unknown) return t('tx_note_unknown');
     if (!r.success) return null;
@@ -1824,10 +1877,10 @@ const WalletScreen = () => {
 
   // The amount as typed or pasted (utils/sendAmount amountInput, the Solana form's rule too): a dot as the decimal point,
   // at most six places (the chain takes nine), thousands separators only where they group by three, a figure pasted as
-  // the app's language writes it read as written; a text that rule refuses leaves the field as it was. A leading zero
+  // every screen writes amounts read as written; a text that rule refuses leaves the field as it was. A leading zero
   // goes unless a point follows it.
   const validateAmountInput = (text) => {
-    const normalized = amountInput(text, 6, { previous: sendAmount, lang: t.lang });
+    const normalized = amountInput(text, 6, { previous: sendAmount });
     if (normalized === null) return;
     setSendAmount(normalized.length > 1 && normalized[0] === '0' && normalized[1] !== '.' ? normalized.substring(1) : normalized);
   };
@@ -4191,9 +4244,8 @@ const WalletScreen = () => {
     });
   };
 
-  // A balance as the screen shows it: in the app's language's figures, or masked while balances are hidden (persisted
-  // 'qnet_hide_balances').
-  const shownBalance = (s) => (balancesHidden ? '••••' : amountText(s, t.lang));
+  // A balance as the screen shows it: the figure, or masked while balances are hidden (persisted 'qnet_hide_balances').
+  const shownBalance = (s) => (balancesHidden ? '••••' : amountText(s));
   // A token row's figure, or a dash while none was read for it (a failed read is never a 0).
   const tokenFigure = (tk) => (tk && tk.balance != null ? String(tk.balance) : '—');
   // A figure of the wallet on screen ('qnc', 'sol', 'oneDev'), or a dash while none was read or kept for it.
@@ -5895,6 +5947,8 @@ const WalletScreen = () => {
       },
       // The sheet's balance read counts only nodes not behind the wallet's claim watermark (ClaimTransit.answerFloor).
       claimFloor: () => claimFloor(wallet.qnetAddress),
+      // The height read as the Node tab reads it, also when the request comes before that tab was opened.
+      height: () => fetchCachedBlockHeight().then(() => estimatedHeight(heightRead())),
     }) : null;
     return (
       <QNetLinkScreen
@@ -5913,8 +5967,11 @@ const WalletScreen = () => {
         onSettled={() => setLinkRequest((r) => (r && r.key === key ? { ...r, settled: true } : r))}
         onOutcome={(outcome) => {
           setLinkRequest((r) => (r && r.key === key ? { ...r, settled: true, outcome } : r));
-          // A node being linked: its status is read now and then on the linking schedule (linkingSince).
-          if (wallet && linkRequest.link.intent === 'link' && outcome && outcome.status === 'ok') loadLightNodeStatus();
+          // A node being linked, or a binding sent with no answer: its status is read now and then on the linking
+          // schedule (linkingSince).
+          if (wallet && linkRequest.link.intent === 'link' && outcome && (outcome.status === 'ok' || outcome.unknown)) {
+            loadLightNodeStatus();
+          }
         }}
         moveOf={(hash) => moveOutcome(transit.owner === (wallet && wallet.qnetAddress) ? transit : null, hash)}
         onShown={() => setLinkRequest((r) => (r && r.key === key && !r.seen ? { ...r, seen: true } : r))}
@@ -6595,6 +6652,7 @@ const WalletScreen = () => {
               amount={sendAmount}
               onAmount={setSendAmount}
               request={solanaRequest}
+              fromLink={sendFromLink}
               balances={{ SOL: fmtAmount(balance, 9), '1DEV': fmtAmount(tokenBalances['1dev'], 6) }}
               mask={shownBalance}
               backArrow={backArrow}
@@ -7510,8 +7568,7 @@ const WalletScreen = () => {
     >
       {renderBrowserPane('main')}
       <View style={[styles.header, { paddingTop: 15 + insets.top }]} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
-        {/* A long press shows the light client's state for a support screenshot; nothing else on screen. */}
-        <Text style={styles.title} onLongPress={() => { walletManager.lightClientDiagnostics(wallet && wallet.qnetAddress).then((text) => showAlert('', text)).catch(() => {}); }}>{t('qnet_wallet')}</Text>
+        <Text style={styles.title}>{t('qnet_wallet')}</Text>
         {/* Overflow menu: token manager / hide balances (Settings is a tab of the bottom bar) */}
         <TouchableOpacity
           style={styles.headerMenuBtn}

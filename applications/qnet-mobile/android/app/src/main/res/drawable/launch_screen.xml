@@ -2,10 +2,11 @@
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/splash_background_color" />
 
-    <!-- The app mark without the icon's square, at the size of the iOS launch screen image (192) -->
+    <!-- The app mark without the icon's square, at the size of the iOS launch screen image (192), one bitmap per
+         density at exactly that size; a drawable, so a device receives only its own density's copy -->
     <item
         android:width="192dp"
         android:height="192dp"
-        android:drawable="@mipmap/splash_logo"
+        android:drawable="@drawable/splash_logo"
         android:gravity="center" />
 </layer-list>

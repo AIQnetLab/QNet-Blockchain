@@ -309,8 +309,11 @@ describe('B3: the node answers only while the app runs, opened since the device 
 
     it('Android reports the system\'s start count with the boot clock; iOS has the clock that counts in sleep', () => {
       const kt = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
-      expect(kt).toMatch(/^import android\.provider\.Settings$/m);
-      expect(kt).toMatch(/fun bootClock\(promise: Promise\) \{[\s\S]*?map\.putDouble\("mono", SystemClock\.elapsedRealtime\(\)\.toDouble\(\)\)[\s\S]*?Settings\.Global\.getInt\(reactContext\.contentResolver, Settings\.Global\.BOOT_COUNT, -1\)[\s\S]*?map\.putDouble\("boots", boots\.getOrDefault\(-1\)\.toDouble\(\)\)\s*promise\.resolve\(map\)/);
+      expect(kt).toMatch(/fun bootClock\(promise: Promise\) \{[\s\S]*?map\.putDouble\("mono", SystemClock\.elapsedRealtime\(\)\.toDouble\(\)\)[\s\S]*?map\.putDouble\("boots", bootCount\(reactContext\)\.toDouble\(\)\)\s*promise\.resolve\(map\)/);
+      // One reading of the start count, shared with the copied secret's boot check (SecretClip.kt).
+      const clip = read('android/app/src/main/java/com/qnetmobile/SecretClip.kt');
+      expect(clip).toMatch(/^import android\.provider\.Settings$/m);
+      expect(clip).toMatch(/internal fun bootCount\(context: Context\): Int =\s*runCatching \{ Settings\.Global\.getInt\(context\.contentResolver, Settings\.Global\.BOOT_COUNT, -1\) \}\.getOrDefault\(-1\)/);
       const m = read('ios/QNetMobile/QNetSecurityModule.m');
       expect(m).toMatch(/clock_gettime\(CLOCK_MONOTONIC, &ts\);/);
       // Reading the boot clock is declared for its one use: elapsed time between the app's own events.

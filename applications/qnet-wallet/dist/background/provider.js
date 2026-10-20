@@ -1,4 +1,4 @@
-// The dApp side of the wallet: per-origin grants, one approval window at a time, and the eleven provider
+// The dApp side of the wallet: per-origin grants, one approval window at a time, and the twelve provider
 // methods. The origin always comes from the router, which took it from the port's sender; nothing a
 // page sends can name another origin. Results and events are JSON data (bytes as lowercase hex). Every
 // change of the approval queue calls events.notifyViews('approval'), and every confirmed action that ran calls
@@ -19,6 +19,7 @@ import {
   isActivationOrigin, isCanonicalOrigin, isU64String, originMatchesPattern, relayMatchPatterns,
 } from './router.js';
 import * as session from './session.js';
+import * as solana from './solana.js';
 import * as vault from './vault.js';
 
 /**
@@ -41,7 +42,7 @@ import * as vault from './vault.js';
  * @typedef {object} ApprovalView  result of approval.get
  * @property {string} id UUID
  * @property {'connect'|'signMessage'|'sendTransaction'|'tokenTransfer'|'contractCall'|'activateNode'|'claimNodeBalance'
- *   |'unlinkNodeDevice'} kind
+ *   |'unlinkNodeDevice'|'solanaTransfer'} kind
  * @property {string} origin as the browser reported it (punycode host)
  * @property {string} originDisplay Unicode host for display
  * @property {boolean} idn true when the host has an xn-- label: the window shows a warning
@@ -74,7 +75,11 @@ import * as vault from './vault.js';
  *   claimNodeBalance: {mode: 'claim'|'empty'|'unavailable'|null, reason, nodeId, nodeType, wallet, amountNano}
  *   (nodes.claimView of the node the site named, read again on every approval.get while not busy; null while locked);
  *   unlinkNodeDevice: {mode: 'confirm'|'unavailable'|null, reason, nodeId, wallet, platform, linkedSince}
- *   (nodes.unlinkView, read again on every approval.get while not busy; null while locked)
+ *   (nodes.unlinkView, read again on every approval.get while not busy; null while locked);
+ *   solanaTransfer: {to, asset: 'sol'|'1dev', mint, amount, amountRaw, feeLamports, rentLamports, totalLamports,
+ *   balanceLamports, tokenRaw, rentFloorLamports, recipient: {known, lookalike}|null, shortfall, mode:
+ *   'confirm'|'unavailable'|null, reason} (the request's part fixed; solana.quote of exactly it, read again on every
+ *   approval.get while not busy; the quote's part and mode null while locked or before a first read)
  *
  * @typedef {object} SiteActivationResult  qnet_activateNode result (QNet Link v1 section 10)
  * @property {'ok'|'exists'|'pending'|'error'} status
@@ -148,8 +153,12 @@ const SITE_VIEW_MODES = new Set(['burn', 'exists', 'pending', 'unavailable', 'ch
 const SITE_CODE_OF = Object.freeze({
   ACTIVATION_RECORDED: 'NODE_EXISTS', ACTIVATION_RESERVED: 'BURN_IN_PROGRESS', RECORD_UNAVAILABLE: 'INTERNAL',
 });
-const siteCode = (code) => (Object.hasOwn(SITE_CODE_OF, code) ? SITE_CODE_OF[code] : code);
-const siteError = (code) => ({ status: 'error', error: SITE_ERRORS.has(siteCode(code)) ? siteCode(code) : 'INTERNAL' });
+// A site's error result, one shape for every method: the code (as `mapping` names it) when `allowed` holds it, else INTERNAL.
+const errorResult = (allowed, code, mapping = {}) => {
+  const mapped = Object.hasOwn(mapping, code) ? mapping[code] : code;
+  return { status: 'error', error: allowed.has(mapped) ? mapped : 'INTERNAL' };
+};
+const siteError = (code) => errorResult(SITE_ERRORS, code, SITE_CODE_OF);
 // qnet_getActivation (decision 35): the statuses of activation.siteActivation and the reasons of 'unknown'.
 const READ_STATUSES = new Set(['searching', 'none', 'unusable', 'unknown', 'pending', 'exists']);
 const READ_REASONS = new Set(['SOLANA_UNAVAILABLE', 'HISTORY_TOO_LONG']);
@@ -158,7 +167,7 @@ const READ_WINDOW_MS = 60000;
 const CLAIM_ERRORS = new Set(['NO_WALLET', 'WALLET_MISMATCH', 'NO_NODE', 'NETWORK', 'CLAIM_REFUSED', 'CLAIM_BUSY', 'INTERNAL']);
 /** The error codes a qnet_claimNodeBalance result may carry, for the shared-vectors test. */
 export const CLAIM_ERROR_CODES = Object.freeze([...CLAIM_ERRORS]);
-const claimError = (code) => ({ status: 'error', error: CLAIM_ERRORS.has(code) ? code : 'INTERNAL' });
+const claimError = (code) => errorResult(CLAIM_ERRORS, code);
 const CLAIM_VIEW_MODES = new Set(['claim', 'empty', 'unavailable']);
 const CLAIM_VIEW_REASONS = new Set(['WALLET_MISMATCH', 'NO_NODE', 'NETWORK', 'SIGNING_DISABLED']);
 // The node a site's move names (router.js CLAIM_NODE_ID_RE): a light or a super node id.
@@ -168,15 +177,31 @@ const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 const UNLINK_ERRORS = new Set(['NO_WALLET', 'NOT_LINKED', 'NETWORK', 'UNLINK_REFUSED', 'INTERNAL']);
 /** The error codes a qnet_unlinkNodeDevice result may carry, for the shared-vectors test. */
 export const UNLINK_ERROR_CODES = Object.freeze([...UNLINK_ERRORS]);
-const unlinkError = (code) => ({ status: 'error', error: UNLINK_ERRORS.has(code) ? code : 'INTERNAL' });
+const unlinkError = (code) => errorResult(UNLINK_ERRORS, code);
 const UNLINK_VIEW_REASONS = new Set(['NOT_LINKED', 'UNSUPPORTED', 'NETWORK', 'SIGNING_DISABLED']);
+// The error codes a qnet_sendSolanaTransfer result may carry (decision 52): a send refusal reaches the site as the code it
+// tells apart (TRANSFER_CODE_OF), anything else as INTERNAL. An error means nothing was transferred (a TX_FAILED that
+// landed moved no tokens).
+const TRANSFER_ERRORS = new Set(['INSUFFICIENT_SOL', 'INSUFFICIENT_TOKENS', 'SOLANA_UNAVAILABLE', 'TX_FAILED', 'NO_WALLET', 'INTERNAL']);
+/** The error codes a qnet_sendSolanaTransfer result may carry, for the shared tests. */
+export const TRANSFER_ERROR_CODES = Object.freeze([...TRANSFER_ERRORS]);
+const TRANSFER_CODE_OF = Object.freeze({
+  SOL_BELOW_RENT: 'INSUFFICIENT_SOL', SIMULATION_FAILED: 'TX_FAILED', TX_TOO_LARGE: 'TX_FAILED', AMOUNT_BELOW_RENT: 'TX_FAILED',
+});
+const transferError = (code) => errorResult(TRANSFER_ERRORS, code, TRANSFER_CODE_OF);
+// A transfer confirm that failed on these stays open: a fresh quote, or an unlock.
+const TRANSFER_RETRY = new Set(['FEE_CHANGED', 'BLOCKHASH_EXPIRED', 'LOCKED']);
+// Why a quote says the transfer cannot go as asked (solana.js shortfallOf).
+const TRANSFER_SHORTFALLS = new Set(['INSUFFICIENT_SOL', 'INSUFFICIENT_TOKENS', 'AMOUNT_BELOW_RENT', 'SOL_BELOW_RENT']);
+const QUOTE_FIGURES = Object.freeze(['feeLamports', 'rentLamports', 'totalLamports', 'balanceLamports', 'rentFloorLamports']);
+const assetDecimals = (asset) => (asset === 'sol' ? DECIMALS.SOL : DECIMALS.ONE_DEV);
 const DEVICE_PLATFORMS = new Set(['android', 'ios', 'unknown']);
 const REGISTRATION_STATES = new Set(['queued', 'admitted', 'onchain', 'other_burn', 'refused', 'clock']);
 const HASH_HEX_RE = /^[0-9a-f]{64}$/;
 // The approvals of qnet_sendTransaction, one kind per request type; each signs and sends a transaction.
 const TX_KINDS = new Set(['sendTransaction', 'tokenTransfer', 'contractCall']);
 // Kinds whose confirm moves value: the confirm must name the revision of the view the page showed.
-const REVISIONED = new Set([...TX_KINDS, 'activateNode', 'claimNodeBalance', 'unlinkNodeDevice']);
+const REVISIONED = new Set([...TX_KINDS, 'activateNode', 'claimNodeBalance', 'unlinkNodeDevice', 'solanaTransfer']);
 const U128_RE = /^(0|[1-9][0-9]{0,38})$/;
 // Why no balance a send is decided by could be had (qnet's send rule), as the approval window names it.
 const BALANCE_PROBLEMS = new Set(['NETWORK', 'BALANCE_UNCONFIRMED']);
@@ -306,6 +331,7 @@ export function displayOrigin(origin) {
  * @param {{siteView: Function, activateForSite: Function, siteActivation: Function}} [options.activation]
  * @param {{claimView: Function, claimForSite: Function, getRegistration: Function, unlinkView: Function,
  *   unlinkForSite: Function}} [options.nodes]
+ * @param {{quote: Function, send: Function}} [options.solana]
  * @param {(origin: string, event: string, data: unknown) => number} [options.emit] default: the sink set
  *   by setEventSink
  * @param {(event: string) => void} [options.notifyViews]
@@ -326,6 +352,7 @@ export function createProviderService(options = {}) {
     qnet: options.qnet ?? qnet,
     activation: options.activation ?? activation,
     nodes: options.nodes ?? nodes,
+    solana: options.solana ?? solana,
     emit: options.emit ?? ((origin, event, data) => (emitEvent === null ? 0 : emitEvent(origin, event, data))),
     notifyViews: options.notifyViews ?? notifyViews,
     now: options.now ?? (() => Date.now()),
@@ -695,6 +722,23 @@ export function createProviderService(options = {}) {
     disarm(approval);
     if (windowId !== null) closeWindow(windowId);
     pump();
+  }
+
+  // A window that could not offer its action ends with `outcome`, a site result or an error, and counts as a rejection only
+  // from the origin's second window within the short budget period on (R2-ERP-01).
+  function endUnoffered(approval, outcome) {
+    if (outcome instanceof Error) settle(approval, outcome);
+    else settle(approval, null, outcome);
+    if (repeated(approval.ctx.origin)) recordRejection(approval.ctx.origin);
+    release(approval);
+  }
+
+  // The user's Reject: 4001 to the site, a counted rejection, and the next window.
+  function rejectedByUser(approval) {
+    settle(approval, new ProviderError(CODES.USER_REJECTED));
+    recordRejection(approval.ctx.origin);
+    release(approval);
+    return { resolved: true };
   }
 
   function expire(approval) {
@@ -1255,6 +1299,60 @@ export function createProviderService(options = {}) {
     return approval.view === null ? none : { ...approval.view };
   }
 
+  const TRANSFER_UNREAD = Object.freeze({
+    feeLamports: null, rentLamports: null, totalLamports: null, balanceLamports: null, tokenRaw: null, rentFloorLamports: null,
+    recipient: null, shortfall: null, mode: null, reason: null,
+  });
+  const unavailableTransfer = (reason) => Object.freeze({ ...TRANSFER_UNREAD, mode: 'unavailable', reason });
+
+  // solana.quote's answer for a solanaTransfer approval, checked against its request: the same recipient and token, the
+  // same base units at the token's decimals, nothing else riding along, u64 figures and a known shortfall.
+  function checkedTransferQuote(quote, payload) {
+    const recipient = quote?.recipient ?? null;
+    const ok = isPlainObject(quote) && quote.asset === payload.asset && quote.to === payload.to && quote.mint === payload.mint
+      && quote.decimals === assetDecimals(payload.asset) && quote.amountRaw === payload.amountRaw
+      && Array.isArray(quote.references) && quote.references.length === 0 && quote.memo === null
+      && QUOTE_FIGURES.every((name) => isU64String(quote[name]))
+      && (payload.asset === 'sol' ? quote.tokenRaw === null : isU64String(quote.tokenRaw))
+      && (quote.shortfall === null || TRANSFER_SHORTFALLS.has(quote.shortfall))
+      && (recipient === null || (isPlainObject(recipient) && typeof recipient.known === 'boolean' && typeof recipient.lookalike === 'boolean'));
+    if (!ok) throw new WalletError('INTERNAL');
+    const { feeLamports, rentLamports, totalLamports, balanceLamports, tokenRaw, rentFloorLamports, shortfall } = quote;
+    return Object.freeze({
+      feeLamports, rentLamports, totalLamports, balanceLamports, tokenRaw, rentFloorLamports,
+      recipient: recipient === null ? null : Object.freeze({ known: recipient.known, lookalike: recipient.lookalike }),
+      shortfall, mode: shortfall === null ? 'confirm' : 'unavailable', reason: shortfall,
+    });
+  }
+
+  // The Solana transfer window's view: the request's part, fixed, and the quote of exactly it, read again on every
+  // approval.get while not busy. A failed read keeps the last view; with none the window says why (the wallet's own
+  // address too, which a request made while locked could not be refused for).
+  async function solanaTransferDetails(approval, current) {
+    const { to, asset, mint, amount, amountRaw } = approval.payload;
+    const base = { to, asset, mint, amount, amountRaw };
+    if (current === null) {
+      approval.view = null;
+      return { ...base, ...TRANSFER_UNREAD };
+    }
+    if (!approval.busy) {
+      approval.readGen += 1;
+      const generation = approval.readGen;
+      let next = null;
+      if (to === current.solanaAddress) next = unavailableTransfer('INVALID_RECIPIENT');
+      else {
+        try {
+          next = checkedTransferQuote(await d.solana.quote({ asset, to, amount }), approval.payload);
+        } catch (error) {
+          log.warn('transfer quote failed', error?.code ?? error?.name);
+          if (approval.view === null && error?.code !== 'LOCKED') next = unavailableTransfer(knownCode(error?.code) ?? 'INTERNAL');
+        }
+      }
+      if (next !== null && stillCurrent(approval, generation)) approval.view = next;
+    }
+    return { ...base, ...(approval.view ?? TRANSFER_UNREAD) };
+  }
+
   async function approvalDetails(approval, current) {
     if (approval.kind === 'connect') {
       const grant = await grantOf(approval.ctx.origin).catch(() => null);
@@ -1266,6 +1364,7 @@ export function createProviderService(options = {}) {
     if (approval.kind === 'activateNode') return activationDetails(approval, current);
     if (approval.kind === 'claimNodeBalance') return claimDetails(approval, current);
     if (approval.kind === 'unlinkNodeDevice') return unlinkDetails(approval, current);
+    if (approval.kind === 'solanaTransfer') return solanaTransferDetails(approval, current);
     if (approval.kind === 'tokenTransfer' || approval.kind === 'contractCall') return callDetails(approval, current);
     return transferDetails(approval, current);
   }
@@ -1388,7 +1487,8 @@ export function createProviderService(options = {}) {
     return true;
   }
 
-  // Ends an activation or claim approval with a dApp result (never an error) and keeps its window on the outcome.
+  // Ends an activation, claim, unlink or Solana transfer approval with a dApp result (never an error) and keeps its window
+  // on the outcome.
   function finishActivation(approval, result, lingerMs = ERROR_LINGER_MS) {
     if (settle(approval, null, result) && slot?.approval === approval) arm(approval, lingerMs, () => release(approval));
   }
@@ -1413,17 +1513,10 @@ export function createProviderService(options = {}) {
     const mode = approval.view?.mode ?? null;
     if (mode === 'unavailable') {
       const { reason } = approval.view;
-      settle(approval, null, siteError(reason));
-      if (repeated(approval.ctx.origin)) recordRejection(approval.ctx.origin);
-      release(approval);
+      endUnoffered(approval, siteError(reason));
       return { resolved: true, status: 'error', error: reason };
     }
-    if (params.approved !== true) {
-      settle(approval, new ProviderError(CODES.USER_REJECTED));
-      recordRejection(approval.ctx.origin);
-      release(approval);
-      return { resolved: true };
-    }
+    if (params.approved !== true) return rejectedByUser(approval);
     approval.busy = true;
     let current;
     let outcome;
@@ -1508,17 +1601,10 @@ export function createProviderService(options = {}) {
     const view = approval.view;
     if (view?.mode === 'unavailable' || view?.mode === 'empty') {
       const result = view.mode === 'empty' ? { status: 'empty', qnet: view.wallet, nodeId: view.nodeId } : claimError(view.reason);
-      settle(approval, null, result);
-      if (repeated(approval.ctx.origin)) recordRejection(approval.ctx.origin);
-      release(approval);
+      endUnoffered(approval, result);
       return { resolved: true, status: result.status, error: result.error ?? null };
     }
-    if (params.approved !== true) {
-      settle(approval, new ProviderError(CODES.USER_REJECTED));
-      recordRejection(approval.ctx.origin);
-      release(approval);
-      return { resolved: true };
-    }
+    if (params.approved !== true) return rejectedByUser(approval);
     // nothing reviewed yet, or not the view the page drew: review again
     if (view === null || params.revision !== approval.revision) throw new WalletError('NONCE_CHANGED');
     approval.busy = true;
@@ -1563,17 +1649,10 @@ export function createProviderService(options = {}) {
     const view = approval.view;
     if (view?.mode === 'unavailable') {
       const result = unlinkError(view.reason);
-      settle(approval, null, result);
-      if (repeated(approval.ctx.origin)) recordRejection(approval.ctx.origin);
-      release(approval);
+      endUnoffered(approval, result);
       return { resolved: true, status: result.status, error: result.error };
     }
-    if (params.approved !== true) {
-      settle(approval, new ProviderError(CODES.USER_REJECTED));
-      recordRejection(approval.ctx.origin);
-      release(approval);
-      return { resolved: true };
-    }
+    if (params.approved !== true) return rejectedByUser(approval);
     if (view === null || params.revision !== approval.revision) throw new WalletError('NONCE_CHANGED');
     approval.busy = true;
     let result;
@@ -1595,6 +1674,56 @@ export function createProviderService(options = {}) {
     finishActivation(approval, result);
     clearCooldown(approval.ctx.origin);
     return { resolved: true, status: 'ok', error: null };
+  }
+
+  // The site's result of a sent transfer, checked once more: {status: 'submitted', signature} exactly, as soon as
+  // solana.send returned a well-formed signature, whatever its status; anything else is INTERNAL.
+  function transferResult(sent) {
+    const ok = isPlainObject(sent) && core.isValidSolanaSignature(sent.signature)
+      && ['finalized', 'confirmed', 'submitted'].includes(sent.status);
+    if (!ok) throw new WalletError('INTERNAL');
+    return { status: 'submitted', signature: sent.signature };
+  }
+
+  // approval.resolve of a solanaTransfer approval (decision 52). A view that could not offer the transfer answers the site
+  // with its reason (the wallet's own address as -32602, as before a window) and counts no rejection the first time; a
+  // reject is a reject; a confirm of the view the page drew sends exactly the reviewed quote. FEE_CHANGED,
+  // BLOCKHASH_EXPIRED and LOCKED keep the window for a fresh review; every other outcome is the site's result.
+  async function resolveSolanaTransfer(approval, params) {
+    const { view } = approval;
+    if (view?.mode === 'unavailable') {
+      endUnoffered(approval, view.reason === 'INVALID_RECIPIENT' ? new WalletError('INVALID_RECIPIENT') : transferError(view.reason));
+      return { resolved: true, status: 'error', error: view.reason };
+    }
+    if (params.approved !== true) return rejectedByUser(approval);
+    // nothing reviewed yet, or not the view the page drew: review again
+    if (view === null || params.revision !== approval.revision) throw new WalletError('FEE_CHANGED');
+    approval.busy = true;
+    let result;
+    try {
+      await d.session.requireUnlocked();
+      const { asset, to, amount } = approval.payload;
+      result = transferResult(await d.solana.send({
+        asset, to, amount, expectedFeeLamports: view.feeLamports, expectedRentLamports: view.rentLamports,
+      }));
+    } catch (error) {
+      approval.busy = false;
+      const code = knownCode(error?.code) ?? 'INTERNAL';
+      if (TRANSFER_RETRY.has(code) && !approval.settled) {
+        if (endIfWindowClosed(approval)) throw error;
+        approval.view = null;
+        queueChanged();
+        throw error;
+      }
+      finishActivation(approval, transferError(code));
+      balanceChanged();
+      return { resolved: true, status: 'error', error: code };
+    }
+    approval.busy = false;
+    finishActivation(approval, result);
+    clearCooldown(approval.ctx.origin);
+    balanceChanged();
+    return { resolved: true, status: 'submitted', error: null, signature: result.signature };
   }
 
   function afterConnect(origin, accounts) {
@@ -1819,6 +1948,23 @@ export function createProviderService(options = {}) {
     return enqueue(ctx, 'unlinkNodeDevice', {});
   }
 
+  // Send from the wallet (decision 52): the activation origin only (the router refused every other), no grant; one frozen
+  // {to, asset, amount} per request, checked again here. The wallet's own address is refused before any window when the
+  // session knows it (-32602), else in the window once it is unlocked.
+  async function requestSolanaTransfer(ctx, params) {
+    if (!isActivationOrigin(ctx.origin)) throw new ProviderError(CODES.UNAUTHORIZED);
+    const { to, mint, amount } = params ?? {};
+    if (!core.isValidSolanaAddress(to)) throw new WalletError('INVALID_PARAMS', { field: 'to' });
+    if (mint !== null && mint !== SOLANA.ONE_DEV_MINT) throw new WalletError('INVALID_PARAMS', { field: 'mint' });
+    const asset = mint === null ? 'sol' : '1dev';
+    const amountRaw = parseUnits(amount, assetDecimals(asset));
+    if (amountRaw <= 0n || formatUnits(amountRaw, assetDecimals(asset)) !== amount) throw new WalletError('INVALID_AMOUNT');
+    if (!(await d.vault.vaultExists())) return transferError('NO_WALLET');
+    const current = await unlockedSession();
+    if (current !== null && current.solanaAddress === to) throw new WalletError('INVALID_RECIPIENT');
+    return enqueue(ctx, 'solanaTransfer', { to, asset, mint, amount, amountRaw: amountRaw.toString() });
+  }
+
   async function handleRequest(ctx, method, params) {
     if (!ctx || !isCanonicalOrigin(ctx.origin) || !Number.isSafeInteger(ctx.portId)) throw new WalletError('INTERNAL');
     livePorts.set(ctx.portId, ctx.origin);
@@ -1847,6 +1993,8 @@ export function createProviderService(options = {}) {
         return requestClaim(ctx, params);
       case 'qnet_unlinkNodeDevice':
         return requestUnlink(ctx);
+      case 'qnet_sendSolanaTransfer':
+        return requestSolanaTransfer(ctx, params);
       default:
         throw new ProviderError(CODES.UNSUPPORTED_METHOD);
     }
@@ -1856,7 +2004,8 @@ export function createProviderService(options = {}) {
   // the site, the first time.
   const offered = (approval) => !(approval.kind === 'activateNode' && ['unavailable', 'checking'].includes(approval.view?.mode))
     && !(approval.kind === 'claimNodeBalance' && (approval.view?.mode === 'unavailable' || approval.view?.mode === 'empty'))
-    && !(approval.kind === 'unlinkNodeDevice' && approval.view?.mode === 'unavailable');
+    && !(approval.kind === 'unlinkNodeDevice' && approval.view?.mode === 'unavailable')
+    && !(approval.kind === 'solanaTransfer' && approval.view?.mode === 'unavailable');
   // The origin already had another window within the short budget period: a second window it lets end
   // unused (its page gone before the confirm armed, or an unavailable activation closed) counts (R2-ERP-01).
   const repeated = (origin) => windowsWithin(origin, TIMINGS.APPROVAL_BUDGET_SHORT_MS) >= 2;
@@ -1893,8 +2042,10 @@ export function createProviderService(options = {}) {
     pump();
   }
 
-  function onWipe() {
-    const origins = new Set([...grantedCache, ...livePorts.values()]);
+  // `named`: the sites the deleted wallet's grants named (vault.eraseAll read them before the clear), so a site this worker
+  // has not seen since it started hears the disconnect too.
+  function onWipe(named = []) {
+    const origins = new Set([...grantedCache, ...livePorts.values(), ...named]);
     grantedCache.clear();
     // storage.session is cleared by the wipe; memory follows
     cooldowns.clear();
@@ -1909,7 +2060,14 @@ export function createProviderService(options = {}) {
   async function notifyLockChanged(change) {
     if (!change || typeof change.locked !== 'boolean') return;
     if (change.reason === 'wipe') {
-      onWipe();
+      onWipe(Array.isArray(change.origins) ? change.origins : []);
+      return;
+    }
+    // the lock a delete or reset starts with: the sites known now hear it, and the grants are not read while they are
+    // erased; the wipe that follows names every one of them
+    if (change.reason === 'erase') {
+      for (const origin of new Set([...grantedCache, ...livePorts.values()])) emit(origin, 'accountsChanged', {});
+      queueChanged();
       return;
     }
     if (change.locked) {
@@ -1988,12 +2146,8 @@ export function createProviderService(options = {}) {
     if (approval.kind === 'activateNode') return resolveActivation(approval, params);
     if (approval.kind === 'claimNodeBalance') return resolveClaim(approval, params);
     if (approval.kind === 'unlinkNodeDevice') return resolveUnlink(approval, params);
-    if (params.approved !== true) {
-      settle(approval, new ProviderError(CODES.USER_REJECTED));
-      recordRejection(approval.ctx.origin);
-      release(approval);
-      return { resolved: true };
-    }
+    if (approval.kind === 'solanaTransfer') return resolveSolanaTransfer(approval, params);
+    if (params.approved !== true) return rejectedByUser(approval);
     // A send confirms exactly the preview the page showed: the revision of the last one served (R2-EXT-UI-03).
     if (REVISIONED.has(approval.kind) && params.revision !== approval.revision) throw new WalletError('NONCE_CHANGED');
     approval.busy = true;
@@ -2116,6 +2270,12 @@ export function eventSink() {
  *     'NO_WALLET'} at once; otherwise an 'unlinkNodeDevice' approval showing nodes.unlinkView (the device the public
  *     status names for the wallet's own light node, or why nothing can be unlinked); its armed confirm (no password)
  *     runs nodes.unlinkForSite → SiteUnlinkResult (ok, or error with an UNLINK_ERRORS code; 4001 on reject).
+ *   qnet_sendSolanaTransfer {to, mint, amount}: router.isActivationOrigin only (else 4100), no grant (decision 52); mint
+ *     null (SOL) or SOLANA.ONE_DEV_MINT, amount at most the token's decimals, the wallet's own address refused (-32602,
+ *     INVALID_RECIPIENT); no vault → {status: 'error', error: 'NO_WALLET'} at once; otherwise a 'solanaTransfer' approval
+ *     showing solana.quote of exactly that transfer, read-only; its armed confirm (no password) runs solana.send with the
+ *     reviewed fee and rent → {status: 'submitted', signature} or {status: 'error', error} with a TRANSFER_ERRORS code
+ *     (nothing sent); 4001 on reject.
  * Approvals: at most LIMITS.APPROVAL_QUEUE_PER_ORIGIN open per origin, shown or waiting (more → 4001 at
  * once); one window at a time, FIFO across origins (chrome.windows.create type 'popup', focused,
  * ui/approve.html?id=<uuid>); closed window or TIMINGS.APPROVAL_TIMEOUT_MS → 4001. A granted origin
@@ -2162,7 +2322,9 @@ export async function onWindowRemoved(windowId) {
 
 /**
  * Lock or unlock: accountsChanged to every granted origin with open ports ({} when locked, Accounts when
- * unlocked). reason 'wipe': disconnect as well, and every queued approval is rejected with 4900.
+ * unlocked). reason 'erase' (a delete or reset begins): accountsChanged {} to the sites known now, no grant read. reason
+ * 'wipe' (the wallet is gone): disconnect as well, to those and to change.origins, and every queued approval is rejected
+ * with 4900.
  * @param {import('./session.js').LockChange} change
  * @returns {Promise<void>}
  */
@@ -2213,8 +2375,9 @@ export async function getApproval(params, meta) {
  * WalletError. Then the window closes and the next approval opens. activateNode: LOCKED and PRICE_CHANGED keep
  * the approval open; every other outcome, failures included, is a dApp result, and the window stays on it until
  * closed (at most 30 s). A view that could not offer the action resolves either way with its reason, as no
- * rejection. A confirmed send, token transfer, contract call, activation or claim that ran tells the pages
- * ('balance').
+ * rejection. solanaTransfer: FEE_CHANGED, BLOCKHASH_EXPIRED and LOCKED keep the approval open; every other outcome is the
+ * site's result and the window stays on it, at most 30 s. A confirmed send, token transfer, contract call, activation,
+ * claim or Solana transfer that ran tells the pages ('balance').
  * @param {{id: string, approved: boolean, revision?: number}} params
  * @param {{page: string, sender: object}} meta
  * @returns {Promise<{resolved: true, status?: 'ok'|'exists'|'pending'|'error', error?: string|null}>}

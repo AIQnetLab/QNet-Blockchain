@@ -1023,7 +1023,10 @@ pub fn set_genesis_anchor_pks(anchors: std::collections::HashMap<String, Vec<u8>
     }
     let mut guard = GENESIS_ANCHOR_PKS.write();
     if !guard.is_empty() {
-        eprintln!("[WARN][CONSENSUS] anchor_install_rejected already_installed={}", guard.len());
+        // Boot installs the same embedded set from several entry points; only a different set is news.
+        if *guard != anchors {
+            eprintln!("[WARN][CONSENSUS] anchor_install_rejected already_installed={} offered_differs=true", guard.len());
+        }
         return false;
     }
     let count = anchors.len();

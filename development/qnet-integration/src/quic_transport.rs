@@ -763,6 +763,36 @@ pub fn is_connection_alive(conn: &QuicConnection) -> bool {
     now_ms.saturating_sub(last_ms) <= ZOMBIE_TIMEOUT_MS
 }
 
+/// Drop `key` from a connection pool only while it still holds `conn`. Both ends of a link bind the
+/// QUIC port, so a peer's inbound and outbound connections share one key: removing by key alone let
+/// a closing connection delete the live one that replaced it when the peer restarted.
+fn release_pool_entry<T>(pool: &DashMap<SocketAddr, Arc<T>>, key: &SocketAddr, conn: &Arc<T>) -> bool {
+    pool.remove_if(key, |_, v| Arc::ptr_eq(v, conn)).is_some()
+}
+
+/// Every peer with a live channel, over BOTH pools: the per-transport pool, then the live inbound
+/// connections indexed by listen address that the pool no longer lists. Those are what `connect()`
+/// reuses; a peer reachable only through one must still get the signed head. One entry per pooled
+/// connection, plus at most one per remaining peer id.
+pub(crate) fn connected_over_both_pools(
+    pool: impl Iterator<Item = (SocketAddr, Option<String>, Option<String>)>,
+    inbound: impl Iterator<Item = (SocketAddr, Option<String>, Option<String>, bool)>,
+) -> Vec<(SocketAddr, String, String)> {
+    // Fallback type "full" for safety: it carries no Super privileges.
+    let mut out: Vec<(SocketAddr, String, String)> = pool
+        .filter_map(|(addr, id, ty)| id.map(|id| (addr, id, ty.unwrap_or_else(|| "full".to_string()))))
+        .collect();
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|(_, id, _)| id.clone()).collect();
+    for (addr, id, ty, alive) in inbound {
+        if let (Some(id), true) = (id, alive) {
+            if seen.insert(id.clone()) {
+                out.push((addr, id, ty.unwrap_or_else(|| "full".to_string())));
+            }
+        }
+    }
+    out
+}
+
 // ============================================================================
 // TRANSPORT STATISTICS
 // ============================================================================
@@ -1571,15 +1601,13 @@ impl QuicTransport {
             }
         }
         
-        // v3.1 CRITICAL: Remove connection from DashMap to prevent memory leak
-        // Without this, dead connections accumulate forever causing 15GB+ memory usage!
-        if connections.remove(&peer_addr).is_some() {
+        // Remove the closed connection (an unremoved one leaks), and only it: the connection that
+        // replaced it under the same key after the peer restarted stays.
+        if release_pool_entry(&connections, &peer_addr, &quic_conn) {
             if is_info() { println!("[INFO][QUIC] conn_removed_on_close peer={}", get_privacy_id_for_addr(&peer_addr.to_string())); }
         }
-        // Drop the listen-addr index entry only if it still points at THIS closing conn (a sibling
-        // conn from the same IP must keep its own live entry).
         let listen_key = SocketAddr::new(peer_addr.ip(), 8001u16.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
-        INBOUND_CONN_BY_LISTEN_ADDR.remove_if(&listen_key, |_, v| Arc::ptr_eq(v, &quic_conn));
+        release_pool_entry(&INBOUND_CONN_BY_LISTEN_ADDR, &listen_key, &quic_conn);
     }
     
     /// Handle bidirectional stream (v2.95: length-prefixed protocol for ACK support)
@@ -1908,7 +1936,7 @@ impl QuicTransport {
                 println!("[INFO][QUIC] removing_dead_conn peer={}",
                          get_privacy_id_for_addr(&peer_addr.to_string()));
             }
-            self.connections.remove(&peer_addr);
+            release_pool_entry(&self.connections, &peer_addr, &conn);
         }
 
         // NAT reuse: no outbound conn to this listen addr. Before dialing (which a NAT/client-dialed
@@ -1918,7 +1946,7 @@ impl QuicTransport {
             if crate::quic_transport::is_connection_alive(&conn) {
                 return Ok(conn);
             }
-            INBOUND_CONN_BY_LISTEN_ADDR.remove(&peer_addr);
+            release_pool_entry(&INBOUND_CONN_BY_LISTEN_ADDR, &peer_addr, &conn);
         }
 
         // v2.96: Per-peer reconnect cooldown — reject if last attempt was < COOLDOWN ago.
@@ -2006,9 +2034,12 @@ impl QuicTransport {
                         let delay_ms = (capped as f64 * jitter) as u64;
                         let delay = Duration::from_millis(delay_ms.max(500)); // floor 500ms
 
-                        if crate::node::is_warn() && (attempt == 1 || attempt == max_attempts - 1) {
-                            println!("[WARN][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={}ms",
-                                attempt, max_attempts,
+                        // A first dial can cross the peer's own dial during a boot; only a dial still failing late
+                        // is news.
+                        let late = attempt == max_attempts - 1;
+                        if (late && crate::node::is_warn()) || (attempt == 1 && crate::node::is_info()) {
+                            println!("[{}][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={}ms",
+                                if late { "WARN" } else { "INFO" }, attempt, max_attempts,
                                 get_privacy_id_for_addr(&peer_addr.to_string()),
                                 delay_ms);
                         }
@@ -2755,23 +2786,14 @@ impl QuicTransport {
         self.connections.len()
     }
     
-    /// Get list of connected peers (addr, node_id, node_type)
-    /// Returns ALL connected peers with their real node_type from QUIC handshake
+    /// Connected peers (addr, node_id, node_type from the QUIC handshake) over both pools; see
+    /// `connected_over_both_pools`.
     pub fn get_connected_peers(&self) -> Vec<(SocketAddr, String, String)> {
-        self.connections.iter()
-            .filter_map(|entry| {
-                let addr = *entry.key();
-                if let Some(ref node_id) = entry.value().remote_node_id {
-                    // Use real node_type from handshake, fallback to "full" for safety
-                    // (Full nodes don't have Super privileges, safer default)
-                    let node_type = entry.value().remote_node_type.clone()
-                        .unwrap_or_else(|| "full".to_string());
-                    Some((addr, node_id.clone(), node_type))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        connected_over_both_pools(
+            self.connections.iter().map(|e| (*e.key(), e.value().remote_node_id.clone(), e.value().remote_node_type.clone())),
+            INBOUND_CONN_BY_LISTEN_ADDR.iter().map(|e| (*e.key(), e.value().remote_node_id.clone(),
+                                                        e.value().remote_node_type.clone(), is_connection_alive(e.value()))),
+        )
     }
     
     /// v2.95.1: Health check with ACTIVE ping verification
@@ -2804,9 +2826,9 @@ impl QuicTransport {
             }
             
             if is_explicitly_closed {
-                dead_addrs.push(*entry.key());
+                dead_addrs.push((*entry.key(), conn.clone()));
             } else if is_stale {
-                dead_addrs.push(*entry.key());
+                dead_addrs.push((*entry.key(), conn.clone()));
                 if crate::node::is_debug() {
                     println!("[DBG][QUIC] stale_conn peer={} idle={}s",
                         get_privacy_id_for_addr(&entry.key().to_string()),
@@ -2826,9 +2848,8 @@ impl QuicTransport {
             }
         }
         
-        for addr in dead_addrs {
-            self.connections.remove(&addr);
-            removed += 1;
+        for (addr, conn) in dead_addrs {
+            if release_pool_entry(&self.connections, &addr, &conn) { removed += 1; }
         }
         
         if removed > 0 {
@@ -3390,6 +3411,38 @@ mod tests_reachability {
 
         // And a genuinely isolated node still reads zero, so the trigger keeps working.
         assert_eq!(QuicTransport::count_reachable(std::iter::empty(), std::iter::empty(), &none), 0);
+    }
+
+    /// The signed-head fan-out reaches every peer with a live channel, inbound-only ones included, each once.
+    #[test]
+    fn the_head_fan_out_covers_a_peer_reachable_only_inbound() {
+        let a: std::net::SocketAddr = "10.0.0.1:10876".parse().unwrap();
+        let b: std::net::SocketAddr = "10.0.0.2:10876".parse().unwrap();
+        let c: std::net::SocketAddr = "10.0.0.3:10876".parse().unwrap();
+        let s = || Some("super".to_string());
+        let got = super::connected_over_both_pools(
+            vec![(a, Some(p(1)), s()), ("10.0.0.9:10876".parse().unwrap(), None, None)].into_iter(),
+            vec![(b, Some(p(2)), s(), true),   // only inbound: must be pinged
+                 (a, Some(p(1)), s(), true),   // already pooled: once
+                 (c, Some(p(3)), s(), false)]  // dead: never
+                .into_iter());
+        assert_eq!(got, vec![(a, p(1), "super".to_string()), (b, p(2), "super".to_string())]);
+    }
+
+    /// A closing connection removes its own pool entry and never the live one that replaced it under the
+    /// same key (both ends bind the QUIC port, so a peer's inbound and outbound connections share a key).
+    #[test]
+    fn a_closing_connection_never_removes_its_replacement() {
+        let pool: dashmap::DashMap<std::net::SocketAddr, std::sync::Arc<u8>> = dashmap::DashMap::new();
+        let key: std::net::SocketAddr = "10.0.0.5:10876".parse().unwrap();
+        let old = std::sync::Arc::new(1u8);
+        let new = std::sync::Arc::new(2u8);
+        pool.insert(key, old.clone());
+        pool.insert(key, new.clone()); // the restarted peer's connection takes the key
+        assert!(!super::release_pool_entry(&pool, &key, &old), "the old connection's close leaves the new one");
+        assert!(pool.get(&key).map_or(false, |v| std::sync::Arc::ptr_eq(v.value(), &new)));
+        assert!(super::release_pool_entry(&pool, &key, &new));
+        assert!(pool.is_empty());
     }
 }
 

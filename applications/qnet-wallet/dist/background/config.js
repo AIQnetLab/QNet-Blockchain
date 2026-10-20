@@ -6,7 +6,7 @@
 /** true only in dist-dev/, where scripts/build-dev.mjs rewrites this line; gates the logger. */
 export const DEV_BUILD = false;
 
-export const WALLET_VERSION = '3.1.5';
+export const WALLET_VERSION = '3.1.6';
 export const RELEASE_CHANNEL = 'testnet';
 
 export const QNET = Object.freeze({
@@ -73,6 +73,38 @@ export const UI_PAGES = Object.freeze({
   setup: 'ui/setup.html',
   approve: 'ui/approve.html',
 });
+// The popup's tabs, in their order (wallet.remember names one).
+export const POPUP_TABS = Object.freeze(['assets', 'send', 'receive', 'history', 'activate', 'settings']);
+
+// A Send form's draft as the popup keeps it (wallet.remember), field by field: [longest, pattern]. The asset (QNC, a
+// token's contract, sol or 1dev); the recipient only with an address's length and letters (a QNet Blockchain address has
+// 45, a Solana one 32 to 44), so a phrase, a private key or a code pasted there by mistake is never kept; the amount
+// field's text, digits and at most one '.'.
+const DRAFT_RULES = Object.freeze({
+  asset: Object.freeze([64, /^[A-Za-z0-9]+$/]),
+  to: Object.freeze([45, /^[A-Za-z0-9]{32,}$/]),
+  amount: Object.freeze([40, /^[0-9]*\.?[0-9]*$/]),
+});
+
+/**
+ * Whether `value` is a draft field the popup may keep and the router takes (wallet.remember): not empty, within its
+ * length and pattern (DRAFT_RULES). The page drops a field that fails; the router refuses it.
+ * @param {'asset'|'to'|'amount'} name
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isDraftField(name, value) {
+  const rule = Object.hasOwn(DRAFT_RULES, name) ? DRAFT_RULES[name] : null;
+  return rule !== null && typeof value === 'string' && value.length > 0 && value.length <= rule[0] && rule[1].test(value);
+}
+
+// The offscreen document the worker empties the clipboard through (clipboard.js): a worker has no clipboard, and a page's
+// own timer dies with the popup. Never a UI_PAGES page: it sends the worker nothing.
+export const OFFSCREEN = Object.freeze({
+  PAGE: 'ui/offscreen.html',
+  // runtime message envelope tag of the worker's request to it
+  TARGET: 'qnet-offscreen',
+});
 
 export const PROVIDER = Object.freeze({
   PORT_NAME: 'qnet-provider',
@@ -119,6 +151,8 @@ export const STORAGE_KEYS = Object.freeze({
   // what a woken worker takes over of the light client (qnet.js lightHintsRead): the certified head last seen and until
   // when no node is asked for a capsule; chain data, no wallet's
   LIGHT_HINTS: 'qnet_light_hints_v1',
+  // when the clipboard is due to be emptied of a secret copied from a page (clipboard.js); a time, never the text
+  CLIPBOARD: 'qnet_clipboard_v1',
 });
 
 export const VAULT_DB = Object.freeze({ NAME: 'qnet-vault-v3', VERSION: 1, STORE: 'vault', KEY: 'main' });
@@ -196,8 +230,13 @@ export const CLAIM_MIN_NANO = '1000000000';
 export const TIMINGS = Object.freeze({
   REVEAL_AUTO_HIDE_MS: 45000,
   CLIPBOARD_CLEAR_MS: 45000,
-  // A recovery phrase copied by its Copy button leaves the clipboard after this, if nothing was copied since.
+  // A recovery phrase copied by its Copy button leaves the clipboard after this, unless a later copy from a wallet page
+  // replaced it.
   PHRASE_CLIPBOARD_CLEAR_MS: 60000,
+  // The popup tells the worker the user is acting (wallet.touch) at most this often: the auto-lock counts from the last.
+  ACTIVITY_TOUCH_MS: 30000,
+  // A Send form's draft the popup keeps (wallet.remember) is written at most this often while it is typed.
+  DRAFT_REMEMBER_MS: 500,
   CONFIRM_ARM_MS: 1000,
   // A confirm that moves value (a QNC send, a 1DEV burn) arms after this instead (the mobile rule, MBL-05).
   CONFIRM_ARM_VALUE_MS: 1500,
@@ -248,6 +287,8 @@ export const TIMINGS = Object.freeze({
 });
 
 export const AUTO_LOCK_ALARM = 'qnet-auto-lock';
+/** The alarm that empties the clipboard of a secret a page copied (clipboard.js). */
+export const CLIPBOARD_ALARM = 'qnet-clipboard';
 /** The alarm that resumes the light node's registration while one waits (nodes.js). */
 export const REGISTRATION_ALARM = 'qnet-register';
 /** The alarm that keeps a verified checkpoint at the certified head while the session is unlocked (qnet.js followTick). */

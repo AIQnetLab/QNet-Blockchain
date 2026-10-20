@@ -11,40 +11,19 @@ import { LIMITS, STORAGE_KEYS, TIMINGS } from '../dist/background/config.js';
 import { ProviderError, WalletError } from '../dist/background/errors.js';
 import { CLAIM_ERROR_CODES } from '../dist/background/provider.js';
 import { until } from './helpers/chrome-mock.mjs';
-import { createPage } from './helpers/provider-dom.mjs';
+import { openApprovePage, resetPageGlobals, texts } from './helpers/provider-dom.mjs';
 import * as core from '../dist/lib/qnet-core.js';
 import {
-  ACCOUNTS, APP, NODE_ID, PASSWORD, SITE, SUPER_NODE_ID, createWorld, eventsOf, replyTo, settleAll,
+  ACCOUNTS, APP, COOLDOWN_TEXT, ERROR_LINGER_MS, NODE_ID, PASSWORD, SITE, SUPER_NODE_ID, answered, createWorld, eventsOf, replyTo,
+  settleAll,
 } from './helpers/provider-harness.mjs';
 
-const ERROR_LINGER_MS = 30000;
-const COOLDOWN_TEXT = 'Too many rejected requests from this site, try again later';
 // The site names the node to move: this wallet's light node unless a test names another.
 const claim = (port, id, params = { nodeId: NODE_ID }) => port.send({ id, method: 'qnet_claimNodeBalance', ...(params === undefined ? {} : { params }) });
 const OTHER_WALLET = core.qnetAddressFromPublicKey(new Uint8Array(1952).fill(9));
-const answered = (port, id) => port.posted.some((message) => message.id === id);
 const TX_HASH = 'ef'.repeat(32);
 
-let pageSeq = 0;
-async function openPage(world, shown) {
-  const page = createPage({
-    query: `?id=${shown.id}`,
-    runtime: world.chrome.runtime,
-    send: (message) => world.router.handleUiMessage(message, shown.sender),
-  });
-  Object.assign(globalThis, { window: page.window, document: page.document, chrome: page.chrome });
-  pageSeq += 1;
-  await import(`../dist/ui/approve.js?claim=${pageSeq}`);
-  return page;
-}
-
-afterEach(() => {
-  delete globalThis.window;
-  delete globalThis.document;
-  delete globalThis.chrome;
-});
-
-const texts = (page, className) => page.app.byClass(className).map((element) => element.textContent);
+afterEach(resetPageGlobals);
 
 describe('provider: qnet_claimNodeBalance', () => {
   it('aiqnet.io: one window with the balance; the armed confirm moves it and answers the claim result', async () => {
@@ -300,7 +279,7 @@ describe('approve page: the node balance', () => {
     w.state.claimOutcome = { status: 'ok', qnet: ACCOUNTS.qnet, nodeId: NODE_ID, amountNano: '1500000000', txHash: TX_HASH, stoppedAtEpoch: '9' };
     const port = w.connect(`${SITE}/`);
     claim(port, 'c');
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Move to wallet') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Move node balance to this wallet?']);
     const text = page.app.textContent;
@@ -333,7 +312,7 @@ describe('approve page: the node balance', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/`);
     claim(port, 's', { nodeId: SUPER_NODE_ID });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Move to wallet') !== null);
     const text = page.app.textContent;
     assert.ok(text.includes(SUPER_NODE_ID) && text.includes('Super node'), text);
@@ -349,7 +328,7 @@ describe('approve page: the node balance', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/`);
     claim(port, 'm', { nodeId: core.superNodeId(OTHER_WALLET) });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Close') !== null);
     assert.ok(page.app.textContent.includes('not this wallet’s'), page.app.textContent);
     assert.equal(page.app.button('Move to wallet'), null);
@@ -363,7 +342,7 @@ describe('approve page: the node balance', () => {
     w.state.claimView = { mode: 'empty', amountNano: '100' };
     const port = w.connect(`${SITE}/`);
     claim(port, 'e');
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Close') !== null);
     assert.ok(page.app.textContent.includes('below 1 QNC'));
     assert.equal(page.app.button('Move to wallet'), null);

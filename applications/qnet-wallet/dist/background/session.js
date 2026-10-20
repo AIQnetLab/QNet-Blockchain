@@ -10,6 +10,7 @@ import {
 } from './config.js';
 import { WalletError } from './errors.js';
 import { log } from './log.js';
+import { ALARM_EARLY_MS, armAlarm, attempt, chromeApi } from './platform.js';
 import * as vault from './vault.js';
 
 /**
@@ -35,8 +36,9 @@ import * as vault from './vault.js';
  * @property {5|15|30|60|'never'|null} autoLockMinutes from the vault state; null while locked
  * @property {string} language
  *
- * @typedef {'user'|'timeout'|'idle'|'startup'|'wipe'|'error'} LockReason
- * @typedef {{locked: boolean, reason: LockReason|'unlock'}} LockChange
+ * @typedef {'user'|'timeout'|'idle'|'startup'|'erase'|'error'} LockReason  erase: the lock that starts a delete or reset
+ * @typedef {{locked: boolean, reason: LockReason|'unlock'|'wipe', origins?: string[]}} LockChange  wipe (announceWipe):
+ *   the wallet is gone; origins: the sites its grants named
  */
 
 const lockListeners = new Set();
@@ -46,9 +48,7 @@ const KEY_BYTES = 32;
 const MINUTE_MS = 60000;
 // A deadline further ahead than the auto-lock allows means the clock went back: lock rather than trust it.
 const CLOCK_SLACK_MS = 60000;
-// chrome.alarms may fire a little before `when`; closer than this to the deadline counts as reached.
-const ALARM_EARLY_MS = 1000;
-const LOCK_REASONS = new Set(['user', 'timeout', 'idle', 'startup', 'wipe', 'error']);
+const LOCK_REASONS = new Set(['user', 'timeout', 'idle', 'startup', 'erase', 'error']);
 const STORED_KEYS = Object.freeze(['v', 'key', 'walletId', 'qnetAddress', 'solanaAddress', 'autoLockMinutes',
   'lockDeadline']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -58,10 +58,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 let current = null;
 // Bumped by every start and lock; an asynchronous step that sees it change has been overtaken.
 let epoch = 0;
-// Bumped by every lock the user or the OS asked for ('user', 'idle', 'startup'): a session whose password
+// Bumped by every lock the user or the OS asked for ('user', 'idle', 'startup', 'erase'): a session whose password
 // check began before one of them never starts (R3-ESM-03).
 let screenLocks = 0;
-const SCREEN_LOCK_REASONS = new Set(['user', 'idle', 'startup']);
+const SCREEN_LOCK_REASONS = new Set(['user', 'idle', 'startup', 'erase']);
 // chrome.idle.queryState's detection interval (its minimum); only its 'locked' answer is used.
 const IDLE_DETECTION_SECONDS = 15;
 let restoring = null;
@@ -71,7 +71,6 @@ let backoffQueue = Promise.resolve();
 const noop = () => {};
 const locked = () => new WalletError('LOCKED');
 const internal = () => new WalletError('INTERNAL');
-const chromeApi = () => globalThis.chrome;
 
 function isPlainObject(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
@@ -81,15 +80,6 @@ function isPlainObject(value) {
 
 function hasExactKeys(value, names) {
   return isPlainObject(value) && Object.keys(value).length === names.length && names.every((n) => Object.hasOwn(value, n));
-}
-
-// A chrome.* call that may throw synchronously or reject; always a promise.
-function attempt(fn) {
-  try {
-    return Promise.resolve(fn());
-  } catch (error) {
-    return Promise.reject(error);
-  }
 }
 
 const isSessionShape = (s) => typeof s.walletId === 'string' && UUID_RE.test(s.walletId)
@@ -135,10 +125,8 @@ function writeMirror(s) {
   }));
 }
 
-// No deadline (Never): no alarm either.
-const armAlarm = (deadline) => attempt(() => (deadline === null
-  ? chromeApi().alarms.clear(AUTO_LOCK_ALARM)
-  : chromeApi().alarms.create(AUTO_LOCK_ALARM, { when: deadline })));
+// No deadline (Never): no alarm either. A refusal is logged; every privileged call re-checks the deadline anyway.
+const armLockAlarm = (deadline) => armAlarm(AUTO_LOCK_ALARM, deadline).catch(() => log.warn('auto-lock alarm not armed'));
 
 function parseStored(stored) {
   if (!hasExactKeys(stored, STORED_KEYS) || stored.v !== SESSION_VERSION || !isSessionShape(stored) || !deadlineFits(stored)) {
@@ -181,7 +169,7 @@ async function restore() {
     return;
   }
   current = parsed;
-  await armAlarm(parsed.lockDeadline).catch(() => log.warn('auto-lock alarm not armed'));
+  await armLockAlarm(parsed.lockDeadline);
 }
 
 function ensureRestored() {
@@ -290,7 +278,7 @@ export async function startSession(session) {
     throw internal();
   }
   if (epoch !== mine) throw locked();
-  await armAlarm(started.lockDeadline).catch(() => log.warn('auto-lock alarm not armed'));
+  await armLockAlarm(started.lockDeadline);
   if (epoch !== mine) throw locked();
   fire({ locked: false, reason: 'unlock' });
   return { lockDeadline: started.lockDeadline };
@@ -386,7 +374,7 @@ export async function touch() {
   } catch {
     throw internal();
   }
-  if (epoch === mine) await armAlarm(s.lockDeadline).catch(() => log.warn('auto-lock alarm not armed'));
+  if (epoch === mine) await armLockAlarm(s.lockDeadline);
 }
 
 /**
@@ -409,9 +397,21 @@ export async function lock(reason) {
   await Promise.allSettled([
     attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.SESSION)),
     attempt(() => chromeApi().storage.session.remove(STORAGE_KEYS.VIEW_CACHE)),
-    attempt(() => chromeApi().alarms.clear(AUTO_LOCK_ALARM)),
+    armAlarm(AUTO_LOCK_ALARM, null),
   ]);
   fire({ locked: true, reason: why });
+}
+
+/**
+ * Tells every onLockChange listener that the wallet is gone: {locked: true, reason: 'wipe', origins} (the pages hear
+ * 'wiped', every site of `origins` and every connected one the disconnect). vault.eraseAll calls it once the vault record
+ * is verified deleted, after its lock('erase'), and never before. Changes no state.
+ * @param {string[]} origins the sites the deleted wallet's grants named
+ * @returns {void}
+ */
+export function announceWipe(origins) {
+  const named = Array.isArray(origins) ? origins.filter((origin) => typeof origin === 'string') : [];
+  fire({ locked: true, reason: 'wipe', origins: Object.freeze(named) });
 }
 
 /**
@@ -439,9 +439,11 @@ export function onLockChange(listener) {
 
 // The last balances, token list and first history pages the popup was served in this session (the router keeps every
 // answer of qnet.balance, qnet.tokens, solana.balances, and qnet.history and solana.history without a cursor): the popup
-// draws them at once the next time it opens or switches network, and reads again behind them. Public data only, of the
-// session's wallet only, in worker memory and chrome.storage.session; every lock and every new session drop it.
-const VIEW_NAMES = Object.freeze(['qnetBalance', 'qnetHistory', 'solanaBalances', 'solanaHistory', 'qnetTokens']);
+// draws them at once the next time it opens or switches network, and reads again behind them; and where the popup was
+// (popupState: the network, the tab and the Send form's draft, rememberPopup; the draft goes once a send went,
+// forgetDraft), where it opens again. Public data only, of the session's wallet only, in worker memory and
+// chrome.storage.session; every lock and every new session drop it.
+const VIEW_NAMES = Object.freeze(['qnetBalance', 'qnetHistory', 'solanaBalances', 'solanaHistory', 'qnetTokens', 'popupState']);
 // The balances outlive the session (owner, 06.10: the popup draws the last balance at once, also right after an unlock):
 // the last QNet balance, the token list and the Solana balances are kept in the vault's chain cache
 // (vault.updateChainCache, with its MAC), and a view of this session not read yet is drawn from there. A QNet balance is
@@ -470,7 +472,7 @@ async function viewsOf(s) {
  * Keeps `value` (a handler result the router already guards) as the view `name` of this session, and a balance view
  * also in the vault's chain cache (keptAcrossSessions); nothing while locked. Never throws for storage: a value that
  * could not be written stays in worker memory.
- * @param {'qnetBalance'|'qnetHistory'|'solanaBalances'|'solanaHistory'|'qnetTokens'} name
+ * @param {'qnetBalance'|'qnetHistory'|'solanaBalances'|'solanaHistory'|'qnetTokens'|'popupState'} name
  * @param {unknown} value
  * @returns {Promise<void>}
  */
@@ -540,7 +542,7 @@ async function keptViews() {
  * Handler of `wallet.cached`: the views this session keeps, and for a balance view not read in this session yet the one
  * kept across sessions (keptAcrossSessions); null for each one there is none of.
  * @returns {Promise<{qnetBalance: object|null, qnetHistory: object|null, solanaBalances: object|null,
- *   solanaHistory: object|null, qnetTokens: object|null}>}
+ *   solanaHistory: object|null, qnetTokens: object|null, popupState: object|null}>}
  * @throws {WalletError} LOCKED
  */
 export async function cachedViews() {
@@ -550,6 +552,37 @@ export async function cachedViews() {
   const missing = PERSISTED_VIEWS.some((name) => values[name] === undefined || values[name] === null);
   const kept = missing ? await keptViews() : {};
   return Object.fromEntries(VIEW_NAMES.map((name) => [name, values[name] ?? kept[name] ?? null]));
+}
+
+/**
+ * Handler of `wallet.remember` (popup): where the popup is, to open there again in this session (the popupState view,
+ * dropped with every lock like the rest of the view cache): the network, the tab and, while the Send form of that network
+ * holds one, its draft (the asset, the recipient and the amount as typed; never a payment request's parts).
+ * @param {{network: 'qnet'|'solana', tab: string, asset?: string, to?: string, amount?: string}} params router-checked
+ * @returns {Promise<{remembered: true}>}
+ * @throws {WalletError} LOCKED
+ */
+export async function rememberPopup(params) {
+  const { network, tab, asset, to, amount } = params ?? {};
+  await requireUnlocked();
+  const draft = Object.fromEntries(Object.entries({ asset, to, amount }).filter(([, value]) => typeof value === 'string'));
+  await rememberView('popupState', { network, tab, draft: Object.keys(draft).length > 0 ? draft : null });
+  return { remembered: true };
+}
+
+/**
+ * Drops the Send form's draft from where the popup was, keeping its network and tab. The router calls it once a send
+ * went (an entry marked `sends`), so a popup closed while the send ran never opens again on the draft it sent. Nothing
+ * while locked; never throws for storage.
+ * @returns {Promise<void>}
+ */
+export async function forgetDraft() {
+  const s = await activeSession();
+  if (s === null) return;
+  const mine = epoch;
+  const kept = (await viewsOf(s)).values.popupState;
+  if (epoch !== mine || !isPlainObject(kept) || (kept.draft ?? null) === null) return;
+  await rememberView('popupState', { ...kept, draft: null });
 }
 
 /**
@@ -638,7 +671,7 @@ export async function setSettings(patch) {
     await writeMirror(s).catch(() => {
       throw internal();
     });
-    if (epoch === mine) await armAlarm(s.lockDeadline).catch(() => log.warn('auto-lock alarm not armed'));
+    if (epoch === mine) await armLockAlarm(s.lockDeadline);
   }
   if (language !== undefined) {
     await attempt(() => chromeApi().storage.local.set({ [STORAGE_KEYS.SETTINGS]: { language } })).catch(() => {
@@ -659,7 +692,7 @@ export async function onAlarm(alarm) {
   const s = current;
   if (s === null) return;
   if (isExpired(s, Date.now() + ALARM_EARLY_MS)) await lock('timeout');
-  else await armAlarm(s.lockDeadline).catch(() => log.warn('auto-lock alarm not armed'));
+  else await armLockAlarm(s.lockDeadline);
 }
 
 /**

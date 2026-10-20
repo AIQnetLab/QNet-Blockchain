@@ -220,7 +220,7 @@ describe('whole addresses fit one line', () => {
       expect(widestFit(n.props.children, st)).toBeLessThanOrEqual(inner);
     }
     const src = fs.readFileSync(path.join(ROOT, 'src/screens/QNetLinkScreen.js'), 'utf8');
-    expect(src.match(/addressField\(t\('link_wallet'\), o\.qnet\)/g)).toHaveLength(5); // reserve, unlink (this device, and by the wallet key), link, claim
+    expect(src.match(/addressField\(t\('link_wallet'\), o\.qnet\)/g)).toHaveLength(6); // reserve, unlink (this device, and by the wallet key), link (to bind, or already here), claim
     act(() => tree.unmount());
   });
 

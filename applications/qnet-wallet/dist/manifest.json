@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extName__",
-  "version": "3.1.5",
+  "version": "3.1.6",
   "description": "__MSG_extDescription__",
   "default_locale": "en",
   "minimum_chrome_version": "111",
@@ -9,7 +9,9 @@
   "permissions": [
     "storage",
     "alarms",
-    "idle"
+    "idle",
+    "offscreen",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "https://node1.aiqnet.io/*",

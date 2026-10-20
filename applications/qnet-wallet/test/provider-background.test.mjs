@@ -837,6 +837,23 @@ describe('provider: lock and unlock', () => {
     await until(() => w.log.removed.includes(shown.windowId));
     assert.equal(w.provider.snapshot().queued, 0);
   });
+
+  // The erase of a delete or reset reads the stored grants before it clears them and names their sites with the wipe
+  // (vault.eraseAll), so a worker that restarted and read no grant since still disconnects every one (batch 19.10).
+  it('a wipe reaches every site the deleted wallet\'s grants named, though this worker read none of them', async () => {
+    const w = createWorld();
+    await w.grant(SITE);
+    const idle = w.connect(`${SITE}/`);
+    const known = w.connect(`${APP}/`);
+    // a request that reads no grant: the site is known by its live port alone
+    assert.equal((await ask(known, { id: 'a', method: 'qnet_chainId' })).ok, true);
+    await w.provider.notifyLockChanged({ locked: true, reason: 'erase' });
+    assert.deepEqual(eventsOf(idle), [], 'the lock that starts the erase reads no grant');
+    assert.deepEqual(eventsOf(known), [{ event: 'accountsChanged', data: {} }], 'a site known now hears it');
+    await w.provider.notifyLockChanged({ locked: true, reason: 'wipe', origins: [SITE] });
+    assert.deepEqual(eventsOf(idle), [{ event: 'accountsChanged', data: {} }, DISCONNECT]);
+    assert.deepEqual(eventsOf(known).slice(1), [{ event: 'accountsChanged', data: {} }, DISCONNECT]);
+  });
 });
 
 describe('provider: revoke and disconnect', () => {

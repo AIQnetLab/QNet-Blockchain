@@ -95,11 +95,72 @@ describe('forgot password: reset the wallet', () => {
     const reply = await resetWith(token);
     assert.equal(reply.ok, true, JSON.stringify(reply));
     assert.deepEqual(reply.result, { wiped: true });
-    assert.deepEqual(env.changes.map((c) => [c.locked, c.reason]), [[true, 'wipe']], "one lock, reason 'wipe': the pages hear 'wiped'");
+    // the lock that starts the erase, then the wipe once the vault is gone, naming the sites its grants named
+    assert.deepEqual(env.changes.map((c) => [c.locked, c.reason]), [[true, 'erase'], [true, 'wipe']]);
+    assert.deepEqual(env.changes[1].origins, ['https://aiqnet.io']);
     await assertErased();
     assert.equal(await session.getBackoffUntil(), null, 'the erased vault took its failed attempts with it');
     assert.equal(errorCode(await resetWith(token)), 'RESET_EXPIRED', 'the token is spent');
     assert.equal(errorCode(await send(popup(), 'vault.resetBegin', {})), 'NO_VAULT');
+  });
+
+  // The pages hear 'wiped' only once the vault is deleted: a deletion that fails leaves the wallet in place, locked, with
+  // nothing announced, so the popup can say the wallet was not deleted (batch 19.10).
+  it('announces the wipe only once the vault is deleted; a deletion that fails leaves the wallet locked and announces nothing', async () => {
+    const before = await oldWallet();
+    await vault.unlock({ password: PASSWORD });
+    env.changes.length = 0;
+    env.idb.inject('deleteDatabase', 'UnknownError');
+    assert.equal(errorCode(await send(popup(), 'vault.wipe', { password: PASSWORD, confirm: 'DELETE' })), 'INTERNAL');
+    assert.deepEqual(env.changes.map((c) => [c.locked, c.reason]), [[true, 'erase']], 'locked, never wiped');
+    assert.equal(env.chrome.storage.local.dump()[STORAGE_KEYS.SITES] !== undefined, true, 'nothing else was erased either');
+    await assertOldVaultIntact(before);
+
+    await vault.unlock({ password: PASSWORD });
+    env.changes.length = 0;
+    const recordAtWipe = [];
+    const unsubscribe = session.onLockChange((change) => {
+      if (change.reason === 'wipe') recordAtWipe.push(record());
+    });
+    try {
+      assert.equal((await send(popup(), 'vault.wipe', { password: PASSWORD, confirm: 'DELETE' })).ok, true);
+    } finally {
+      unsubscribe();
+    }
+    assert.deepEqual(recordAtWipe, [null], 'announced after the record was gone');
+    await assertErased();
+  });
+
+  // R16: the erase itself empties the clipboard of a secret a page copied and has yet to clear (clipboard.clearNow), before
+  // the wipe is announced, whether or not that page is still open.
+  it('empties the clipboard of a copied secret still due to be cleared, before the wipe is announced (R16)', async () => {
+    const clipboard = await import('../dist/background/clipboard.js');
+    await oldWallet();
+    const steps = [];
+    env.chrome.offscreen = {
+      createDocument: async () => steps.push('open'),
+      closeDocument: async () => steps.push('close'),
+    };
+    env.chrome.runtime.sendMessage = async (message) => {
+      steps.push(message.type);
+      return { cleared: true };
+    };
+    await clipboard.schedule({ afterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS });
+    const unsubscribe = session.onLockChange((change) => {
+      if (change.reason === 'wipe') steps.push('wiped');
+    });
+    try {
+      assert.equal((await resetWith(await begin())).ok, true);
+    } finally {
+      unsubscribe();
+    }
+    assert.deepEqual(steps, ['open', 'clear', 'close', 'wiped']);
+    await assertErased();
+    // nothing was due: the next erase leaves the clipboard alone
+    steps.length = 0;
+    await oldWallet();
+    assert.equal((await resetWith(await begin())).ok, true);
+    assert.deepEqual(steps, []);
   });
 
   it('keeps the chosen language only as an exact allowed value: anything else under that key goes too', async () => {

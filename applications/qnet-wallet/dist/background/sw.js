@@ -1,6 +1,7 @@
 // Service worker entry (module). MV3 requires every listener to be registered synchronously on each
 // start, so this file only wires: listeners first, then the asynchronous start-up work.
 import * as activation from './activation.js';
+import * as clipboard from './clipboard.js';
 import { notifyViews, setViewBroadcaster } from './events.js';
 import * as keys from './keys.js';
 import { log } from './log.js';
@@ -27,6 +28,7 @@ const background = (tag, fn) => {
   Promise.resolve().then(fn).catch(guard(tag));
 };
 
+// 'wiped' only once the wallet is gone (session.announceWipe); the lock a delete or reset starts with is an ordinary lock
 session.onLockChange((change) => {
   notifyViews(change.reason === 'wipe' ? 'wiped' : change.locked ? 'locked' : 'unlocked');
   background('provider lock notify', () => provider.notifyLockChanged(change));
@@ -53,6 +55,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   session.onAlarm(alarm).catch(guard('alarm'));
   nodes.onAlarm(alarm).catch(guard('registration alarm'));
   qnet.onAlarm(alarm).catch(guard('follow alarm'));
+  clipboard.onAlarm(alarm).catch(guard('clipboard alarm'));
 });
 chrome.idle.onStateChanged.addListener((state) => {
   session.onIdleState(state).catch(guard('idle'));

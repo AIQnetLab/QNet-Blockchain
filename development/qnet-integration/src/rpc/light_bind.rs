@@ -149,11 +149,14 @@ pub(super) fn check_bind(storage: &crate::storage::Storage, req: &LightNodeBindR
     let target = lb::push_target(push_type, &token, endpoint.as_deref()).to_string();
     let platform = lb::platform_hint(req.platform.as_deref());
     let model = lb::model_hint(req.model.as_deref()).to_string();
+    // Checked once per exact request (`verified_once`).
     let signatures_hold = |seq: u64, ts: u64| -> bool {
-        crate::rpc::verify_mobile_dilithium_signature(
+        let digest = digest_of(&["bind", &req.identity_pubkey, &req.node_id, &req.ping_pubkey, &seq.to_string(),
+                                 &ts.to_string(), &target, &req.delegation_cert, &req.attach_sig]);
+        verified_once(digest, || crate::rpc::verify_mobile_dilithium_signature(
             &lb::delegation_v2_message(&req.ping_pubkey, &req.node_id, seq), &req.delegation_cert, &req.identity_pubkey)
             && lb::attach_v2_message(&req.node_id, &req.ping_pubkey, &target, seq, ts)
-                .map_or(false, |m| crate::rpc::verify_mobile_dilithium_signature(&m, &req.attach_sig, &req.identity_pubkey))
+                .map_or(false, |m| crate::rpc::verify_mobile_dilithium_signature(&m, &req.attach_sig, &req.identity_pubkey)))
     };
 
     if onchain {
@@ -207,7 +210,10 @@ pub(super) fn check_bind(storage: &crate::storage::Storage, req: &LightNodeBindR
     if consent.registration_proof != proof || !is_hex_len(&consent.consent_sig, lb::MLDSA65_SIG_HEX) {
         return Err(Refusal::BadSignature);
     }
-    if !consent_verifies(&req.node_id, &req.wallet_address, &proof, t, &consent.consent_sig, &req.identity_pubkey) {
+    let consent_digest = digest_of(&["consent", &req.node_id, &req.wallet_address, &proof, &t.to_string(),
+                                     &consent.consent_sig, &req.identity_pubkey]);
+    if !verified_once(consent_digest,
+        || consent_verifies(&req.node_id, &req.wallet_address, &proof, t, &consent.consent_sig, &req.identity_pubkey)) {
         return Err(Refusal::BadSignature);
     }
     if !signatures_hold(req.seq, req.ts) { return Err(Refusal::BadSignature); }
@@ -234,7 +240,7 @@ pub(super) fn check_bind(storage: &crate::storage::Storage, req: &LightNodeBindR
 
 /// Sliding-window limit per key: a node id, applied after the signatures verified (an IP is not a
 /// device: a carrier NAT fronts thousands of them), or a client address where only an address is known.
-pub(super) struct KeyedLimiter {
+pub(crate) struct KeyedLimiter {
     max: usize,
     window: u64,
     map: std::sync::OnceLock<DashMap<String, Vec<u64>>>,
@@ -242,13 +248,19 @@ pub(super) struct KeyedLimiter {
 }
 
 impl KeyedLimiter {
-    pub(super) const fn new(max: usize, window: u64) -> Self {
+    pub(crate) const fn new(max: usize, window: u64) -> Self {
         KeyedLimiter { max, window, map: std::sync::OnceLock::new(), swept: std::sync::atomic::AtomicU64::new(0) }
     }
 
-    /// Spend one slot of `key`'s window if one is free. Past 100k keys the idle ones are swept at most once a
-    /// minute, not on every call (a flood of fresh keys made each call a full pass).
-    pub(super) fn allows(&self, key: &str, now: u64) -> bool {
+    /// Spend one slot of `key`'s window if one is free.
+    pub(crate) fn allows(&self, key: &str, now: u64) -> bool {
+        self.spend(key, now).is_ok()
+    }
+
+    /// Spend one slot of `key`'s window if one is free; Err carries the seconds until one frees, for the refusal to
+    /// name. Past 100k keys the idle ones are swept at most once a minute, not on every call (a flood of fresh keys
+    /// made each call a full pass).
+    pub(crate) fn spend(&self, key: &str, now: u64) -> Result<(), u64> {
         let map = self.map.get_or_init(DashMap::new);
         let cutoff = now.saturating_sub(self.window);
         if map.len() > 100_000 {
@@ -261,32 +273,87 @@ impl KeyedLimiter {
         }
         let mut e = map.entry(key.to_string()).or_default();
         e.retain(|t| *t > cutoff);
-        if e.len() >= self.max { return false; }
+        if e.len() >= self.max { return Err(self.wait(&e, now)); }
         e.push(now);
-        true
+        Ok(())
     }
 
     /// Whether a slot is free, without spending it; Err carries the seconds until one frees. For a
     /// caller that must pass two limits before it spends either.
-    pub(super) fn check(&self, key: &str, now: u64) -> Result<(), u64> {
+    pub(crate) fn check(&self, key: &str, now: u64) -> Result<(), u64> {
         let Some(map) = self.map.get() else { return Ok(()); };
         let Some(e) = map.get(key) else { return Ok(()); };
         let cutoff = now.saturating_sub(self.window);
         let live: Vec<u64> = e.iter().copied().filter(|t| *t > cutoff).collect();
         if live.len() < self.max { return Ok(()); }
+        Err(self.wait(&live, now))
+    }
+
+    /// The seconds until the oldest of a full window's `live` slots frees, at least one.
+    fn wait(&self, live: &[u64], now: u64) -> u64 {
         let oldest = live.iter().copied().min().unwrap_or(now);
-        Err(oldest.saturating_add(self.window).saturating_sub(now).max(1))
+        oldest.saturating_add(self.window).saturating_sub(now).max(1)
     }
 }
 
 pub(super) static BIND_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new(5, 3600);
 pub(super) static TOKEN_REFRESH_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new(6, 3600);
+/// Newer bindings of one light node a node takes per hour from gossip (A3): a full window refuses before the delegation
+/// check, and only a copy whose delegation verifies spends a slot. The bind route takes at most BIND_NODE_LIMIT an hour
+/// at each genesis, and a copy past this one reaches the node's owners by the token sync, the identity pull and the
+/// device's own answer instead.
+pub(crate) static BINDING_COPY_NODE_LIMIT: KeyedLimiter = KeyedLimiter::new(10, 3600);
 /// Pending bindings this node stores per hour, whatever their source: a backstop beside the burn each one needs
 /// (`pending_burn_seen`) and the per-network share at the store's cap (M-10).
 pub(super) static PENDING_BIND_GLOBAL_LIMIT: KeyedLimiter = KeyedLimiter::new(6_000, 3600);
 /// New pending bindings this node holds in memory per hour (`lb::deferred_insert`): a flood turns the memory tier over
 /// at most once an hour, so the bindings real users posted before it stay until their registration applies.
 pub(super) static DEFERRED_BIND_GLOBAL_LIMIT: KeyedLimiter = KeyedLimiter::new(lb::DEFERRED_CAP, 3600);
+
+/// The signatures `/bind` verified, by a digest of everything they cover (`verified_once`): an exact re-send of a
+/// request (the app's post to two owners and its re-sends, or anyone replaying one) costs a hash and no ML-DSA-65 check
+/// (A4). At the cap it starts over, which costs only checks.
+pub(super) struct VerifiedBinds {
+    set: std::sync::OnceLock<DashSet<[u8; 32]>>,
+}
+
+const VERIFIED_BINDS_CAP: usize = 65_536;
+
+impl VerifiedBinds {
+    pub(super) const fn new() -> Self {
+        VerifiedBinds { set: std::sync::OnceLock::new() }
+    }
+
+    pub(super) fn holds(&self, digest: &[u8; 32]) -> bool {
+        self.set.get().map_or(false, |s| s.contains(digest))
+    }
+
+    pub(super) fn insert(&self, digest: [u8; 32]) {
+        let s = self.set.get_or_init(DashSet::new);
+        if s.len() >= VERIFIED_BINDS_CAP { s.clear(); }
+        s.insert(digest);
+    }
+}
+
+pub(super) static VERIFIED_BINDS: VerifiedBinds = VerifiedBinds::new();
+
+/// SHA3-256 of the length-prefixed `parts`: what a check covers, its kind first.
+fn digest_of(parts: &[&str]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    for part in parts {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// `check` run once per `digest`: one that passed before passes again with no check (`VERIFIED_BINDS`).
+fn verified_once(digest: [u8; 32], check: impl FnOnce() -> bool) -> bool {
+    if VERIFIED_BINDS.holds(&digest) { return true; }
+    let ok = check();
+    if ok { VERIFIED_BINDS.insert(digest); }
+    ok
+}
 
 /// The address a per-address limit counts a caller under: an IPv4 address (also one mapped into IPv6), an IPv6
 /// address by its /64, the block one host is given (L-2).
@@ -354,6 +421,9 @@ impl FailLimiter {
     }
 }
 
+/// The per-address bucket every `/bind` request counts in (`ApiRateLimiter`), beside its failures' `BIND_FAIL_LIMIT`.
+pub(super) const LIGHT_BIND_BUCKET: &str = "light_node_bind";
+
 /// Failures one address may make on each route before a short block (`FailLimiter`).
 const ROUTE_FAILS_MAX: usize = 60;
 const ROUTE_FAILS_WINDOW_SECS: u64 = 60;
@@ -376,9 +446,8 @@ pub(super) fn pending_burn_seen(storage: &crate::storage::Storage, p: &PendingBi
 /// budget spent): a refusal the app sends again later (`rate_limited` with `retry_after_seconds`), never a final one.
 /// Once the chain lists the node, the same binding is taken as a fresh one.
 pub(super) fn pending_later_json(retry_after: u64) -> serde_json::Value {
-    let mut v = Refusal::RateLimited.to_json();
+    let mut v = lb::rate_limited_json(retry_after);
     v["error"] = json!("The binding is not held here for now; it is sent again later");
-    v["retry_after_seconds"] = json!(retry_after);
     v
 }
 
@@ -507,9 +576,11 @@ pub(super) async fn handle_light_node_bind(
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     // The address's budget of failed requests (L-2): a request that verifies spends none of it.
     if let Some(wait) = BIND_FAIL_LIMIT.blocked(remote_addr, now) {
-        let mut v = Refusal::RateLimited.to_json();
-        v["retry_after_seconds"] = json!(wait);
-        return Ok(warp::reply::json(&v));
+        return Ok(warp::reply::json(&lb::rate_limited_json(wait)));
+    }
+    // Every request, an exact re-send included, counts against its address (A4), an IPv6 address by its /64.
+    if let Err(wait) = api_rate_limit_retry(remote_addr, LIGHT_BIND_BUCKET) {
+        return Ok(warp::reply::json(&lb::rate_limited_json(wait)));
     }
     let storage = blockchain.get_storage();
     let onchain = storage.is_node_registration_onchain(&req.node_id);
@@ -584,8 +655,10 @@ pub(super) async fn handle_light_node_bind(
             Err(r) => return Ok(answer(r.to_json())),
         },
     } || prepared.as_ref().map_or(false, |p| p.held.is_none());
-    if changes && !BIND_NODE_LIMIT.allows(&req.node_id, now) {
-        return Ok(answer(Refusal::RateLimited.to_json()));
+    if changes {
+        if let Err(wait) = BIND_NODE_LIMIT.spend(&req.node_id, now) {
+            return Ok(answer(lb::rate_limited_json(wait)));
+        }
     }
     // The node-wide backstops on what the pending store takes, past the burn each entry needs, and on what the memory
     // tier takes (M-10).
@@ -1279,6 +1352,111 @@ mod tests {
         assert!(p2p.get_light_node(&w.node).is_none(), "no resident entry from gossip");
     }
 
+    /// B2/B10: a genesis that missed a move holds the old phone's binding; the new phone's answer presents its newer
+    /// delegation and corrects it, and the old phone's next answer is told `superseded`, both before the route looks at
+    /// the epoch's count or its commit gap.
+    #[test]
+    fn a_missed_move_is_repaired_from_the_new_phones_answer_before_the_epochs_count() {
+        let (s, _d) = storage();
+        let w = wallet();
+        register(&s, &w);
+        let t = now();
+        let ((pp_x, sk_x), (pp_y, sk_y)) = (ping_key(), ping_key());
+        let cert = |pp: &str, seq: u64| lb::format_v2_cert(seq, &sign(&w.sk, &lb::delegation_v2_message(pp, &w.node, seq)));
+        let bx = match check_bind(&s, &bind_req(&w, &pp_x, "tok_x", t, t), true, t) { Ok(BindPath::Fresh(b)) => b, o => panic!("{o:?}") };
+        apply_fresh_binding(&s, None, &bx, t).expect("the old phone's binding, the move to the new one missed here");
+        let challenge = format!("selfattest:5:{}", "ab".repeat(32));
+        let answer = |pp: &str, sk: &d3::SecretKey, cert: String| -> (HashMap<String, String>, String) {
+            let fields = [("ping_pubkey", pp.to_string()), ("ping_delegation_cert", cert), ("identity_pubkey", w.pk_hex.clone())];
+            (fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), format!("ping_dilithium:{}", sign(sk, &challenge)))
+        };
+        let (py, sy) = answer(&pp_y, &sk_y, cert(&pp_y, t + 10));
+        assert!(repair_from_presented(&py, &w.node, &challenge, &sy, &s, 0, t).is_none(), "taken; the reply goes on");
+        assert_eq!(s.get_light_binding(&w.node).map(|b| (b.ping_pubkey, b.seq)), Some((pp_y.clone(), t + 10)));
+        let (px, sx) = answer(&pp_x, &sk_x, cert(&pp_x, t));
+        assert!(repair_from_presented(&px, &w.node, &challenge, &sx, &s, 0, t).is_some(), "the old phone: superseded");
+        // The bound device presenting what is held costs no check here; a forged σ under a newer key changes nothing.
+        assert!(repair_from_presented(&py, &w.node, &challenge, "ping_dilithium:00", &s, 0, t).is_none());
+        let (pp_z, _) = ping_key();
+        let (pz, _) = answer(&pp_z, &sk_y, cert(&pp_z, t + 20));
+        assert!(repair_from_presented(&pz, &w.node, &challenge, &sy, &s, 0, t).is_none());
+        assert_eq!(s.get_light_binding(&w.node).map(|b| b.seq), Some(t + 10));
+        // In the route, before the epoch's count and the commit gap, on one path.
+        let src = include_str!("light_nodes.rs");
+        let h = &src[src.find("async fn answer_light_node_ping(").unwrap()..src.find("pub(super) fn repair_from_presented(").unwrap()];
+        let repair = h.find("repair_from_presented(&params").expect("repair");
+        assert!(repair < h.find("p2p.has_attestation_in_window(&node_id)").unwrap() && repair < h.find("if in_commit_gap(tip) {").unwrap());
+        assert!(!h.contains("save_light_ping_keys_identity("), "one repair path");
+    }
+
+    /// A3: a token sync whose binding runs more than COPY_FUTURE_SEQ_SLACK_SECS ahead of this genesis's clock is refused
+    /// `future_seq` (HTTP 400), not answered as stale, so the sender asks again and a later try takes it; one within the
+    /// slack is taken at once.
+    #[test]
+    fn a_token_sync_ahead_of_this_clock_is_refused_for_a_later_try() {
+        let (s, _d) = storage();
+        let w = wallet();
+        register(&s, &w);
+        let t = now();
+        let (pp, _) = ping_key();
+        let sync_at = |seq: u64| {
+            let cert = lb::format_v2_cert(seq, &sign(&w.sk, &lb::delegation_v2_message(&pp, &w.node, seq)));
+            sync_req(&w, &pp, &cert, "tok", seq, t, t)
+        };
+        let ahead = t + lb::COPY_FUTURE_SEQ_SLACK_SECS + 60;
+        assert_eq!(apply_token_sync(&s, None, &sync_at(ahead), t), SyncOutcome::Refused("future_seq"));
+        assert!(s.get_light_binding(&w.node).is_none(), "nothing taken");
+        let within = t + lb::COPY_FUTURE_SEQ_SLACK_SECS - 60;
+        assert_eq!(apply_token_sync(&s, None, &sync_at(within), t), SyncOutcome::Applied);
+        assert_eq!(s.get_light_binding(&w.node).map(|b| b.seq), Some(within));
+    }
+
+    /// A3: a node takes at most BINDING_COPY_NODE_LIMIT newer bindings of one light node an hour from gossip, and none a
+    /// day ahead of its clock; a copy whose delegation does not verify spends none of the hour, and another node's copies
+    /// are not held by that node's limit.
+    #[tokio::test]
+    async fn gossip_copies_of_one_node_are_held_to_their_hourly_limit() {
+        use crate::unified_p2p::{NetworkMessage, NodeType, PushType, Region, SimplifiedP2P};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let mut p2p = SimplifiedP2P::new("test_a3_node".into(), NodeType::Super, Region::Europe, 8114);
+        p2p.set_storage(s.clone());
+        let t = now();
+        let signed_by = |w: &Wallet, signer: &d3::SecretKey, pp: &str, seq: u64| NetworkMessage::LightNodeRegistration {
+            node_id: w.node.clone(), wallet_address: w.wallet.clone(), device_token_hash: String::new(),
+            quantum_pubkey: w.pk_hex.clone(), registered_at: t, signature: String::new(), gossip_hop: 0,
+            push_type: PushType::FCM, unified_push_endpoint: None, last_seen: t, consecutive_failures: 0, is_active: true,
+            ping_pubkey: pp.to_string(),
+            ping_delegation_cert: lb::format_v2_cert(seq, &sign(signer, &lb::delegation_v2_message(pp, &w.node, seq))),
+        };
+        let copy = |w: &Wallet, pp: &str, seq: u64| signed_by(w, &w.sk, pp, seq);
+        let (w, other, mallory) = (wallet(), wallet(), wallet());
+        register(&s, &w);
+        register(&s, &other);
+        let seq_of = |w: &Wallet| s.get_light_binding(&w.node).map(|b| b.seq);
+        // A sequence a day ahead is refused before it counts.
+        let (far, _) = ping_key();
+        p2p.handle_message("peer", copy(&w, &far, t + 86_400));
+        assert_eq!(seq_of(&w), None);
+        // Junk under the node's committed key with a delegation that key never signed spends none of the hour.
+        for i in 0..12u64 {
+            let (pp, _) = ping_key();
+            p2p.handle_message("peer", signed_by(&w, &mallory.sk, &pp, t + 100 + i));
+        }
+        assert_eq!(seq_of(&w), None);
+        for i in 0..10u64 {
+            let (pp, _) = ping_key();
+            p2p.handle_message("peer", copy(&w, &pp, t + i));
+            assert_eq!(seq_of(&w), Some(t + i), "copy {i}");
+        }
+        let (pp, _) = ping_key();
+        p2p.handle_message("peer", copy(&w, &pp, t + 10));
+        assert_eq!(seq_of(&w), Some(t + 9), "the eleventh within the hour waits for the token sync or the device");
+        let (pp, _) = ping_key();
+        p2p.handle_message("peer", copy(&other, &pp, t));
+        assert_eq!(seq_of(&other), Some(t), "another node's limit is its own");
+    }
+
     /// A replayed attach never takes back the channel a later refresh of the same binding set: a v2
     /// push record is ordered by the signed time of the message that set it, here and at every peer.
     #[test]
@@ -1352,8 +1530,8 @@ mod tests {
         forged.token = "attacker".into();
         assert_eq!(apply_token_sync(&s, None, &forged, t), SyncOutcome::Refused("bad_proof"));
         // ...and a pulled record is taken only at the stored seq.
-        assert!(!apply_pulled_push_record(&s, None, &w.node, "pulled", "fcm", None, t + 2, t + 5, ""));
-        assert!(apply_pulled_push_record(&s, None, &w.node, "pulled", "fcm", None, t + 2, t + 10, ""));
+        assert!(!apply_pulled_push_record(&s, None, &w.node, "pulled", "fcm", None, t + 2, t + 5, "", "", ""));
+        assert!(apply_pulled_push_record(&s, None, &w.node, "pulled", "fcm", None, t + 2, t + 10, "", "", ""));
 
         // A genesis that has not applied the registration yet refuses a v2 record it cannot check; the
         // sender tries it once more a little later.
@@ -1672,7 +1850,7 @@ mod tests {
         assert_eq!(lb::deferred_admits(&PendingBind { seq: t - 1, ..p.clone() }, now()), Err(Refusal::StaleSeq));
         assert_eq!(lb::deferred_admits(&p, now()), Ok(true));
         let h = include_str!("light_bind.rs");
-        let changes = &h[h.find("let changes = match &path {").unwrap()..h.find("if changes && !BIND_NODE_LIMIT.allows(").unwrap()];
+        let changes = &h[h.find("let changes = match &path {").unwrap()..h.find("BIND_NODE_LIMIT.spend(").unwrap()];
         assert!(changes.contains("lb::deferred_admits(p, now)"));
         assert!(s.get_light_pending_bind(&w.node).is_none(), "nothing written to the store");
         register(&s, &w);
@@ -1737,7 +1915,7 @@ mod tests {
         assert!(!h.contains("check_api_rate_limit("));
         let unbind = include_str!("light_unbind.rs");
         let u = &unbind[unbind.find("pub(super) async fn handle_light_node_unbind(").unwrap()..];
-        let u = &u[..u.find("UNBIND_NODE_LIMIT.allows(").unwrap()];
+        let u = &u[..u.find("UNBIND_NODE_LIMIT.spend(").unwrap()];
         assert!(u.contains("UNBIND_FAIL_LIMIT.charge(remote_addr, now);") && !u.contains("check_api_rate_limit("));
         let nodes = include_str!("light_nodes.rs");
         let r = &nodes[nodes.find("pub(super) async fn handle_light_node_token_refresh(").unwrap()..];
@@ -1746,8 +1924,52 @@ mod tests {
         assert_eq!(r[..verified].matches("return fail(").count(), 8, "every refusal up to the signature");
         assert!(!r[verified..].contains("return fail(") && !r.contains("check_api_rate_limit("));
         let m = include_str!("mod.rs");
-        for gone in ["\"light_node_bind\"", "\"light_node_unbind\"", "\"light_node_token_refresh\"", "\"light_node_pending_bind\""] {
+        for gone in ["\"light_node_unbind\"", "\"light_node_token_refresh\"", "\"light_node_pending_bind\""] {
             assert!(!m.contains(gone), "{gone}: no hour-long per-address bucket");
         }
+        // Bind's bucket of every request (A4) is a short one, like the ping route's.
+        let cfg = &m[m.find("configs.insert(light_bind::LIGHT_BIND_BUCKET.to_string(), RateLimitConfig {").expect("the bind bucket")..];
+        let cfg = &cfg[..cfg.find("});").unwrap()];
+        assert!(cfg.contains("window_seconds: 60,") && cfg.contains("block_duration: 60,"), "{cfg}");
+    }
+
+    /// A limit's refusal names the seconds until a slot frees: when the oldest request of the window leaves it. The bind,
+    /// unbind and token refresh limits answer with it.
+    #[test]
+    fn a_node_limit_names_its_wait() {
+        let l = KeyedLimiter::new(2, 3600);
+        assert_eq!(l.spend("n", 1_000), Ok(()));
+        assert_eq!(l.spend("n", 1_100), Ok(()));
+        assert_eq!(l.spend("n", 1_200), Err(3_400), "the first leaves at 4,600");
+        assert_eq!(l.check("n", 1_200), Err(3_400));
+        assert_eq!(l.spend("other", 1_200), Ok(()), "each key its own window");
+        assert!(!l.allows("n", 4_599) && l.allows("n", 4_601));
+        let bind = include_str!("light_bind.rs");
+        assert!(bind.contains("if let Err(wait) = BIND_NODE_LIMIT.spend(&req.node_id, now) {\r\n            return Ok(answer(lb::rate_limited_json(wait)));")
+                || bind.contains("if let Err(wait) = BIND_NODE_LIMIT.spend(&req.node_id, now) {\n            return Ok(answer(lb::rate_limited_json(wait)));"));
+        let unbind = include_str!("light_unbind.rs");
+        assert!(unbind.contains("if let Err(wait) = UNBIND_NODE_LIMIT.spend(&req.node_id, now) {"));
+        let nodes = include_str!("light_nodes.rs");
+        assert!(nodes.contains("if let Err(wait) = TOKEN_REFRESH_NODE_LIMIT.spend(&req.node_id, now) {"));
+        let bare = format!("Refusal::RateLimited.{}()));", "to_json");
+        for src in [bind, unbind, nodes] {
+            assert!(!src.contains(&bare), "no limit refusal without its wait");
+        }
+    }
+
+    /// Every per-address bucket counts an IPv6 caller by its /64 (A2), bind's own bucket of every request (A4) and the
+    /// answer route's included.
+    #[test]
+    fn every_address_bucket_counts_an_ipv6_host_by_its_64() {
+        let at = |s: &str| -> Option<std::net::SocketAddr> { Some(format!("[{s}]:443").parse().unwrap()) };
+        for _ in 0..60 { assert!(api_rate_limit_retry(at("2001:db8:5:6::1"), LIGHT_BIND_BUCKET).is_ok()); }
+        assert!(api_rate_limit_retry(at("2001:db8:5:6:ffff::2"), LIGHT_BIND_BUCKET).is_err(), "the same /64");
+        assert!(api_rate_limit_retry(at("2001:db8:5:7::1"), LIGHT_BIND_BUCKET).is_ok(), "the next /64");
+        for _ in 0..120 { assert!(api_rate_limit_retry(at("2001:db8:9:9::1"), "light_node_ping").is_ok()); }
+        assert!(api_rate_limit_retry(at("2001:db8:9:9:abcd::7"), "light_node_ping").is_err(), "another address of the /64");
+        let v4: Option<std::net::SocketAddr> = Some("198.51.100.200:443".parse().unwrap());
+        for _ in 0..60 { assert!(api_rate_limit_retry(v4, LIGHT_BIND_BUCKET).is_ok()); }
+        let next: Option<std::net::SocketAddr> = Some("198.51.100.201:443".parse().unwrap());
+        assert!(api_rate_limit_retry(next, LIGHT_BIND_BUCKET).is_ok(), "an IPv4 address is its own");
     }
 }

@@ -1,0 +1,7 @@
+# Pastes the simulator's pasteboard into the field whose placeholder is FIELD: a tap gives it focus, a long press opens
+# the edit menu with Paste.
+appId: com.qnetmobile
+---
+- tapOn: ${FIELD}
+- longPressOn: ${FIELD}
+- tapOn: "Paste"

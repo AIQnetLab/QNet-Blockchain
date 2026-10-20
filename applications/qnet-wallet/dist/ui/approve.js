@@ -9,13 +9,16 @@
 // (qnet_activateNode) is confirmed the same way (a burn also needs its acknowledgement ticked); the worker burns (or
 // reads the wallet's existing activation) and this window stays on the outcome until closed, showing a light node's
 // record on the QNet network while it is made. So do a move of the balance of the node the site names, the wallet's light
-// or super node (qnet_claimNodeBalance, decision 47), and the unlink of the light node's device (qnet_unlinkNodeDevice).
+// or super node (qnet_claimNodeBalance, decision 47), the unlink of the light node's device (qnet_unlinkNodeDevice), and
+// aiqnet.io's one SOL or 1DEV transfer (qnet_sendSolanaTransfer, decision 52), shown read-only as the Send review shows it.
 import { DEFAULT_LANGUAGE, QNET, TIMINGS, languageForTag } from '../background/config.js';
 import {
   DECIMALS, call, clear, clearPageStorage, el, formatUnits, hardenSecretInput, loadLocale, log, onWalletEvent, refuseAutoFocus,
   refuseFramed, t, wipeInputs,
 } from './common.js';
-import { codeText, errorText, figureText, formatAmount, formatDay } from './kit.js';
+import {
+  codeText, errorText, figureText, formatAmount, formatDay, solAmount, solanaAsset, solanaReviewRows, solanaShortfall,
+} from './kit.js';
 
 refuseFramed();
 // no field takes the cursor on its own (owner, 06.10)
@@ -27,6 +30,9 @@ const REVIEW_AGAIN = new Set(['FEE_CHANGED', 'NONCE_CHANGED', 'NONCE_UNAVAILABLE
 const TX_KINDS = new Set(['sendTransaction', 'tokenTransfer', 'contractCall']);
 const PREVIEW_RETRY_MS = 3000;
 const PREVIEW_RETRIES = 5;
+// A transfer whose quote Solana did not give (no answer, or one that did not check) may get it at the next read; a
+// shortfall or the wallet's own address stays as it is, so those are not read again this often.
+const TRANSFER_READ_AGAIN = new Set(['SOLANA_UNAVAILABLE', 'INTERNAL']);
 // While an earlier transaction of the wallet holds the nonce before this one's, the view is read again this often.
 const IN_FLIGHT_RETRY_MS = 4000;
 const REFRESH_DEBOUNCE_MS = 150;
@@ -156,6 +162,23 @@ function frame(next, body, actions, title = null) {
   clear(app);
   // append() would print a null as the text "null"
   app.append(...parts.filter((part) => part !== null));
+}
+
+// A progress bar with its line, while the worker runs a confirmed action.
+function progressCard(label) {
+  return el('section', { className: 'ap-card' },
+    el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': label } }, el('div', { className: 'progress-bar' })),
+    el('p', { text: label }));
+}
+
+// The worker answered the site: the window says what happened and stays until closed (the worker closes it at the latest).
+function showOutcome(next, body, title = null, primary = true) {
+  finished = true;
+  clearInterval(heartbeat);
+  clearTimeout(retryTimer);
+  const close = button(t('close'), primary);
+  close.addEventListener('click', closeWindow);
+  frame(next, body, el('div', { className: 'ap-actions' }, close), title);
 }
 
 async function fetchView() {
@@ -433,8 +456,8 @@ function transferBody(details) {
   return { body, confirmable: ready && covered && details.inFlight !== true };
 }
 
-// A token amount in the token's decimals with its symbol, or the bare figure when the token has no symbol to show, as the
-// UI language writes figures (figureText).
+// A token amount in the token's decimals with its symbol, or the bare figure when the token has no symbol to show, in the
+// one format of every language (figureText).
 function tokenAmount(units, details) {
   if (details.symbol !== '') return formatAmount(units, details.decimals, details.symbol);
   try {
@@ -519,9 +542,9 @@ function contractCallBody(details) {
   return { body, confirmable: ready && covered && details.inFlight !== true };
 }
 
-// While unlocked a transaction preview or an activation view may still be missing (network); ask again. A transaction
-// behind an earlier one not in a block yet is read again until it is, and so is an activation while the wallet is being
-// checked, without a limit (the approval's own timeout ends it).
+// While unlocked a transaction preview, an activation view or a transfer's quote may still be missing (network); ask
+// again. A transaction behind an earlier one not in a block yet is read again until it is, and so is an activation while
+// the wallet is being checked, without a limit (the approval's own timeout ends it).
 function schedulePreviewRetry(next) {
   clearTimeout(retryTimer);
   if (!next.locked && next.kind === 'activateNode' && next.details.mode === 'checking') {
@@ -535,7 +558,8 @@ function schedulePreviewRetry(next) {
     return;
   }
   const waiting = !next.locked && ((TX_KINDS.has(next.kind) && next.details.nonce === null)
-    || (['activateNode', 'claimNodeBalance', 'unlinkNodeDevice'].includes(next.kind) && next.details.mode === null));
+    || (['activateNode', 'claimNodeBalance', 'unlinkNodeDevice', 'solanaTransfer'].includes(next.kind) && next.details.mode === null)
+    || (next.kind === 'solanaTransfer' && next.details.mode === 'unavailable' && TRANSFER_READ_AGAIN.has(next.details.reason)));
   if (!waiting) {
     previewRetries = 0;
     return;
@@ -567,6 +591,10 @@ function renderApproval(next) {
   }
   if (next.kind === 'unlinkNodeDevice') {
     renderUnlink(next);
+    return;
+  }
+  if (next.kind === 'solanaTransfer') {
+    renderSolanaTransfer(next);
     return;
   }
   const confirm = button(t(`apConfirm_${next.kind}`), true);
@@ -771,12 +799,7 @@ function renderActivation(next) {
 }
 
 function progressBody(next, mode) {
-  if (mode !== 'burn') {
-    return el('section', { className: 'ap-card' },
-      el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': t('apActivateChecking') } },
-        el('div', { className: 'progress-bar' })),
-      el('p', { text: t('apActivateChecking') }));
-  }
+  if (mode !== 'burn') return progressCard(t('apActivateChecking'));
   const elapsed = el('p', { className: 'ap-muted' });
   const started = Date.now();
   ticker = setInterval(() => {
@@ -822,11 +845,6 @@ async function runActivation(next, mode) {
 
 // The worker answered the site; this window says what happened and stays until closed.
 function renderActivationOutcome(next, result) {
-  finished = true;
-  clearInterval(heartbeat);
-  clearTimeout(retryTimer);
-  const close = button(t('close'), true);
-  close.addEventListener('click', closeWindow);
   const status = result?.status;
   let body;
   // titled by what happened (EXT-F5): the code, a burn waiting for Solana, or no code
@@ -853,7 +871,7 @@ function renderActivationOutcome(next, result) {
       el('p', { className: 'ap-error', attrs: { role: 'alert' }, text: codeText(code) }),
       el('p', { className: 'ap-muted', text: t(note) }));
   }
-  frame(next, body, el('div', { className: 'ap-actions' }, close), title);
+  showOutcome(next, body, title);
 }
 
 // The line of a light node's record on the QNet network after the answer, read again while it is being made (the
@@ -940,16 +958,27 @@ function renderClaim(next) {
   armConfirm(confirm, () => runClaim(next), () => true, TIMINGS.CONFIRM_ARM_VALUE_MS);
 }
 
-async function runClaim(next) {
+/**
+ * The armed confirm of a claim, an unlink or a transfer: progress while the worker runs it, then onResult(result). LOCKED
+ * or a code of `again` reads the view again (the approval is still open, `noticeOf(code)` says why); any other error is
+ * shown until the window is closed.
+ * @param {import('../background/provider.js').ApprovalView} next
+ * @param {string} label the progress line
+ * @param {(result: object) => void} onResult
+ * @param {{again?: Set<string>, noticeOf?: (code: string) => string, keepAlive?: boolean}} [options] keepAlive: a cheap read
+ *   every KEEPALIVE_MS keeps the worker awake while it runs
+ * @returns {Promise<void>}
+ */
+async function runConfirm(next, label, onResult, { again = REVIEW_AGAIN, noticeOf = () => t('apReviewAgain'), keepAlive = false } = {}) {
   if (busy || finished) return;
   busy = true;
   notice = null;
-  frame(next, el('section', { className: 'ap-card' },
-    el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': t('apClaimProgress') } }, el('div', { className: 'progress-bar' })),
-    el('p', { text: t('apClaimProgress') })), null);
-  keepalive = setInterval(() => {
-    call('vault.status').catch(() => {});
-  }, KEEPALIVE_MS);
+  frame(next, progressCard(label), null);
+  if (keepAlive) {
+    keepalive = setInterval(() => {
+      call('vault.status').catch(() => {});
+    }, KEEPALIVE_MS);
+  }
   let result;
   try {
     result = await call('approval.resolve', { id: next.id, approved: true, revision: next.revision });
@@ -958,8 +987,8 @@ async function runClaim(next) {
     busy = false;
     if (error.code === 'NOT_FOUND') {
       closeWindow();
-    } else if (error.code === 'LOCKED' || REVIEW_AGAIN.has(error.code)) {
-      notice = REVIEW_AGAIN.has(error.code) ? t('apReviewAgain') : null;
+    } else if (error.code === 'LOCKED' || again.has(error.code)) {
+      notice = again.has(error.code) ? noticeOf(error.code) : null;
       screenKey = '';
       await refresh();
     } else {
@@ -969,16 +998,15 @@ async function runClaim(next) {
   }
   stopActivityTimers();
   busy = false;
-  renderClaimOutcome(next, result);
+  onResult(result);
+}
+
+function runClaim(next) {
+  return runConfirm(next, t('apClaimProgress'), (result) => renderClaimOutcome(next, result), { keepAlive: true });
 }
 
 // The worker answered the site; this window says what happened and stays until closed.
 function renderClaimOutcome(next, result) {
-  finished = true;
-  clearInterval(heartbeat);
-  clearTimeout(retryTimer);
-  const close = button(t('close'), true);
-  close.addEventListener('click', closeWindow);
   let body;
   let title = t('done');
   if (result?.status === 'ok') {
@@ -992,7 +1020,7 @@ function renderClaimOutcome(next, result) {
     body = el('section', { className: 'ap-card' },
       el('p', { className: 'ap-error', attrs: { role: 'alert' }, text: codeText(typeof result?.error === 'string' ? result.error : 'INTERNAL') }));
   }
-  frame(next, body, el('div', { className: 'ap-actions' }, close), title);
+  showOutcome(next, body, title);
 }
 
 // ---------------------------------------------------------------- the light node's device (qnet_unlinkNodeDevice)
@@ -1037,54 +1065,90 @@ function renderUnlink(next) {
   armConfirm(confirm, () => runUnlink(next));
 }
 
-async function runUnlink(next) {
-  if (busy || finished) return;
-  busy = true;
-  notice = null;
-  frame(next, el('section', { className: 'ap-card' },
-    el('div', { className: 'progress', attrs: { role: 'progressbar', 'aria-label': t('unlinkWorking') } }, el('div', { className: 'progress-bar' })),
-    el('p', { text: t('unlinkWorking') })), null);
-  let result;
-  try {
-    result = await call('approval.resolve', { id: next.id, approved: true, revision: next.revision });
-  } catch (error) {
-    busy = false;
-    if (error.code === 'NOT_FOUND') {
-      closeWindow();
-    } else if (error.code === 'LOCKED' || REVIEW_AGAIN.has(error.code)) {
-      notice = REVIEW_AGAIN.has(error.code) ? t('apReviewAgain') : null;
-      screenKey = '';
-      await refresh();
-    } else {
-      renderOutcome(error);
-    }
+function runUnlink(next) {
+  return runConfirm(next, t('unlinkWorking'), (result) => {
+    const ok = result?.status === 'ok';
+    showOutcome(next,
+      el('section', { className: 'ap-card' }, ok
+        ? el('p', { className: 'ap-ok', text: t('unlinkDone') })
+        : el('p', { className: 'ap-error', attrs: { role: 'alert' }, text: unlinkReason(typeof result?.error === 'string' ? result.error : 'INTERNAL') })),
+      ok ? t('apOutcome_unlinkOk') : t('apFailed'));
+  });
+}
+
+// ---------------------------------------------------------------- a site's Solana transfer (qnet_sendSolanaTransfer)
+
+// The Send review's rows (kit.solanaReviewRows), read-only: the request's recipient, token and amount (never a field the
+// user can edit), its quote, then the balances.
+function solanaTransferRows(details, token) {
+  const read = details.feeLamports !== null;
+  return [
+    ...block(t('reviewTo'), details.to, 'ap-mono ap-address'),
+    recipientWarning(details),
+    ...solanaReviewRows(details, token).flatMap(([label, value, kind]) => (kind === 'address'
+      ? block(label, value, 'ap-mono ap-address') : [row(label, value, kind === 'strong' ? 'ap-strong' : '')])),
+    row(t('apBalance'), read ? solAmount(details.balanceLamports) : '—'),
+    read && token.mint !== null ? row(t('apBalance'), formatAmount(details.tokenRaw, token.decimals, token.symbol)) : null,
+  ];
+}
+
+/**
+ * The transfer by details.mode: 'confirm' (the request read-only with its quote; Reject or the armed Send), 'unavailable'
+ * (why, with one button that tells the site), null (still reading). No password: the unlocked session and the armed press
+ * confirm (TIMINGS.CONFIRM_ARM_VALUE_MS, as any transaction).
+ * @param {import('../background/provider.js').ApprovalView} next
+ * @returns {void}
+ */
+function renderSolanaTransfer(next) {
+  const { details } = next;
+  const token = solanaAsset(details.asset);
+  if (details.mode !== 'confirm' && details.mode !== 'unavailable') {
+    frame(next, el('section', { className: 'ap-card' }, el('p', { className: 'ap-muted', attrs: { role: 'status' }, text: t('apSolanaReading') })),
+      el('div', { className: 'ap-actions' }, rejectButton()));
     return;
   }
-  busy = false;
-  finished = true;
-  clearInterval(heartbeat);
-  clearTimeout(retryTimer);
-  const close = button(t('close'), true);
-  close.addEventListener('click', closeWindow);
-  const ok = result?.status === 'ok';
+  if (details.mode === 'unavailable') {
+    const close = button(t('close'), true);
+    close.addEventListener('click', (event) => {
+      if (event.isTrusted) resolve(next.id, false);
+    });
+    const reason = solanaShortfall(details, token, token.decimals) ?? codeText(details.reason);
+    frame(next,
+      el('section', { className: 'ap-card' },
+        el('p', { className: 'ap-error ap-strong', attrs: { role: 'alert' }, text: reason }),
+        ...solanaTransferRows(details, token)),
+      el('div', { className: 'ap-actions' }, close));
+    return;
+  }
+  const confirm = button(t('apConfirm_solanaTransfer'), true);
   frame(next,
-    el('section', { className: 'ap-card' }, ok
-      ? el('p', { className: 'ap-ok', text: t('unlinkDone') })
-      : el('p', { className: 'ap-error', attrs: { role: 'alert' }, text: unlinkReason(typeof result?.error === 'string' ? result.error : 'INTERNAL') })),
-    el('div', { className: 'ap-actions' }, close), ok ? t('apOutcome_unlinkOk') : t('apFailed'));
+    el('section', { className: 'ap-card' }, el('p', { text: t('apSolanaIntro') }), ...solanaTransferRows(details, token)),
+    el('div', { className: 'ap-actions' }, rejectButton(), confirm));
+  armConfirm(confirm, () => runSolanaTransfer(next), () => true, TIMINGS.CONFIRM_ARM_VALUE_MS);
+}
+
+// FEE_CHANGED, BLOCKHASH_EXPIRED and LOCKED leave the request open: the window reads the quote again (or unlocks first).
+const TRANSFER_REVIEW_AGAIN = new Set(['FEE_CHANGED', 'BLOCKHASH_EXPIRED']);
+
+// The outcome stays until closed; closing it never cancels a sent transfer.
+function runSolanaTransfer(next) {
+  return runConfirm(next, t('apSolanaSending'), (result) => {
+    const sent = result?.status === 'submitted' && typeof result.signature === 'string';
+    const error = typeof result?.error === 'string' ? result.error : 'INTERNAL';
+    showOutcome(next,
+      el('section', { className: 'ap-card' }, ...(sent
+        ? [el('p', { className: 'ap-ok', text: t('apOutcome_solanaSent') }), ...block(t('sentSignature'), result.signature)]
+        : [el('p', { className: 'ap-error', attrs: { role: 'alert' }, text: codeText(error) })])),
+      sent ? t('sentTitle') : t('apFailed'));
+  }, { again: TRANSFER_REVIEW_AGAIN, noticeOf: codeText });
 }
 
 function renderOutcome(error) {
-  finished = true;
-  clearInterval(heartbeat);
-  clearTimeout(retryTimer);
-  const close = button(t('close'), false);
-  close.addEventListener('click', closeWindow);
-  frame(view,
+  showOutcome(view,
     el('section', { className: 'ap-card' },
       el('p', { className: 'ap-strong', text: t('apFailed') }),
       el('p', { className: 'ap-error', attrs: { role: 'alert' }, text: errorText(error) })),
-    el('div', { className: 'ap-actions' }, close));
+    null, false);
 }
 
 function setActionsDisabled(disabled) {

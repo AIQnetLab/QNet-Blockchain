@@ -1,0 +1,27 @@
+# Auto-Lock set to Never right after the import, so no wait for a node's answer in the scenes can lock the wallet under
+# the flows (the default locks after a minute without a touch). A longer time asks for the wallet password, pasted as at
+# the import and submitted with the keyboard's return; settings.yaml sets the default back before its capture.
+appId: com.qnetmobile
+---
+- tapOn:
+    id: "tab-settings"
+# The row's value, the default, opens the choices.
+- tapOn: "1 minute"
+- tapOn: "Never"
+- runScript:
+    file: control.js
+    env:
+      ACTION: "pasteboard/password"
+- runFlow:
+    file: paste.yaml
+    env:
+      FIELD: "Password"
+- pressKey: Enter
+- runScript:
+    file: control.js
+    env:
+      ACTION: "pasteboard/clear"
+# The row shows the new value once the password was accepted and the choice saved.
+- extendedWaitUntil:
+    visible: "Never"
+    timeout: 10000

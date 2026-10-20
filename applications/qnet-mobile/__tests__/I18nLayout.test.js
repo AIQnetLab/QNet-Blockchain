@@ -66,20 +66,6 @@ jest.mock('../src/i18n/translations', () => {
   return { __esModule: true, default: tables };
 });
 
-// The screens' figures are written as the suite's language writes them (utils/amountFormat), the screen itself running
-// in 'en': each suite width-checks its own group and decimal marks, the longest table French ones (a narrow no-break
-// space, a decimal comma).
-jest.mock('../src/utils/amountFormat', () => {
-  const real = jest.requireActual('../src/utils/amountFormat');
-  const of = (lang) => (lang && lang !== 'en' ? lang : (mockTables.active === 'longest' ? 'fr' : mockTables.active));
-  return {
-    ...real,
-    amountSymbols: (lang) => real.amountSymbols(of(lang)),
-    amountText: (value, lang) => real.amountText(value, of(lang)),
-    qncText: (nano, lang, hidden) => real.qncText(nano, of(lang), hidden),
-  };
-});
-
 // ── The wallet's services, standing still ──────────────────────────────────────────────────────────────────────────
 const mockQNET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const mockSOL = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
@@ -203,6 +189,8 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
 }));
 
 jest.mock('../src/services/PushService', () => ({
+  readUnconfirmedBinding: jest.fn(async () => null),
+  settleUnconfirmedBinding: jest.fn(async () => false),
   BG_REFRESH_STATUS_KEY: 'qnet_bg_refresh_status',
   LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
   localBinding: jest.fn(async () => mockState.local),
@@ -528,9 +516,9 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const WalletScreen = require('../src/screens/WalletScreen').default;
 const walletStyles = require('../src/screens/WalletScreen.styles').default;
 const Svg = require('react-native-svg').default;
-// A figure with its symbol as the suite's language writes it (the mock above).
+// A figure with its symbol as every screen writes it, in every language (utils/amountFormat).
 const { amountText } = require('../src/utils/amountFormat');
-const figure = (value, symbol) => `${amountText(value, 'en')} ${symbol}`;
+const figure = (value, symbol) => `${amountText(value)} ${symbol}`;
 
 // The Send form's scan: one button inside the recipient field's own container, beside the address input, named by the
 // scan's title for screen readers and drawn as an icon, with no text. Returns the button.
@@ -717,13 +705,13 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await AsyncStorage.setItem('qnet_shown_tokens', JSON.stringify(['a'.repeat(64), 'b'.repeat(64), 'd'.repeat(64)]));
     const tree = await unlocked();
     const issues = [...check(tree, 'assets')];
-    // Every figure in the language's own marks: QNC as read (1234567.123456, five places shown) and each token exactly.
-    expect(texts(tree)).toContain(amountText('1234567.12346', 'en'));
+    // Every figure in the one format: QNC as read (1234567.123456, five places shown) and each token exactly.
+    expect(texts(tree)).toContain(amountText('1234567.12346'));
     // A balance is never cut: beside its token while it fits two fifths of the row at half its size at the large text
     // size, else under the token, whole (the strict walk measures the first at full size and at the large text size).
     const balances = tree.root.findAll((n) => n.type === Text && n.props.style === walletStyles.tokenAmount);
     for (const [balance, beside] of [['1234567.891234', true], ['0.000000000000000001', false], ['12345.123456789012345678', false]]) {
-      const shown = balances.filter((n) => [].concat(n.props.children).join('') === amountText(balance, 'en'));
+      const shown = balances.filter((n) => [].concat(n.props.children).join('') === amountText(balance));
       expect([balance, shown.length, shown.length === 1 && shown[0].props.numberOfLines === 1]).toEqual([balance, 1, beside]);
     }
     await pressKey(tree, 'assets_send');
@@ -935,9 +923,9 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     shows(tree, ['node_use_title']);
     issues.push(...checkWidths(tree, 'node: use this device alert'));
     await pressKey(tree, 'cancel');
-    // Bound to another device, or to none: what a wallet without a node shows (owner, 11.10).
+    // Bound to another device: that, and nothing else; bound to none: what a wallet without a node shows (owner, 11.10).
     await reread(tree, { local: null, lightStatus: base });
-    shows(tree, ['node_none']);
+    shows(tree, ['node_elsewhere']);
     expect(tree.root.findAll((n) => n.props.testID === 'node-use' || n.props.testID === 'node-move')).toEqual([]);
     issues.push(...checkWidths(tree, 'node: another device'));
     await reread(tree, { lightStatus: { ...base, deviceBound: false } });
@@ -980,7 +968,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     issues.push(...checkWidths(tree, 'node: server node'));
     await unmount(tree);
     // Registered and not admitted to consensus yet (owner, 11.10): waiting, never Offline.
-    mockState.server = { isOnline: false, consensusAdmitted: false, reputation: 70 };
+    mockState.server = { isOnline: false, admission: 'waiting', reputation: 70 };
     tree = await nodeTab();
     shows(tree, ['node_waiting_admission', 'node_badge_waiting', 'node_move']);
     expect(texts(tree)).not.toContain(label('node_server_offline'));
@@ -1267,7 +1255,7 @@ describe('a label with its value is held to one line', () => {
     expect(now).toEqual([]);
     expect(await walk((t) => <InfoRow label={t('node_answered')} value={t('node_answered_yes', { time: '14:05' })} />, 'ru')).toEqual([]);
     // A figure may shrink to half its size, the label beside it giving way far less.
-    expect(await walk((t) => <InfoRow label={t('node_balance')} value={`${amountText('1234567.123456', 'ru')} QNC`} tone="accent" ltr fit />, 'ru'))
+    expect(await walk((t) => <InfoRow label={t('node_balance')} value={`${amountText('1234567.123456')} QNC`} tone="accent" ltr fit />, 'ru'))
       .toEqual([]);
   });
 

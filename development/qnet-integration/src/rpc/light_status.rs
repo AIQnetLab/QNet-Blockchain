@@ -107,6 +107,9 @@ pub(crate) struct DeviceView {
     /// Unix seconds of the answer that counted the node in its latest counted epoch, from this genesis's rows for
     /// the current epoch and the two before (`last_counted_answer_at`); None when it holds none.
     pub(crate) last_answer_at: Option<u64>,
+    /// The device bound now answered since this genesis took its binding (`device_answered`), not only the node: false
+    /// right after a move while the node still counts by the device it replaced, and while no device is bound.
+    pub(crate) answered: bool,
     /// "online", "offline", "unlinked" or "other_device_pending".
     pub(crate) state: &'static str,
     /// The epochs the node was not counted in, newest first, as this genesis saw them (`shown_misses`); the newest is
@@ -124,6 +127,7 @@ impl DeviceView {
             "model": self.model,
             "linked_since": self.linked_since,
             "last_answer_epoch": self.last_answer_epoch,
+            "answered": self.answered,
             "state": self.state,
             "last_miss": self.misses.first().map(LightMiss::public_json),
         })
@@ -140,17 +144,19 @@ impl DeviceView {
     }
 }
 
-/// The device view from the vouched binding and the final liveness. `other_device_pending`: nothing counted the
-/// node in this epoch or the last two, and the device linked less than an epoch ago has not answered yet.
-/// `platform` and `model` are the bound device's (`device_hints`).
-pub(crate) fn device_view(onchain: bool, binding: Option<&BindingRow>, needs_reactivation: bool, platform: &'static str,
-                          model: &str, last_answer_epoch: Option<u64>, now: u64) -> Option<DeviceView> {
+/// The device view from the vouched binding, the final liveness and whether the device bound now answered
+/// (`device_answered`). `online`: that device answered and the node counts; `other_device_pending`: the device linked
+/// less than an epoch ago has not answered yet, whatever the device it replaced did; else `offline`. `platform` and
+/// `model` are the bound device's (`device_hints`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn device_view(onchain: bool, binding: Option<&BindingRow>, needs_reactivation: bool, device_answered: bool,
+                          platform: &'static str, model: &str, last_answer_epoch: Option<u64>, now: u64) -> Option<DeviceView> {
     if !onchain { return None; }
     let bound = binding.filter(|b| b.device_bound());
     let state = match bound {
         None => "unlinked",
-        Some(_) if !needs_reactivation => "online",
-        Some(b) if b.v2 && b.seq > 0 && now < b.seq.saturating_add(LINK_GRACE_SECS) => "other_device_pending",
+        Some(_) if device_answered && !needs_reactivation => "online",
+        Some(b) if !device_answered && b.v2 && b.seq > 0 && now < b.seq.saturating_add(LINK_GRACE_SECS) => "other_device_pending",
         Some(_) => "offline",
     };
     Some(DeviceView {
@@ -159,10 +165,27 @@ pub(crate) fn device_view(onchain: bool, binding: Option<&BindingRow>, needs_rea
         linked_since: bound.filter(|b| b.seq > 0).map(|b| b.seq - b.seq % 86_400),
         last_answer_epoch,
         last_answer_at: None,
+        answered: bound.is_some() && device_answered,
         state,
         misses: Vec::new(),
         last_answer: None,
     })
+}
+
+/// Whether the device bound now answered, from what this genesis holds, all on its own clock: an answer of it recorded
+/// here since it stored the binding (`answer_here`, `LightPushRow::since`), or a count of the node in an epoch that
+/// began at or after `bound_at` (`counted_starts`: the start of each epoch the node counts in), since every answer this
+/// genesis credits from then on verified under that binding's key.
+pub(crate) fn device_answered(bound_at: u64, answer_here: bool, counted_starts: &[Option<u64>]) -> bool {
+    answer_here || counted_starts.iter().flatten().any(|start| *start >= bound_at)
+}
+
+/// Whether this genesis recorded an answer of the device bound now since it stored that binding (`record_answer`): None
+/// while no device is bound. The answer route verifies the first answer of a new device that the epoch's count would
+/// otherwise turn away unchecked, so the status can tell it from the device it replaced.
+pub(crate) fn bound_answer_recorded(storage: &crate::storage::Storage, node_id: &str) -> Option<bool> {
+    let b = storage.get_light_binding(node_id).filter(|b| b.device_bound())?;
+    Some(stored_row(storage, node_id).map_or(false, |r| r.since(b.bound_at).answer.is_some()))
 }
 
 /// The last finished epoch's candidate miss by the dormant rule (`not_woken_inactive`), read from the committed index
@@ -317,6 +340,13 @@ pub(crate) fn liveness(onchain: bool, attested_recent: bool, answered: bool, fre
     (needs_reactivation, is_active)
 }
 
+/// Whether the status asks the other owners of the node's light shard (`shard_owners_view`): while this genesis would
+/// call the node inactive, and while a device is bound whose answer this genesis has not seen (a non-owner, or an owner
+/// the device did not answer, right after a move). A node counted by a device that answered here asks nobody.
+pub(crate) fn owners_asked(is_active: bool, device_bound: bool, bound_answered: bool) -> bool {
+    !is_active || (device_bound && !bound_answered)
+}
+
 /// The first epoch a registration at `reg_height` can be counted in: its own epoch when it applied
 /// before that epoch's light roster froze, else the next (`light_roster_cutoff`, the reward reader's
 /// rule).
@@ -376,29 +406,7 @@ pub(crate) async fn light_status(blockchain: &BlockchainNode, node_id: &str, ask
     let attested_recent = onchain && storage.light_attested_recent_onchain(node_id, cur_height);
     let fresh = registered_height.map_or(false, |h| cur_height.saturating_sub(h) < FRESH_GRACE_BLOCKS);
     let (mut needs_reactivation, mut is_active) = liveness(onchain, attested_recent, answered, fresh, device_bound, false);
-    // This epoch's view is shard-owner RAM: before calling an on-chain node inactive, ask every other owner (F13),
-    // so every genesis returns one verdict whichever owner took the answer.
-    if onchain && !is_active && ask_owner {
-        if let Some(v) = super::light_nodes::shard_owners_view(node_id).await {
-            answered |= v.answered;
-            if v.active || v.answered {
-                (needs_reactivation, is_active) = liveness(onchain, attested_recent, answered, fresh, device_bound, true);
-            }
-        }
-    }
-    // F8: an epoch of the two the verdict reads that this genesis did not derive, or in which the node's shard
-    // committed no row, says nothing of the device.
     let shard = crate::node::light_shard_of(node_id);
-    let e = cur_height / EPOCH_BLOCKS;
-    let recent_shards = [e.checked_sub(1).and_then(|x| storage.light_elig_shards(x)),
-                         e.checked_sub(2).and_then(|x| storage.light_elig_shards(x))];
-    if needs_reactivation && recent_neutral(recent_shards, shard) {
-        needs_reactivation = false;
-    }
-    // A registration the pool holds or a submit collecting attestations here: the cabinet offers no
-    // second burn meanwhile.
-    let registration_pending = !onchain
-        && (pending_registration_tx(node_id).is_some() || submit_in_flight(node_id, now));
     // Only the epochs this genesis indexed in which the node's shard committed a row count (F8).
     let (uptime, done_raw, committed) = match (onchain, last_finished_epoch(cur_height)) {
         (true, Some(end)) => {
@@ -412,21 +420,57 @@ pub(crate) async fn light_status(blockchain: &BlockchainNode, node_id: &str, ask
         (true, Some(_)) => counted_view(registered_height, cur_height, uptime, done),
         _ => Counted::default(),
     };
+    // This epoch on the clock `has_attestation_in_window` reads.
+    let this_epoch = crate::unified_p2p::SimplifiedP2P::get_current_window_number();
+    // While a device is bound, only what came after the binding held here, so never the device it replaced: its last
+    // answer, why the node was not counted in each epoch, and whether that device answered at all.
+    let bound_at = binding.as_ref().filter(|b| b.device_bound()).map(|b| b.bound_at);
+    let row = bound_at.map(|t| stored_row(&storage, node_id).unwrap_or_default().since(t));
+    let counted_starts = [
+        if answered { epoch_started_at(&storage, this_epoch, cur_height, now) } else { None },
+        counted.last_counted_epoch.and_then(|e| epoch_started_at(&storage, e, cur_height, now)),
+    ];
+    let mut bound_answered = match (bound_at, &row) {
+        (Some(t), Some(r)) => device_answered(t, r.answer.is_some(), &counted_starts),
+        _ => false,
+    };
+    // This epoch's view is shard-owner RAM: before calling an on-chain node inactive, or the device bound now silent, ask
+    // every other owner (F13), so every genesis returns one verdict whichever owner took the answer. An owner's word on
+    // that device holds only under the very binding held here (`bound`): its plain `answered` may be the replaced
+    // device's.
+    let bound_seq = binding.as_ref().filter(|b| b.device_bound() && b.v2).map(|b| b.seq);
+    if onchain && ask_owner && owners_asked(is_active, bound_at.is_some(), bound_answered) {
+        if let Some(v) = super::light_nodes::shard_owners_view(node_id, bound_seq).await {
+            answered |= v.answered;
+            if v.active || v.answered {
+                (needs_reactivation, is_active) = liveness(onchain, attested_recent, answered, fresh, device_bound, true);
+            }
+            bound_answered |= bound_seq.is_some() && v.device_answered;
+        }
+    }
+    // F8: an epoch of the two the verdict reads that this genesis did not derive, or in which the node's shard
+    // committed no row, says nothing of the device.
+    let e = cur_height / EPOCH_BLOCKS;
+    let recent_shards = [e.checked_sub(1).and_then(|x| storage.light_elig_shards(x)),
+                         e.checked_sub(2).and_then(|x| storage.light_elig_shards(x))];
+    if needs_reactivation && recent_neutral(recent_shards, shard) {
+        needs_reactivation = false;
+    }
+    // A registration the pool holds or a submit collecting attestations here: the cabinet offers no
+    // second burn meanwhile.
+    let registration_pending = !onchain
+        && (pending_registration_tx(node_id).is_some() || submit_in_flight(node_id, now));
     let record = storage.device_record(node_id);
     let (platform, model) = match (&binding, onchain) {
         (Some(b), true) => device_hints(&storage, node_id, b, record.as_ref()),
         _ => ("", String::new()),
     };
-    // This epoch on the clock `has_attestation_in_window` reads, else the last epoch the node was counted in.
-    let last_answer = if answered { Some(crate::unified_p2p::SimplifiedP2P::get_current_window_number()) }
-                      else { counted.last_counted_epoch };
-    let mut device_view = device_view(onchain, binding.as_ref(), needs_reactivation, platform, &model, last_answer, now);
+    // This epoch, else the last epoch the node was counted in.
+    let last_answer = if answered { Some(this_epoch) } else { counted.last_counted_epoch };
+    let mut device_view = device_view(onchain, binding.as_ref(), needs_reactivation, bound_answered, platform, &model,
+                                      last_answer, now);
     if let Some(d) = device_view.as_mut() { d.last_answer_at = last_counted_answer_at(&storage, node_id, cur_height); }
-    // Why the node was not counted in each epoch and its last answer, while a device is bound: only what came after
-    // the binding held here, so never the device it replaced.
-    let bound_at = binding.as_ref().filter(|b| b.device_bound()).map(|b| b.bound_at);
-    if let (Some(d), Some(bound_at)) = (device_view.as_mut(), bound_at) {
-        let row = stored_row(&storage, node_id).unwrap_or_default().since(bound_at);
+    if let (Some(d), Some(row)) = (device_view.as_mut(), row) {
         // The dormant rule's miss only where it holds as the pusher applies it: two proven device misses before the
         // epoch (`proven_dormant`, an owner's reach records); a genesis that cannot prove them shows none.
         let dormant = dormant_miss(registered_height, cur_height, uptime, done)
@@ -535,7 +579,7 @@ fn parse_nonce(s: Option<&str>) -> Option<[u8; 16]> {
 /// The `node_id` of a keyless light-node query, or the answer that refuses one without it.
 fn node_id_param(params: &HashMap<String, String>) -> Result<String, warp::reply::Json> {
     match params.get("node_id") {
-        Some(id) if !id.is_empty() && id.len() <= 128 => Ok(id.clone()),
+        Some(id) if !id.is_empty() && id.len() <= lb::LIGHT_NODE_ID_MAX => Ok(id.clone()),
         _ => Err(warp::reply::json(&json!({
             "success": false,
             "error": "node_id parameter required"
@@ -557,9 +601,22 @@ pub(super) async fn handle_light_node_status(
         Err(refused) => return Ok(refused),
     };
     // `fwd=1` marks the shard-owner consultation of another genesis: answered from this view alone.
-    let s = light_status(&blockchain, &node_id, !params.contains_key("fwd")).await;
+    let fwd = params.contains_key("fwd");
+    let mut s = light_status(&blockchain, &node_id, !fwd).await;
+    if let (true, Some(bound)) = (fwd, params.get("bound").and_then(|b| b.parse::<u64>().ok())) {
+        let genesis = remote_addr.map_or(false, |a| super::misc_api::is_genesis_peer_ip(&a.ip().to_string()));
+        answered_under(&mut s, bound, genesis);
+    }
     let nonce = parse_nonce(params.get("nonce").map(|n| n.as_str()));
     Ok(warp::reply::json(&public_json(&s, nonce.as_ref())))
+}
+
+/// A consultation that names the binding the asking genesis holds (`bound`, its sequence): `device.answered` holds only
+/// when this genesis holds that very binding, so an owner that missed a move never vouches for the device it replaced.
+/// Told to a genesis only; anyone else asking with `bound` reads false, which says nothing of the binding's time.
+pub(crate) fn answered_under(s: &mut LightStatus, bound: u64, genesis_caller: bool) {
+    let same = genesis_caller && s.binding.as_ref().map_or(false, |b| b.device_bound() && b.v2 && b.seq == bound);
+    if let Some(d) = s.device_view.as_mut() { d.answered &= same; }
 }
 
 /// The misses route's `limit`: 1 to MISS_HISTORY_EPOCHS, the whole history when absent or not a number.
@@ -615,7 +672,7 @@ pub(super) struct SignedStatusRequest {
 /// kind: for a ping key, that this device is not the one bound.
 pub(super) fn check_signed_status(storage: &crate::storage::Storage, req: &SignedStatusRequest, now: u64) -> Result<(), Refusal> {
     let hex_ok = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
-    if !req.node_id.starts_with("light_") || req.node_id.len() > 128 || !hex_ok(&req.sig, lb::MLDSA65_SIG_HEX) {
+    if !req.node_id.starts_with("light_") || req.node_id.len() > lb::LIGHT_NODE_ID_MAX || !hex_ok(&req.sig, lb::MLDSA65_SIG_HEX) {
         return Err(Refusal::BadRequest);
     }
     if now.abs_diff(req.ts) > lb::FRESH_TS_WINDOW_SECS {
@@ -682,7 +739,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn status(binding: Option<BindingRow>) -> LightStatus {
-        let device = device_view(true, binding.as_ref(), false, "android", "", Some(150), NOW);
+        let device = device_view(true, binding.as_ref(), false, true, "android", "", Some(150), NOW);
         LightStatus {
             node_id: "light_mobile_0123456789abcdef".into(),
             known: true,
@@ -734,7 +791,7 @@ mod tests {
         ].into_iter().collect();
         assert_eq!(keys, want, "no exact sequence, channel or device record in public");
         assert_eq!(v["device"], json!({"platform": "android", "model": null, "linked_since": 1_789_948_800u64,
-                                       "last_answer_epoch": 150, "state": "online", "last_miss": null}));
+                                       "last_answer_epoch": 150, "answered": true, "state": "online", "last_miss": null}));
         assert!(v.get("push_reregister").is_none(), "how the device is reached is never public");
         assert_eq!(v["counted"], json!({"epochs_since_registration": 6, "counted": 5, "last_counted_epoch": 150}));
         assert_eq!(v["device_bound"], json!(true));
@@ -768,45 +825,111 @@ mod tests {
         let seq = 1_790_000_123u64;
         let day = seq - seq % 86_400;
         let row = BindingRow { seq, cert: lb::format_v2_cert(seq, "cd"), ..bound_row() };
-        let view = |b: Option<&BindingRow>, needs: bool, platform: &'static str, last: Option<u64>, now: u64| {
-            device_view(true, b, needs, platform, "", last, now).unwrap()
+        let view = |b: Option<&BindingRow>, needs: bool, answered: bool, platform: &'static str, last: Option<u64>, now: u64| {
+            device_view(true, b, needs, answered, platform, "", last, now).unwrap()
         };
-        assert_eq!(device_view(false, Some(&row), false, "ios", "Acme 7", Some(3), NOW), None, "not on chain: null");
-        // Online: counted (or in its first epochs) with a device bound.
-        assert_eq!(view(Some(&row), false, "ios", Some(155), NOW),
+        assert_eq!(device_view(false, Some(&row), false, true, "ios", "Acme 7", Some(3), NOW), None, "not on chain: null");
+        // Online: counted (or in its first epochs) with a device bound that answered.
+        assert_eq!(view(Some(&row), false, true, "ios", Some(155), NOW),
                    DeviceView { platform: Some("ios"), model: None, linked_since: Some(day), last_answer_epoch: Some(155),
-                                  last_answer_at: None, state: "online", misses: Vec::new(), last_answer: None });
+                                  last_answer_at: None, answered: true, state: "online", misses: Vec::new(), last_answer: None });
         // Offline: bound, not counted in this epoch or the last two, linked longer than an epoch ago.
-        let off = view(Some(&row), true, "", Some(150), seq + LINK_GRACE_SECS);
+        let off = view(Some(&row), true, true, "", Some(150), seq + LINK_GRACE_SECS);
         assert_eq!((off.state, off.platform, off.last_answer_epoch), ("offline", Some("unknown"), Some(150)));
         // Linked less than an epoch ago and not answered yet.
-        assert_eq!(view(Some(&row), true, "android", None, seq + LINK_GRACE_SECS - 1).state, "other_device_pending");
-        assert_eq!(view(Some(&row), true, "android", None, seq).state, "other_device_pending");
+        assert_eq!(view(Some(&row), true, false, "android", None, seq + LINK_GRACE_SECS - 1).state, "other_device_pending");
+        assert_eq!(view(Some(&row), true, false, "android", None, seq).state, "other_device_pending");
+        // Right after a move the node still counts by the device it replaced: the new one is pending until it answers,
+        // and offline when it has not within an epoch of its link (B-display).
+        let moved = view(Some(&row), false, false, "android", Some(155), seq + 60);
+        assert_eq!((moved.state, moved.answered), ("other_device_pending", false));
+        assert_eq!(view(Some(&row), false, false, "android", Some(155), seq + LINK_GRACE_SECS).state, "offline");
+        assert_eq!(view(Some(&row), false, true, "android", Some(155), seq + 60).state, "online", "once it answered");
         // Unlinked: no binding, or a withdrawn one; no platform, no day.
         let withdrawn = BindingRow { ping_pubkey: String::new(), seq: 0, floor: seq, ..row.clone() };
         for b in [None, Some(&withdrawn)] {
-            assert_eq!(view(b, true, "ios", Some(140), NOW),
+            assert_eq!(view(b, true, true, "ios", Some(140), NOW),
                        DeviceView { platform: None, model: None, linked_since: None, last_answer_epoch: Some(140),
-                                      last_answer_at: None, state: "unlinked", misses: Vec::new(), last_answer: None });
+                                      last_answer_at: None, answered: false, state: "unlinked", misses: Vec::new(), last_answer: None });
         }
         // A legacy binding has no sequence: no day, and never "just linked".
         let legacy = BindingRow { cert: "legacy".into(), seq: 0, v2: false, ..row.clone() };
-        let l = view(Some(&legacy), true, "", None, NOW);
+        let l = view(Some(&legacy), true, false, "", None, NOW);
         assert_eq!((l.state, l.linked_since, l.platform), ("offline", None, Some("unknown")));
         // Rendered in the public form by its epoch only; the answer's second is the signed form's (H-1).
         let mut s = status(Some(row.clone()));
         s.device_view = Some(DeviceView { last_answer_at: Some(1_790_050_000), ..off });
         let v = public_json(&s, None);
         assert_eq!(v["device"], json!({"platform": "unknown", "model": null, "linked_since": day, "last_answer_epoch": 150,
-                                       "state": "offline", "last_miss": null}));
+                                       "answered": true, "state": "offline", "last_miss": null}));
         let signed = signed_json(&s, None);
         assert_eq!(signed["device"], json!({"platform": "unknown", "model": null, "linked_since": day, "last_answer_epoch": 150,
-                                            "last_answer_at": 1_790_050_000u64, "state": "offline", "last_miss": null,
-                                            "last_answer": null}));
+                                            "answered": true, "last_answer_at": 1_790_050_000u64, "state": "offline",
+                                            "last_miss": null, "last_answer": null}));
         assert!(holds(&signed["device"], &v["device"]), "the signed device carries everything the public one does");
         s.device_view = None;
         assert_eq!(public_json(&s, None)["device"], Value::Null);
         assert_eq!(signed_json(&s, None)["device"], Value::Null);
+    }
+
+    /// Whether the device bound now answered, from this genesis's own records on its own clock: its answer recorded since
+    /// the binding was stored here, or a count in an epoch that began at or after it. An answer recorded before (the
+    /// device it replaced) and a count in the epoch of the move tell nothing.
+    #[test]
+    fn the_status_tells_the_device_that_answered_from_the_one_it_replaced() {
+        let bound_at = 1_800_000_000;
+        assert!(!device_answered(bound_at, false, &[]));
+        assert!(!device_answered(bound_at, false, &[Some(bound_at - 600), None]), "counted in the epoch of the move");
+        assert!(device_answered(bound_at, false, &[None, Some(bound_at + 1)]), "counted in an epoch after it");
+        assert!(device_answered(bound_at, true, &[Some(bound_at - 600)]), "its own answer recorded here");
+        assert!(device_answered(0, false, &[Some(5)]), "a row from before the binding time was kept");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let node = "light_mobile_answered";
+        assert_eq!(bound_answer_recorded(&s, node), None, "no device bound");
+        s.bind_light_v2(node, &"ab".repeat(16), "cd", "ef", 100, 1_000).unwrap().unwrap();
+        record_answer(&s, node, 900, Delivery::default(), None, None, None);
+        assert_eq!(bound_answer_recorded(&s, node), Some(false), "an answer from before the binding");
+        record_answer(&s, node, 1_100, Delivery::default(), None, None, None);
+        assert_eq!(bound_answer_recorded(&s, node), Some(true));
+    }
+
+    /// A genesis that does not own the node's shard keeps no answer of the device. With a binding stored mid-epoch while
+    /// the node counted in that epoch by the device it replaced, its own records say the device has not answered, so it
+    /// asks the owners, and takes an owner's word only for the very binding it holds (an owner that missed the move
+    /// vouches for nothing).
+    #[test]
+    fn a_non_owner_takes_the_bound_devices_answer_from_an_owner_holding_the_same_binding() {
+        let seq = 1_800_000_000;
+        let row = BindingRow { seq, cert: lb::format_v2_cert(seq, "cd"), bound_at: seq, ..bound_row() };
+        let here = device_answered(row.bound_at, false, &[Some(seq - 3_600), None]);
+        assert!(!here, "counted only in the epoch of the move, no answer kept here");
+        assert!(owners_asked(true, true, here), "an active node whose bound device this genesis has not seen asks");
+        assert!(!owners_asked(true, true, true) && !owners_asked(true, false, false), "a seen device, or none, asks nobody");
+        assert!(owners_asked(false, false, false), "an inactive node asks, as before");
+        // At the owner: told only for the binding the asker names, and only to a genesis.
+        let mut owner = status(Some(row.clone()));
+        owner.device_view = device_view(true, Some(&row), false, true, "android", "", Some(150), seq + 60);
+        let told = |bound: u64, genesis: bool| {
+            let mut s = owner.clone();
+            answered_under(&mut s, bound, genesis);
+            public_json(&s, None)
+        };
+        assert_eq!(told(seq, true)["device"]["answered"], json!(true));
+        assert_eq!(told(seq - 7_200, true)["device"]["answered"], json!(false), "the owner holds another binding");
+        assert_eq!(told(seq, false)["device"]["answered"], json!(false), "anyone else learns nothing of the binding");
+        // At the asker: the owners' word reads online at once; alone it would read pending.
+        let owners = OwnersView::of(&[told(seq, true)]).expect("a verdict");
+        let view = device_view(true, Some(&row), false, here || owners.device_answered, "android", "", Some(150), seq + 60).unwrap();
+        assert_eq!((view.state, view.answered), ("online", true));
+        assert_eq!(device_view(true, Some(&row), false, here, "android", "", Some(150), seq + 60).unwrap().state, "other_device_pending");
+        // The status asks with its binding's sequence, and takes the owners' word only when it named one.
+        let src = include_str!("light_status.rs");
+        let body = &src[src.find("pub(crate) async fn light_status(").unwrap()..src.find("pub(crate) fn public_json(s: &LightStatus").unwrap()];
+        assert!(body.contains("owners_asked(is_active, bound_at.is_some(), bound_answered)"));
+        assert!(body.contains("bound_answered |= bound_seq.is_some() && v.device_answered;"));
+        let h = &src[src.find("pub(super) async fn handle_light_node_status(").unwrap()..];
+        assert!(h[..h.find("pub(crate) fn answered_under(").unwrap()].contains("answered_under(&mut s, bound, genesis);"));
     }
 
     /// `big` carries every field of `small` with the same value, nested objects field by field.
@@ -834,7 +957,7 @@ mod tests {
         let p = public_json(&s, None);
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
         let set = |k: &[&str]| k.iter().map(|x| x.to_string()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(keys(&p["device"]), set(&["platform", "model", "linked_since", "last_answer_epoch", "state", "last_miss"]));
+        assert_eq!(keys(&p["device"]), set(&["platform", "model", "linked_since", "last_answer_epoch", "answered", "state", "last_miss"]));
         assert_eq!(p["device"]["last_miss"], json!({"epoch": 160, "reason": "woken_no_answer", "delivered": true}));
         let wire = p.to_string();
         for leak in ["1800000100", "1799990000", "1799990240", "swiped", "delivery_delay_secs", "handling_secs", "woken_at",
@@ -922,7 +1045,7 @@ mod tests {
         let body = &src[src.find("pub(crate) async fn light_status(").unwrap()..];
         let body = &body[..body.find("        push_reregister,\n    }").unwrap()];
         assert!(body.contains("let bound_at = binding.as_ref().filter(|b| b.device_bound()).map(|b| b.bound_at);"));
-        assert!(body.contains("let row = stored_row(&storage, node_id).unwrap_or_default().since(bound_at);"));
+        assert!(body.contains("let row = bound_at.map(|t| stored_row(&storage, node_id).unwrap_or_default().since(t));"));
         assert!(body.contains("dormant_miss(registered_height, cur_height, uptime, done)"));
     }
 
@@ -1054,14 +1177,14 @@ mod tests {
         // Served beside the platform; null while unknown or nothing is bound.
         let shown = |model: &str| {
             let mut s = status(Some(row.clone()));
-            s.device_view = device_view(true, Some(&row), false, "android", model, Some(150), NOW);
+            s.device_view = device_view(true, Some(&row), false, true, "android", model, Some(150), NOW);
             public_json(&s, None)["device"].clone()
         };
         assert_eq!((shown("Acme Phone 7")["platform"].clone(), shown("Acme Phone 7")["model"].clone()),
                    (json!("android"), json!("Acme Phone 7")));
         assert_eq!(shown("")["model"], Value::Null);
         let withdrawn = BindingRow { ping_pubkey: String::new(), seq: 0, floor: seq, ..row.clone() };
-        assert_eq!(device_view(true, Some(&withdrawn), true, "android", "Acme Phone 7", None, NOW).map(|d| d.model), Some(None));
+        assert_eq!(device_view(true, Some(&withdrawn), true, false, "android", "Acme Phone 7", None, NOW).map(|d| d.model), Some(None));
         // A stored model that is not a model (a hand-written row) is none.
         let raw = json!({"token": "tok3", "push_type": "fcm", "endpoint": "", "updated_at": seq + 61, "seq": seq,
                          "platform": "android", "model": "<b>x</b>"});
@@ -1393,7 +1516,7 @@ mod tests {
         assert!(body.contains("storage.light_uptime_done_masks(end, shard)") && body.contains("let done = done_raw & committed;"));
         assert!(body.contains("recent_neutral(recent_shards, shard)") && body.contains("not_committed_miss(registered_height, cur_height, done_raw, committed)"));
         assert!(body.contains("proven_dormant(&storage, &REACH_CACHE"), "the dormant miss only as the pusher proves it");
-        assert!(body.contains("shard_owners_view(node_id)"), "every other owner is asked");
+        assert!(body.contains("shard_owners_view(node_id, bound_seq)"), "every other owner is asked");
     }
 
     #[test]

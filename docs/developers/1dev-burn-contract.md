@@ -176,7 +176,7 @@ treat the values in this repository as authoritative.
 | --- | --- |
 | Program ID | `CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw` — `declare_id!` in `src/lib.rs`, all three cluster entries in `Anchor.toml`, `initialize_tracker.py`, and `BURN_CONTRACT_PROGRAM_ID` in `development/qnet-integration/src/network_config.rs` |
 | 1DEV mint, devnet/testnet | `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ` — compiled into `burn_1dev_for_node_activation.rs`, `initialize_tracker.py`, and `DEVNET_1DEV_MINT` in the node |
-| 1DEV mint, mainnet | `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` — `MAINNET_1DEV_MINT` in the node, and the same literal in the mobile and browser wallets |
+| 1DEV mint, mainnet | `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` — `MAINNET_1DEV_MINT` in the node, and the same literal in the browser extension (`dist/background/config.js`) |
 | Burn address | `1nc1nerator11111111111111111111111111111111`, the Solana incinerator — compiled into the contract, required to equal `burn_tracker.burn_address`, and `SOLANA_INCINERATOR` in the node |
 
 The mint constant is compared inside the program, so the mint passed to `initialize` must match it or

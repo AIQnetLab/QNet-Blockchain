@@ -572,6 +572,26 @@ export function walletAddresses(wallet) {
 
 const unavailable = (error, extra = {}) => ({ kind: 'unavailable', error, ...extra });
 
+// Whether the network holds this device's binding `local` of the node, by the status signed with its ping key
+// (node.pingStatus): { held, status }, `held` true when two owners name its sequence, false when two name another one or
+// refuse its key, null when the status says neither (no answer, no key to sign with); `status` the status read, or null.
+async function heldHere(node, nodeId, local) {
+  const signed = typeof node.pingStatus === 'function' ? await node.pingStatus(nodeId).catch(() => null) : null;
+  if (!signed) return { held: null, status: null };
+  if (Number.isSafeInteger(signed.bindingSeqAgreed)) return { held: signed.bindingSeqAgreed === local.seq, status: signed };
+  return { held: signed.keyOurs === false ? false : null, status: signed };
+}
+
+// Whether this device runs the node already and the network counts it as it is: held here, and nothing the Node tab
+// offers Use this device for (node.offersUse: no device key, a revoked or overdue one, a check that ended), which a new
+// binding mends. A check that cannot be made answers no, so the request mends rather than says "nothing changed".
+async function runsHere(node, nodeId, local) {
+  const { held, status } = await heldHere(node, nodeId, local);
+  if (held !== true) return false;
+  if (typeof node.offersUse !== 'function') return true;
+  return (await node.offersUse(nodeId, status, local).catch(() => true)) !== true;
+}
+
 // One wallet, one node type, chosen once: no light node is prepared or consented to for a wallet the network holds a
 // super or genesis node for (two genesis nodes decide), or whose super node's burn aiqnet.io holds and the network does
 // not list yet (reserved, on its way or recorded). A source that cannot answer gives nothing. null when neither stands
@@ -590,7 +610,8 @@ async function otherNodeProblem(node, qnet) {
  * `node` is the Node side the wallet screen hands over (services/NodeLinkActions): status, device, balance, the
  * wallet's other node (`otherNode`), aiqnet.io's record of its burn (`record`), this device's binding (`binding`), and
  * the actions that sign. Answers { kind: 'connect', addresses } · { kind: 'reserve', qnet, nodeId, burner } ·
- * { kind: 'link', mode: 'consent' | 'device', nodeId, qnet, device, switchFrom } · { kind: 'unlink', mode: 'here', nodeId,
+ * { kind: 'link', mode: 'consent' | 'device', nodeId, qnet, device, switchFrom } · { kind: 'link', mode: 'here', nodeId, qnet,
+ * seq } (the node runs here already) · { kind: 'unlink', mode: 'here', nodeId,
  * qnet, since } · { kind: 'unlink', mode: 'wallet', nodeId, qnet, platform, since } · { kind: 'claim', nodeId, nodeType,
  * qnet, amountNano } · { kind: 'claim_empty', nodeId, nodeType, qnet } · { kind: 'unavailable', error, reason? }. A `claim`
  * moves the balance of the node the request names, this wallet's light or super node (`nodeType`), and no other.
@@ -610,17 +631,14 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
   if ((link.intent === 'link' || link.intent === 'reserve') && node.serverNode) return unavailable('NODE_OTHER');
 
   if (link.intent === 'unlink') {
-    // The device that runs this wallet's node unbinds it with its own key (`here`), unless two owners name another
-    // binding than this device's; any other device that holds the wallet withdraws the binding with the wallet key
-    // (`wallet`, once two genesis nodes serve `unbind_wallet`), whichever device it is on (contract 1.9b).
+    // The device that runs this wallet's node unbinds it with its own key (`here`); any other device that holds the
+    // wallet withdraws the binding with the wallet key (`wallet`, once two genesis nodes serve `unbind_wallet`), whichever
+    // device it is on (contract 1.9b), and says so. A device whose binding another one replaced is such a device
+    // (heldHere), never `here`: its sheet would speak of this device while the withdrawal ends the other's.
     if (!request.walletHash || typeof node.binding !== 'function' || typeof node.status !== 'function') return unavailable('INTERNAL');
     const local = await node.binding(nodeId);
-    if (local) {
-      const signed = typeof node.pingStatus === 'function' ? await node.pingStatus(nodeId).catch(() => null) : null;
-      const named = signed && Number.isSafeInteger(signed.bindingSeqAgreed) ? signed.bindingSeqAgreed : null;
-      if (named === null || named === local.seq) {
-        return { kind: 'unlink', mode: 'here', qnet, nodeId, since: Number.isSafeInteger(local.boundAt) ? local.boundAt : null };
-      }
+    if (local && (await heldHere(node, nodeId, local)).held !== false) {
+      return { kind: 'unlink', mode: 'here', qnet, nodeId, since: Number.isSafeInteger(local.boundAt) ? local.boundAt : null };
     }
     const status = await node.status(nodeId).catch(() => null);
     if (!status || status.onChain === null) return unavailable('NETWORK');
@@ -654,6 +672,9 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
   const local = node.localNode ? await node.localNode() : null;
   const switchFrom = local && local.nodeId !== nodeId ? local.walletAddress || local.nodeId : null;
   if (status.onChain === true) {
+    // Already bound here and counted: nothing moves, and a new binding would spend one of the node's moves for nothing.
+    const own = typeof node.binding === 'function' ? await node.binding(nodeId) : null;
+    if (own && await runsHere(node, nodeId, own)) return { kind: 'link', mode: 'here', nodeId, qnet, seq: own.seq };
     // Linking a recorded node binds this device; a device that cannot run one has nothing to confirm.
     if (!capable) return unavailable('BIND_REFUSED', { reason: device ? device.reason : 'device_unsupported' });
     if (!features.includes('bind_v2')) return unavailable('NETWORK');
@@ -746,16 +767,18 @@ export async function performIntent(link, offer, { node = null, now = Date.now }
       stoppedAtEpoch: r.stoppedAtEpoch === null || r.stoppedAtEpoch === undefined ? null : u64Text(r.stoppedAtEpoch),
     };
   }
-  // `reason`, `ref`, `here`, `byWallet` and `unknown` are for this device's screen only: an answer's plaintext carries
-  // the keys of its row alone. `ref`: the support reference of a refused enrolment (light-node-messages section 5.9).
-  // `unknown`: the request went out and no answer told whether it was done; the wire says NETWORK, the screen never
-  // "nothing changed" (MN-R4-05).
+  // `reason`, `retryAfterSeconds`, `ref`, `here`, `already`, `byWallet` and `unknown` are for this device's screen only:
+  // an answer's plaintext carries the keys of its row alone. `ref`: the support reference of a refused enrolment
+  // (light-node-messages section 5.9). `unknown`: the request went out and no answer told whether it was done; the wire
+  // says NETWORK, the screen never "nothing changed" (MN-R4-05). `already`: the node runs here already, and the binding
+  // the network holds is this device's: nothing is signed or sent for it.
+  if (offer.kind === 'link' && offer.mode === 'here') return { status: 'linked', qnet, nodeId, seq: u64Text(offer.seq), already: true };
   if (offer.kind === 'link' && offer.mode === 'device') {
     const r = await node.useDevice({ nodeId, device: offer.device });
     if (r.ok) return { status: 'linked', qnet, nodeId, seq: u64Text(r.seq) };
     return {
       status: 'error', error: r.reason === 'network' ? 'NETWORK' : 'BIND_REFUSED', reason: r.reason || null, ...(r.ref ? { ref: r.ref } : {}),
-      ...(r.unknown ? { unknown: true } : {}),
+      ...(r.retryAfterSeconds ? { retryAfterSeconds: r.retryAfterSeconds } : {}), ...(r.unknown ? { unknown: true } : {}),
     };
   }
   if (offer.kind === 'link' && offer.mode === 'consent') {

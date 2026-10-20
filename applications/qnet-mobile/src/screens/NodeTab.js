@@ -2,13 +2,13 @@
  * The Node tab (plan-mobile 3.2, unified plan 3.1): this wallet's node as the network records it, and what this device
  * can do about it here: keep it running (Use this device, where the card offers it) and move its balance into the
  * wallet. One wallet, one node (owner, 11.10): a light node shows only on the device it is bound to; bound to another
- * device, or to none, it is not shown at all and the tab says what it says for a wallet without a node (binding is done
- * on aiqnet.io; the tab names neither it nor activation). It stops running on a device only on a request the user
+ * device, or to none, it is not shown: the tab says that it is linked to another device, or what it says for a wallet
+ * without a node (binding is done on aiqnet.io; the tab names neither it nor activation). It stops running on a device only on a request the user
  * confirms on that device's QNet Link sheet (`unlink`, which the device's own key signs), when another device takes it
  * over, or with the wallet's deletion: the tab has no button for it (owner, 30.09). A super node runs on its server and
  * shows on every device that holds the wallet: its card only shows it (status, last seen, heartbeats, missed epochs, the
- * balance) and moves its balance; a super node the network registered but does not admit to consensus yet says it
- * waits for admission, never Offline. A wallet with a super and a light node on the chain (an older wallet) shows both
+ * balance) and moves its balance; a super node the network registered but does not admit to consensus yet says so,
+ * never Offline. A wallet with a super and a light node on the chain (an older wallet) shows both
  * cards, the server's first, and the node balance (the wallet's, whichever node id is asked) with its move once, on the
  * server card. A super node aiqnet.io recorded for the wallet that the network does not list yet is said as such. A move
  * of the wallet's node balance in transit (services/ClaimTransit) shows as "Moving X" with the rest of the balance, and
@@ -23,6 +23,8 @@ import { InfoField, InfoRow } from '../components/InfoRow';
 import { BIND_SETTLE_MS, freshMiss } from '../services/LightNode';
 import { heldMove } from '../services/ClaimTransit';
 import { qncText } from '../utils/amountFormat';
+import { reasonText } from '../utils/bindRefusal';
+import { clock, day } from '../utils/timeText';
 import styles from './WalletScreen.styles';
 
 const EPOCH_BLOCKS = 14400;
@@ -34,28 +36,6 @@ export const ROTATION_GRACE_EPOCHS = 180;
 // a record that waits once a day (light-node-messages section 8).
 export const CHECK_RUNNING_MS = 24 * 3600 * 1000;
 
-// Why the network did not take this device's binding, as the tab says it (light-node-messages section 8).
-const REFUSAL_TEXT = {
-  device_unsupported: 'node_cant_run',
-  device_desktop: 'node_cant_run',
-  device_emulator: 'node_cant_run',
-  device_not_genuine: 'node_cant_run_now',
-  device_compromised: 'node_cant_run_now',
-  device_app_unrecognized: 'node_cant_run_now',
-  device_unlicensed: 'node_cant_run_now',
-  device_key_in_use: 'node_cant_run_now',
-  device_slot_paused: 'node_cant_run_now',
-  device_secondary_user: 'node_main_profile',
-  identity_mismatch: 'node_use_err_key',
-  bad_signature: 'node_use_err_key',
-  not_registered: 'node_none',
-  rate_limited: 'node_use_err_limit',
-  device_rate_limited: 'node_use_err_limit',
-};
-
-const pad = (n) => String(n).padStart(2, '0');
-const clock = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
-const day = (ms) => { const d = new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
 // When block `target` is due, at one block a second from `height`.
 const blockTime = (target, height, now) => now + (target - height) * 1000;
 
@@ -66,14 +46,15 @@ const blockTime = (target, height, now) => now + (target - height) * 1000;
  * sequence two signed answers name alike (`bindingSeqAgreed`), D whether two owners say a device is bound
  * (`deviceBoundAgreed`). Without B (no signed answer, a refused key without a sequence, no network) a binding of this
  * device stands: the caller passes the last verdict read for that binding when it has one, and nothing else ever turns
- * it into elsewhere or no_device. Owners refusing this device's key, or a device tag of another key (`tagOurs`), decide
- * nothing here: the tag only asks for a new device key (nodeView `reenrol`).
+ * it into elsewhere or no_device; a binding sent with no answer that no status settled yet (`local.unconfirmed`) stays
+ * 'linking'. Owners refusing this device's key, or a device tag of another key (`tagOurs`), decide nothing here: the tag
+ * only asks for a new device key (nodeView `reenrol`).
  */
 export function bindingVerdict(status, local, now = Date.now()) {
   const D = status.deviceBoundAgreed;
   if (!local) return D === true ? 'elsewhere' : (D === false ? 'no_device' : 'unknown');
   const B = Number.isSafeInteger(status.bindingSeqAgreed) ? status.bindingSeqAgreed : null;
-  if (B === null) return 'here';
+  if (B === null) return local.unconfirmed === true ? 'linking' : 'here';
   const seq = Number.isSafeInteger(local.seq) ? local.seq : 0;
   if (B < seq) {
     const age = Number.isSafeInteger(local.boundAt) ? now - local.boundAt * 1000 : Infinity;
@@ -157,7 +138,8 @@ export function nodeView({ status, local = null, pending = null, height = 0, che
       notice = { key: `node_check_${where}`, ...(where === 'refused' ? { reason: check.refusal.reason } : {}) };
     } else if (revoked) notice = { key: 'node_cant_run_now' };
     else if (signed && signed.deviceState === 'paused') notice = { key: 'node_paused', epoch: signed.pausedUntil };
-    const reenrol = !!local && (local.hw !== true || status.tagOurs === false)
+    // A binding not this device's yet (`unconfirmed`) has no device key to ask about.
+    const reenrol = !!local && local.unconfirmed !== true && (local.hw !== true || status.tagOurs === false)
       && Array.isArray(status.features) && status.features.includes('device_v1');
     if (reenrol) notice = { key: 'node_device_again' };
     // Linked here and not counted yet: the network has not taken the binding, or the device has not answered since.
@@ -181,8 +163,8 @@ export function nodeView({ status, local = null, pending = null, height = 0, che
 /**
  * Whether the light card shows this wallet's light node on this device (owner, 11.10: one wallet, one node, shown only
  * where it runs): a node being linked here, or one this device holds a binding of that the network does not name as
- * another device's or none's. `light` null (nothing read yet) is still being checked. Otherwise the card says what a
- * wallet without a node says: a node on another device, unbound, or with no binding here is not this device's to show.
+ * another device's or none's. `light` null (nothing read yet) is still being checked. A node on another device, unbound,
+ * or with no binding here is not this device's to show: the card says only that (hiddenText).
  */
 export function lightShownHere(light, view) {
   if (!light) return true;
@@ -205,11 +187,14 @@ export function refusalText(t, refusal, now = Date.now()) {
   if (!refusal) return null;
   // The binding went out and nothing told whether the node took it: never "try again" as if nothing had changed.
   if (refusal.unknown === true) return t('node_use_unknown');
-  const key = REFUSAL_TEXT[refusal.reason] || 'node_use_err_network';
-  if (key === 'node_use_err_limit' && refusal.retryAfterSeconds) {
-    return t('node_move_limit', { time: clock(now + refusal.retryAfterSeconds * 1000) });
-  }
-  return t(key);
+  return reasonText(t, refusal, now) || t('node_use_err_network');
+}
+
+// What the card says for this wallet's light node when it is not this device's to show (lightShownHere): linked to
+// another device (or to this one before a reinstall: the network cannot tell them apart); otherwise what a wallet
+// without a node says (owner, 11.10: the node on no device has the site's sentence only).
+function hiddenText(t, view) {
+  return t(view.state === 'elsewhere' ? 'node_elsewhere' : 'node_none');
 }
 
 function noticeText(t, notice, height, now) {
@@ -321,18 +306,18 @@ function BalanceBlock({ t, balanceNano, hidden, moving, onMove, alone = false, m
   const shownNano = move ? (move.restNano !== null ? move.restNano : Math.max(0, balanceNano - Number(move.amountNano))) : balanceNano;
   const known = Number.isFinite(shownNano) && shownNano >= 0;
   const movable = known && shownNano >= ONE_QNC_NANO;
-  const label = move ? t('node_moving', { amount: qncText(move.amountNano, t.lang, hidden) })
+  const label = move ? t('node_moving', { amount: qncText(move.amountNano, hidden) })
     : (moving ? t('claiming') : t('node_move'));
   return (
     <>
-      <InfoRow label={t('node_balance')} value={qncText(shownNano, t.lang, hidden)} tone="accent" ltr fit divider={!alone} />
+      <InfoRow label={t('node_balance')} value={qncText(shownNano, hidden)} tone="accent" ltr fit divider={!alone} />
       <Button label={label} onPress={onMove} disabled={!movable || moving || !!move} testID="node-move" />
     </>
   );
 }
 
-// The light node on this device, or what a wallet without a node shows (lightShownHere: a node bound to another device,
-// or to none, is not this device's to show, nor one aiqnet.io recorded that the network does not list yet).
+// The light node on this device, or the one sentence for a node that is not this device's to show (lightShownHere: a
+// node bound to another device, or to none, nor one aiqnet.io recorded that the network does not list yet).
 // `showBalance` false: the server card above shows the wallet's node balance and its move (the same figure), so this
 // card does not show it twice.
 function LightNodeCard({
@@ -342,7 +327,7 @@ function LightNodeCard({
   const view = light ? nodeView({ ...light, height, now }) : { state: 'checking' };
   const nodeId = light ? light.nodeId : '';
   if (view.state === 'none' || !lightShownHere(light, view)) {
-    return <View style={styles.emptyState}><Text style={styles.emptyText}>{t('node_none')}</Text></View>;
+    return <View style={styles.emptyState}><Text style={styles.emptyText}>{hiddenText(t, view)}</Text></View>;
   }
   const move = heldMove(transit);
   // The balance stays on screen in every state of the node this device runs, so it never vanishes while the binding or
@@ -406,13 +391,13 @@ function LightNodeCard({
 }
 
 /**
- * Whether the network registered a super node and does not admit it yet (owner, 11.10: registrations stay open while a
- * rule holds outside super nodes back): the node's own word in its status, its admission 'waiting' (the site's WAITING
- * state, node-view superState) or `consensus_admitted` false (PushService.checkServerNodeStatus). A node that says
- * nothing of it (every node before that rule) is not waiting.
+ * Whether the network registered a super node and does not admit it to consensus yet (owner, 11.10: registrations stay
+ * open while a rule holds outside super nodes back): the node's own word in its status, its admission 'waiting'
+ * (registration.rs super_admission_label: outside the epoch's consensus-admitted set; the site's WAITING state). A node
+ * that says nothing of it (every node before that rule) is not waiting.
  */
 export function waitingAdmission(status) {
-  return serverRegistered(status) && (status.admission === 'waiting' || status.consensusAdmitted === false);
+  return serverRegistered(status) && status.admission === 'waiting';
 }
 
 /**

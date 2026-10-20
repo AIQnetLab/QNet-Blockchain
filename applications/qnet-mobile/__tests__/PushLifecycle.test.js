@@ -180,12 +180,18 @@ describe('Use this device', () => {
     expect(calls.some((c) => c.url.endsWith('/light-node/bind'))).toBe(false);
   });
 
-  it('an answer that does not name this binding binds nothing', async () => {
+  it('an answer that does not name this binding binds nothing, and a newer binding the network names after it ends it', async () => {
     const s = signer();
-    network(() => ({ success: true, bound: false }));
+    let posted = null;
+    network((body) => { posted = body.seq; return { success: true, bound: false }; });
+    const plain = global.fetch;
+    global.fetch = jest.fn((url, opts) => (url.endsWith('/light-node/status') && opts && opts.body && posted
+      ? reply({ onchain_registered: true, binding_seq: posted + 5 }) : plain(url, opts)));
     const r = await Push.bindThisDevice({ signer: s, credential: 'c', nodeId: NODE });
-    expect(r.ok).toBe(false);
+    expect(r).toEqual({ ok: false, reason: 'network', retryAfterSeconds: null });
     expect(s.binding.keep).not.toHaveBeenCalled();
+    expect(await AsyncStorage.getItem('qnet_light_node_info')).toBe(null);
+    expect(await Push.readUnconfirmedBinding(NODE)).toBe(null);
   });
 });
 
@@ -200,6 +206,42 @@ describe('the unlink this device confirms, and every other end of the binding', 
     expect(Keychain.resetGenericPassword).toHaveBeenCalledWith({ service: `qnet_ping_sk_${NODE}` });
     expect(await AsyncStorage.getItem('qnet_light_node_info')).toBe(null);
     expect(await AsyncStorage.getItem('qnet_ping_node_id')).toBe(null);
+  });
+
+  it('a binding sent from here with no answer ends too: its own key signs its unbind, and it goes with that key', async () => {
+    const WAITING = SEQ + 60;
+    await linked();
+    Keychain.getGenericPassword.mockImplementation(async ({ service }) => ({ password: service === 'qnet_ping_next' ? 'next-sk' : 'sk' }));
+    await AsyncStorage.setItem(Push.UNCONFIRMED_BIND_KEY, JSON.stringify({
+      nodeId: NODE, walletAddress: 'w', seq: WAITING, push: { type: 'fcm', token: 'tok' }, at: Date.now() - 60000,
+    }));
+    // The network holds only the waiting binding: the current one's unbind is refused, the waiting one's taken.
+    global.fetch = jest.fn((url, opts) => {
+      const body = opts && opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ url, body });
+      return reply(body && body.seq === WAITING ? { success: true, unbound: true } : { success: false, reason: 'stale_seq' });
+    });
+    expect(await Push.stopLightNode()).toEqual({ unbound: true });
+    const posts = calls.filter((c) => c.url.endsWith('/api/v1/light-node/unbind')).map((c) => c.body);
+    expect(posts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node_id: NODE, seq: SEQ, signer: 'ping' }),
+      expect.objectContaining({ node_id: NODE, seq: WAITING, signer: 'ping' }),
+    ]));
+    const waitingPost = posts.find((b) => b.seq === WAITING);
+    expect(signDetached).toHaveBeenCalledWith(unbindPreimage(NODE, WAITING, waitingPost.ts), 'next-sk');
+    expect(signDetached).toHaveBeenCalledWith(unbindPreimage(NODE, SEQ, posts.find((b) => b.seq === SEQ).ts), 'sk');
+    expect(await Push.readUnconfirmedBinding(NODE)).toBe(null);
+    expect(Keychain.resetGenericPassword).toHaveBeenCalledWith({ service: 'qnet_ping_next' });
+    expect(await AsyncStorage.getItem('qnet_light_node_info')).toBe(null);
+  });
+
+  it('a waiting binding of another node (another wallet\'s, under a foreign-record stop) is not this end\'s', async () => {
+    const OTHER_NODE = 'light_mobile_0123456789abcdef';
+    await linked();
+    await AsyncStorage.setItem(Push.UNCONFIRMED_BIND_KEY, JSON.stringify({ nodeId: OTHER_NODE, walletAddress: 'x', seq: SEQ + 9, at: 1 }));
+    await Push.stopLightNode();
+    expect(calls.filter((c) => c.url.endsWith('/api/v1/light-node/unbind')).map((c) => c.body.node_id)).toEqual([NODE]);
+    expect(await Push.readUnconfirmedBinding(OTHER_NODE)).toMatchObject({ seq: SEQ + 9 });
   });
 
   it('a binding older builds made has nothing to sign: only the device forgets it', async () => {

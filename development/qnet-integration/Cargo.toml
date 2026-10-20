@@ -163,3 +163,7 @@ path = "src/bin/qnet-node.rs"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
+# statvfs: the storage-full guard reads the data disk's real free space (already in Cargo.lock).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

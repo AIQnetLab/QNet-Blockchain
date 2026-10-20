@@ -16,6 +16,8 @@ import {
 } from '../services/QNetLink';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
 import { moveNote } from '../services/ClaimTransit';
+import { reasonText } from '../utils/bindRefusal';
+import { day } from '../utils/timeText';
 import { qncText } from '../utils/amountFormat';
 
 export const ARM_MS = 1000;
@@ -38,9 +40,6 @@ const byWallet = (o) => !!o && o.kind === 'unlink' && o.mode === 'wallet';
 
 // A wallet named on the sheet: its start and its end.
 const shortAddress = (a) => (typeof a === 'string' && a.length > 20 ? `${a.slice(0, 10)}…${a.slice(-6)}` : String(a || ''));
-// The day this device was linked (Unix seconds), as the sheet shows it.
-const pad2 = (n) => String(n).padStart(2, '0');
-const dayText = (s) => { const d = new Date(s * 1000); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
 
 // `afterOther`: this request arrived while another one was on screen and waited until that one was closed
 // (R4-MOBLINK-01); the screen says so before anything can be confirmed. `onShown` tells the owner the user has this
@@ -167,7 +166,8 @@ export default function QNetLinkScreen({
     }
     acting.current = true;
     let ok = false;
-    try { ok = (await authenticate(t(byWallet(offer) ? WALLET_UNLINK.auth : AUTH[link.intent]))) === true; } catch (_) { ok = false; }
+    const reason = byWallet(offer) ? WALLET_UNLINK.auth : (offer.kind === 'link' && offer.mode === 'here' ? 'link_auth_here' : AUTH[link.intent]);
+    try { ok = (await authenticate(t(reason))) === true; } catch (_) { ok = false; }
     if (!ok || !alive.current) {
       acting.current = false;
       return;
@@ -196,13 +196,8 @@ export default function QNetLinkScreen({
 
   // An error code this build has no text for is shown as the generic one.
   const errText = (error) => t(hasKey(`link_err_${error}`) ? `link_err_${error}` : 'link_err_INTERNAL');
-  // Why this device cannot take the node, when a check of the device or the network said so.
-  const deviceReasonText = (reason) => {
-    if (reason === 'device_secondary_user') return t('node_main_profile');
-    if (reason === 'device_unsupported' || reason === 'device_desktop' || reason === 'device_emulator') return t('node_cant_run');
-    if (typeof reason === 'string' && reason.startsWith('device_')) return t('node_cant_run_now');
-    return null;
-  };
+  // Why the network or a check of this device refused the binding, in the Node tab's words (utils/bindRefusal).
+  const whyText = (a) => (a ? reasonText(t, { reason: a.reason, retryAfterSeconds: a.retryAfterSeconds || null }) : null);
   // Google Play's licence dialog, on the builds that carry its text (Android).
   const licenceFix = (reason) => reason === 'device_unlicensed' && onPlayDialog && hasKey('node_play_licence');
 
@@ -276,7 +271,7 @@ export default function QNetLinkScreen({
           <Text style={s.text}>{t('link_unlink_wallet_body')}</Text>
           {nodeField(o.nodeId)}
           {addressField(t('link_wallet'), o.qnet)}
-          {Number.isSafeInteger(o.since) ? <InfoRow label={t('link_unlink_linked_since')} value={dayText(o.since)} ltr /> : null}
+          {Number.isSafeInteger(o.since) ? <InfoRow label={t('link_unlink_linked_since')} value={day(o.since * 1000)} ltr /> : null}
         </>
       );
     }
@@ -287,7 +282,17 @@ export default function QNetLinkScreen({
           <Text style={s.text}>{t('link_unlink_body')}</Text>
           {nodeField(o.nodeId)}
           {addressField(t('link_wallet'), o.qnet)}
-          {Number.isSafeInteger(o.since) ? <InfoRow label={t('link_unlink_since')} value={dayText(o.since)} ltr /> : null}
+          {Number.isSafeInteger(o.since) ? <InfoRow label={t('link_unlink_since')} value={day(o.since * 1000)} ltr /> : null}
+        </>
+      );
+    }
+    // The node runs here already: nothing is bound, checked or moved; Confirm only tells the website so.
+    if (o.kind === 'link' && o.mode === 'here') {
+      return (
+        <>
+          <Text style={s.text}>{t('link_link_here_body')}</Text>
+          {nodeField(o.nodeId)}
+          {addressField(t('link_wallet'), o.qnet)}
         </>
       );
     }
@@ -309,7 +314,7 @@ export default function QNetLinkScreen({
         {o.kind === 'claim' ? null : <Text style={s.text}>{t('link_claim_empty')}</Text>}
         <InfoField label={t(o.nodeType === 'super' ? 'node_title_super' : 'node_title_light')} value={o.nodeId} mono fit t={t}
           testID="link-claim-node" />
-        {o.kind === 'claim' ? <InfoRow label={t('link_claim_amount')} value={qncText(o.amountNano, t.lang)} ltr fit /> : null}
+        {o.kind === 'claim' ? <InfoRow label={t('link_claim_amount')} value={qncText(o.amountNano)} ltr fit /> : null}
         {addressField(t('link_wallet'), o.qnet)}
       </>
     );
@@ -319,7 +324,7 @@ export default function QNetLinkScreen({
     const a = answer;
     if (a.status === 'rejected') return <Text style={s.text}>{t('link_result_rejected')}</Text>;
     if (a.status === 'error') {
-      const why = deviceReasonText(a.reason);
+      const why = whyText(a);
       // Sent, and no answer told whether it was done: said as unknown, never as "nothing changed" (MN-R4-05).
       if (a.unknown) {
         return <Text style={s.text}>{t(link.intent === 'claim' ? 'claim_note_unknown' : 'node_use_unknown')}</Text>;
@@ -338,22 +343,22 @@ export default function QNetLinkScreen({
       if (a.byWallet) return <Text style={s.text}>{t('link_result_unlinked_wallet')}</Text>;
       return <Text style={s.text}>{t(a.unbound === true ? 'link_result_unlinked' : 'link_result_unlinked_unconfirmed')}</Text>;
     }
-    if (a.status === 'linked') return <Text style={s.text}>{t('link_result_linked')}</Text>;
+    if (a.status === 'linked') return <Text style={s.text}>{t(a.already ? 'link_result_already_here' : 'link_result_linked')}</Text>;
     if (a.status === 'empty') return <Text style={s.text}>{t('link_result_claim_empty')}</Text>;
     if (link.intent === 'claim') {
       const n = moveNote(moveOf && a.txHash ? moveOf(a.txHash) : null, a.stoppedAtEpoch);
       return (
         <>
-          <Text style={s.text}>{t('link_result_claim', { amount: qncText(a.amountNano, t.lang) })}</Text>
+          <Text style={s.text}>{t('link_result_claim', { amount: qncText(a.amountNano) })}</Text>
           <Text style={s.hint}>
-            {t(n.key, n.appliedNano !== undefined ? { amount: qncText(n.appliedNano, t.lang) } : { epoch: n.epoch })}
+            {t(n.key, n.appliedNano !== undefined ? { amount: qncText(n.appliedNano) } : { epoch: n.epoch })}
           </Text>
         </>
       );
     }
     if (a.here !== false && a.reason) {
       // The consent stands; the network refused this device's binding for good.
-      const why = deviceReasonText(a.reason);
+      const why = whyText(a);
       return (
         <>
           <Text style={s.text}>{t('link_result_consent_only')}</Text>
@@ -421,7 +426,7 @@ export default function QNetLinkScreen({
           {phase === 'unavailable' ? (
             <>
               <Text style={s.text}>{errText(offer.error)}</Text>
-              {deviceReasonText(offer.reason) ? <Text style={s.text}>{deviceReasonText(offer.reason)}</Text> : null}
+              {whyText(offer) ? <Text style={s.text}>{whyText(offer)}</Text> : null}
             </>
           ) : null}
 

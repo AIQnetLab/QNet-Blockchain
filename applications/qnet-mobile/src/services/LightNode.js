@@ -388,8 +388,8 @@ const MIN_POST_MS = 1500;
 const postMs = (timeoutMs, deadline) => Math.min(timeoutMs, deadline ? deadline - Date.now() : Infinity);
 
 // A POST to `owners` in order: the first that takes it wins; a stated refusal ends the round (the owners share the
-// binding), anything unreadable moves on to the next owner. `deadline` (ms): every POST stays within it, and no owner
-// is asked once too little of it is left.
+// binding), anything else moves on to the next owner. `deadline` (ms): every POST stays within it, and no owner is
+// asked once too little of it is left.
 async function postToOwners(owners, path, body, accepted, timeoutMs, deadline = null) {
   for (const u of owners) {
     const ms = postMs(timeoutMs, deadline);

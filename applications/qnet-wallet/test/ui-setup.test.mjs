@@ -1,6 +1,6 @@
 // The setup tab on a browserless DOM with a scripted worker (requests checked against the router
 // table). R11: refuses when a vault exists, typed backup check, a copy only by the Copy button with its warning
-// (cleared after 60 s and at the end of setup), no download, phrase handed over once and then dropped; the success
+// (the worker clears it after 60 s and at the end of setup), no download, phrase handed over once and then dropped; the success
 // screen stays until the user presses Done, which closes the tab (owner, 28.09: nothing closes by itself);
 // EXT-SEC-M2: a failed write keeps the phrase for another try.
 import { afterEach, describe, it, mock } from 'node:test';
@@ -14,16 +14,29 @@ const ADDRESSES = Object.freeze({ qnet: core.KAT.qnetAddress, solana: core.KAT.s
 const PASSWORD = 'correct horse battery staple';
 const noVault = () => ({ exists: false, unlocked: false, lockDeadline: null, addresses: null, signingEnabled: true, backoffUntil: null });
 
+// The worker's clipboard clear (clipboard.js): what the page asked of it, and clearNow empties the clipboard as the
+// worker's offscreen document does.
+let clipboardAsks = [];
 function handlers(overrides = {}) {
   return {
     'settings.get': () => ({ autoLockMinutes: null, language: 'en' }),
     'vault.status': noVault,
+    'clipboard.schedule': ({ afterMs }) => {
+      clipboardAsks.push(['schedule', afterMs]);
+      return { scheduled: afterMs > 0 };
+    },
+    'clipboard.clearNow': () => {
+      clipboardAsks.push(['clearNow']);
+      if (page) page.clipboard.text = '';
+      return { cleared: true };
+    },
     ...overrides,
   };
 }
 
 let page = null;
 afterEach(() => {
+  clipboardAsks = [];
   if (page) {
     assert.deepEqual(page.violations, [], 'every request matches the router table');
     page.close();
@@ -273,14 +286,17 @@ describe('setup', () => {
 // clipboard emptied after TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS (or when the tab gets the focus back after that) and at the
 // end of setup, which closes the tab before that timer would run.
 describe('setup: the Copy button of the new phrase', () => {
-  it('copies the shown words on an explicit click only, with the warning next to it, and clears them after a minute', async () => {
+  // The worker clears it (clipboard.js), the tab open or closed, focused or not: the page only asks, and the warning says
+  // the wallet clears it, with no condition on the page.
+  it('copies the shown words on an explicit click only, with the warning next to it, and has the worker clear them after a minute', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     page = await openPage('setup', { handlers: handlers() });
     await page.click('[data-action="create"]');
     assert.equal(page.$('[data-action="copy-phrase"]'), null, 'no Copy button while the words are hidden');
     await page.click('[data-action="reveal-words"]');
     const words = shownWords();
-    assert.match(page.text(), /Anyone who can read your clipboard can take your wallet\. The clipboard is cleared in 60 seconds/);
+    assert.match(page.text(), /Anyone who can read your clipboard can take your wallet\. The wallet clears the clipboard after 60 seconds\./);
+    assert.doesNotMatch(page.text(), /if this page stays open/);
     // the words screen: one line on who the words give the wallet to, and the copy line (owner, 28.09)
     assert.match(page.text(), /Anyone with these words controls your wallet\./);
     assert.doesNotMatch(page.text(), /Keep it safe|A phrase in a file, a screenshot or the clipboard can be stolen|Nobody can restore it/);
@@ -289,18 +305,15 @@ describe('setup: the Copy button of the new phrase', () => {
     await page.click('[data-action="copy-phrase"]');
     assert.equal(page.clipboard.text, words.join(' '));
     assert.match(page.text(), /Recovery phrase copied/);
-    mock.timers.tick(59_999);
-    assert.equal(page.clipboard.text, words.join(' '));
-    mock.timers.tick(1);
-    assert.equal(page.clipboard.text, '', 'cleared after 60 s');
-    // a copy the deadline finds without the focus goes as soon as the tab has it again
-    await page.click('[data-action="copy-phrase"]');
+    assert.deepEqual(clipboardAsks, [['schedule', 60_000]], 'the worker clears it after 60 s');
+    // no timer and no focus of the page writes the clipboard: a closed or unfocused tab clears all the same
     page.document.focused = false;
     mock.timers.tick(60_000);
-    assert.equal(page.clipboard.text, words.join(' '));
     page.document.focused = true;
     fire(page.window, 'focus');
-    assert.equal(page.clipboard.text, '');
+    await page.settle();
+    assert.deepEqual(page.clipboard.writes, [words.join(' ')]);
+    assert.deepEqual(clipboardAsks, [['schedule', 60_000]]);
   });
 
   it('empties the clipboard of a copied phrase when the wallet is set up, before the tab closes', async () => {
@@ -320,7 +333,18 @@ describe('setup: the Copy button of the new phrase', () => {
     await choosePassword();
     assert.deepEqual(created, { mnemonic: words.join(' '), password: PASSWORD });
     assert.match(page.text(), /Your wallet is ready/);
-    assert.equal(page.clipboard.text, '', 'cleared at the end of setup');
+    assert.deepEqual(clipboardAsks, [['schedule', 60_000], ['clearNow']], 'the worker clears it at the end of setup');
+    assert.equal(page.clipboard.text, '');
+  });
+
+  it('asks nothing at the end of setup when no phrase was copied', async () => {
+    page = await openPage('setup', { handlers: handlers({ 'vault.import': () => ({ ...ADDRESSES, lockDeadline: 1 }) }) });
+    await page.click('[data-action="import"]');
+    type(page.$('textarea[name="phrase"]'), core.KAT.mnemonic);
+    await page.click('[data-action="continue"]');
+    await choosePassword();
+    assert.match(page.text(), /Your wallet is ready/);
+    assert.deepEqual(clipboardAsks, []);
   });
 
 });
@@ -356,9 +380,9 @@ describe('setup: secrets on screen', () => {
     assert.equal(input.value, '', 'a pasted phrase does not wait in a locked screen');
   });
 
-  // R3-EXT-UI-01: the idle drop covers a phrase typed or pasted into Import too, and another window taking the
-  // focus hides the word grid and clears a typed phrase, as the popup's reveal hides on blur.
-  it('clears a phrase left in Import after ten idle minutes, and hides secrets when the window loses the focus (R3-EXT-UI-01)', async () => {
+  // R3-EXT-UI-01: the idle drop covers a phrase typed or pasted into Import too, and another window taking the focus
+  // hides the word grid and masks a typed phrase until the focus is back, never emptying what was typed (batch 19.10).
+  it('clears a phrase left in Import after ten idle minutes, and masks secrets while another window has the focus (R3-EXT-UI-01)', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     page = await openPage('setup', { handlers: handlers() });
     await page.click('[data-action="import"]');
@@ -368,8 +392,14 @@ describe('setup: secrets on screen', () => {
     await page.settle();
     assert.equal(input.value, '', 'the idle drop clears the Import field');
     type(input, core.KAT.mnemonic);
+    assert.ok(input.classList.contains('blur-mask'));
     fire(page.window, 'blur');
-    assert.equal(input.value, '', 'another window has the focus: the typed phrase goes');
+    assert.equal(input.value, core.KAT.mnemonic, 'another window has the focus: the typed phrase stays');
+    assert.ok(page.app.classList.contains('window-blurred'), 'masked meanwhile (setup.css)');
+    fire(page.window, 'focus');
+    assert.ok(!page.app.classList.contains('window-blurred'), 'shown again with the focus');
+    const css = await readFile(new URL('../dist/ui/setup.css', import.meta.url), 'utf8');
+    assert.match(css, /\.window-blurred \.blur-mask \{\s*-webkit-text-security: disc;\s*\}/);
     await page.click('[data-action="back"]');
     await page.click('[data-action="create"]');
     await page.click('[data-action="reveal-words"]');
@@ -377,6 +407,28 @@ describe('setup: secrets on screen', () => {
     fire(page.window, 'blur');
     await page.settle();
     assert.deepEqual(shownWords(), [], 'the grid goes back behind "Show the words"');
+  });
+
+  // The password fields show dots anyway: another window taking the focus empties none of them (batch 19.10); a hidden tab,
+  // the screen lock and the idle timer still do.
+  it('keeps typed passwords when another window takes the focus; a hidden tab still empties them', async () => {
+    page = await openPage('setup', { handlers: handlers() });
+    await page.click('[data-action="import"]');
+    type(page.$('textarea[name="phrase"]'), core.KAT.mnemonic);
+    await page.click('[data-action="continue"]');
+    const first = page.$('input[name="new-password"]');
+    const second = page.$('input[name="confirm-password"]');
+    type(first, PASSWORD);
+    type(second, PASSWORD);
+    fire(page.window, 'blur');
+    assert.deepEqual([first.value, second.value], [PASSWORD, PASSWORD]);
+    fire(page.window, 'focus');
+    page.document.hidden = true;
+    page.document.visibilityState = 'hidden';
+    fire(page.document, 'visibilitychange');
+    assert.deepEqual([first.value, second.value], ['', ''], 'a hidden tab empties them');
+    page.document.hidden = false;
+    page.document.visibilityState = 'visible';
   });
 
   // R3-EXT-UI-02: a phrase pasted into Import leaves the current clipboard at once, and again on every way out of the

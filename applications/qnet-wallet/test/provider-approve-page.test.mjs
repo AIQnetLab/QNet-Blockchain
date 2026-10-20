@@ -11,36 +11,14 @@ import { SOLANA, TIMINGS } from '../dist/background/config.js';
 import { WalletError } from '../dist/background/errors.js';
 import { createRouter } from '../dist/background/router.js';
 import { until } from './helpers/chrome-mock.mjs';
-import { createPage } from './helpers/provider-dom.mjs';
+import { createPage, loadApprovePage, openApprovePage, resetPageGlobals, texts } from './helpers/provider-dom.mjs';
 import {
-  ACCOUNTS, GAME, PASSWORD, SITE, TOKEN, activationRecord, createWorld, manifestWithHosts, replyTo, settleAll,
+  ACCOUNTS, GAME, PASSWORD, SITE, TOKEN, activationRecord, answered, createWorld, manifestWithHosts, replyTo, settleAll,
 } from './helpers/provider-harness.mjs';
 
-let pageSeq = 0;
-
-// Loads a fresh copy of approve.js as the page of the approval shown in `shown`'s window.
-async function openPage(world, shown) {
-  const page = createPage({
-    query: `?id=${shown.id}`,
-    runtime: world.chrome.runtime,
-    send: (message) => world.router.handleUiMessage(message, shown.sender),
-  });
-  Object.assign(globalThis, { window: page.window, document: page.document, chrome: page.chrome });
-  pageSeq += 1;
-  await import(`../dist/ui/approve.js?page=${pageSeq}`);
-  return page;
-}
-
-afterEach(() => {
-  delete globalThis.window;
-  delete globalThis.document;
-  delete globalThis.chrome;
-});
-
-const texts = (page, className) => page.app.byClass(className).map((element) => element.textContent);
+afterEach(resetPageGlobals);
 
 const noStrayValues = (page) => assert.ok(!/\bnull\b|\bundefined\b|NaN/.test(page.app.textContent), page.app.textContent);
-const answered = (port, id) => port.posted.some((message) => message.id === id);
 
 describe('approve page', () => {
   it('connect: shows the origin and both addresses; confirm arms after 1 s and takes only trusted, focused clicks', async (t) => {
@@ -48,7 +26,7 @@ describe('approve page', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'c', method: 'qnet_requestAccounts' });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.textContent.includes(ACCOUNTS.solana));
     assert.deepEqual(texts(page, 'ap-title'), ['Connect this site?']);
     assert.deepEqual(texts(page, 'ap-origin-host'), [SITE]);
@@ -94,7 +72,7 @@ describe('approve page', () => {
       const w = createWorld();
       const port = w.connect(`${SITE}/`);
       port.send({ id: 'c', method: 'qnet_requestAccounts' });
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.textContent.includes(ACCOUNTS.solana));
       assert.equal(local.length, 0);
     } finally {
@@ -111,7 +89,7 @@ describe('approve page', () => {
     const shown = await w.shown();
     const gaps = new Set();
     for (let i = 0; i < 16; i += 1) {
-      const page = await openPage(w, shown);
+      const page = await openApprovePage(w, shown);
       await until(() => page.app.button('Connect') !== null);
       const shifts = page.app.byClass('ap-shift');
       assert.equal(shifts.length, 1);
@@ -135,7 +113,7 @@ describe('approve page', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'c', method: 'qnet_requestAccounts' });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Connect') !== null);
     const confirm = page.app.button('Connect');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_MS);
@@ -157,7 +135,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'c', method: 'qnet_requestAccounts' });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.querySelectorAll('input').length === 1);
     const [input] = page.app.querySelectorAll('input');
     for (const [name, value] of Object.entries({
@@ -189,7 +167,7 @@ describe('approve page', () => {
     const w = createWorld({ unlocked: false });
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Unlock') !== null);
     assert.equal(w.log.siteViews.length, 0, 'nothing read while locked');
     const [input] = page.app.querySelectorAll('input');
@@ -217,7 +195,7 @@ describe('approve page', () => {
     const port = w.connect(`${idn}/`);
     const message = 'Line one\n  Line two\twith a tab';
     port.send({ id: 's', method: 'qnet_signMessage', params: { message } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.byClass('ap-message').length === 1);
     assert.deepEqual(texts(page, 'ap-title'), ['Sign this message?']);
     assert.deepEqual(texts(page, 'ap-origin-host'), ['https://аррӏе.aiqnet.io']);
@@ -239,7 +217,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '2.5' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     const values = () => texts(page, 'ap-row-value');
     assert.deepEqual(values(), ['QNet Blockchain testnet (q1337)', '2.5 QNC', '0.00015 QNC', '2.50015 QNC', '5', '10 QNC']);
@@ -273,7 +251,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '2.5' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_MS * 3);
     assert.equal(page.app.button('Send').disabled, true);
@@ -292,7 +270,7 @@ describe('approve page', () => {
       await w.grant(SITE);
       const port = w.connect(`${SITE}/`);
       port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.button('Send') !== null);
       assert.equal(page.app.byClass('ap-row-value').at(-1).textContent, '10 QNC', verification);
       assert.ok(!/Verified|verified|proof|two nodes/.test(page.app.textContent), `${verification}: ${page.app.textContent}`);
@@ -315,7 +293,7 @@ describe('approve page', () => {
       await w.grant(SITE);
       const port = w.connect(`${SITE}/`);
       port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.button('Send') !== null);
       const warnings = page.app.byClass('ap-warning');
       if (expected === null) {
@@ -338,7 +316,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     w.state.sendError = new WalletError('NODE_REJECTED');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
@@ -358,7 +336,7 @@ describe('approve page', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'c', method: 'qnet_requestAccounts' });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Connect') !== null);
     port.close();
     await until(() => w.provider.snapshot().queued === 0);
@@ -371,7 +349,7 @@ describe('approve page', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Activate a Light node?']);
     assert.deepEqual(texts(page, 'ap-kicker'), ['Activation request']);
@@ -432,7 +410,7 @@ describe('approve page', () => {
     w.state.activateOutcome = { status: 'exists', activation: record };
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'e', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Share the code') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Share your activation code?']);
     assert.ok(!page.app.textContent.includes(code), 'the window never shows the code');
@@ -462,7 +440,7 @@ describe('approve page', () => {
     other.state.siteView = { mode: 'unavailable', reason: 'INSUFFICIENT_TOKENS', cost: 1500, balances: { lamports: '5000', oneDevRaw: '1000000' } };
     const otherPort = other.connect(`${SITE}/`);
     otherPort.send({ id: 'u', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const otherPage = await openPage(other, await other.shown());
+    const otherPage = await openApprovePage(other, await other.shown());
     await until(() => otherPage.app.button('Close') !== null);
     assert.deepEqual(texts(otherPage, 'ap-title'), ['Activation is not possible now']);
     assert.ok(otherPage.app.textContent.includes('Not enough 1DEV.'));
@@ -485,7 +463,7 @@ describe('approve page', () => {
     };
     const port = paid.connect(`${SITE}/`);
     port.send({ id: 'n', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(paid, await paid.shown());
+    const page = await openApprovePage(paid, await paid.shown());
     await until(() => page.app.button('Close') !== null);
     const text = page.app.textContent;
     assert.ok(text.includes('This wallet’s node was activated with a burn on aiqnet.io, and its code is in Settings.'), text);
@@ -500,7 +478,7 @@ describe('approve page', () => {
     const known = createWorld();
     known.state.siteView = { mode: 'unavailable', reason: 'NODE_EXISTS', cost: null, balances: null, activation: null };
     known.connect(`${SITE}/`).send({ id: 'm', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const knownPage = await openPage(known, await known.shown());
+    const knownPage = await openApprovePage(known, await known.shown());
     await until(() => knownPage.app.button('Close') !== null);
     assert.ok(knownPage.app.textContent.includes('Use Recover my code on the Activate tab'), knownPage.app.textContent);
     assert.ok(!knownPage.app.textContent.includes('with a burn on aiqnet.io'));
@@ -522,7 +500,7 @@ describe('approve page', () => {
     w.state.registration = other;
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'o', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Share the code') !== null);
     const text = page.app.textContent;
     assert.ok(text.includes('recorded on QNet Blockchain with another 1DEV burn'), text);
@@ -545,7 +523,7 @@ describe('approve page', () => {
       const w = createWorld();
       const port = w.connect(`${SITE}/activate`);
       port.send({ id: nodeType, method: 'qnet_activateNode', params: { nodeType } });
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.button('Burn 1,500 1DEV') !== null);
       assert.deepEqual(texts(page, 'ap-title'), [title]);
       assert.ok(page.app.textContent.includes(line), `${nodeType}: ${page.app.textContent}`);
@@ -570,7 +548,7 @@ describe('approve page', () => {
     w.state.registration = refused;
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'w', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Share the code') !== null);
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     page.app.button('Share the code').click();
@@ -585,7 +563,7 @@ describe('approve page', () => {
     other.state.registration = stopped;
     const otherPort = other.connect(`${SITE}/`);
     otherPort.send({ id: 'r', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const otherPage = await openPage(other, await other.shown());
+    const otherPage = await openApprovePage(other, await other.shown());
     await until(() => otherPage.app.button('Share the code') !== null);
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
     otherPage.app.button('Share the code').click();
@@ -613,7 +591,7 @@ describe('approve page', () => {
     w.state.activateOutcome = { status: 'exists', activation: record };
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'k', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Share the code') !== null);
     assert.ok(!page.app.textContent.includes('the wallet records it too'), 'no line on the record');
     const armed = page.app.button('Share the code');
@@ -662,10 +640,10 @@ describe('approve page', () => {
     });
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'super' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Ablehnen') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Einen Super-Knoten aktivieren?']);
-    assert.ok(page.app.button('1.500 1DEV verbrennen') !== null);
+    assert.ok(page.app.button('1,500 1DEV verbrennen') !== null);
     assert.equal(page.document.title, 'Anfrage an QNet Wallet');
     page.app.button('Ablehnen').click();
     assert.equal((await replyTo(port, 'a')).error.code, 4001);
@@ -677,7 +655,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     const send = page.app.button('Send');
     // a burst of clicks meant for a page: each press anywhere in the window restarts the delay
@@ -707,7 +685,7 @@ describe('approve page', () => {
     const port = w.connect(`${SITE}/`);
     const message = `Sign in to aiqnet.io${'\n'.repeat(300)}I transfer my node registration to someone else`;
     port.send({ id: 's', method: 'qnet_signMessage', params: { message } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.byClass('ap-message').length === 1);
     const [box] = page.app.byClass('ap-message');
     assert.ok(page.app.textContent.includes('Lines: 301'));
@@ -735,7 +713,7 @@ describe('approve page', () => {
     w.state.outstanding = [{ ...base, nonce: '4' }, { ...base, nonce: '5', amountNano: '7' }];
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     assert.ok(page.app.textContent.includes('Earlier transfers of this wallet are not confirmed yet: 2'));
     assert.ok(!/pay twice|30 minutes/.test(page.app.textContent), 'owner, 18.10: a send like any other');
@@ -754,7 +732,7 @@ describe('approve page', () => {
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
     const shown = await w.shown();
     assert.deepEqual((await shown.get()).result.details.replaces, { nonce: '5', to: ACCOUNTS.qnet, amountNano: '1000000000', kind: 'transfer' });
-    const page = await openPage(w, shown);
+    const page = await openApprovePage(w, shown);
     await until(() => page.app.button('Send') !== null);
     assert.ok(page.app.textContent.includes(`A node refused an earlier transfer of 1 QNC to ${ACCOUNTS.qnet} (nonce 5), but it may still go through`));
     page.app.button('Reject').click();
@@ -773,7 +751,7 @@ describe('approve page', () => {
     };
     const port = w.connect(`${SITE}/activate`);
     port.send({ id: 'a', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Burn 1,500 1DEV') !== null);
     const [ack] = page.app.querySelectorAll('input');
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);
@@ -791,7 +769,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { type: 'tokenTransfer', token: TOKEN, to: ACCOUNTS.qnet, amount: '2.5' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     assert.deepEqual(texts(page, 'ap-kicker'), ['Token transfer request']);
     assert.deepEqual(texts(page, 'ap-title'), ['Send tokens?']);
@@ -828,7 +806,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { type: 'tokenTransfer', token: TOKEN, to: core.CANONICAL_BURN_ADDRESS, amount: '1' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     const text = page.app.textContent;
     assert.ok(text.includes('named after the native coin of QNet Blockchain, but it is not QNC'));
@@ -856,7 +834,7 @@ describe('approve page', () => {
       port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
       const shown = await w.shown();
       assert.equal((await shown.get()).result.details.balanceProblem, code);
-      const page = await openPage(w, shown);
+      const page = await openApprovePage(w, shown);
       await until(() => page.app.textContent.includes(text));
       assert.ok(!page.app.textContent.includes('Reading the account from QNet Blockchain'), code);
       t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS * 2);
@@ -878,7 +856,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { type: 'tokenTransfer', token: TOKEN, to: ACCOUNTS.qnet, amount: '1' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     assert.ok(page.app.textContent.includes('The balance is not confirmed yet. Try again in a minute.'));
     assert.ok(!page.app.textContent.includes('The token balance could not be read yet.'));
@@ -895,7 +873,7 @@ describe('approve page', () => {
     const port = w.connect(`${SITE}/`);
     const args = core.bytesToHex(core.utf8Encode('move e2e4'));
     port.send({ id: 'c', method: 'qnet_sendTransaction', params: { type: 'contractCall', contract: GAME, method: 'play', args } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Confirm') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Call this contract?']);
     assert.deepEqual(texts(page, 'ap-args'), [args, 'move e2e4']);
@@ -922,7 +900,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'a', method: 'qnet_sendTransaction', params: { type: 'contractCall', contract: GAME, method: 'run', args: '' } });
-    let page = await openPage(w, await w.shown());
+    let page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Confirm') !== null);
     assert.ok(page.app.textContent.includes('No input'));
     assert.deepEqual(texts(page, 'ap-args'), []);
@@ -933,7 +911,7 @@ describe('approve page', () => {
     await w2.grant(SITE);
     const port2 = w2.connect(`${SITE}/`);
     port2.send({ id: 'b', method: 'qnet_sendTransaction', params: { type: 'contractCall', contract: GAME, method: 'run', args: '00ff' } });
-    page = await openPage(w2, await w2.shown());
+    page = await openApprovePage(w2, await w2.shown());
     await until(() => page.app.button('Confirm') !== null);
     assert.deepEqual(texts(page, 'ap-args'), ['00ff']);
   });
@@ -945,7 +923,7 @@ describe('approve page', () => {
     await w.grant(SITE);
     const port = w.connect(`${SITE}/`);
     port.send({ id: 't', method: 'qnet_sendTransaction', params: { to: ACCOUNTS.qnet, amount: '1' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Send') !== null);
     assert.ok(page.app.textContent.includes('Waiting for your previous transaction to be confirmed.'));
     t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS * 2);
@@ -960,10 +938,7 @@ describe('approve page', () => {
   });
   it('refuses an id that is not an approval uuid', async () => {
     const w = createWorld();
-    const page = createPage({ query: '?id=../../popup', runtime: w.chrome.runtime, send: () => assert.fail('no request') });
-    Object.assign(globalThis, { window: page.window, document: page.document, chrome: page.chrome });
-    pageSeq += 1;
-    await import(`../dist/ui/approve.js?page=${pageSeq}`);
+    const page = await loadApprovePage(createPage({ query: '?id=../../popup', runtime: w.chrome.runtime, send: () => assert.fail('no request') }));
     await until(() => page.window.closed);
     assert.equal(page.app.childNodes.length, 0);
   });
@@ -978,7 +953,7 @@ describe('approve page: the one-code checks (decision 35)', () => {
     w.state.siteView = { mode: 'checking', reason: null, cost: null, balances: null };
     const port = w.connect(`${SITE}/`);
     port.send({ id: 'k', method: 'qnet_activateNode', params: { nodeType: 'super' } });
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.textContent.includes('Checking this wallet: QNet Blockchain, Solana and aiqnet.io…'));
     assert.deepEqual(page.app.querySelectorAll('button').map((button) => button.textContent), ['Reject']);
     assert.equal(page.app.querySelectorAll('input').length, 0, 'no acknowledgement, no burn');
@@ -1008,7 +983,7 @@ describe('approve page: the one-code checks (decision 35)', () => {
       w.state.siteView = { mode: 'unavailable', reason, cost: null, balances: null };
       const port = w.connect(`${SITE}/`);
       port.send({ id: 'u', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.button('Close') !== null);
       assert.deepEqual(texts(page, 'ap-title'), ['Activation is not possible now']);
       assert.ok(page.app.textContent.includes(text), page.app.textContent);
@@ -1031,7 +1006,7 @@ describe('approve page: the one-code checks (decision 35)', () => {
       }
       const port = w.connect(`${SITE}/`);
       port.send({ id: 'o', method: 'qnet_activateNode', params: { nodeType: 'light' } });
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.button('Burn 1,500 1DEV') !== null);
       const [ack] = page.app.querySelectorAll('input');
       t.mock.timers.tick(TIMINGS.CONFIRM_ARM_VALUE_MS);

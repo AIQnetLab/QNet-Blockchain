@@ -47,9 +47,9 @@ const ORIGINS = [...config.QNET.NODES, config.QNET.EXPLORER_API, ...config.SOLAN
 const DAPP_MATCHES = ['https://aiqnet.io/*', 'https://games.aiqnet.io/*'];
 
 describe('skeleton: store manifest', () => {
-  it('is MV3 3.1.5 on Chrome 111+ with the module worker and the popup', () => {
+  it('is MV3 3.1.6 on Chrome 111+ with the module worker and the popup', () => {
     assert.equal(MANIFEST.manifest_version, 3);
-    assert.equal(MANIFEST.version, '3.1.5');
+    assert.equal(MANIFEST.version, '3.1.6');
     assert.equal(MANIFEST.version, PACKAGE.version);
     assert.equal(MANIFEST.version, config.WALLET_VERSION);
     assert.equal(MANIFEST.minimum_chrome_version, '111');
@@ -58,8 +58,10 @@ describe('skeleton: store manifest', () => {
     assert.equal(MANIFEST.default_locale, 'en');
   });
 
-  it('asks for storage, alarms and idle only, and the pinned HTTPS origins only', () => {
-    assert.deepEqual([...MANIFEST.permissions].sort(), ['alarms', 'idle', 'storage']);
+  // offscreen and clipboardWrite: the worker empties the clipboard of a copied secret through an offscreen document, the
+  // popup closed or not (clipboard.js)
+  it('asks for storage, alarms, idle, offscreen and clipboardWrite only, and the pinned HTTPS origins only', () => {
+    assert.deepEqual([...MANIFEST.permissions].sort(), ['alarms', 'clipboardWrite', 'idle', 'offscreen', 'storage']);
     assert.equal(MANIFEST.optional_permissions, undefined);
     assert.equal(MANIFEST.optional_host_permissions, undefined);
     assert.deepEqual([...MANIFEST.host_permissions].sort(), ORIGINS.map((o) => `${o}/*`).sort());
@@ -119,7 +121,7 @@ describe('skeleton: store manifest', () => {
       MANIFEST.background.service_worker, MANIFEST.action.default_popup,
       ...MANIFEST.content_scripts.flatMap((e) => e.js),
       ...Object.values(MANIFEST.icons), ...Object.values(MANIFEST.action.default_icon),
-      ...Object.values(config.UI_PAGES), 'lib/qnet-core.js', '_locales/en/messages.json',
+      ...Object.values(config.UI_PAGES), config.OFFSCREEN.PAGE, 'lib/qnet-core.js', '_locales/en/messages.json',
     ];
     for (const file of files) assert.ok((await stat(path.join(DIST, file))).isFile(), file);
     const messages = JSON.parse(await read('dist/_locales/en/messages.json'));
@@ -256,8 +258,12 @@ describe('skeleton: shipped files', () => {
     assert.equal(LIMITS.REGISTRATION_MAX_ATTEMPTS, 12);
     assert.equal(config.TIMINGS.REGISTRATION_ADMIT_HOLD_MS, 600000);
     assert.equal(config.CLAIM_MIN_NANO, '1000000000');
-    // a recovery phrase copied by its Copy button leaves the clipboard after a minute
+    // a recovery phrase copied by its Copy button leaves the clipboard after a minute, by the worker's own alarm, and the
+    // offscreen page it writes through is no page that may message the worker
     assert.equal(config.TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS, 60000);
+    assert.equal(config.CLIPBOARD_ALARM, 'qnet-clipboard');
+    assert.equal(new Set([config.CLIPBOARD_ALARM, config.AUTO_LOCK_ALARM, config.REGISTRATION_ALARM, config.FOLLOW_ALARM]).size, 4);
+    assert.ok(!Object.values(config.UI_PAGES).includes(config.OFFSCREEN.PAGE));
     // aiqnet.io's record of the wallet's burns (decision 35): the one path asked there, the origin a proof names in every
     // build, the timers every client shares, and the read limits of qnet_getActivation
     assert.equal(config.RECORD_PATH, '/api/cabinet/activation/');
@@ -275,6 +281,7 @@ const EXPORTS = {
   'background/activation.js': ['activateForSite', 'burn', 'copyCode', 'getPrice', 'getStatus', 'lookup', 'maskCode', 'publicActivation',
     'recover', 'setRegistrationHook', 'siteActivation', 'siteView', 'syncRecord'],
   'background/amount.js': ['DECIMALS', 'U64_MAX', 'formatUnits', 'isPositiveAmount', 'parseUnits'],
+  'background/clipboard.js': ['clearNow', 'onAlarm', 'schedule'],
   'background/errors.js': ['ERROR_MESSAGES', 'PROVIDER_ERROR_CODES', 'ProviderError', 'WalletError', 'toProviderError', 'toUiError'],
   'background/events.js': ['notifyViews', 'setViewBroadcaster'],
   'background/keys.js': ['burnRecordMessage', 'deriveAddresses', 'getQnetPublicKey', 'initKeys', 'signBurnRecord', 'signClaimPayload',
@@ -283,6 +290,7 @@ const EXPORTS = {
   'background/nodes.js': ['claimForSite', 'claimView', 'getRegistration', 'onAlarm', 'onChain', 'ownNodeType', 'publicRegistration',
     'registeredBurn', 'registrationFor', 'requestRecord', 'resumeRegistration', 'unlinkForSite', 'unlinkView'],
   'background/log.js': ['log'],
+  'background/platform.js': ['ALARM_EARLY_MS', 'armAlarm', 'attempt', 'chromeApi'],
   'background/provider.js': ['displayOrigin', 'eventSink', 'getApproval', 'handleRequest', 'listSites', 'notifyLockChanged',
     'onPortClosed', 'onWindowRemoved', 'readSites', 'resolveApproval', 'revokeSite', 'setEventSink'],
   'background/qnet.js': ['assertPayableRecipient', 'getBalance', 'getHistory', 'nodeRequest', 'prepareTransfer', 'preview',
@@ -290,10 +298,10 @@ const EXPORTS = {
   'background/router.js': ['PROVIDER_METHODS', 'PROVIDER_RESULT_KEY_EXCEPTIONS', 'RESULT_KEY_EXCEPTIONS', 'SECRET_RESULT_KEYS',
     'UI_MESSAGES', 'createRouter', 'isActivationOrigin', 'isCanonicalOrigin', 'isSafeResult', 'isU64String', 'originMatchesPattern', 'providerOriginOf', 'relayMatchPatterns',
     'uiPageOf', 'validateParams'],
-  'background/session.js': ['backoffDelayMs', 'cachedViews', 'checkBackoff', 'getAddresses', 'getBackoffUntil', 'getSettings', 'initSession',
+  'background/session.js': ['announceWipe', 'backoffDelayMs', 'cachedViews', 'checkBackoff', 'forgetDraft', 'getAddresses', 'getBackoffUntil', 'getSettings', 'initSession',
     'isAutoLockChoice', 'isUnlocked', 'lock', 'lockNow', 'onAlarm', 'onIdleState', 'onLockChange', 'recordPasswordFailure',
-    'recordPasswordSuccess', 'rememberView', 'replaceVaultKey', 'requireUnlocked', 'setSettings', 'startSession', 'storedLanguage', 'touch',
-    'withVaultKey'],
+    'recordPasswordSuccess', 'rememberPopup', 'rememberView', 'replaceVaultKey', 'requireUnlocked', 'setSettings', 'startSession',
+    'storedLanguage', 'touch', 'withVaultKey'],
   'background/solana.js': ['blockHeight', 'buildBurnTransaction', 'burnInstruction', 'compileLegacyMessage',
     'createAtaIdempotentInstruction', 'findWalletBurns', 'getBalances', 'getHistory', 'historyItem', 'memoInstruction', 'quote', 'rpc', 'send',
     'sendAndConfirm', 'serializeTransaction', 'signatureStatus', 'simulate', 'systemTransferInstruction',
@@ -371,7 +379,7 @@ describe('skeleton: dev overlay', () => {
       await rm(path.join(target, 'ui/i18n/ar.js'));
       await writeFile(path.join(target, 'ui/extra.js'), '');
       const manifestPath = path.join(target, 'manifest.json');
-      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.5"', '"version": "3.0.9"'));
+      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.6"', '"version": "3.0.9"'));
       const configPath = path.join(target, 'background/config.js');
       await writeFile(configPath, (await readFile(configPath, 'utf8')).replace('DEV_BUILD = true', 'DEV_BUILD = false'));
       assert.deepEqual((await checkDevBuild(DIST, target)).sort(), [

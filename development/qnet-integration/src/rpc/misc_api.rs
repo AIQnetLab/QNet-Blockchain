@@ -329,7 +329,6 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
     platform:  &str,
     model:     &str,
 ) {
-    use crate::genesis_constants::GENESIS_NODE_IPS;
     const SYNC_PATH: &str = "/api/v1/internal/fcm-token-sync";
 
     let body = FcmTokenSyncRequest {
@@ -358,45 +357,125 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
             genesis_internal_call_tls(ip, SYNC_PATH, |c, url| c.post(url).json(body_ref)).await
         }
     };
+    // A binding's own record (its attach: a move, a first binding) is what a peer down or behind at that moment
+    // needs to push the new device and stop crediting the old one, so it is asked again for hours, while the
+    // binding is still the newest here; any other record once more, a little later (a peer seconds behind the
+    // chain refuses a v2 record as not_registered).
+    let attach = body.proof.as_ref().map_or(false, |p| p.kind == "attach");
+    let retry: &[u64] = if attach { &GENESIS_SYNC_RETRY_SECS } else { &GENESIS_SYNC_ONE_RETRY_SECS };
+    let current = || !attach || crate::node::try_get_storage()
+        .map_or(true, |s| s.get_light_binding(pseudonym).map_or(false, |b| b.seq == seq));
+    sync_to_genesis_peers("fcm_token", pseudonym, our_ip, retry, send, token_sync_settled, current).await;
+}
 
-    // A peer that has not applied the node's registration yet cannot check a v2 record and refuses it
-    // as not_registered; the block reaches it within seconds (a promoted pending binding is sent the
-    // moment this genesis applies it), so those peers get one more try.
-    let mut behind: Vec<&'static str> = Vec::new();
-    for (ip, _id) in GENESIS_NODE_IPS {
-        // Skip self
-        if *ip == our_ip || ip.is_empty() { continue; }
+/// A token sync's refusal that a retry cannot change: the record itself (its fields, its proof, its key).
+fn token_sync_settled(reason: &str) -> bool {
+    matches!(reason, "missing_fields" | "bad_endpoint" | "proof_required" | "bad_proof" | "identity_mismatch")
+}
 
-        match send(*ip).await {
-            Ok(resp) if resp.status().is_success() => {
+/// When a genesis peer that did not take a binding's sync (an unbind, a binding's own token record) is asked again: a
+/// restart or a roll is over within minutes, a longer outage within hours. After that it heals by its own pulls.
+pub(crate) const GENESIS_SYNC_RETRY_SECS: [u64; 5] = [15, 60, 300, 1800, 7200];
+/// The one retry of any other sync (a token refresh).
+pub(crate) const GENESIS_SYNC_ONE_RETRY_SECS: [u64; 1] = [15];
+/// Syncs that wait for a retry at once, node-wide: past it a sync gets its first round only, and its peers heal by
+/// their pulls, so a long outage of one genesis holds a bounded set of requests here.
+pub(crate) const SYNC_RETRY_WAITING_MAX: usize = 4_096;
+static SYNC_RETRY_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One sync among the waiting ones (`SYNC_RETRY_WAITING_MAX`) while it lives.
+struct WaitingSync;
+
+impl WaitingSync {
+    fn enter() -> Option<WaitingSync> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = SYNC_RETRY_WAITING.fetch_add(1, Relaxed);
+        if n >= SYNC_RETRY_WAITING_MAX {
+            SYNC_RETRY_WAITING.fetch_sub(1, Relaxed);
+            return None;
+        }
+        Some(WaitingSync)
+    }
+}
+
+impl Drop for WaitingSync {
+    fn drop(&mut self) {
+        SYNC_RETRY_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Send one sync of light node `node` (`what` names it in the logs) to every other genesis peer through `send`, and ask
+/// the peers that did not take it again after each wait of `retry`: not one whose refusal `settled` names (a refusal of
+/// the record itself), and none once `current` says the record is no longer this genesis's newest. Returns the peers it
+/// gave up on. One driver for the unbind sync and the token sync.
+pub(crate) async fn sync_to_genesis_peers<F, Fut>(
+    what: &str,
+    node: &str,
+    our_ip: &str,
+    retry: &[u64],
+    send: F,
+    settled: impl Fn(&str) -> bool,
+    current: impl Fn() -> bool,
+) -> Vec<&'static str>
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    let mut pending: Vec<&'static str> = crate::genesis_constants::GENESIS_NODE_IPS.iter()
+        .map(|(ip, _)| *ip).filter(|ip| *ip != our_ip && !ip.is_empty()).collect();
+    let mut waiting: Option<WaitingSync> = None;
+    for (attempt, wait) in std::iter::once(0).chain(retry.iter().copied()).enumerate() {
+        if pending.is_empty() { break; }
+        if wait > 0 {
+            if waiting.is_none() {
+                waiting = WaitingSync::enter();
+                if waiting.is_none() {
+                    if crate::node::is_warn() {
+                        println!("[WARN][LIGHT] {}_sync_retry_skipped node={} peers={:?} reason=too_many_waiting", what, node, pending);
+                    }
+                    return pending;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            if !current() {
                 if crate::node::is_info() {
-                    println!("[INFO][LIGHT] fcm_token_synced_to ip={} pseudonym={}", ip, pseudonym);
+                    println!("[INFO][LIGHT] {}_sync_superseded node={} attempt={}", what, node, attempt);
                 }
+                return Vec::new();
             }
-            Ok(resp) => {
-                let status = resp.status();
-                let reason = resp.json::<serde_json::Value>().await.ok()
-                    .and_then(|v| v["reason"].as_str().map(|r| r.to_string())).unwrap_or_default();
-                if reason == "not_registered" && body.proof.is_some() { behind.push(*ip); }
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] fcm_token_sync_rejected ip={} status={} reason={}", ip, status, reason);
+        }
+        let mut again = Vec::new();
+        for ip in pending {
+            match send(ip).await {
+                Ok(r) if r.status().is_success() => {
+                    if crate::node::is_info() {
+                        println!("[INFO][LIGHT] {}_synced_to ip={} node={} attempt={}", what, ip, node, attempt);
+                    }
                 }
-            }
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] fcm_token_sync_failed ip={} err={}", ip, e);
+                Ok(r) => {
+                    let status = r.status();
+                    let reason = r.json::<Value>().await.ok()
+                        .and_then(|v| v["reason"].as_str().map(|s| s.to_string())).unwrap_or_default();
+                    if !settled(&reason) { again.push(ip); }
+                    if crate::node::is_warn() {
+                        println!("[WARN][LIGHT] {}_sync_rejected ip={} node={} status={} reason={} attempt={}",
+                                 what, ip, node, status, reason, attempt);
+                    }
+                }
+                Err(e) => {
+                    again.push(ip);
+                    if crate::node::is_warn() {
+                        println!("[WARN][LIGHT] {}_sync_failed ip={} node={} err={} attempt={}", what, ip, node, e.without_url(), attempt);
+                    }
                 }
             }
         }
+        pending = again;
     }
-    if behind.is_empty() { return; }
-    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-    for ip in behind {
-        let ok = send(ip).await.map_or(false, |r| r.status().is_success());
-        if crate::node::is_info() {
-            println!("[INFO][LIGHT] fcm_token_sync_retry ip={} pseudonym={} ok={}", ip, pseudonym, ok);
-        }
+    if !pending.is_empty() && crate::node::is_warn() {
+        println!("[WARN][LIGHT] {}_sync_gave_up node={} peers={:?} action=peers_heal_by_pull", what, node, pending);
     }
+    pending
 }
 
 /// Handler: POST /api/v1/internal/fcm-token-sync
@@ -522,6 +601,8 @@ pub(super) fn apply_token_sync(
             if !signed { return SyncOutcome::Refused("bad_proof"); }
             match storage.save_light_ping_keys_identity(node, &p.ping_pubkey, &p.delegation_cert, &identity) {
                 Ok(w) if w.holds() => {}
+                // Ahead of this clock for now: the sender asks again, and a later try takes it.
+                Ok(crate::storage::PingKeyWrite::Refused(lb::Admit::FutureSeq)) => return SyncOutcome::Refused("future_seq"),
                 Ok(_) => return SyncOutcome::Stale("stale_seq"),
                 Err(_) => return SyncOutcome::Refused("storage"),
             }
@@ -549,13 +630,15 @@ pub(super) fn apply_token_sync(
 
 /// A push record this shard owner pulled from a peer genesis to heal its own (the peer served the
 /// device's attestation, so its channel is live). It carries no proof, so it is taken only for the
-/// binding this node already holds - a v2 record at exactly the stored sequence - or, for a node with
-/// no v2 binding, a legacy record, under the writer the peer kept (a legacy row here takes only its own).
+/// binding this node already holds - a v2 record at exactly the stored sequence, with the bind's platform and model
+/// hints the peer kept - or, for a node with no v2 binding, a legacy record, under the writer the peer kept (a legacy
+/// row here takes only its own).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_pulled_push_record(
     storage: &crate::storage::Storage,
     p2p: Option<&crate::unified_p2p::SimplifiedP2P>,
     node_id: &str, token: &str, push_type: &str, endpoint: Option<&str>, ts: u64, seq: u64, writer: &str,
+    platform: &str, model: &str,
 ) -> bool {
     let binding = storage.get_light_binding(node_id);
     let current = binding.as_ref().filter(|b| !b.never_v2()).map(|b| b.seq);
@@ -573,7 +656,8 @@ pub(crate) fn apply_pulled_push_record(
     let written = if seq == 0 {
         storage.save_fcm_token_by(node_id, token, pt, endpoint, ts, writer)
     } else {
-        storage.save_fcm_token_seq(node_id, token, pt, endpoint, ts, seq)
+        let (platform, model) = (crate::light_binding::platform_hint(Some(platform)), crate::light_binding::model_hint(Some(model)));
+        storage.save_fcm_token_seq_platform(node_id, token, pt, endpoint, ts, seq, platform, model)
     };
     match written {
         Ok(true) => {
@@ -613,7 +697,7 @@ pub(super) async fn handle_internal_fcm_token_get(
             warp::reply::json(&serde_json::json!({
                 "success": true, "token": e.token, "push_type": e.push_type,
                 "endpoint": e.endpoint.unwrap_or_default(), "ts": e.updated_at, "seq": e.seq,
-                "writer": e.writer,
+                "writer": e.writer, "platform": e.platform, "model": e.model,
             })),
             warp::http::StatusCode::OK,
         )),
@@ -1671,9 +1755,9 @@ mod internal_call_tests {
         let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
         let node = "light_mobile_nb3pull";
         let now = crate::light_device::now_secs();
-        assert!(!apply_pulled_push_record(&s, None, node, "tok_forged", "fcm", None, u64::MAX, 0, ""));
-        assert!(!apply_pulled_push_record(&s, None, node, "tok_forged", "fcm", None, now + 3_600, 0, ""));
-        assert!(apply_pulled_push_record(&s, None, node, "tok_real", "fcm", None, now, 0, ""));
+        assert!(!apply_pulled_push_record(&s, None, node, "tok_forged", "fcm", None, u64::MAX, 0, "", "", ""));
+        assert!(!apply_pulled_push_record(&s, None, node, "tok_forged", "fcm", None, now + 3_600, 0, "", "", ""));
+        assert!(apply_pulled_push_record(&s, None, node, "tok_real", "fcm", None, now, 0, "", "", ""));
         assert_eq!(s.get_fcm_entry(node).map(|e| e.token), Some("tok_real".to_string()));
     }
 
@@ -1683,17 +1767,103 @@ mod internal_call_tests {
     fn the_token_and_unbind_syncs_never_send_an_unproven_record_in_clear() {
         let src = include_str!("misc_api.rs");
         let sync = &src[src.find("pub(super) async fn sync_fcm_token_to_genesis_peers(").unwrap()..];
-        let sync = &sync[..sync.find("pub(super) async fn handle_internal_fcm_token_sync(").unwrap()];
+        let sync = &sync[..sync.find("fn token_sync_settled(").unwrap()];
         let proven = sync.find("if body_ref.proof.is_some() {").expect("the proof decides");
         let plain = sync.find("genesis_internal_call(ip, SYNC_PATH").expect("the v2 path");
         let tls = sync.find("genesis_internal_call_tls(ip, SYNC_PATH").expect("the TLS-only path");
         assert!(proven < plain && plain < tls);
         assert_eq!(sync.matches("genesis_internal_call(").count(), 1, "one call site, behind the proof");
-        assert_eq!(sync.matches("send(").count(), 2, "both rounds go through it");
+        assert!(sync.contains("sync_to_genesis_peers(\"fcm_token\", pseudonym, our_ip, retry, send,"), "every round goes through it");
         let unbind = include_str!("light_unbind.rs");
         let unbind = &unbind[unbind.find("pub(super) async fn sync_unbind_to_genesis_peers(").unwrap()..];
-        let unbind = &unbind[..unbind.find("\n}\n").unwrap()];
+        let unbind = &unbind[..unbind.find("pub(crate) fn repair_withdrawn_binding(").unwrap()];
         assert!(unbind.contains("genesis_internal_call_tls(ip, PATH") && !unbind.contains("genesis_internal_call(ip"));
+        assert!(unbind.contains("sync_to_genesis_peers(\"unbind\""), "the same driver as the token sync");
+    }
+
+    /// B2/B3: a sync asks again, after each wait of its schedule, the peers that did not take it (unreachable, behind
+    /// the chain) and never one that refused the record itself; it stops once the record is no longer the newest here.
+    /// A binding's own record is asked again for hours, any other once.
+    #[tokio::test]
+    async fn a_sync_asks_again_only_the_peers_that_may_still_take_it() {
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        let ips: Vec<&'static str> = GENESIS_NODE_IPS.iter().map(|(ip, _)| *ip).collect();
+        let (ours, taker, refuser, late, behind) = (ips[0], ips[1], ips[2], ips[3], ips[4]);
+        let reply = |status: u16, reason: &str| -> reqwest::Result<reqwest::Response> {
+            Ok(reqwest::Response::from(warp::http::Response::builder().status(status)
+                .body(format!(r#"{{"success":{},"reason":"{}"}}"#, status == 200, reason)).unwrap()))
+        };
+        let calls: Arc<DashMap<&'static str, u32>> = Arc::new(DashMap::new());
+        let send = {
+            let calls = calls.clone();
+            move |ip: &'static str| {
+                let n = { let mut e = calls.entry(ip).or_insert(0); *e += 1; *e };
+                let r = if ip == taker { reply(200, "") }
+                    else if ip == refuser { reply(400, "bad_proof") }
+                    else if ip == late && n >= 2 { reply(200, "") }
+                    else { reply(400, "not_registered") };
+                async move { r }
+            }
+        };
+        let gave_up = sync_to_genesis_peers("test", "light_mobile_sync", ours, &[1, 1], send.clone(), token_sync_settled, || true).await;
+        assert_eq!(gave_up, vec![behind]);
+        let n = |ip: &'static str| calls.get(ip).map_or(0, |v| *v);
+        assert_eq!((n(ours), n(taker), n(refuser), n(late), n(behind)), (0, 1, 1, 2, 3), "itself never, a settled refusal once");
+        // The record is no longer the newest here: nobody is asked again.
+        calls.clear();
+        let gave_up = sync_to_genesis_peers("test", "light_mobile_sync", ours, &[1], send, token_sync_settled, || false).await;
+        assert!(gave_up.is_empty());
+        assert_eq!((n(late), n(behind)), (1, 1));
+        assert!(token_sync_settled("identity_mismatch") && token_sync_settled("bad_proof"));
+        assert!(!token_sync_settled("not_registered") && !token_sync_settled("future_seq") && !token_sync_settled("storage")
+                && !token_sync_settled(""), "a peer behind, a clock behind, a storage error or a terminator's 403 may pass");
+        // The schedules, and the bound on syncs that wait for a retry.
+        assert_eq!(GENESIS_SYNC_RETRY_SECS.iter().sum::<u64>(), 15 + 60 + 300 + 1800 + 7200);
+        assert_eq!(GENESIS_SYNC_ONE_RETRY_SECS, [15]);
+        let mut held = Vec::new();
+        while let Some(g) = WaitingSync::enter() { held.push(g); }
+        assert!(held.len() <= SYNC_RETRY_WAITING_MAX && WaitingSync::enter().is_none());
+        held.clear();
+        assert!(WaitingSync::enter().is_some(), "a sync that ends leaves room");
+        // The token sync chooses the schedule by the record's kind, and only an attach checks it is still the newest.
+        let src = include_str!("misc_api.rs");
+        let body = &src[src.find("pub(super) async fn sync_fcm_token_to_genesis_peers(").unwrap()..src.find("fn token_sync_settled(").unwrap()];
+        assert!(body.contains("p.kind == \"attach\"") && body.contains("if attach { &GENESIS_SYNC_RETRY_SECS } else { &GENESIS_SYNC_ONE_RETRY_SECS }"));
+        assert!(body.contains("b.seq == seq"));
+    }
+
+    /// B3: the pull serves the bind's platform and model with a v2 record, and the puller keeps them; a later token
+    /// refresh keeps them, and an older write of the same binding (its attach arriving after the refresh) gives the ones
+    /// the record lacks without taking the channel back.
+    #[test]
+    fn the_binds_hints_survive_a_pull_a_refresh_and_a_late_attach() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let node = "light_mobile_hints";
+        let now = crate::light_device::now_secs();
+        // No binding here: a v2 pull is not taken (it belongs to no binding held here).
+        assert!(!apply_pulled_push_record(&s, None, node, "tok", "fcm", None, now, 7, "", "ios", "Acme 7"));
+        // A refresh of the binding at 7 reached this genesis before the attach did: no hints yet.
+        assert!(s.save_fcm_token_seq(node, "tok_r", "fcm", None, now, 7).unwrap());
+        assert_eq!(s.get_fcm_entry(node).map(|e| (e.platform, e.model)), Some((String::new(), String::new())));
+        // The attach comes later, signed earlier: the channel stays the refresh's, the hints are taken.
+        assert!(!s.save_fcm_token_seq_platform(node, "tok_a", "fcm", None, now - 60, 7, "ios", "Acme 7").unwrap());
+        let e = s.get_fcm_entry(node).unwrap();
+        assert_eq!((e.token.as_str(), e.updated_at, e.platform.as_str(), e.model.as_str()), ("tok_r", now, "ios", "Acme 7"));
+        // An older write of another binding gives nothing.
+        assert!(!s.save_fcm_token_seq_platform(node, "tok_o", "fcm", None, now - 60, 6, "android", "Other").unwrap());
+        assert_eq!(s.get_fcm_entry(node).map(|e| e.platform), Some("ios".to_string()));
+        // A refresh names none and keeps them.
+        assert!(s.save_fcm_token_seq(node, "tok_r2", "fcm", None, now + 1, 7).unwrap());
+        assert_eq!(s.get_fcm_entry(node).map(|e| (e.token, e.platform, e.model)),
+                   Some(("tok_r2".into(), "ios".into(), "Acme 7".into())));
+        // The served record names them, and the pull path hands them to the store.
+        let src = include_str!("misc_api.rs");
+        let get = &src[src.find("pub(super) async fn handle_internal_fcm_token_get(").unwrap()..];
+        assert!(get[..get.find("pub(super) fn is_genesis_peer_ip(").unwrap()].contains("\"platform\": e.platform, \"model\": e.model"));
+        let prop = include_str!("../unified_p2p/propagation.rs");
+        let pull = &prop[prop.find("pub(super) fn maybe_pull_push_channel(").unwrap()..];
+        assert!(pull[..pull.find("pub(super) fn genesis_peer_ip(").unwrap()].contains("v[\"platform\"].as_str().unwrap_or(\"\"), v[\"model\"].as_str().unwrap_or(\"\")"));
     }
 }
 

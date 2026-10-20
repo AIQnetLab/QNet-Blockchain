@@ -1,0 +1,14 @@
+# The Node tab once its first status read answered.
+appId: com.qnetmobile
+---
+- tapOn:
+    id: "tab-node"
+- waitForAnimationToEnd:
+    timeout: 3000
+- extendedWaitUntil:
+    notVisible: "Checking node status.*"
+    timeout: 40000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "shot/05-node"

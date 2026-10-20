@@ -8,38 +8,16 @@ import { LIMITS, STORAGE_KEYS, TIMINGS } from '../dist/background/config.js';
 import { ProviderError, WalletError } from '../dist/background/errors.js';
 import { UNLINK_ERROR_CODES } from '../dist/background/provider.js';
 import { until } from './helpers/chrome-mock.mjs';
-import { createPage } from './helpers/provider-dom.mjs';
+import { openApprovePage, resetPageGlobals, texts } from './helpers/provider-dom.mjs';
 import {
-  ACCOUNTS, APP, NODE_ID, PASSWORD, SITE, createWorld, eventsOf, replyTo, settleAll,
+  ACCOUNTS, APP, COOLDOWN_TEXT, ERROR_LINGER_MS, NODE_ID, PASSWORD, SITE, answered, createWorld, eventsOf, replyTo, settleAll,
 } from './helpers/provider-harness.mjs';
 
-const ERROR_LINGER_MS = 30000;
-const COOLDOWN_TEXT = 'Too many rejected requests from this site, try again later';
 const LINKED_DAY = 1_790_035_200;
 const unlink = (port, id, params) => port.send({ id, method: 'qnet_unlinkNodeDevice', ...(params === undefined ? {} : { params }) });
-const answered = (port, id) => port.posted.some((message) => message.id === id);
 const OK = Object.freeze({ status: 'ok', qnet: ACCOUNTS.qnet, nodeId: NODE_ID, unbound: true });
 
-let pageSeq = 0;
-async function openPage(world, shown) {
-  const page = createPage({
-    query: `?id=${shown.id}`,
-    runtime: world.chrome.runtime,
-    send: (message) => world.router.handleUiMessage(message, shown.sender),
-  });
-  Object.assign(globalThis, { window: page.window, document: page.document, chrome: page.chrome });
-  pageSeq += 1;
-  await import(`../dist/ui/approve.js?unlink=${pageSeq}`);
-  return page;
-}
-
-afterEach(() => {
-  delete globalThis.window;
-  delete globalThis.document;
-  delete globalThis.chrome;
-});
-
-const texts = (page, className) => page.app.byClass(className).map((element) => element.textContent);
+afterEach(resetPageGlobals);
 
 describe('provider: qnet_unlinkNodeDevice', () => {
   it('aiqnet.io: one window with the device; the armed confirm unlinks it and answers ok with unbound', async () => {
@@ -178,7 +156,7 @@ describe('approve page: the light node\'s device', () => {
     const w = createWorld();
     const port = w.connect(`${SITE}/`);
     unlink(port, 'u');
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Unlink') !== null);
     assert.deepEqual(texts(page, 'ap-title'), ['Unlink the node’s device?']);
     const text = page.app.textContent;
@@ -212,7 +190,7 @@ describe('approve page: the light node\'s device', () => {
       w.state.unlinkView = { mode: 'unavailable', reason, platform: null, linkedSince: null };
       const port = w.connect(`${SITE}/`);
       unlink(port, 'e');
-      const page = await openPage(w, await w.shown());
+      const page = await openApprovePage(w, await w.shown());
       await until(() => page.app.button('Close') !== null);
       assert.ok(page.app.textContent.includes(line), page.app.textContent);
       assert.equal(page.app.button('Unlink'), null);
@@ -230,7 +208,7 @@ describe('approve page: the light node\'s device', () => {
     w.state.unlinkView = { platform: 'ios', linkedSince: null };
     const port = w.connect(`${SITE}/`);
     unlink(port, 'r');
-    const page = await openPage(w, await w.shown());
+    const page = await openApprovePage(w, await w.shown());
     await until(() => page.app.button('Unlink') !== null);
     assert.ok(page.app.textContent.includes('iPhone or iPad'));
     assert.ok(!page.app.textContent.includes('Linked since'), 'no day when the network names none');

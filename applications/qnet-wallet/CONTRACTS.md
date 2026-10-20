@@ -1,4 +1,4 @@
-# QNet Wallet extension 3.1.5: contracts
+# QNet Wallet extension 3.1.6: contracts
 
 This file is the single agreement between the modules of the rebuilt extension. The rebuild spec and the
 three audit reports (ext-secrets, ext-surface, ext-crypto) are normative; this file turns them into
@@ -23,10 +23,10 @@ Implementation areas:
 
 | Area | Files |
 |---|---|
-| A. Vault and session | `background/vault.js`, `session.js`, `keys.js` |
+| A. Vault and session | `background/vault.js`, `session.js`, `keys.js`, `clipboard.js` (the clipboard clear after a copied secret, section 8), `platform.js` (the chrome.* helpers session.js and clipboard.js share) |
 | B. Chains and activation | `background/qnet.js`, `solana.js`, `activation.js`, `nodes.js` (the wallet's nodes on QNet Blockchain: the light node's registration and the unlink of its device, and the move of the balance of the light or super node a site names, section 4.10) |
 | C. dApp | `background/provider.js`, `content/relay.js`, `inject/provider.js` |
-| D. Pages | `ui/popup.*`, `ui/setup.*`, `ui/approve.*`, `ui/kit.js`, `ui/i18n/*`, `ui/qr.js`, the area-D functions of `ui/common.js`, `_locales/*` |
+| D. Pages | `ui/popup.*`, `ui/setup.*`, `ui/approve.*`, `ui/offscreen.*` (the offscreen document of `clipboard.js`; no UI page), `ui/kit.js`, `ui/i18n/*`, `ui/qr.js`, the area-D functions of `ui/common.js`, `_locales/*` |
 
 An area may export more helpers than listed here (tests may need them) but must keep every listed
 export with its signature. Every exported function carries JSDoc (checked).
@@ -127,11 +127,14 @@ sender → envelope (`INVALID_REQUEST`) → known type (`UNKNOWN_TYPE`) → page
 declared fields is built; a field is a string, an integer, a boolean, one of a set of values, or a list: an array of at
 most a stated number of distinct values of one such kind, copied) → cross-field check → `requireUnlocked()` when marked (`LOCKED`) →
 `handler(params, meta)` with `meta = Object.freeze({ page, sender })` → result guard → `session.touch()`
-when marked activity (a failed touch is only logged).
+when marked activity (a failed touch is only logged) → `session.forgetDraft()` when marked sends (a failed drop is only
+logged).
 
 ### 2.4 Message types
 
-Pages: P popup, S setup, A approve. U: requires unlocked. T: a success extends the auto-lock deadline.
+Pages: P popup, S setup, A approve. U: requires unlocked. T: a success extends the auto-lock deadline. A success of
+`qnet.send`, `qnet.tokenSend` or `solana.send` (marked sends) also drops the popup's Send form draft, the popup open or
+not (`session.forgetDraft`, decision 51).
 Field types: `password` string 1..1024; `mnemonic` string 1..1024; `qnetAddress` EON with valid
 checksum; `solanaAddress` canonical base58 of 32 bytes; `qnc` canonical decimal > 0, at most 9
 decimals, <= u64 nano; `u64` canonical u64 decimal string; `uuid` lowercase v4; `resetToken` 64
@@ -149,11 +152,15 @@ lowercase hex characters.
 | `vault.changePassword` | P | U | T | `{password, newPassword}` | `{changed: true}` | `BACKOFF, BAD_PASSWORD, WEAK_PASSWORD` |
 | `vault.reveal` | P | U | T | `{password}` | `{mnemonic}` (the only response with this vault's phrase) | `BACKOFF, BAD_PASSWORD` |
 | `vault.exportKey` | P | U | T | `{password, network: 'qnet'\|'solana'}` (decision 40) | `{network, address, privateKey}`: QNet the 32-byte ML-DSA-65 KeyGen seed as 64 lowercase hex characters, Solana the 64-byte secret key (private seed, then public key) in base58; derived and checked against the session's address after a fresh password check (the only response with a private key) | `BACKOFF, BAD_PASSWORD, SIGNING_DISABLED, ADDRESS_MISMATCH, NO_VAULT` |
-| `vault.wipe` | P | | | `{password, confirm: 'DELETE'}` | `{wiped: true}` | `NO_VAULT, BACKOFF, BAD_PASSWORD, INTERNAL` |
+| `vault.wipe` | P | | | `{password, confirm: 'DELETE'}` | `{wiped: true}` (section 5, Wipe: the wipe is announced only once the vault is deleted) | `NO_VAULT, BACKOFF, BAD_PASSWORD` (nothing locked or erased); `INTERNAL`: the database could not be deleted (the wallet stays, locked, nothing announced) or something else stayed (announced) |
 | `vault.resetBegin` | P | | | `{}` | `{token: resetToken, expiresAt}` (section 5, Reset) | `NO_VAULT, UNLOCKED` |
 | `vault.reset` | P | | | `{token: resetToken, confirm: 'ERASE'}` (no password: it is forgotten; `confirm`: the user pressed Reset wallet, never typed) | `{wiped: true}`: everything `vault.wipe` erases, erased only while locked (section 5, Reset) | `RESET_EXPIRED, NO_VAULT, UNLOCKED, INTERNAL` |
 | `wallet.addresses` | PA | U | | none | `{qnet, solana}` | |
-| `wallet.cached` | P | U | | none | `{qnetBalance: QnetBalance\|null, qnetHistory: {items, cursor, pending}\|null, solanaBalances: SolanaBalances\|null, solanaHistory: {items, cursor}\|null, qnetTokens: TokenList\|null}`: the last answer of each this session served (decision 39: `qnet.balance`, `qnet.tokens`, `solana.balances`, and `qnet.history` / `solana.history` without a cursor), null for one not read yet; dropped by every lock and every new session. A balance view (`qnetBalance` when verified or read at the live tip, `qnetTokens`, `solanaBalances`) not read in this session comes from the vault's chain cache, where the last one is kept across sessions (decisions 40, 50) | |
+| `wallet.cached` | P | U | | none | `{qnetBalance: QnetBalance\|null, qnetHistory: {items, cursor, pending}\|null, solanaBalances: SolanaBalances\|null, solanaHistory: {items, cursor}\|null, qnetTokens: TokenList\|null, popupState: {network, tab, draft: {asset?, to?, amount?}\|null}\|null}`: the last answer of each this session served, and where the popup was (`wallet.remember`) (decision 39: `qnet.balance`, `qnet.tokens`, `solana.balances`, and `qnet.history` / `solana.history` without a cursor), null for one not read yet; dropped by every lock and every new session. A balance view (`qnetBalance` when verified or read at the live tip, `qnetTokens`, `solanaBalances`) not read in this session comes from the vault's chain cache, where the last one is kept across sessions (decisions 40, 50) | |
+| `wallet.touch` | P | U | T | none | `{touched: true}`: the user pressed or typed in the popup (sent at most every `TIMINGS.ACTIVITY_TOUCH_MS`, 30 s, and when the wallet opens); only the activity rule acts on it, so the auto-lock counts from the user's last action, never from a read (decision 51) | |
+| `wallet.remember` | P | U | | `{network: 'qnet'\|'solana', tab: POPUP_TABS, asset?, to?, amount?}` (`config.isDraftField`: an asset alphanumeric <= 64, a recipient of 32 to 45 letters and digits, an address's length and letters, so a phrase, a private key or an activation code is never kept; an amount of digits and one '.' <= 40) | `{remembered: true}`: where the popup is, kept as the view cache's `popupState` (dropped by every lock); the draft fields only while the Send form of that network holds a recipient or an amount, never with a payment request; the draft is dropped by the worker once a send went (decision 51) | |
+| `clipboard.schedule` | PS | | | `{afterMs: 0..PHRASE_CLIPBOARD_CLEAR_MS}` | `{scheduled: boolean}`: after a page copied a secret (`afterMs` > 0) the worker empties the clipboard that long later through its offscreen document, the page open or not; 0: a later copy that needs no clear replaced it, the pending clear is dropped (section 8) | |
+| `clipboard.clearNow` | S | | | none | `{cleared: boolean}`: setup's end empties the clipboard of a copied phrase still due to be cleared, at once; nothing pending, nothing written (section 8) | |
 | `qnet.balance` | P | U | | none | `QnetBalance` | `NETWORK, BALANCE_UNCONFIRMED` |
 | `qnet.history` | P | U | | `{cursor?: string\|null (printable ASCII <= 512), limit?: 1..50}` | `{items: HistoryItem[], cursor: string\|null, pending: HistoryItem[]}` | `NETWORK` |
 | `qnet.tokens` | P | U | | none | `TokenList` (section 2.5; decision 40): the built-in QRC-20 tokens the wallet holds, each named by two nodes, each balance at a pinned node's live tip, else certified (decision 50) | `NETWORK` (no node listed the wallet's tokens) |
@@ -185,7 +192,7 @@ lowercase hex characters.
 | `settings.get` | PSA | | | none | `{autoLockMinutes: 5\|15\|30\|60\|'never'\|null, language}` (null while locked); `language` is the stored one, else the browser's UI language (`chrome.i18n.getUILanguage()` through `config.languageForTag`) when the UI has it, else `'en'` | |
 | `settings.set` | P | U | T | `{autoLockMinutes?: 5\|15\|30\|60\|'never', language?: SUPPORTED_LANGUAGES}`, at least one (`'never'`: no inactivity timer) | same as get | `VAULT_CORRUPT` |
 | `approval.get` | A | | | `{id: uuid}` | `ApprovalView` | `NOT_FOUND` |
-| `approval.resolve` | A | | T | `{id: uuid, approved: boolean, revision?: integer}` (no password for any kind: a `password` field is `INVALID_PARAMS`, the unlocked session and the armed press in the approval's own window confirm, section 4.8; `revision`: the `ApprovalView.revision` the page drew, required by a transaction's (`sendTransaction`, `tokenTransfer`, `contractCall`), an `activateNode`, a `claimNodeBalance` or an `unlinkNodeDevice` confirm: another one is `NONCE_CHANGED` / `PRICE_CHANGED` and the window reviews again) | `{resolved: true}`; for `activateNode` also `{status: 'ok'\|'exists'\|'pending'\|'error', error: code\|null}`, `nodeType: 'light'\|'super'` for `ok` and `exists` (the node type of the code the site received: the window adds the server's next step for a Super code, decision 36), and `registration: {nodeId, state, automatic, deferred}` after a light answer while the node has a record on QNet Blockchain; for `claimNodeBalance` also `{status: 'ok'\|'empty'\|'error', error: code\|null}` and, for `ok`, `{amountNano, partial}`; for `unlinkNodeDevice` also `{status: 'ok'\|'error', error: code\|null}` (the wallet's own code, for the window's text) | `NOT_FOUND, LOCKED, INVALID_PARAMS`, errors of the approved action; `activateNode`: `LOCKED, PRICE_CHANGED` (the approval stays open) |
+| `approval.resolve` | A | | T | `{id: uuid, approved: boolean, revision?: integer}` (no password for any kind: a `password` field is `INVALID_PARAMS`, the unlocked session and the armed press in the approval's own window confirm, section 4.8; `revision`: the `ApprovalView.revision` the page drew, required by a transaction's (`sendTransaction`, `tokenTransfer`, `contractCall`), an `activateNode`, a `claimNodeBalance`, an `unlinkNodeDevice` or a `solanaTransfer` confirm: another one is `NONCE_CHANGED` / `PRICE_CHANGED` / `FEE_CHANGED` and the window reviews again) | `{resolved: true}`; for `activateNode` also `{status: 'ok'\|'exists'\|'pending'\|'error', error: code\|null}`, `nodeType: 'light'\|'super'` for `ok` and `exists` (the node type of the code the site received: the window adds the server's next step for a Super code, decision 36), and `registration: {nodeId, state, automatic, deferred}` after a light answer while the node has a record on QNet Blockchain; for `claimNodeBalance` also `{status: 'ok'\|'empty'\|'error', error: code\|null}` and, for `ok`, `{amountNano, partial}`; for `unlinkNodeDevice` also `{status: 'ok'\|'error', error: code\|null}` (the wallet's own code, for the window's text); for `solanaTransfer` also `{status: 'submitted'\|'error', error: code\|null}` and, for `submitted`, `signature` | `NOT_FOUND, LOCKED, INVALID_PARAMS`, errors of the approved action; `activateNode`: `LOCKED, PRICE_CHANGED` (the approval stays open); `solanaTransfer`: `LOCKED, FEE_CHANGED, BLOCKHASH_EXPIRED` (the approval stays open) |
 `LOCKED` can come from every U type. A dApp never reaches any of these types.
 
 ### 2.5 Result shapes
@@ -385,9 +392,9 @@ only from this extension's worker (`sender.url === getURL('background/sw.js')`, 
 
 | Event | When | data | Page reaction |
 |---|---|---|---|
-| `locked` | any lock | null | clear every input `.value`, drop secrets, show the lock screen |
+| `locked` | any lock, the one a delete or reset starts with too (reason `erase`) | null | clear every input `.value`, drop secrets, show the lock screen; the popup whose own Delete wallet runs keeps its screen until that answer (section 5, Wipe) |
 | `unlocked` | unlock | null | refresh (the popup's lock and reset screens give way to the wallet) |
-| `wiped` | wipe, reset | null | clear localStorage/sessionStorage of the page, drop the view, take a copy the page made and has yet to clear off the clipboard (`common.clearCopiedNow`, best effort; anything else on the clipboard stays: Reset leads to Import, whose phrase may be on it), reload once. sw.js sends it when the wipe starts, before `vault.wipe` or `vault.reset` answers: the popup that asked for the delete or the reset reloads here, so the clipboard is cleared here, never after the answer (R16, R4-ESM-01) |
+| `wiped` | wipe, reset, once the vault is deleted (`session.announceWipe`) | null | clear localStorage/sessionStorage of the page, drop the view, reload once. The erase itself already emptied the clipboard of a copied secret still due to be cleared (`clipboard.clearNow`, R16); anything else on the clipboard stays (Reset leads to Import, whose phrase may be on it). sw.js sends it before `vault.wipe` or `vault.reset` answers, never before the record is gone: an erase that fails announces nothing, and the popup says the wallet was not deleted (decision 51) |
 | `activation` | activation record, pending burn or the state of the light node's registration changed | null | refresh the Activate tab |
 | `approval` | approval queue changed | null | approve page refreshes |
 | `balance` | a send, token transfer, contract call, activation or claim a site asked for ran after its confirm (sent, burned, moved, or failed on the way) | null | the popup reads the balances, the token list or the history on screen again at once (section 9, Pages) |
@@ -468,6 +475,7 @@ Shared with the future mobile in-app browser: the same page API, methods, result
 | `qnet_getActivation` | none | `SiteActivationRead` (below) | Decision 35. `router.isActivationOrigin` only (4100 for any other origin before the params). Read-only and never a window: no approval queue, budget or cooldown, no grant read-or-written besides the check, no `accountsChanged`, nothing signed for the site or burned; a burn the kept search finds is stored as `activation.recover` stores it (a Light activation's record on QNet Blockchain then starts, as after Recover), and the vault's own burn may be recorded on aiqnet.io (`syncRecord`). At most `LIMITS.ACTIVATION_READS_PER_MINUTE` (30) a minute per origin (more: 4001). `{status: 'no_wallet'}` without a vault, `{status: 'locked'}`, `{status: 'not_connected'}` while this origin holds no valid grant of the session's wallet; otherwise `activation.siteActivation`, checked by provider.js before it leaves (the wallet's own addresses, a known status with exactly its keys, a well-formed burn, the code the node's derivation of it; anything else -32603) |
 | `qnet_unlinkNodeDevice` | none | `SiteUnlinkResult` (below) | Decision 38. `router.isActivationOrigin` only (4100 for any other origin before the params). No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise an `unlinkNodeDevice` approval (cooldown and queue as 4.8) showing `nodes.unlinkView`; its armed confirm (no password, like every approval) runs `nodes.unlinkForSite` (section 4.10). The wallet's own light node only; an extension without the method answers 4200 |
 | `qnet_claimNodeBalance` | `{nodeId}`: a light (`light_mobile_` + 16 hex) or super (`super_node_` + 16 hex) node id | `SiteClaimResult` (below) | Decision 47. `router.isActivationOrigin` only (4100 for any other origin before the params); another form of `nodeId`, a genesis node's among them, or none → -32602 before any window. No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `claimNodeBalance` approval (cooldown and queue as 4.8) showing `nodes.claimView` of that node; its armed confirm (no password, like every approval) runs `nodes.claimForSite` (section 4.10). Only this wallet's own light or super node (`core.lightNodeId`, `core.superNodeId` of its address): any other is `WALLET_MISMATCH`, shown in the window and answered as an error, nothing signed. The popup offers no move of its own |
+| `qnet_sendSolanaTransfer` | `{to: solanaAddress, mint: solanaAddress \| null, amount: string}` | `{status: 'submitted', signature}` or `{status: 'error', error}` (`SiteTransferResult`, below) | Decision 52. `router.isActivationOrigin` only (4100 for any other origin, games.aiqnet.io included, before the params). Params checked by the router before anything else (-32602, no window): `to` `F.solanaAddress`; `mint` null (SOL) or exactly `config.SOLANA.ONE_DEV_MINT` of the build's cluster (1DEV), any other mint -32602; `amount` `F.transferAmount` (`/^(0\|[1-9][0-9]{0,19})(\.[0-9]{0,17}[1-9])?$/`: plain decimal whole tokens, no trailing fraction zero) above zero with at most the token's decimals (`DECIMALS.SOL` 9, `DECIMALS.ONE_DEV` 6: the router's `transferCheck`); no other key. **The probe:** a call without params (absent, `null`, `[]`, `{}`) is -32602 from that check at once: no window, nothing counted toward the budget or the cooldown, no Solana read; an extension without the method answers 4200. provider.js checks the request again, maps `mint` to the send's asset (`'sol'`/`'1dev'`) and refuses the wallet's own Solana address (`INVALID_RECIPIENT`, -32602) before any window while the session knows it, else in the window once unlocked (its Close answers -32602). No grant read or created, no `accountsChanged`. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `solanaTransfer` approval (cooldown, budget and queue as 4.8) showing `solana.quote` of exactly `{asset, to, amount}`, read-only; its armed confirm (no password) runs `solana.send` with the reviewed `feeLamports` and `rentLamports` |
 
 `SiteActivationResult` (QNet Link v1 sections 7 and 10): `ok` and `exists` `{status, qnet, solana, nodeType,
 burnTx, burnAmount, code}`; `pending` `{status, qnet, solana, nodeType, burnTx, burnAmount}`; `exists` may add
@@ -514,6 +522,15 @@ NOT_LINKED, NETWORK, UNLINK_REFUSED, INTERNAL` (`UNLINK_ERRORS`; any other code 
 `unbind_wallet` among them). A reject or a closed window is 4001. Before a result leaves, provider.js checks it once more: this
 wallet's address and light node id and `unbound: true`; anything else becomes `INTERNAL`.
 
+`SiteTransferResult` (decision 52): `{status: 'submitted', signature}`, exactly these two keys, as soon as `solana.send`
+returned a well-formed signature, whatever its status (provider.js `transferResult`; a send answer it cannot check is
+`INTERNAL`); or `{status: 'error', error}` with one of `INSUFFICIENT_SOL` (also for `SOL_BELOW_RENT`), `INSUFFICIENT_TOKENS`,
+`SOLANA_UNAVAILABLE`, `TX_FAILED` (also for `SIMULATION_FAILED`, `TX_TOO_LARGE`, `AMOUNT_BELOW_RENT`), `NO_WALLET`, `INTERNAL`
+(`TRANSFER_ERRORS`; any other code is `INTERNAL`). An error result means nothing was transferred: `solana.send` refused or
+failed before the broadcast, or the status read right after it already reports the transaction failed on chain (also
+`TX_FAILED`: it moved no tokens, though its network fee is spent); any other broadcast answers `submitted`. A reject or a
+closed window is 4001. The site never waits on the answer: it reads the payment address's balance for what arrived.
+
 `SiteActivationRead` (decision 35): `{status: 'no_wallet'}`, `{status: 'locked'}`, `{status: 'not_connected'}`, or
 `{status: 'searching'|'none'|'unusable', qnet, solana}`, `{status: 'unknown', qnet, solana, reason:
 'SOLANA_UNAVAILABLE'|'HISTORY_TOO_LONG'}`, `{status: 'pending', qnet, solana, nodeType, burnTx, burnAmount}`, `{status: 'exists',
@@ -542,7 +559,8 @@ the reservation back (`POST .../release`, best effort) and sends nothing. The ne
 codes they mean: `ACTIVATION_RECORDED` → `NODE_EXISTS`, `ACTIVATION_RESERVED` → `BURN_IN_PROGRESS`, `RECORD_UNAVAILABLE` →
 `INTERNAL`; the window names each in its own words. The answer shapes and codes of QNet Link section 7 are unchanged.
 
-Solana signing is not offered to dApps. A dApp verifier of `qnet_signMessage` must use the same bytes
+aiqnet.io may ask for one SOL or 1DEV transfer that the user reviews and confirms in the window
+(`qnet_sendSolanaTransfer`); no other Solana signing is offered. A dApp verifier of `qnet_signMessage` must use the same bytes
 and the same FIPS 204 context (`core.verifyOffchainMessage`).
 
 ### 4.5 Error codes
@@ -551,10 +569,10 @@ and the same FIPS 204 context (`core.verifyOffchainMessage`).
 |---|---|---|
 | 4001 | User rejected the request | rejected, window closed, approval timeout, per-origin queue full, port flood, the origin's 20 `qnet_getTransactionStatus` reads or 30 `qnet_getActivation` reads of the last minute spent |
 | 4001 | Too many rejected requests from this site, try again later | the origin is in its approval cooldown (section 4.8); `WalletError('APPROVAL_COOLDOWN')`, the only other text a 4001 carries (`inject/provider.js` `COOLDOWN_MESSAGE`) |
-| 4100 | Unauthorized | no grant for sign/send; grant revoked while waiting; `LOCKED`/`UNAUTHORIZED` from a module; `qnet_activateNode`, `qnet_getActivation`, `qnet_claimNodeBalance` or `qnet_unlinkNodeDevice` from any origin but `https://aiqnet.io` (dev: + loopback) |
+| 4100 | Unauthorized | no grant for sign/send; grant revoked while waiting; `LOCKED`/`UNAUTHORIZED` from a module; `qnet_activateNode`, `qnet_getActivation`, `qnet_claimNodeBalance`, `qnet_unlinkNodeDevice` or `qnet_sendSolanaTransfer` from any origin but `https://aiqnet.io` (dev: + loopback), before the params are read |
 | 4200 | Unsupported method | not in the allow-list |
 | 4900 | Disconnected | port closed (sent by the relay) |
-| -32602 | Invalid params | envelope or params invalid; `INVALID_*` (`INVALID_METHOD`, `INVALID_ARGS`, `INVALID_GAS_LIMIT` included), `PROTOCOL_PREFIX`, `MESSAGE_TOO_LONG`, `UNSUPPORTED_PARAM`, `RECIPIENT_IS_CONTRACT`; a token transfer of a contract that is no QRC-20 token or a call of one that is a token or no contract; a transfer or token transfer to a contract (section 4.9) |
+| -32602 | Invalid params | envelope or params invalid; `INVALID_*` (`INVALID_METHOD`, `INVALID_ARGS`, `INVALID_GAS_LIMIT` included), `PROTOCOL_PREFIX`, `MESSAGE_TOO_LONG`, `UNSUPPORTED_PARAM`, `RECIPIENT_IS_CONTRACT`; a token transfer of a contract that is no QRC-20 token or a call of one that is a token or no contract; a transfer or token transfer to a contract (section 4.9); `qnet_sendSolanaTransfer` without params (the site's probe), with another mint, an amount of more decimals than its token or not in plain form, an extra key, or to the wallet's own Solana address (`INVALID_RECIPIENT`) |
 | -32602 | Unsupported parameter, with `data: {reason: 'UNSUPPORTED_PARAM'}` | a `contractCall` naming `value` or `accessList`: the network accepts neither on a call today (errors.js `UNSUPPORTED_CALL_FIELDS`, `UNSUPPORTED_PARAM_MESSAGE`), refused before anything else is read; the only error that carries `data` and the one other text a -32602 carries, the mobile in-app browser's shape; the relay and `inject/provider.js` pass on exactly that shape (`error.data`, frozen) |
 | -32603 | Internal error | anything else (a dApp learns nothing about balances or nodes); a `qnet_getActivation` answer that fails its check |
 
@@ -623,7 +641,7 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   `TIMINGS.APPROVAL_COOLDOWN_WINDOW_MS` (10 min) bars the origin for `TIMINGS.APPROVAL_COOLDOWN_LONG_MS` (1 min).
   Meanwhile a request that would need a window
   (`qnet_requestAccounts` without a grant or while locked, `qnet_signMessage`, `qnet_sendTransaction`,
-  `qnet_activateNode`, `qnet_claimNodeBalance`, `qnet_unlinkNodeDevice`) fails at once with the cooldown 4001 (section 4.5); a counted rejection ends the origin's
+  `qnet_activateNode`, `qnet_claimNodeBalance`, `qnet_unlinkNodeDevice`, `qnet_sendSolanaTransfer`) fails at once with the cooldown 4001 (section 4.5); a counted rejection ends the origin's
   approvals already waiting with it; calls that need no window are served. An
   approved and performed approval of the origin clears its cooldown and its count. A port that closes
   while its approval's page has drawn the action (`approval.get` served) for at least `TIMINGS.CONFIRM_ARM_MS`
@@ -636,7 +654,7 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   `{[origin]: {rejections: ms[], until: ms, windows: ms[]}}` (an entry without `windows` reads as none; read
   once per worker, entries shape-checked, `until` never more than the long cooldown ahead, at most
   `LIMITS.APPROVAL_COOLDOWN_ORIGINS_MAX` origins).
-- `ApprovalView`: `{id, kind: 'connect'|'signMessage'|'sendTransaction'|'tokenTransfer'|'contractCall'|'activateNode'|'claimNodeBalance'|'unlinkNodeDevice', origin,
+- `ApprovalView`: `{id, kind: 'connect'|'signMessage'|'sendTransaction'|'tokenTransfer'|'contractCall'|'activateNode'|'claimNodeBalance'|'unlinkNodeDevice'|'solanaTransfer', origin,
   originDisplay, idn, locked, queued, createdAt, revision, details}`; `revision` grows whenever the lock state
   or the details served change, and a send or burn confirm must name the one the page drew (R2-ERP-04); a read
   that finishes after a newer one started, or after a confirm started, stores nothing (R2-EXT-UI-03).
@@ -668,8 +686,14 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   wallet's light and super node ids; `nodeType` null only for `WALLET_MISMATCH`; null while locked or before a first
   read), unlinkNodeDevice `{mode: 'confirm'|'unavailable'|null, reason, nodeId, wallet, platform,
   linkedSince}` (`nodes.unlinkView`, read on every `approval.get` while not busy, checked against this wallet's own light node;
-  null while locked or before a first read). The worker signs exactly the last preview it served, and only when the page
-  names that preview's revision.
+  null while locked or before a first read), solanaTransfer `{to, asset: 'sol'|'1dev', mint, amount, amountRaw, feeLamports,
+  rentLamports, totalLamports, balanceLamports, tokenRaw, rentFloorLamports, recipient: {known, lookalike}|null, shortfall,
+  mode: 'confirm'|'unavailable'|null, reason}` (the request's part fixed for the approval's life; the rest `solana.quote` of
+  exactly `{asset, to, amount}`, read on every `approval.get` while not busy and checked against the request: the same
+  recipient, token, mint and base units at the token's decimals, no references or memo, u64 figures, a known shortfall;
+  `totalLamports` and `rentFloorLamports` give the shortfall's text its numbers; a failed read keeps the last view, and with
+  none `mode` is `unavailable` with its code; null while locked or before a first read). The worker signs exactly the last
+  preview it served, and only when the page names that preview's revision.
 - `activateNode` (QNet Link v1 section 10): the price of the first `burn` view is fixed for the
   approval's life (`siteView` gets it back as `known.cost`, and the burn re-checks it:
   `PRICE_CHANGED` resets it and the window reviews again); the network's word that the wallet has no node
@@ -722,6 +746,25 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   (no device runs the node, a network that does not take the unlink yet, no two nodes alike, signing off) offers one Close that
   sends `approved: false`: the dApp gets `{status: 'error', error}` (`UNSUPPORTED` and `SIGNING_DISABLED` as `INTERNAL`),
   counted like an unavailable activation. The outcome (the device unlinked, or the reason) stays until closed, at most 30 s.
+- `solanaTransfer` (decision 52): the window, titled "Send from your wallet", is the popup's Solana Send review filled in
+  from the request and read-only: one line that the site asks for this transfer and that nothing in it can be changed, the
+  recipient with the first-send and look-alike warnings (`recipient`), then the review's rows (`kit.solanaReviewRows`): the
+  token and, for 1DEV, its mint, the amount as asked, the network fee, the rent of the recipient's token account when the
+  transfer creates it, the SOL spent in all and the network; then the wallet's SOL balance (and 1DEV balance for a 1DEV
+  transfer). No input element: recipient, token and amount
+  are the request's, one request is one frozen `{to, mint, amount}`, and a second request is a second approval in the queue.
+  Send arms after `CONFIRM_ARM_VALUE_MS` like any transaction, names the revision it shows (`REVISIONED`; another one is
+  `FEE_CHANGED`: review again) and takes no password (locked: unlock first, then the review). Confirm runs
+  `solana.send({asset, to, amount, expectedFeeLamports, expectedRentLamports})` with the reviewed quote; `FEE_CHANGED`,
+  `BLOCKHASH_EXPIRED` and `LOCKED` keep the window open and read the quote again. A shortfall (`INSUFFICIENT_SOL`,
+  `INSUFFICIENT_TOKENS`, `SOL_BELOW_RENT`, `AMOUNT_BELOW_RENT`, with its numbers: `kit.solanaShortfall`, the popup's text), a
+  quote that failed with none read before, or the wallet's own address is an `unavailable` view with its reason and one
+  Close that sends `approved: false`: the site gets `{status: 'error', error}` (`SiteTransferResult` codes; the own address
+  -32602), counted like an unavailable activation (the first close counts nothing). A quote Solana did not give
+  (`SOLANA_UNAVAILABLE`, `INTERNAL`) is read again every 3 s, up to five times, then with the heartbeat, and the review
+  replaces it as soon as a read succeeds. After the confirm the window shows the progress, then the signature or why
+  nothing was transferred, and stays until closed, at most 30 s; closing it never cancels a sent transfer, and the next
+  approval's window opens after it.
 
 ### 4.9 Token transfers, contract calls and transaction status
 
@@ -960,8 +1003,9 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   failed write removes nothing. "Use my recovery phrase instead" (or a new wallet) leaves both copies in place: setup's last screen and
   Settings offer to remove them behind one confirmation that says the earlier wallet then opens only with its own
   phrase (`vault.removeEarlier`, while a vault of this version exists and is unlocked). What 2.x left with nothing it
-  can open (a placeholder, a copy without the phrase, or no wallet) goes with the first vault written; Delete wallet and
-  a Forgot-password reset remove the pages' database with the rest of `chrome.storage.local`. Every extension page empties its own
+  can open (a placeholder, a copy without the phrase, or no wallet) goes with the first vault written, and with Delete wallet
+  and a Forgot-password reset; an earlier wallet that still opens (`readEarlierWallet` not null, or not readable for
+  certain) stays through both, its keys and its pages' database, until its own Remove or its move (decision 51). Every extension page empties its own
   `localStorage` and `sessionStorage` when it starts (`common.clearPageStorage`). No secret of the earlier version is
   ever written anywhere by this version.
 - KDF: Argon2id (`core.argon2idAsync`, dkLen 32) by default; `assertKdfFloor` refuses anything below
@@ -1048,13 +1092,19 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   wipe or reset); write, read back, decrypt with the entered password, re-derive and compare addresses, only then
   start the session (EXT-SEC-M2).
 - Reveal: `vault.reveal` decrypts with the password and answers the phrase (section 8 for its Copy button).
-- Wipe: password check; then `session.lock('wipe')`, close connections, await `deleteDatabase` (success,
-  blocked, error), reset the password backoff (memory and storage; only once the database is deleted),
-  clear `chrome.storage.local` and `session`, verify the vault is gone (only the self-test pass, which is
-  not wallet data, may be written again meanwhile). The interface language (`qnet_settings_v3` holding exactly an
-  allowed `{language}`: `session.storedLanguage()`) stays in `chrome.storage.local`; any other value there goes. The
-  popup's Delete screen sends `vault.wipe` on its button or Enter in the password field; a refusal empties only the
-  password field (the typed `DELETE` stays).
+- Wipe (`eraseAll`): password check; then the origins the stored grants name are read, `session.lock('erase')`, close
+  connections, await `deleteDatabase` (success, blocked, error: a failure ends it here, the wallet in place and locked,
+  nothing announced), reset the password backoff (memory and storage; only once the database is deleted), clear
+  `chrome.storage.local` and `session`, empty the clipboard of a copied secret still due to be cleared
+  (`clipboard.clearNow`), and once the record is verified gone `session.announceWipe(origins)`: the pages hear `wiped`,
+  and every site of those origins and every connected one the disconnect (`provider.onWipe`), also when the worker read
+  no grant since it started. Only the self-test pass, the light client's hints and a clipboard clear asked meanwhile,
+  none of them wallet data, may be written again meanwhile. Stays in `chrome.storage.local`: the interface language
+  (`qnet_settings_v3` holding exactly an allowed `{language}`: `session.storedLanguage()`; any other value there goes)
+  and an earlier wallet that still opens (Earlier version above). The popup's Delete screen sends `vault.wipe` on its
+  button or Enter in the password field; a refusal before the erase (a wrong password) empties only the password field
+  (the typed `DELETE` stays); while it runs the popup keeps its screen through the `locked` the erase starts with, and
+  an erase that did not finish shows the lock screen with "The wallet was not deleted" (`deleteNotFinished`).
 - Reset ("Forgot password?" on the popup lock screen → Reset wallet; decision 45): the popup says the extension cannot
   recover the password and that a new one takes a reset, gives one danger warning (the reset removes the wallet from this
   browser; only its recovery phrase brings it back) and offers Back and Reset wallet; nothing is typed, no phrase and no
@@ -1063,8 +1113,9 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   (one minute), in worker memory only (a newer token replaces it), then at once `vault.reset` with the token and
   `confirm: 'ERASE'`. `vault.reset` refuses any page but the popup, takes the token (any call spends it; wrong,
   expired, foreign or missing → `RESET_EXPIRED`), requires the confirmation, and erases as Wipe does after its password
-  check (`session.lock('wipe')`, the database deleted, the backoff reset, `chrome.storage.local` but the interface
-  language and `session` cleared, the earlier version's database deleted, nothing left), whatever the record holds (one that does not parse goes too:
+  check (`session.lock('erase')`, the database deleted, the backoff reset, `chrome.storage.local` but the interface
+  language and an earlier wallet that opens and `session` cleared, the clipboard of a copied secret emptied, nothing
+  left, then the wipe announced), whatever the record holds (one that does not parse goes too:
   R2-ESM-05), and only while the wallet is locked: an unlocked one (its password is known; Delete wallet takes it) is
   refused with `UNLOCKED` by both types, `vault.reset` checking in the same queue as unlock, so an unlock that finishes
   first is seen and the wallet just unlocked stays (the popup then opens it; its "Forgot password?" waits while its own
@@ -1086,13 +1137,15 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   `storage.local`, best effort), then restores a mirror whose deadline is ahead, else clears it.
 - Deadline = now + autoLockMinutes (default 15; choices 5/15/30/60 and `'never'`, `AUTO_LOCK_CHOICES`). One alarm
   `qnet-auto-lock`; the deadline is also checked on every `requireUnlocked`. `touch()` after activity
-  types only; reads and polling never extend. Never (owner, 28.09): `lockDeadline` null and no alarm; the session
+  types only, `wallet.touch` among them (a press or a key on the popup, at most every 30 s, and its opening: decision
+  51); reads and polling never extend. Never (owner, 28.09): `lockDeadline` null and no alarm; the session
   still ends on Lock, the OS screen lock, a browser start, and when the browser closes (`storage.session` goes with it).
-- Lock on: `vault.lock`, deadline, `runtime.onStartup`, `idle` state `locked`, wipe, and any error that
-  makes the session doubtful (`'error'`). Lock zeroizes the key, clears memory and the mirror, clears
+- Lock on: `vault.lock`, deadline, `runtime.onStartup`, `idle` state `locked`, the start of a delete or reset
+  (`'erase'`), and any error that makes the session doubtful (`'error'`). `announceWipe(origins)` is no lock: it tells
+  the listeners `{locked: true, reason: 'wipe', origins}` once the erase deleted the vault. Lock zeroizes the key, clears memory and the mirror, clears
   the alarm and calls every `onLockChange` listener; it never throws. The unlock state is never a
-  stored boolean. A session whose password check (Argon2id, about a second) began before a `user`, `idle` or
-  `startup` lock, or that would start while `chrome.idle.queryState` reports `locked`, never starts
+  stored boolean. A session whose password check (Argon2id, about a second) began before a `user`, `idle`,
+  `startup` or `erase` lock, or that would start while `chrome.idle.queryState` reports `locked`, never starts
   (`session.lockMark()` taken before the KDF, `startSession({since})`: R3-ESM-03); an unlock then fails with
   `LOCKED`, and a vault just written (create, import) stays locked (`lockDeadline` null).
 - Backoff: `chrome.storage.session['qnet_backoff_v3'] = {failures, until}`; shared by every password
@@ -1121,16 +1174,18 @@ phrase (decision 41) and its balance is moved with this extension's approval win
 | `chrome.storage.session` | `qnet_backoff_v3` | `{failures, until}` | session.js | trusted contexts only |
 | `chrome.storage.session` | `qnet_selftest_v3` | `{v: 1, bundle, passedAt}` crypto self-test pass | keys.js | trusted contexts only; used only for the same bundle bytes |
 | `chrome.storage.session` | `qnet_approval_cooldown_v3` | `{[origin]: {rejections, until, windows}}` | provider.js | trusted contexts only; shape-checked, capped |
-| `chrome.storage.session` | `qnet_view_cache_v3` | `{walletId, values: {qnetBalance?, qnetHistory?, solanaBalances?, solanaHistory?, qnetTokens?}}` the popup's view cache (decision 39) | session.js (for the router) | trusted contexts only; public answers of the session's wallet only, read only for that wallet; removed by every lock and every new session |
+| `chrome.storage.session` | `qnet_view_cache_v3` | `{walletId, values: {qnetBalance?, qnetHistory?, solanaBalances?, solanaHistory?, qnetTokens?, popupState?}}` the popup's view cache (decision 39) and where the popup was (`popupState`: network, tab, the Send form's draft; decision 51) | session.js (for the router) | trusted contexts only; public answers of the session's wallet only, read only for that wallet; removed by every lock and every new session |
 | `chrome.storage.session` | `qnet_light_hints_v1` | `{headSeen, capsuleQuietUntil}` (`headSeen`: `{index, at}` or null) the certified head the worker saw last and until when no node is asked for a capsule (decision 49) | qnet.js | trusted contexts only; hints only (a proof stands only by the certified head read with it; a quiet probe costs a longer walk); chain data, kept across locks; a wipe clears it, and a read still running may write it again after |
+| `chrome.storage.session` | `qnet_clipboard_v1` | `{until}`: when the clipboard is due to be emptied of a secret a page copied (section 8), never the text | clipboard.js | trusted contexts only; removed when the clear runs or a later copy drops it |
 | `chrome.storage.local` | `qnet_sites_v3` | grants with MAC | provider.js | untrusted until the MAC verifies |
 | `chrome.storage.local` | `qnet_settings_v3` | `{language}`, a UI preference (`SUPPORTED_LANGUAGES`) | session.js | untrusted, allow-list validated; the worst a writer can do is change the UI language |
-| IndexedDB `QNetWallet` / `vault` | `main` | what the store's 2.1.x pages kept: the recovery phrase and two keys, each sealed under its password (section 5, Earlier version) | never written by this version; never created (a read opens it only when `indexedDB.databases()` lists it, and aborts an upgrade from version 0) | read only by `vault.status` (`earlier`) and `vault.migrate`; deleted with the earlier keys (after a migration read its vault back, by `vault.removeEarlier`, with the first vault when it holds no phrase and no readable record is there, by Delete wallet and by a reset) |
-| `chrome.storage.local` | `earlier.EARLIER_KEYS` (`encryptedWallet`, `walletExists`, `walletData`, `encryptedActivationCodes`, `wallet`, `isUnlocked`, `lastUnlockTime`, `currentNetwork`, `mainnet`, `auto_lock_timer`, `connected_sites`) | what the store's 2.1.x left: its encrypted wallet and the keys beside it (section 5, Earlier version) | never written by this version | read only by `vault.migrate` (a record that does not open moves nothing); removed after a migration read its vault back, by `vault.removeEarlier`, or with the first vault when no readable record is there |
+| IndexedDB `QNetWallet` / `vault` | `main` | what the store's 2.1.x pages kept: the recovery phrase and two keys, each sealed under its password (section 5, Earlier version) | never written by this version; never created (a read opens it only when `indexedDB.databases()` lists it, and aborts an upgrade from version 0) | read only by `vault.status` (`earlier`) and `vault.migrate`; deleted with the earlier keys (after a migration read its vault back, by `vault.removeEarlier`, with the first vault when it holds no phrase and no readable record is there, and by Delete wallet and a reset only then) |
+| `chrome.storage.local` | `earlier.EARLIER_KEYS` (`encryptedWallet`, `walletExists`, `walletData`, `encryptedActivationCodes`, `wallet`, `isUnlocked`, `lastUnlockTime`, `currentNetwork`, `mainnet`, `auto_lock_timer`, `connected_sites`) | what the store's 2.1.x left: its encrypted wallet and the keys beside it (section 5, Earlier version) | never written by this version | read only by `vault.migrate` (a record that does not open moves nothing); removed after a migration read its vault back, by `vault.removeEarlier`, or with the first vault, Delete wallet or a reset when no wallet that opens is there |
 
 Nothing else is stored: pages keep nothing in `localStorage` or `sessionStorage`, and empty both when they start (the
 light node's registration lives
-in the vault state; its alarm `qnet-register` holds no data, nor does the follow alarm `qnet-follow`). Approvals, the reset token, the burn single-flight, the registration's one-at-a-time lane,
+in the vault state; its alarm `qnet-register` holds no data, nor do the follow alarm `qnet-follow` and the clipboard alarm
+`qnet-clipboard`). Approvals, the reset token, the burn single-flight, the registration's one-at-a-time lane,
 the shared search's last verdict, what the last sync learnt of aiqnet.io's record, the `qnet_getActivation` read counts and the
 Solana History's rows read so far (at most 500) live in worker memory (aiqnet.io keeps the record itself, decision 35); a
 worker restart drops them (the relay answers 4900, the approve window closes on `NOT_FOUND`, a reset
@@ -1141,22 +1196,31 @@ token only when Reset wallet is pressed and spends it at once, so no keepalive h
 
 - Where it shows: the setup screen of a new wallet (the word grid, behind Show the words, hidden again after
   `max(TIMINGS.REVEAL_AUTO_HIDE_MS, 2 min)`, on a screen lock, a hidden tab, a lost focus and ten idle minutes; the
-  grid is never selected, copied, cut or dragged out) and Settings → Recovery phrase (owner, 06.10: after the warning and
+  grid is never selected, copied, cut or dragged out; another window taking the focus masks a phrase typed into Import
+  until the focus is back and empties no field, decision 51) and Settings → Recovery phrase (owner, 06.10: after the warning and
   the password the words show at once, then Copy and Done; no press-and-hold and no timer; they leave the page with the
   screen: Done, another tab, a lock, the popup closing). Settings → Private key is the same: the chosen account's key at
   once, then Copy and Done, with no account or address block.
 - Its Copy button (owner decision of 2026-09-28), on both screens while the words are shown: an explicit click
   only, never on its own; on the setup screen the warning next to it says that anyone who can read the clipboard can
-  take the wallet and that the clipboard is cleared in 60 seconds if the page stays open (`phraseCopyWarn`); Settings
-  shows no clipboard text (owner, 06.10) and clears it the same way, silently. It copies the canonical words in one line,
-  as every import takes them (`common.copyText(words, {clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS, untilFocused:
-  true})`), and says "Recovery phrase copied"; the key's Copy says "Private key copied".
-- Clearing: after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (60 s) the page writes an empty clipboard if nothing was copied
-  from it since (the page cannot read the clipboard: that needs the clipboardRead permission); a page without the focus
-  then clears it as soon as it has the focus again. Setup clears it when the wallet is set up (`common.clearCopiedNow`),
-  since the user may close the tab before that timer would run; a wallet deletion or reset clears such a copy still
-  waiting at once (`common.clearCopiedNow`, R16, section 3) and leaves anything else on the clipboard. A closed page cannot clear: the popup closes when the user clicks elsewhere, which the warning's "if the
-  page stays open" covers.
+  take the wallet and that the wallet clears the clipboard after 60 seconds (`phraseCopyWarn`); Settings shows no
+  clipboard text (owner, 06.10) and clears it the same way, silently. It copies the canonical words in one line, as every
+  import takes them (`common.copyText(words, {clearAfterMs: TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS})`), and says "Recovery
+  phrase copied"; the key's Copy says "Private key copied".
+- Clearing (decision 51): the worker does it, whether or not the page is still open or has the focus (the popup closes
+  as soon as the user clicks elsewhere). After a copy with `clearAfterMs` the page sends `clipboard.schedule`; the worker
+  keeps the due time (memory and `chrome.storage.session` `qnet_clipboard_v1`, never the text) and an alarm
+  `qnet-clipboard` (`CLIPBOARD_ALARM`; the browser fires an alarm no sooner than 30 s after it was set, a minute before
+  Chrome 120), and when it fires opens the offscreen document `ui/offscreen.html` (reason `CLIPBOARD`), which writes an
+  empty text with the copy command (the `clipboardWrite` permission lets a document without the focus run it; it selects a
+  node of its own when the command needs a selection) and is closed again. Every copy from a wallet page that needs no
+  clear sends `clipboard.schedule {afterMs: 0}` and drops the pending one (the secret is no longer on the clipboard), also
+  from a popup or tab opened after the one that copied the secret closed; a new secret's replaces it; one is pending at
+  most. Nothing reads the clipboard (that needs the clipboardRead permission), so a copy made in another app within the
+  60 seconds is emptied too. Setup asks the worker to clear at once when the wallet is set up
+  (`common.clearCopiedNow` → `clipboard.clearNow`), and a wallet deletion or reset empties such a copy as a step of the
+  erase (`clipboard.clearNow`, R16, section 3); anything else on the clipboard stays. A write that fails (no offscreen
+  document, no answer within 5 s) is logged and not tried again.
 - One line on the setup screen: anyone with the words controls the wallet (`setupWordsWarn`); the reveal has one line
   before its password (`revealWarn`), and the setup screen's copy line is `phraseCopyWarn` (owner, 28.09: one short line
   where an action is irreversible).
@@ -1172,8 +1236,10 @@ NODES, EXPLORER_API, EXPLORER_TX_PATH}, SOLANA {CLUSTER, RPC_URLS, ONE_DEV_MINT,
 NODE_TYPE_MEMO, FEE_BUFFER_LAMPORTS, EXPLORER_TX_URL, EXPLORER_CLUSTER_QUERY, TRANSACTION_MAX_BYTES}, PAYMENT_REQUEST
 {REFERENCES_MAX, MEMO_MAX_BYTES}, DECIMALS, UI_PAGES, PROVIDER, VIEW_EVENT_CHANNEL, VIEW_EVENTS, STORAGE_KEYS, VAULT_DB,
 AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, RTL_LANGUAGES, LIMITS, TIMINGS,
-AUTO_LOCK_ALARM, REGISTRATION_ALARM, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, CLAIM_MIN_NANO`, pure `languageForTag(tag) → code|null` and
-`isPaymentRequestMemo(text) → boolean` (decision 34). `PROVIDER` includes `CHANNEL`
+AUTO_LOCK_ALARM, REGISTRATION_ALARM, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, CLIPBOARD_ALARM, CLAIM_MIN_NANO, POPUP_TABS, OFFSCREEN {PAGE,
+TARGET}`, pure `languageForTag(tag) → code|null` and
+`isPaymentRequestMemo(text) → boolean` (decision 34) and `isDraftField(name, value) → boolean` (decision 51: the draft
+fields `wallet.remember` takes, the popup's filter and the router's check). `PROVIDER` includes `CHANNEL`
 (`'extension'`) and `ACTIVATION_ORIGIN`. `LIMITS` includes `REGISTRATION_MAX_ATTEMPTS`; `TIMINGS` includes
 `REGISTRATION_SUBMIT_TIMEOUT_MS`, `REGISTRATION_ADMIT_HOLD_MS`, `REGISTRATION_ADMIT_CHECK_MS`, `REGISTRATION_SOON_MS`,
 `REGISTRATION_FIRST_RETRY_MS`, `REGISTRATION_BACKOFF_MAX_MS`, `REGISTRATION_CHECK_MS`, `REGISTRATION_WINDOW_MS`,
@@ -1187,7 +1253,8 @@ s), `WALLET_SEARCH_FRESH_MS` (60 s), `ACTIVATE_RECHECK_MS` (5 s).
 `BURN_SCAN_MAX_PAGES`, `BURN_SCAN_MAX_UNCHECKED`, `BURN_SCAN_DEADLINE_MS`; `TIMINGS` includes `APPROVAL_COOLDOWN_MS`,
 `APPROVAL_COOLDOWN_LONG_MS`, `APPROVAL_COOLDOWN_WINDOW_MS`, `APPROVAL_BUDGET_SHORT_MS`, `CONFIRM_ARM_VALUE_MS`,
 `RESET_TOKEN_TTL_MS`, `CLIPBOARD_CLEAR_MS`, `PHRASE_CLIPBOARD_CLEAR_MS` (section 8),
-`POPUP_REFRESH_MS` (section 9, Pages).
+`POPUP_REFRESH_MS`, `ACTIVITY_TOUCH_MS`, `DRAFT_REMEMBER_MS` (section 9, Pages); `STORAGE_KEYS` includes `CLIPBOARD`
+(decision 51).
 
 **errors.js**: `ERROR_MESSAGES`, `PROVIDER_ERROR_CODES`, `class WalletError(code, {retryAfterMs?, field?})`,
 `class ProviderError(code)`, `toUiError(error) → {code, message, …}`, `toProviderError(error) → {code,
@@ -1210,7 +1277,7 @@ them and reads as `INTERNAL`.
 
 **events.js**: `setViewBroadcaster(fn)` (sw.js only), `notifyViews(event)` (never throws).
 
-**router.js**: `createRouter({runtime?, handlers?, requireUnlocked?, touch?, providerRequest?,
+**router.js**: `createRouter({runtime?, handlers?, requireUnlocked?, touch?, forgetDraft?, providerRequest?,
 providerPortClosed?, tabs?}) → {handleUiMessage, handleProviderConnect, emitProviderEvent(origin, event,
 data) → number (the ports reached; the origin's other tabs get it through `tabs`, section 4.2), broadcastToViews(event, data?),
 install(), openPorts()}`; tables `UI_MESSAGES`,
@@ -1245,14 +1312,26 @@ Only vault.js calls it.
 **session.js** (area A): `initSession()`, `startSession({vaultKey, walletId, qnetAddress, solanaAddress,
 autoLockMinutes}) → {lockDeadline}`, `requireUnlocked() → {walletId, qnetAddress, solanaAddress,
 lockDeadline}`, `isUnlocked()`, `withVaultKey(fn)` (vault.js only), `replaceVaultKey(key)`, `touch()`,
-`lock(reason)`, `onLockChange(listener) → unsubscribe` (implemented), handlers `lockNow()`,
-`getAddresses()`, `getSettings()`, `setSettings(patch)`, `storedLanguage() → language|null` (the valid stored
-interface language, which a wipe keeps), `cachedViews()` (`wallet.cached`), the view cache's
+`lock(reason)`, `announceWipe(origins)` (vault.js only, once the erase deleted the vault), `onLockChange(listener) →
+unsubscribe` (implemented), handlers `lockNow()`, `rememberPopup(p)` (`wallet.remember`), `forgetDraft()` (the router,
+after a send that went: the draft leaves `popupState`, its network and tab stay; nothing while locked), `getAddresses()`,
+`getSettings()`, `setSettings(patch)`, `storedLanguage() → language|null` (the valid stored interface language, which a
+wipe keeps), `cachedViews()` (`wallet.cached`), the view cache's
 `rememberView(name, value)` (the router, decision 39; nothing while locked; a QNet balance verified or read at the live
 tip, the token list and the Solana balances also into the vault's chain cache, decisions 40, 50) and `forgetViews(names)`
 (qnet.js, a chain the wallet no longer follows), listeners `onAlarm(alarm)`, `onIdleState(state)`,
 backoff `checkBackoff()`, `recordPasswordFailure()`, `recordPasswordSuccess()`, `getBackoffUntil()`,
 pure `backoffDelayMs(failures)`, `isAutoLockChoice(minutes)`.
+
+**clipboard.js** (area A, decision 51): handlers `schedule({afterMs})` (`clipboard.schedule`) and `clearNow()`
+(`clipboard.clearNow`, and vault.js's erase; never throws), listener `onAlarm(alarm)` (`CLIPBOARD_ALARM`, from sw.js's one
+alarm listener). It holds only the due time and writes the clipboard only through the offscreen document
+(`OFFSCREEN.PAGE`, `chrome.offscreen`, one at a time). `ui/offscreen.js` answers only the worker's
+`{target: OFFSCREEN.TARGET, type: 'clear'}` with `{cleared}`.
+
+**platform.js** (area A, decision 51): the chrome.* calls session.js and clipboard.js share: `chromeApi()` (the global as
+it is now), `attempt(fn) → Promise` (a call that may throw or reject), `armAlarm(name, when|null)` (a one-shot alarm, or
+its clear) and `ALARM_EARLY_MS` (1 s: an alarm that fires this close to its time has reached it).
 
 **keys.js** (area A): `startKeys() → Promise<boolean>` (worker start: a cached self-test pass for this
 bundle, else `core.selfTest()` and cache the pass; section 6), `initKeys() → boolean` (synchronous gate:
@@ -1459,23 +1538,28 @@ unbound: true}` (`node.unlink`; throws `NOT_LINKED`, `NETWORK`, `UNLINK_REFUSED`
 **provider.js** (area C): `setEventSink(emit)`, `eventSink()` (both implemented), `handleRequest(ctx,
 method, params)`, `onPortClosed(ctx)`, `onWindowRemoved(windowId)`, `notifyLockChanged(change)`, handlers
 `listSites()`, `revokeSite(p)`, `getApproval(p, meta)`, `resolveApproval(p, meta)`, internal
-`readSites()`, `displayOrigin(origin) → {text, idn}`, `SITE_ERROR_CODES`, `CLAIM_ERROR_CODES`, `UNLINK_ERROR_CODES`; `qnet_getActivation` (decision 35)
+`readSites()`, `displayOrigin(origin) → {text, idn}`, `SITE_ERROR_CODES`, `CLAIM_ERROR_CODES`, `UNLINK_ERROR_CODES`,
+`TRANSFER_ERROR_CODES` (decision 52); `qnet_getActivation` (decision 35)
 is served in `createProviderService` from `activation.siteActivation`, with its per-origin read count. The approval cooldown
-(section 4.8) lives in `createProviderService` (its `now` option drives it in tests; `activation` and `nodes` are among
-its injected collaborators).
+(section 4.8) lives in `createProviderService` (its `now` option drives it in tests; `activation`, `nodes` and `solana` are
+among its injected collaborators).
 
 **ui/common.js** (area D): implemented `UiError`, `refuseFramed()`, `el(tag, props, ...children)`,
 `clear(node)`, `hardenSecretInput(input)`, `wipeInputs(root)`, `shortAddress(address, keep)`,
 `call(type, params)`, `onWalletEvent(handler)`, re-exports `DECIMALS, formatUnits, parseUnits, log`;
 area D: `loadLocale(language)` (the table of `ui/i18n`, `<html lang dir>`), `currentLanguage()`,
-`t(key, subs)` (bidi-isolates substitutions in right-to-left languages), `copyText(text, {clearAfterMs, untilFocused})`
-(with `clearAfterMs` the page empties the clipboard after that delay if nothing was copied from it since and it has
-the focus; with `untilFocused` too, a page without the focus then does it when it gets the focus back),
-`clearCopiedNow() → Promise` (empties such a copy at once, nothing else), `holdToReveal(control, target, secret, {autoHideMs, onExpire,
+`t(key, subs)` (bidi-isolates substitutions in right-to-left languages), `copyText(text, {clearAfterMs})` (with
+`clearAfterMs` the worker empties the clipboard after that delay, `clipboard.schedule`; a later copy of the page without
+one drops that clear; section 8), `clearCopiedNow() → Promise` (has the worker empty such a copy at once,
+`clipboard.clearNow`; nothing else), `holdToReveal(control, target, secret, {autoHideMs, onExpire,
 placeholder})` (no page uses it since decision 43), `openSetup(flow)` (`'create'` or `'import'`: setup opens at that
 step, `?flow=`; decision 45), `clearPageStorage()` (decision 43: every page at start).
 `ui/kit.js` adds `earlierRemoval({onRemoved})`: what an earlier version left, with Remove behind one confirmation
-(setup's last screen and Settings).
+(setup's last screen and Settings), and for the Solana send the popup's review and a site's transfer window share
+(decision 52): `SOLANA_ASSETS` and `solanaAsset(asset)` (SOL and 1DEV with symbol, decimals and mint), `solAmount(lamports)`,
+`solanaReviewRows(quote, token)` (the review's `[label, value, kind]` rows: token, mint, amount, network fee, the rent of a
+new token account when the quote has one, SOL spent in all, network) and `solanaShortfall(quote, token, decimals)`: why a
+quoted send cannot go, with its numbers.
 
 **Pages** (area D): `popup.js`, `setup.js`, `approve.js` start with `refuseFramed()` (checked). The popup
 tabs are Assets · Send · Receive · History · Activate · Settings with a QNet / Solana switch; no Node
@@ -1550,10 +1634,19 @@ off); Send arms `TIMINGS.CONFIRM_ARM_VALUE_MS` after the review is drawn and ask
 confirmed (finalized reads so), failed or expired (Send again), read while shown as the QNet sent screen asks
 (`popup.SENT_STATUS_STEPS`), and the balance of the token
 sent is read again then. The QNet send takes QNet addresses only. Both recipient fields show a whole address in the
-input. Auto-lock offers 5, 15, 30, 60 minutes and Never (section 6). The activation
-code only by explicit button with a
-warning and a clear after `TIMINGS.CLIPBOARD_CLEAR_MS`; the phrase only by its Copy button, with its warning and a clear
-after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
+input. Auto-lock offers 5, 15, 30, 60 minutes and Never (section 6); the popup's opening and a press or a key on it
+send `wallet.touch` (at most every `TIMINGS.ACTIVITY_TOUCH_MS`), its reads never. The popup opens where it was in this
+session (`wallet.cached` `popupState`): the network, the tab and, on the Send tab, the form's draft once (a token the
+token list does not name keeps only the recipient; an asset the Solana form does not list too); it sends
+`wallet.remember` on a change of tab or network and `TIMINGS.DRAFT_REMEMBER_MS` after the form's last change (at once
+when the popup closes), never a payment request's parts; the worker drops the draft once a send went, the popup open or
+closed meanwhile (router `sends`, `session.forgetDraft`; decision 51). Export
+private key keeps the account switch disabled while its password is checked. QNet History shows one row per token
+transfer: the archive's call row and token row of one hash are one row, the token row, with the fee the call paid
+(`popup.oneRowPerTransfer`, over every row drawn, so across a page boundary too); a call with no token row keeps its own
+(decision 51). The activation code only by explicit button, with a clear after `TIMINGS.CLIPBOARD_CLEAR_MS`; the phrase
+only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS`, both by the worker
+(section 8).
 
 ## 10. Who may call what
 
@@ -1563,8 +1656,9 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   `entropyToMnemonic`, `validateMnemonic`, `isValidQnetAddress`, `isValidSolanaAddress`); the worker
   validates everything again.
 - `router` → handlers in the table; `provider.handleRequest`, `onPortClosed`; `session.rememberView` (the view cache,
-  decision 39).
-- `vault` → `session` (start, key, backoff), `keys.deriveAddresses`, `earlier` (the earlier version's record and pages' copy), core. `session` → `vault.updateState`
+  decision 39), `session.rememberPopup`, `session.forgetDraft` (after a send), `clipboard.schedule` / `clearNow` (decision
+  51).
+- `vault` → `session` (start, key, backoff, `announceWipe`), `keys.deriveAddresses`, `earlier` (the earlier version's record and pages' copy), `clipboard.clearNow` (the erase), core. `session` → `vault.updateState`
   / `readState` for settings, `vault.readChainCache` / `updateChainCache` for the balances kept across sessions.
 - `router` → `keys.exportPrivateKey` (`vault.exportKey`).
 - `keys` → `session.requireUnlocked`, `vault.readEntropy`, `vault.readState` (the light activation a registration
@@ -1583,11 +1677,11 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   `qnet.prepareTransfer`, `qnet.sendTransfer`, `qnet.recipientCheck`, `qnet.readContract`, `qnet.assertPayableRecipient`,
   `qnet.prepareCall`, `qnet.sendCall`, `qnet.transactionStatus`, `activation.siteView`,
   `activation.activateForSite`, `activation.siteActivation`, `nodes.claimView`, `nodes.claimForSite`, `nodes.getRegistration`,
-  `nodes.unlinkView`, `nodes.unlinkForSite`,
+  `nodes.unlinkView`, `nodes.unlinkForSite`, `solana.quote`, `solana.send` (decision 52),
   the event sink, `chrome.windows`.
 - `router` → `chrome.tabs.query` / `sendMessage` for an event no port carried (section 4.2), given by sw.js.
 - sw.js → `activation.setRegistrationHook(nodes.resumeRegistration)`, `nodes.resumeRegistration` and `activation.syncRecord`
-  after every unlock, `nodes.onAlarm` from its one alarm listener, `createRouter({tabs: chrome.tabs})`.
+  after every unlock, `nodes.onAlarm` and `clipboard.onAlarm` from its one alarm listener, `createRouter({tabs: chrome.tabs})`.
 - Network: only `qnet.nodeRequest` (QNET.NODES and EXPLORER_API), `qnet.siteRequest` (EXPLORER_API under `RECORD_PATH`) and
   `solana.rpc` (SOLANA.RPC_URLS);
   HTTPS only; no other host, no third-party QR, price or RPC service.
@@ -1642,10 +1736,10 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   result re-check, rejections toward the cooldown (the fifth bars), an unavailable view counts nothing, a confirm only
   from its own window for its own id and once, a password refused for every kind; the approval window's activation
   screens on the fake DOM with no password field, locked included (`provider-approve-page`).
-- D: pure helpers (`t`, `holdToReveal` timing with fake timers, `copyText` clear, `untilFocused`, `clearCopiedNow`); no
-  page test may need a real browser. Languages (`i18n`, section 13). The phrase's Copy button (section 8): an explicit
-  click only, the warning, the clear after 60 s, on the next focus and at the end of setup (`ui-setup`), the reveal's
-  button ending with the reveal and the clipboard emptied by a deletion (`ui-popup`). The payment-request parser: plain
+- D: pure helpers (`t`, `holdToReveal` timing with fake timers, `copyText` handing its clear to the worker, `clearCopiedNow`);
+  no page test may need a real browser. Languages (`i18n`, section 13). The phrase's Copy button (section 8): an explicit
+  click only, the warning, the worker's clear asked after 60 s and at the end of setup (`ui-setup`), the reveal's
+  button ending with the reveal and the clipboard left to the worker's erase on a deletion (`ui-popup`). The payment-request parser: plain
   addresses, every part, form decoding, decimals, four and five references, 200- and 201-byte memos, unknown and repeated
   parts, junk, plain-text label and message, and the same answer as the app's `parseSolanaScan` (imported read-only)
   over a corpus (`ui-common`); the Solana send in the popup: review, arming, pending to confirmed, failed and expired,
@@ -1802,7 +1896,7 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   with a new vault, the record parser's bounds; the pages' copy made with 2.x's own sealing: never created by a status
   read, a phrase with a line break or tab from a paste, moved alone, after a password change made in 2.x (the record with the first password, the copy with the current
   one), the copy taken when the record holds no valid phrase and the record winning when both do, deleted by the move,
-  `vault.removeEarlier`, Delete wallet and a new vault when it holds no phrase, and its parser's bounds
+  `vault.removeEarlier`, and by Delete wallet and a new vault when it holds no phrase, and its parser's bounds
   (`vault-session-earlier`); `vault.migrate` and `vault.removeEarlier` in the
   table (`router`); a hidden or format character shown as U+FFFD and marking the token, QNet's names in any spelling, the
   rows of `listTokens` and of History with `reserved`, the tokens of a send first, `complete` past 20 or with a token no
@@ -1815,6 +1909,38 @@ after `TIMINGS.PHRASE_CLIPBOARD_CLEAR_MS` (section 8).
   password (`ui-setup`); the approval window's web storage emptied at start (`provider-approve-page`); the integration's
   code from Settings and the phrase at once (`integration`); every new screen in
   every language (`scripts/overflow-check.mjs`).
+- Decision 51 (19.10): the worker's clipboard clear: the due time and its alarm, the offscreen write when it fires (early
+  alarms armed again), a later copy dropping it, a restarted worker clearing, a document left open, one that does not
+  answer, and the offscreen page answering only the worker, with and without a selection (`clipboard`); the page asking
+  the worker and writing no clear of its own, and every plain copy dropping a clear another page left (`ui-common`,
+  `ui-setup`, `ui-popup`); the erase emptying a copied secret
+  before the wipe, the wipe announced only once the record is gone, a failed deletion leaving the wallet locked with
+  nothing announced (`vault-session-reset`); an earlier wallet that opens kept through Delete wallet, one that opens
+  nothing taken (`vault-session-earlier`); `announceWipe`, the `erase` reason, `popupState` and its draft dropped through
+  the router by a send that went (`vault-session-session`); the wipe reaching the sites the stored grants named in a
+  worker that read none (`provider-background`); the four new types, their pages, lock, activity and sends marks and
+  params, a draft recipient only with an address's length and letters (`router`); the manifest's `offscreen` and
+  `clipboardWrite` (`skeleton`, `static`); setup's blur mask keeping a typed phrase and passwords (`ui-setup`);
+  `wallet.touch` at most every 30 s and never from a read, `wallet.remember` and the reopened popup with its draft, the
+  page writing nothing after a send and never keeping a draft with a payment request, the Delete screen kept through
+  the erase's lock and the lock screen after an erase that did not finish, the export's account switch held while busy (`ui-popup`); one row per token transfer with its
+  call's fee, across a page boundary too (`ui-history`).
+
+- Decision 52 (batch 19.10): `qnet_sendSolanaTransfer` on the allow-list for the activation origin only, 4100 for
+  games.aiqnet.io and any other origin before the params, the probe (no params, `null`, `[]`, `{}`) and every other shape
+  (another mint, `'0'`, `'1.50'`, `'1e3'`, `'1,500'`, 7 decimals for 1DEV, 10 for SOL, an extra key) -32602 with the
+  provider never called (`router`); no vault → `NO_WALLET` without a window, one `solanaTransfer` approval with the
+  request's exact `{to, asset, amount}` and its quote, a confirm of another revision `FEE_CHANGED` with nothing sent, the
+  confirm calling `solana.send` once with the reviewed fee and rent, `FEE_CHANGED` / `BLOCKHASH_EXPIRED` / `LOCKED` keeping
+  the window, a reject 4001 and counted, the cooldown and the window budget, a shortfall `unavailable` answering
+  `INSUFFICIENT_SOL` / `INSUFFICIENT_TOKENS` with nothing signed, every send failure as one of the site's codes, the result
+  exactly `{status, signature}` and a send answer it cannot check `INTERNAL`, a quote not of exactly the request never
+  shown, the wallet's own address -32602 before a window and from the window once unlocked; the window on the fake DOM
+  with no input element, Send armed after `CONFIRM_ARM_VALUE_MS`, the origin from the view, the shortfall's text and the
+  outcome until closed (`provider-solana-transfer`); aiqnet.io's 1DEV and SOL transfers to a fresh address end to end, the
+  scripted Solana seeing exactly one TransferChecked after the idempotent account create, then one System Transfer
+  (`integration`); one amount format in every language and the amount field's one paste rule (`core`, `ui-common`,
+  `ui-history`, `ui-popup`, `provider-approve-page`).
 
 ## 12. Decisions to confirm with the owner
 
@@ -1871,8 +1997,8 @@ These follow the audits where the spec text was silent or looser; each is small 
     UI language is used.
 14. The recovery phrase may be copied by its Copy button, on the setup screen of a new wallet and in Settings →
     Recovery phrase, after an explicit click and with the warning next to it; the clipboard is emptied after 60 s,
-    at the end of setup and on a deletion, as far as a page that is still open can (owner decision of 2026-09-28,
-    section 8).
+    at the end of setup and on a deletion (owner decision of 2026-09-28, section 8); who empties it: superseded by
+    decision 51 (a), the worker, the page open or not.
 15. The vault record keeps the keys `aad.legacy` (always null) and `state.exposedAdvice` of its format, so a vault an
     earlier 3.x build wrote opens unchanged; a record with anything but null in `aad.legacy` or `state.legacy` does not
     open (`VAULT_CORRUPT`: Reset removes it, decision 45).
@@ -2438,6 +2564,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     to 49 is 3.1.2. Frozen files changed: `dist/manifest.json` and `config.js` `WALLET_VERSION` (3.1.2), `config.js`
     (`STORAGE_KEYS.LIGHT_HINTS`), `errors.js` (`walkSteps` on `WalletError` and in `toUiError`), the `UiError` of
     `ui/common.js` (keeps `walkSteps`; its export list is unchanged), `test/skeleton.test.mjs` (3.1.2).
+
 50. Owner command of 2026-10-18 (the wallets behave as top wallets do): balance, incoming funds, the send checks and the
     status of every transaction act at once on a pinned node's answer; the committee check runs only in the background
     and never holds what the user does or sees; the network refuses what is invalid. (a) **Balance.**
@@ -2482,6 +2609,47 @@ These follow the audits where the spec text was silent or looser; each is small 
     (`BALANCE_FOREIGN_PENDING` gone), `router.js` (`qnet.sentStatus`), the bundle (`amountText`, `amountInput`),
     `test/router.test.mjs`.
 
+51. Owner command of 2026-10-19 (batch 19.10, W5 and W9; 3.1.6). (a) **Clipboard.** A secret copied from a page (the
+    recovery phrase, a private key, the activation code) is emptied by the worker on its own alarm through an offscreen
+    document, the popup open or not (section 8); the manifest adds `offscreen` and `clipboardWrite` (Chrome names the
+    latter at install and asks again for it on update). No page timer or focus-return clear is left (`copyText`'s
+    `untilFocused` is gone), and `phraseCopyWarn` says the wallet clears the clipboard after 60 seconds. Every copy
+    from a wallet page that needs no clear drops the pending one, whichever page or popup copied the secret. This
+    supersedes decision 14's "as far as a page that is still open can" and decision 43 (e)'s "if nothing was copied
+    since". (b) **Delete and reset.** The erase locks with reason `erase` and announces the wipe
+    (`session.announceWipe`, the pages' `wiped`, the sites' disconnect) only once the vault record is gone; a deletion
+    that fails leaves the wallet in place, locked, and the popup's lock screen says it was not deleted
+    (`deleteNotFinished`, 11 languages). The erase names the sites the
+    stored grants named, so a worker that restarted disconnects them too, and keeps an earlier version's wallet that
+    still opens. (c) **Setup.** Another window taking the focus masks a typed phrase (setup.css `.window-blurred
+    .blur-mask`) and empties no field; the word grid still goes back behind its button. (d) **Auto-lock by activity.**
+    `wallet.touch`: the popup's opening and a press or a key on it extend the deadline, at most every 30 s; reads never.
+    (e) **Popup state.** `wallet.remember` keeps the network, the tab and the Send form's draft in the session's view
+    cache; the popup opens there again, the draft drawn once and never kept with a payment request. The worker drops it
+    once a send went (the router's `sends` mark, `session.forgetDraft`), so a popup closed while the send ran does not
+    open on it again; a recipient is kept only with an address's length and letters, so nothing secret pasted into the
+    field reaches `chrome.storage.session`. (f) **Export key.** The account switch is held while the key is asked for.
+    (g) **History (W9).** One token transfer is one row: the token row, with its call's fee. Frozen files changed:
+    `manifest.json` (permissions, 3.1.6), `config.js` (`OFFSCREEN`, `POPUP_TABS`, `isDraftField`, `CLIPBOARD_ALARM`,
+    `STORAGE_KEYS.CLIPBOARD`, `TIMINGS.ACTIVITY_TOUCH_MS`, `DRAFT_REMEMBER_MS`, `WALLET_VERSION`), `router.js` (`wallet.touch`, `wallet.remember`, `clipboard.schedule`,
+    `clipboard.clearNow`, the `sends` mark and `createRouter`'s `forgetDraft`), `sw.js` (`clipboard.onAlarm`), the export
+    list of `ui/common.js` (unchanged names; `copyText` without `untilFocused`), `test/router.test.mjs`,
+    `test/skeleton.test.mjs`. New module `platform.js` (the chrome.* helpers session.js and clipboard.js share).
+
+52. Owner command of 2026-10-19 (batch 19.10, 3.1.6). (a) **Amounts.** One format in every language: the whole part
+    grouped by three with `,` and the decimals after `.` (42,578.81988), in Latin digits, every digit kept
+    (`core.amountText(value)`, the mobile `utils/amountFormat.js`; `kit.figureText` passes no language); the amount field's
+    paste rule is the same in every language (`core.amountInput(text, decimals, {previous})`: a pasted `1,000` is a
+    thousand, a pasted `1.000` one, a typed comma the decimal point). This supersedes decision 50 (g)'s language marks.
+    (b) **Send from your wallet.** aiqnet.io's Funding step may ask for one SOL or 1DEV transfer to the payment address it
+    names (`qnet_sendSolanaTransfer`, section 4.4; `SiteTransferResult`): the activation origin only, no grant, a call
+    without params is the site's probe (-32602 from the router, nothing read or counted), the `solanaTransfer` window is the
+    Solana Send review read-only (section 4.8), its armed confirm sends exactly the reviewed quote, and an error result
+    means nothing was transferred. The site sends what the address still lacks, so a fraction is asked as is (`'0.5'`).
+    Frozen files changed: `router.js` (`PROVIDER_METHODS.qnet_sendSolanaTransfer`, `F.transferAmount`, `transferCheck`,
+    the `SOLANA` import), `errors.js` (`INVALID_RECIPIENT`, a -32602 input code), the bundle (`amountText` without a
+    language, `amountInput` without `lang`), `test/router.test.mjs`.
+
 ## 13. Languages (`ui/i18n`, `_locales`)
 
 - UI languages: `config.SUPPORTED_LANGUAGES`, the mobile app's set (`en, zh-CN, ru, es, ko, ja, pt, fr, de,
@@ -2494,11 +2662,11 @@ These follow the audits where the spec text was silent or looser; each is small 
   tests forbid shipping. In a right-to-left language every substitution is wrapped in U+2068/U+2069, and
   addresses, codes, hashes, amounts and words are left-to-right isolates in CSS; inputs for addresses,
   amounts, words and phrases are `dir=ltr`.
-- Amounts take the language's group and decimal marks (`kit.figureText`, `core.amountText`, the mobile app's
-  `utils/amountFormat.js`: `2,047,243.4405` in English, `2 047 243,4405` in Russian with U+00A0, U+202F in French, `2.047.243,4405`
-  in German and Portuguese, the same in Spanish and Italian with four-digit whole parts ungrouped), every digit kept; an
-  amount field keeps canonical text (`kit.keepAmountCanonical`, `core.amountInput`): a figure pasted in the language's
-  format is read as written, a typed comma is the decimal mark (decision 50).
+- Amounts are in one format in every language (decision 52 (a)): the whole part grouped by three with `,` and the
+  decimals after `.` (`42,578.81988`; `kit.figureText`, `core.amountText`, the mobile app's `utils/amountFormat.js`),
+  never a language's own marks or digits, every digit kept; an amount field keeps canonical text by one rule in every
+  language (`kit.keepAmountCanonical`, `core.amountInput`): a pasted `1,000` is a thousand, a typed comma is the
+  decimal point.
 - Never translated: the recovery phrase words, codes, addresses, hashes, the digits of amounts, QNet Blockchain, QNet,
   Solana, 1DEV, QNC, SOL, SPL, Light, Super, aiqnet.io, `QNET_*` names, `DELETE` (checked).
 - Pages: `popup`, `setup` and `approve` read `settings.get` at start (the approve window too) and set

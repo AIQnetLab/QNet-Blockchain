@@ -2377,8 +2377,12 @@ async fn detect_region_from_local_interfaces() -> Result<Region, String> {
     Err("Could not detect region from local interfaces".to_string())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The main runtime names its threads, so a stall sample reads them apart from the process's other runtimes.
+    qnet_integration::node::main_runtime()?.block_on(node_main())
+}
+
+async fn node_main() -> Result<(), Box<dyn std::error::Error>> {
     // Crash observability. Installed before any spawn so every panic is traced.
     // panic=abort (workspace Cargo.toml) ends the process on any panic with no
     // JoinError for watchdogs to observe — this stderr line is the only crash

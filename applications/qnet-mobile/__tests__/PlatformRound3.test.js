@@ -68,7 +68,8 @@ describe('MPLAT-R3-01: the phrase field exports nothing, and a paste leaves the 
     expect(screen).not.toMatch(/Clipboard\.getString/);
     const kotlin = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
     expect(kotlin).toMatch(/@ReactMethod\s*fun clearClipboard\(promise: Promise\) \{\s*main\.post \{\s*clearClipboardNow\(\)\s*promise\.resolve\(null\)/);
-    expect(kotlin).toMatch(/if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.P\) cm\.clearPrimaryClip\(\)\s*else cm\.setPrimaryClip\(ClipData\.newPlainText\("", ""\)\)/);
+    expect(kotlin).toMatch(/private fun clearClipboardNow\(\) \{\s*clipboard\(\)\?\.clearNow\(\)/);
+    expect(read('android/app/src/main/java/com/qnetmobile/SecretClip.kt')).toMatch(/if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.P\) clearPrimaryClip\(\)\s*else setPrimaryClip\(ClipData\.newPlainText\("", ""\)\)/);
   });
 
   it('leaving the app empties the field but does not clear what another app copied meanwhile (iOS)', () => {

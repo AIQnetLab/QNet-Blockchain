@@ -211,6 +211,20 @@ pub async fn load_genesis(
     GenesisResult::NotAvailable { tried }
 }
 
+/// A genesis loaded at boot: a fresh chain applies its transactions (`apply_genesis_state`); a warm node's state already
+/// holds them, replayed from its blocks, so it takes only the registrations and the timing (`adopt_genesis_metadata`).
+pub async fn ingest_loaded_genesis(
+    block: &qnet_state::MicroBlock,
+    state: &Arc<tokio::sync::RwLock<crate::StateManager>>,
+    storage: &Arc<Storage>,
+) {
+    if storage.get_chain_height().unwrap_or(0) == 0 {
+        apply_genesis_state(block, state, storage).await;
+    } else {
+        adopt_genesis_metadata(block, storage);
+    }
+}
+
 /// Apply genesis transactions to state (PK registration, initial balances).
 /// Must be called after genesis is loaded, before any block processing.
 /// Idempotent — safe to call multiple times.
@@ -565,6 +579,52 @@ async fn load_from_http(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod boot_ingest_tests {
+    use super::*;
+
+    /// A warm boot takes the loaded genesis's registrations and timing and never applies its transactions again: they are
+    /// in the state the node replayed, and a second pass failed each one. A fresh chain applies them.
+    #[tokio::test]
+    async fn a_warm_boot_takes_the_genesis_registrations_without_applying_its_transactions_again() {
+        let mut mint = qnet_state::Transaction {
+            hash: String::new(), from: "system".into(), to: Some("genesis".into()), amount: 0, nonce: 0, gas_price: 0,
+            gas_limit: 0, timestamp: 0, signature: Some("system".into()), public_key: None,
+            tx_type: qnet_state::TransactionType::CreateAccount { address: "genesis".into(), initial_balance: 1_000 },
+            data: None, dilithium_signature: None, dilithium_public_key: None, chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        };
+        mint.hash = mint.calculate_hash();
+        let mut txs = vec![mint];
+        txs.extend(crate::node::BlockchainNode::create_genesis_registration_txs());
+        // The timestamp the process already holds, so the global genesis time other tests read never moves.
+        let ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+        let block = qnet_state::MicroBlock::new(0, ts, [0u8; 32], txs, "genesis_node_001".to_string());
+        let ingest = |height: u64| {
+            let block = block.clone();
+            async move {
+                let dir = tempfile::TempDir::new().expect("tempdir");
+                let storage = Arc::new(Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+                if height > 0 { storage.set_chain_height(height).expect("height"); }
+                let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+                ingest_loaded_genesis(&block, &state, &storage).await;
+                let minted = state.read().await.accounts.get("genesis").map(|a| a.balance);
+                (minted, storage.node_registration_record("genesis_node_001").0, dir)
+            }
+        };
+        let (minted, reg, _d) = ingest(7).await;
+        assert_eq!(minted, None, "a warm node applies no genesis transaction again");
+        assert_eq!(reg, Some(0), "its registrations are stamped at height 0");
+        let (minted, reg, _d) = ingest(0).await;
+        assert_eq!((minted, reg), (Some(1_000), Some(0)), "a fresh chain applies them");
+        let src = include_str!("genesis_config.rs");
+        let adopt = &src[src.find("pub fn adopt_genesis_metadata(").unwrap()..src.find("pub fn spawn_genesis_restore(").unwrap()];
+        assert!(adopt.contains("crate::GLOBAL_GENESIS_TIMESTAMP.store(block.timestamp"), "and its timing");
+        let boot = include_str!("node/lifecycle.rs");
+        assert!(boot.contains("crate::genesis_config::ingest_loaded_genesis(&block, &blockchain.state, &blockchain.storage).await;"));
+        assert!(!boot.contains("genesis_config::apply_genesis_state("), "the boot applies genesis through ingest_loaded_genesis alone");
+    }
 }
 
 #[cfg(test)]

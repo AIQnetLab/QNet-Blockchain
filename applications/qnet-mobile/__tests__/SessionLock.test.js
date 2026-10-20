@@ -81,6 +81,8 @@ jest.mock('../src/components/WalletManager', () => {
 });
 
 jest.mock('../src/services/PushService', () => ({
+  readUnconfirmedBinding: jest.fn(async () => null),
+  settleUnconfirmedBinding: jest.fn(async () => false),
   BG_REFRESH_STATUS_KEY: 'qnet_bg_refresh_status',
   checkNodeStatus: jest.fn(async () => null),
   readdressIfOwed: jest.fn(async () => false),

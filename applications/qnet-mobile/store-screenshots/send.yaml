@@ -1,0 +1,40 @@
+# Send of a quarter of the QNC balance back to this wallet (a tap on the address card copies it). The wallet of
+# QNET_SCREENSHOT_PHRASE holds QNC, so Send opens the review, which is captured and then cancelled, never confirmed; a
+# new wallet has nothing to send, so its filled-in form is captured instead.
+appId: com.qnetmobile
+---
+- tapOn:
+    id: "address-card"
+- tapOn:
+    id: "assets-send"
+- extendedWaitUntil:
+    visible: "To address"
+    timeout: 10000
+- runFlow:
+    file: paste.yaml
+    env:
+      FIELD: "Enter an EON address"
+# A tap on the label closes the keyboard.
+- tapOn: "To address"
+- tapOn: "25%"
+- runFlow:
+    when:
+      true: ${MAESTRO_QNET_OWN_WALLET == 'true'}
+    commands:
+      - tapOn:
+          id: "send-button"
+      - extendedWaitUntil:
+          visible: "Check this send"
+          timeout: 40000
+- waitForAnimationToEnd:
+    timeout: 3000
+- runScript:
+    file: control.js
+    env:
+      ACTION: "shot/02-send"
+- runFlow:
+    when:
+      true: ${MAESTRO_QNET_OWN_WALLET == 'true'}
+    commands:
+      - tapOn: "Cancel"
+- tapOn: ".*Back"

@@ -18,6 +18,100 @@ fn runtime_stall_is_boundary_pause(stall_ms: u64, beat: u64, boundary: u64, last
         && beat.saturating_sub(last_deferral) >= GRACE_MS
 }
 
+/// (state, user+system CPU ticks) from one `/proc/<pid>/task/<tid>/stat` line. The thread name sits in
+/// parentheses and may hold spaces or ')', so fields are counted after the LAST ')'.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn task_stat_state_cpu(stat: &str) -> Option<(char, u64)> {
+    let f: Vec<&str> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
+    let state = f.first()?.chars().next()?;
+    Some((state, f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?))
+}
+
+/// What each main-runtime thread did over a stall sample window, from two kernel readings `(tid, state, cpu
+/// ticks, wchan)`: busy (on the CPU for at least half the window: synchronous work), runnable but off the
+/// CPU (the host withheld it), in disk wait, or asleep in the kernel at the named wait point. The threads are the
+/// `workers` and the blocking pool together: an idle pool thread is asleep too, so at most `blocking_pool` of the
+/// asleep threads are idle pool threads and the rest are workers waiting (a lock wait when the runtime is stalled,
+/// since an idle worker would have run the beat task).
+fn runtime_threads_summary(before: &[(u32, char, u64, String)], after: &[(u32, char, u64, String)], half_window_ticks: u64,
+                           workers: Option<usize>) -> String {
+    let (mut busy, mut runnable, mut io, mut asleep) = (0usize, 0usize, 0usize, 0usize);
+    let mut waits: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (tid, state, cpu, wchan) in after {
+        let used = before.iter().find(|b| b.0 == *tid).map_or(0, |b| cpu.saturating_sub(b.2));
+        if used >= half_window_ticks { busy += 1; continue; }
+        match state {
+            'R' => runnable += 1,
+            'D' => io += 1,
+            _ => { asleep += 1; *waits.entry(if wchan.is_empty() || wchan == "0" { "?" } else { wchan.as_str() }).or_default() += 1; }
+        }
+    }
+    let waits: Vec<String> = waits.iter().map(|(w, n)| format!("{}:{}", w, n)).collect();
+    let pool = workers.map_or("?".to_string(), |w| after.len().saturating_sub(w).to_string());
+    format!("threads={} blocking_pool={} busy={} runnable={} io_wait={} asleep={} wchan={}",
+            after.len(), pool, busy, runnable, io, asleep, if waits.is_empty() { "-".to_string() } else { waits.join(",") })
+}
+
+/// The name of every thread of the node's main runtime, its workers and its blocking pool alike: tokio hands a worker's
+/// core to a pool thread at every `block_in_place`, so no name could tell the two apart, but this one keeps the other
+/// runtimes of the process (signature checks, broadcast) out of a stall sample. At most 15 bytes, the kernel's `comm`.
+pub const MAIN_RUNTIME_THREAD: &str = "qnet-main-rt";
+
+/// The node's main runtime: multi-threaded with every driver, as `#[tokio::main]` builds it, its threads named
+/// MAIN_RUNTIME_THREAD.
+pub fn main_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().thread_name(MAIN_RUNTIME_THREAD).build()
+}
+
+/// A kernel thread name (`/proc/self/task/<tid>/comm`, newline included) of the main runtime.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_main_runtime_thread(comm: &str) -> bool {
+    comm.trim_end() == MAIN_RUNTIME_THREAD
+}
+
+/// The main runtime's threads as the kernel reports them. Linux only.
+#[cfg(target_os = "linux")]
+fn runtime_threads_now() -> Option<Vec<(u32, char, u64, String)>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+        let Some(tid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let dir = e.path();
+        if !is_main_runtime_thread(&std::fs::read_to_string(dir.join("comm")).unwrap_or_default()) { continue; }
+        let Some((state, cpu)) = std::fs::read_to_string(dir.join("stat")).ok().as_deref().and_then(task_stat_state_cpu) else { continue };
+        out.push((tid, state, cpu, std::fs::read_to_string(dir.join("wchan")).unwrap_or_default().trim().to_string()));
+    }
+    Some(out)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_threads_now() -> Option<Vec<(u32, char, u64, String)>> { None }
+
+/// Sampled once per stall report, from the watchdog's own thread: workers that did not park across the
+/// window are stuck inside one poll, and the kernel says whether that poll is computing or waiting.
+fn runtime_stall_sample(handle: Option<&tokio::runtime::Handle>) -> String {
+    const WINDOW_MS: u64 = 200;
+    let parks = |h: &tokio::runtime::Handle| {
+        let m = h.metrics();
+        (0..m.num_workers()).map(|w| m.worker_park_count(w).wrapping_add(m.worker_park_unpark_count(w))).collect::<Vec<u64>>()
+    };
+    let parks_before = handle.map(|h| parks(h));
+    let threads_before = runtime_threads_now();
+    std::thread::sleep(std::time::Duration::from_millis(WINDOW_MS));
+    let stuck = match (handle, parks_before) {
+        (Some(h), Some(b)) => {
+            let a = parks(h);
+            format!("stuck_workers={}/{}", a.iter().zip(&b).filter(|(x, y)| x == y).count(), a.len())
+        }
+        _ => "stuck_workers=?".to_string(),
+    };
+    // USER_HZ is 100 on every Linux the node ships for: half the window in ticks.
+    let kernel = match (threads_before, runtime_threads_now()) {
+        (Some(b), Some(a)) => runtime_threads_summary(&b, &a, WINDOW_MS / 20, handle.map(|h| h.metrics().num_workers())),
+        _ => "threads=unavailable".to_string(),
+    };
+    format!("{} {}", stuck, kernel)
+}
+
 /// Anchors this process already dropped as poisoned (see verify_v2_macroblock): one attempt each.
 static POISONED_ANCHORS_DROPPED: once_cell::sync::Lazy<dashmap::DashMap<u64, ()>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
@@ -1201,8 +1295,9 @@ impl BlockchainNode {
                         }
                         None => "workers=? alive_tasks=? global_queue=?".to_string(),
                     };
-                    let facts = format!("committee_lock={} beat_ms={} {} {}",
-                                        committee_lock, beat, tokio_facts, storage.rocksdb_stall_facts());
+                    let facts = format!("committee_lock={} beat_ms={} {} {} {}",
+                                        committee_lock, beat, tokio_facts, storage.rocksdb_stall_facts(),
+                                        runtime_stall_sample(handle.as_ref()));
                     let boundary = crate::storage::LAST_BOUNDARY_WORK_MS.load(Ordering::Relaxed);
                     if runtime_stall_is_boundary_pause(stall_ms, beat, boundary, last_deferral) {
                         last_deferral = beat;
@@ -1273,5 +1368,47 @@ mod runtime_stall_tests {
         assert!(!runtime_stall_is_boundary_pause(2_100, b + 4_000, 0, 0), "no boundary work seen yet");
         assert!(!runtime_stall_is_boundary_pause(2_100, b + 9_000, b, b + 4_000), "a second stall in the grace");
         assert!(runtime_stall_is_boundary_pause(2_100, b + 40_000, b + 39_000, b + 4_000), "the next boundary's first");
+    }
+
+    // The sample tells busy threads from blocked ones: CPU over the window marks synchronous work, otherwise
+    // the kernel state and wait point name the wait.
+    #[test]
+    fn a_stall_sample_tells_busy_from_blocked_threads() {
+        let line = "4242 (tokio-runtime-w) S 1 1 1 0 -1 4194624 10 0 0 0 731 52 0 0 20 0 41 0 900 1 2";
+        assert_eq!(task_stat_state_cpu(line), Some(('S', 783)));
+        assert_eq!(task_stat_state_cpu("7 (a ) b) R 1 1 1 0 -1 0 0 0 0 0 5 6 0"), Some(('R', 11)), "a ')' in the name");
+        assert_eq!(task_stat_state_cpu("garbage"), None);
+        let t = |tid: u32, state: char, cpu: u64, wchan: &str| (tid, state, cpu, wchan.to_string());
+        let before = vec![t(1, 'R', 100, "0"), t(2, 'S', 50, "futex_wait_queue"), t(3, 'S', 70, "futex_wait_queue"),
+                          t(4, 'D', 10, "io_schedule"), t(5, 'R', 30, "0")];
+        let after = vec![t(1, 'R', 118, "0"), t(2, 'S', 50, "futex_wait_queue"), t(3, 'S', 71, "futex_wait_queue"),
+                         t(4, 'D', 10, "io_schedule"), t(5, 'R', 31, "0")];
+        // The main runtime's workers and its blocking pool are one set of threads to the kernel (tokio moves a worker's core
+        // between them), so the line says how many of them are the blocking pool, whose idle threads are asleep too.
+        assert_eq!(runtime_threads_summary(&before, &after, 10, Some(3)),
+                   "threads=5 blocking_pool=2 busy=1 runnable=1 io_wait=1 asleep=2 wchan=futex_wait_queue:2");
+        assert!(runtime_threads_summary(&before, &after, 10, None).starts_with("threads=5 blocking_pool=? "));
+        let src = include_str!("sync.rs");
+        let code = &src[..src.find("mod runtime_stall_tests").unwrap()];
+        assert!(code.contains("runtime_threads_summary(&b, &a, WINDOW_MS / 20, handle.map(|h| h.metrics().num_workers()))"));
+    }
+
+    // The sample read every thread with tokio's default name: the main runtime's and those of the process's other runtimes
+    // (the signature-check runtimes), whose idle workers sleep in a futex like a waiting worker. The node's main runtime
+    // names its threads, workers and blocking pool alike, and only those are sampled.
+    #[test]
+    fn the_stall_sample_reads_the_main_runtimes_threads_alone() {
+        let rt = main_runtime().expect("runtime");
+        let worker = rt.block_on(async { tokio::spawn(async { std::thread::current().name().map(str::to_string) }).await.unwrap() });
+        let pool = rt.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::current().name().map(str::to_string)).await.unwrap()
+        });
+        assert_eq!((worker.as_deref(), pool.as_deref()), (Some(MAIN_RUNTIME_THREAD), Some(MAIN_RUNTIME_THREAD)));
+        assert_eq!(rt.metrics().num_workers(), tokio::runtime::Runtime::new().unwrap().metrics().num_workers(),
+                   "as many workers as the default runtime");
+        assert!(MAIN_RUNTIME_THREAD.len() <= 15, "the kernel keeps 15 bytes of a name");
+        assert!(is_main_runtime_thread("qnet-main-rt\n") && !is_main_runtime_thread("tokio-runtime-w\n"));
+        let main = include_str!("../bin/qnet-node.rs");
+        assert!(main.contains("qnet_integration::node::main_runtime()?.block_on(node_main())") && !main.contains("#[tokio::main]"));
     }
 }

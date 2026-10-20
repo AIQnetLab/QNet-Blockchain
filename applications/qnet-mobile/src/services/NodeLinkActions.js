@@ -10,9 +10,11 @@
  */
 import { postUnbind, readNodeStatus, readServerNodeListed } from './LightNode';
 import {
-  bindThisDevice, getPendingRewards, linkWithConsent, localBinding, localNode, signStatusWithPingKey, stopLightNode,
+  bindThisDevice, getPendingRewards, linkWithConsent, localBinding, localNode, nodeCheckState, readUnconfirmedBinding,
+  signStatusWithPingKey, stopLightNode,
 } from './PushService';
-import { checkDevice } from './NodeDeviceKey';
+import { checkDevice, isThisDevice } from './NodeDeviceKey';
+import { nodeView } from '../screens/NodeTab';
 import { readNodeRecordState } from './NodeRecordRead';
 import { acceptedBalance, claimedNano } from './ClaimTransit';
 import { ownNodeType } from '../crypto/NodePreimages';
@@ -50,25 +52,28 @@ function claimAnswer(result) {
  * reads again); `onClaimed(nodeId, result, balanceNano)` once the network took a move (claimRewards' `result`, from the
  * node balance the sheet showed): the move is in transit from then on, as one from the Node tab (services/ClaimTransit);
  * `claimFloor()` the wallet's claim watermark (ClaimTransit.answerFloor; null: none known), which the balance read is
- * judged by.
+ * judged by; `height()` reads the block height as the Node tab does (a promise; 0: none), which that tab's view of a
+ * device key is judged by.
  * The node balance, a move running and a move in transit are the wallet's, whichever of its node ids a move names: one
  * started for the super node holds a move of the light node's balance too, and the reverse.
  */
 export function nodeLinkActions({
   walletManager, credential, serverNode = false, claimBusy = () => false, onUnlinked = () => {}, onClaimed = () => {},
-  claimFloor = () => null,
+  claimFloor = () => null, height = async () => 0,
 }) {
   let moving = false;
   const walletStatus = (nodeId) => readNodeStatus(nodeId, { signStatus: (id, ts) => walletManager.signNodeStatus(credential, id, ts) });
   // The wallet form of the unbind (contract 1.9b): the binding two owners name while a device is bound (S), withdrawn
-  // with the wallet key's signature over it. This device's own records are not touched here.
-  const unbindByWallet = async (nodeId) => {
+  // with the wallet key's signature over it; with `onlySeqs`, only while S is one of those bindings (this device's own:
+  // a binding another device took meanwhile is never withdrawn in its place). This device's own records are not touched.
+  const unbindByWallet = async (nodeId, onlySeqs = null) => {
     const before = await walletStatus(nodeId).catch(() => null);
     if (!before || before.onChain === null) return { status: 'error', error: 'NETWORK' };
     if (before.onChain === false || before.deviceBoundAgreed === false) return { status: 'error', error: 'NOT_LINKED' };
     if (before.deviceBoundAgreed !== true || !Number.isSafeInteger(before.bindingSeqAgreed) || before.bindingSeqAgreed <= 0) {
       return { status: 'error', error: 'NETWORK' };
     }
+    if (onlySeqs !== null && !onlySeqs.includes(before.bindingSeqAgreed)) return { status: 'error', error: 'UNLINK_REFUSED' };
     const seq = before.bindingSeqAgreed;
     const ts = Math.floor(Date.now() / 1000);
     const { sig, identityPublicKey } = await walletManager.signNodeUnbind(credential, nodeId, seq, ts);
@@ -94,6 +99,18 @@ export function nodeLinkActions({
     serverListed: (nodeId) => readServerNodeListed(nodeId).catch(() => null),
     // The status signed with this device's ping key, which tells whether the network names this device's binding.
     pingStatus: (nodeId) => readNodeStatus(nodeId, { signStatus: signStatusWithPingKey }),
+    // Whether the Node tab offers Use this device for this device's binding `local` by that status (NodeTab nodeView,
+    // with the device check and key comparison the tab makes): a new binding mends what it shows. With no height, a
+    // check-pending key with a rotation due cannot be told overdue or not, so a new binding mends it either way.
+    offersUse: async (nodeId, status, local) => {
+      const pending = !!status.signed && status.signed.deviceState === 'check_pending';
+      const h = await Promise.resolve().then(height).catch(() => 0);
+      if (pending && Number.isSafeInteger(status.signed.rotationDue) && !(h > 0)) return true;
+      const check = pending ? await nodeCheckState(nodeId, local.seq).catch(() => null) : null;
+      const tagOurs = local.hw && (status.deviceTags || []).length > 0
+        ? await isThisDevice(status.nonce, status.deviceTags).catch(() => null) : null;
+      return nodeView({ status: { ...status, tagOurs }, local, height: h, check }).offerUse === true;
+    },
     device: () => checkDevice().catch(() => ({ capable: false, reason: 'device_unsupported' })),
     localNode,
     // This device's binding of the node ({ seq, boundAt, ... }), or null when this device does not run it.
@@ -101,15 +118,18 @@ export function nodeLinkActions({
     // The unlink of the binding this device holds, which the website asked for and the user confirmed: the ping key's
     // signed unbind with the device's release, then this device forgets the binding whatever the network answered. A
     // ping-key unbind the network did not take (no ping key here any more, a refusal) goes again in the wallet form
-    // where two genesis nodes serve it. Resolves { unbound }.
+    // where two genesis nodes serve it, for this device's bindings only: the current one, and one sent from here with no
+    // answer that the network may hold (stopLightNode ends both). Resolves { unbound }.
     unlink: async (nodeId) => {
-      if (!(await localBinding(nodeId))) return { unbound: false };
+      const local = await localBinding(nodeId);
+      if (!local) return { unbound: false };
       try {
+        const waiting = await readUnconfirmedBinding(nodeId);
         const r = await stopLightNode();
         if (r.unbound) return r;
         const status = await readNodeStatus(nodeId).catch(() => null);
         if (!status || !status.features.includes('unbind_wallet') || status.deviceBoundAgreed !== true) return r;
-        const w = await unbindByWallet(nodeId).catch(() => null);
+        const w = await unbindByWallet(nodeId, waiting ? [local.seq, waiting.seq] : [local.seq]).catch(() => null);
         return { unbound: !!w && w.status === 'ok' };
       } finally {
         onUnlinked();

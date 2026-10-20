@@ -82,7 +82,7 @@ Lines worth alerting on directly:
 | `[CRIT][NODE] identity_anchor_mismatch` | the derived identity key does not match this node's chain anchor; startup is aborted |
 | `[FATAL][GEN] WS restart pin active … refusing to mint` | a restart pin is set but the local chain is empty; the node halts rather than minting a fresh genesis |
 | `[CRIT][MEMORY] … OOM_IMMINENT graceful_shutdown` | memory stayed above the fatal threshold 30 s after an emergency cleanup; the node flushes and exits 137 for the supervisor to restart |
-| `[CRIT][STORAGE] … state=critically_full action=admin_required` | the internal storage budget is at or above 95 % |
+| `[CRIT][STORAGE] … state=critically_full action=admin_required` | the storage fill level — the fuller of the data against `QNET_MAX_STORAGE_GB` and the data disk itself — is at or above 95 %; this is the line's only source. A Super node (`blocks=still_stored`) keeps storing blocks, repeats it every 600 s while the level stays at or above 94 %, and logs `[INFO][STORAGE] storage_critical_cleared` once it falls below; a Light node (`blocks=refused`) prints it from the hourly check while it would refuse a block |
 | `[WARN][MONITOR] no_peers_connected` | emitted by the 30-second monitor loop |
 | `[INFO][HALT] Reached halt_height=…` | coordinated-upgrade stop reached |
 | `[CRIT][STATE] escalate=halt_signal` then `[CRIT][NODE] halt_requested` | the error ladder reached its terminal stage; the node exits 1 for the orchestrator to restart |
@@ -90,7 +90,7 @@ Lines worth alerting on directly:
 | `[CRIT][FAILOVER] … action=stay_up_degraded reason=restart_budget_exhausted` | the restart budget is spent; the node stays up and keeps syncing, and the cause is structural |
 | `[CRIT][WATCHDOG] chain_stuck …` | the chain-stuck watchdog fired; alert only, the process keeps running |
 | `[CRIT][WATCHDOG] chain_halted …` | the best height known to this node, its own or the network's, has not moved for 300 s — the whole network is stopped; alert only |
-| `[CRIT][WATCHDOG] runtime_stalled …` | the async runtime missed its heartbeat for 2 s or more; logged once per stall from a separate OS thread with tokio's worker, task and queue counts and RocksDB's write-stop, compaction, flush, memtable and L0 state, which `[WARN][PIPELINE] slow_storage_write` also carries; `runtime_recovered` closes the episode |
+| `[CRIT][WATCHDOG] runtime_stalled …` | the async runtime missed its heartbeat for 2 s or more; logged once per stall from a separate OS thread with tokio's worker, task and queue counts, RocksDB's write-stop, compaction, flush, memtable and L0 state (which `[WARN][PIPELINE] slow_storage_write` also carries) and a 200 ms sample of the runtime: `stuck_workers` (workers that did not park in the window, i.e. stuck inside one poll) and, from the kernel, how many of the main runtime's `threads` (named `qnet-main-rt`: its workers and its blocking pool alike, since tokio moves a worker between them; `blocking_pool` says how many are the pool, whose idle threads are asleep too) were `busy` on the CPU, `runnable` but kept off it, in `io_wait`, or `asleep` at the wait points listed in `wchan` (Linux only); `runtime_recovered` closes the episode |
 | `[WARN][MEMORY] rss_floor_rising …` | the lowest RSS of the last hour exceeds the previous hour's lowest by more than 256 MB — memory that is not released, as opposed to a periodic peak that the next five-minute sample no longer shows |
 
 Three of these describe how a node handles its own failure. The **error ladder** counts consecutive
@@ -186,12 +186,29 @@ from "no events". Registry and total-supply seals are pruned one 14,400-block wi
 (`REGISTRY_SEAL_RETENTION = 14400`). On a miss, a `registry_root` seal is recomputed from scratch, while the
 checkpoint reader defers on a missing total-supply seal.
 
-The node's own storage monitor runs hourly and needs care. It measures the directory named by `QNET_DATA_DIR`
-(`./node_data` when unset, which may not be the directory the node chose at boot) against `QNET_MAX_STORAGE_GB`,
-default 2000 GB for a Super node. That is a configured budget, not the filesystem's free space, and the 70 %, 85 % and
-95 % thresholds are percentages of it. All three cleanup tiers clear caches and the transaction pool and force
-compaction; chain data is kept. So: set `QNET_DATA_DIR` explicitly, set `QNET_MAX_STORAGE_GB` near the real volume
-size, and monitor actual free space externally with `df` regardless.
+The node's own storage monitor runs hourly. It measures the directory the node opened its database in, and its fill
+level is the fuller of two: that size against `QNET_MAX_STORAGE_GB` (default 2000 GB for a Super node), and the data
+disk's own use as `df` reports it, read with `statvfs` (on Linux; elsewhere the budget alone counts). A budget larger
+than the disk therefore cannot hide a full disk. The 70 %, 85 % and 95 % thresholds apply to that level, and the 95 %
+guard before every block save reads the disk live. At 70 % the monitor drops transaction-pool entries older than 24 h
+and at 85 % those older than 6 h. Neither runs a compaction: the prunes above compact the families they shed rows
+from, and RocksDB's own compactions reclaim the rest. Chain data is kept at every level.
+`[INFO][STORAGE] storage_usage` logs the size, the budget, `disk_used_pct` and the resulting level.
+
+At 95 % a Super node (every genesis node included) never stops storing blocks: the disk may be filling with data that
+is not the node's, and a node that stopped storing would stop applying blocks. It logs
+`[CRIT][STORAGE] state=critically_full action=admin_required pct=… disk_used_pct=… blocks=still_stored` once every
+600 s while the level stays at or above 94 %. With the first line of such an episode it takes the emergency measures
+once: the transaction pool keeps its last hour, and a compaction of every column family of the main, tree and aux
+databases, the default families included, runs on its own thread, one at a time and beside RocksDB's own compactions
+(`emergency_compaction_start`, then `db_compaction_done mode=emergency families=all elapsed_ms=…`), never on the
+block-save path. Above level 0 RocksDB runs each family in steps whose input is at most `max_compaction_bytes` (25
+target files, 0.8–1.6 GB), which bounds the extra disk it holds. The measures do not repeat until the level has fallen
+below 94 % and reached 95 % again: on a disk filled by data that is not the node's, every further compaction would
+rewrite the database and reclaim nothing. The hourly check feeds the same state, so below 94 % it logs
+`[INFO][STORAGE] storage_critical_cleared` even while no block arrives. The node writes until the disk itself is full; a write it cannot make then fails as a storage error. A Light node, which keeps no blocks, takes the same
+emergency measures before a save at 95 %, logs `emergency_cleanup_done pct=… accept_blocks=refused` (or `yes`) and
+refuses the block while a fresh reading stays at or above 95 %.
 
 Memory is sampled every 300 seconds, logging RSS, virtual size, the delta since the last sample, the allocator's
 `heap_alloc_mb`, `heap_resident_mb` and `heap_retained_mb`, RocksDB's `db_cache_mb`, `db_memtable_mb` and
@@ -435,12 +452,13 @@ refused by that node (and by `node_decreeSubmit`), which records its `seq` so it
 answer internal callers only. For a fork in which no branch holds a quorum, `QNET_ROLLBACK_TO_HEIGHT` brings every
 stored marker back to one height at boot, never below the node's certified floor, and the node rejoins from the network.
 
-**Storage full.** Distinguish the two meanings. If the *filesystem* is full the node cannot flush and should be stopped
-before it is starved; free space outside the data directory, then restart. If the node logs `storage_warn_85pct_full`
-or `critically_full`, that is the internal budget against `QNET_MAX_STORAGE_GB`, whose cleanups touch caches only. The
-real levers: confirm the body prune is running (`[INFO][STORAGE] microblock_bodies_pruned` appears at 14,400-block
-boundaries — a node that has not crossed one since starting has not pruned yet), confirm `QNET_DATA_DIR` points at the
-directory the node really uses, then provision more disk. Never hand-delete files from the RocksDB directory.
+**Storage full.** `storage_warn_85pct_full` or `critically_full` means the fill level above crossed that line, either
+against `QNET_MAX_STORAGE_GB` or on the disk itself (compare `disk_used_pct` in `storage_usage`); the node's own
+cleanups delete no chain data, and a Super node keeps storing and applying blocks through it. If the disk is the one
+filling, free space outside the data directory first; a node that can no longer flush should be stopped before it is
+starved, then restarted. The real levers: confirm the body prune is
+running (`[INFO][STORAGE] microblock_bodies_pruned` appears at 14,400-block boundaries — a node that has not crossed one
+since starting has not pruned yet), then provision more disk. Never hand-delete files from the RocksDB directory.
 
 **Reward-epoch commitment deferring.** The checkpoint's `reward_epoch_root` folds every certified epoch
 root up to the N-2 macroblock, resuming from a persisted prefix, and defers rather than seal a shorter

@@ -202,3 +202,24 @@ The token check must print nothing. `crl_refused` means a snapshot did not verif
 rotated oracle key not yet in the binary, or a wrong host); `device_crl_stale` that the held snapshot is
 older than seven days (it stays in use). `light_bitmap_divergence` names the owner and the epoch: compare
 that owner's logs for the epoch before anything else.
+
+## 7. Reading a container's log more than once
+
+With the json-file log driver (`max-size=200m`, `max-file=50`: up to 10 GB per container), `docker logs --since`
+decodes every retained log file from its start on each call, about 30 ms of dockerd CPU per MB of log, so its cost
+grows with the container's age. The one-off checks above are fine. Never poll `docker logs --since` in a loop or from a
+watcher: bound every read with `--tail N`, which reads the last N lines from the end of the file, read once per cycle,
+and grep that copy:
+
+```
+L=$(docker logs --tail 100000 --since 31m qnet-genesis-00N 2>&1)
+printf '%s\n' "$L" | grep -cE '\[(CRIT|ERR)\]'
+```
+
+`scripts/watch-fleet.sh` reads each node this way, once per cycle (`TAIL`, 100,000 lines by default; the digest says
+when the window was cut). Each call is short, so one `ps` does not show a poller; sample for a few seconds before
+leaving a watcher running on a host:
+
+```
+for i in $(seq 20); do pgrep -af 'docker logs .*--since'; sleep 0.5; done | sort | uniq -c
+```
