@@ -150,7 +150,7 @@ test('the gate fails on a release line past its security support or without a da
 
 test('the site pins a Next.js and a Node.js line that release-support.json dates, and the allowlist entries carry dates', () => {
   const pkg = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'));
-  assert.equal(pkg.dependencies.next, '16.3.6');
+  assert.equal(pkg.dependencies.next, '16.4.3');
   const support = loadSupport();
   for (const line of pinnedLines(pkg)) {
     const entry = support.lines.find((l) => l.name === line.name && l.major === line.major);
@@ -165,7 +165,9 @@ test('the site pins a Next.js and a Node.js line that release-support.json dates
   });
   // The PostCSS entries that waited for Next.js 16 are gone with it: its bundled PostCSS has the fix.
   const lock = json('package-lock.json');
-  assert.equal(lock.packages['node_modules/next'].version, '16.3.6');
+  assert.equal(lock.packages['node_modules/next'].version, '16.4.3');
+  // Next.js 16.4.3 and sharp 0.35.5 carry the October 2026 remote-code-execution fixes.
+  assert.equal(lock.packages['node_modules/sharp'].version, '0.35.5');
   assert.equal(lock.packages['node_modules/next/node_modules/postcss'].version, '8.5.23');
   for (const a of loadAllowlist()) {
     assert.match(a.id, /^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/, a.id);
