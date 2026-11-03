@@ -373,6 +373,9 @@ async function captureDevice({ kind, picked, app, out, secrets, own }) {
     sh(['simctl', 'spawn', udid, 'defaults', 'write', 'Apple Global Domain', 'AppleLanguages', '-array', 'en']);
     sh(['simctl', 'spawn', udid, 'defaults', 'write', 'Apple Global Domain', 'AppleLocale', '-string', 'en_US']);
     sh(['simctl', 'status_bar', udid, 'override', ...STATUS_BAR]);
+    // A device with no screen lock: the flows import with a password, so Face ID is not enrolled on the simulator.
+    sh(['simctl', 'spawn', udid, 'notifyutil', '-s', 'com.apple.BiometricKit.enrollmentChanged', '0']);
+    sh(['simctl', 'spawn', udid, 'notifyutil', '-p', 'com.apple.BiometricKit.enrollmentChanged']);
     sh(['simctl', 'install', udid, app]);
     const code = await runFlows(udid, maestroEnv(process.env, { control: control.url, own }));
     if (code !== 0) {
