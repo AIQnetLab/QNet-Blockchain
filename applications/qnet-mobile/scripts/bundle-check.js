@@ -80,7 +80,8 @@ function scanBundle(platform, bundle, { legacy = false } = {}) {
   }
   const android = androidTexts();
   if (platform === 'ios') {
-    for (const s of [...android, 'Google Play', 'play.google.com', 'QNetAppBuild']) {
+    // QNetAppBuild is both platforms' module (utils/clientAgent); the old Android package's move reads its legacyMove.
+    for (const s of [...android, 'Google Play', 'play.google.com', 'legacyMove']) {
       if (holds(bundle, s)) problems.push(`ios: carries Android's own "${s.slice(0, 40)}"`);
     }
   } else if (!android.every((s) => holds(bundle, s))) {
