@@ -284,7 +284,7 @@ describe('A2: deleting the wallet stops its node for good', () => {
     // Delete (the screen lock, the password) ends on the welcome screen, erase on the import.
     const doors = ws.slice(ws.indexOf('// Settings → Delete wallet'), ws.indexOf('// Terms of Service Modal'));
     expect(doors.match(/await eraseWallet\(\);\s*\} catch/g)).toHaveLength(3);
-    expect(doors).toMatch(/return;\s*\}\s*\/\/[^\n]*\n\s*await startImport\(\);\s*\};/);
+    expect(doors).toMatch(/return;\s*\}\s*\/\/[^\n]*\n\s*await startImport\(\{ fresh: true \}\);\s*\};/);
     expect(['wallet_deleted', 'erased_title', 'erased_body'].filter(require('../src/i18n').hasKey)).toEqual([]);
   });
 });

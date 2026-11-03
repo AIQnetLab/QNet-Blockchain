@@ -3601,13 +3601,13 @@ const WalletScreen = () => {
   const confirmPhraseScreen = async () => (await confirmNoScreenReaders()) && (await confirmDeviceIntegrity());
 
   /**
-   * The import, from the welcome screen and right after an erase: the device's screen lock read now, since a render
-   * from before the erase may hold an older answer. Under it there is no password step: the phrase field is the
-   * import's first screen, so the checks that otherwise follow the password step run here.
+   * The import, from the welcome screen (the screen lock as Create reads it) and right after an erase (`fresh`: read
+   * from the device now, since a render from before the erase may hold an older answer). Under it there is no password
+   * step: the phrase field is the import's first screen, so the checks that otherwise follow the password step run here.
    */
-  const startImport = async () => {
-    const underLock = !!(await walletManager.deviceAuthAvailable().catch(() => false));
-    setDeviceAuthAvail(underLock);
+  const startImport = async ({ fresh = false } = {}) => {
+    const underLock = fresh ? !!(await walletManager.deviceAuthAvailable().catch(() => false)) : deviceAuthAvail;
+    if (fresh) setDeviceAuthAvail(underLock);
     if (underLock && !(await confirmPhraseScreen())) return;
     setPassword('');
     setConfirmPassword('');
@@ -5625,7 +5625,7 @@ const WalletScreen = () => {
       return;
     }
     // Erased to be restored: the import opens on its own.
-    await startImport();
+    await startImport({ fresh: true });
   };
 
   // Terms of Service Modal
@@ -6198,7 +6198,7 @@ const WalletScreen = () => {
               }}
             />
 
-            <Action kind="secondary" label={t('import_wallet')} onPress={startImport} />
+            <Action kind="secondary" label={t('import_wallet')} onPress={() => startImport()} />
           </StartScreen>
           {vaultChecked ? renderLinkRequest() : null}
           {renderCustomAlert()}
