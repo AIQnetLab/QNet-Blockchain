@@ -6,7 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { StyleSheet } from 'react-native';
-import { color, layer, radius, setThemeLanguage, shadow, sheet, themed, type } from '../src/theme';
+import { card, color, layer, radius, setThemeLanguage, shadow, sheet, themed, type } from '../src/theme';
 
 const SRC = path.join(__dirname, '..', 'src');
 const files = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
@@ -26,7 +26,9 @@ describe('the tokens', () => {
       'signalPale', 'ember', 'mint', 'fillField', 'fillFieldFocus', 'fillPress', 'fillDisabled', 'scrim', 'qrLight', 'qrDark', 'web', 'camera'];
     for (const n of names) expect([n, /^(#[0-9A-F]{6}|rgba\(\d+, \d+, \d+, [\d.]+\))$/.test(color[n])]).toEqual([n, true]);
     expect([color.ink, color.signal, color.ember, color.paper]).toEqual(['#05080A', '#3CF0DC', '#FFB547', '#E8F0F0']);
-    expect(radius).toEqual({ box: 2, dot: 3.5, tile: 14 });
+    // Rounded everywhere: a field 12, a button a pill, a card 16, a sheet's top corners 20.
+    expect(radius).toEqual({ box: 12, pill: 24, tile: 16, sheet: 20, dot: 3.5 });
+    expect(card).toEqual({ borderRadius: radius.tile, borderWidth: 1, borderColor: color.rule, backgroundColor: color.surface });
   });
 
   it('the overlays rank the same way in drawing (elevation) and in touch (zIndex)', () => {
@@ -41,7 +43,7 @@ describe('the tokens', () => {
 });
 
 describe('no literal outside the theme', () => {
-  it('no colour, face, weight, radius above 2 or shadow is written in any other source file', () => {
+  it('no colour, face, weight, radius above the field radius or shadow is written in any other source file', () => {
     const found = [];
     for (const f of UI) {
       codeLines(fs.readFileSync(f, 'utf8')).forEach((line, i) => {

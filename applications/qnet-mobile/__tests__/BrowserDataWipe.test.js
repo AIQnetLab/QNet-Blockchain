@@ -74,8 +74,10 @@ describe('the native halves, alike', () => {
 
   it('Android: the app\'s own network reads are never kept on disk; a cache an earlier build left is deleted at start', () => {
     const app = read('android/app/src/main/java/com/qnetmobile/MainApplication.kt');
-    // React Native's client caches 10 MB of answers under cacheDir/http-cache; the factory's client has no cache.
-    expect(app).toMatch(/OkHttpClientProvider\.setOkHttpClientFactory \{ OkHttpClientProvider\.createClientBuilder\(\)\.build\(\) \}/);
+    // React Native's client caches 10 MB of answers under cacheDir/http-cache; the factory's client has no cache, and
+    // the shared pool it is built on (AppNetwork) adds none.
+    expect(app).toMatch(/OkHttpClientProvider\.setOkHttpClientFactory \{ AppNetwork\.clientBuilder\(OkHttpClientProvider\.createClientBuilder\(\)\)\.build\(\) \}/);
+    expect(read('android/app/src/main/java/com/qnetmobile/AppNetwork.kt')).not.toMatch(/\.cache\(/);
     expect(app.indexOf('setOkHttpClientFactory')).toBeLessThan(app.indexOf('loadReactNative(this)'));
     expect(app).toMatch(/Thread \{ File\(cacheDir, HTTP_CACHE_DIR\)\.deleteRecursively\(\) \}\.start\(\)/);
     expect(app).toMatch(/const val HTTP_CACHE_DIR = "http-cache"/);

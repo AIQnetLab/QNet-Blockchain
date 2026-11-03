@@ -1,6 +1,4 @@
-// The cabinet moves on by itself (owner, 30.09): the Overview stayed on "Recording your node on the QNet network" while
-// the wallet's light node was already on the network. Once the network lists the node, every page leads with the next
-// step (Link your phone for a light node without a device, the server for a super node), whichever way the wallet was
+// The cabinet moves on by itself: once the network lists the node, every page leads with the next step (Link your phone for a light node without a device, the server for a super node), whichever way the wallet was
 // connected; a listing that reaches the page before two nodes agree on the status is recorded, never an empty section;
 // while the record, the phone or the server is awaited the network is read every few seconds, and the watch stops once
 // nothing is (src/lib/cabinet/wallet-activation.ts nextStep, watchInterval, lightSectionState; the provider and the
@@ -10,19 +8,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  WATCH_MAX_MS, WATCH_NEXT_MS, WATCH_RECORD_MS, activationView, c9Name, lightSectionState, nextStep, watchInterval,
+  WATCH_MAX_MS, WATCH_NEXT_MS, WATCH_RECORD_MS, activationView, viewName, lightSectionState, nextStep, watchInterval,
 } from '../cabinet/wallet-activation.ts';
 import { journey } from '../cabinet/tabs.ts';
 import { recordCode } from '../cabinet/burn-record.ts';
 import { lightNodeId, superNodeId } from '../qnet-link.ts';
-import { TEXTS } from '../texts.ts';
+import { code } from './source.mjs';
+import { TEXTS } from './texts-helper.mjs';
 
 const V = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
 const W = V.wallets[0].address;
 const SOL = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
 const TX = V.node[0].burnTx;
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 
 const ok = (value) => ({ phase: 'ok', value });
 const LOADING = { phase: 'loading' };
@@ -38,7 +35,7 @@ const recorded = (nodeType = 'light', way = 'extension') => ({
 });
 const LISTED_LIGHT = ok({ state: 'registered', nodeId: lightNodeId(W), nodeType: 'light' });
 
-// The owner's wallet on 30.09: the extension's burn in the site's record, the node not on the network yet.
+// A wallet whose extension burn is in the site's record while its node is not on the network yet.
 const inputs = (over = {}) => ({
   choice: { qnet: W, source: 'extension', solana: SOL },
   network: ok({ state: 'none' }),
@@ -61,17 +58,17 @@ test('burned, then recorded: the step moves from the record to Link your phone a
   assert.equal(nextStep(view({ light: ok(light({ pending: true })) })), 'record');
   // The status the nodes settled lists it: Link your phone.
   const linked = view({ light: ok(light({ registered: true })) });
-  assert.deepEqual([linked.state, linked.light, nextStep(linked), c9Name(linked)], ['node', 'no_device', 'link', 'light-not-linked']);
+  assert.deepEqual([linked.state, linked.light, nextStep(linked), viewName(linked)], ['node', 'no_device', 'link', 'light-not-linked']);
   assert.deepEqual(journey(true, linked), { done: 2, current: 2, nodeType: 'light' });
   // Then running, or Offline for a device the network asks to come back (its phone answers once QNet Wallet is open, or
-  // runs the node again; owner, 11.10).
+  // runs the node again).
   assert.equal(nextStep(view({ light: ok(light({ registered: true, deviceBound: true })) })), 'running');
   assert.equal(nextStep(view({ light: ok(light({ registered: true, deviceBound: true, needsReactivation: true })) })), 'offline');
-  // Contract of 04.10: the node names its device. A device linked less than an epoch ago that has not answered yet is
-  // linked (never Offline): the step waits for its first answer, and the page watches for it.
+  // The node names its device: one that has not answered yet, linked or registered less than an epoch ago, is linked
+  // (never Offline); the step waits for its first answer, and the page watches for it.
   const device = (state) => ({ platform: 'android', linkedSince: 1_790_000_000, lastAnswerEpoch: null, state });
   const pending = view({ light: ok(light({ registered: true, deviceBound: true, needsReactivation: true, device: device('other_device_pending') })) });
-  assert.deepEqual([pending.light, nextStep(pending), c9Name(pending), watchInterval(pending)], ['device_pending', 'answer', 'light-linking', WATCH_NEXT_MS]);
+  assert.deepEqual([pending.light, nextStep(pending), viewName(pending), watchInterval(pending)], ['device_pending', 'answer', 'light-linking', WATCH_NEXT_MS]);
   assert.deepEqual(journey(true, pending), { done: 3, current: 3, nodeType: 'light' });
   assert.ok(pending.nodes.includes('light'));
   assert.equal(nextStep(view({ light: ok(light({ registered: true, deviceBound: true, needsReactivation: true, device: device('offline') })) })), 'offline');
@@ -128,7 +125,7 @@ test('the watch: every few seconds while the record is awaited, ten seconds for 
 test('the provider watches the network while the wallet waits, and every page leads with the step it is on', () => {
   const provider = code('components/cabinet/CabinetProvider.tsx');
   assert.match(provider, /const watch = watchInterval\(view\);/);
-  // Modest (05.10): the watch's few seconds last at most WATCH_MAX_MS from the step's start or the page's return; then
+  // Modest: the watch's few seconds last at most WATCH_MAX_MS from the step's start or the page's return; then
   // only the reads' own half-minute round goes on.
   assert.equal(WATCH_MAX_MS, 600_000);
   assert.equal(WATCH_RECORD_MS, 5_000);
@@ -151,7 +148,7 @@ test('the provider watches the network while the wallet waits, and every page le
   // section (CabinetFrame), shown only while such a step is open, never a second list of checks here.
   const steps = code('components/cabinet/NextSteps.tsx');
   const linkPhone = steps.slice(steps.indexOf('export function LinkPhone('), steps.indexOf('export function NodeNext('));
-  assert.match(linkPhone, /<Group title=\{t\('next_link_title'\)\}>\s*<p>\{t\('next_link_lead'\)\}<\/p>\s*<ol className="cab-list">\s*<PhoneReady \/>/);
+  assert.match(linkPhone, /<Group title=\{t\('next_link_title'\)\}>\s*<p>\{say\('next_link_lead'\)\}<\/p>\s*<ol className="cab-list">\s*<PhoneReady \/>/);
   assert.doesNotMatch(steps, /next_step_|cabinet-checks/);
   // The Activate page and the extension's answer follow the listing too.
   assert.match(code('components/cabinet/NodeActivate.tsx'), /\{!extensionAnswered && \(view\.state === 'node' \? <NodeNext \/> : <NoNode pending=\{view\.state === 'recording'\} overview \/>\)\}/);
@@ -161,8 +158,8 @@ test('the provider watches the network while the wallet waits, and every page le
   assert.match(ext, /const listed = choice\?\.qnet === qnet && view\.nodes\.includes\('light'\);/);
   // The record's card: what needs no record goes on meanwhile, and it says when the network does not answer.
   const recording = steps.slice(steps.indexOf('export function Recording('), steps.indexOf('function PhoneReady('));
-  assert.match(recording, /\{askAgain && \(\s*<>\s*<p>\{t\('next_phone_ready'\)\}<\/p>\s*<ol className="cab-list">\s*<PhoneReady \/>/);
-  assert.match(recording, /\{view\.networkDown && choice\?\.qnet === qnet && <p className="note" role="status">\{t\('next_network_down'\)\}<\/p>\}/);
+  assert.match(recording, /\{askAgain && \(\s*<>\s*<p>\{say\('next_phone_ready'\)\}<\/p>\s*<ol className="cab-list">\s*<PhoneReady \/>/);
+  assert.match(recording, /\{view\.networkDown && choice\?\.qnet === qnet && <p className="note" role="status">\{say\('next_network_down'\)\}<\/p>\}/);
   assert.match(TEXTS.next_recording, /every few seconds and moves on to linking your phone as soon as QNet Blockchain lists the node\.$/);
   assert.doesNotMatch(TEXTS.next_recording, /half minute/);
 });

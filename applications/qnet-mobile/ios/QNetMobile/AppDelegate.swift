@@ -41,7 +41,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     // connect no scene: React Native then starts in a window no scene shows yet, so the JS still runs.
     DispatchQueue.main.async {
       guard self.window == nil, application.connectedScenes.isEmpty else { return }
-      self.runReactNative(in: UIWindow(), launchOptions: nil)
+      self.runReactNative(in: UIWindow())
     }
 
     // Registers the periodic wake with BGTaskScheduler, which accepts a launch handler only while the app
@@ -51,12 +51,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     return true
   }
 
-  // React Native's one root, started once per process in `window`; `launchOptions` carries the link that opened the
-  // app, where Linking reads it (getInitialURL).
-  func runReactNative(in window: UIWindow, launchOptions: [UIApplication.LaunchOptionsKey: Any]?) {
+  // React Native's one root, started once per process in `window`. A link that opened the app is not among its launch
+  // options: it waits in the link inbox (LinkInbox.swift, SceneDelegate.swift).
+  func runReactNative(in window: UIWindow) {
     window.backgroundColor = AppDelegate.launchColor
     self.window = window
-    reactNativeFactory?.startReactNative(withModuleName: "QNetMobile", in: window, launchOptions: launchOptions)
+    reactNativeFactory?.startReactNative(withModuleName: "QNetMobile", in: window, launchOptions: nil)
     window.rootViewController?.view.backgroundColor = AppDelegate.launchColor
   }
 

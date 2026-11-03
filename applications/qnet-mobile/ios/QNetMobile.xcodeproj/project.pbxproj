@@ -19,6 +19,14 @@
 		AA000029SCENEDELEGAT0029 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000028SCENEDELEGAT0028 /* SceneDelegate.swift */; };
 		AA000031QNETTASKSTAT0031 /* TaskState.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000030QNETTASKSTAT0030 /* TaskState.swift */; };
 		AA000033QNETTASKMODL0033 /* QNetTaskState.m in Sources */ = {isa = PBXBuildFile; fileRef = AA000032QNETTASKMODL0032 /* QNetTaskState.m */; };
+		AA000035QNETLINKINBX0035 /* LinkInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000034QNETLINKINBX0034 /* LinkInbox.swift */; };
+		AA000037QNETLINKMODL0037 /* QNetLinkInbox.m in Sources */ = {isa = PBXBuildFile; fileRef = AA000036QNETLINKMODL0036 /* QNetLinkInbox.m */; };
+		AA000039QNETAPPBUILD0039 /* QNetAppBuild.m in Sources */ = {isa = PBXBuildFile; fileRef = AA000038QNETAPPBUILD0038 /* QNetAppBuild.m */; };
+		AA000071QNETNETWATCH0071 /* AppNetwork.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000070QNETNETWATCH0070 /* AppNetwork.swift */; };
+		AA000073QNETNETMODUL0073 /* QNetNetwork.m in Sources */ = {isa = PBXBuildFile; fileRef = AA000072QNETNETMODUL0072 /* QNetNetwork.m */; };
+		AA000075QNETHEXFIELD0075 /* HexField.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000074QNETHEXFIELD0074 /* HexField.swift */; };
+		AA000077QNETHEXMODUL0077 /* QNetHexField.m in Sources */ = {isa = PBXBuildFile; fileRef = AA000076QNETHEXMODUL0076 /* QNetHexField.m */; };
+		AA000079QNETHEXRAIN00079 /* HexRain.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000078QNETHEXRAIN00078 /* HexRain.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
 		AF5ECC0B032181446EB6CD26 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
 		5E1A0000000000000000A002 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5E1A0000000000000000A001 /* InfoPlist.strings */; };
@@ -67,6 +75,14 @@
 		AA000028SCENEDELEGAT0028 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SceneDelegate.swift; path = QNetMobile/SceneDelegate.swift; sourceTree = "<group>"; };
 		AA000030QNETTASKSTAT0030 /* TaskState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TaskState.swift; path = QNetMobile/TaskState.swift; sourceTree = "<group>"; };
 		AA000032QNETTASKMODL0032 /* QNetTaskState.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = QNetTaskState.m; path = QNetMobile/QNetTaskState.m; sourceTree = "<group>"; };
+		AA000034QNETLINKINBX0034 /* LinkInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LinkInbox.swift; path = QNetMobile/LinkInbox.swift; sourceTree = "<group>"; };
+		AA000036QNETLINKMODL0036 /* QNetLinkInbox.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = QNetLinkInbox.m; path = QNetMobile/QNetLinkInbox.m; sourceTree = "<group>"; };
+		AA000038QNETAPPBUILD0038 /* QNetAppBuild.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = QNetAppBuild.m; path = QNetMobile/QNetAppBuild.m; sourceTree = "<group>"; };
+		AA000070QNETNETWATCH0070 /* AppNetwork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppNetwork.swift; path = QNetMobile/AppNetwork.swift; sourceTree = "<group>"; };
+		AA000072QNETNETMODUL0072 /* QNetNetwork.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = QNetNetwork.m; path = QNetMobile/QNetNetwork.m; sourceTree = "<group>"; };
+		AA000074QNETHEXFIELD0074 /* HexField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HexField.swift; path = QNetMobile/HexField.swift; sourceTree = "<group>"; };
+		AA000076QNETHEXMODUL0076 /* QNetHexField.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = QNetHexField.m; path = QNetMobile/QNetHexField.m; sourceTree = "<group>"; };
+		AA000078QNETHEXRAIN00078 /* HexRain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HexRain.swift; path = QNetMobile/HexRain.swift; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = QNetMobile/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		AA000001DILITHIUMMOD0001 /* DilithiumModule.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = DilithiumModule.m; path = QNetMobile/DilithiumModule/DilithiumModule.m; sourceTree = SOURCE_ROOT; };
@@ -117,6 +133,14 @@
 				AA000028SCENEDELEGAT0028 /* SceneDelegate.swift */,
 				AA000030QNETTASKSTAT0030 /* TaskState.swift */,
 				AA000032QNETTASKMODL0032 /* QNetTaskState.m */,
+				AA000034QNETLINKINBX0034 /* LinkInbox.swift */,
+				AA000036QNETLINKMODL0036 /* QNetLinkInbox.m */,
+				AA000038QNETAPPBUILD0038 /* QNetAppBuild.m */,
+				AA000070QNETNETWATCH0070 /* AppNetwork.swift */,
+				AA000072QNETNETMODUL0072 /* QNetNetwork.m */,
+				AA000074QNETHEXFIELD0074 /* HexField.swift */,
+				AA000076QNETHEXMODUL0076 /* QNetHexField.m */,
+				AA000078QNETHEXRAIN00078 /* HexRain.swift */,
 				AA000024QNETSECURITY0024 /* QNetSecurityModule.m */,
 				AA000026QNETDEVATTST0026 /* QNetDeviceAttestModule.m */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -364,6 +388,14 @@
 				AA000029SCENEDELEGAT0029 /* SceneDelegate.swift in Sources */,
 				AA000031QNETTASKSTAT0031 /* TaskState.swift in Sources */,
 				AA000033QNETTASKMODL0033 /* QNetTaskState.m in Sources */,
+				AA000035QNETLINKINBX0035 /* LinkInbox.swift in Sources */,
+				AA000037QNETLINKMODL0037 /* QNetLinkInbox.m in Sources */,
+				AA000039QNETAPPBUILD0039 /* QNetAppBuild.m in Sources */,
+				AA000071QNETNETWATCH0071 /* AppNetwork.swift in Sources */,
+				AA000073QNETNETMODUL0073 /* QNetNetwork.m in Sources */,
+				AA000075QNETHEXFIELD0075 /* HexField.swift in Sources */,
+				AA000077QNETHEXMODUL0077 /* QNetHexField.m in Sources */,
+				AA000079QNETHEXRAIN00079 /* HexRain.swift in Sources */,
 				AA000002DILITHIUMMOD0002 /* DilithiumModule.m in Sources */,
 				AA000004DILITHIUMRND0004 /* randombytes_ios.c in Sources */,
 				AA000025QNETSECURITY0025 /* QNetSecurityModule.m in Sources */,
@@ -412,7 +444,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = QNetMobile/QNetMobile.entitlements;
-				CURRENT_PROJECT_VERSION = 31;
+				CURRENT_PROJECT_VERSION = 32;
 				ENABLE_BITCODE = NO;
 								HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -452,7 +484,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = QNetMobile/QNetMobile.entitlements;
-				CURRENT_PROJECT_VERSION = 31;
+				CURRENT_PROJECT_VERSION = 32;
 								HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SOURCE_ROOT)/QNetMobile/DilithiumModule",

@@ -6,7 +6,7 @@
 // - fails when the Next.js major that package.json pins, or the Node.js major its `engines` names, is past the
 //   end of its security support in release-support.json, or has no entry there, and warns ahead of that date.
 //   npm audit never reports a release line that is out of support: its unfixed advisories simply have no fixed
-//   version on that line (SITE-R5-CSP-01).
+//   version on that line.
 //
 // An entry npm lists only because a dependency of it is vulnerable (its `via` names another package) is
 // judged by that package's own advisories, so an allow-listed advisory does not fail its dependents.
@@ -76,7 +76,7 @@ export function stale(reports, allow) {
 }
 
 // The release lines the site runs on, as its package.json pins them: the major of the exact `next` version,
-// and the Node.js major of `engines` (">=N": the deploy scripts install NODE_MAJOR N, deploy-config.test.mjs).
+// and the Node.js major of `engines` (">=N": the deploy script installs NODE_MAJOR N, deploy-config.test.mjs).
 export function pinnedLines(pkg) {
   const next = /^(\d+)\.\d+\.\d+$/.exec(pkg?.dependencies?.next ?? '');
   const node = /^>=(\d+)$/.exec(pkg?.engines?.node ?? '');

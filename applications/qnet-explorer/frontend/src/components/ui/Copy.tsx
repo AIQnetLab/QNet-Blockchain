@@ -5,6 +5,7 @@
 // are short, so that width stays close to the word "Copied".
 
 import { useEffect, useRef, useState } from 'react';
+import { useT } from '@/i18n/client';
 
 type State = 'idle' | 'done' | 'blocked';
 
@@ -30,7 +31,9 @@ function fallbackCopy(text: string): boolean {
 
 // `ariaLabel`: what a screen reader hears, naming what is copied ("Copy Merkle root"), where several Copy acts share a
 // view; it keeps the visible label's words.
-export default function Copy({ value, label = 'Copy', ariaLabel, className }: { value: string; label?: string; ariaLabel?: string; className?: string }) {
+export default function Copy({ value, label, ariaLabel, className }: { value: string; label?: string; ariaLabel?: string; className?: string }) {
+  const t = useT();
+  const shownLabel = label ?? t('copy');
   const [state, setState] = useState<State>('idle');
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
@@ -51,13 +54,13 @@ export default function Copy({ value, label = 'Copy', ariaLabel, className }: { 
 
   const tone = state === 'done' ? ' done' : state === 'blocked' ? ' blocked' : '';
   return (
-    <button type="button" className={`act copy${tone}${className ? ` ${className}` : ''}`} aria-label={ariaLabel ?? label} onClick={() => void copy()}>
+    <button type="button" className={`act copy${tone}${className ? ` ${className}` : ''}`} aria-label={ariaLabel ?? shownLabel} onClick={() => void copy()}>
       <span className="swap" aria-hidden="true">
-        <span data-on={state === 'idle'}>{label}</span>
-        <span data-on={state === 'done'}>Copied</span>
-        <span data-on={state === 'blocked'}>Select to copy</span>
+        <span data-on={state === 'idle'}>{shownLabel}</span>
+        <span data-on={state === 'done'}>{t('copied')}</span>
+        <span data-on={state === 'blocked'}>{t('copy_select')}</span>
       </span>
-      <span className="sr-only" aria-live="polite">{state === 'done' ? 'Copied' : state === 'blocked' ? 'Copying is blocked here: select the text to copy it' : ''}</span>
+      <span className="sr-only" aria-live="polite">{state === 'done' ? t('copied') : state === 'blocked' ? t('copy_blocked') : ''}</span>
     </button>
   );
 }

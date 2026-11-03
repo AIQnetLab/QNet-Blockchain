@@ -1,15 +1,18 @@
-// The site's other pages in concept B (B-SPEC 6.8 to 6.12): the wallet and extension pages, the testnet faucet, the
+// The site's other pages: the wallet and extension pages, the testnet faucet, the
 // documentation, How it works, the DAO, Support, Privacy, Terms, the error and 404 pages and the link pages. One title
 // band and one h1 each, the shared rows and fields, every request in three visible states, nothing that swaps after
 // load, and nothing on them that is not true. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EN, TEXTS, english } from './texts-helper.mjs';
 import { readFileSync } from 'node:fs';
 import { clockAt } from '../format.ts';
 import { LANGUAGES } from '../languages.ts';
 import { EXTENSION_STORE_URL } from '../qnet-provider.ts';
-import { code, read } from './source.mjs';
+import { pageTitle, translator } from '../texts.ts';
+import { CATALOGS } from '../../i18n/catalogs.ts';
+import { allSheets, code, read } from './source.mjs';
 
 const PAGES = {
   wallet: 'app/wallet/page.tsx',
@@ -45,24 +48,28 @@ test('every page has the title band and its one h1, and none of the old cards, b
   assert.match(sheet, /\.pg-bare \.page-head \{ padding-top: clamp\(36px, 5vw, 72px\); \}/);
 });
 
-test('the old rules of these pages are gone from the legacy sheets', () => {
-  const legacy = read('app/globals.css') + read('app/mobile-fixes.css');
+test('the old rules of these pages are gone with the sheets from before the rebuild', () => {
+  const sheets = allSheets();
   for (const cls of ['page-wallet', 'page-docs', 'page-dao', 'page-privacy', 'content-card', 'privacy-section', 'tool-card-large', 'tools-grid-large',
     'explorer-card', 'explorer-tabs', 'tabs-nav', 'block-list', 'block-item', 'status-indicator', 'create-proposal-card', 'activation-card',
-    'activation-content', 'faucet-heading', 'page-link', 'link-open', 'guide-switch', 'guide-steps', 'guide-step', 'guide-art', 'guide-faq', 'guide-connect']) {
-    assert.doesNotMatch(legacy, new RegExp(`\\.${cls}\\b`), cls);
+    'activation-content', 'faucet-heading', 'page-link', 'link-open', 'guide-switch', 'guide-steps', 'guide-step', 'guide-connect']) {
+    assert.doesNotMatch(sheets, new RegExp(`\\.${cls}(?![\\w-])`), cls);
   }
 });
 
 test('Privacy and Terms: sections with anchors, and the contents beside them list exactly those, in order', () => {
   for (const file of [PAGES.privacy, PAGES.terms]) {
     const src = read(file);
-    const sections = [...src.matchAll(/<section className="doc-sec prose" id="([a-z-]+)">\s*<h2>([^<]+)<\/h2>/g)].map((m) => [m[1], m[2]]);
-    const toc = [...src.slice(src.indexOf('const TOC')).matchAll(/\['([a-z-]+)', '([^']+)'\]/g)].map((m) => [m[1], m[2]]);
+    // Each section's title is a key of the page's language, the same key its line in the contents names.
+    const sections = [...src.matchAll(/<section className="doc-sec prose" id="([a-z-]+)">\s*<h2>\{(?:t|say)\('([a-z0-9_]+)'\)\}<\/h2>/g)].map((m) => [m[1], m[2]]);
+    const toc = [...src.slice(src.indexOf('const TOC')).matchAll(/\['([a-z-]+)', '([a-z0-9_]+)'\]/g)].map((m) => [m[1], m[2]]);
     assert.ok(sections.length >= 12, `${file}: ${sections.length} sections`);
     assert.deepEqual(toc, sections, file);
-    assert.match(src, /<DocToc items=\{TOC\} \/>/, file);
-    assert.match(src, /<p className="doc-date">Effective: [A-Z][a-z]+ \d{1,2}, \d{4}<\/p>/, file);
+    for (const [, key] of sections) assert.ok(TEXTS[key], key);
+    assert.match(src, /<DocToc items=\{TOC\.map\(\(\[id, title\]\) => \[id, t\(title\)\] as const\)\} \/>/, file);
+    // The date of the version, as a day in the page's language.
+    assert.match(src, /const EFFECTIVE = Date\.UTC\(\d{4}, \d{1,2}, \d{1,2}\);/, file);
+    assert.match(src, /<p className="doc-date">\{t\('legal_effective', \{ date: dayUtc\(EFFECTIVE, t\) \}\)\}<\/p>/, file);
   }
   // The anchors other pages link land on their sections.
   assert.match(read(PAGES.terms), /id="device-rules"/);
@@ -103,21 +110,26 @@ test('the wallet page: its languages in the app\'s order, its links client-side,
 test('the extension page: the store on a computer at the manifest\'s browser version, the app on a phone, no emoji or other browser', () => {
   const src = code(PAGES.extension);
   assert.doesNotMatch(src, /['"]use client['"]/);
-  assert.match(src, /<Action kind="solid" href=\{EXTENSION_STORE_URL\} external>Install from the Chrome Web Store<\/Action>/);
+  assert.match(src, /<Action kind="solid" href=\{EXTENSION_STORE_URL\} external>\{t\('get_install_extension'\)\}<\/Action>/);
+  assert.equal(TEXTS.get_install_extension, 'Install from the Chrome Web Store');
   // The site path in its text is a link to that page, as on the wallet page.
-  assert.match(src, /Its Activate tab, or <Link href="\/node">aiqnet\.io\/node<\/Link>, burns 1DEV on Solana/);
+  assert.match(src, /\{rich\('xp_activation_p', \{ node: <Link href="\/node" translate="no">aiqnet\.io\/node<\/Link> \}\)\}/);
+  assert.match(TEXTS.xp_activation_p, /^Its Activate tab, or \{node\}, burns 1DEV on Solana/);
   assert.match(EXTENSION_STORE_URL, /^https:\/\/chromewebstore\.google\.com\//);
   const manifest = JSON.parse(readFileSync(new URL('../../../../../qnet-wallet/dist/manifest.json', import.meta.url), 'utf8'));
   assert.match(src, new RegExp(`const MIN_BROWSER_VERSION = ${manifest.minimum_chrome_version};`));
   assert.match(src, /<p className="body phone-only" data-field-dim="0\.1">/);
-  assert.doesNotMatch(src, /\p{Extended_Pictographic}/u);
-  assert.doesNotMatch(src, /\bEdge\b|Chromium|Firefox|Safari|Download Extension|No Registration|bg-gradient|className="[^"]*\b(?:text|bg|px|py|mb|mt)-\d/);
+  const words = Object.entries(TEXTS).filter(([k]) => k.startsWith('xp_')).map(([, v]) => v).join(' ');
+  assert.doesNotMatch(src + words, /\p{Extended_Pictographic}/u);
+  assert.doesNotMatch(src + words, /\bEdge\b|Chromium|Firefox|Safari|Download Extension|No Registration|bg-gradient|className="[^"]*\b(?:text|bg|px|py|mb|mt)-\d/);
 });
 
 test('the DAO page says what exists: no proposals, no counts, no votes', () => {
   const src = code(PAGES.dao);
   assert.doesNotMatch(src, /['"]use client['"]|useState|forVotes|againstVotes|Vote Yes|Vote No|Demo Mode|Pool #4|Treasury|audits scheduled/i);
-  assert.match(src, /lead="No governance runs on QNet Blockchain yet, so this page lists no proposals and takes no votes\."/);
+  assert.match(src, /<PageHead title=\{say\('dao_title'\)\} lead=\{say\('dao_lead'\)\} \/>/);
+  assert.equal(TEXTS.dao_lead, 'No governance runs on QNet Blockchain yet, so this page lists no proposals and takes no votes.');
+  for (const key of Object.keys(TEXTS).filter((k) => k.startsWith('dao_'))) assert.doesNotMatch(TEXTS[key], /Vote Yes|Vote No|Demo Mode|Pool #4|Treasury|audits scheduled/i, key);
   // What the page says matches the vote route and the consensus document.
   assert.match(read('app/api/dao/vote/route.ts'), /process\.env\.DAO_ENABLED !== '1'/);
   const consensus = readFileSync(new URL('../../../../../../docs/architecture/consensus.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
@@ -128,26 +140,29 @@ test('the documentation index: a server page, every document a row that opens it
   const src = code(PAGES.docs);
   assert.doesNotMatch(src, /['"]use client['"]/);
   assert.match(src, /<a className="rowlink" href=\{href\} target="_blank" rel="noopener noreferrer">/);
-  assert.match(src, /<DocRow key=\{d\.path\} href=\{`\$\{DOCS\}\/\$\{d\.path\}`\} name=\{d\.name\} what=\{d\.what\} \/>/);
+  assert.match(src, /<DocRow key=\{d\.path\} href=\{`\$\{DOCS\}\/\$\{d\.path\}`\} name=\{say\(d\.key\)\} what=\{say\(d\.what\)\} \/>/);
+  // Every row's name and description in the page's language.
+  for (const m of src.matchAll(/\{ key: '([a-z0-9_]+)', what: '([a-z0-9_]+)', path: '[^']+' \}/g)) assert.ok(TEXTS[m[1]] && TEXTS[m[2]], m[1]);
   assert.ok(readFileSync(new URL('../../../../../../QNet_Whitepaper.md', import.meta.url), 'utf8').length > 0);
 });
 
 test('the faucet: three visible states under the form, no dialog over the page, its times through the formats module', () => {
-  const src = code(PAGES.testnet);
+  const src = english(PAGES.testnet);
   assert.doesNotMatch(src, /position: 'fixed'|zIndex|showFaucetAlert|showSuccessAlert|explorer\.solana\.com|Intl\.DateTimeFormat/);
   // Waiting and failed through the site's one request-line component, in the slot under the form.
   assert.match(src, /\{isLoading && <Waiting>Sending the tokens on Solana devnet<\/Waiting>\}/);
   assert.match(src, /\{errorMessage && <Failed>\{errorMessage\}<\/Failed>\}/);
   assert.match(src, /import \{ Failed, Waiting \} from '@\/components\/ui\/RequestState';/);
-  // Owner 20.10: tokens that went through show a green check and "Test tokens sent" with the amounts, the address and
+  // Tokens that went through show a green check and "Test tokens sent" with the amounts, the address and
   // each transaction, announced, until the visitor closes it (or claims again).
   assert.match(src, /<section className="faucet-sent" role="status" aria-labelledby="faucet-sent">/);
   assert.match(src, /<svg className="faucet-sent-mark" viewBox="0 0 24 24" aria-hidden="true">/);
   assert.match(src, /<h3 className="faucet-sent-title" id="faucet-sent">Test tokens sent<\/h3>/);
   assert.match(src, /<Action kind="quiet" onClick=\{\(\) => setSent\(null\)\}>Close<\/Action>/);
-  assert.match(src, /<dt>Sent<\/dt>\s*<dd>\{sent\.amounts\}<\/dd>/);
-  assert.match(src, /<dt>To<\/dt>\s*<dd className="mono">\{sent\.address\}<\/dd>/);
-  assert.match(src, /amounts: \[devData\.success && '1,500 1DEV', solData\.success && `\$\{FAUCET_SOL\} SOL`\]\.filter\(Boolean\)\.join\(' \+ '\),\s*address,/);
+  // Each token sent on a line of its own with its icon, only those that went through.
+  assert.match(src, /<dt>Sent<\/dt>\s*<dd className="faucet-amts">\s*\{sent\.dev && <Amount value=\{number\(FAUCET_DEV\)\} solana="1DEV" \/>\}\s*\{sent\.sol && <Amount value=\{number\(FAUCET_SOL\)\} solana="SOL" \/>\}\s*<\/dd>/);
+  assert.match(src, /<dt>To<\/dt>\s*<dd className="mono" translate="no">\{sent\.address\}<\/dd>/);
+  assert.match(src, /dev: Boolean\(devData\.success\),\s*sol: Boolean\(solData\.success\),\s*address,/);
   // Nothing else takes the panel down: no timer, and only Close and a new claim clear it.
   assert.doesNotMatch(src, /setTimeout|setInterval/);
   assert.equal(src.match(/setSent\(null\)/g).length, 2);
@@ -157,14 +172,14 @@ test('the faucet: three visible states under the form, no dialog over the page, 
   assert.match(src, /<EntityLink kind="solana-tx" value=\{sent\.devTx\} \/>/);
   assert.match(src, /<EntityLink kind="solana-tx" value=\{sent\.solTx\} \/>/);
   // The button keeps its width while it sends.
-  assert.match(src, /<span className="swap">\s*<span data-on=\{!isLoading\}>\{t\('ui_faucet_button'\)\}<\/span>\s*<span data-on=\{isLoading\} aria-hidden=\{!isLoading\}>Sending…<\/span>/);
+  assert.match(src, /<span className="swap">\s*<span data-on=\{!isLoading\}>Get test tokens<\/span>\s*<span data-on=\{isLoading\} aria-hidden=\{!isLoading\}>Sending…<\/span>/);
   // A field with a visible label, at 16 px so a phone does not zoom.
   assert.match(src, /<label className="label form-label" htmlFor="faucet-address">/);
   assert.match(read('styles/base.css'), /\.form-row \.field \{[^}]*font-size: 16px;/);
   // 14:05 within the next twelve hours, the day as well beyond them.
   const now = new Date(2026, 9, 19, 10, 0).getTime();
-  assert.equal(clockAt(new Date(2026, 9, 19, 14, 5).getTime(), now), '14:05');
-  assert.equal(clockAt(new Date(2026, 9, 20, 14, 5).getTime(), now), 'Oct 20, 14:05');
+  assert.equal(clockAt(new Date(2026, 9, 19, 14, 5).getTime(), now, EN), '14:05');
+  assert.equal(clockAt(new Date(2026, 9, 20, 14, 5).getTime(), now, EN), 'Oct 20, 14:05');
 });
 
 test('How it works: the way shown first comes from the request, so the steps are in the first paint and never swap', () => {
@@ -176,8 +191,12 @@ test('How it works: the way shown first comes from the request, so the steps are
   // The three ways are underlined tabs with arrow keys; the steps are numbered rows beside their pictures.
   assert.match(guide, /<ViewTabs items=\{WAYS\.map/);
   assert.match(code('components/ui/ViewTabs.tsx'), /role="tablist"/);
-  assert.match(code('components/ui/ViewTabs.tsx'), /e\.key === 'ArrowRight' \? at \+ 1 : e\.key === 'ArrowLeft' \? at - 1/);
-  assert.match(read('styles/base.css'), /\.tab \{\n {2}position: relative; flex: none; min-height: 44px;/);
+  // The arrow toward the end of the line moves on: right in a left-to-right page, left in Arabic.
+  assert.match(code('components/ui/ViewTabs.tsx'), /const step = e\.key === 'ArrowRight' \? 1 : e\.key === 'ArrowLeft' \? -1 : 0;\n\s*const next = step \? at \+ \(dir === 'rtl' \? -step : step\) : e\.key === 'Home' \? 0 : e\.key === 'End' \? items\.length - 1 : null;/);
+  // A row wider than its column wraps, and a long label wraps inside its tab: no tab or word is cut or scrolled away.
+  assert.match(read('styles/base.css'), /\.tabs \{ display: flex; flex-wrap: wrap; column-gap: 28px; border-bottom: 1px solid var\(--rule\); \}/);
+  assert.match(read('styles/base.css'), /\.tab \{\n {2}position: relative; flex: 0 1 auto; min-width: 0; min-height: 44px;[^}]*text-align: start; overflow-wrap: break-word;/);
+  assert.doesNotMatch(read('styles/base.css'), /\.tabs[^{]*\{[^}]*overflow-x|\.tab \{[^}]*white-space: nowrap/);
   // The site's one numbered-steps primitive (the activation's), with the picture as a third column here.
   assert.match(guide, /<ol className="cab-steps guide-list">/);
   assert.match(code(PAGES.extension), /<ol className="cab-steps">/);
@@ -194,20 +213,51 @@ test('the guide\'s pictures draw in the site\'s tokens: the site\'s buttons sent
   assert.match(art, /const radius = b\.site \? 2 : 5;/);
 });
 
-test('the home page\'s rate limits say exactly what they are (owner 19.10): per IP at each node\'s API, never throughput', () => {
+test('the home page\'s rate limits say exactly what they are: per IP at each node\'s API, never throughput', () => {
   const home = code('app/HomeClient.tsx');
-  assert.doesNotMatch(home, /tx \/ min|per-address/i);
-  assert.match(home, /<Feature datum="Per-IP limits" title="Rate limiting">/);
-  const text = home.slice(home.indexOf('title="Rate limiting">'), home.indexOf('</Feature>', home.indexOf('title="Rate limiting">'))).replace(/\s+/g, ' ');
-  assert.match(text, /Each node&apos;s public API limits every IP address \(an IPv6 address by its \/64\): 100 transaction submissions and 300 reads a minute, and 5 activations an hour, with a pause after a limit is passed\./);
+  assert.doesNotMatch(home + Object.values(TEXTS).join(' '), /tx \/ min|per-address/i);
+  assert.match(home, /<Feature datum=\{t\('home_rate_datum'\)\} title=\{t\('home_rate_title'\)\}>\{t\('home_rate_body'\)\}<\/Feature>/);
+  assert.deepEqual([TEXTS.home_rate_datum, TEXTS.home_rate_title], ['Per-IP limits', 'Rate limiting']);
+  const text = TEXTS.home_rate_body;
+  assert.match(text, /Each node's public API limits every IP address \(an IPv6 address by its \/64\): 100 transaction submissions and 300 reads a minute, and 5 activations an hour, with a pause after a limit is passed\./);
   assert.match(text, /Incoming transactions are checked in a separate, bounded verification pool, and block validation keeps a pool of its own\./);
 });
 
-// Owner 19.10: the open-source section stays, the big VERIFY word included. A reveal element whose class React
-// recomputes loses the "in" the reveal adds by hand and stays invisible, as VERIFY did while it toggled "scan".
-test('the home page keeps VERIFY with its two links, and every element that fades in has a static class', () => {
+// The security model's datum: equal nodes and faults proven on chain, each language naming the node with the word its
+// own body uses.
+test('the home page\'s reputation datum says equal nodes and proven faults, in each language\'s word for a node', () => {
   const home = code('app/HomeClient.tsx');
-  assert.match(home, /<p className="verify-word rv" data-text="VERIFY" aria-hidden="true">VERIFY<\/p>/);
+  assert.match(home, /<Feature datum=\{t\('home_rep_datum'\)\} title=\{t\('home_rep_title'\)\}>\{t\('home_rep_body'\)\}<\/Feature>/);
+  assert.deepEqual([TEXTS.home_rep_datum, TEXTS.home_rep_title], ['Equal nodes, proven faults', 'Reputation-based security']);
+  const node = { en: 'node', ru: 'нод', es: 'nodo', fr: 'nœud', de: 'knoten', it: 'nodi', pt: 'nós', ja: 'ノード', ko: '노드', 'zh-CN': '节点', ar: 'عقد' };
+  assert.deepEqual(Object.keys(node).sort(), Object.keys(CATALOGS).sort());
+  for (const [locale, word] of Object.entries(node)) {
+    const { home_rep_datum: datum, home_rep_body: body } = CATALOGS[locale];
+    assert.ok(datum.toLowerCase().includes(word) && body.toLowerCase().includes(word), `${locale}: ${datum}`);
+  }
+});
+
+// On a phone (28 px, 328 px of line at 360 px wide) a datum breaks only between its two phrases, never inside a word of
+// any script: its lines balanced, CJK words kept whole, each phrase within one line (20 mono letters; a CJK or Hangul
+// character is as wide as two).
+test('the home page\'s two-phrase datum breaks only at its comma, each phrase within a phone\'s line, in every language', () => {
+  const rule = /\.feat-k \{([^}]*)\}/.exec(read('styles/home.css'));
+  assert.ok(rule, 'the .feat-k rule');
+  assert.match(rule[1], /text-wrap: balance;/);
+  assert.match(rule[1], /word-break: keep-all;/);
+  const width = (text) => [...text].reduce((w, ch) => w + (/[ᄀ-ᇿ　-鿿가-힯＀-￯]/.test(ch) ? 2 : /\p{M}/u.test(ch) ? 0 : 1), 0);
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    const phrases = catalog.home_rep_datum.split(/(?<=[,،、，])\s*/);
+    assert.equal(phrases.length, 2, `${locale}: two phrases`);
+    for (const phrase of phrases) assert.ok(width(phrase.trim()) <= 20, `${locale}: ${phrase}`);
+  }
+});
+
+// The open-source section stays, the big VERIFY word included. A reveal element whose class React recomputes loses
+// the "in" the reveal adds by hand and stays invisible.
+test('the home page keeps VERIFY with its two links, and every element that fades in has a static class', () => {
+  const home = english('app/HomeClient.tsx');
+  assert.match(home, /<p className="verify-word rv" data-text="VERIFY" aria-hidden="true" translate="no">VERIFY<\/p>/);
   assert.match(home, /<h2 id="source-h" className="h2 rv">100% open source code<\/h2>/);
   assert.match(home, /href="https:\/\/github\.com\/AIQnetLab\/QNet-Blockchain\/tree\/testnet"[^>]*>\s*<span className="vlink-t">Check source code<\/span>/);
   assert.match(home, /href="https:\/\/github\.com\/AIQnetLab\/QNet-Blockchain\/actions"[^>]*>\s*<span className="vlink-t">Verify build<\/span>/);
@@ -221,8 +271,35 @@ test('the home page keeps VERIFY with its two links, and every element that fade
   assert.match(read('styles/base.css'), /\.off \*, \.off \*::before, \.off \*::after \{ animation-play-state: paused !important; \}/);
 });
 
+// A link card of the site (Open Graph, the X card) says of it what the home page says, in the page's language.
+test('the link cards describe the site with the home page\'s own line', () => {
+  const layout = code('app/layout.tsx');
+  assert.equal(layout.match(/\n\s*description: t\('home_deck'\),\n/g)?.length, 2, 'the Open Graph card and the X card');
+  assert.match(code('app/HomeClient.tsx'), /<p className="deck" data-field-dim="0\.1">\{t\('home_deck'\)\}<\/p>/);
+  for (const [locale, catalog] of Object.entries(CATALOGS)) assert.equal(catalog.meta_og_description, undefined, locale);
+});
+
+// The home page's transfer rate: the measured rate, with no link, and the validator-hardware figure, in every language.
+test('the home page\'s transfer rate is the measured rate with no link, and the validator-hardware figure', () => {
+  const home = code('app/HomeClient.tsx');
+  assert.match(home, /<Readout label=\{t\('home_tps'\)\} value="13,000" sub=\{t\('home_tps_sub'\)\} wide \/>/);
+  assert.doesNotMatch(home, /LOAD_TEST_RESULTS|qnet-loadtest|home_tps_measured/);
+  assert.equal(TEXTS.home_tps, 'Transfers/sec');
+  assert.equal(TEXTS.home_tps_sub, 'Measured end-to-end on a 5-node testnet; 40,000–80,000 on validator hardware');
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    assert.match(catalog.home_tps_sub, /40,000.80,000/, locale);
+    assert.doesNotMatch(catalog.home_tps_sub, /\{measured\}|90.109|430.450/, locale);
+  }
+});
+
 test('the 404 page: the explorer\'s own search in the title band, a way to the explorer, and no wallet state', () => {
-  const page = code(PAGES.lost);
+  // Its tab's title in the page's language, as every page's (i18n/server.ts pageMetadata: the title, then the site's name).
+  assert.match(code(PAGES.lost), /export const generateMetadata = \(\) => pageMetadata\(\['notfound_title'\], 'notfound_lead'\);/);
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    assert.equal(pageTitle(translator(locale, catalog), 'notfound_title'), `${catalog.notfound_title} - QNet Blockchain`, locale);
+    if (locale !== 'en') assert.notEqual(catalog.notfound_title, CATALOGS.en.notfound_title, locale);
+  }
+  const page = english(PAGES.lost);
   // One search component for the site: the explorer's, not a second one for this page.
   assert.match(page, /<PageHead title="This page does not exist"[^>]*>\s*<ExplorerSearch \/>\s*<\/PageHead>/);
   assert.match(page, /import ExplorerSearch from '@\/components\/explorer\/ExplorerSearch';/);
@@ -238,15 +315,15 @@ test('the link page keeps the room of its Android button from the first paint', 
   assert.match(sheet, /\[data-device='android'\] \.link-slot \{[^}]*min-height: 200px;/);
 });
 
-// REAL.md 7.9 (owner 19.10, no arrows): the economic model drew a connector with an arrowhead from Phase 1 to Phase 2.
-// The phases are now a plain sequence: two columns in reading order (one under the other on a phone), each under a top
+// No arrows: the economic model's phases are a plain sequence: two columns in reading order (one under the other on a phone), each under a top
 // rule, and Phase 2 says in words when it starts, as docs/economics/tokenomics-1dev.md defines it.
 test('the economic model shows its two phases in sequence with no drawn arrow', () => {
-  const home = code('app/HomeClient.tsx');
+  const home = english('app/HomeClient.tsx');
   assert.doesNotMatch(home, /phase-link|Transition at/);
   const phases = home.slice(home.indexOf('<div className="phases rv">'), home.indexOf('<div className="eco-charts">'));
   assert.equal(phases.match(/<article className="phase">/g)?.length, 2);
-  assert.ok(phases.indexOf('Phase 1') < phases.indexOf('Phase 2'));
+  assert.ok(phases.indexOf("t('home_phase', { n: 1 })") < phases.indexOf("t('home_phase', { n: 2 })"));
+  assert.equal(TEXTS.home_phase, 'Phase {n}');
   assert.match(phases, /<p className="note phase-when">Starts when 90% of the original 1DEV supply is burned or five years after the genesis block, whichever comes first\.<\/p>/);
   const doc = readFileSync(new URL('../../../../../../docs/economics/tokenomics-1dev.md', import.meta.url), 'utf8');
   assert.match(doc, /90% or more of the original 1DEV supply burned, or\n- five years/);
@@ -257,23 +334,22 @@ test('the economic model shows its two phases in sequence with no drawn arrow', 
   assert.doesNotMatch(css, /border-(top|right|bottom|left): 1px solid var\(--fog\);[^}]*rotate\(/);
 });
 
-// REAL.md 7.3: Support's "never send your recovery phrase" sat under the contact rows that appear once the wallet check
-// ends, and moved down with them (CLS 0.0066 at 1440). It now stands above them.
+// Support's "never send your recovery phrase" stands above the contact rows that appear once the wallet check ends, so
+// they never move it.
 test('Support: the warning stands above the contact rows that appear late, so nothing moves', () => {
   const page = code('app/support/page.tsx');
   const contact = page.slice(page.indexOf('id="contact"'));
-  assert.ok(contact.indexOf("t('support_never_share')") > 0);
-  assert.ok(contact.indexOf("t('support_never_share')") < contact.indexOf('<ul>'));
+  assert.ok(contact.indexOf("say('support_never_share')") > 0);
+  assert.ok(contact.indexOf("say('support_never_share')") < contact.indexOf('<ul>'));
   assert.equal(page.match(/support_never_share/g)?.length, 1);
 });
 
-// REAL.md 7.6: the address page said "Address" twice, as the kicker and in the title. A wallet address has no kicker
-// now; a system account keeps its "System account".
+// The address page says "Address" once: a wallet address has no kicker; a system account keeps its "System account".
 test('the address page names an address once', () => {
-  const page = code('app/explorer/address/[address]/AddressClient.tsx');
+  const page = english('app/explorer/address/[address]/AddressClient.tsx');
   assert.match(page, /kicker=\{system \? 'System account' : isAddressShape\(address\) \? undefined : 'Address'\}/);
-  // The whole address in the title, under the word, and written once: under it only Copy (owner 20.10).
-  assert.match(page, /title=\{name \?\? \(isAddressShape\(address\) \? <>Address<span className="ex-title-addr"><AddressParts value=\{address\} \/><\/span><\/> : address\)\}/);
+  // The whole address in the title, under the word, and written once: under it only Copy.
+  assert.match(page, /title=\{name \?\? \(isAddressShape\(address\) \? <>Address<span className="ex-title-addr" translate="no"><AddressParts value=\{address\} \/><\/span><\/> : address\)\}/);
   assert.match(page, /isAddressShape\(address\) \? <Copy value=\{address\} ariaLabel="Copy address" \/> : <Whole value=\{null\}/);
   assert.doesNotMatch(page, /short\('address', address\)/);
   assert.match(read('styles/explorer.css'), /^\.ex-title-addr \{ display: block;/m);

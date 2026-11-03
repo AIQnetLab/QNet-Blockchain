@@ -133,18 +133,6 @@ describe('answering a ping', () => {
       expect(new URL(url).search).toBe(`?node_id=${NODE}`);
     }
   });
-
-  it('a token refresh goes only to genesis nodes, shard owners first', async () => {
-    await AsyncStorage.multiSet([
-      ['qnet_light_node_info', JSON.stringify({ nodeId: NODE, pushType: 'fcm' })], ['qnet_ping_node_id', NODE],
-    ]);
-    global.fetch = jest.fn((url) => { calls.push({ url }); return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: false }) }); });
-    await Push.refreshFcmTokenOnServer(NODE);
-    const hosts = calls.map((c) => new URL(c.url).origin);
-    expect(hosts).toHaveLength(GENESIS_NODES.length);
-    expect(new Set(hosts)).toEqual(new Set(GENESIS_NODES));
-    expect(hosts.slice(0, 3)).toEqual([GENESIS_NODES[3], GENESIS_NODES[4], GENESIS_NODES[0]]);
-  });
 });
 
 // L-5: the node counts a polling device as having fetched its challenge only when the poll is signed with its ping key

@@ -7,9 +7,11 @@
  * in one step of the same block, so that figure holds the amount. A watermark past the batch's start but short of its end
  * is a move that went through in part (the network stops a batch at an epoch it cannot prove). While a move is in
  * transit the Node tab says "Moving X" with its button off and the rest of the node balance, and the move's history row
- * says so too: the amount is never shown twice, nor nowhere. Nothing else ends a move, neither the clock nor what nodes
- * say of the node balance (owner, 12.10: settleMoves says why). The record itself stays until a certified read of the
- * wallet shows the watermark, in the background: only that read raises the wallet's durable watermark (`floor`), which
+ * says so too: the amount is never shown twice, nor nowhere. A V2 claim (one that signed a last height) that a figure of a
+ * block past that height shows none of has expired: no block can take it, the whole amount stays on the node. Nothing
+ * else ends a move, neither the clock nor what nodes say of the node balance (settleMoves says why). The record itself
+ * stays until a certified read of the wallet shows the watermark, in the background: only that read raises the wallet's
+ * durable watermark (`floor`), which
  * judges every node balance read (acceptedBalance), and a certified read of the live figure's height or later that shows
  * a lower watermark puts the move back in transit. The live watermark (`liveLce`, with the height of the figure that
  * showed it, `liveHeight`) is held in memory only, never written. The record is kept on the device per wallet
@@ -17,6 +19,8 @@
  * record and is tested without the screen.
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { expiredAt } from '../crypto/TxBuilders';
+import { SIZE_STOPS } from '../utils/claimRun';
 
 export const TRANSIT_KEY = 'qnet_claim_transit_v1';
 // How long a settled move still marks its history row.
@@ -62,11 +66,14 @@ export function claimedNano(result) {
   return Number.isFinite(qnc) && qnc > 0 ? String(Math.round(qnc * 1e9)) : null;
 }
 
+// The last height a V2 claim signed, kept with its move: { validUntil } or nothing (a V1 claim has none).
+const validUntilPart = (v) => (Number.isSafeInteger(v) && v > 0 ? { validUntil: v } : {});
+
 /**
  * The record of a move the network took, from claimRewards' answer (`result`: amountNano or amount, txHash,
- * prevWatermark, lastEpoch, parts), or null when the answer names no batch to follow (a node that quoted none).
- * `balanceNano`: the node balance shown when the move was made, whose rest (`restNano`) the Node tab shows while it is
- * in transit.
+ * prevWatermark, lastEpoch, parts, validUntil), or null when the answer names no batch to follow (a node that quoted
+ * none). `balanceNano`: the node balance shown when the move was made, whose rest (`restNano`) the Node tab shows while
+ * it is in transit.
  */
 export function transitRecord({ nodeId, result, balanceNano = null, now = Date.now() }) {
   if (!nodeId || !result || result.success === false) return null;
@@ -80,6 +87,7 @@ export function transitRecord({ nodeId, result, balanceNano = null, now = Date.n
     nodeId, amountNano, restNano, prevWatermark, lastEpoch,
     parts: cleanParts(result.parts, prevWatermark, lastEpoch, amountNano),
     txHash: typeof result.txHash === 'string' && result.txHash ? result.txHash : null, time: now,
+    ...validUntilPart(result.validUntil),
   };
 }
 
@@ -97,16 +105,19 @@ export function addMove(state, move) {
   };
 }
 
-// What watermark `lce` says of `move`: 'done' at or past its last epoch, 'partial' past its start only, else null (the
-// move is not in that state yet, or no watermark is known).
-const outcomeAt = (move, lce) => {
+// What watermark `lce` of the state of block `height` says of `move`: 'done' at or past its last epoch, 'partial' past
+// its start only, 'expired' short of its start once that block is past the last height a V2 claim signed (no block can
+// take it any more), else null (the move is not in that state yet, or no watermark is known).
+const outcomeAt = (move, lce, height = null) => {
   if (!isEpoch(lce)) return null;
   if (lce >= move.lastEpoch) return 'done';
-  return lce > move.prevWatermark ? 'partial' : null;
+  if (lce > move.prevWatermark) return 'partial';
+  return isEpoch(height) && expiredAt(move.validUntil, height + 1) ? 'expired' : null;
 };
+const through = (result) => result === 'done' || result === 'partial';
 
-// The moves the wallet's live watermark does not show through yet: the ones in transit on screen.
-const movingMoves = (state) => (state ? state.moves.filter((m) => outcomeAt(m, state.liveLce) === null) : []);
+// The moves the wallet's live watermark does not show through or expired yet: the ones in transit on screen.
+const movingMoves = (state) => (state ? state.moves.filter((m) => outcomeAt(m, state.liveLce, state.liveHeight) === null) : []);
 
 // The part of `move` the network applied by watermark `lce`, nanoQNC as a number (the whole amount without its parts).
 function appliedNano(move, lce) {
@@ -115,11 +126,26 @@ function appliedNano(move, lce) {
   return move.parts.reduce((sum, [epoch, nano]) => (epoch <= lce ? sum + Number(nano) : sum), 0);
 }
 
+/**
+ * The first epoch of a move taken in part that the network did not apply: the first of its `parts` ([epoch, nanoText],
+ * ascending) past the `appliedNano` its outcome names (appliedNano sums the parts up to the watermark); null without them.
+ */
+export function restEpochOf(parts, applied) {
+  if (!Array.isArray(parts)) return null;
+  const limit = BigInt(Math.round(Number(applied) || 0));
+  let sum = 0n;
+  for (const [epoch, nano] of parts) {
+    sum += BigInt(nano);
+    if (sum > limit) return epoch;
+  }
+  return null;
+}
+
 const outcomeOf = (move, result, at, lce) => ({
   nodeId: move.nodeId, txHash: move.txHash, amountNano: move.amountNano, result, at,
   prevWatermark: move.prevWatermark, lastEpoch: move.lastEpoch,
   // What of it is back on the node (the part the network did not apply): the Node tab adds it to the rest.
-  returnedNano: result === 'partial' ? Number(move.amountNano) - appliedNano(move, lce) : 0,
+  returnedNano: result === 'partial' || result === 'expired' ? Number(move.amountNano) - appliedNano(move, lce) : 0,
 });
 
 /**
@@ -142,13 +168,13 @@ export function settleMoves(state, { lastClaimedEpoch = null, blockHeight = null
   const settled = [];
   const moves = [];
   for (const move of s.moves) {
-    // A certified watermark ends the record, never a timer or nodes' answers of the node balance: a QNet transaction has
-    // no consensus expiry (no valid_until height; each node's mempool TTL is its own), so a batch not seen yet can still
-    // be included later and nothing can say it never will. A "did not go through" state waits for such a rule.
-    const result = outcomeAt(move, lce);
+    // A certified state ends the record, never a timer or nodes' answers of the node balance: its watermark shows the
+    // move through, or, for a V2 claim, its height passed the claim's last height with none of it applied ('expired').
+    // A V1 claim has no last height, so one not seen yet can still be included later and only its watermark ends it.
+    const result = outcomeAt(move, lce, blockHeight);
     if (result) {
       const o = outcomeOf(move, result, now, lce);
-      settled.push({ move, result, returnedNano: o.returnedNano, liveSeen: outcomeAt(move, live) !== null, outcome: o });
+      settled.push({ move, result, returnedNano: o.returnedNano, liveSeen: outcomeAt(move, live, liveHeight) !== null, outcome: o });
     } else moves.push(move);
   }
   const kept = s.outcomes.filter((o) => now - o.at < OUTCOME_KEEP_MS);
@@ -168,19 +194,21 @@ export function settleMoves(state, { lastClaimedEpoch = null, blockHeight = null
 /**
  * `state` with the claim watermark of the wallet's live figure (a genesis node's live tip, its proof folded to that
  * node's root) and that figure's `height`, for the screen and in memory only: only ever raised, as the chain's watermark
- * only moves forward, until a certified read contradicts it (settleMoves). A move it shows at or past its last epoch is
- * no longer in transit ('done'), one it shows past its start only went through in part ('partial'); the record stays
- * until a certified read settles it. { state, settled: [{ move, result, returnedNano }] }: the moves this watermark is the
- * first to show through; `state` is the same object when nothing changed.
+ * only moves forward (the same watermark of a later block raises the height), until a certified read contradicts it
+ * (settleMoves). A move it shows at or past its last epoch is no longer in transit ('done'), one it shows past its start
+ * only went through in part ('partial'), a V2 one whose last height that block passed with none of it applied never will
+ * ('expired'); the record stays until a certified read settles it. { state, settled: [{ move, result, returnedNano }] }:
+ * the moves this figure is the first to end; `state` is the same object when nothing changed.
  */
 export function noteLiveWatermark(state, liveLce, height) {
   const s = state || emptyTransit();
-  const was = liveOf(s).liveLce;
-  if (!isEpoch(liveLce) || !isEpoch(height) || (was !== null && was >= liveLce)) return { state: s, settled: [] };
+  const { liveLce: was, liveHeight: wasAt } = liveOf(s);
+  const later = was === null || liveLce > was || (liveLce === was && height > wasAt);
+  if (!isEpoch(liveLce) || !isEpoch(height) || !later) return { state: s, settled: [] };
   const settled = [];
   for (const move of s.moves) {
-    const result = outcomeAt(move, liveLce);
-    if (result && outcomeAt(move, was) === null) {
+    const result = outcomeAt(move, liveLce, height);
+    if (result && outcomeAt(move, was, wasAt) === null) {
       settled.push({ move, result, returnedNano: outcomeOf(move, result, 0, liveLce).returnedNano });
     }
   }
@@ -204,15 +232,15 @@ export function transitTotal(state) {
 
 /**
  * What became of the move submitted as `txHash`, as its result card says it: { result: 'moving' } while it is in transit,
- * { result: 'done' | 'partial', appliedNano (what of it is in the wallet) } once the live or a certified watermark shows
- * it, null when no record names it.
+ * { result: 'done' | 'partial' | 'expired', appliedNano (what of it is in the wallet) } once the live or a certified
+ * state ends it, null when no record names it.
  */
 export function moveOutcome(state, txHash) {
   if (!state || !txHash) return null;
   const move = state.moves.find((m) => m.txHash === txHash);
   if (move) {
-    const result = outcomeAt(move, state.liveLce);
-    return result ? { result, appliedNano: appliedNano(move, state.liveLce) } : { result: 'moving' };
+    const result = outcomeAt(move, state.liveLce, state.liveHeight);
+    return result ? { result, appliedNano: result === 'expired' ? 0 : appliedNano(move, state.liveLce) } : { result: 'moving' };
   }
   const o = state.outcomes.find((x) => x.txHash === txHash);
   return o ? { result: o.result, appliedNano: Number(o.amountNano) - o.returnedNano } : null;
@@ -221,13 +249,45 @@ export function moveOutcome(state, txHash) {
 /**
  * What a move's result card (the Node tab's, a QNet Link claim sheet's) says under it, as a text key and its values:
  * `outcome` from moveOutcome. Done: in the wallet; in part: the part that is (`appliedNano`); still in transit: that the
- * batch stopped at `stoppedAtEpoch` when the quote did, else that it is credited once in a block.
+ * batch stopped at `stoppedAtEpoch` when the quote did, else that it is credited once in a block. `beforeNano` (BigInt):
+ * what earlier parts of the same move put in the wallet (runNote), counted in what is said to be there, as exact text.
  */
-export function moveNote(outcome, stoppedAtEpoch = null) {
+export function moveNote(outcome, stoppedAtEpoch = null, beforeNano = null) {
   if (outcome && outcome.result === 'done') return { key: 'claim_note_done' };
-  if (outcome && outcome.result === 'partial') return { key: 'claim_note_partial', appliedNano: outcome.appliedNano };
+  if (outcome && outcome.result === 'partial') {
+    const applied = beforeNano === null ? outcome.appliedNano : (beforeNano + BigInt(Math.round(outcome.appliedNano))).toString();
+    return { key: 'claim_note_partial', appliedNano: applied };
+  }
+  if (outcome && outcome.result === 'expired') {
+    return beforeNano ? { key: 'claim_note_partial', appliedNano: beforeNano.toString() } : { key: 'claim_note_expired' };
+  }
   if (stoppedAtEpoch !== null && stoppedAtEpoch !== undefined) return { key: 'claim_stopped_at', epoch: stoppedAtEpoch };
   return { key: 'claim_credited_on_block' };
+}
+
+/**
+ * Whether a move the network took (claimRewards' answer) stopped at a bound of its request (utils/claimRun SIZE_STOPS):
+ * more of it can go next.
+ */
+export function movesOn(result) {
+  return !!result && Number.isSafeInteger(result.stoppedAtEpoch) && SIZE_STOPS.includes(result.stoppedReason);
+}
+
+/**
+ * What a move's card says under its amount, for every card (the Node tab's, a QNet Link claim sheet's). A move in parts
+ * (`run`: { parts: [{ txHash, amountNano }], more, stop, whole }: services/MoveRun): while the next part is to go
+ * (`more`), that it goes once this one is in a block; once the next part was not sent (`stop`), what the parts put in
+ * the wallet with the rest on the node and the refusal's code as `reason`, or with no answer that it may have gone
+ * (`unknown`); otherwise the last part's note (moveNote, `outcome` its moveOutcome), counting the parts before it, with
+ * no stop once nothing was left to quote (`whole`). A move of one part (no `run`): its moveNote.
+ */
+export function runNote(run, outcome, stoppedAtEpoch = null) {
+  if (!run) return moveNote(outcome, stoppedAtEpoch);
+  const all = run.parts.reduce((sum, p) => sum + BigInt(p.amountNano), 0n);
+  if (run.more) return { key: 'claim_parts_next' };
+  if (run.stop && run.stop.unknown) return { key: 'claim_parts_in_wallet', appliedNano: all.toString(), unknown: true };
+  if (run.stop) return { key: 'claim_note_partial', appliedNano: all.toString(), reason: run.stop.code || null };
+  return moveNote(outcome, run.whole ? null : stoppedAtEpoch, all - BigInt(run.parts[run.parts.length - 1].amountNano));
 }
 
 /**
@@ -237,7 +297,7 @@ export function moveNote(outcome, stoppedAtEpoch = null) {
  */
 export function answerFloor(state) {
   if (!state) return null;
-  const live = state.moves.some((m) => outcomeAt(m, state.liveLce) !== null) ? state.liveLce : null;
+  const live = state.moves.some((m) => through(outcomeAt(m, state.liveLce))) ? state.liveLce : null;
   const marks = [state.floor, live].filter(isEpoch);
   return marks.length ? Math.max(...marks) : null;
 }
@@ -274,13 +334,15 @@ export function withMoveStates(rows, state) {
   if (!Array.isArray(rows) || !state || (state.moves.length === 0 && state.outcomes.length === 0)) return rows;
   const inTransit = movingMoves(state);
   const moving = new Set(inTransit.map((m) => m.txHash).filter(Boolean));
-  const through = new Set([...state.outcomes, ...state.moves.filter((m) => !inTransit.includes(m))]
-    .map((x) => x.txHash).filter(Boolean));
+  // An expired move is in no block: nothing confirms its row.
+  const ended = [...state.outcomes.filter((o) => through(o.result)),
+    ...state.moves.filter((m) => through(outcomeAt(m, state.liveLce, state.liveHeight)))];
+  const shown = new Set(ended.map((x) => x.txHash).filter(Boolean));
   let changed = false;
   const next = rows.map((row) => {
     if (!row || !row.hash) return row;
     if (moving.has(row.hash)) { changed = true; return { ...row, moving: true }; }
-    if (through.has(row.hash) && row.status === 'reported') { changed = true; return { ...row, status: 'confirmed' }; }
+    if (shown.has(row.hash) && row.status === 'reported') { changed = true; return { ...row, status: 'confirmed' }; }
     return row;
   });
   return changed ? next : rows;
@@ -293,12 +355,12 @@ function cleanMove(m) {
   return {
     nodeId: m.nodeId, amountNano: m.amountNano, restNano: Number.isFinite(m.restNano) && m.restNano >= 0 ? m.restNano : null,
     prevWatermark: m.prevWatermark, lastEpoch: m.lastEpoch, parts: cleanParts(m.parts, m.prevWatermark, m.lastEpoch, m.amountNano),
-    txHash: typeof m.txHash === 'string' && m.txHash ? m.txHash : null, time: m.time,
+    txHash: typeof m.txHash === 'string' && m.txHash ? m.txHash : null, time: m.time, ...validUntilPart(m.validUntil),
   };
 }
 
 function cleanOutcome(o) {
-  if (!o || typeof o.nodeId !== 'string' || !['done', 'partial'].includes(o.result) || !Number.isSafeInteger(o.at)) return null;
+  if (!o || typeof o.nodeId !== 'string' || !['done', 'partial', 'expired'].includes(o.result) || !Number.isSafeInteger(o.at)) return null;
   const span = isEpoch(o.prevWatermark) && isEpoch(o.lastEpoch) && o.lastEpoch > o.prevWatermark;
   return {
     nodeId: o.nodeId, txHash: typeof o.txHash === 'string' && o.txHash ? o.txHash : null,

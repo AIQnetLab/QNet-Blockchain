@@ -1,4 +1,4 @@
-// The activation from a payment address as four numbered steps on its page (B-SPEC 5.18, 6.7): 1 confirm in QNet Wallet,
+// The activation from a payment address as four numbered steps on its page: 1 confirm in QNet Wallet,
 // 2 pay, 3 burn, 4 register. Which one a record's stage is at; 5 once registered; null for the stages outside them (what
 // is left going back, a burn whose wallet's node came from another burn). Pure.
 

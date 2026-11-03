@@ -180,7 +180,7 @@ test('invalid answers get 400 or 413, unknown sessions 404, malformed ids 400', 
   }
 });
 
-// Owner, 12.10: the `claim` request names the node; the earlier one named none, and its session is refused as an invalid
+// The `claim` request names the node; one that names none is refused as an invalid
 // body, whatever an address sends; an app's answer to such a session finds none.
 test('a claim session names the wallet and its node; the earlier one and every broken one are refused', async () => {
   const { r } = relay();
@@ -274,9 +274,9 @@ test('reserve sessions are capped with the link sessions, and take a link-sized 
   }
 });
 
-// SITE-8: a session whose answer its page read, or that its page released, stops holding a place of that address:
+// A session whose answer its page read, or that its page released, stops holding a place of that address:
 // many people behind one carrier NAT address are not locked out by finished or cancelled requests. A read one ends
-// READ_GRACE_S after the read (SITE-R1-01), a released one at once.
+// READ_GRACE_S after the read, a released one at once.
 test('a read answer frees the address\'s place after the grace, a release at once; only the creating address releases', async () => {
   const { r, advance } = relay({ maxLinkPerIp: 2 });
   const from = (n) => ({ 'x-test-ip': `198.51.100.${n}` });
@@ -320,9 +320,9 @@ test('a read answer frees the address\'s place after the grace, a release at onc
   assert.match(readFileSync(new URL('../../app/api/link/sessions/[id]/route.ts', import.meta.url), 'utf8'), /export async function DELETE\([^)]*\): Promise<Response> \{\s*const \{ id \} = await params;\s*return linkRelay\(\)\.releaseSession\(request, id\);/);
 });
 
-// SITE-R1-01: reading its own answer released the address's place while the session stayed in the store until its TTL,
-// so one address could create, answer with junk, read, and repeat up to the create limit: about 120 live link sessions
-// from one address, and some 42 addresses kept all 5,000 link places full (every cabinet link request got 503).
+// Reading its own answer must not release the address's place while the session stays in the store until its TTL:
+// one address could create, answer with junk, read, and repeat up to the create limit, and a few dozen addresses
+// would keep every link place full.
 test('answer-then-read from one address never holds more than its caps in the store', async () => {
   const { r, advance } = relay({ maxLinkSessions: 50 });
   const attacker = { 'x-test-ip': '198.51.100.66' };
@@ -394,7 +394,7 @@ test('origins: none, or aiqnet.io; localhost only for development or a local hos
   assert.equal((await dev.createSession(post(BASE, CONNECT.sessionRequest, { origin: 'http://localhost.evil:3000' }))).status, 403);
 });
 
-// R4-SRA-01: a GET that another page makes from a visitor's browser (new Image().src = '…/response') carries
+// A GET that another page makes from a visitor's browser (new Image().src = '…/response') carries
 // no Origin. It spent the visitor's poll and session windows, so the page's own polls got 429 and the app's
 // session read failed. The browser names such a request in Sec-Fetch-Site; it is refused before any limit.
 test('a browser request that no page of this origin made is refused before any limit counts it', async () => {

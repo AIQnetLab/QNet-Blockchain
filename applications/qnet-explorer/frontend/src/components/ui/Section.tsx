@@ -1,4 +1,4 @@
-// A section (B-SPEC 5.14): a hairline on top, the section rhythm, and a head with the title on the left (7 of 12
+// A section: a hairline on top, the section rhythm, and a head with the title on the left (7 of 12
 // columns) and the lead on the right (5), aligned to the bottom. Tool pages use the tighter rhythm.
 
 import type { ReactNode } from 'react';

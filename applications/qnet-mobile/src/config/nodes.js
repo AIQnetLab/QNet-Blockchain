@@ -108,9 +108,12 @@ export const explorerTxUrl = (hash) => `${EXPLORER_API}/explorer/tx/${encodeURIC
  * bitmap. An answer sent anywhere else has to be relayed to it, and a relay carries the signature
  * without the key it was signed with — which is exactly how a device that rotated its ping key
  * (a reinstall does) ends up attesting into a void.
+ *
+ * No node id, or a hash this device cannot compute, has no owners: the list is empty, and a caller sends nothing
+ * rather than to every genesis node.
  */
 export function lightShardOwnerUrls(nodeId) {
-  if (!nodeId) return GENESIS_NODES.slice();
+  if (!nodeId) return [];
   let shard;
   try {
     const { blake3 } = require('@noble/hashes/blake3.js');
@@ -120,7 +123,7 @@ export function lightShardOwnerUrls(nodeId) {
     for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(h[i]);
     shard = Number(v % 5n);
   } catch (_) {
-    return GENESIS_NODES.slice(); // hashing unavailable: every genesis, rather than nothing
+    return [];
   }
   const owners = [shard % 5, (shard + 1) % 5, (shard + 2) % 5];
   return owners.map(i => GENESIS_NODES[i]).filter(Boolean);
@@ -129,6 +132,8 @@ export function lightShardOwnerUrls(nodeId) {
 // Solana devnet only, in every build, while QNet is a test network: a constant of the build, never a setting.
 export const SOLANA_CLUSTER = 'devnet';
 export const SOLANA_RPC_ENDPOINTS = ['https://api.devnet.solana.com'];
+// The same calls through the site the wallet already uses, when the endpoint gives this device no answer at all.
+export const SOLANA_RELAY_URL = `${EXPLORER_API}/api/cabinet/solana`;
 // A Solana transaction's page on the cluster's public explorer (a Solana send's History detail), opened in the system
 // browser; fixed by the build like the cluster.
 export const solanaExplorerTxUrl = (signature) => `https://explorer.solana.com/tx/${encodeURIComponent(signature || '')}`

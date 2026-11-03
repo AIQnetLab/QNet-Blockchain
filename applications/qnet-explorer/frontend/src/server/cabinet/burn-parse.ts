@@ -1,4 +1,4 @@
-// An activation burn as Solana holds it (shared contract C3.6), read from a finalized transaction (getTransaction,
+// An activation burn as Solana holds it, read from a finalized transaction (getTransaction,
 // jsonParsed): the site's /tx read of a light burn, the settle and the record of the activation registry, and the
 // search of a wallet's own Solana address all read a burn this one way.
 
@@ -23,7 +23,7 @@ const MEMO_RE = /^QNET_NODE_TYPE:(LIGHT|SUPER)$/;
 
 // A finalized transaction (getTransaction, jsonParsed) as an activation burn: it succeeded; its fee payer, who signed
 // it, burned a whole number of 1DEV, as the burn's authority, in exactly one burn, with exactly one
-// QNET_NODE_TYPE:LIGHT or QNET_NODE_TYPE:SUPER memo (shared contract C3.6). With `expected`, only a burn of that node
+// QNET_NODE_TYPE:LIGHT or QNET_NODE_TYPE:SUPER memo. With `expected`, only a burn of that node
 // type. Null otherwise. The account burned from is not checked: an older extension burned from any 1DEV account of the
 // wallet.
 export function parseBurn(result: unknown, expected: NodeType | null = null): ActivationBurn | null {

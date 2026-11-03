@@ -13,6 +13,7 @@ import { WalletError } from './errors.js';
 import { notifyViews } from './events.js';
 import * as keys from './keys.js';
 import { log } from './log.js';
+import { sleep } from './platform.js';
 import * as qnet from './qnet.js';
 import * as session from './session.js';
 import * as vault from './vault.js';
@@ -40,7 +41,10 @@ import * as vault from './vault.js';
  * @property {string|null} amountNano the balance two pinned nodes agree on
  *
  * @typedef {{status: 'ok', qnet: string, nodeId: string, amountNano: string, txHash: string,
- *   stoppedAtEpoch: string|null} | {status: 'empty', qnet: string, nodeId: string}} ClaimOutcome
+ *   stoppedAtEpoch: string|null, whole: boolean} | {status: 'empty', qnet: string, nodeId: string}} ClaimOutcome  ok: the
+ *   parts of the move as submitted, except a last part the live figure showed taken in part (up to its watermark) or
+ *   expired (nothing), the last counted part's hash and the first epoch it did not take (null: the whole balance moved,
+ *   at least CLAIM_MIN_NANO in all), and whether nothing was left to quote (for the window only)
  *
  * @typedef {object} UnlinkView  what the unlink of the light node's device offers (unlinkView)
  * @property {'confirm'|'unavailable'} mode
@@ -87,6 +91,10 @@ const TX_HASH_RE = /^[0-9a-f]{64}$/;
 const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
 // The claim payload the node accepts back (rewards_api.rs MAX_CLAIMS_DATA).
 const CLAIMS_DATA_MAX = 256 * 1024;
+// A part's watermark is read at a pinned node's live tip this long after its submit, each wait then half as long again,
+// up to PART_READ_MAX_MS.
+const PART_READ_FIRST_MS = 2000;
+const PART_READ_MAX_MS = 10000;
 
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const u64Of = (v) => (typeof v === 'string' && U64_RE.test(v) && BigInt(v) <= 0xffffffffffffffffn ? v : null);
@@ -665,7 +673,8 @@ export async function claimView(nodeId) {
 
 // The quote of step 1, checked as the app checks it (WalletManager.claimRewards): claims strictly ascending above the
 // wallet's watermark, amounts summing to amount_nano (at least CLAIM_MIN_NANO for a full batch, above zero for a part),
-// a timestamp, and a message the wallet builds itself.
+// a timestamp, and a message the wallet builds itself. A quote with valid_until offers the V2 form: its message is built
+// here too (core.claimPayloadPreimageV2) and the node's sign_message_v2, when sent, held to it.
 function checkedQuote(body, wallet) {
   const refuse = () => {
     throw new WalletError('CLAIM_REFUSED');
@@ -699,11 +708,27 @@ function checkedQuote(body, wallet) {
   // the node's own copy of the message is never signed; one that differs from the wallet's is refused
   const message = core.claimPayloadPreimage(wallet, timestamp, claimsData);
   if (body.sign_message !== undefined && body.sign_message !== null && body.sign_message !== message) refuse();
+  const offered = body.valid_until ?? null;
+  const validUntil = offered === null ? null : safeHeightOf(offered);
+  if (offered !== null && validUntil === null) refuse();
+  if (validUntil !== null && body.sign_message_v2 !== undefined && body.sign_message_v2 !== null
+    && body.sign_message_v2 !== claimMessageV2(wallet, claimsData, validUntil)) refuse();
   return {
     claimsData, entries, watermark, firstEpoch: entries[0].epoch, lastEpoch: entries.at(-1).epoch, amountNano,
-    timestamp: Number(timestamp), stoppedAtEpoch: stopped,
+    timestamp: Number(timestamp), stoppedAtEpoch: stopped, stoppedReason: stopped !== null && typeof body.stopped_reason === 'string'
+      ? body.stopped_reason : null, validUntil,
   };
 }
+
+// A last height a node names (a decimal string as the lossless reader keeps it), as a safe positive integer, or null.
+function safeHeightOf(value) {
+  const height = u64Of(value);
+  return height === null || height === '0' || BigInt(height) > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(height);
+}
+
+// The V2 claim message this wallet signs over `claimsData` with last height `validUntil` (the shared builder, under this
+// build's network id): what a quote's sign_message_v2 is held to.
+const claimMessageV2 = (wallet, claimsData, validUntil) => core.claimPayloadPreimageV2(wallet, claimsData, core.expiryAt(validUntil));
 
 // A refusal of either step as the site learns it.
 function claimRefusal(body) {
@@ -725,29 +750,61 @@ async function claimRequest(nodes, body) {
   return { body: reply.status === 200 ? parse(reply.text) : null, node: reply.node };
 }
 
-// A step-1 answer of a node that cannot serve an epoch (its root or shard is not there: rewards_api.rs), which says to
-// retry on another node: no quote, `stopped_reason` set.
-const cannotServe = (body) => isObject(body) && body.needs_signature !== true && typeof body.stopped_reason === 'string';
+// A step-1 answer that leaves the quote to another node: one that cannot serve an epoch (`stopped_reason` set:
+// rewards_api.rs), one that spent this address's claim budget at that node (its limit per address, which quotes count
+// in), and one busy with another request for the node. No quote either way.
+const handsOver = (body) => isObject(body) && body.needs_signature !== true && (typeof body.stopped_reason === 'string'
+  || body.code === 'rate_limited' || body.code === 'claim_busy' || /rate limit exceeded|already in progress/i.test(String(body.error ?? '')));
 
-// Step 1 from the first node of `among` (default: every pinned node, in random order) that can quote: a node that cannot
-// serve an epoch hands over to the next one, as its answer asks. When none can, the last such answer (a refusal);
-// NETWORK only when no node answered at all.
-async function quoteRequest(body, among = pickNodes(QNET.NODES.length)) {
+// Whether a step-1 answer comes from a node that has not applied this wallet's claim ending at epoch `after` yet (the last
+// part of the move, in a block already): its watermark below that epoch, or a stop at an epoch that claim settled. Such a
+// node would quote epochs the wallet moved already; a null `after` judges nothing (the app's _behindClaim).
+function behindClaim(body, after) {
+  if (after === null || !isObject(body)) return false;
+  if (body.needs_signature === true) {
+    const watermark = u64Of(body.last_claimed_epoch);
+    return watermark !== null && BigInt(watermark) < BigInt(after);
+  }
+  const stopped = u64Of(body.stopped_at_epoch);
+  return typeof body.stopped_reason === 'string' && stopped !== null && BigInt(stopped) <= BigInt(after);
+}
+
+// Step 1 from the first node of `among` that can quote: one that hands over (handsOver) leaves it to the next, and so
+// does one behind the move's last part (`after`, behindClaim). When none can, the last answer that handed over (a
+// refusal), else {behind: true} when every node that answered is behind; NETWORK only when no node answered at all.
+async function quoteRequest(body, among, after = null) {
   let nodes = [...among];
   let unservable = null;
+  let behind = false;
   while (nodes.length > 0) {
     let answer;
     try {
       answer = await claimRequest(nodes, body);
     } catch (error) {
       if (unservable !== null) return unservable;
+      if (behind) return { behind: true };
       throw error;
     }
-    if (!cannotServe(answer.body)) return answer;
-    unservable = answer;
+    const lagging = behindClaim(answer.body, after);
+    if (!lagging && !handsOver(answer.body)) return answer;
+    if (lagging) behind = true;
+    else unservable = answer;
     nodes = nodes.filter((node) => node !== answer.node);
   }
-  return unservable;
+  return unservable ?? (behind ? { behind: true } : null);
+}
+
+// The pinned nodes a next part is quoted at (`after`: the last epoch of the part before): those whose pending read shows
+// that part applied (a head past it, or nothing left) first, then those that answered with no head; never one whose head
+// is at or below it, nor one that did not answer. Every quote spends the address's claim budget at the node it goes to.
+async function appliedFirst(nodeId, after) {
+  const reads = await Promise.all(pickNodes(QNET.NODES.length).map(async (node) => {
+    const read = await readPending(nodeId, node);
+    return { node, read, head: read === null ? null : u64Of(read.head ?? null) };
+  }));
+  const applied = ({ read, head }) => (head !== null ? BigInt(head) > BigInt(after) : read !== null && read.amount === '0');
+  const unknown = ({ read, head }) => read !== null && head === null && read.amount !== '0';
+  return [...reads.filter(applied), ...reads.filter(unknown)].map(({ node }) => node);
 }
 
 // What pinned nodes other than the quoting one report of the node balance (GET /api/v1/rewards/pending), asking two
@@ -755,8 +812,9 @@ async function quoteRequest(body, among = pickNodes(QNET.NODES.length)) {
 // quote that dropped the head would burn those epochs behind the monotonic watermark), and for a full batch (no
 // `stopped_at_epoch`) the pending total two of them report alike must not exceed the quote. The pending figure counts the
 // epochs the claim path serves and can only under-report it, so a full quote below it skipped an epoch the wallet holds a
-// leaf in. None answering (or, for a full batch, no two agreeing) is no check: NETWORK.
-async function crossChecked(nodeId, others, checked) {
+// leaf in. None answering (or, for a full batch, no two agreeing) is no check: NETWORK. A node whose head is at or below
+// `after` (the last epoch of the move's part before this one) has not applied that part: its word counts for nothing.
+async function crossChecked(nodeId, others, checked, after = null) {
   const full = checked.stoppedAtEpoch === null;
   const queue = [...others];
   const amounts = [];
@@ -769,6 +827,7 @@ async function crossChecked(nodeId, others, checked) {
     for (const read of await Promise.all(wave.map((other) => readPending(nodeId, other)))) {
       if (read === null) continue;
       const head = u64Of(read.head);
+      if (after !== null && head !== null && BigInt(head) <= BigInt(after)) continue;
       if (head !== null) {
         if (head !== checked.firstEpoch) throw new WalletError('CLAIM_REFUSED');
         heads += 1;
@@ -789,9 +848,10 @@ async function crossChecked(nodeId, others, checked) {
 // held to another pinned node's quote of the same request (the claim_rewards signature carries no time); honest nodes
 // list the same epochs and amounts from the same watermark and differ only in where they stop. The quote ending lower is
 // signed, and only if the other lists exactly its entries up to its last epoch: the other covers every epoch below its
-// own, higher stop. Returns that quote.
-async function corroborated(request, checked, wallet) {
-  const answer = await quoteRequest(request, pickNodes(QNET.NODES.length).filter((other) => other !== checked.node));
+// own, higher stop. Returns that quote, or {behind: true} when every other node of `among` is behind `after` (quoteRequest).
+async function corroborated(request, checked, wallet, among, after = null) {
+  const answer = await quoteRequest(request, among.filter((other) => other !== checked.node), after);
+  if (answer?.behind) return answer;
   const body = answer?.body ?? null;
   if (!isObject(body) || body.needs_signature !== true) throw new WalletError(claimRefusal(body));
   const second = { ...checkedQuote(body, wallet), node: answer.node };
@@ -804,47 +864,169 @@ async function corroborated(request, checked, wallet) {
   return short;
 }
 
-/**
- * The action of qnet_claimNodeBalance (provider.js, after its approval), as the app moves the node balance: the quote
- * of the first pinned node that can serve it for the node the site names, this wallet's light or super node (ML-DSA-65
- * over claim_rewards for that node), checked; the batch held to a second node's quote (corroborated); the
- * first epoch of the quote to sign (and, for a full batch, its total) compared with what other pinned nodes report
- * (crossChecked); then the payload signed over the message the wallet builds and sent back to the node that quoted it.
- * The site learns the result; the network credits it once a block includes it.
- * @param {string} nodeId
- * @returns {Promise<ClaimOutcome>}
- * @throws {WalletError} LOCKED, WALLET_MISMATCH, SIGNING_DISABLED, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY
- */
-export async function claimForSite(nodeId) {
-  const wallet = (await session.requireUnlocked()).qnetAddress;
-  if (ownNodeType(nodeId, wallet) === null) throw new WalletError('WALLET_MISMATCH');
-  const quote = await keys.signNodeClaim({ nodeId, wallet });
-  const signature = core.bytesToHex(quote.signature);
-  const publicKey = core.bytesToHex(quote.publicKey);
-  const request = { node_id: nodeId, wallet_address: wallet, dilithium_signature: signature, dilithium_public_key: publicKey };
-  const { body: first, node } = await quoteRequest(request);
+// One part of a move from `after` (the last epoch of the part before, null for the first), checked as the app checks
+// one: {empty: true} when nothing is left, {behind: true} while fewer than two nodes applied the part before (a quote
+// and the one it is held to), else the part the network took, with its entries and the last height it signed.
+async function claimPart(request, wallet, nodeId, after) {
+  const among = after === null ? pickNodes(QNET.NODES.length) : await appliedFirst(nodeId, after);
+  if (among.length < 2) return { behind: true };
+  const quoted = await quoteRequest(request, among, after);
+  if (quoted?.behind) return quoted;
+  const { body: first, node } = quoted;
   if (!isObject(first) || first.needs_signature !== true) {
-    if (isObject(first) && /no claimable rewards/i.test(String(first.error ?? ''))) return { status: 'empty', qnet: wallet, nodeId };
+    if (isObject(first) && /no claimable rewards/i.test(String(first.error ?? ''))) return { empty: true };
     throw new WalletError(claimRefusal(first));
   }
   let checked = { ...checkedQuote(first, wallet), node };
-  checked = await corroborated(request, checked, wallet);
-  await crossChecked(nodeId, pickNodes(QNET.NODES.length).filter((other) => other !== checked.node), checked);
-  const payload = await keys.signClaimPayload({ wallet, timestamp: checked.timestamp, claimsData: checked.claimsData });
-  const { body: second } = await claimRequest([checked.node], {
-    node_id: nodeId,
-    wallet_address: wallet,
-    dilithium_signature: signature,
-    dilithium_public_key: publicKey,
-    claims_data: checked.claimsData,
-    claims_signature: core.bytesToHex(payload.signature),
-    claim_timestamp: checked.timestamp,
-  });
-  if (!isObject(second) || second.success !== true || typeof second.tx_hash !== 'string' || !TX_HASH_RE.test(second.tx_hash)) {
-    throw new WalletError(claimRefusal(second));
+  checked = await corroborated(request, checked, wallet, among, after);
+  if (checked.behind) return checked;
+  await crossChecked(nodeId, pickNodes(QNET.NODES.length).filter((other) => other !== checked.node), checked, after);
+  // V1 carries the quoted timestamp its message signs; V2 signs no timestamp and names its last height instead.
+  const submitIn = async (validUntil) => {
+    const payload = await keys.signClaimPayload({ wallet, timestamp: checked.timestamp, claimsData: checked.claimsData, validUntil });
+    return (await claimRequest([checked.node], {
+      ...request,
+      claims_data: checked.claimsData,
+      claims_signature: core.bytesToHex(payload.signature),
+      ...(validUntil === null ? { claim_timestamp: checked.timestamp } : { valid_until: validUntil }),
+    })).body;
+  };
+  const taken = (body) => isObject(body) && body.success === true && typeof body.tx_hash === 'string' && TX_HASH_RE.test(body.tx_hash);
+  let signedUntil = checked.validUntil;
+  let second = await submitIn(signedUntil);
+  // A typed refusal of the form or the last height: one re-sign, never more (as a send's, qnet.resignUntil).
+  const again = taken(second) || !isObject(second) ? null : await qnet.resignUntil(wallet, core.expiryRefusalOf(second));
+  if (again !== null) {
+    signedUntil = again.validUntil === null ? null : Number(again.validUntil);
+    second = await submitIn(signedUntil);
   }
+  if (!taken(second)) throw new WalletError(claimRefusal(second));
   return {
-    status: 'ok', qnet: wallet, nodeId, amountNano: checked.amountNano, txHash: second.tx_hash, stoppedAtEpoch: checked.stoppedAtEpoch,
+    amountNano: checked.amountNano, txHash: second.tx_hash, watermark: checked.watermark, lastEpoch: checked.lastEpoch,
+    entries: checked.entries, stoppedAtEpoch: checked.stoppedAtEpoch, stoppedReason: checked.stoppedReason, validUntil: signedUntil,
+  };
+}
+
+// What the wallet's live figure (qnet.liveAccountFigure) shows of a part the network took, read PART_READ_FIRST_MS after
+// its submit and then each wait half as long again: {result: 'done'|'partial'|'expired', watermark}, {result: 'locked'},
+// or {result: null} once `until` passed. No clock decides the part: at `until` only the next one is not sent.
+async function partSettled(wallet, part, until) {
+  let wait = PART_READ_FIRST_MS;
+  for (;;) {
+    const left = until - Date.now();
+    if (left <= 0) return { result: null };
+    await sleep(Math.min(wait, left));
+    wait = Math.min(wait * 1.5, PART_READ_MAX_MS);
+    if (!(await session.isUnlocked())) return { result: 'locked' };
+    if (Date.now() >= until) return { result: null };
+    const figure = await qnet.liveAccountFigure(wallet).catch(() => null);
+    const watermark = u64Of(figure?.lastClaimedEpoch);
+    if (watermark === null) continue;
+    if (BigInt(watermark) >= BigInt(part.lastEpoch)) return { result: 'done', watermark };
+    if (BigInt(watermark) > BigInt(part.watermark)) return { result: 'partial', watermark };
+    if (Number.isSafeInteger(figure.blockHeight) && core.expiredAt(part.validUntil, figure.blockHeight + 1)) {
+      return { result: 'expired', watermark };
+    }
+  }
+}
+
+// The part as the live figure showed it (`seen`, partSettled): taken in part, its entries at or below the watermark,
+// and the rest from the next one; expired, nothing (null); otherwise, or while its fate is unknown, the part submitted.
+function partAsSeen(part, seen) {
+  if (seen?.result === 'expired') return null;
+  if (seen?.result !== 'partial') return part;
+  const taken = part.entries.filter((entry) => BigInt(entry.epoch) <= BigInt(seen.watermark));
+  const rest = part.entries.find((entry) => BigInt(entry.epoch) > BigInt(seen.watermark));
+  return { ...part, amountNano: taken.reduce((sum, entry) => sum + BigInt(entry.amount), 0n).toString(), stoppedAtEpoch: rest.epoch };
+}
+
+// The wallets whose move runs in this worker: one run at a time each, as the app's, since two would quote the same epochs.
+const moving = new Set();
+
+/**
+ * The action of qnet_claimNodeBalance (provider.js, after its approval): the balance of the node the site names, this
+ * wallet's light or super node, moved in parts under one quote signature as the app's Node tab moves it (moveInParts),
+ * one run per wallet at a time. The network credits each part once a block includes it.
+ * @param {string} nodeId
+ * @param {{shownNano?: string|null, until?: number|null}} [options] shownNano: the balance the approval showed; until:
+ *   ms epoch, the last moment a next part starts (none: one part)
+ * @returns {Promise<ClaimOutcome>}
+ * @throws {WalletError} LOCKED, WALLET_MISMATCH, SIGNING_DISABLED, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY
+ */
+export async function claimForSite(nodeId, { shownNano = null, until = null } = {}) {
+  const wallet = (await session.requireUnlocked()).qnetAddress;
+  if (ownNodeType(nodeId, wallet) === null) throw new WalletError('WALLET_MISMATCH');
+  if (moving.has(wallet)) throw new WalletError('CLAIM_BUSY');
+  moving.add(wallet);
+  try {
+    const quote = await keys.signNodeClaim({ nodeId, wallet });
+    const request = {
+      node_id: nodeId, wallet_address: wallet, dilithium_signature: core.bytesToHex(quote.signature),
+      dilithium_public_key: core.bytesToHex(quote.publicKey),
+    };
+    return await moveInParts(request, wallet, nodeId, u64Of(shownNano), until);
+  } finally {
+    moving.delete(wallet);
+  }
+}
+
+// The parts of one move by the app's rules (utils/claimRun.js: core.SIZE_STOPS, BEHIND_TRIES, BEHIND_WAIT_MS): after a
+// part stopped at a bound of one request, the next once the live figure shows it through, while the parts took less
+// than `shown` and before `until`. The answer counts the last part as the live figure showed it (partAsSeen).
+async function moveInParts(request, wallet, nodeId, shown, until) {
+  const parts = [];
+  let whole = false;
+  let behind = 0;
+  let seen = null;
+  // why a next part failed, logged once the run ended
+  let short = null;
+  for (;;) {
+    const last = parts.at(-1) ?? null;
+    let part;
+    try {
+      part = await claimPart(request, wallet, nodeId, last === null ? null : last.lastEpoch);
+    } catch (error) {
+      if (last === null) throw error;
+      short = error?.code ?? error?.name;
+      break;
+    }
+    if (part.behind) {
+      behind += 1;
+      if (behind > core.BEHIND_TRIES) {
+        short = 'behind';
+        break;
+      }
+      await sleep(Math.min(core.BEHIND_WAIT_MS, until - Date.now()));
+      if (Date.now() >= until || !(await session.isUnlocked())) break;
+      continue;
+    }
+    if (part.empty) {
+      if (last === null) return { status: 'empty', qnet: wallet, nodeId };
+      whole = true;
+      break;
+    }
+    parts.push(part);
+    behind = 0;
+    if (part.stoppedAtEpoch === null) {
+      whole = true;
+      break;
+    }
+    const total = parts.reduce((sum, p) => sum + BigInt(p.amountNano), 0n);
+    if (!core.SIZE_STOPS.includes(part.stoppedReason) || until === null || (shown !== null && total >= BigInt(shown))) break;
+    seen = await partSettled(wallet, part, until);
+    if (seen.result !== 'done' || Date.now() >= until) break;
+    seen = null;
+  }
+  if (short !== null) log.warn('node balance move ended short', short);
+  const taken = [...parts.slice(0, -1), partAsSeen(parts.at(-1), seen)]
+    .filter((part) => part !== null && BigInt(part.amountNano) > 0n);
+  // an expired first part moved nothing: no block can take it any more
+  if (taken.length === 0) throw new WalletError('CLAIM_REFUSED');
+  const total = taken.reduce((sum, p) => sum + BigInt(p.amountNano), 0n);
+  const last = taken.at(-1);
+  return {
+    status: 'ok', qnet: wallet, nodeId, amountNano: total.toString(), txHash: last.txHash,
+    stoppedAtEpoch: whole && total >= BigInt(CLAIM_MIN_NANO) ? null : last.stoppedAtEpoch, whole,
   };
 }
 

@@ -1,100 +1,90 @@
 // The browser extension's page: what it does, where it installs from and the steps after. The provider sends a browser
 // without a usable extension here (src/lib/qnet-provider.ts). A server component: nothing on it changes in the browser.
 
-import Link from 'next/link';
+import { Link } from '@/i18n/client';
+import { getI18n } from '@/i18n/server';
 import Action from '@/components/ui/Action';
 import PageHead from '@/components/ui/PageHead';
 import Section from '@/components/ui/Section';
 import { EXTENSION_STORE_URL } from '@/lib/qnet-provider';
+import type { MessageKey } from '@/lib/texts';
 
 // The manifest's minimum_chrome_version (applications/qnet-wallet/dist/manifest.json).
 const MIN_BROWSER_VERSION = 111;
 
-const STEPS: [string, string][] = [
-  ['Open the listing', 'Install from the Chrome Web Store above opens the QNet Wallet listing in a new tab.'],
-  ['Add it to the browser', 'Add the extension from the listing and confirm in the browser’s window.'],
-  ['Pin it to the toolbar', 'Pin QNet Wallet so its window is one click away.'],
-  ['Create or import a wallet', 'Create a new wallet, or import one with its recovery phrase.'],
+// Each installation step's title and what to do.
+const STEPS: [MessageKey, MessageKey][] = [
+  ['xp_step1_t', 'xp_step1'],
+  ['xp_step2_t', 'xp_step2'],
+  ['xp_step3_t', 'xp_step3'],
+  ['xp_step4_t', 'xp_step4'],
 ];
 
-export default function QNetWalletExtensionPage() {
+export default async function QNetWalletExtensionPage() {
+  const { t, say, rich } = await getI18n();
   return (
     <div className="pg">
-      <PageHead
-        title="QNet Wallet extension"
-        lead="The browser wallet for QNet Blockchain: hold and send QNC, SOL and 1DEV, with keys that never leave your browser."
-      >
+      <PageHead title={say('xp_title')} lead={say('xp_lead')}>
         <div className="pg-act desk-only" data-field-clear>
-          <Action kind="solid" href={EXTENSION_STORE_URL} external>Install from the Chrome Web Store</Action>
-          <p className="note">For browsers that install extensions from the Chrome Web Store, version {MIN_BROWSER_VERSION} or later.</p>
+          <Action kind="solid" href={EXTENSION_STORE_URL} external>{t('get_install_extension')}</Action>
+          <p className="note">{t('xp_browsers', { version: MIN_BROWSER_VERSION })}</p>
         </div>
         <p className="body phone-only" data-field-dim="0.1">
-          The extension runs in a computer&apos;s browser. On a phone or tablet, <Link href="/wallet#get">install the QNet Wallet app</Link>.
+          {rich('xp_phone', { app: <Link href="/wallet#get">{say('xp_phone_link')}</Link> })}
         </p>
       </PageHead>
 
-      <Section id="what" title="What it does" variant="tool" className="topics">
+      <Section id="what" title={t('xp_what_title')} variant="tool" className="topics">
         <div className="spec">
-          <h3 className="h3">Secure storage</h3>
+          <h3 className="h3">{t('xp_storage_title')}</h3>
           <div className="body">
-            <p>Your private keys are encrypted and stored locally. Only you have access to your funds.</p>
+            <p>{t('xp_storage_p')}</p>
           </div>
         </div>
         <div className="spec">
-          <h3 className="h3">Verified balances</h3>
+          <h3 className="h3">{t('xp_verified_title')}</h3>
           <div className="body">
-            <p>
-              A balance counts as verified only when the node&apos;s account proof folds to a state root that the validator
-              committee of QNet Blockchain signed, which the extension checks itself.
-            </p>
+            <p>{say('xp_verified_p')}</p>
           </div>
         </div>
         <div className="spec">
-          <h3 className="h3">Site connection</h3>
+          <h3 className="h3">{t('xp_sites_title')}</h3>
           <div className="body">
-            <p>
-              Sites can ask the extension to connect and to sign; every request is shown to you first, with the requesting
-              site, and the key stays where it is. Approved sites can be removed in the settings.
-            </p>
+            <p>{t('xp_sites_p')}</p>
           </div>
         </div>
         <div className="spec">
-          <h3 className="h3">Node activation</h3>
+          <h3 className="h3">{t('xp_activation_title')}</h3>
           <div className="body">
-            <p>
-              Its Activate tab, or <Link href="/node">aiqnet.io/node</Link>, burns 1DEV on Solana and issues the activation code of the wallet&apos;s
-              one node: a light node, which it also records on QNet Blockchain, or a super node, which only the extension
-              activates and which runs on your own server. It recovers the code of an earlier burn, and its &quot;Record on QNet
-              Blockchain&quot; button records an earlier burn&apos;s light node.
-            </p>
+            <p>{rich('xp_activation_p', { node: <Link href="/node" translate="no">aiqnet.io/node</Link> })}</p>
           </div>
         </div>
       </Section>
 
-      <Section id="install" title="Installation" variant="tool">
+      <Section id="install" title={t('xp_install_title')} variant="tool">
         {/* The site's numbered steps (styles/cabinet.css, the activation's too): the order is the information. */}
         <ol className="cab-steps">
           {STEPS.map(([title, text], i) => (
             <li key={title} className="cab-step">
               <span className="cab-step-n" aria-hidden="true">{i + 1}</span>
               <div className="cab-step-body">
-                <h3 className="cab-step-t">{title}</h3>
-                <p>{text}</p>
+                <h3 className="cab-step-t">{say(title)}</h3>
+                <p>{say(text)}</p>
               </div>
             </li>
           ))}
         </ol>
       </Section>
 
-      <Section id="requirements" title="System requirements" variant="tool">
+      <Section id="requirements" title={t('xp_req_title')} variant="tool">
         <dl className="kv">
           <div>
-            <dt>Browser</dt>
-            <dd>One that installs extensions from the Chrome Web Store, version {MIN_BROWSER_VERSION} or later</dd>
+            <dt>{t('xp_req_browser')}</dt>
+            <dd>{t('xp_req_browser_v', { version: MIN_BROWSER_VERSION })}</dd>
           </div>
           <div>
-            <dt>Device</dt>
-            <dd>A computer; phones and tablets use the QNet Wallet app</dd>
+            <dt>{t('xp_req_device')}</dt>
+            <dd>{say('xp_req_device_v')}</dd>
           </div>
         </dl>
       </Section>

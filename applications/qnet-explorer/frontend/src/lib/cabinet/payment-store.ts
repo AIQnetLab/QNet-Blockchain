@@ -26,7 +26,7 @@ export interface PaymentArea {
 // Whether this browser offers the storage at all (a private window may not).
 export const storageAvailable = (): boolean => typeof indexedDB !== 'undefined';
 
-// Asks the browser to keep this site's storage when it is short of room (SITE-R1-06): after a burn the payment key in
+// Asks the browser to keep this site's storage when it is short of room: after a burn the payment key in
 // it is the only authority that can register that burn. Some browsers ask the user first, so callers never wait for
 // the answer; nothing depends on it, and a browser may still delete the data of a site not visited for a week.
 export async function requestPersistence(storage: { persist?: () => Promise<boolean> } | undefined = globalThis.navigator?.storage): Promise<boolean> {

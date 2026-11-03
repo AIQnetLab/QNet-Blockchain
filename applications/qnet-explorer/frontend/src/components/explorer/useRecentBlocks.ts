@@ -1,6 +1,6 @@
 'use client';
 
-// The newest blocks for the explorer's Latest blocks strip (B-SPEC 6.2) and the home page's live column: the server's
+// The newest blocks for the explorer's Latest blocks strip and the home page's live column: the server's
 // list at first paint (the head snapshot's newest blocks), then each new head from the head stream at the top with its
 // producer and transaction count, the oldest row out (src/lib/explorer-view.ts nextBlocks), so the list keeps its
 // length. Rows the stream left incomplete (a height it skipped, a head whose event did not name its block) and a list
@@ -11,6 +11,7 @@ import { useHold, useLanded, type Hold } from '@/components/ui/useHold';
 import { useChainHead } from '@/hooks/useChainHead';
 import { useIntersectionObserver } from '@/hooks/useIntersectionObserver';
 import { blocksMissing, fillBlocks, headBlock, nextBlocks, type RecentBlock } from '@/lib/explorer-view';
+import { siteRequest } from '@/lib/site-request';
 import { slideCount, slideIn } from '@/lib/slide';
 
 // At most one read every 2 s while something is missing; after a read that filled nothing (the index behind the
@@ -38,7 +39,7 @@ export function useRecentBlocks(seed: readonly RecentBlock[], limit: number): Re
     let filled = false;
     void (async () => {
       try {
-        const res = await fetch(`/api/blocks?latest=${limit}`, { cache: 'no-store' });
+        const res = await fetch(`/api/blocks?latest=${limit}`, siteRequest());
         const body = await res.json();
         if (body?.success && Array.isArray(body.data)) {
           const read = body.data as RecentBlock[];

@@ -1,5 +1,5 @@
-// The registration the node cabinet submits (src/lib/cabinet/registration.ts, src/server/cabinet/register.ts; shared
-// contract C4): the v2 owner bind and the consent strings against the shared vectors
+// The registration the node cabinet submits (src/lib/cabinet/registration.ts, src/server/cabinet/register.ts):
+// the v2 owner bind and the consent strings against the shared vectors
 // (docs/protocols/light-node.vectors.json), the consent body the page posts, the site's checks before it forwards one,
 // the body completed from the wallet's record with the payment key's bind (any browser, no payment key), the one submit
 // per node, and the node's answers mapped to what the page does next. Run: npm run test:wallet
@@ -9,14 +9,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { ed25519 } from '@noble/curves/ed25519';
 import {
-  CONSENT_KEYS, SUBMIT_KEYS, buildConsentBody, checkConsentBody, completeSubmitBody, ownerBindMessageV2, parseSubmitOutcome, submitOutcome,
-  verifyOwnerBindV2,
+  ADMIT_HOLD_MS, CONSENT_KEYS, SUBMIT_KEYS, buildConsentBody, checkConsentBody, completeSubmitBody, ownerBindMessageV2, parseSubmitOutcome,
+  submitOutcome, verifyOwnerBindV2,
 } from '../cabinet/registration.ts';
 import { verifyConsent } from '../cabinet/consent-verify.ts';
 import { consentMessage, consentProof, encodeB64url, lightNodeId } from '../qnet-link.ts';
-import { createRegister, fromRecord } from '../../server/cabinet/register.ts';
+import { createRegister, fromRecord, registrationIdentity } from '../../server/cabinet/register.ts';
 import { CABINET_LIMITS, KEYED_LIMITS } from '../../server/cabinet/limits.ts';
 import { UPSTREAM_BUDGETS, createUpstreamBudget } from '../../server/cabinet/upstream.ts';
+import { repo } from './source.mjs';
 
 const V = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
 const hex = (b) => Buffer.from(b).toString('hex');
@@ -217,15 +218,22 @@ test('/register: checks, then one genesis node gets the body completed from the 
   assert.equal(calls.length, 1, 'a refused body reaches no node');
   assert.equal((await r.submit(post(body, { origin: 'https://evil.example' }))).status, 403);
 
-  // While one submit for the node waits, another is a retry, not a second submit.
+  // While one submit for the node waits, the same signed registration gets its answer and reaches no node; another
+  // consent for the node is a retry, not a second submit. A retry is not remembered: the next submit goes again.
   let release;
-  const held = route(() => new Promise((resolve) => { release = resolve; }));
+  const answers = [new Promise((resolve) => { release = resolve; }), { success: true, tx_hash: tx }];
+  const held = route(() => answers.shift(), { verifyConsent: () => true });
   const first = held.r.submit(post(body));
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.deepEqual(await json(await held.r.submit(post(body))), { result: 'retry', code: 'in_flight' });
+  const same = held.r.submit(post(body));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(await json(await held.r.submit(post({ ...body, timestamp: body.timestamp + 1 }))), { result: 'retry', code: 'in_flight' });
   release({ success: false, error: 'burn-attestation quorum not yet reached; retry shortly' });
   assert.deepEqual(await json(await first), { result: 'retry', code: 'quorum_pending' });
+  assert.deepEqual(await json(await same), { result: 'retry', code: 'quorum_pending' });
   assert.equal(held.calls.length, 1);
+  assert.deepEqual(await json(await held.r.submit(post(body))), { result: 'admitted', txHash: tx });
+  assert.equal(held.calls.length, 2);
 
   const down = route(new TypeError('fetch failed'));
   assert.deepEqual(await json(await down.r.submit(post(body))), { result: 'retry', code: 'network' });
@@ -239,19 +247,57 @@ test('/register: checks, then one genesis node gets the body completed from the 
   for (let i = 0; i < 6; i += 1) assert.equal((await limited.submit(post(body, { 'x-test-ip': `198.51.100.${i}` }))).status, 200);
   assert.equal((await limited.submit(post(body, { 'x-test-ip': '198.51.100.77' }))).status, 429);
 
-  // SITE-2: bodies naming the node whose signatures do not verify spend nothing of that node's budget, from however
+  // Bodies naming the node whose signatures do not verify spend nothing of that node's budget, from however
   // many clients: the real registration still gets its six submits.
   const { r: victim, calls: victimCalls } = route({ success: false, error: 'Node already registered' });
   const junk = { ...body, dilithium_signature: `${body.dilithium_signature.slice(0, -2)}${body.dilithium_signature.endsWith('00') ? '01' : '00'}` };
   for (let i = 0; i < 12; i += 1) assert.equal((await victim.submit(post(junk, { 'x-test-ip': `192.0.2.${i}` }))).status, 400);
   assert.equal(victimCalls.length, 0);
   for (let i = 0; i < 6; i += 1) assert.equal((await victim.submit(post(body, { 'x-test-ip': `198.51.100.${i}` }))).status, 200, `submit ${i}`);
-  // SITE-8: one carrier NAT address carries several activations' submits; each node keeps its own budget.
+  // One carrier NAT address carries several activations' submits; each node keeps its own budget.
   assert.deepEqual(CABINET_LIMITS.register, { max: 30, windowMs: 600_000 });
   assert.deepEqual(KEYED_LIMITS.register, { max: 6, windowMs: 600_000 });
 });
 
-// A2 (owner, 29.09): the registration of a payment address's burn is finished from any browser or device with a fresh
+// QNet Wallet sends the registration as soon as the user consents, and the activation page sends the same signed body
+// when it reads the answer: one registration, one node submit, both answered with the node's admission.
+test('/register: the same signed registration from QNet Wallet and the page is one submit, both answered with its admission', async () => {
+  let t = 1_790_000_000_000;
+  const now = () => t;
+  const c = okCases[0];
+  const body = bodyOf(c);
+  const tx = 'cd'.repeat(32);
+  let release;
+  const answers = [new Promise((resolve) => { release = resolve; }), { success: false, error: 'Node already registered' }];
+  const { r, calls } = route(() => answers.shift(), { now });
+  // The same fields in another key order are the same registration.
+  const reordered = Object.fromEntries(Object.entries(body).reverse());
+  assert.equal(registrationIdentity(reordered, false), registrationIdentity(body, false));
+  assert.notEqual(registrationIdentity({ ...body, timestamp: body.timestamp + 1 }, false), registrationIdentity(body, false));
+  const app = r.submit(post(body, { 'x-test-ip': '198.51.100.1' }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const page = r.submit(post(reordered, { 'x-test-ip': '203.0.113.2' }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release({ success: true, tx_hash: tx });
+  assert.deepEqual(await json(await app), { result: 'admitted', txHash: tx });
+  assert.deepEqual(await json(await page), { result: 'admitted', txHash: tx });
+  assert.equal(calls.length, 1);
+  // Sent again while neither client would submit it again (QNet Wallet waits as long as the page): the same admission,
+  // no node, none of the node's budget.
+  const readmit = repo('applications/qnet-mobile/src/services/RegistrationSubmit.js');
+  assert.equal(Number(/^export const READMIT_MS = (\d+);/m.exec(readmit)?.[1]), ADMIT_HOLD_MS, 'QNet Wallet\'s READMIT_MS');
+  t += ADMIT_HOLD_MS - 1;
+  for (let i = 0; i < 8; i += 1) {
+    assert.deepEqual(await json(await r.submit(post(body, { 'x-test-ip': `192.0.2.${i}` }))), { result: 'admitted', txHash: tx }, `again ${i}`);
+  }
+  assert.equal(calls.length, 1);
+  // Past the hold a node is asked again (a pool entry may have gone stale), and its answer maps as ever.
+  t += 1;
+  assert.deepEqual(await json(await r.submit(post(body))), { result: 'registered' });
+  assert.equal(calls.length, 2);
+});
+
+// The registration of a payment address's burn is finished from any browser or device with a fresh
 // consent; the site takes the burner and the owner bind from the wallet's record, never from the page. Anything else
 // than the wallet's own final payment burn of this very burn and amount, whose reservation this wallet key signed, is
 // refused, and no node hears of it.
@@ -285,20 +331,23 @@ test('/register: completed from the wallet\'s record in any browser; not final, 
   assert.deepEqual(fromRecord(body, rowOf(c)), { ...body, burn_wallet: V.burner.address, owner_signature: bindOf(c) });
 });
 
-// SITE-R2-09: the site sends each genesis node at most UPSTREAM_BUDGETS.submit registrations a second; past it the next
+// The site sends each genesis node at most UPSTREAM_BUDGETS.submit registrations a second; past it the next
 // node takes the submit, and with none left the page submits again later.
 test('/register: each genesis node takes a bounded number of submits a second, then the next one, then none', async () => {
   let t = 1_790_000_000_000;
   const now = () => t;
   const c = okCases[0];
   const body = bodyOf(c);
-  const { r, calls } = route({ success: true, tx_hash: 'cd'.repeat(32) }, { now, budget: createUpstreamBudget({ now }) });
+  // Retries, which the site does not remember, so each submit goes on to a node.
+  let answer = { success: false, error: 'burn-attestation quorum not yet reached; retry shortly' };
+  const { r, calls } = route(() => answer, { now, budget: createUpstreamBudget({ now }) });
   const outcomes = [];
   for (let i = 0; i < 5; i += 1) outcomes.push(await json(await r.submit(post(body, { 'x-test-ip': `198.51.100.${i + 10}` }))));
   assert.deepEqual(calls.map((x) => new URL(x.url).host), ['node2.aiqnet.io', 'node2.aiqnet.io', 'node1.aiqnet.io', 'node1.aiqnet.io']);
   assert.deepEqual(outcomes.at(-1), { result: 'retry', code: 'busy' });
   assert.deepEqual(parseSubmitOutcome(outcomes.at(-1)), { result: 'retry', code: 'busy' });
   t += UPSTREAM_BUDGETS.submit.windowMs;
+  answer = { success: true, tx_hash: 'cd'.repeat(32) };
   assert.equal((await json(await r.submit(post(body, { 'x-test-ip': '198.51.100.30' })))).result, 'admitted');
   assert.equal(calls.length, 5);
 });

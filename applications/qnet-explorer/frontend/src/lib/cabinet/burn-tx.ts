@@ -1,4 +1,4 @@
-// The node cabinet's two Solana transaction shapes (unified plan SITE-3; plan-site section 4.1), built here from
+// The node cabinet's two Solana transaction shapes, built here from
 // the payment address and a few numbers, and read back by the site before it forwards one
 // (src/server/cabinet/solana-proxy.ts). Nothing else is ever signed with a payment key or sent through the site.
 //
@@ -13,8 +13,10 @@ import {
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   associatedTokenAddress,
+  bytesEqual,
   createAssociatedTokenAccountIdempotent,
   decodeKey,
+  keysAre,
   memo,
   readU32,
   readU64,
@@ -29,9 +31,11 @@ import {
   type ParsedTransaction,
 } from '../solana-message.ts';
 import { ONE_DEV_MINT, ONE_DEV_UNIT } from '../one-dev.ts';
-import { BURN_AMOUNT_MAX } from '../qnet-link.ts';
+import { BURN_AMOUNT_MAX, type NodeType } from '../qnet-link.ts';
 
-export const LIGHT_MEMO = 'QNET_NODE_TYPE:LIGHT';
+// The memo of an activation burn, by its node type (the extension burns for either; the cabinet for a light node).
+export const NODE_TYPE_MEMO: Readonly<Record<NodeType, string>> = Object.freeze({ light: 'QNET_NODE_TYPE:LIGHT', super: 'QNET_NODE_TYPE:SUPER' });
+export const LIGHT_MEMO = NODE_TYPE_MEMO.light;
 // The form of the read pass the site gives with each burn or refund it forwarded (solana-proxy.ts): 16 bytes, base64url.
 export const READ_PASS_RE = /^[A-Za-z0-9_-]{22}$/;
 export const BURN_PRIORITY_MICRO_LAMPORTS = 20_000n;
@@ -89,7 +93,7 @@ export function refundLamports(plan: RefundPlan): bigint {
 // The SOL the payment address still lacks to move its 1DEV or close its token account: the refund's signature fee
 // and, when the destination has no 1DEV account, that account's rent (it is created before the payment address's own
 // one is closed, whose rent goes to the destination and pays for nothing here). Zero when neither is to be moved
-// (SOL alone goes back only when there is more than the fee, refundLamports) or the address holds enough (SITE-R2-02).
+// (SOL alone goes back only when there is more than the fee, refundLamports) or the address holds enough.
 export function refundShortfall(plan: RefundPlan): bigint {
   if (plan.oneDevRaw === 0n && !plan.accountExists) return 0n;
   const createsAccount = plan.oneDevRaw > 0n && !plan.destAccountExists;
@@ -123,11 +127,6 @@ export function refundInstructions(payer: string, dest: string, plan: RefundPlan
 export type CabinetTx =
   | { kind: 'burn'; payer: string; whole: number }
   | { kind: 'refund'; payer: string; dest: string; oneDevRaw: bigint; lamports: bigint };
-
-const keysAre = (ix: ParsedInstruction, keys: string[]): boolean =>
-  ix.accounts.length === keys.length && ix.accounts.every((a, i) => a.pubkey === keys[i]);
-
-const bytesEqual = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
 
 // The compute budget instructions at the head: at most one price and one limit, each within bounds. The index
 // of the first other instruction, or -1 for anything else.

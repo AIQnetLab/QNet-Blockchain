@@ -317,8 +317,9 @@ describe('the two messages: no answer, or what a transaction takes not known yet
   it('the Send form refuses with the reason the check gave, for QNC and for a token, and counts own unconfirmed sends', () => {
     const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     const send = ws.slice(ws.indexOf('const handleSendTransaction = async () => {'), ws.indexOf('const pressSend = async'));
-    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error\) \}\);/);
-    expect(send).toMatch(/error: sendCheckError\(held && held\.error\)/);
+    expect(send).toMatch(/const refuse = \(error\) => \{\s*if \(confirmed \|\| formOpen\(\)\) setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error \}\);/);
+    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*refuse\(sendCheckError\(qncCheck\.error\)\);/);
+    expect(send).toMatch(/refuse\(sendCheckError\(held && held\.error\)\)/);
     expect(send).toMatch(/spendable = afterPending\(qncNano, qncCheck\.pending, replaceNonce\);/);
     expect(send).toMatch(/const tokenLeft = afterPending\(held\.balanceBase, held\.pending, replaceNonce\);/);
     expect(ws).toMatch(/const sendCheckError = \(error\) => t\(error === 'unconfirmed' \? 'balance_unconfirmed' : 'send_balance_unreadable'\);/);

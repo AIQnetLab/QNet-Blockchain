@@ -1,4 +1,4 @@
-// View by address (owner, 13.10): a typed address is a read-only view, never a connection. It is kept for the tab apart
+// View by address: a typed address is a read-only view, never a connection. It is kept for the tab apart
 // from the connected wallet, the header and the progress never show it as connected, no action that needs the wallet is
 // offered, and neither the page nor the site's status and history routes carry the device details that are the owner's,
 // not the network's (the platform, the model, the day it linked, its account of a missed epoch).
@@ -13,10 +13,7 @@ import {
 import { TABS, visibleTabs } from '../cabinet/tabs.ts';
 import { historyPagePath, parseHistoryView, parseStatusView, publicHistory, publicStatus, statusPath } from '../cabinet/node-view.ts';
 import { createNodeProxy, viewRead } from '../../server/cabinet/node-proxy.ts';
-
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n')
-  .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+import { SRC, code } from './source.mjs';
 
 const EON = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const OTHER = '60b4f3e026e24dcc7d8eonfda2b095a258ab95c1db2c0';
@@ -94,7 +91,7 @@ test('the page while viewing: the line that it is viewed read only with Stop vie
   const frame = code('components/cabinet/CabinetFrame.tsx');
   // A view: its note, and no journey; the wallet itself (address, Copy, Disconnect) is the header's account menu, never
   // the page's.
-  assert.match(frame, /\{viewOnly && <p className="note cab-lead-note">\{t\('view_note'\)\}<\/p>\}/);
+  assert.match(frame, /\{viewOnly && <p className="note cab-lead-note">\{say\('view_note'\)\}<\/p>\}/);
   assert.match(frame, /\{!viewOnly && showJourney\(tab, true, view\) && <CabinetProgress connected view=\{view\} \/>\}/);
   assert.doesNotMatch(frame, /WalletCard|ViewingCard|forget|disconnect|SOURCE_TEXT/);
   // The rail's head says the address is viewed read only, with Stop viewing, in place of the node's line.
@@ -142,7 +139,7 @@ test('the device details that are the owner\'s are left out of a view: the route
       assert.match(call, /, viewOnly\)$/, `${name}: ${call}`);
     }
   }
-  // History likewise (batch 18.10): a view's page carries no reason an epoch was missed, every other field stays, and its
+  // History likewise: a view's page carries no reason an epoch was missed, every other field stays, and its
   // read is its own address too.
   const why = { epoch: 150, reason: 'not_delivered', delivered: false };
   const page = {
@@ -175,8 +172,8 @@ test('the device details that are the owner\'s are left out of a view: the route
   // The rows: the network's facts only for a view (no platform, no model, no day it linked, no miss).
   const rows = code('components/cabinet/NodeStatus.tsx');
   assert.match(rows, /const named = viewOnly \? null : device;/);
-  assert.match(rows, /\{full \? \([\s\S]*?\{named && deviceName\(named\) && <p className="cab-dev-name">\{deviceName\(named\)\}<\/p>\}/);
-  assert.match(rows, /\{!viewOnly && <Readout label=\{t\('device_since'\)\} value=\{device\?\.linkedSince != null \? DAY\.format\(device\.linkedSince \* 1000\) : null\} \/>\}/);
+  assert.match(rows, /\{full \? \([\s\S]*?\{named && deviceName\(named, t\) && <p className="cab-dev-name">\{deviceName\(named, t\)\}<\/p>\}/);
+  assert.match(rows, /\{!viewOnly && <Readout label=\{t\('device_since'\)\} value=\{device\?\.linkedSince != null \? dayUtc\(device\.linkedSince \* 1000, t\) : null\} \/>\}/);
   assert.match(rows, /const missed = !viewOnly && \(state === 'offline' \|\| \(full && state === 'online'\)\);/);
 });
 

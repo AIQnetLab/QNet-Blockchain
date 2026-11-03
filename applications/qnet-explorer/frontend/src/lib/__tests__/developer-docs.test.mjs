@@ -4,10 +4,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { REPO, repo as read } from './source.mjs';
 
-const REPO = new URL('../../../../../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, REPO), 'utf8').replace(/\r\n/g, '\n');
 const DOCS_DIR = 'docs/developers/';
 const DOCS = readdirSync(new URL(DOCS_DIR, REPO)).filter((f) => f.endsWith('.md')).sort()
   .map((name) => ({ name, path: `${DOCS_DIR}${name}`, text: read(`${DOCS_DIR}${name}`) }));
@@ -189,13 +188,20 @@ test('signed texts, calldata and deploy payloads in the docs are the shared vect
   // The template the docs give for each kind is the one the builders sign.
   const identity = read('applications/qnet-mobile/src/crypto/WalletIdentity.js');
   const transactions = DOCS.find((d) => d.name === 'transactions.md').text;
-  for (const [kind, fields] of [
-    ['transfer', '{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}'],
-    ['contract_call', '{from}:{sha3_256_hex(calldata)}:{nonce}:{gas_price}:{gas_limit}'],
-    ['contract_deploy', '{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}'],
+  assert.match(identity, /return \{ prefix: `\$\{QNET_CHAIN_TAG\}\$\{networkId\}\|`, validUntil: height \};/);
+  for (const [kind, fields, builder] of [
+    ['transfer', '{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}', 'transferPreimage'],
+    ['contract_call', '{from}:{sha3_256_hex(calldata)}:{nonce}:{gas_price}:{gas_limit}', 'contractCallPreimage'],
+    ['contract_deploy', '{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}', 'contractDeployPreimage'],
   ]) {
+    const count = fields.split(':').length;
     assert.ok(transactions.includes(`q1337|${kind}:${fields}`), `transactions.md: the ${kind} template`);
-    assert.match(identity, new RegExp(`\\$\\{QNET_CHAIN_TAG\\}${kind}:\\$\\{from\\}:\\$\\{[a-zA-Z]+\\}:\\$\\{[a-zA-Z]+\\}:\\$\\{[a-zA-Z]+\\}:\\$\\{[a-zA-Z]+\\}`));
+    const start = identity.indexOf(`export function ${builder}(`);
+    assert.ok(start >= 0, builder);
+    const body = identity.slice(start, identity.indexOf('\n}\n', start));
+    assert.match(body, new RegExp(`const fields = \`\\$\\{from\\}${':\\$\\{[a-zA-Z]+\\}'.repeat(count - 1)}\`;`), `${builder}: the fields`);
+    assert.match(body, new RegExp(`return \`\\$\\{QNET_CHAIN_TAG\\}${kind}:\\$\\{fields\\}\`;`), `${builder}: V1`);
+    assert.match(body, new RegExp(`return \`\\$\\{v2\\.prefix\\}${kind}_v2:\\$\\{fields\\}:\\$\\{v2\\.validUntil\\}\`;`), `${builder}: V2`);
   }
 });
 
@@ -256,7 +262,7 @@ test('links in the developer docs and the site\'s documentation page resolve', (
   for (const doc of DOCS) assert.ok(index.includes(`](developers/${doc.name})`), `docs/README.md links developers/${doc.name}`);
 });
 
-// SD-R2-14: docs/ is the documentation's one tree (docs consolidation, 19.08): the explorer is described in
+// docs/ is the documentation's one tree: the explorer is described in
 // docs/applications/explorer.md, and its folder carries no README of its own, an empty one least of all.
 test('the explorer\'s documentation lives in docs/applications/explorer.md, not in a README of its folder', () => {
   assert.equal(existsSync(new URL('applications/qnet-explorer/frontend/README.md', REPO)), false);

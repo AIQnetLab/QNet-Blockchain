@@ -57,7 +57,7 @@ test('the burn equals web3.js\'s: message, wire and id, signed with noble and wi
   // Only a funded record burns, and only a whole amount within the node's bound.
   const v = V.burns[0];
   await assert.rejects(signBurn({ ...await record(v.payerSeed, v.payer, 'funding'), reservation: held(v.whole) }, v.whole, v.blockhash, subtle, NOW), /stage/);
-  // R6 and A1: the payment key signs a burn only under the reservation of the wallet that signed the record's hold, of
+  // One wallet, one burn: the payment key signs a burn only under the reservation of the wallet that signed the record's hold, of
   // that very amount, with at least SIGN_MARGIN_MS of it left: none, one about to end or ended, another amount, no wallet
   // in it, another wallet than the hold's, or no hold, and nothing is signed.
   const funded = await record(v.payerSeed, v.payer, 'funded');

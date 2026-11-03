@@ -3,10 +3,11 @@
 // answers are in src/lib/cabinet/extension-view.ts.
 
 import type { WalletChannel } from './qnet-provider.ts';
+import type { MessageKey } from './texts.ts';
 
 // The QNet app's store builds (Google Play, App Store) carry no text about activation or payment, and no
 // way to it. The site holds to that in the app's in-app browser, known by the provider channel 'mobile'
-// (owner, 11.10: only there; a page the app opens in the system browser is an ordinary visit). A page shows
+// (only there: a page the app opens in the system browser is an ordinary visit). A page shows
 // such text only once it knows it is elsewhere: never while the wallet is still being detected (the
 // server's render included), never in the in-app browser.
 export type DetectStatus = 'detecting' | 'available' | 'missing';
@@ -15,9 +16,10 @@ export function showsActivationContent(status: DetectStatus, channel: WalletChan
   return status !== 'detecting' && channel !== 'mobile';
 }
 
+// A header link: its page and the key of its words (src/i18n/locales/en.ts).
 export interface NavLink {
   href: string;
-  label: string;
+  label: MessageKey;
   external?: boolean;
 }
 
@@ -26,10 +28,10 @@ export interface NavLink {
 // logo leads to the explorer too. These pages show no activation text and no link to one in that view
 // (src/lib/__tests__/in-app-pages.test.mjs).
 export const IN_APP_NAV: NavLink[] = [
-  { href: '/explorer', label: 'Explorer' },
-  { href: '/privacy', label: 'Privacy' },
-  { href: '/terms', label: 'Terms' },
-  { href: '/support', label: 'Support' },
+  { href: '/explorer', label: 'hdr_explorer' },
+  { href: '/privacy', label: 'hdr_privacy' },
+  { href: '/terms', label: 'hdr_terms' },
+  { href: '/support', label: 'support_title' },
 ];
 
 export const IN_APP_HOME = '/explorer';

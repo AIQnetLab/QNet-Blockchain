@@ -1,4 +1,4 @@
-// The server's Solana reads of activation burns (shared contracts C3.1 and C3.6): one burn checked by its signature
+// The server's Solana reads of activation burns: one burn checked by its signature
 // (final, valid for its burner, node type and amount), and the search of a wallet's own Solana address for the burns it
 // made, filtered by their memo and then by who paid for them. Both go through the site's one Solana client
 // (src/server/solana-endpoint.ts); a search is kept for SCAN_CACHE_MS per address. Each lane (the page's anonymous
@@ -6,7 +6,7 @@
 // own, so that no flood of reads starves a reservation. A search is charged to the clients the route names (the
 // visitor's IP, and for a registration also its node) before it takes anything of the server's: each client at most
 // CLIENT_SCANS_PER_MINUTE searches a lane, and of them at most CLIENT_FULL_SCANS_PER_MINUTE that read past the first page
-// of signatures (SITE H-5: a QNet wallet costs nothing, so a signed request is no scarce thing). The first page of
+// of signatures (a QNet wallet costs nothing, so a signed request is no scarce thing). The first page of
 // signatures counts against the lane's LIST_PER_MINUTE; only a search that reads further pages or the transactions with
 // an activation memo takes one of the lane's SCANS_PER_MINUTE, so an address with no such history (a throwaway one)
 // drains nothing scarce. Past any budget a search answers "not complete", which offers no burn.
@@ -52,7 +52,7 @@ export interface BurnExpectation {
 const getTx = (rpc: Rpc, signature: string) =>
   rpc('getTransaction', [signature, { encoding: 'jsonParsed', commitment: 'finalized', maxSupportedTransactionVersion: 0 }]);
 
-// C3.6: the burn by its signature; null when Solana could not be read.
+// The burn by its signature; null when Solana could not be read.
 export async function checkBurn(rpc: Rpc, burnTx: string, expect: BurnExpectation): Promise<BurnCheck | null> {
   try {
     const status = await statusOf(rpc, burnTx);
@@ -84,7 +84,7 @@ function feePayerOf(tx: unknown): string | null {
   return typeof first === 'string' ? first : isObject(first) && typeof first.pubkey === 'string' ? first.pubkey : null;
 }
 
-// The search of `address` (C3.1): its signatures, newest first in pages of SIGNATURES_MAX (older ones with `before`) up
+// The search of `address`: its signatures, newest first in pages of SIGNATURES_MAX (older ones with `before`) up
 // to SIGNATURE_PAGES_MAX pages, those with an activation memo that did not fail, read oldest first. Only a transaction
 // `address` paid for counts (anyone can send it one with such a memo): the fee payer is checked first, so another
 // payer's transactions never fill SCAN_BURNS_MAX, and at most SCAN_READS_MAX are read. `complete` only when every page

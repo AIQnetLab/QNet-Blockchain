@@ -1,6 +1,6 @@
 'use client';
 
-// The header's account control, one component on every page and every width (B-SPEC 5.2). Outside the QNet app's view
+// The header's account control, one component on every page and every width. Outside the QNet app's view
 // its Connect wallet is My node's own (useConnectWallet): on a computer with the QNet extension it asks the extension at
 // once and My node keeps that wallet and opens; on a computer without it, it opens the extension's store page; on a phone
 // or tablet it leads to My node's connect card and starts QNet Wallet's request there (on a page that shows the card it
@@ -13,8 +13,6 @@
 // value is rendered as text.
 
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from 'react';
-import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
 import { useActivationContent, useWallet } from '@/contexts/AppContext';
 import { forgetWallet, useHeldChoice } from '@/components/cabinet/CabinetProvider';
 import Copy from '@/components/ui/Copy';
@@ -27,8 +25,9 @@ import { CONNECT_ID, isNodePath } from '@/lib/cabinet/tabs';
 import type { WalletSource } from '@/lib/cabinet/wallet-choice';
 import { short } from '@/lib/format';
 import type { AddressView } from '@/lib/qnet-provider';
-import { t, type MessageKey } from '@/lib/texts';
+import { type MessageKey } from '@/lib/texts';
 import { useConnectWallet } from './useConnectWallet';
+import { Link, useI18n, useLocaleRouter, usePath } from '@/i18n/client';
 
 const VIEWS: { key: AddressView; label: string }[] = [
   { key: 'qnet', label: 'QNet Blockchain' },
@@ -54,13 +53,14 @@ function toConnect(event: MouseEvent<HTMLAnchorElement>, run: () => void) {
   showConnectCard(card, true);
 }
 
-// Connect wallet and its waiting label in one grid cell, so the control keeps its width (B-SPEC 3.7); a phone's header
+// Connect wallet and its waiting label in one grid cell, so the control keeps its width; a phone's header
 // shows the short words of both, so the row fits 360 px with the menu button inside the gutter.
-function ConnectLabel({ waiting = false }: { waiting?: boolean }) {
+export function ConnectLabel({ waiting = false }: { waiting?: boolean }) {
+  const { t } = useI18n();
   return (
     <span className="swap">
-      <span data-on={!waiting}>Connect<span className="c-long"> wallet</span></span>
-      <span data-on={waiting}>Approve<span className="c-long"> in wallet</span>…</span>
+      <span data-on={!waiting}><span className="c-long">{t('hdr_connect')}</span><span className="c-short">{t('hdr_connect_short')}</span></span>
+      <span data-on={waiting}><span className="c-long">{t('hdr_approve')}</span><span className="c-short">{t('hdr_approve_short')}</span></span>
     </span>
   );
 }
@@ -78,10 +78,11 @@ export const OVERLAY_EVENT = 'qnet-overlay';
 // `active`: the menu is open or about to open; until then the rows stand in place with dashes and nothing is asked. The
 // reads are My node's shared ones (useAccountReads), so none is asked twice.
 function NodeRows({ wallet, active, onNode }: { wallet: string; active: boolean; onNode: (node: NodeShown) => void }) {
+  const { t } = useI18n();
   const reads = useAccountReads(active ? wallet : null);
-  const rows = accountRows(reads);
+  const rows = accountRows(reads, t);
   const online = nodeOnline(reads);
-  const words = rows[0].datum ? rows[0].datum.replace(' · ', ' ').toLowerCase() : null;
+  const words = rows[0].datum ? rows[0].datum.replace(' · ', ' ').toLocaleLowerCase(t.locale) : null;
   useEffect(() => {
     if (online !== null && words !== null) onNode({ online, words });
   }, [online, words, onNode]);
@@ -105,13 +106,14 @@ function NodeRows({ wallet, active, onNode }: { wallet: string; active: boolean;
 // open, and returns to the button. Only the phone's sheet locks the page's scrolling.
 // The menu's content is laid out from the start (hidden while closed), so opening it moves nothing inside it.
 function AccountMenu({ address, mark, label, children }: { address: string; mark: ReactNode; label: string; children: (close: () => void, active: boolean) => ReactNode }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   // A pointer over the button or focus on it starts the menu's reads, so its rows are usually in by the click.
   const [primed, setPrimed] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLDivElement>(null);
-  const pathname = usePathname();
+  const pathname = usePath();
   const panelId = useId();
 
   const close = useCallback((focusBack = false) => {
@@ -210,7 +212,7 @@ function AccountMenu({ address, mark, label, children }: { address: string; mark
       >
         <div className="acct-top">
           <p className="label">{t('wallet_label')}</p>
-          <button type="button" className="act quiet acct-close" onClick={() => close(true)}>Close</button>
+          <button type="button" className="act quiet acct-close" onClick={() => close(true)}>{t('hdr_close')}</button>
         </div>
         {children(() => close(true), open || primed)}
       </div>
@@ -219,13 +221,14 @@ function AccountMenu({ address, mark, label, children }: { address: string; mark
 }
 
 export default function ConnectWalletButton() {
+  const { t, say } = useI18n();
   const { providerStatus, accounts, view, connecting, error, connect, disconnect, setView, clearError } = useWallet();
   // False in the QNet app's view (src/lib/activate-view.ts), where no page about the wallet may be offered.
   const fullView = useActivationContent();
   const choice = useHeldChoice();
   const held = choice?.qnet ?? null;
-  const router = useRouter();
-  const pathname = usePathname();
+  const router = useLocaleRouter();
+  const pathname = usePath();
   // The extension shared its wallet after this control asked: My node opens unless this is one of its pages already.
   const { way, run } = useConnectWallet(() => {
     if (!isNodePath(pathname)) router.push('/node');
@@ -241,7 +244,7 @@ export default function ConnectWalletButton() {
     setNode(value);
   }, [held]);
 
-  // A wallet error goes away by itself after a few seconds; the x still closes it at once (owner, 28.09).
+  // A wallet error goes away by itself after a few seconds; the x still closes it at once.
   useEffect(() => {
     if (!error) return;
     const timer = window.setTimeout(() => clearError(), 6000);
@@ -258,8 +261,8 @@ export default function ConnectWalletButton() {
 
   const errorNote = error ? (
     <div className="wallet-error" role="alert">
-      <span>{error}</span>
-      <button type="button" className="act quiet wallet-error-close" onClick={clearError} aria-label="Dismiss">×</button>
+      <span>{say(error)}</span>
+      <button type="button" className="act quiet wallet-error-close" onClick={clearError} aria-label={t('hdr_dismiss')}>×</button>
     </div>
   ) : null;
 
@@ -311,7 +314,7 @@ export default function ConnectWalletButton() {
               <>
                 <p className="acct-addr mono"><AddressParts value={held} /></p>
                 <Copy value={held} label={t('account_copy')} />
-                {choice.source !== 'entered' && <p className="acct-src">{t(SOURCE_TEXT[choice.source])}</p>}
+                {choice.source !== 'entered' && <p className="acct-src">{say(SOURCE_TEXT[choice.source])}</p>}
                 <NodeRows wallet={held} active={active} onNode={onNode} />
                 <button
                   type="button"
@@ -349,7 +352,7 @@ export default function ConnectWalletButton() {
       <AccountMenu key="app-account" address={address} mark={null} label={t('account_button', { address: short('address', address) })}>
         {(close) => (
           <>
-            <div className="acct-views" role="tablist" aria-label="Address shown">
+            <div className="acct-views" role="tablist" aria-label={t('account_views')}>
               {VIEWS.map((v) => (
                 <button key={v.key} type="button" role="tab" aria-selected={view === v.key} className="acct-view" onClick={() => setView(v.key)}>
                   {v.label}

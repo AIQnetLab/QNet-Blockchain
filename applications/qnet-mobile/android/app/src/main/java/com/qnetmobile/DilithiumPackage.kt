@@ -8,19 +8,21 @@ import com.facebook.react.uimanager.ViewManager
 /**
  * React Native package for the app's own native modules: DilithiumModule (ML-DSA-65), SecurityModule,
  * DeviceAttestModule (the light node's device key), AppBuildModule (what kind of build this is), TaskStateModule
- * (whether the user swiped the app away since it was last opened) and BackgroundPriorityModule (how much the system lets
- * the app run in the background)
+ * (whether the user swiped the app away since it was last opened), BackgroundPriorityModule (how much the system lets
+ * the app run in the background), LinkInboxModule (the links the system handed to the app) and AppNetworkModule (a
+ * network that appears, told to JS), and the live field's view (HexFieldManager, QNetHexField)
  */
 class DilithiumPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
         return listOf(
             DilithiumModule(reactContext), SecurityModule(reactContext), DeviceAttestModule(reactContext),
             AppBuildModule(reactContext), TaskStateModule(reactContext), BackgroundPriorityModule(reactContext),
+            LinkInboxModule(reactContext), AppNetworkModule(reactContext),
         )
     }
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {
-        return emptyList()
+        return listOf(HexFieldManager())
     }
 }
 

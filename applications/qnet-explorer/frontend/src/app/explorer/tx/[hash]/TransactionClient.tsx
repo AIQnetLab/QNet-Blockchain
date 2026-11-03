@@ -1,6 +1,6 @@
 'use client';
 
-// A transaction (B-SPEC 6.4): its short hash as the title with its type and status above, the whole hash with Copy and
+// A transaction: its short hash as the title with its type and status above, the whole hash with Copy and
 // its time; readouts for its status, block, amount and fee; its sides, nonce and signature as rows; a token transfer,
 // a batch's recipients or the transaction's data under them. The server renders the record into the page (page.tsx),
 // so those groups are there from the first paint; while the route loads, a row the list already showed paints from the
@@ -12,11 +12,12 @@ import { getCache, setCache } from '@/lib/explorer-cache';
 import { readRecord, txPath } from '@/lib/explorer-reads';
 import { formatTokenAmount } from '@/lib/token-format';
 import { useActivationContent } from '@/contexts/AppContext';
-import { txDataEntries, txTypeLabel } from '@/lib/tx-labels';
+import { useT } from '@/i18n/client';
+import { txDataEntries, txDataLabel, txTypeLabel } from '@/lib/tx-labels';
 import OnHead from '@/components/explorer/OnHead';
 import { HashRow, Row, Rows, Whole } from '@/components/explorer/Detail';
 import { Party, QncAmount } from '@/components/explorer/cells';
-import { amountCol, partyCol, textCol } from '@/components/explorer/columns';
+import { amountCol, amountsWidth, partyCol, textCol } from '@/components/explorer/columns';
 import Action from '@/components/ui/Action';
 import DataTable from '@/components/ui/DataTable';
 import EntityLink, { Amount, type AmountToken } from '@/components/ui/EntityLink';
@@ -24,8 +25,10 @@ import PageHead from '@/components/ui/PageHead';
 import { Readout, Readouts } from '@/components/ui/Readouts';
 import { Status, TxType } from '@/components/ui/Status';
 import { isAddressShape, isHeight } from '@/lib/entity';
-import { signatureName, txStatusView } from '@/lib/explorer-view';
+import { signatureName, splitAmount, txStatusView } from '@/lib/explorer-view';
 import { epochMs, int, qnc, short, when } from '@/lib/format';
+import { siteRequest } from '@/lib/site-request';
+import type { T } from '@/lib/texts';
 import type { FirstAnswer } from '@/server/first-answer';
 
 // Decoded QRC-20 ContractCall: the contract is the tx `to`, the method + args live in the tx `data` JSON
@@ -81,11 +84,12 @@ interface TokenMeta {
 
 type Phase = 'loading' | 'ready' | 'missing' | 'failed';
 
-// snake_case keys of the data rows as words: "eligible_count" → "Eligible count".
-const humanizeKey = (key: string): string => {
-  const words = key.replace(/[_-]+/g, ' ').trim();
-  return words.charAt(0).toUpperCase() + words.slice(1);
-};
+// A data row's label: the page's words for a fact the indexer records, else the record's field name as code, which
+// keeps its own direction (i18n.css .mono) and is never machine-translated.
+function DataLabel({ name, t }: { name: string; t: T }) {
+  const key = txDataLabel(name);
+  return key ? <>{t(key)}</> : <span className="mono" translate="no">{name}</span>;
+}
 
 // A data value: an address or a block as its link, a count grouped, anything else as written.
 function DataValue({ name, value }: { name: string; value: unknown }) {
@@ -105,7 +109,7 @@ function useTokenMeta(contract: string | null): TokenMeta | null {
     let active = true;
     (async () => {
       try {
-        const res = await fetch(`/api/token/${contract}`);
+        const res = await fetch(`/api/token/${contract}`, siteRequest());
         const result = await res.json();
         if (active && result?.success && result.data) {
           setMeta({ symbol: result.data.symbol || '', decimals: typeof result.data.decimals === 'number' ? result.data.decimals : 9, logo: result.data.logo || '' });
@@ -119,15 +123,18 @@ function useTokenMeta(contract: string | null): TokenMeta | null {
   return meta;
 }
 
-const BATCH_COLUMNS = (full: boolean) => [
+// The amount as wide as the batch's longest (columns.tsx amountsWidth).
+const BATCH_COLUMNS = (t: T, full: boolean, recipients: readonly { amount: string }[]) => [
   textCol<{ i: number; to: string; amount: string }>('n', '#', (r) => int(r.i + 1), 64),
-  partyCol<{ i: number; to: string; amount: string }>('to', 'Recipient', (r) => r.to, full),
-  amountCol<{ i: number; to: string; amount: string }>((r) => <QncAmount nano={r.amount} />, 'Amount', 220),
+  partyCol<{ i: number; to: string; amount: string }>('to', t('tx_recipient'), (r) => r.to, full),
+  amountCol<{ i: number; to: string; amount: string }>(t, (r) => <QncAmount nano={r.amount} />, t('col_amount'),
+    amountsWidth(recipients.map((r) => splitAmount(`${qnc(r.amount)} QNC`)), false, 220)),
 ];
 
 // `first` is the server's answer (null: it had none, the client reads it); absent while the route loads (loading.tsx):
 // the page's shape with the list's row from this tab if it has one, and no reads.
 export default function TransactionClient({ first }: { first?: FirstAnswer | null }) {
+  const t = useT();
   const params = useParams();
   const hash = params.hash as string;
   // The app's view names reward and activation types by what they change (src/lib/tx-labels.ts).
@@ -139,7 +146,7 @@ export default function TransactionClient({ first }: { first?: FirstAnswer | nul
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(txPath(hash));
+      const res = await fetch(txPath(hash), siteRequest());
       const read = readRecord<TransactionData>(res.status, await res.json());
       if (read.record) {
         setTx(read.record);
@@ -162,16 +169,16 @@ export default function TransactionClient({ first }: { first?: FirstAnswer | nul
   const block = tx ? (tx.block_height ?? tx.block) : null;
   const ts = tx && Number(tx.timestamp) > 0 ? epochMs(Number(tx.timestamp)) : 0;
   const recipients = tx?.tx_type_data?.recipients as Array<{ to: string; amount: string }> | undefined;
-  const status = txStatusView(tx?.status, tx !== null && phase === 'ready');
+  const status = txStatusView(tx?.status, tx !== null && phase === 'ready', t);
 
   // The amount readout: a token transfer's token amount, else the exact QNC from nano QNC (from a listed row until the
   // record arrives).
-  let amount: { value: string | null; token?: AmountToken; sub: string } = { value: null, sub: 'Moved by this transaction' };
+  let amount: { value: string | null; token?: AmountToken; sub: string } = { value: null, sub: t('tx_moved') };
   if (call && meta) {
-    amount = { value: formatTokenAmount(call.amountRaw, meta.decimals), token: { token: call.contract, symbol: meta.symbol, logo: meta.logo }, sub: 'Token moved by this call' };
+    amount = { value: formatTokenAmount(call.amountRaw, meta.decimals), token: { token: call.contract, symbol: meta.symbol, logo: meta.logo }, sub: t('tx_token_moved') };
   } else if (tx) {
     const moved = qnc(tx.amount_raw ?? '0');
-    amount = { value: moved, token: {}, sub: moved === '0' ? 'This transaction moves no QNC' : 'Moved by this transaction' };
+    amount = { value: moved, token: {}, sub: moved === '0' ? t('tx_no_qnc') : t('tx_moved') };
   }
   const entries = txDataEntries(tx?.tx_type_data, full).filter(([key]) => key !== 'recipients');
 
@@ -180,67 +187,67 @@ export default function TransactionClient({ first }: { first?: FirstAnswer | nul
       <PageHead
         kicker={(
           <span className="ex-kicker">
-            {tx ? <TxType type={tx.type} label={txTypeLabel(tx.type, full)} /> : '\u00a0'}
+            {tx ? <TxType type={tx.type} label={txTypeLabel(tx.type, full, t)} /> : '\u00a0'}
             {status && <Status tone={status.done ? 'done' : 'quiet'}>{status.value}</Status>}
           </span>
         )}
-        title={`Transaction ${short('hash', hash)}`}
+        title={t('tx_title_n', { hash: short('hash', hash) })}
         more={(
           <div className="ex-ro ex-ro-amount" data-field-dim="0.1">
-            <Readouts cols={4} size="tool" label="This transaction">
-              <Readout label="Status" value={status?.value ?? null} sub={status?.sub} />
-              <Readout label="Block" value={block !== null && block !== '' ? int(Number(block)) : null} href={block !== null && block !== '' ? `/explorer/block/${Number(block)}` : undefined} sub="The block that holds it" />
-              <Readout label="Amount" value={amount.value} amount={amount.token} sub={amount.sub} wide />
-              <Readout label="Fee" value={tx && phase === 'ready' ? qnc(tx.fee_raw ?? '0') : null} amount={{}} sub="Paid to the network" />
+            <Readouts cols={4} size="tool" label={t('tx_this')}>
+              <Readout label={t('col_status')} value={status?.value ?? null} sub={status?.sub} />
+              <Readout label={t('col_block')} value={block !== null && block !== '' ? int(Number(block)) : null} href={block !== null && block !== '' ? `/explorer/block/${Number(block)}` : undefined} sub={t('tx_block_sub')} />
+              <Readout label={t('col_amount')} value={amount.value} amount={amount.token} sub={amount.sub} wide />
+              <Readout label={t('tx_fee')} value={tx && phase === 'ready' ? qnc(tx.fee_raw ?? '0') : null} amount={{}} sub={t('tx_fee_sub')} />
             </Readouts>
           </div>
         )}
       >
-        <Whole value={hash} name="transaction hash" />
-        <p className="ex-facts"><span className="ex-when">{ts ? when(ts) : '—'}</span></p>
+        <Whole value={hash} name={t('tx_hash')} />
+        <p className="ex-facts"><span className="ex-when">{ts ? when(ts, t) : '—'}</span></p>
         {phase === 'missing' && (
-          <p className="ex-error" role="status">This transaction is not in a block the explorer has read. The page shows it once it is.</p>
+          <p className="ex-error" role="status">{t('tx_missing')}</p>
         )}
         {phase === 'missing' && <OnHead every={3000} max={20} onHead={load} />}
         {phase === 'failed' && (
-          <p className="ex-error" role="alert">Could not read this transaction. <Action kind="act" onClick={() => void load()}>Try again</Action></p>
+          <p className="ex-error" role="alert">{t('tx_unreadable')} <Action kind="act" onClick={() => void load()}>{t('try_again')}</Action></p>
         )}
       </PageHead>
 
       <div className="wrap ex-body">
         <section className="ex-group" aria-labelledby="tx-details">
-          <h2 id="tx-details" className="tbl-title">Details</h2>
-          <Rows label="Transaction details">
-            <Row label="From">{tx ? <Party value={tx.from} full={full} whole copyName="from address" /> : null}</Row>
-            <Row label="To">{tx ? <Party value={tx.to} full={full} whole copyName="to address" /> : null}</Row>
-            <Row label="Nonce">{tx && phase === 'ready' && tx.nonce !== undefined && tx.nonce !== null ? int(Number(tx.nonce)) : null}</Row>
-            <Row label="Signature">{phase === 'ready' ? signatureName(tx?.signature_type) : null}</Row>
+          <h2 id="tx-details" className="tbl-title">{t('details')}</h2>
+          <Rows label={t('tx_details')}>
+            <Row label={t('tx_from')}>{tx ? <Party value={tx.from} full={full} whole copyName={t('tx_from_address')} /> : null}</Row>
+            <Row label={t('tx_to')}>{tx ? <Party value={tx.to} full={full} whole copyName={t('tx_to_address')} /> : null}</Row>
+            <Row label={t('tx_nonce')}>{tx && phase === 'ready' && tx.nonce !== undefined && tx.nonce !== null ? int(Number(tx.nonce)) : null}</Row>
+            <Row label={t('blk_sig')}>{phase === 'ready' ? signatureName(tx?.signature_type) : null}</Row>
           </Rows>
         </section>
 
         {call && (
           <section className="ex-group" aria-labelledby="tx-token">
-            <h2 id="tx-token" className="tbl-title">Token transfer</h2>
-            <Rows label="Token transfer">
-              <Row label="Amount">
+            <h2 id="tx-token" className="tbl-title">{t('tx_token_transfer')}</h2>
+            <Rows label={t('tx_token_transfer')}>
+              <Row label={t('col_amount')}>
                 {meta
                   ? <Amount value={formatTokenAmount(call.amountRaw, meta.decimals)} token={call.contract} symbol={meta.symbol} logo={meta.logo} />
-                  : <span className="ex-val">{call.amountRaw} base units</span>}
+                  : <span className="num">{t('tx_base_units', { amount: /^\d+$/.test(call.amountRaw) ? formatTokenAmount(call.amountRaw, 0) : call.amountRaw })}</span>}
               </Row>
-              <Row label="Recipient"><Party value={call.to} full={full} whole copyName="recipient address" /></Row>
-              <Row label="Token"><EntityLink kind="token" value={call.contract} symbol={meta?.symbol} /></Row>
-              <HashRow label="Contract" value={call.contract} />
-              <Row label="Method"><span className="ex-val">{call.method}</span></Row>
+              <Row label={t('tx_recipient')}><Party value={call.to} full={full} whole copyName={t('tx_recipient_address')} /></Row>
+              <Row label={t('col_token')}><EntityLink kind="token" value={call.contract} symbol={meta?.symbol} /></Row>
+              <HashRow label={t('tx_contract')} value={call.contract} />
+              <Row label={t('tx_method')}><span className="ex-val">{call.method}</span></Row>
             </Rows>
           </section>
         )}
 
         {!call && Array.isArray(recipients) && recipients.length > 0 && (
           <DataTable
-            title="Batch recipients"
-            meta={<span className="label">{int(recipients.length)} recipients</span>}
-            caption="The recipients of this batch"
-            columns={BATCH_COLUMNS(full)}
+            title={t('tx_batch')}
+            meta={<span className="label">{t('tx_batch_count', { count: int(recipients.length) })}</span>}
+            caption={t('tx_batch_caption')}
+            columns={BATCH_COLUMNS(t, full, recipients)}
             rows={recipients.map((r, i) => ({ i, to: r.to, amount: r.amount }))}
             rowKey={(r) => String(r.i)}
           />
@@ -248,9 +255,9 @@ export default function TransactionClient({ first }: { first?: FirstAnswer | nul
 
         {!call && entries.length > 0 && (
           <section className="ex-group" aria-labelledby="tx-data">
-            <h2 id="tx-data" className="tbl-title">Transaction data</h2>
-            <Rows label="Transaction data">
-              {entries.map(([key, value]) => <Row key={key} label={humanizeKey(key)}><DataValue name={key} value={value} /></Row>)}
+            <h2 id="tx-data" className="tbl-title">{t('tx_data')}</h2>
+            <Rows label={t('tx_data')}>
+              {entries.map(([key, value]) => <Row key={key} label={<DataLabel name={key} t={t} />}><DataValue name={key} value={value} /></Row>)}
             </Rows>
           </section>
         )}

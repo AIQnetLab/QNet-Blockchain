@@ -3,6 +3,7 @@ import { getContractTokenTransfers } from '../../../../../lib/db';
 import { formatTokenAmount } from '@/lib/token-format';
 import { sanitizeLogo } from '@/lib/sanitize-logo';
 import { fetchNode } from '@/lib/node-api';
+import { nodeTokenRead } from '@/lib/explorer-reads';
 
 // ============================================================================
 // QRC-20 token detail: node /api/v1/token/{contract} + recent transfers
@@ -59,59 +60,64 @@ export async function GET(
     500,
   );
 
-  // Fetch token metadata from the node (authoritative on-chain state).
-  let info: TokenInfo | null = null;
+  // Token metadata from the node (authoritative on-chain state): "no token" only when the node says so (nodeTokenRead).
+  let status: number | null = null;
+  let body: unknown = null;
   try {
     const res = await fetchNode(`/api/v1/token/${encodeURIComponent(contract)}`);
-    if (res && res.ok) {
-      const body = await res.json().catch(() => null);
-      if (body?.success && body.token) {
-        const t = body.token as {
-          contract_address?: string; standard?: string; name?: string; symbol?: string; logo?: string;
-          decimals?: number; total_supply?: number | string; deployer?: string; deployed_at?: string;
-          total_minted?: number | string; total_burned?: number | string;
-        };
-        const decimals = typeof t.decimals === 'number' ? t.decimals : 9;
-        // total_supply is a u64 base-unit amount. The node now emits it as a JSON
-        // STRING, so res.json() hands us the exact digit string — pass it straight
-        // to formatTokenAmount with NO Number() round-trip (>2^53 safe). A number
-        // (legacy small values) is stringified without float error via toString.
-        let totalSupplyRaw = '0';
-        if (typeof t.total_supply === 'string') {
-          totalSupplyRaw = t.total_supply.trim() || '0';
-        } else if (typeof t.total_supply === 'number' && Number.isFinite(t.total_supply)) {
-          totalSupplyRaw = Math.trunc(t.total_supply).toString();
-        }
-        // Lifetime emission counters (base-unit digit strings, u128-safe); same parse as supply.
-        const rawStr = (v: number | string | undefined): string =>
-          typeof v === 'string' ? (v.trim() || '0')
-          : (typeof v === 'number' && Number.isFinite(v)) ? Math.trunc(v).toString() : '0';
-        info = {
-          contract_address: t.contract_address || contract,
-          standard: t.standard || 'qrc20',
-          name: t.name || '',
-          symbol: t.symbol || '',
-          logo: sanitizeLogo(t.logo),
-          decimals,
-          total_supply: formatTokenAmount(totalSupplyRaw, decimals),
-          total_supply_raw: totalSupplyRaw,
-          total_minted: formatTokenAmount(rawStr(t.total_minted), decimals),
-          total_burned: formatTokenAmount(rawStr(t.total_burned), decimals),
-          deployer: t.deployer || '',
-          deployed_at: t.deployed_at || '',
-        };
-      }
+    if (res) {
+      status = res.status;
+      body = await res.json().catch(() => null);
     }
   } catch {
-    // fall through — info stays null, handled below
+    status = null;
   }
-
-  if (!info) {
+  const read = nodeTokenRead(status, body);
+  if (read.kind === 'unavailable') {
+    console.warn(`[WARN][API] token_unavailable contract=${JSON.stringify(contract.slice(0, 64))} status=${status ?? 'none'}`);
+    return NextResponse.json({ success: false, error: 'unavailable' }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
+  }
+  if (read.kind === 'missing') {
     return NextResponse.json(
       { success: false, error: 'Token not found or not a QRC-20 contract' },
       { status: 404 }
     );
   }
+
+  const t = read.token as {
+    contract_address?: string; standard?: string; name?: string; symbol?: string; logo?: string;
+    decimals?: number; total_supply?: number | string; deployer?: string; deployed_at?: string;
+    total_minted?: number | string; total_burned?: number | string;
+  };
+  const decimals = typeof t.decimals === 'number' ? t.decimals : 9;
+  // total_supply is a u64 base-unit amount. The node now emits it as a JSON
+  // STRING, so res.json() hands us the exact digit string — pass it straight
+  // to formatTokenAmount with NO Number() round-trip (>2^53 safe). A number
+  // (legacy small values) is stringified without float error via toString.
+  let totalSupplyRaw = '0';
+  if (typeof t.total_supply === 'string') {
+    totalSupplyRaw = t.total_supply.trim() || '0';
+  } else if (typeof t.total_supply === 'number' && Number.isFinite(t.total_supply)) {
+    totalSupplyRaw = Math.trunc(t.total_supply).toString();
+  }
+  // Lifetime emission counters (base-unit digit strings, u128-safe); same parse as supply.
+  const rawStr = (v: number | string | undefined): string =>
+    typeof v === 'string' ? (v.trim() || '0')
+    : (typeof v === 'number' && Number.isFinite(v)) ? Math.trunc(v).toString() : '0';
+  const info: TokenInfo = {
+    contract_address: t.contract_address || contract,
+    standard: t.standard || 'qrc20',
+    name: t.name || '',
+    symbol: t.symbol || '',
+    logo: sanitizeLogo(t.logo),
+    decimals,
+    total_supply: formatTokenAmount(totalSupplyRaw, decimals),
+    total_supply_raw: totalSupplyRaw,
+    total_minted: formatTokenAmount(rawStr(t.total_minted), decimals),
+    total_burned: formatTokenAmount(rawStr(t.total_burned), decimals),
+    deployer: t.deployer || '',
+    deployed_at: t.deployed_at || '',
+  };
 
   // Recent transfers: real transfer logs from the effect-sourced token_transfers
   // index (success-gated). Amount is a u64 base-unit string, scaled by the token's
@@ -130,7 +136,7 @@ export async function GET(
         std: r.std,
         token_id: r.token_id,
         // NFTs (qrc721) render as "#<token_id>", never scaled by decimals.
-        amount: isNft ? `#${r.token_id}` : formatTokenAmount(r.amount, info!.decimals),
+        amount: isNft ? `#${r.token_id}` : formatTokenAmount(r.amount, info.decimals),
         amountRaw: r.amount,
         method: r.kind,
         block: r.block,

@@ -5,9 +5,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import bs58 from 'bs58';
+import { TEXTS } from './texts-helper.mjs';
+import { read, repo } from './source.mjs';
 import {
   COOLDOWN_MESSAGE,
-  COOLDOWN_TEXT,
   EXTENSION_STORE_URL,
   QNET_RDNS,
   DETECT_MS,
@@ -148,36 +149,36 @@ test('readAccounts is passive and reads every failure as not connected', async (
   assert.equal(await readAccounts(throwing), null);
 });
 
+// A failure names the key of its fixed text (src/i18n/locales/en.ts); the tests read its English.
 test('requestAccounts maps protocol errors to fixed texts', async () => {
   const ok = await requestAccounts(mockProvider({ qnet_requestAccounts: async () => ({ qnet: EON, solana: SOL }) }));
   assert.deepEqual(ok, { ok: true, accounts: { qnet: EON, solana: SOL } });
 
   const rejected = await requestAccounts(mockProvider({ qnet_requestAccounts: () => Promise.reject({ code: 4001, message: '<b>spoof</b>' }) }));
   assert.equal(rejected.ok, false);
-  assert.equal(rejected.message, 'The connection was rejected in the wallet.');
+  assert.equal(TEXTS[rejected.message], 'The connection was rejected in the wallet.');
 
   const empty = await requestAccounts(mockProvider({ qnet_requestAccounts: async () => ({}) }));
   assert.equal(empty.ok, false);
-  assert.match(empty.message, /not valid/);
+  assert.match(TEXTS[empty.message], /not valid/);
 
   const unsupported = await requestAccounts(mockProvider({}));
   assert.equal(unsupported.ok, false);
-  assert.match(unsupported.message, /Update the extension/);
+  assert.match(TEXTS[unsupported.message], /Update the extension/);
 });
 
 test('connectErrorMessage covers the protocol codes', () => {
-  assert.match(connectErrorMessage({ code: 4100 }), /locked/);
-  assert.match(connectErrorMessage({ code: 4900 }), /disconnected/);
-  assert.equal(connectErrorMessage({ code: -32603, message: 'internal' }), 'The wallet did not connect. Try again.');
-  assert.equal(connectErrorMessage('string error'), 'The wallet did not connect. Try again.');
+  assert.match(TEXTS[connectErrorMessage({ code: 4100 })], /locked/);
+  assert.match(TEXTS[connectErrorMessage({ code: 4900 })], /disconnected/);
+  assert.equal(TEXTS[connectErrorMessage({ code: -32603, message: 'internal' })], 'The wallet did not connect. Try again.');
+  assert.equal(TEXTS[connectErrorMessage('string error')], 'The wallet did not connect. Try again.');
 });
 
 test('the approval cooldown (4001 with its fixed text) reads as too many declined requests', async () => {
   // applications/qnet-wallet CONTRACTS.md 4.5 and the in-app browser's provider carry this exact text.
   assert.equal(COOLDOWN_MESSAGE, 'Too many rejected requests from this site, try again later');
-  // The extension bars an origin until its oldest of 20 windows in 10 minutes is 10 minutes old: up to several minutes
-  // (XC-07).
-  assert.equal(COOLDOWN_TEXT, 'Too many declined requests. Try again in a few minutes.');
+  // The extension bars an origin until its oldest of 20 windows in 10 minutes is 10 minutes old: up to several minutes.
+  assert.equal(TEXTS.ext_failure_cooldown, 'Too many declined requests. Try again in a few minutes.');
   assert.equal(isApprovalCooldown({ code: 4001, message: COOLDOWN_MESSAGE }), true);
   assert.equal(isApprovalCooldown({ code: 4001, message: 'User rejected the request' }), false);
   assert.equal(isApprovalCooldown({ code: 4001, message: `${COOLDOWN_MESSAGE}.` }), false);
@@ -187,10 +188,10 @@ test('the approval cooldown (4001 with its fixed text) reads as too many decline
   Object.defineProperty(hostile, 'message', { get() { throw new Error('boom'); } });
   assert.equal(isApprovalCooldown(hostile), false);
 
-  assert.equal(connectErrorMessage({ code: 4001, message: COOLDOWN_MESSAGE }), COOLDOWN_TEXT);
-  assert.equal(connectErrorMessage({ code: 4001, message: 'User rejected the request' }), 'The connection was rejected in the wallet.');
+  assert.equal(connectErrorMessage({ code: 4001, message: COOLDOWN_MESSAGE }), 'ext_failure_cooldown');
+  assert.equal(TEXTS[connectErrorMessage({ code: 4001, message: 'User rejected the request' })], 'The connection was rejected in the wallet.');
   const cooled = await requestAccounts(mockProvider({ qnet_requestAccounts: () => Promise.reject({ code: 4001, message: COOLDOWN_MESSAGE }) }));
-  assert.deepEqual(cooled, { ok: false, message: COOLDOWN_TEXT });
+  assert.deepEqual(cooled, { ok: false, message: 'ext_failure_cooldown' });
 });
 
 test('Android is told apart for the explicit app launch', () => {
@@ -338,7 +339,7 @@ test('one failure mapping and one signature check, shared with the activation\'s
   assert.equal(isSolanaSignature(SIG), true);
   assert.equal(isSolanaSignature(PAY_TO), false);
   assert.equal(linkSignatureCheck, isSolanaSignature);
-  const link = readFileSync(new URL('../qnet-link.ts', import.meta.url), 'utf8');
+  const link = read('lib/qnet-link.ts');
   assert.doesNotMatch(link, /function providerFailure|function isSolanaSignature/);
 });
 
@@ -350,7 +351,7 @@ test('phones and tablets, iPadOS included, are told apart from desktops', () => 
   assert.equal(isPhoneLike({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/140.0 Safari/537.36', maxTouchPoints: 10 }), false);
   assert.equal(isPhoneLike(null), false);
   assert.equal(installTarget({ userAgent: mac, maxTouchPoints: 5 }).kind, 'mobile');
-  // SITE-5: an Android tablet in desktop mode (the common tablet browsers' default on large tablets) presents a
+  // An Android tablet in desktop mode (the common tablet browsers' default on large tablets) presents a
   // desktop Linux; its touch screen makes it a tablet, and Android for the app launch. A CrOS laptop stays a computer.
   const desktopMode = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
   const samsung = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/28.0 Chrome/130.0.0.0 Safari/537.36';
@@ -364,16 +365,31 @@ test('phones and tablets, iPadOS included, are told apart from desktops', () => 
   const chromebook = 'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
   assert.equal(isPhoneLike({ userAgent: chromebook, maxTouchPoints: 10 }), false);
   assert.equal(isAndroid({ userAgent: chromebook, maxTouchPoints: 10 }), false);
-  // A request shown as a QR code can be opened on this device too; the page still asks for its check number, and a
-  // button that opened nothing is told within NOT_OPENED_MS (SITE-14).
-  const waiting = readFileSync(new URL('../../components/cabinet/LinkWaiting.tsx', import.meta.url), 'utf8');
-  assert.match(waiting, /<QrCode text=\{state\.link\} label=\{t\('link_qr_label'\)\} \/>[\s\S]*?<a className="btn btn-text" href=\{openHref\(state\.link, android\)\}>\{t\('link_open_here'\)\}<\/a>/);
-  assert.match(waiting, /export const NOT_OPENED_MS = 2_500;/);
-  assert.match(waiting, /timer\.current = window\.setTimeout\(\(\) => \{\s*if \(document\.visibilityState === 'visible'\) setNotOpened\(true\);\s*\}, NOT_OPENED_MS\);/);
-  assert.match(waiting, /if \(document\.visibilityState === 'hidden'\) window\.clearTimeout\(timer\.current\);/);
-  assert.match(waiting, /\{notOpened && <p className="rq-failed" role="status">\{t\('link_not_opened'\)\}<\/p>\}/);
+  // A request shown as a QR code can be opened on this device too; the page still asks for its check number.
+  const waiting = read('components/cabinet/LinkWaiting.tsx');
+  assert.match(waiting, /<QrCode text=\{state\.link\} label=\{t\('link_qr_label'\)\} \/>[\s\S]*?<a className="btn btn-text" href=\{openHref\(state\.link, android\)\}>\{say\('link_open_here'\)\}<\/a>/);
 });
-// SITE-R2-11: official source names no other product. Comments describe browsers by what they do (a tablet browser in
+
+// Another app's built-in browser never hands the link to QNet Wallet, so the hint comes after 6 s on the page. It reads
+// as a condition (never a failure) while the request keeps waiting for the app's answer however long a hand-over takes,
+// and goes once the page leaves the screen (the app took the link).
+test('the hint for a QNet Wallet that has not opened comes after 6 s and never reads as a failure', () => {
+  const waiting = read('components/cabinet/LinkWaiting.tsx');
+  const ms = Number(/export const NOT_OPENED_MS = ([\d_]+);/.exec(waiting)?.[1].replace(/_/g, ''));
+  assert.equal(ms, 6_000, `NOT_OPENED_MS ${ms}`);
+  assert.match(waiting, /timer\.current = window\.setTimeout\(\(\) => \{\s*if \(document\.visibilityState === 'visible'\) setNotOpened\(true\);\s*\}, NOT_OPENED_MS\);/);
+  assert.match(waiting, /if \(document\.visibilityState !== 'hidden'\) return;\s*window\.clearTimeout\(timer\.current\);\s*setNotOpened\(false\);/);
+  assert.match(waiting, /\{notOpened && <p className="note" role="status">\{say\('link_not_opened'\)\}<\/p>\}/);
+  assert.doesNotMatch(waiting, /notOpened && <p className="rq-failed"/);
+  // The hint sits beside the request's own countdown, which keeps running: nothing ends the request on it.
+  assert.match(waiting, /<OpenApp href=\{openHref\(state\.link, android\)\} \/>\s*<p className="note">\{say\('link_open_note'\)\}<\/p>\s*\{wait\}/);
+  assert.match(TEXTS.link_not_opened, /^If QNet Wallet has not opened yet, /);
+  assert.match(TEXTS.link_not_opened, /This page keeps waiting for the answer\.$/);
+  const doc = repo('docs/applications/explorer.md').replace(/\s+/g, ' ');
+  assert.ok(doc.includes(`after ${ms / 1000} s still on the page (\`NOT_OPENED_MS\`) a note says what to do if QNet Wallet has not opened`), 'explorer.md');
+  assert.ok(doc.includes('The note is worded as a condition, never as a failure'), 'explorer.md');
+});
+// Official source names no other product. Comments describe browsers by what they do (a tablet browser in
 // desktop mode, a browser without Object.hasOwn); user-agent tokens stay in the code that matches them.
 test('no comment of the site\'s source names a browser product', () => {
   const PRODUCTS = /\b(Chrome|Chromium|ChromeOS|Chromebook|Safari|Samsung Internet|Firefox|Brave|Opera|Edge|WebKit)\b/;
@@ -391,7 +407,7 @@ test('no comment of the site\'s source names a browser product', () => {
   }
   assert.deepEqual(found, []);
 });
-// Owner, 20.10: the header's Connect wallet and My node's main action are one function, by device. A phone or tablet
+// The header's Connect wallet and My node's main action are one function, by device. A phone or tablet
 // opens QNet Wallet and is never offered the extension; a computer asks the extension it has, or without one gets the
 // extension's store page at once; nothing is offered while the wallet is still being detected.
 const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36';

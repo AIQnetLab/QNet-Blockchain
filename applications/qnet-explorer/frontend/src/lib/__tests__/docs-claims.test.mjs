@@ -3,21 +3,18 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { ERROR_CODES, parseLink, validateActivation } from '../qnet-link.ts';
-import { COOLDOWN_TEXT } from '../qnet-provider.ts';
-
-const REPO = new URL('../../../../../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, REPO), 'utf8').replace(/\r\n/g, '\n');
+import { REPO, read as site, repo as read } from './source.mjs';
+import { TEXTS } from './texts-helper.mjs';
 const flat = (text) => text.replace(/\s+/g, ' ');
 
-// Wording from before the owner's correction of 26.09, when the phone burned for a request of aiqnet.io/activate.
+// Wording of a phone that burns for a request of aiqnet.io/activate, which no document may say.
 const APP_BURNS = [
   /the mobile app, only for an activation request from aiqnet\.io\/activate/i, /by the app for a confirmed aiqnet\.io\/activate request/i,
   /\| Light \| Mobile app only \| Activation code of the wallet's burn/,
 ];
 
-// Owner corrections 26.09: the cabinet's one-time payment key burns a Light activation (src/lib/cabinet/payment-key.ts)
+// The cabinet's one-time payment key burns a Light activation (src/lib/cabinet/payment-key.ts)
 // and the extension burns with the wallet's own key; QNet Wallet makes no burn and takes no code (revision 2 links carry
 // connect, link, claim, reserve and unlink only, src/lib/qnet-link.ts).
 test('the README and the operator guide name the two places that burn, and what the app does', () => {
@@ -32,7 +29,6 @@ test('the README and the operator guide name the two places that burn, and what 
     for (const pattern of APP_BURNS) assert.doesNotMatch(text, pattern, `${name}: ${pattern}`);
   }
   // What the site does: the payment key signs the burn; the code names the wallet (flow.ts receiptCode).
-  const site = (p) => read(`applications/qnet-explorer/frontend/src/${p}`);
   assert.match(site('lib/cabinet/payment-key.ts'), /export async function signBurn\(/);
   assert.match(site('lib/cabinet/flow.ts'), /activationCode\('light', wallet, record\.burn\.tx, record\.burn\.amount\)/);
 });
@@ -44,7 +40,7 @@ test('the protocol: HISTORY_TOO_LONG and the site\'s codes agree; pending covers
   assert.deepEqual(codes, [...ERROR_CODES]);
   const text = flat(protocol);
   assert.match(text, /\| `HISTORY_TOO_LONG` \| Solana was read, but this wallet's burn history could not be searched back to its start in one attempt/);
-  // R5-ESA-03 / XP-R5-01: the burn no code derives from, in the table and in the app's order of checks.
+  // The burn no code derives from, in the table and in the app's order of checks.
   assert.match(text, /\| `BURN_UNUSABLE` \| the wallet already made a 1DEV burn of its own that yields no Light or Super code: a successful Token-program burn of the cluster's 1DEV mint that the wallet paid for, signed and authorized, with another memo \(such as `QNET_NODE_TYPE:FULL`\) or from a 1DEV token account other than the associated one/);
   assert.match(text, /a burn of the wallet's own that yields no code \(section 7, `BURN_UNUSABLE`\), finalized or confirmed, among the candidates of that search or burned from any other of the wallet's 1DEV token accounts \(every such burn is a transaction the wallet signed, so it lists in the history of the wallet's own address, a closed account's included\) → `BURN_UNUSABLE`; a search for such burns that has not reached the start of that history fails closed as above; the QNet Blockchain wallet already has a node → `NODE_EXISTS`/);
   assert.match(text, /A burn of the wallet's own that yields no code, found as in section 8, is answered `BURN_UNUSABLE` without burning\./);
@@ -58,17 +54,16 @@ test('the protocol: HISTORY_TOO_LONG and the site\'s codes agree; pending covers
   assert.match(view, /const unknown: ExtensionFailure\[\] = \['timeout', 'failed', 'unverifiable', 'disconnected'\];/);
   assert.doesNotMatch(text, /While a phone `activate` request is being made or shown/);
   assert.match(text, /answered before any search, so an unreadable Solana still gets `pending` for it/);
-  // XP-R5-03: no longer an open item; section 7.1 names the burn that lost.
+  // Not an open item: section 7.1 names the burn that lost.
   assert.doesNotMatch(text, /Open item: two devices of one wallet/);
   assert.match(text, /### 7\.1 A burn another device's older burn beat: `supersededBurnTx` Two devices of one wallet can each send a burn before either burn is visible to the other/);
   // The site's own comment no longer carries the old premise.
   assert.doesNotMatch(read('applications/qnet-explorer/frontend/src/lib/activate-view.ts'), /before Solana finalizes it/);
 });
 
-// MOBLINK-R3-03, XP-R3-06, R3-XPD-04, R3-XPD-11: the normative protocol and the wallet docs had fallen behind
-// the code (a five-minute drop rule, HISTORY_TOO_LONG "not sent yet", a one-page in-flight check, a stale
-// open item, Confirm timing, the in-app browser "loading" link pages, the extension's rejection rule). Each
-// statement is pinned here next to the code it describes. The app no longer burns (revision 2, section 14), so
+// The normative protocol and the wallet docs follow the code (the drop rule, HISTORY_TOO_LONG, the in-flight
+// check, Confirm timing, the in-app browser's link pages, the extension's rejection rule): each statement is
+// pinned here next to the code it describes. The app no longer burns (revision 2, section 14), so
 // only the extension's burn code is read.
 test('the protocol and the wallet docs describe the rules the wallets run', async () => {
   const protocol = flat(read('docs/protocols/qnet-link-v1.md'));
@@ -89,10 +84,8 @@ test('the protocol and the wallet docs describe the rules the wallets run', asyn
   // The in-flight check pages the confirmed history, at most 20 pages in 30 s, and fails closed.
   assert.match(protocol, /at most 20 pages in 30 s \(a check that cannot get that far fails closed: `SOLANA_UNAVAILABLE`, or `HISTORY_TOO_LONG` when its time ran out\)/);
 
-  // Two devices' burns. R4-SRA-02, R4-MOBLINK-03, R4-XPD-02: "nothing was burned" is never said after a device's
-  // own burn went through (MOBLINK-R3-01). XP-R5-03: the protocol names that burn on the wire (section 7.1,
-  // supersededBurnTx), whatever the older burn's node type, so the extension's old INTERNAL for another node type
-  // is gone from it.
+  // Two devices' burns: "nothing was burned" is never said after a device's own burn went through. The protocol
+  // names that burn on the wire (section 7.1, supersededBurnTx), whatever the older burn's node type.
   assert.doesNotMatch(protocol, /today the app answers `ok` with its own burn and code/);
   assert.doesNotMatch(protocol, /its screen says the wallet already had its activation and nothing was burned/);
   assert.doesNotMatch(protocol, /the app keeps no record of its own later burn/);
@@ -138,17 +131,15 @@ test('the protocol and the wallet docs describe the rules the wallets run', asyn
     assert.match(config, new RegExp(`\\b${name}: ${value},`), name);
   }
   for (const text of [protocol, browserDoc]) assert.match(text, /at most 5 within a minute and 20 within 10 minutes/);
-  // The cooldown the site names, as the site's own text has it (XC-07: the bar can last several minutes).
-  assert.ok(protocol.includes(`the site says "${COOLDOWN_TEXT}"`), `the protocol quotes the site's text: ${COOLDOWN_TEXT}`);
+  // The cooldown the site names, as the site's own text has it in English (the bar can last several minutes).
+  assert.ok(protocol.includes(`the site says "${TEXTS.ext_failure_cooldown}"`), `the protocol quotes the site's text: ${TEXTS.ext_failure_cooldown}`);
 
   // The extension's answer names the wallet's own Solana address as the burner, the only one it burns from.
   assert.match(provider, /&& b\.solanaAddress === current\.solanaAddress;/);
   assert.doesNotMatch(provider, /legacy/);
 });
 
-// XP-R4-06, R4-ERP-04, XP-R4-03, R4-XPD-01: the extension doc still described the old capped search (20
-// pages, 50 candidates, the wallet's own address) and a confirm armed after 1 second by any trusted click;
-// the protocol limited NO_WALLET to the app.
+// The extension doc describes the search, the confirm's arming and NO_WALLET as the code does them.
 test('the extension doc and the protocol describe its burn search, NO_WALLET and the approval window as the code has them', () => {
   const protocol = flat(read('docs/protocols/qnet-link-v1.md'));
   const browserDoc = flat(read('docs/applications/browser-wallet.md'));
@@ -190,13 +181,13 @@ test('the extension doc and the protocol describe its burn search, NO_WALLET and
   assert.match(config, /CONFIRM_ARM_VALUE_MS: 1500,/);
   assert.match(approve, /const TX_KINDS = new Set\(\['sendTransaction', 'tokenTransfer', 'contractCall'\]\);/);
   assert.match(approve, /const delay = TX_KINDS\.has\(next\.kind\) \? TIMINGS\.CONFIRM_ARM_VALUE_MS : TIMINGS\.CONFIRM_ARM_MS;/);
-  // No password in an approval window while the wallet is unlocked (29.09): the armed press, and the burn's checkbox.
+  // No password in an approval window while the wallet is unlocked: the armed press, and the burn's checkbox.
   assert.match(approve, /armConfirm\(confirm, \(\) => runActivation\(next, mode\), \(\) => ack === null \|\| ack\.checked,\s+TIMINGS\.CONFIRM_ARM_VALUE_MS\);/);
   assert.match(approve, /for \(const type of \['pointerdown', 'pointerup', 'keydown'\]\) window\.addEventListener\(type, restart/);
   assert.match(approve, /return event\.isTrusted === true && Number\.isInteger\(event\.detail\) && event\.detail >= 1/);
   assert.match(approve, /ready = message\.seen;/);
   assert.match(provider, /await api\.windows\.getAll\(\{ windowTypes: \['normal'\] \}\)/);
-  // Under the extension's toolbar icon: the top-right corner of that window (owner, 30.09; extension decision 37).
+  // Under the extension's toolbar icon: the top-right corner of that window.
   assert.match(provider, /left: area\.left \+ Math\.max\(0, area\.width - APPROVAL_WINDOW\.width - APPROVAL_EDGE\.right\)/);
   assert.match(browserDoc, /The confirm button arms 1 second after the window was last left alone, 1\.5 seconds for every transaction and every node activation window: any press, release or key anywhere in the window before it armed starts the wait again/);
   assert.match(browserDoc, /Enter or Space on the focused button never confirms/);
@@ -204,7 +195,7 @@ test('the extension doc and the protocol describe its burn search, NO_WALLET and
   assert.match(browserDoc, /It opens under the extension's toolbar icon: the top-right corner of one of the user's normal browser windows \(the focused one, otherwise one of them at random\)/);
 
   // A wallet's activation is the oldest valid burn of its own Solana address. The store's 2.1.x wallet moves into this
-  // version (earlier.js, 06.10) by its recovery phrase alone, so no earlier address takes part in an activation: the
+  // version (earlier.js) by its recovery phrase alone, so no earlier address takes part in an activation: the
   // protocol never names 2.1.x, and the browser document names it only where it describes that move.
   assert.match(protocol, /the extension elects it so, and every client that looks up a wallet's activation MUST elect the same one\. Vector: `burnOrder` \(section 13\)/);
   for (const text of [protocol, browserDoc]) assert.doesNotMatch(text, /previousAddress|previous Solana address/);
@@ -216,15 +207,14 @@ test('the extension doc and the protocol describe its burn search, NO_WALLET and
   const releaseNotes = browserDoc.slice(browserDoc.indexOf('## Store release notes'), browserDoc.indexOf('## Languages'));
   assert.match(moveParagraph, /^- \*\*A wallet of the earlier version\.\*\* The store's 2\.1\.x kept its wallet/);
   assert.match(moveParagraph, /the worker takes only the wallet's recovery phrase, never the keys stored beside it/);
-  assert.match(releaseNotes, /^## Store release notes 3\.1\.6: a copied recovery phrase, private key or activation code leaves the clipboard on time also after the popup closes[\s\S]* Deleting or resetting the wallet keeps a wallet of version 2\.1 that is still in the browser[\s\S]* 3\.1\.2: the first screen offers \*\*Create a new wallet\*\*[\s\S]* 3\.1\.0: a wallet created in version 2\.1 moves into this version\./);
+  assert.match(releaseNotes, /^## Store release notes 3\.1\.7: [\s\S]* 3\.1\.6: a copied recovery phrase, private key or activation code leaves the clipboard on time also after the popup closes[\s\S]* Deleting or resetting the wallet keeps a wallet of version 2\.1 that is still in the browser[\s\S]* 3\.1\.2: the first screen offers \*\*Create a new wallet\*\*[\s\S]* 3\.1\.0: a wallet created in version 2\.1 moves into this version\./);
   assert.doesNotMatch(browserDoc.replace(moveParagraph, '').replace(releaseNotes, ''), /2\.1\.x|version 2\.1\b/);
   assert.doesNotMatch(extActivation, /earlier\.js|previousAddress|readEarlierWallet/);
   assert.match(extActivation, /if \(scan\.canonical\) return \{ status: 'exists', activation: await storeCanonical\(scan\.canonical, owner\) \};/);
 });
 
-// R3-XPD-07: the same phrase is the same wallet everywhere only in its canonical spelling. The extension and
-// the app canonicalize an imported phrase alike (R5-XPD-03: the doc still said the app refuses other
-// spellings), and the node derives from the text as written.
+// The same phrase is the same wallet everywhere only in its canonical spelling. The extension and the app
+// canonicalize an imported phrase alike, and the node derives from the text as written.
 test('the docs and the site say that a node takes the phrase only in its canonical spelling', () => {
   const browserDoc = flat(read('docs/applications/browser-wallet.md'));
   assert.doesNotMatch(browserDoc, /The mobile wallet and the node derive the same values\. /);
@@ -237,15 +227,13 @@ test('the docs and the site say that a node takes the phrase only in its canonic
   assert.doesNotMatch(browserDoc, /refuses a phrase in any other spelling|instead of canonicalizing it|\(the mobile wallet does not/);
   assert.match(browserDoc, /The mobile wallet canonicalizes an imported phrase exactly as the extension does/);
   assert.match(flat(read('docs/operators/running-a-node.md')), /Write the mnemonic exactly in its canonical form: the 12 or 24 words in lowercase, on one line, separated by single spaces/);
-  // The cabinet's super-node next step (components/cabinet/NextSteps.tsx SuperNext, text in src/lib/texts.ts).
-  const site = flat(read('applications/qnet-explorer/frontend/src/lib/texts.ts'));
-  assert.match(site, /Write the phrase as its words in lowercase, on one line, separated by single spaces\. The node uses the text as written and does not check it/);
+  // The cabinet's super-node next step (components/cabinet/NextSteps.tsx SuperNext, text in src/i18n/locales/en.ts).
+  assert.match(TEXTS.ext_super_spelling, /Write the phrase as its words in lowercase, on one line, separated by single spaces\. The node uses the text as written and does not check it/);
   assert.match(read('applications/qnet-explorer/frontend/src/components/cabinet/NextSteps.tsx'), /<p className="note">\{t\('ext_super_spelling'\)\}<\/p>/);
 });
 
-// R5-XPD-03: the extension's public document contradicted the shipped code: content scripts on www. and
-// explorer., a prefix list without 'register:' and 'migrate:', an upgrade that "deletes every earlier storage
-// key", and no word of BURN_UNUSABLE or the other 1DEV token accounts. The hosts and the prefixes are compared
+// The extension's public document says what the shipped code does: where content scripts run, the prefix list,
+// what an upgrade keeps, BURN_UNUSABLE and the other 1DEV token accounts. The hosts and the prefixes are compared
 // with manifest.json and message.js; the other statements are pinned next to the code.
 test('the extension doc names the manifest\'s hosts, the signing prefixes and BURN_UNUSABLE as the code has them', () => {
   const raw = read('docs/applications/browser-wallet.md');
@@ -273,7 +261,7 @@ test('the extension doc names the manifest\'s hosts, the signing prefixes and BU
   assert.match(message, /const head = message\.replace\(PREFIX_NOISE, ''\)\.normalize\('NFKC'\)\.toLowerCase\(\);/);
   assert.match(doc, /checked after every whitespace and invisible character anywhere in the text is removed and the rest folded \(NFKC, lowercase\)/);
 
-  // The store's 2.1.x wallet moves into this version (earlier.js, M-4, 06.10): both documents describe what the move
+  // The store's 2.1.x wallet moves into this version (earlier.js): both documents describe what the move
   // reads and takes as the code has it, and neither names a previous-address code or a list of previous addresses,
   // which 2.x had and this version does not.
   const contracts = flat(read('applications/qnet-wallet/CONTRACTS.md'));
@@ -317,7 +305,7 @@ test('the extension doc names the manifest\'s hosts, the signing prefixes and BU
   }
 });
 
-// ERP-R5-02, R5-XPD-03: the extension's round-5 behaviour in its public document, each statement next to the code:
+// The extension's behaviour in its public document, each statement next to the code:
 // the result guard's full exception list, the message rules for a lone carriage return and the typographic spaces,
 // the qnet_sendTransaction result and the (from, nonce) identity, the approval window's one-window placement,
 // "In a block", refused and resent transfers, the search of the transactions the wallet signed, and the superseded
@@ -368,20 +356,21 @@ test('the extension doc states the round-5 behaviour as the code has it', () => 
   assert.match(provider, /created = await api\.windows\.create\(\{ url, \.\.\.APPROVAL_WINDOW \}\);/);
   assert.match(doc, /when Chrome refuses the position it opens once more where Chrome places it by default/);
 
-  // History and pending transfers: Pending / Confirmed / Failed (28.09), Not found / Unverified (06.10: a row resolves),
-  // a token row this wallet sent confirmed by its call (18.10), refused transfers, the resend intervals, the per-nonce
+  // History and pending transfers: Pending / Confirmed / Failed, Not found / Unverified (a row resolves), a token row
+  // this wallet sent confirmed by its call, refused transfers, the resend intervals, the per-nonce
   // reserve.
   assert.match(en, /historyConfirmed: 'Confirmed',/);
   assert.match(en, /historyNotFound: 'Not found',/);
   assert.match(doc, /Confirmed when two pinned nodes list it alike \(a token row: its call, when this wallet sent it, or its logs proof verifies\), Failed when another transaction took its nonce, Not found for a dropped transfer, Unverified for an archive row no two pinned nodes list/);
-  assert.match(qnet, /return verdict === 'verified' \|\| \(verdict !== 'rejected' && item\.direction !== 'in' && confirmed\.has\(identityOf\(item\)\)\);/);
+  assert.match(qnet, /const agreed = \(item\) => confirmed\.has\(identityOf\(item\)\) \|\| lookedUp\(item\);/);
+  assert.match(qnet, /return verdict === 'verified' \|\| \(verdict !== 'rejected' && item\.direction !== 'in' && agreed\(item\)\);/);
   assert.match(doc, /Two nodes listing a row says it is in a block, not that it applied/);
   assert.match(qnet, /const RESUBMIT_INTERVAL_MS = 30000;/);
   assert.match(qnet, /const RESEND_ACCEPTED_MS = 10 \* 60 \* 1000;/);
   assert.match(qnet, /const PENDING_TRANSFER_TTL_MS = 60 \* 60 \* 1000;/);
   assert.match(config, /PENDING_TRANSFERS_MAX: 16,/);
   assert.match(qnet, /outcome: 'refused'/);
-  assert.match(qnet, /if \(replaceNonce === null\) replaceNonce = defaultReplaceNonce\(outstanding, confirmed, Date\.now\(\)\);/);
+  assert.match(qnet, /if \(replaceNonce === null\) replaceNonce = defaultReplaceNonce\(outstanding, confirmed, Date\.now\(\), address\);/);
   assert.doesNotMatch(doc, /leaves the list when a verified read shows its nonce confirmed, or after one hour/);
   for (const phrase of [
     /up to 16 can be pending at once, one place kept free for a replace/,
@@ -391,7 +380,7 @@ test('the extension doc states the round-5 behaviour as the code has it', () => 
     /the next transfer takes its nonce by default, so the two can never both be paid/,
   ]) assert.match(doc, phrase);
 
-  // No 2.x address to empty any more (28.09): its sweep and its unread cluster are gone.
+  // No 2.x address to empty: its sweep and its unread cluster are gone.
   assert.doesNotMatch(config, /LEGACY_/);
   assert.doesNotMatch(doc, /LEGACY_UNCHECKED/);
 
@@ -405,7 +394,7 @@ test('the extension doc states the round-5 behaviour as the code has it', () => 
   assert.doesNotMatch(doc, /does not carry yet/);
 });
 
-// XP-R5-03: the protocol's optional answer key, its rows and its order of checks, the vectors and the site's
+// The protocol's optional answer key, its rows and its order of checks, the vectors and the site's
 // validator agree.
 test('the protocol, the vectors and the site agree on supersededBurnTx', async () => {
   const protocol = flat(read('docs/protocols/qnet-link-v1.md'));
@@ -425,7 +414,7 @@ test('the protocol, the vectors and the site agree on supersededBurnTx', async (
   assert.ok(reasons.has('supersededBurnTx'));
 });
 
-// R3-XPD-11: the order of two burns in one slot is part of the protocol, with a vector, and the extension, the
+// The order of two burns in one slot is part of the protocol, with a vector, and the extension, the
 // wallet that burns, uses it (the vector is recomputed here with the reference and with its comparator).
 test('the burn order: protocol section 3, the vector, and the extension\'s rule', async () => {
   const protocol = flat(read('docs/protocols/qnet-link-v1.md'));
@@ -444,10 +433,12 @@ test('the burn order: protocol section 3, the vector, and the extension\'s rule'
   }
 });
 
-// explorer.md's /api/cabinet rows said 10 registrations per client per 10 minutes while limits.ts allows 30 (29.09):
-// each row's numbers are read from CABINET_LIMITS and KEYED_LIMITS.
+// explorer.md's /api/cabinet rows state each route's limits: each row's numbers are read from CABINET_LIMITS and
+// KEYED_LIMITS.
 test('explorer.md states the cabinet routes\' limits as limits.ts has them', async () => {
   const { CABINET_LIMITS: C, KEYED_LIMITS: K } = await import('../../server/cabinet/limits.ts');
+  const { ADMIT_HOLD_MS } = await import('../cabinet/registration.ts');
+  const { SENT_KEPT } = await import('../../server/cabinet/register.ts');
   const doc = flat(read('docs/applications/explorer.md'));
   const perMinute = (l) => { assert.equal(l.windowMs, 60_000); return l.max; };
   const perTen = (l) => { assert.equal(l.windowMs, 600_000); return l.max; };
@@ -455,9 +446,84 @@ test('explorer.md states the cabinet routes\' limits as limits.ts has them', asy
     `then ${perMinute(C.node)} requests per minute per client with a limiter store of the cabinet's own`,
     `Per client ${perMinute(C.price)}, ${perMinute(C.payment)}, ${perMinute(C.blockhash)}, ${perMinute(C.tx)} and ${perMinute(C.send)} per minute; \`send\` also ${perTen(K.send)} per payment address per 10 min`,
     `one submit in flight per node; ${perTen(C.register)} per client per 10 min and ${perTen(K.register)} per node`,
+    `or for ${ADMIT_HOLD_MS / 60_000} minutes after a node admitted it (\`ADMIT_HOLD_MS\``,
+    `up to ${SENT_KEPT.toLocaleString('en-US')} are kept`,
     `(30 s cache, ${perMinute(C.registration)} per client per minute)`,
   ]) assert.ok(doc.includes(claim), claim);
-  // Owner, 11.10: the site has no "I'm back", so no wake route and no wake limit.
+  // The site has no "I'm back", so no wake route and no wake limit.
   assert.ok(!('wake' in C) && !('wake' in K));
   assert.doesNotMatch(doc, /\/api\/cabinet\/wake|I'm back/);
+});
+
+// The page's request budgets (site-request.ts, the reservation's, the registration's, the faucet claim's) as explorer.md and the protocol's
+// site behaviour state them.
+test('explorer.md and the protocol state the page\'s request budgets as the code has them', async () => {
+  const { SITE_REQUEST_MS } = await import('../site-request.ts');
+  const { RESERVE_REQUEST_MS } = await import('../cabinet/activation.ts');
+  const { REGISTER_REQUEST_MS } = await import('../cabinet/consent-submit.ts');
+  const { SUBMIT_TIMEOUT_MS } = await import('../cabinet/registration.ts');
+  const { FAUCET_CLAIM_MS, FAUCET_CLAIM_REQUEST_MS } = await import('../faucet-handover.ts');
+  const { CONFIRM_POLL_MS } = await import('../../server/solana-rpc.ts');
+  const { RPC_CALL_MS } = await import('../../server/solana-endpoint.ts');
+  const s = (ms) => `${ms / 1000} s`;
+  const explorer = flat(read('docs/applications/explorer.md'));
+  for (const claim of [
+    `ends after ${s(SITE_REQUEST_MS)} without its answer (\`src/lib/site-request.ts\` \`SITE_REQUEST_MS\`), a reservation after ${s(RESERVE_REQUEST_MS)}`,
+    `registration after ${s(REGISTER_REQUEST_MS)} (\`REGISTER_REQUEST_MS\`: the site's ${s(SUBMIT_TIMEOUT_MS)} wait for the node, \`SUBMIT_TIMEOUT_MS\`, and ${s(REGISTER_REQUEST_MS - SUBMIT_TIMEOUT_MS)} more)`,
+    `the balance check) ends after ${s(SITE_REQUEST_MS)} without its answer (\`src/lib/site-request.ts\` \`SITE_REQUEST_MS\`), and a search typed further`,
+    `A claim answers once its transfer landed, and at most ${s(FAUCET_CLAIM_MS)} after the route took it (\`FAUCET_CLAIM_MS\` in \`src/lib/faucet-handover.ts\`): the blockhash and the send, each Solana call at most ${s(RPC_CALL_MS)} (\`RPC_CALL_MS\`), then a confirmation read every ${s(CONFIRM_POLL_MS)} (\`CONFIRM_POLL_MS\`) until the transfer lands, fails or its blockhash expires`,
+    `the page waits ${s(FAUCET_CLAIM_REQUEST_MS)} for the pair (\`FAUCET_CLAIM_REQUEST_MS\`, a read more)`,
+  ]) assert.ok(explorer.includes(claim), claim);
+  const claim = `ends after ${s(SITE_REQUEST_MS)} without its answer (\`SITE_REQUEST_MS\``;
+  assert.ok(flat(read('docs/protocols/qnet-link-v1.md')).includes(claim), claim);
+});
+
+// explorer.md states the Latest blocks strip, an address page's title with the whole address under it, a list's From / To
+// on one line and the Overview opening after an activation as the pages have them, and none of the layouts they replaced.
+test('explorer.md states the Latest blocks strip, an address\'s title, From / To and a finished activation as the pages have them', () => {
+  const doc = flat(read('docs/applications/explorer.md'));
+  for (const stale of ['Latest blocks beside All transactions', '12 rows (6 on a phone)', 'Beside All transactions from 1,281 px wide', 'the short address as the title', 'From / To is two lines']) {
+    assert.ok(!doc.includes(stale), stale);
+  }
+  // The strip: its place, its count, its cards, Hide and the cookie that keeps it folded.
+  assert.ok(doc.includes('then the Latest blocks strip with All transactions below it'));
+  assert.ok(doc.includes('of the 14 newest blocks (`RECENT_BLOCKS` in `src/lib/explorer-view.ts`), each a card of 184 by 100 px (164 px wide under 720 px)'));
+  assert.match(site('lib/explorer-view.ts'), /export const RECENT_BLOCKS = 14;/);
+  const css = site('styles/explorer.css');
+  assert.match(css, /\.ex-chain \{ --card-h: 100px; --card-w: 184px; min-width: 0; \}/);
+  assert.match(css, /@media \(max-width: 720px\) \{\n(?: {2}[^\n]*\n)*? {2}\.ex-chain \{ --card-w: 164px; \}/);
+  assert.ok(doc.includes('the `qnet.blocks` cookie, written by Hide for a year on the explorer\'s path in the page\'s language'));
+  assert.match(site('lib/strip-pref.ts'), /export const STRIP_COOKIE = 'qnet\.blocks';\n[\s\S]*const KEEP_S = 365 \* 24 \* 60 \* 60;/);
+  assert.match(site('components/explorer/LatestBlocks.tsx'), /<Action kind="act" href="\/explorer\/blocks" className="ex-chain-all">/);
+  // An address's title, From / To, and the Overview after a finished activation.
+  assert.ok(doc.includes('the word Address as the title with the whole address under it, spaced at its structure, and Copy under that'));
+  assert.match(site('app/explorer/address/[address]/AddressClient.tsx'), /<>\{t\('sugg_address'\)\}<span className="ex-title-addr" translate="no"><AddressParts value=\{address\} \/><\/span><\/>/);
+  assert.ok(doc.includes('A list\'s From / To is one line, the sender, "to" in Fog and the recipient (`cells.tsx` `FromTo`)'));
+  assert.match(site('components/explorer/cells.tsx'), /\{!noTo && <span className="ex-ft-to">\{t\('party_to'\)\}<\/span>\}/);
+  assert.ok(doc.includes('A finished activation with nothing left to send back opens My node\'s Overview by itself (`NodeActivate.tsx`).'));
+  assert.match(site('components/cabinet/NodeActivate.tsx'), /const finished = record\?\.stage === 'done' && registered !== null && !mayReturnLeftovers\(record\);\n\s*useEffect\(\(\) => \{\n\s*if \(finished\) router\.replace\('\/node\?tab=overview'\);/);
+});
+
+// The layout of every page in every language as explorer.md states it: the home page's live row and column, a value's
+// character and icon, an Arabic letter's width, a detail row's Copy, the token methods' column, the payment code on a
+// tablet, and My node's bar and journey.
+test('explorer.md states the live blocks, a value\'s length, an Arabic letter, the payment code on a tablet and My node\'s bar as the site has them', () => {
+  const doc = flat(read('docs/applications/explorer.md'));
+  assert.ok(doc.includes('each a height, a link to its block, with its transaction count, under them the node that made it and its age, whose box holds the language\'s longest; three of the hero\'s twelve columns, four from 861 to 1,099 px'));
+  assert.match(site('styles/home.css'), /@media \(min-width: 861px\) and \(max-width: 1099px\) \{ \.stream \{ grid-column: 9 \/ span 4; \} \}/);
+  assert.doesNotMatch(site('app/HomeClient.tsx'), /blk-hash|short\('hash'/);
+  assert.ok(doc.includes('each character counts `--ro-ch` em (0.6 against the face\'s 0.57 em advance, 0.63 on Arabic, Chinese, Japanese and Korean pages, which drop the face\'s -0.03 em spacing), and the icon inside such a value stays 1.25 times its text at every size'));
+  assert.match(site('styles/tokens.css'), /\n {2}--ro-ch: \.6;\n/);
+  assert.match(site('styles/i18n.css'), /\n:root:is\(:lang\(ar\), :lang\(zh-CN\), :lang\(ja\), :lang\(ko\)\) \{ --ro-ch: \.63; \}\n/);
+  assert.ok(doc.includes('a value set smaller by its length (a readout\'s, a section\'s datum) an Arabic letter as 0.72 em (`ARABIC_VALUE_EM`'));
+  assert.match(site('lib/geometry.ts'), /\nexport const ARABIC_VALUE_EM = 0\.72;\n/);
+  assert.match(site('lib/geometry.ts'), /return textLength\(value, 0\.6, ARABIC_VALUE_EM\) \+/);
+  assert.ok(doc.includes('Where a detail row\'s Copy wraps under its value (a longer language\'s word), the two lines keep 10 px apart'));
+  assert.match(site('styles/explorer.css'), /\n\.ex \.kv :is\(\.ent-copy, \.ex-val\) \{ row-gap: 10px; \}\n/);
+  assert.ok(doc.includes('(Contract: the standard\'s methods, what each does on one line, the column as wide as the longest of them in the page\'s language)'));
+  assert.ok(doc.includes('a tablet\'s code in the second of its two columns; a test token\'s name longer than its line breaks between its words'));
+  assert.match(site('styles/cabinet.css'), /html\[data-device='ios'\] \.cab-manual, html\[data-device='android'\] \.cab-manual \{ grid-template-columns: minmax\(0, 1fr\) 196px; \}/);
+  assert.ok(doc.includes('On the bar a section\'s name is set smaller by its longest word where the section is narrower than that word (`--n-len`, four sections on a 320 px screen).'));
+  assert.ok(doc.includes('(`showJourney`), four steps across, two rows of two under 380 px.'));
+  assert.match(site('styles/cabinet.css'), /@media \(max-width: 379px\) \{\n {2}\.cab-journey \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); row-gap: 12px; \}\n\}/);
 });

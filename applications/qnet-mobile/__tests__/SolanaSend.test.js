@@ -11,15 +11,15 @@ import nacl from 'tweetnacl';
 import { PublicKey, Transaction } from '@solana/web3.js';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { makeT } from '../src/i18n';
-import { ONE_DEV_MINT } from '../src/config/nodes';
+import { ONE_DEV_MINT, SOLANA_RELAY_URL, getSolanaRpcUrl } from '../src/config/nodes';
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, associatedTokenAddress, base58Encode,
 } from '../src/crypto/SolanaTx';
 import {
-  SOLANA_TOKENS, heldTokenBase, loadSolanaSends, maxSendable, quoteSolanaSend, recordSolanaSend, solanaHistoryRow, solanaSendStatus,
-  submitSolanaSend, updateSolanaSend,
+  SOLANA_TOKENS, forgetSolanaRoute, heldTokenBase, loadSolanaSends, maxSendable, quoteSolanaSend, recordSolanaSend,
+  solanaHistoryRow, solanaSendStatus, submitSolanaSend, updateSolanaSend,
 } from '../src/services/SolanaSend';
-import SolanaSendForm, { cleanAmountInput, runSolanaSend, useSolanaSends } from '../src/screens/SolanaSend';
+import SolanaSendForm, { cleanAmountInput, refusalText, runSolanaSend, useSolanaSends } from '../src/screens/SolanaSend';
 
 const t = makeT('en');
 const seedPair = (n) => nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(n));
@@ -41,7 +41,8 @@ const tokenAccount = (owner, amount, mint = ONE_DEV_MINT, state = 'initialized')
   data: { program: 'spl-token', parsed: { type: 'account', info: { mint, owner, state, tokenAmount: { amount: String(amount), decimals: 6 } } }, space: 165 },
 });
 
-// A Solana RPC endpoint in memory: the methods the wallet calls, answered from `st`.
+// A Solana RPC endpoint in memory: the methods the wallet calls, answered from `st`, alike on the endpoint and on the
+// site's route, which passes the same call on (services/SolanaSend solanaRpc); no other address answers.
 function fakeRpc(over = {}) {
   const st = {
     balances: { [FROM]: 2 * LAMPORTS, [TO]: LAMPORTS },
@@ -63,6 +64,7 @@ function fakeRpc(over = {}) {
   global.fetch = jest.fn(async (url, init) => {
     const { method, params } = JSON.parse(init.body);
     calls.push({ url, method, params });
+    if (url !== getSolanaRpcUrl() && url !== SOLANA_RELAY_URL) throw new Error(`unexpected ${url}`);
     if (st.down) throw new Error('Network request failed');
     const ok = (result) => ({ result });
     const ctx = (value) => ok({ context: { slot: 1 }, value });
@@ -94,9 +96,11 @@ const sign = jest.fn(async (message) => nacl.sign.detached(message, SENDER.secre
 const wire = (b64) => Transaction.from(Buffer.from(b64, 'base64'));
 const coded = (code, params) => expect.objectContaining(params ? { code, params } : { code });
 
+// Each test starts on the direct route: nothing kept, nothing held in memory.
 beforeEach(async () => {
   sign.mockClear();
   await AsyncStorage.clear();
+  forgetSolanaRoute();
 });
 
 describe('the quote: everything a send needs, read now, and what the network would refuse', () => {
@@ -185,12 +189,7 @@ describe('the quote: everything a send needs, read now, and what the network wou
     expect(await maxSendable(FROM, '1DEV')).toBe('300');
     await expect(quoteSolanaSend({ from: FROM, to: TO, symbol: '1DEV', amount: '1500' })).rejects.toEqual(
       coded('SOL_SHORT_TOKEN', { need: '1,500 1DEV', balance: '300 1DEV' }));
-    // Both balances are read at 'confirmed', as the quote reads them (getBalance reads the answer with json()).
-    const rpc = global.fetch;
-    global.fetch = jest.fn(async (...args) => {
-      const r = await rpc(...args);
-      return { ...r, json: async () => JSON.parse(await r.text()) };
-    });
+    // Both balances are read at 'confirmed', as the quote reads them, by the one Solana client.
     expect(await wm.getBalance(FROM)).toBe(2);
     for (const c of calls.filter((x) => x.method === 'getBalance' || x.method === 'getTokenAccountsByOwner')) {
       expect([c.method, c.params[c.params.length - 1].commitment]).toEqual([c.method, 'confirmed']);
@@ -199,8 +198,7 @@ describe('the quote: everything a send needs, read now, and what the network wou
     fakeRpc({ tokenAccounts: {} });
     expect(await wm.getTokenBalance(FROM, ONE_DEV_MINT)).toBe(0);
     global.fetch = jest.fn(async () => ({
-      ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'busy' } }),
-      text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'busy' } }),
+      ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'busy' } }),
     }));
     expect(await wm.getTokenBalance(FROM, ONE_DEV_MINT)).toBe(null);
     expect(await wm.getBalance(FROM)).toBe(null);
@@ -487,6 +485,22 @@ describe('the Send screen flow (runSolanaSend): review, fresh check, signature, 
     expect(d.quote.mock.calls[0][0].request).toBe(null);
   });
 
+  it('a form closed while its quote was read is cancelled: no refusal, no review; a submit refused later still is one', async () => {
+    let open = true;
+    const closing = (result) => jest.fn(async () => { open = false; return result(); });
+    let d = deps({ formOpen: () => open, quote: closing(() => { throw Object.assign(new Error('x'), { code: 'SOL_SHORT_FEE' }); }) });
+    expect(await runSolanaSend(d)).toEqual({ outcome: 'cancelled' });
+    open = true;
+    d = deps({ formOpen: () => open, quote: closing(() => QUOTE) });
+    expect(await runSolanaSend(d)).toEqual({ outcome: 'cancelled' });
+    expect(d.reviewSend).not.toHaveBeenCalled();
+    expect(d.submit).not.toHaveBeenCalled();
+    // Closed after the user confirmed: the network's refusal of the submitted transfer is still said.
+    d = deps({ formOpen: () => open, submit: jest.fn(async () => { open = false; throw Object.assign(new Error('x'), { code: 'SOL_REFUSED' }); }) });
+    open = true;
+    expect(await runSolanaSend(d)).toMatchObject({ outcome: 'refused', submitted: true, error: { code: 'SOL_REFUSED' } });
+  });
+
   it('an unanswered submit is unknown; a refused one is a refusal after the submit', async () => {
     let d = deps({ submit: jest.fn(async () => ({ status: 'unknown', signature: 'SIG', lastValidBlockHeight: 7 })) });
     expect(await runSolanaSend(d)).toMatchObject({ outcome: 'unknown', entry: { signature: 'SIG', status: 'pending' } });
@@ -496,14 +510,13 @@ describe('the Send screen flow (runSolanaSend): review, fresh check, signature, 
 });
 
 describe('the Send screen itself, against the network in memory', () => {
-  // The wallet screen's part: the form's values as its state.
+  // The wallet screen's part: the form's values as its state; the token was chosen before the form opened.
   function Screen(props) {
-    const [symbol, setSymbol] = React.useState(props.symbol || 'SOL');
     const [address, setAddress] = React.useState('');
     const [amount, setAmount] = React.useState('');
     return (
       <SolanaSendForm
-        t={t} rtl={false} owner={FROM} symbol={symbol} onSymbol={setSymbol} address={address} onAddress={setAddress}
+        t={t} rtl={false} owner={FROM} symbol={props.symbol || 'SOL'} address={address} onAddress={setAddress}
         amount={amount} onAmount={setAmount} request={null} balances={{ SOL: '2', '1DEV': '5' }} backArrow="←"
         onBack={() => {}} onScan={props.onScan || (() => {})} known={[]} {...props}
       />
@@ -524,10 +537,11 @@ describe('the Send screen itself, against the network in memory', () => {
     const onResult = jest.fn();
     let tree;
     await act(async () => {
-      tree = renderer.create(<Screen reviewSend={reviewSend} confirmFresh={confirmFresh} sign={sign} onSent={onSent} onResult={onResult} />);
+      tree = renderer.create(<Screen symbol="1DEV" reviewSend={reviewSend} confirmFresh={confirmFresh} sign={sign} onSent={onSent} onResult={onResult} />);
     });
-    await act(async () => { byId(tree, 'solana-token-1DEV').props.onPress(); });
     expect(texts(tree)).toContain('Send 1DEV');
+    // No token switch on the form: the token picker chose it.
+    expect(tree.root.findAll((n) => /^solana-token-/.test(n.props.testID || ''))).toEqual([]);
     await act(async () => { byId(tree, 'solana-send-address').props.onChangeText(TO); });
     await act(async () => { byId(tree, 'solana-send-amount').props.onChangeText('2,5000001'); });
     expect(byId(tree, 'solana-send-amount').props.value).toBe('2.500000'); // six decimals at most, a comma read as a point
@@ -566,6 +580,43 @@ describe('the Send screen itself, against the network in memory', () => {
       error: 'Insufficient balance. Need 0.500005 SOL, including the 0.000005 SOL fee.\nYour balance: 0.4 SOL.',
     });
     await act(async () => { tree.unmount(); });
+  });
+
+  // With balances hidden a Solana refusal masks the figures it names, as a QNet one does.
+  it('with balances hidden, a refusal for want of SOL, a token or the fee, or for what would stay, masks every figure it names', async () => {
+    const { MASK } = require('../src/utils/amountFormat');
+    fakeRpc({ balances: { [FROM]: 400_000_000, [TO]: 0 } });
+    const onResult = jest.fn();
+    let tree;
+    await act(async () => {
+      tree = renderer.create(<Screen hideAmounts reviewSend={jest.fn(async () => true)} confirmFresh={jest.fn(async () => true)} sign={sign} onSent={jest.fn()} onResult={onResult} />);
+    });
+    expect(texts(tree)).toContain(`${MASK} SOL`);
+    expect(texts(tree)).not.toContain('2 SOL');
+    await act(async () => { byId(tree, 'solana-send-address').props.onChangeText(TO); });
+    await act(async () => { byId(tree, 'solana-send-amount').props.onChangeText('0.5'); });
+    await act(async () => { await byId(tree, 'solana-send-button').props.onPress(); });
+    expect(onResult).toHaveBeenCalledWith({
+      success: false, title: 'Cannot send', error: `Insufficient balance. Need ${MASK}, including the ${MASK} fee.\nYour balance: ${MASK}.`,
+    });
+    await act(async () => { tree.unmount(); });
+    const refused = (code, params) => Object.assign(new Error(code), { code, params });
+    for (const [code, params] of [
+      ['SOL_SHORT_FEE', { need: '0.000005 SOL', balance: '0.000003 SOL' }],
+      ['SOL_SHORT_FEE_ACCOUNT', { need: '0.00204428 SOL', account: '0.00203928 SOL', balance: '0.001 SOL' }],
+      ['SOL_SHORT_TOKEN', { need: '4 1DEV', balance: '3 1DEV' }],
+      ['SOL_REMAINDER', { left: '0.000595 SOL', min: '0.00089088 SOL' }],
+      ['SOL_REMAINDER_FEE', { left: '0.00045572 SOL', min: '0.00089088 SOL' }],
+      ['SOL_NEW_ACCOUNT_MIN', { min: '0.00089088 SOL' }],
+    ]) {
+      const hidden = refusalText(t, refused(code, params), true);
+      expect([code, hidden]).toEqual([code, t(`err_${code}`, Object.fromEntries(Object.keys(params).map((k) => [k, MASK])))]);
+      for (const figure of Object.values(params)) expect([code, hidden.includes(figure)]).toEqual([code, false]);
+      expect(refusalText(t, refused(code, params), false)).toBe(t(`err_${code}`, params));
+    }
+    // A reason in words stays, and so does what an error without a code says.
+    expect(refusalText(t, refused('SOL_REFUSED', { detail: 'Blockhash not found' }), true)).toContain('Blockhash not found');
+    expect(refusalText(t, new Error('socket hang up'), true)).toBe(`${t('tx_failed')}\n${t('err_detail', { detail: 'socket hang up' })}`);
   });
 
   it('Scan sits in the recipient field, named for screen readers, and opens the scan', async () => {

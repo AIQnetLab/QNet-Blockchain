@@ -355,7 +355,10 @@ describe('SD-R2-03: no reward wording reaches the screen through an error', () =
 
   it('the QNet Link claim says "empty" or "busy" for those codes, not a refusal', async () => {
     const W = require('../../../docs/protocols/light-node.vectors.json').wallets[0];
-    const actions = (err) => nodeLinkActions({ walletManager: { claimRewards: async () => { throw err; } }, credential: 'c' });
+    const actions = (err) => {
+      const walletManager = { claimRewards: async () => { throw err; } };
+      return nodeLinkActions({ walletManager, credential: 'c', ...require('../test-support/moveRun').sheetMove(walletManager, { walletAddress: W.address }) });
+    };
     const claim = (err) => actions(err).claim({ nodeId: W.nodeId, qnet: W.address, amountNano: 1 });
     expect(await claim(Object.assign(new Error('x'), { code: 'NO_REWARDS' }))).toEqual({ status: 'empty' });
     expect(await claim(Object.assign(new Error('x'), { code: 'CLAIM_BUSY' }))).toEqual({ status: 'error', error: 'CLAIM_BUSY' });
@@ -367,10 +370,13 @@ describe('SD-R2-03: no reward wording reaches the screen through an error', () =
     const move = between(src, 'const moveNodeBalance = async', 'const handleClaimServerNodeRewards');
     expect(move).not.toMatch(/errorText\(/);
     expect((move.match(/claimErrorText\(/g) || []).length).toBe(2);
-    expect(src).toMatch(/const claimErrorText = \(error\) => t\(\(error && CLAIM_TEXT\[error\.code\]\) \|\| 'claim_failed'\);/);
+    expect(src).toMatch(/const claimErrorText = \(error\) => t\(claimErrorKey\(error\)\);/);
+    // One composition of a move's words, the Node tab's card and the QNet Link sheet alike (utils/moveText).
+    const text = fs.readFileSync(path.join(ROOT, 'src/utils/moveText.js'), 'utf8');
+    expect(text).toMatch(/export const claimErrorKey = \(error\) => \(error && CLAIM_TEXT\[error\.code\]\) \|\| 'claim_failed';/);
     // Each code's text is the Node tab's own, in every language: none of the QNet Link screen's texts, which appear only
     // on that screen (BuildParity).
-    const keys = [...between(src, 'const CLAIM_TEXT = {', '};').matchAll(/: '([A-Za-z_]+)'/g)].map((m) => m[1]);
+    const keys = [...between(text, 'export const CLAIM_TEXT = Object.freeze({', '});').matchAll(/: '([A-Za-z_]+)'/g)].map((m) => m[1]);
     expect(keys.length).toBeGreaterThanOrEqual(4);
     for (const lang of Object.keys(translations)) {
       for (const k of keys) expect([lang, k, k.startsWith('link_'), typeof translations[lang][k]]).toEqual([lang, k, false, 'string']);

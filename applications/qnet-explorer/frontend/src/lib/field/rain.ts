@@ -1,8 +1,9 @@
-// The field: hex rain in a page's head zone (B-SPEC 4). Glyphs sit in a fixed grid and a stream lights them as it
+// The field: hex rain in a page's head zone. Glyphs sit in a fixed grid and a stream lights them as it
 // passes, the way a ledger is read: the head white with a Signal glow, two pale cells behind it, the trail Signal. A
-// glyph atlas is drawn once; a frame is drawImage calls for the cells the heads step into, one fade of the canvas and the
-// clearing of each trail's end, so its cost follows the number of streams, not their length. Framework-free, so its rules
-// are tested (src/lib/__tests__/site-field.test.mjs); src/components/field/Field.tsx mounts it.
+// glyph atlas is drawn once; a frame is drawImage calls for the cells the heads step into and the glyphs that change,
+// one fade of the canvas and the clearing of each trail's end, so its cost follows the number of streams, not their
+// length. Framework-free, so its rules are tested (src/lib/__tests__/site-field.test.mjs);
+// src/components/field/Field.tsx mounts it.
 
 import { frameLoop, type FrameClock, type FrameLoop } from '../frame-loop.ts';
 
@@ -27,6 +28,31 @@ export function fieldCaps(kind: FieldKind, narrow: boolean): { fps: number; dpr:
 // Density across the zone for the tool pages: rising to the right (r = x / width), and the glyphs' opacity with it.
 export const rightWeight = (r: number): number => 0.2 + 1.8 * r * r;
 export const rightOpacity = (r: number): number => 0.25 + 0.75 * r;
+
+// A trail glyph is drawn at TRAIL_ALPHA of its stream's brightness and the canvas then keeps FADE_KEEP of it every
+// thirtieth of a second; a glyph under MIN_ALPHA is not drawn.
+const TRAIL_ALPHA = 0.85;
+const FADE_KEEP = 0.925;
+const MIN_ALPHA = 0.02;
+// The share of a glyph's brightness the fade leaves after `seconds`.
+const faded = (seconds: number): number => FADE_KEEP ** (seconds * 30);
+// How long a glyph drawn at `alpha` (a cell holds at most 1) takes to fall under MIN_ALPHA.
+const gone = (alpha: number): number => Math.log(MIN_ALPHA / Math.min(1, alpha)) / Math.log(faded(1));
+// How long a trail glyph of a stream at brightness `a` stays drawn: the reach of the changes behind its head.
+const seen = (a: number): number => gone(TRAIL_ALPHA * a);
+// A lit stream's head changes its glyph at least this often a second (each step into a cell is one change), and each
+// trail cell in sight changes on its own random schedule at this rate on average, whatever the frame rate.
+export const HEAD_FLICKER_PER_S = 12;
+export const TRAIL_SWAP_PER_CELL_S = 0.65;
+
+// A glyph other than GLYPHS[g], from one random draw: its own index is skipped and so is its twin (the set repeats the
+// hex digits), so every change shows.
+function fresh(g: number): number {
+  let n = (Math.random() * (GLYPHS.length - 1)) | 0;
+  if (n >= g) n++;
+  if (GLYPHS[n] === GLYPHS[g]) n++;
+  return n;
+}
 
 export const SLOW_STEP_MS = 7;
 export const SLOW_STEPS = 30;
@@ -142,6 +168,9 @@ interface Stream {
   a: number;
   at: number;
   tail: number;
+  // Head and trail glyph changes due, fractions carried from frame to frame.
+  flick: number;
+  due: number;
 }
 
 interface Decoder extends Stream {
@@ -177,6 +206,12 @@ export class Rain implements Drawable {
   private dpr = 1;
   private grid = new Uint8Array(0);
   private dim = new Float32Array(0);
+  // Per cell, the alpha it was last drawn at (0 once cleared) and the fade clock then: what the cell shows now.
+  private shown = new Float32Array(0);
+  private shownAt = new Float64Array(0);
+  // Per column, the fade clock until which a column whose stream a halving switched off still fades (0: none).
+  private fading = new Float64Array(0);
+  private fadeClock = 0;
   private streams: Stream[] = [];
   private decoders: Decoder[] = [];
   private atlas: { img: CanvasImageSource; cw: number } | null = null;
@@ -204,7 +239,7 @@ export class Rain implements Drawable {
   private spawn(i: number, initial: boolean): Stream {
     const y = initial ? Math.random() * this.rows * 1.3 - this.rows * 0.3 : -Math.random() * this.rows * 0.3;
     const len = 14 + ((Math.random() * 27) | 0);
-    return { y, v: 8 + Math.random() * 16, len, on: Math.random() < this.chance(i), a: 0.45 + Math.random() * 0.55, at: Math.floor(y), tail: Math.floor(y) - len + 1 };
+    return { y, v: 8 + Math.random() * 16, len, on: Math.random() < this.chance(i), a: 0.45 + Math.random() * 0.55, at: Math.floor(y), tail: Math.floor(y) - len + 1, flick: Math.random(), due: Math.random() };
   }
 
   buildAtlas(): void {
@@ -248,6 +283,9 @@ export class Rain implements Drawable {
     this.rows = Math.ceil(height / this.cell) + 1;
     this.grid = new Uint8Array(this.cols * this.rows);
     for (let k = 0; k < this.grid.length; k++) this.grid[k] = (Math.random() * GLYPHS.length) | 0;
+    this.shown = new Float32Array(this.grid.length);
+    this.shownAt = new Float64Array(this.grid.length);
+    this.fading = new Float64Array(this.cols);
     this.streams = [];
     for (let i = 0; i < this.cols; i++) this.streams.push(this.spawn(i, true));
     this.buildAtlas();
@@ -277,6 +315,7 @@ export class Rain implements Drawable {
     this.zones = zones;
     this.bake();
     for (const z of zones) if (z.dim === 0) this.ctx.clearRect(z.l, z.t, z.r - z.l, z.b - z.t);
+    for (let k = 0; k < this.dim.length; k++) if (this.dim[k] === 0) this.shown[k] = 0;
   }
 
   // New weights apply as streams restart; idle columns re-roll at once, so a dense zone fills within a second.
@@ -288,25 +327,36 @@ export class Rain implements Drawable {
     for (let i = 0; i < this.streams.length; i++) if (!this.streams[i].on) this.streams[i] = this.spawn(i, false);
   }
 
+  // Half the lit streams go out. What each drew keeps fading by the trail's law until its brightest glyph (the head) is
+  // under MIN_ALPHA, and is then cleared (fade), so a stream switched off leaves no glyph frozen on the canvas.
   halve(): void {
     this.density /= 2;
-    for (let i = 0; i < this.streams.length; i++) if (this.streams[i].on && Math.random() < 0.5) this.streams[i].on = false;
+    for (let i = 0; i < this.streams.length; i++) {
+      const s = this.streams[i];
+      if (!s.on || Math.random() >= 0.5) continue;
+      s.on = false;
+      this.fading[i] = Math.max(this.fading[i], this.fadeClock + gone(1.4 * s.a));
+    }
   }
 
   // A bright stream that reaches `row` after `delay` ms and then calls `cb` (the headline decode).
   decoder(x: number, row: number, delay: number, cb: () => void): void {
     const v = 34;
     const y = row - (v * delay) / 1000;
-    this.decoders.push({ x, y, v, len: 16, row, cb, fired: false, at: Math.floor(y), tail: Math.floor(y) - 15, on: true, a: 1 });
+    this.decoders.push({ x, y, v, len: 16, row, cb, fired: false, at: Math.floor(y), tail: Math.floor(y) - 15, on: true, a: 1, flick: 0, due: 0 });
   }
 
-  // One cell: cleared, then a glyph from atlas row `kind` (0 trail, 1 pale, 2 head) when it is bright enough to see.
-  private put(x: number, r: number, g: number, kind: number, alpha: number): void {
+  // One cell of column `base / rows`, drawn at x: cleared, then its grid glyph from atlas row `kind` (0 trail, 1 pale,
+  // 2 head) when it is bright enough to see; the cell's record follows what it now shows.
+  private put(x: number, base: number, r: number, kind: number, alpha: number): void {
     const c = this.cell;
+    const k = base + r;
     this.ctx.clearRect(x, r * c, c, c);
-    if (alpha > 0.02 && this.atlas) {
-      this.ctx.globalAlpha = Math.min(1, alpha);
-      this.ctx.drawImage(this.atlas.img, g * this.atlas.cw, kind * this.atlas.cw, this.atlas.cw, this.atlas.cw, x, r * c, c, c);
+    this.shown[k] = 0;
+    this.shownAt[k] = this.fadeClock;
+    if (alpha > MIN_ALPHA && this.atlas) {
+      this.shown[k] = this.ctx.globalAlpha = Math.min(1, alpha);
+      this.ctx.drawImage(this.atlas.img, this.grid[k] * this.atlas.cw, kind * this.atlas.cw, this.atlas.cw, this.atlas.cw, x, r * c, c, c);
     }
   }
 
@@ -315,6 +365,7 @@ export class Rain implements Drawable {
     if (!this.w || !this.atlas) return;
     const { rows, cell, dim } = this;
     this.ctx.clearRect(0, 0, this.w, this.h);
+    this.shown.fill(0);
     for (let i = 0; i < this.cols; i++) {
       const s = this.streams[i];
       if (!s.on) continue;
@@ -323,7 +374,7 @@ export class Rain implements Drawable {
         const r = head - k;
         if (r < 0 || r >= rows) continue;
         const shade = k === 0 ? 1.4 : k < 3 ? 1.05 : (1 - k / s.len) ** 1.25;
-        this.put(i * cell, r, this.grid[i * rows + r], k === 0 ? 2 : k < 3 ? 1 : 0, shade * s.a * dim[i * rows + r]);
+        this.put(i * cell, i * rows, r, k === 0 ? 2 : k < 3 ? 1 : 0, shade * s.a * dim[i * rows + r]);
       }
     }
     this.ctx.globalAlpha = 1;
@@ -331,38 +382,65 @@ export class Rain implements Drawable {
 
   // A head moves to row `to`: the cells it leaves turn pale, the cell two behind takes the trail colour, the head is
   // drawn fresh and the cells past the trail's end are cleared. `quiet` only moves the end (a landed decoder).
-  private step(s: Stream, x: number, col: number, to: number, flat: boolean, quiet: boolean): void {
-    const { rows, grid, dim, cell } = this;
+  private step(s: Stream, x: number, col: number, to: number, flat: boolean, quiet: boolean, dt: number): void {
+    const { rows, dim, cell, grid } = this;
     const base = col * rows;
     const d = (row: number) => (flat ? 1 : dim[base + row]);
     if (!quiet) {
+      // The head writes a new glyph into each cell it enters; on a frame it stays, a due flicker changes the one it is
+      // on. Either way the head is drawn below, so a flicker costs no extra draw.
+      s.flick += HEAD_FLICKER_PER_S * dt;
+      const first = to > s.at || s.flick < 1 ? s.at + 1 : to;
+      s.flick %= 1;
+      for (let r = Math.max(0, first); r <= Math.min(to, rows - 1); r++) grid[base + r] = fresh(grid[base + r]);
       for (let r = s.at; r < to; r++) {
-        if (r >= 0 && r < rows) this.put(x, r, grid[base + r], 1, 1.05 * s.a * d(r));
+        if (r >= 0 && r < rows) this.put(x, base, r, 1, 1.05 * s.a * d(r));
         const t = r - 2;
-        if (t >= 0 && t < rows) this.put(x, t, grid[base + t], 0, 0.85 * s.a * d(t));
+        if (t >= 0 && t < rows) this.put(x, base, t, 0, TRAIL_ALPHA * s.a * d(t));
       }
-      if (to >= 0 && to < rows) this.put(x, to, grid[base + to], 2, 1.4 * s.a * d(to));
+      if (to >= 0 && to < rows) this.put(x, base, to, 2, 1.4 * s.a * d(to));
     }
     s.at = to;
-    for (const end = to - s.len; s.tail <= end; s.tail++) if (s.tail >= 0 && s.tail < rows) this.ctx.clearRect(x, s.tail * cell, cell, cell);
+    for (const end = to - s.len; s.tail <= end; s.tail++) {
+      if (s.tail < 0 || s.tail >= rows) continue;
+      this.ctx.clearRect(x, s.tail * cell, cell, cell);
+      this.shown[base + s.tail] = 0;
+    }
   }
 
-  // The fade, over the columns that hold a trail only (a column without a stream is already clear), every other frame:
-  // on a canvas without a GPU it is the frame's largest cost, and it follows the area it covers.
+  // Each trail cell of a lit stream still in sight changes TRAIL_SWAP_PER_CELL_S times a second on average, a random cell
+  // per change, so the work follows the changes, not the cells; the new glyph takes the brightness its cell shows (drawn
+  // at, faded since), so it changes in place without a flash or a dark gap.
+  private swap(s: Stream, col: number, dt: number): void {
+    const { rows } = this;
+    const base = col * rows;
+    const lo = Math.max(0, s.at - Math.min(s.len, 3 + Math.ceil(s.v * seen(s.a))) + 1);
+    const hi = Math.min(rows - 1, s.at - 3);
+    const n = Math.max(0, hi - lo + 1);
+    for (s.due += TRAIL_SWAP_PER_CELL_S * n * dt; s.due >= 1; s.due--) {
+      const r = lo + ((Math.random() * n) | 0);
+      this.grid[base + r] = fresh(this.grid[base + r]);
+      this.put(col * this.cell, base, r, 0, this.shown[base + r] * faded(this.fadeClock - this.shownAt[base + r]));
+    }
+  }
+
+  // The fade, over the columns that hold a trail only (a column without a stream is already clear, one switched off still
+  // fading counts), every other frame: on a canvas without a GPU it is the frame's largest cost, and it follows the area
+  // it covers.
   private fade(dt: number): void {
     this.fadeDt += dt;
     this.fadeNow = !this.fadeNow;
     if (!this.fadeNow) return;
     const { ctx, cell } = this;
     const lit = new Uint8Array(this.cols + 1);
-    for (let i = 0; i < this.cols; i++) if (this.streams[i].on) lit[i] = 1;
+    for (let i = 0; i < this.cols; i++) if (this.streams[i].on || this.fading[i] > this.fadeClock) lit[i] = 1;
     for (const dc of this.decoders) {
       const col = Math.floor(dc.x / cell);
       for (const c of [col, col + 1]) if (c >= 0 && c < this.cols) lit[c] = 1;
     }
     ctx.globalCompositeOperation = 'destination-out';
     ctx.globalAlpha = 1;
-    ctx.fillStyle = `rgba(0, 0, 0, ${(1 - 0.925 ** (this.fadeDt * 30)).toFixed(3)})`;
+    ctx.fillStyle = `rgba(0, 0, 0, ${(1 - faded(this.fadeDt)).toFixed(3)})`;
     for (let i = 0, run = -1; i <= this.cols; i++) {
       if (lit[i] && run < 0) run = i;
       else if (!lit[i] && run >= 0) {
@@ -371,7 +449,23 @@ export class Rain implements Drawable {
       }
     }
     ctx.globalCompositeOperation = 'source-over';
+    this.fadeClock += this.fadeDt;
     this.fadeDt = 0;
+    for (let i = 0; i < this.cols; i++) if (this.fading[i] > 0 && this.fading[i] <= this.fadeClock) this.sweep(i);
+  }
+
+  // A switched-off column's fade is over: each of its cells the law has under MIN_ALPHA is cleared, as a lit trail's end
+  // is, since the canvas's 8-bit alpha would otherwise keep the last faint glyphs.
+  private sweep(col: number): void {
+    this.fading[col] = 0;
+    const { rows, cell } = this;
+    const base = col * rows;
+    for (let r = 0; r < rows; r++) {
+      const k = base + r;
+      if (this.shown[k] === 0 || this.shown[k] * faded(this.fadeClock - this.shownAt[k]) > MIN_ALPHA) continue;
+      this.ctx.clearRect(col * cell, r * cell, cell, cell);
+      this.shown[k] = 0;
+    }
   }
 
   draw(dt: number): void {
@@ -385,22 +479,13 @@ export class Rain implements Drawable {
         this.streams[i] = this.spawn(i, false);
         continue;
       }
-      if (s.on) this.step(s, i * cell, i, Math.floor(s.y), false, false);
-      else {
+      if (s.on) {
+        this.step(s, i * cell, i, Math.floor(s.y), false, false, dt);
+        this.swap(s, i, dt);
+      } else {
         s.at = Math.floor(s.y);
         s.tail = s.at - s.len + 1;
       }
-    }
-    // Four lit cells change their glyph, as the ledger is read.
-    for (let m = 0; m < 4; m++) {
-      const i = (Math.random() * this.cols) | 0;
-      const s = this.streams[i];
-      if (!s || !s.on) continue;
-      const k = 3 + ((Math.random() * (s.len - 3)) | 0);
-      const r = s.at - k;
-      if (r < 0 || r >= rows) continue;
-      const g = (this.grid[i * rows + r] = (Math.random() * GLYPHS.length) | 0);
-      this.put(i * cell, r, g, 0, 0.7 * (1 - k / s.len) ** 1.25 * s.a * this.dim[i * rows + r]);
     }
     for (let i = this.decoders.length - 1; i >= 0; i--) {
       const dc = this.decoders[i];
@@ -410,7 +495,7 @@ export class Rain implements Drawable {
         dc.cb();
       }
       const col = Math.min(this.cols - 1, Math.max(0, Math.round(dc.x / cell)));
-      this.step(dc, dc.x, col, Math.min(Math.floor(dc.y), dc.row), true, dc.fired && dc.at >= dc.row);
+      this.step(dc, dc.x, col, Math.min(Math.floor(dc.y), dc.row), true, dc.fired && dc.at >= dc.row, dt);
       if (dc.fired) {
         dc.len = Math.max(0, dc.len - 1);
         if (!dc.len) this.decoders.splice(i, 1);
@@ -420,7 +505,7 @@ export class Rain implements Drawable {
   }
 }
 
-// The zones that clear the cells under each line of text in a title band (B-SPEC 4.2, per-line clearing): one per line
+// The zones that clear the cells under each line of text in a title band: one per line
 // box, padded by half a cell, so every cell any part of which lies under a letter shows no glyph, while the space beside
 // a short line keeps its rain. The boxes and the canvas in the same (viewport) coordinates.
 export function lineZones(canvas: DOMRect, lines: Iterable<{ left: number; right: number; top: number; bottom: number }>, pad: number): DimZone[] {

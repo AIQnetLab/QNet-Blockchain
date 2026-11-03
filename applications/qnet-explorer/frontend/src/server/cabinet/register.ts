@@ -1,5 +1,5 @@
-// POST /api/cabinet/register: the registration of a light node from any browser where the wallet is connected (unified
-// plan SITE-4, R1; shared contract C4), with the wallet's fresh consent from QNet Wallet (src/lib/cabinet/registration.ts:
+// POST /api/cabinet/register: the registration of a light node from any browser where the wallet is connected,
+// with the wallet's fresh consent from QNet Wallet (src/lib/cabinet/registration.ts:
 // the exact fields, the node id, the proof, the wallet key, its signature), in one of two forms:
 // - the consent body, for a burn from a one-time payment address: the site finds the wallet's burn in the activation
 //   registry (activation-registry.ts: the payment address's burn, final, of this amount, whose reservation the same
@@ -12,16 +12,19 @@
 //   the search of the burner's address the page's reads keep, burn-scan.ts, charged to the client and the node: the
 //   first burn it made), and the network's one-node rule.
 // Either goes to one genesis node, never hedged (the node builds and hashes the transaction itself), with one submit in
-// flight per node; anything refused is relayed nowhere. The explorer server may be on the nodes' whitelist, so the client
-// and, once the signature verified, the node are metered here (limits.ts).
+// flight per node; anything refused is relayed nowhere. The same signed registration sent again (QNet Wallet and the
+// activation page both send it, or a retry) is one registration: it gets the answer of the one in flight, or the
+// admission a node gave it, and reaches no node a second time. The explorer server may be on the nodes' whitelist, so
+// the client and, once the signature verified, the node are metered here (limits.ts).
 
+import { createHash } from 'node:crypto';
 import { readCappedBytes } from '../../lib/capped-body.ts';
 import { GENESIS_NODES } from '../../lib/genesis-nodes.ts';
 import { MLDSA65_PUBLIC_KEY_BYTES, bytesToHex, decodeB64url, type ConsentVerifier } from '../../lib/qnet-link.ts';
 import type { ScanView } from '../../lib/cabinet/burn-record.ts';
 import {
-  SUBMIT_BODY_MAX_BYTES, SUBMIT_PATH, checkConsentBody, checkOwnBurnBody, completeSubmitBody, submitOutcome, type ConsentBody, type SubmitBody,
-  type SubmitOutcome,
+  ADMIT_HOLD_MS, CONSENT_KEYS, SUBMIT_BODY_MAX_BYTES, SUBMIT_KEYS, SUBMIT_PATH, SUBMIT_TIMEOUT_MS, checkConsentBody, checkOwnBurnBody, completeSubmitBody,
+  submitOutcome, type ConsentBody, type SubmitBody, type SubmitOutcome,
 } from '../../lib/cabinet/registration.ts';
 import type { ActivationRow } from './activation-registry.ts';
 import { readJsonPost } from '../request-guard.ts';
@@ -29,16 +32,22 @@ import { cabinetGate, cabinetJson, createGate, type Gate, type GateOptions } fro
 import { sharedUpstreamBudget, unbudgeted, type UpstreamBudget } from './upstream.ts';
 import type { WalletNode } from './wallet-node.ts';
 
-// The node collects the committee's burn attestations inside the submit.
-export const SUBMIT_TIMEOUT_MS = 30_000;
 const NODE_BODY_MAX_BYTES = 64 * 1024;
+// Signed registrations whose answer is remembered at once: a node admits a few a minute, each kept ADMIT_HOLD_MS.
+export const SENT_KEPT = 10_000;
+
+// One signed registration, whatever the key order it came in: its checked fields in the node's order, hashed.
+export function registrationIdentity(body: ConsentBody | SubmitBody, own: boolean): string {
+  const fields = body as unknown as Record<string, unknown>;
+  return createHash('sha256').update(JSON.stringify((own ? SUBMIT_KEYS : CONSENT_KEYS).map((k) => fields[k]))).digest('hex');
+}
 
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
 // The registry's burn of a wallet (activation-api.ts paymentRecord): its row once it has a burn, null without one.
 export type PaymentRecordReader = (wallet: string) => Promise<ActivationRow | null | 'unavailable'>;
 // The search of a Solana address for the burns it made (burn-scan.ts BurnScanner, the scanner the page's reads use),
-// charged to `clients`: the register client's key and the node's (SITE H-5), each its share of the signed lane.
+// charged to `clients`: the register client's key and the node's, each its share of the signed lane.
 export type OwnBurnScan = (address: string, clients: readonly string[]) => Promise<ScanView>;
 // Whether the wallet has a node of either type (wallet-node.ts); null when the network could not answer.
 export type WalletNodeReader = (wallet: string) => Promise<WalletNode | null>;
@@ -114,7 +123,26 @@ export function createRegister(options: RegisterOptions): Register {
   const nodes = options.nodes ?? GENESIS_NODES;
   const random = options.random ?? Math.random;
   const budget = options.budget ?? unbudgeted;
+  const now = options.now ?? Date.now;
   const inFlight = new Set<string>();
+  // By registrationIdentity: the answer of a submit in flight (until Infinity), or of an admitted one until its clients
+  // would submit it again (ADMIT_HOLD_MS), so a later submit after a stale pool entry still reaches a node.
+  const sent = new Map<string, { answer: Promise<SubmitOutcome>; until: number }>();
+  const remembered = (identity: string): Promise<SubmitOutcome> | null => {
+    const kept = sent.get(identity);
+    if (!kept) return null;
+    if (kept.until > now()) return kept.answer;
+    sent.delete(identity);
+    return null;
+  };
+  const remember = (identity: string, answer: Promise<SubmitOutcome>, until: number) => {
+    sent.delete(identity);
+    sent.set(identity, { answer, until });
+    for (const [key, kept] of sent) {
+      if (sent.size <= SENT_KEPT && kept.until > now()) break;
+      if (kept.until !== Infinity) sent.delete(key);
+    }
+  };
 
   // One genesis node: a random one, else the next whose submit budget this second is not spent (upstream.ts); with
   // none left the page submits again later.
@@ -165,20 +193,31 @@ export function createRegister(options: RegisterOptions): Register {
       const checked = own ? checkOwnBurnBody(read.value, options.verifyConsent) : checkConsentBody(read.value, options.verifyConsent);
       if (!checked.ok) return cabinetJson(400, { error: 'invalid_request', reason: checked.reason });
       const id = checked.body.node_id;
+      // The same signed registration again: its answer, before any budget counts it (it costs no node anything).
+      const identity = registrationIdentity(checked.body, own);
+      const known = remembered(identity);
+      if (known) return cabinetJson(200, await known);
       // Only once the wallet's consent verified: a junk body naming someone's node spends nothing of its budget.
       const limited = gate.keyed('register', id);
       if (limited) return limited;
       if (inFlight.has(id)) return cabinetJson(200, { result: 'retry', code: 'in_flight' });
       inFlight.add(id);
-      try {
-        if (own) {
-          const client = gate.client(request);
-          return cabinetJson(200, await ownBurn(checked.body as SubmitBody, [...(client === null ? [] : [client]), `node:${id}`]));
-        }
+      const client = own ? gate.client(request) : null;
+      const answer = (async (): Promise<SubmitOutcome> => {
+        if (own) return ownBurn(checked.body as SubmitBody, [...(client === null ? [] : [client]), `node:${id}`]);
         const row = options.paymentRecord ? await options.paymentRecord(checked.body.wallet_address) : 'unavailable';
         const full = fromRecord(checked.body, row);
-        if ('result' in full) return cabinetJson(200, full);
-        return cabinetJson(200, await toNode(full));
+        return 'result' in full ? full : toNode(full);
+      })();
+      remember(identity, answer, Infinity);
+      try {
+        const outcome = await answer;
+        if (outcome.result === 'admitted') remember(identity, answer, now() + ADMIT_HOLD_MS);
+        else sent.delete(identity);
+        return cabinetJson(200, outcome);
+      } catch (err) {
+        sent.delete(identity);
+        throw err;
       } finally {
         inFlight.delete(id);
       }

@@ -22,6 +22,7 @@ import {
   capsuleProblem, capsuleRootOf, capsuleSigned, capsuleWire, rootPartsOf,
   type Capsule, type CapsuleEntry, type CapsuleRecord, type CapsuleRefresh, type CapsuleRefreshReason, type CapsuleRootParts, type CapsuleRules,
 } from './galc.ts';
+import { within } from '../../lib/deadline.ts';
 import { GENESIS_CONSENSUS_PKS } from './genesis-keys.ts';
 import { GALC_V2_MINT_INTERVAL, NETWORK_ID, WS_CHECKPOINT, type PinAnchor } from './pin.ts';
 import type { CheckpointStore, PinRef, StoredCheckpoint, StoredLineage } from './store.ts';
@@ -145,12 +146,6 @@ interface Held { index: number; cpA: string; record: CapsuleRecord; entries: Map
 
 const sleep = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 const yieldNow = () => new Promise<void>((resolve) => { setImmediate(resolve); });
-// `p`, or `fallback` after `ms`, whichever comes first; the timer does not outlive the race.
-function within<T, F>(p: Promise<T>, ms: number, fallback: F): Promise<T | F> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<F>((resolve) => { timer = setTimeout(() => resolve(fallback), ms); });
-  return Promise.race([p, late]).finally(() => clearTimeout(timer));
-}
 
 function defaultVerify(message: string, sigHex: string, pkHex: string): boolean {
   if (sigHex.length !== SIG_HEX || pkHex.length !== PK_HEX || !/^[0-9a-fA-F]*$/.test(sigHex + pkHex)) return false;
@@ -712,7 +707,7 @@ export function createLightClient(opts: LightOptions): LightClient {
   async function certifiedRootAt(j: number, waitMs: number): Promise<RootAnswer> {
     if (!pinOk) return { unprovable: 'no_pin' };
     if (!Number.isSafeInteger(j) || j < trustFloorIndex()) return { unprovable: 'below_floor' };
-    await within(loaded, waitMs, undefined);
+    await within(waitMs, loaded);
     const hit = verified.get(j);
     if (hit) {
       remember(j, hit);
@@ -720,7 +715,7 @@ export function createLightClient(opts: LightOptions): LightClient {
     }
     const root = capsuleEntry(j);
     if (root) return { root: root.stateRoot };
-    const outcome = await within(walkFor(j), waitMs, 'pending' as const);
+    const outcome = await within(waitMs, walkFor(j), 'pending' as const);
     const entry = certifiedEntry(j);
     if (entry) return { root: entry.stateRoot };
     if (outcome === 'pending' || outcome === 'transient') return { pending: true };

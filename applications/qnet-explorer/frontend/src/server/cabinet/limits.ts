@@ -13,6 +13,7 @@ import {
   type RateLimiter,
 } from '../../../lib/rate-limit.ts';
 import { activationOriginAllowed, originAllowed } from '../request-guard.ts';
+import { UPSTREAM_BUDGETS } from './upstream.ts';
 
 export const CABINET_LIMITS = {
   // Node status and history: a page reads on load, on return and every half minute while shown.
@@ -24,10 +25,10 @@ export const CABINET_LIMITS = {
   send: { max: 10, windowMs: 60_000 },
   tx: { max: 120, windowMs: 60_000 },
   // Reads of a signature the page holds no read pass for (solana-proxy.ts): each client's share of the server's small
-  // budget, so that no one client holds all of it (SITE-R3-01).
+  // budget, so that no one client holds all of it.
   txOther: { max: 12, windowMs: 60_000 },
   // A registration is a few submits (retries back off); sized for several activations behind one carrier NAT
-  // address, each node also held to its own KEYED_LIMITS budget once its signatures verify (SITE-8).
+  // address, each node also held to its own KEYED_LIMITS budget once its signatures verify.
   register: { max: 30, windowMs: 600_000 },
   registration: { max: 30, windowMs: 60_000 },
   // A wallet's activation record (activation-api.ts): read on load and while a burn is on its way; the search of its
@@ -38,10 +39,12 @@ export const CABINET_LIMITS = {
   // A super node's status and a wallet's node on the network, read as a light node's status is.
   super: { max: 120, windowMs: 60_000 },
   walletNode: { max: 60, windowMs: 60_000 },
+  // The wallets' Solana relay (solana-relay.ts): every call of a wallet whose Solana endpoint gives it no answer.
+  solana: { max: 240, windowMs: 60_000 },
 } as const;
 export type CabinetRoute = keyof typeof CABINET_LIMITS;
 // The routes the QNet extension calls too: their origin rule is request-guard.ts activationOriginAllowed.
-const ACTIVATION_ROUTES: ReadonlySet<string> = new Set(['activation', 'activationScan', 'activationWrite']);
+const ACTIVATION_ROUTES: ReadonlySet<string> = new Set(['activation', 'activationScan', 'activationWrite', 'solana']);
 
 // Limits on a key of the request's own (a payment address, a node), across every client.
 export const KEYED_LIMITS = {
@@ -52,11 +55,20 @@ export const KEYED_LIMITS = {
 } as const;
 export type KeyedRoute = keyof typeof KEYED_LIMITS;
 
+// A client's share of a relay lane, in the lane's own window: the most that stays under half of it, so that one client,
+// even across the seam of two of its own windows, never takes a whole lane.
+const laneShare = ({ max, windowMs }: { max: number; windowMs: number }) => ({ max: Math.ceil(max / 2) - 1, windowMs });
+
 // Budgets of each client across routes. `upstreamMiss`: the reads of the node, super and wallet-node routes that miss
-// the cache and go to the genesis nodes (SITE M-12): a page reads three every half minute, and a made-up id always
-// misses, so one client cannot hold the server's whole read budget (upstream.ts).
+// the cache and go to the genesis nodes: a page reads three every half minute, and a made-up id always
+// misses, so one client cannot hold the server's whole read budget (upstream.ts). `solanaRead`, `solanaScan`,
+// `solanaSend`: the relay's calls that reach Solana (each key added to a batch, each read the cache does not hold, each
+// simulation and send), each charged to the client's share of the lane it goes on.
 export const CLIENT_BUDGETS = {
   upstreamMiss: { max: 30, windowMs: 60_000 },
+  solanaRead: laneShare(UPSTREAM_BUDGETS.solanaRead),
+  solanaScan: laneShare(UPSTREAM_BUDGETS.solanaScan),
+  solanaSend: laneShare(UPSTREAM_BUDGETS.solanaSend),
 } as const;
 export type ClientBudget = keyof typeof CLIENT_BUDGETS;
 
@@ -77,7 +89,7 @@ export interface GateOptions {
 
 // The origin checks and the client's limit of `route`; with `keyed`, also the limit on that key of the request.
 // `keyed` alone counts only the key's limit: a route whose key is someone else's until a signature proves it (a
-// payment address, a node) calls it after that check, so nobody spends another's budget with junk (SITE-2). `client`:
+// payment address, a node) calls it after that check, so nobody spends another's budget with junk. `client`:
 // the request's client key as the limits count it (`ip:` and the IP, IPv6 by its /64), for a route that charges a
 // budget of its own to the client (burn-scan.ts); null without a client address. `spend`: one of the client's
 // CLIENT_BUDGETS, counted when the route is about to spend the server's (429 past it).

@@ -1,20 +1,20 @@
-// Total earned (owner, 13.10): what the wallet's moves took to it in all, from the explorer archive's moves replayed by
-// the chain's own watermark rule, plus the node balance, both of one moment: the balance read from the node that gives
-// the history's first page just before it, the moves only when they replay to that node's watermark. Anything less is
-// "could not be read", never a wrong number. The same for a light and a super node, a connected wallet and a view.
+// Total earned: what the wallet's moves took to it in all, from the explorer archive's moves replayed by the chain's own
+// watermark rule (a move the archive keeps cut short read whole from the chain), plus the node balance, both of one
+// moment: the balance read from the node that gives the history's first page just before it, the moves only when they
+// replay to that node's watermark. Anything less is "could not be read" beside the balance, never a wrong number. The
+// same for a light, a super and a genesis node, a connected wallet and a view.
 // Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { MOVES_SQL, MOVE_ROWS, createEpochArchive, movedTotal, CLAIMS_SQL, REGISTRATION_SQL, TIMES_SQL } from '../../server/cabinet/epoch-archive.ts';
+import {
+  CLAIMS_SQL, MOVES_SQL, MOVE_READS, MOVE_ROWS, PROOFS_RE, REGISTRATION_SQL, TIMES_SQL, completeMoves, createEpochArchive, movedTotal, wholeEntries,
+} from '../../server/cabinet/epoch-archive.ts';
+import { MOVE_BLOCK_MAX_BYTES, MOVE_NODES_ASKED, MOVE_RETRY_MS, createMovePayloads, payloadFrom } from '../../server/cabinet/move-payload.ts';
 import { createNodeProxy, earnedOf, historyView, parsePendingAt } from '../../server/cabinet/node-proxy.ts';
 import { earnedView, formatQnc, parseHistoryView } from '../cabinet/node-view.ts';
-import { TEXTS } from '../texts.ts';
-
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n')
-  .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+import { code } from './source.mjs';
+import { TEXTS } from './texts-helper.mjs';
 
 const WALLET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const NODE = 'light_mobile_6526ab8fd00ff8ca';
@@ -65,9 +65,127 @@ test('a move that cannot be read whole gives no total, never a wrong one', () =>
   assert.deepEqual(movedTotal(Array.from({ length: 3 }, (_, i) => move([[i + 1, '1']]))), { nano: '3', watermark: key(3) });
 });
 
+// A super or genesis node moves hundreds of epochs at once (a genesis wallet's third move took 201): the archive keeps a
+// transaction's data to 100,000 characters (src/indexer/transform.ts), so the payload of such a move is cut short there
+// and its listed amounts fall short of its total. Its whole payload comes from a genesis node's microblock at its height,
+// taken only when its amounts add up to the move's own total; then the total replays to the node's watermark and every
+// epoch the move took names it.
+const PROOF = (i) => Array.from({ length: 8 }, (_, j) => [`${String(i).padStart(4, '0')}${'ab'.repeat(30)}`, j % 2 === 0]);
+const GENESIS_EPOCH = '10476347500000';
+const span = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => [from + i, GENESIS_EPOCH]);
+// A move as the chain carries it, its proofs in, and as the archive keeps it: cut to 100,000 characters, the proofs left
+// out by MOVES_SQL.
+const chainMove = (hash, block, entries) => {
+  const data = JSON.stringify({ claims: entries.map(([epoch, a], i) => ({ amount: Number(a), epoch: key(epoch), proof: PROOF(i) })) });
+  return { hash, block: String(block), amount: String(entries.reduce((sum, [, a]) => sum + BigInt(a), 0n)), data };
+};
+const archived = (m) => ({ ...m, data: m.data.slice(0, 100_000).replace(PROOFS_RE, '') });
+const MOVES = [chainMove('aa'.repeat(32), 852109, span(1, 57)), chainMove('bb'.repeat(32), 2068589, span(58, 139)), chainMove('cc'.repeat(32), 4967463, span(140, 340)), chainMove('dd'.repeat(32), 4995221, span(341, 342))];
+const TOTAL = String(BigInt(GENESIS_EPOCH) * 342n);
+
+test('a move the archive keeps cut short is read whole from the chain, and the total and every moved epoch follow', async () => {
+  assert.ok(MOVES[2].data.length > 100_000, 'the 201-epoch move passes what the archive keeps');
+  const rows = MOVES.map(archived);
+  assert.equal(wholeEntries(rows[2]), null, 'cut: its listed amounts fall short of its total');
+  assert.equal(movedTotal(rows), null);
+  // Read whole: the total of every move, up to the last epoch moved, the node's own watermark.
+  const asked = [];
+  const whole = async (hash, height, amount) => {
+    asked.push([hash, height, amount]);
+    const m = MOVES.find((x) => x.hash === hash);
+    return m ? m.data.replace(PROOFS_RE, '') : null;
+  };
+  const completed = await completeMoves(rows, whole);
+  assert.deepEqual(asked, [[MOVES[2].hash, 4967463, MOVES[2].amount]], 'only the cut move is read');
+  assert.deepEqual(movedTotal(completed), { nano: TOTAL, watermark: key(342) });
+  // Without a reader, or when it gives none, the rows stay and give no total.
+  assert.equal(movedTotal(await completeMoves(rows)), null);
+  assert.equal(movedTotal(await completeMoves(rows, async () => null)), null);
+  // At most MOVE_READS payloads a read: a wallet with more gets the rest on later reads.
+  let reads = 0;
+  await completeMoves(Array.from({ length: MOVE_READS + 3 }, () => rows[2]), async () => { reads += 1; return null; });
+  assert.equal(reads, MOVE_READS);
+  // A payload the reader keeps costs none of them: the next read fetches the rest and the total follows, each payload
+  // fetched once.
+  const many = Array.from({ length: MOVE_READS + 3 }, (_, i) => ({
+    hash: (i + 16).toString(16).repeat(32), block: String(10_000 + i), amount: '5', whole: `{"claims":[{"amount":5,"epoch":${key(i + 1)}}]}`,
+  }));
+  const fetchedMoves = [];
+  const reader = createMovePayloads({
+    fetchFn: async (url) => {
+      const height = Number(new URL(url).pathname.split('/').pop());
+      fetchedMoves.push(height);
+      const m = many.find((x) => Number(x.block) === height);
+      return new Response(JSON.stringify({ height, transactions: [{ hash: m.hash, data: m.whole }] }), { status: 200 });
+    },
+    nodes: ['https://node1.example'], random: () => 0, now: () => 1_000_000,
+  });
+  const cutRows = many.map(({ hash, block, amount }) => ({ hash, block, amount, data: '{"claims":[' }));
+  const firstRead = await completeMoves(cutRows, reader);
+  assert.equal(firstRead.filter((r) => wholeEntries(r) === null).length, 3, 'the first read leaves three cut');
+  assert.equal(movedTotal(firstRead), null);
+  assert.deepEqual(movedTotal(await completeMoves(cutRows, reader)), { nano: String(5 * many.length), watermark: key(many.length) });
+  assert.equal(fetchedMoves.length, many.length, 'each payload fetched once');
+  // The archive's page facts and total, with the reader: every epoch the cut move took names it, its amount exact.
+  const archive = createEpochArchive(async (text) => ({
+    rows: text === MOVES_SQL ? rows : text === CLAIMS_SQL ? rows.slice(2) : [],
+  }), () => 1_000_000, whole);
+  const facts = await archive(WALLET, 'genesis_node_001', [key(342), key(341), key(338)], true);
+  assert.deepEqual(facts.moved, { nano: TOTAL, watermark: key(342) });
+  assert.deepEqual(facts.claims.get(key(338)), { tx: MOVES[2].hash, amountNano: GENESIS_EPOCH });
+  assert.deepEqual(facts.claims.get(key(341)), { tx: MOVES[3].hash, amountNano: GENESIS_EPOCH });
+  // The page then carries the total with the balance: no "could not be read".
+  const node = { wallet: WALLET, rows: [], more: false, lastClaimed: key(342) };
+  assert.deepEqual(earnedOf(node, facts, { nano: '188574255000000', firstUnclaimed: key(343) }), { movedNano: TOTAL, balanceNano: '188574255000000' });
+});
+
+test('a move\'s whole payload: the microblock\'s transaction of its hash, its amounts the move\'s total, read once', async () => {
+  const big = MOVES[2];
+  const block = (txs) => ({ height: 4967463, transactions: txs });
+  const fetched = [];
+  let answer = block([{ hash: 'ee'.repeat(32), data: '{}' }, { hash: big.hash, data: big.data, amount: Number(big.amount) }]);
+  const fetchFn = async (url) => {
+    fetched.push(new URL(url).pathname);
+    return new Response(JSON.stringify(answer), { status: 200 });
+  };
+  let t = 1_000_000;
+  const read = createMovePayloads({ fetchFn, nodes: ['https://node1.example', 'https://node2.example'], random: () => 0, now: () => t });
+  const data = await read(big.hash, 4967463, big.amount);
+  assert.equal(data, big.data.replace(PROOFS_RE, ''), 'its payload without the proofs');
+  assert.doesNotMatch(data, /"proof"/);
+  assert.deepEqual(fetched, ['/api/v1/microblock/4967463']);
+  // Kept for good: a move in a block never changes.
+  t += 86_400_000;
+  assert.equal(await read(big.hash, 4967463, big.amount), data);
+  assert.equal(fetched.length, 1);
+  // A transaction whose amounts are not the move's total, or a block without it, gives none: asked again after a while,
+  // from at most MOVE_NODES_ASKED nodes.
+  assert.equal(payloadFrom(block([{ hash: big.hash, data: big.data }]), big.hash, String(BigInt(big.amount) + 1n)), null);
+  assert.equal(payloadFrom(block([{ hash: 'ee'.repeat(32), data: big.data }]), big.hash, big.amount), null);
+  assert.equal(payloadFrom({ transactions: 'x' }, big.hash, big.amount), null);
+  answer = block([]);
+  fetched.length = 0;
+  assert.equal(await read(MOVES[1].hash, 2068589, MOVES[1].amount), null);
+  assert.equal(fetched.length, MOVE_NODES_ASKED);
+  assert.equal(await read(MOVES[1].hash, 2068589, MOVES[1].amount), null);
+  assert.equal(fetched.length, MOVE_NODES_ASKED, 'none read again at once');
+  t += MOVE_RETRY_MS + 1;
+  answer = block([{ hash: MOVES[1].hash, data: MOVES[1].data }]);
+  assert.equal(await read(MOVES[1].hash, 2068589, MOVES[1].amount), MOVES[1].data.replace(PROOFS_RE, ''));
+  // A node over its budget is not asked.
+  fetched.length = 0;
+  const none = createMovePayloads({ fetchFn, nodes: ['https://node1.example'], budget: () => false });
+  assert.equal(await none(big.hash, 4967463, big.amount), null);
+  assert.deepEqual(fetched, []);
+  // The microblock's body is read up to a bound; the route builds its archive with the process's reader.
+  assert.equal(MOVE_BLOCK_MAX_BYTES, 8 * 1024 * 1024);
+  assert.match(code('server/cabinet/move-payload.ts'), /const data = payloadFrom\(await read\(`\$\{base\}\/api\/v1\/microblock\/\$\{height\}`\), hash, amount\);/);
+});
+
 test('the archive reads every move of the wallet only for the first page, and a failed read of them leaves the other facts', async () => {
-  // Every move to the wallet from the pool, in chain order, the proofs left out in the database, one row past the limit.
-  assert.match(MOVES_SQL, /^SELECT amount::text AS amount, regexp_replace\(COALESCE\(data, ''\), '"proof"\\s\*:\\s\*\\\[\[\^\{\}\]\*\\\]', '', 'g'\) AS data FROM transactions/);
+  // Every move to the wallet from the pool, in chain order, with its hash and block, the proofs left out in the database,
+  // one row past the limit.
+  assert.match(MOVES_SQL, /^SELECT hash, block::text AS block, amount::text AS amount, regexp_replace\(COALESCE\(data, ''\), '"proof"\\s\*:\\s\*\\\[\[\^\{\}\]\*\\\]', '', 'g'\) AS data FROM transactions/);
   assert.match(MOVES_SQL, /WHERE to_address = \$1 AND tx_type = 'RewardDistribution' AND from_address = 'system_rewards_pool'\s+ORDER BY transactions\.block ASC, tx_index ASC LIMIT 5001$/);
   assert.equal(MOVE_ROWS, 5_000);
   const asked = [];
@@ -98,16 +216,17 @@ test('one moment: the balance read just before the page goes with its watermark,
   const balance = { nano: '5000000000', firstUnclaimed: key(3) };
   assert.deepEqual(earnedOf(node, facts({ nano: '7000000000', watermark: key(2) }), balance), { movedNano: '7000000000', balanceNano: '5000000000' });
   assert.deepEqual(earnedOf(node, facts({ nano: '7000000000', watermark: key(2) }), { nano: '0', firstUnclaimed: null }), { movedNano: '7000000000', balanceNano: '0' });
-  // The archive has not reached the latest move, or holds one the node has not applied yet.
-  assert.equal(earnedOf(node, facts({ nano: '3000000000', watermark: key(1) }), balance), null);
-  assert.equal(earnedOf(node, facts({ nano: '9000000000', watermark: key(3) }), balance), null);
-  // A move landed between the balance and the page: the balance still counts epochs the page calls moved.
+  // The archive has not reached the latest move, or holds one the node has not applied yet: the balance alone.
+  const alone = { movedNano: null, balanceNano: '5000000000' };
+  assert.deepEqual(earnedOf(node, facts({ nano: '3000000000', watermark: key(1) }), balance), alone);
+  assert.deepEqual(earnedOf(node, facts({ nano: '9000000000', watermark: key(3) }), balance), alone);
+  // A move landed between the balance and the page: the balance still counts epochs the page calls moved, so neither.
   assert.equal(earnedOf(node, facts({ nano: '7000000000', watermark: key(2) }), { nano: '5000000000', firstUnclaimed: key(2) }), null);
-  // No balance, no archive, no moves read, or a node that names no watermark.
+  // No balance: nothing. No archive, no moves read, or a node that names no watermark: the balance alone.
   assert.equal(earnedOf(node, facts({ nano: '7', watermark: key(2) }), null), null);
-  assert.equal(earnedOf(node, null, balance), null);
-  assert.equal(earnedOf(node, facts(null), balance), null);
-  assert.equal(earnedOf({ ...node, lastClaimed: null }, facts({ nano: '7', watermark: key(2) }), balance), null);
+  assert.deepEqual(earnedOf(node, null, balance), alone);
+  assert.deepEqual(earnedOf(node, facts(null), balance), alone);
+  assert.deepEqual(earnedOf({ ...node, lastClaimed: null }, facts({ nano: '7', watermark: key(2) }), balance), alone);
   // A wallet that never moved: its watermark is 0, its moves none.
   assert.deepEqual(earnedOf({ ...node, lastClaimed: 0 }, facts({ nano: '0', watermark: 0 }), balance), { movedNano: '0', balanceNano: '5000000000' });
   // The page carries it; the page reads it exactly.
@@ -169,6 +288,12 @@ test('the line: the total and its split when the history\'s balance is the one t
   // No answer: could not be read, with the balance the page shows when it shows one.
   assert.deepEqual(earnedView(null, '5000000000'), { kind: 'unknown', balanceNano: '5000000000' });
   assert.deepEqual(earnedView(null, null), { kind: 'unknown', balanceNano: null });
+  // The balance read without its moves: no total, and History names that balance.
+  assert.deepEqual(earnedView({ movedNano: null, balanceNano: '5000000000' }, null), { kind: 'unknown', balanceNano: '5000000000' });
+  assert.deepEqual(earnedView({ movedNano: null, balanceNano: '5000000000' }, '5000000000'), { kind: 'unknown', balanceNano: '5000000000' });
+  assert.deepEqual(earnedView({ movedNano: null, balanceNano: '5000000000' }, '0'), { kind: 'reading' });
+  assert.deepEqual(parseHistoryView({ registeredEpoch: 0, archived: true, rows: [], more: false, earned: { movedNano: null, balanceNano: '5' } })?.earned, { movedNano: null, balanceNano: '5' });
+  assert.equal(parseHistoryView({ registeredEpoch: 0, archived: true, rows: [], more: false, earned: { movedNano: null, balanceNano: null } }), null);
   // The words, and amounts as the balance writes them: readings named "Total earned" and "Moved to the wallet".
   assert.equal(TEXTS.ro_total_earned, 'Total earned');
   assert.equal(TEXTS.ro_moved, 'Moved to the wallet');
@@ -182,7 +307,7 @@ test('the line on the Overview\'s balance of a light and a super node and on His
   const home = code('components/cabinet/NodeHome.tsx');
   // One node balance group for a light and a super node: the figure, then the total earned against the balance it shows.
   assert.equal(home.match(/<Balance nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\}>/g)?.length, 2);
-  assert.match(home, /<p className="cab-figure">[\s\S]*?<\/p>[\s\S]*?<Earned nodeId=\{nodeId\} balanceNano=\{balanceNano\} \/>/);
+  assert.match(home, /<p className="cab-figure" [^\n]*>[\s\S]*?<\/p>[\s\S]*?<Earned nodeId=\{nodeId\} balanceNano=\{balanceNano\} \/>/);
   const history = code('components/cabinet/NodeHistory.tsx');
   assert.match(history, /<div className="cab-earned"><Earned nodeId=\{nodeId\} balanceNano=\{null\} \/><\/div>\s*<Group>\s*<Epochs nodeId=\{nodeId\} show="all" \/>/);
   const line = history.slice(history.indexOf('export function Earned('), history.indexOf('function EpochCard('));
@@ -195,8 +320,10 @@ test('the line on the Overview\'s balance of a light and a super node and on His
   assert.match(line, /const shown = state\.phase === 'loading' \? null : earnedView\(earned, balanceNano, tries >= EARNED_RETRIES\);/);
   assert.match(line, /const sub = shown\?\.kind === 'reading' \? t\('earned_reading'\) : shown\?\.kind === 'unknown' \? t\('earned_unknown'\) : undefined;/);
   assert.match(line, /<Readout label=\{t\('ro_total_earned'\)\} value=\{qnc\(total\?\.totalNano\)\} amount=\{\{\}\} sub=\{sub\} wide \/>/);
-  // History, which shows no balance of its own above, names the history's balance as a third reading.
-  assert.match(line, /\{balanceNano === null && <Readout label=\{t\('balance_title'\)\} value=\{qnc\(total\?\.balanceNano\)\}/);
+  // History, which shows no balance of its own above, names the history's balance as a third reading, also while the
+  // moves cannot be totalled (a super or genesis node's move the archive keeps cut short, an archive behind).
+  assert.match(line, /const balance = shown\?\.kind === 'total' \|\| shown\?\.kind === 'unknown' \? shown\.balanceNano : null;/);
+  assert.match(line, /\{balanceNano === null && <Readout label=\{t\('balance_title'\)\} value=\{qnc\(balance\)\}/);
   // Public chain data: a view only reads its own address, and the line shows the same.
   assert.equal(line.match(/viewOnly/g)?.length, 2, 'public chain data: no difference for a view');
   // The site keeps a page as long as the line waits for.

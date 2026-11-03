@@ -1,4 +1,4 @@
-// A light burn made from the wallet's own Solana address, finished from any browser with QNet Wallet (owner, 06.10: the
+// A light burn made from the wallet's own Solana address, finished from any browser with QNet Wallet (the
 // phone showed the code and "Open the Activate tab of the QNet extension", with nothing to press). Every light burn of a
 // wallet with no node goes on with "Continue in QNet Wallet" (src/lib/cabinet/burn-next.ts, NextSteps.tsx Burned and
 // FinishLight); for this one the `link` request names the burner and QNet Wallet's consent carries that Solana key's owner
@@ -21,11 +21,11 @@ import {
   verifyOwnerBind, walletHash,
 } from '../qnet-link.ts';
 import { createRegister, oneNodeOutcome, ownBurnProof } from '../../server/cabinet/register.ts';
+// Its source read whole, comments with it.
+import { read as code } from './source.mjs';
 
 const OWN = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node-own-burn.vectors.json', import.meta.url), 'utf8'));
 const LN = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
 const bytes = (h) => Uint8Array.from(Buffer.from(h, 'hex'));
 const hex = (b) => Buffer.from(b).toString('hex');
 const utf8 = (s) => new TextEncoder().encode(s);
@@ -73,8 +73,8 @@ test('the Overview: the code first, then Continue in QNet Wallet; the extension 
   assert.doesNotMatch(steps, /burned_scan_open|ext_light_not_listed/);
   // FinishLight is the one QNet Wallet button for both kinds: its label on a phone is Continue in QNet Wallet.
   const finish = steps.slice(steps.indexOf('export function FinishLight('), steps.indexOf('// A burn the wallet has'));
-  assert.match(finish, /\{t\(device\?\.phone \? 'act_link_open' : 'act_link_show_qr'\)\}/);
-  const texts = code('lib/texts.ts');
+  assert.match(finish, /\{say\(device\?\.phone \? 'act_link_open' : 'act_link_show_qr'\)\}/);
+  const texts = code('i18n/locales/en.ts');
   assert.match(texts, /act_link_open: 'Continue in QNet Wallet',/);
   assert.doesNotMatch(texts, /burned_scan_open|ext_light_not_listed/);
 });

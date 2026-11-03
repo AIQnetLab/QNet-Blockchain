@@ -14,7 +14,7 @@ jest.mock('../src/crypto/DilithiumCrypto', () => ({
   signWithDilithium: jest.fn().mockResolvedValue('sig'),
   signDetached: jest.fn().mockResolvedValue('ab'.repeat(8)),
 }));
-jest.mock('../src/services/TaskState', () => ({ closedByUser: jest.fn(async () => false) }));
+jest.mock('../src/services/TaskState', () => ({ closedByUser: jest.fn(async () => false), lastExit: jest.fn(async () => null) }));
 jest.mock('../src/services/DeviceSecurity', () => ({
   ...jest.requireActual('../src/services/DeviceSecurity'),
   bootMark: jest.fn(async () => null),
@@ -74,6 +74,7 @@ beforeEach(async () => {
   appState = AppState.currentState;
   AppState.currentState = 'background';
   TaskState.closedByUser.mockResolvedValue(false);
+  TaskState.lastExit.mockResolvedValue(null);
   BackgroundFetch.status.mockResolvedValue(2);
   Keychain.getGenericPassword.mockResolvedValue({ password: 'sk' });
   delete NativeModules.QNetBackground;
@@ -191,14 +192,14 @@ describe('F12: a background answer reads as little as it can', () => {
     expect(calls.filter((c) => c.url.includes('/light-node/next-ping'))).toHaveLength(1);
   });
 
-  it('a launch in the background reads no status; the first return to the app reads it, and arms the periodic wake again', async () => {
+  it('a launch in the background reads and sends nothing; the first return to the app runs its work, and arms the periodic wake again', async () => {
     await linked();
     // Answered in an earlier epoch: a round reads no registration status, so every status read here is the launch's.
     await AsyncStorage.setItem('qnet_last_self_attest_epoch', String(EPOCH - 1));
     await Push.initializePushService();
     await settle();
-    expect(calls.some((c) => c.url.endsWith('/api/v1/height'))).toBe(true); // the launch's own answer
-    expect(calls.filter((c) => c.url.includes('/light-node/status'))).toEqual([]);
+    // The push or the fetch that started the process answers by its own handler.
+    expect(calls).toEqual([]);
     expect(typeof resume).toBe('function');
     BackgroundFetch.configure.mockClear();
     AppState.currentState = 'active';
@@ -384,6 +385,56 @@ describe('the background priority: what the system allows, read the same way on 
     expect(JSON.stringify(report).length).toBeLessThan(2048);
     const rec = JSON.parse(await AsyncStorage.getItem(Receipts.PUSH_RECEIPTS_KEY));
     for (const e of rec.epochs) expect(e.bg).toBeUndefined();
+  });
+});
+
+// Why the app's last process ended, as Android records it, reaches the node's logs once, with the next answer an owner
+// takes (the node's flat `last_exit` and `last_exit_api`, strings as every field); iOS records none, and none is made up.
+describe('why the app\'s last process ended: once, with the next answer', () => {
+  const AT = 1_800_000_000_000;
+  const exitOf = () => {
+    const body = posts()[posts().length - 1].body;
+    return 'last_exit' in body || 'last_exit_api' in body ? [body.last_exit, body.last_exit_api] : null;
+  };
+
+  it('goes with every answer until an owner takes one, then never again; an older record never', async () => {
+    await linked();
+    TaskState.lastExit.mockImplementation(async (since) => (since < AT ? { reason: 'low_memory', at: AT, api: 34 } : null));
+    // No owner takes the answer: the record stays for the next one.
+    chainAt(at(1000), () => new Error('down'));
+    expect(await Push.selfAttestIfNeeded(NODE)).toBe(false);
+    expect(exitOf()).toEqual(['low_memory', '34']);
+    // Taken, beside the answer's other fields and outside the push receipts.
+    await AsyncStorage.removeItem(HOLD);
+    calls = [];
+    chainAt(at(1000));
+    expect(await Push.selfAttestIfNeeded(NODE)).toBe(true);
+    expect(exitOf()).toEqual(['low_memory', '34']);
+    for (const v of Object.values(posts()[0].body)) expect(typeof v).toBe('string');
+    // The next answer carries none: the record is read again only past the one taken.
+    await AsyncStorage.removeItem(HOLD);
+    calls = [];
+    chainAt(at(1000, EPOCH + 1));
+    expect(await Push.selfAttestIfNeeded(NODE)).toBe(true);
+    expect(exitOf()).toBe(null);
+    expect(TaskState.lastExit).toHaveBeenLastCalledWith(AT);
+    // A newer end goes with a pushed answer too, its receipts as before.
+    TaskState.lastExit.mockImplementation(async (since) => (since < AT + 5 ? { reason: 'swiped', at: AT + 5, api: 34 } : null));
+    await Receipts.noteReceived(NODE, EPOCH + 2, { sentAt: 1_800_000_000, receivedAt: 1_800_000_001 });
+    await Receipts.noteOutcome(NODE, EPOCH + 2, 'swiped');
+    calls = [];
+    chainAt(at(1000, EPOCH + 3));
+    expect(await Push.handlePushMessage({ action: 'epoch', anchor: `${at(1000, EPOCH + 3)}:${HASH}` })).toBe(true);
+    expect(exitOf()).toEqual(['swiped', '34']);
+    expect(JSON.parse(posts()[0].body.push_receipts).pushes).toMatchObject([{ epoch: EPOCH + 2, outcome: 'swiped' }]);
+  });
+
+  it('a device that records none (iOS, Android before 11) sends none', async () => {
+    await linked();
+    chainAt(at(1000));
+    expect(await Push.selfAttestIfNeeded(NODE)).toBe(true);
+    expect(exitOf()).toBe(null);
+    expect(await AsyncStorage.getItem(Receipts.LAST_EXIT_KEY)).toBe(null);
   });
 });
 

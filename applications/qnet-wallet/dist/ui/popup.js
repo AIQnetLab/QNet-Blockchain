@@ -1381,8 +1381,8 @@ function followSent(isCurrent, read, settle) {
  * After qnet.send or qnet.tokenSend. The hash a node returned is not shown or linked: every node that took the signed body
  * stamps its own copy, and the one that lands may have another hash (R2-EXTQ-06). The transfer is known by its nonce: while
  * the screen is shown it asks where that stands by the pinned nodes' live word (qnet.sentStatus, followSent) and turns
- * Confirmed once the transaction is in a block, or says so when another transaction of this wallet took its nonce.
- * History shows the applied one with its real hash.
+ * Confirmed once the transaction is in a block, Expired once no block took it by its signed last height (dropped), or
+ * says so when another transaction of this wallet took its nonce. History shows the applied one with its real hash.
  * @param {{status: 'submitted'|'unknown', nonce: string}} result
  * @returns {void}
  */
@@ -1395,15 +1395,18 @@ function renderQnetSent(result) {
     kvList([[t('reviewNonce'), String(result.nonce)]]),
     actionsRow(button(t('done'), () => selectTab('history'), { kind: 'primary', action: 'done' }))));
   const draw = (status) => {
-    const title = status === 'in_block' ? 'sentConfirmedTitle' : (result.status === 'submitted' ? 'sentTitle' : 'sentUnknownTitle');
+    const title = status === 'in_block' ? 'sentConfirmedTitle'
+      : status === 'dropped' ? 'sentExpiredTitle' : (result.status === 'submitted' ? 'sentTitle' : 'sentUnknownTitle');
     head.replaceChildren(el('h2', { text: t(title) }));
     clear(statusBox);
     if (status === 'replaced') statusBox.append(notice('warn', t('historyReplacedLead')));
+    // no block took it by the last height it signed: it failed and took nothing
+    else if (status === 'dropped') statusBox.append(notice('warn', t('historyDroppedLead')));
     else if (status !== 'in_block') statusBox.append(pendingLine(t('sentQnetPendingLead')));
   };
   draw('pending');
   followSent(isCurrent, () => call('qnet.sentStatus', { nonce: result.nonce }), (answer) => {
-    if (answer?.status !== 'in_block' && answer?.status !== 'replaced') return false;
+    if (!['in_block', 'replaced', 'dropped'].includes(answer?.status)) return false;
     draw(answer.status);
     return true;
   });
@@ -1855,12 +1858,9 @@ function qnetParty(item, sentToken) {
   return partyLine(item.direction, item.direction === 'in' ? item.from : (sentToken ? item.recipient : item.to));
 }
 
-// The worker's row states as plain badges (owner, 28.09; 06.10: a row resolves). Confirmed: two pinned nodes list it
-// (included), or Solana confirmed it. Failed: another transaction took its nonce (replaced), or it failed on Solana. Not
-// found: no node can hold it any more and its nonce is still free (dropped): it did not go through. Unverified: the
-// explorer lists it and no two pinned nodes do (older than what they keep, or not on the chain they serve). Every other
-// state may still apply: pending, stale (no longer resent), unknown (no two nodes agree on its nonce yet), refused (one
-// node refused it).
+// The worker's row states as plain badges: Confirmed in a block, Failed when another transaction took its nonce or
+// Solana failed it, Not found past its last height with its nonce free, Unverified when no two pinned nodes list it
+// where they keep rows; any other state (pending, stale, unknown, refused) may still apply until the chain decides it.
 const HISTORY_BADGES = Object.freeze({
   included: ['badge-ok', 'historyConfirmed'],
   confirmed: ['badge-ok', 'historyConfirmed'],

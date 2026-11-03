@@ -8,6 +8,10 @@ import { pickNetworkHeight, reduceHeaderViews, archiveFloor, HEIGHT_SLACK, NodeC
 import { TOP_BLOCK_SQL } from '../sql';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { migrationsDir } from '../migrate';
 import { WebSocketServer } from 'ws';
 
 // A u64 amount above 2^53 survives the JSON hop exactly: quoted before parse, kept as a digit string.
@@ -320,4 +324,18 @@ test('sockets dropped before any tip block reconnect slower and slower', async (
 // After a restart or a reorg the head is the highest block by number: ordered by the text column, '999999' beat 3508200.
 test('the head query orders by the height column, not its text', () => {
   assert.match(TOP_BLOCK_SQL, /SELECT height::text, hash, timestamp::text FROM blocks ORDER BY blocks\.height DESC LIMIT 1/);
+});
+
+// The indexer's unit enters the release an update switched to, and an update can switch it between two starts: the
+// migrations applied are the build's own, read from beside its code, never from the directory the process started in.
+test('the indexer applies the migrations of its own build, whatever directory it starts in', () => {
+  const own = path.join(__dirname, '..', '..', 'migrations');
+  const before = process.cwd();
+  process.chdir(os.tmpdir());
+  try {
+    assert.equal(migrationsDir(), own);
+  } finally {
+    process.chdir(before);
+  }
+  assert.ok(fs.readdirSync(own).some((f) => /^\d{3}_.*\.sql$/.test(f)), own);
 });

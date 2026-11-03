@@ -1,8 +1,8 @@
-// The one-time payment key of an activation (plan-site section 4.1): an Ed25519 key the browser makes
+// The one-time payment key of an activation: an Ed25519 key the browser makes
 // non-extractable, whose public key is the payment address. It signs exactly three things, each built here from
 // verified inputs and never from bytes a relay, a node or a URL supplied: the burn, only under the wallet's reservation
 // in the server's activation registry, which the wallet itself signed in QNet Wallet; the v2 owner bind of that reserved
-// wallet's light node to the burn, right after the burn is signed and before it is sent (shared contract C4); and the
+// wallet's light node to the burn, right after the burn is signed and before it is sent; and the
 // refund of what is left to the wallet. Only the activation page imports this module.
 
 import { ed25519 } from '@noble/curves/ed25519';
@@ -37,8 +37,8 @@ export async function paymentKeySupported(subtle: SubtleCrypto | undefined = glo
 // A new payment address in this browser for `wallet`'s light node, stored before anything else happens; null when the
 // browser cannot keep one. It starts at `walletConfirm`: nothing shows the address until QNet Wallet confirmed that the
 // light node is for that wallet (activation.ts takeHold), so nothing can be sent to it before. The browser is asked to
-// keep the site's storage (SITE-R1-06), without waiting for its answer. Its network is the release's, never the page's
-// choice: a devnet release makes no mainnet record (SITE-R3-01).
+// keep the site's storage, without waiting for its answer. Its network is the release's, never the page's
+// choice: a devnet release makes no mainnet record.
 export async function createPaymentKey(
   {
     wallet, subtle = globalThis.crypto?.subtle, area = browserArea, now = Date.now(), persist = requestPersistence,
@@ -79,7 +79,7 @@ async function signTx(record: PaymentRecord, instructions: Instruction[], blockh
 }
 
 // 1. The burn of `whole` 1DEV, only from a funded record whose wallet signed its reservation, and only under that
-// wallet's reservation of that very amount with at least SIGN_MARGIN_MS of it left (shared contract C0): two browsers
+// wallet's reservation of that very amount with at least SIGN_MARGIN_MS of it left: two browsers
 // cannot both burn for one wallet, and nobody burns in a wallet's name without it.
 export async function signBurn(record: PaymentRecord, whole: number, blockhash: string, subtle: SubtleCrypto = crypto.subtle, now: number = Date.now()): Promise<SignedTx> {
   if (record.stage !== 'funded') throw new Error('stage');

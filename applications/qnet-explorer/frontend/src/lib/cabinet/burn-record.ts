@@ -1,6 +1,6 @@
-// The server's record of a wallet's activation burn (unified plan R1 and R6: one wallet, one code, for a light or a
+// The server's record of a wallet's activation burn (one wallet, one code, for a light or a
 // super node, chosen once): the timers every client shares, the wallet's signed reservation (only the wallet itself can
-// hold it, shared contract C1), the proof that a burn from the wallet's own Solana address is that wallet's (the message,
+// hold it), the proof that a burn from the wallet's own Solana address is that wallet's (the message,
 // its signed envelope and the check), and the exact answer of GET /api/cabinet/activation/{wallet}, read again in the
 // page. Pure; the server keeps the rows (src/server/cabinet/activation-registry.ts) and the page decides with them
 // (wallet-activation.ts).
@@ -20,6 +20,10 @@ export const RESERVATION_TTL_MS = 600_000;
 export const SIGN_MARGIN_MS = 120_000;
 // An announced burn still not found this long after the announce can no longer land.
 export const SETTLE_AFTER_MS = 600_000;
+// A burn is taken as never landed only when a read this long after the first that missed it still finds it nowhere: by
+// then no lagging Solana backend still misses a burn that landed. The page's dropped burns and the server's announced
+// ones both wait it.
+export const DROP_SETTLE_MS = 3 * 60_000;
 // The server's search of a Solana address for activation burns is reused this long.
 export const SCAN_CACHE_MS = 300_000;
 // How old a wallet's signed reservation may be when the server takes it (seconds): the extension signs right before it
@@ -47,8 +51,8 @@ export const isBurnWay = (value: unknown): value is BurnWay => value === 'extens
 export const isBurnAmount = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= BURN_AMOUNT_MAX;
 
-// The code of a burn (C0): from the burner's own Solana address for a burn of the extension; for a payment address's
-// light burn, from the wallet's QNet address (owner rule, 26.09).
+// The code of a burn: from the burner's own Solana address for a burn of the extension; for a payment address's
+// light burn, from the wallet's QNet address.
 export function recordCode(way: BurnWay, nodeType: NodeType, wallet: string, burner: string, burnTx: string, burnAmount: number): string {
   return way === 'payment' ? activationCode('light', wallet, burnTx, burnAmount) : activationCode(nodeType, burner, burnTx, burnAmount);
 }
@@ -68,7 +72,7 @@ const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typ
 const hasKeys = (v: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(v).length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(v, k));
 
-// ---------------------------------------------------------------- the wallet's signed reservation (C1)
+// ---------------------------------------------------------------- the wallet's signed reservation
 
 // The message the wallet signs to hold itself for one burn: exact text, LF line breaks, no trailing line break, the
 // time in decimal Unix seconds. `burner`: the Solana address that burns (the extension's own, or the payment address).
@@ -108,7 +112,7 @@ function reservationVerifies(fields: ReservationFields, time: number | string, p
   }
 }
 
-// The checks of C1 in their order: the proof's form, its key is the wallet's, the wallet's ML-DSA-65 signature (FIPS 204
+// The reservation proof's checks in their order: the proof's form, its key is the wallet's, the wallet's ML-DSA-65 signature (FIPS 204
 // context QNET_OFFCHAIN_MSG_v1) verifies over the envelope of these very fields and time (`invalid` otherwise), and the
 // time is within the way's window of `nowS` (`stale` otherwise). Without the wallet's key nobody holds it.
 export function verifyReservationProof(fields: ReservationFields, proof: unknown, nowS: number): 'ok' | 'invalid' | 'stale' {
@@ -125,7 +129,7 @@ export function verifyReservationProof(fields: ReservationFields, proof: unknown
 export const verifyReserveAnswer: ReservationVerifier = ({ wallet, burner, time, publicKey, signature }) =>
   reservationVerifies({ wallet, nodeType: 'light', way: 'payment', burner }, time, publicKey, signature);
 
-// ---------------------------------------------------------------- the proof of a burn of the extension (C1)
+// ---------------------------------------------------------------- the proof of a burn of the extension
 
 // The message the wallet signs for its burn: exact text, LF line breaks, no trailing line break.
 export function burnRecordMessage(wallet: string, nodeType: NodeType, burner: string, burnTx: string, amount: number): string {
@@ -166,7 +170,7 @@ export function parseBurnProof(value: unknown): BurnProof | null {
   return { pk: value.pk as string, sig: value.sig as string, solanaSig: value.solanaSig as string };
 }
 
-// Every check of C1: the key is the wallet's, the wallet's ML-DSA-65 signature (FIPS 204 context QNET_OFFCHAIN_MSG_v1)
+// Every check of a burn record's proof: the key is the wallet's, the wallet's ML-DSA-65 signature (FIPS 204 context QNET_OFFCHAIN_MSG_v1)
 // and the burner's Ed25519 signature both verify over the envelope of these very facts. Without both keys of the
 // wallet's recovery phrase no record can be made for it. The Solana check of the burn itself is the caller's.
 export function verifyBurnRecordProof(facts: BurnFacts, proof: unknown): boolean {
@@ -186,7 +190,7 @@ export function verifyBurnRecordProof(facts: BurnFacts, proof: unknown): boolean
   }
 }
 
-// ---------------------------------------------------------------- GET /api/cabinet/activation/{wallet} (C3.1)
+// ---------------------------------------------------------------- GET /api/cabinet/activation/{wallet}
 
 export interface ScanBurn {
   burnTx: string;

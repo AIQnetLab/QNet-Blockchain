@@ -5,10 +5,12 @@
  * sit at the bottom, its body scrolls inside. It slides up in 240 ms (in place with reduce motion on).
  * `level` places it among the root overlays (theme.layer): an alert or prompt by default.
  */
-import React, { useContext, useEffect, useRef, useState } from 'react';
-import { AccessibilityInfo, Animated, Easing, KeyboardAvoidingView, ScrollView, Text, View } from 'react-native';
+import React, { useContext, useEffect, useRef } from 'react';
+import { Animated, Easing, KeyboardAvoidingView, ScrollView, Text, View } from 'react-native';
 import { SafeAreaInsetsContext } from 'react-native-safe-area-context';
 import Action from './Action';
+import { plainAmp } from './amp';
+import { useReduceMotion } from './Status';
 import { color, layer, motion, sheet, space, themed } from '../../theme';
 import { tr } from '../../i18n';
 
@@ -19,15 +21,10 @@ export default function Sheet({
   bodyStyle,
 }) {
   const insets = useContext(SafeAreaInsetsContext) || NO_INSETS;
-  const shown = useRef(new Animated.Value(0)).current;
-  const [still, setStill] = useState(null);
+  // The setting as the app already knows it, so the sheet moves from its first frame instead of waiting on the system.
+  const still = useReduceMotion();
+  const shown = useRef(new Animated.Value(still ? 1 : 0)).current;
   useEffect(() => {
-    let alive = true;
-    AccessibilityInfo.isReduceMotionEnabled().then((v) => { if (alive) setStill(!!v); }, () => { if (alive) setStill(true); });
-    return () => { alive = false; };
-  }, []);
-  useEffect(() => {
-    if (still === null) return;
     if (still) { shown.setValue(1); return; }
     Animated.timing(shown, {
       toValue: 1, duration: motion.sheet, easing: Easing.bezier(...motion.curve), useNativeDriver: true,
@@ -47,11 +44,11 @@ export default function Sheet({
             {kicker || onClose ? (
               <View style={s.headRow}>
                 <View style={s.headText}>{kicker ? <Text style={s.kicker}>{kicker}</Text> : null}</View>
-                {onClose ? <Action kind="quiet" label={closeLabel || t('common_close')} onPress={onClose} align="end" /> : null}
+                {onClose ? <Action kind="quiet" label={closeLabel || t('common_close')} onPress={onClose} /> : null}
               </View>
             ) : null}
             {/* The title takes the whole width under Close, so its longest word fits a narrow screen. */}
-            {title ? <Text style={s.title} accessibilityRole="header">{title}</Text> : null}
+            {title ? <Text style={s.title} accessibilityRole="header">{plainAmp(title, 'semibold')}</Text> : null}
           </View>
         ) : null}
         {scroll ? (

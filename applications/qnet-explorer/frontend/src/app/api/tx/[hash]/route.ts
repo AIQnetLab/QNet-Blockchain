@@ -312,7 +312,7 @@ export async function GET(
     // Determine transaction signature type
     const from = (tx.from_address || tx.from || 'unknown') as string;
     const isSystemTx = from.startsWith('system_') || from === 'genesis' || blockHeight === 0;
-    // FIX-5: sig-only (pk elided after first use → requiring it would mislabel signed txs Unsigned)
+    // The signature alone: a key elided after its first use would otherwise mark a signed transaction Unsigned.
     const isQuantumSigned = !!(tx.is_quantum_signed || tx.dilithium_signature);
     
     // 3 signature types

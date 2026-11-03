@@ -8,7 +8,6 @@
 
 import type { ReactNode } from 'react';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
-import { t } from '@/lib/texts';
 import { isUnfinished, pinnedWallet } from '@/lib/cabinet/flow';
 import { showJourney, type Tab } from '@/lib/cabinet/tabs';
 import type { WalletChoice } from '@/lib/cabinet/wallet-choice';
@@ -16,8 +15,10 @@ import CabinetNav from './CabinetNav';
 import CabinetProgress from './CabinetProgress';
 import { useCabinet } from './CabinetProvider';
 import ConnectScreen from './ConnectScreen';
+import { useI18n } from '@/i18n/client';
 
 function Dashboard({ choice, tab, children }: { choice: WalletChoice; tab: Tab; children: ReactNode }) {
+  const { say } = useI18n();
   const { view, viewOnly } = useCabinet();
   // An activation of this browser for this wallet (or for none yet) that is not finished keeps Activate in reach.
   const records = usePaymentRecords();
@@ -26,8 +27,8 @@ function Dashboard({ choice, tab, children }: { choice: WalletChoice; tab: Tab; 
     <>
       <CabinetNav tab={tab} openActivation={openActivation} />
       <div className="cab-main">
-        {viewOnly && <p className="note cab-lead-note">{t('view_note')}</p>}
-        {choice.source === 'app-qr' && <p className="note cab-lead-note">{t('wallet_from_qr')}</p>}
+        {viewOnly && <p className="note cab-lead-note">{say('view_note')}</p>}
+        {choice.source === 'app-qr' && <p className="note cab-lead-note">{say('wallet_from_qr')}</p>}
         {!viewOnly && showJourney(tab, true, view) && <CabinetProgress connected view={view} />}
         <div className="cab-view">{children}</div>
       </div>

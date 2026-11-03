@@ -12,6 +12,7 @@ import {
   enrolPreimage, hwPingPreimage, hwPublicKeySha3, pingWire, playNonce, refreshPreimage, releasePreimage, rotatePreimage,
 } from '../crypto/NodePreimages';
 import * as DeviceKey from './NodeDeviceKey';
+import { valueBy } from '../utils/deadline';
 
 // The forms a client uses only when two genesis nodes list them (section 7).
 export const FEATURE_DEVICE = 'device_v1';
@@ -319,14 +320,6 @@ export async function hwPingSignature(nodeId, challenge, sigma) {
 
 // ---- refresh, rotation, release ----
 
-// `promise`'s value, or `fallback` once `deadline` passes first (the promise runs on).
-function within(promise, deadline, fallback) {
-  if (!deadline) return promise;
-  let timer;
-  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), Math.max(0, deadline - Date.now())); });
-  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
-}
-
 // The schedule's rotation epoch set to `due`; a new epoch starts its tries over (MN-R2-02).
 function rotationFields(prev, due) {
   const same = !!prev && prev.rotationDue === due;
@@ -379,7 +372,7 @@ export async function refreshIfDue(nodeId, { now = Date.now(), deadline = null, 
   let tokenError = null;
   try {
     // The token may take a while (a Play Integrity round trip): it is waited for only while the POST still fits after it.
-    const t = await within(DeviceKey.vendorToken(playNonce(preimage)), deadline && deadline - 2 * MIN_CALL_MS, null);
+    const t = await valueBy(DeviceKey.vendorToken(playNonce(preimage)), deadline ? deadline - 2 * MIN_CALL_MS : null, null);
     token = t ? t.value : null;
     if (!t) tokenError = 'BUSY';
   } catch (e) {

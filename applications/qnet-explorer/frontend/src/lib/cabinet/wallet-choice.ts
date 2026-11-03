@@ -28,8 +28,8 @@ export function isHeldWallet(choice: WalletChoice): boolean {
 }
 
 // The wallet's own Solana address as far as the page can rely on it: the one the extension or QNet Wallet on this
-// device shared, never one from a QR answer anyone could have given. A payment key sends what is left back to it
-// (owner rule, 26.09), and Node details tell by it whose burn registered the node.
+// device shared, never one from a QR answer anyone could have given. A payment key sends what is left back to it,
+// and Node details tell by it whose burn registered the node.
 export function ownSolanaOf(choice: WalletChoice | null): string | null {
   return choice && isHeldWallet(choice) && choice.solana ? choice.solana : null;
 }

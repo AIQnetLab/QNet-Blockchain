@@ -1,5 +1,5 @@
-// The next step of a known burn of a wallet with no node on the QNet network (components/cabinet/NextSteps.tsx Burned;
-// owner, 06.10: a light node runs in the app, and an activation started on a phone finishes on that phone). The code is
+// The next step of a known burn of a wallet with no node on the QNet network (components/cabinet/NextSteps.tsx Burned:
+// a light node runs in the app, and an activation started on a phone finishes on that phone). The code is
 // always shown first; then, by the burn's node type and the way it was made:
 // - a super node's burn: its server (only the QNet extension activates one);
 // - a payment address's burn: the browser that holds its record goes on in the Activate tab; any other browser

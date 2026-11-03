@@ -4,7 +4,7 @@
 # deploy-aiqnet.sh alone, whose file carries the QNet Link relay's own location (no access log, the
 # Fetch Metadata refusal, a rate-limit zone of its own), the link host and the redirect-only names
 # (docs/protocols/qnet-link-v1.md sections 5 and 12); applications/qnet-explorer/frontend/src/lib/__tests__/
-# deploy-config.test.mjs keeps every script other than the deploy scripts from writing a site file.
+# deploy-config.test.mjs keeps every script other than the deploy script from writing a site file.
 #
 # Security headers come from the app (applications/qnet-explorer/frontend), not from nginx: next.config.js
 # sends X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy,
@@ -21,12 +21,12 @@ echo "=== QNet Blockchain web-server hardening ==="
 # 1. The site file must be the deploy script's: refuse to go on over one without the relay's rules.
 echo "1. Checking the site file written by deployment/deploy-aiqnet.sh..."
 if [ ! -f "$SITE_FILE" ]; then
-    echo "✗ $SITE_FILE is missing: run step 3 of deployment/deploy-aiqnet.sh first." >&2
+    echo "$SITE_FILE is missing: run step 3 of deployment/deploy-aiqnet.sh first." >&2
     exit 1
 fi
 for rule in 'location ^~ /api/link/ {' 'access_log off;' 'if ($aiqnet_cross_fetch) {' 'zone=aiqnet_link' 'server_name link.aiqnet.io;'; do
     if ! grep -qF -- "$rule" "$SITE_FILE"; then
-        echo "✗ $SITE_FILE lacks '$rule': it is not the file deployment/deploy-aiqnet.sh writes." >&2
+        echo "$SITE_FILE lacks '$rule': it is not the file deployment/deploy-aiqnet.sh writes." >&2
         echo "  Replace it with the file of step 3 of deploy-aiqnet.sh, then run this script again." >&2
         exit 1
     fi
@@ -35,18 +35,28 @@ done
 # 2. http-level options, in conf.d (included in the http context): the nginx version stays out of every
 # answer and error page.
 echo "2. Hiding the nginx version..."
+# The file in place now, kept until the new one passes nginx -t (conf.d includes only *.conf).
+if [ -f /etc/nginx/conf.d/security-hardening.conf ]; then
+    cp -p /etc/nginx/conf.d/security-hardening.conf /etc/nginx/conf.d/security-hardening.conf.previous
+fi
 cat > /etc/nginx/conf.d/security-hardening.conf << 'EOF'
 # scripts/security_hardening.sh: http-level options only. Sites are written by deployment/deploy-aiqnet.sh.
 server_tokens off;
 EOF
 
-# 3. Test and apply.
+# 3. Test and apply. A file nginx refuses never stays in place, where the next restart or boot of nginx would meet it.
 echo "3. Testing and applying the configuration..."
 if nginx -t; then
+    rm -f /etc/nginx/conf.d/security-hardening.conf.previous
     systemctl reload nginx
-    echo "✓ nginx reloaded"
+    echo "nginx reloaded"
 else
-    echo "✗ nginx configuration error: nothing was reloaded" >&2
+    if [ -f /etc/nginx/conf.d/security-hardening.conf.previous ]; then
+        mv /etc/nginx/conf.d/security-hardening.conf.previous /etc/nginx/conf.d/security-hardening.conf
+    else
+        rm -f /etc/nginx/conf.d/security-hardening.conf
+    fi
+    echo "nginx configuration error: the new file was taken back out and nothing was reloaded" >&2
     exit 1
 fi
 

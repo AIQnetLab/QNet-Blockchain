@@ -118,7 +118,7 @@ export default function TokenIcon({ logo, symbol, address, size = 28, native = f
       // eslint-disable-next-line @next/next/no-img-element
       <img
         src={`/api/token/${contract}/logo`}
-        alt={symbol ? `${symbol} logo` : 'token logo'}
+        alt={symbol ?? ''}
         width={text ? 16 : size}
         height={text ? 16 : size}
         className={box}

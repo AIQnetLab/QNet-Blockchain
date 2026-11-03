@@ -1,15 +1,15 @@
-// My node's Node details (unified plan R7, SITE-6; R1: the code is shown by itself, with no field to check one): an
+// My node's Node details (the code is shown by itself, with no field to check one): an
 // activation code identifies the burn behind a light or a super node and authorizes nothing. The page shows the chosen
-// wallet's activation (activationFacts) by the code priority of the shared contracts: the registration as the chain
+// wallet's activation (activationFacts) by the code priority: the registration as the chain
 // holds it (src/server/cabinet/registration-record.ts), else the server's record, the answer of the QNet extension that
 // holds the wallet, the burn on the wallet's own Solana address, the extension's answer kept in this browser
 // (wallet-activation.ts knownBurn), else an activation made in this browser. Pure reads.
 //
-// A code encodes a wallet (owner rule, 26.09): a burn a payment key of aiqnet.io made for a wallet carries that
+// A code encodes a wallet: a burn a payment key of aiqnet.io made for a wallet carries that
 // wallet's QNet address, so its code is found only through the registration (burn -> wallet), never through the
 // payment address; a wallet that burned from its own Solana address (the extension, an earlier QNet Wallet, QNet
 // Wallet's own-burn registration with its owner bind v1) keeps the code of that address, as before. Node details show
-// exactly one code (owner, 06.10): whose burn it is comes from what the page knows, else from the site's registration
+// exactly one code: whose burn it is comes from what the page knows, else from the site's registration
 // route (burnByOf); until either tells, the code follows later.
 
 import { activationCode, isActivationCode, type NodeType } from '../qnet-link.ts';
@@ -78,8 +78,7 @@ export function burnByOf(wallet: string, r: RegistrationRecord, evidence: BurnEv
 
 // Where the chosen wallet's registration stands, from the nodes (registered or not, two agreeing) and the archive, with
 // its one code: the wallet's for a payment key's burn, the burner's for a burn from the wallet's own Solana address
-// (owner rule 2, 26.09; SITE-13: the burner's form of a payment key's burn names that temporary address, so it is never
-// shown). `code` is null while whose burn it is cannot be told yet (burnByOf): never a code of the other form.
+// (the burner's form of a payment key's burn names that temporary address, so it is never shown). `code` is null while whose burn it is cannot be told yet (burnByOf): never a code of the other form.
 export type WalletRegistration =
   | { kind: 'none' }
   | { kind: 'code'; code: string | null; record: RegistrationRecord }

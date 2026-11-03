@@ -85,7 +85,7 @@ describe('A6: an app swiped away from the recent apps answers nothing until it i
     expect(kt).toMatch(/if \(inFront\) return false/);
     const activity = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
     expect(activity).toMatch(/TaskState\.opened\(this\)\s*TaskState\.watch\(this\)/);
-    expect(activity).toMatch(/super\.onPause\(\)\s*TaskState\.left\(this\)/);
+    expect(activity).toMatch(/super\.onPause\(\)\s*TaskState\.left\(\)/);
     // One way to start the watch, for the open app and for every answer path in the background.
     expect(activity).not.toMatch(/startService/);
     expect(kt.match(/startService\(/g)).toHaveLength(1);
@@ -110,31 +110,26 @@ describe('A6: an app swiped away from the recent apps answers nothing until it i
     expect(kt).toMatch(/later\(REMOVAL_SETTLE_MS\) \{ mark\.delete\(\) \}/);
     expect(kt).toMatch(/Handler\(Looper\.getMainLooper\(\)\)\.postDelayed\(takeBack, ms\)/);
     // Only a mark another process left counts, on every version, and opening the app clears every one.
-    expect(kt).toMatch(/val swiped = removalOutlived\(context\) \|\| endedWithRemovedTask\(context, p\.getLong\(OPENED_AT, 0L\)\) \|\|/);
+    expect(kt).toMatch(/if \(swipedAway\(\{ removalOutlived\(context\) \}, \{ endedWithRemovedTask\(context, p\.getLong\(OPENED_AT, 0L\)\) \}\)\) \{\s*markClosed\(context\)/);
     expect(kt).toMatch(/fun opened\(context: Context\) \{[^}]*marks\(context\)\.clear\(\)/);
     // Android 7 sets no background limit: a watch only background answers started stops itself after the minute.
     expect(kt).toMatch(/if \(watchStopsItself\(Build\.VERSION\.SDK_INT, startedInFront\)\) main\.postDelayed\(stop, BACKGROUND_WATCH_MS\)/);
     expect(kt).toMatch(/startedInFront = startedInFront \|\| TaskState\.inFront/);
   });
 
-  it('Android: a task missing from the recent apps is a swipe only inside the time the system itself would keep it (L-7)', () => {
+  // A swipe that cannot be told for sure is answered. A task missing from the recent apps is what the system's own trim
+  // leaves too, and some phones trim within minutes of the app leaving the front.
+  it('Android: a task missing from the recent apps alone is never a swipe; only the two sure signs are', () => {
     const kt = read('android/app/src/main/java/com/qnetmobile/TaskState.kt');
-    // The third sign, read after the other two on every ask; the mark it sets stays until the next open.
-    expect(kt).toMatch(/\|\|\s*goneInsideKeepWindow\(context, p\)\s*if \(swiped\) \{\s*markClosed\(context\)/);
-    // The app notes when it left the front on the boot clock, with the boot's start count, as the system counts a task
-    // inactive; outside that boot, or past the window, the missing task says nothing (TaskStateTest.kt).
-    expect(kt).toMatch(/fun left\(context: Context\) \{\s*inFront = false\s*prefs\(context\)\.edit\(\)\s*\.putLong\(LEFT_AT, SystemClock\.elapsedRealtime\(\)\)\.putInt\(LEFT_BOOTS, bootCount\(context\)\)/);
-    expect(kt).toMatch(/removedInsideKeepWindow\(sameBoot, now - leftAt, keepWindow\(context\)\) \{ taskGone\(context\) \}/);
-    // The window is the platform's own setting; a low-memory device, which keeps recent apps by count, has none.
-    expect(kt).toMatch(/isLowRamDevice != false\) return 0L/);
-    expect(kt).toMatch(/platformInteger\("config_maxNumVisibleRecentTasks"\) \?: -1/);
-    expect(kt).toMatch(/platformInteger\("config_activeTaskDurationHours"\) \?: DEFAULT_KEEP_HOURS/);
-    // One reader of the task list (this sign and the finishing activity), and one boot check, shared with SecretClip.
+    expect(kt).toMatch(/internal fun swipedAway\(removalMark: \(\) -> Boolean, removedTaskRecord: \(\) -> Boolean\): Boolean =\s*removalMark\(\) \|\| removedTaskRecord\(\)/);
+    // An ask never reads the recent apps; only a finishing activity on Android 7 to 10 does, for its removal mark.
+    const ask = kt.slice(kt.indexOf('fun closedByUser('), kt.indexOf('fun removed('));
+    expect(ask).not.toMatch(/taskGone|appTasks/);
+    expect(kt.match(/taskGone\(context\)/g)).toHaveLength(1);
     expect(kt.match(/appTasks/g)).toHaveLength(1);
-    expect(kt).not.toMatch(/getRecentTasks/);
-    const clip = read('android/app/src/main/java/com/qnetmobile/SecretClip.kt');
-    expect(`${kt}\n${clip}`.match(/fun sameBoot\(/g)).toHaveLength(1);
-    expect(clip).toMatch(/if \(!sameBoot\(copy\.boots, copy\.copiedAt, boots, now\)\) return ClipAction\.FORGET/);
+    // Nothing notes when the app left the front but the activity's own flag, and no recent-apps setting is read.
+    expect(kt).not.toMatch(/LEFT_AT|LEFT_BOOTS|KeepWindow|recentsKeepMs|activeTaskDuration|maxNumVisibleRecentTasks|getRecentTasks/);
+    expect(kt).toMatch(/fun left\(\) \{\s*inFront = false\s*\}/);
   });
 
   it('one JS reader on both platforms answers the native mark; a build without it, or an error, never stops a node', async () => {
@@ -152,6 +147,37 @@ describe('A6: an app swiped away from the recent apps answers nothing until it i
       delete NativeModules.QNetTaskState;
     }
     expect(await closedByUser()).toBe(false);
+  });
+
+  // Why the app's last process ended, for the node's logs: Android 11+ keeps a record of it; iOS keeps none, and nothing
+  // is made up for it.
+  it('why the app\'s last process ended: Android\'s record in the fixed words with its API level, nothing elsewhere', async () => {
+    const { lastExit, EXIT_REASONS } = jest.requireActual('../src/services/TaskState');
+    expect(EXIT_REASONS).toEqual(['crash', 'anr', 'low_memory', 'system_killed', 'user_closed', 'swiped', 'other', 'unknown']);
+    NativeModules.QNetTaskState = { lastExit: jest.fn(async () => ({ reason: 'anr', at: 1_800_000_000_000, api: 34 })) };
+    try {
+      expect(await lastExit(5)).toEqual({ reason: 'anr', at: 1_800_000_000_000, api: 34 });
+      expect(NativeModules.QNetTaskState.lastExit).toHaveBeenCalledWith(5);
+      for (const bad of [null, { reason: 'killed_by_magic', at: 1, api: 34 }, { reason: 'crash', at: 1.5, api: 34 }, { reason: 'crash', at: 1 }]) {
+        NativeModules.QNetTaskState.lastExit.mockResolvedValueOnce(bad);
+        expect(await lastExit()).toBe(null);
+      }
+      NativeModules.QNetTaskState.lastExit.mockRejectedValueOnce(new Error('no'));
+      expect(await lastExit()).toBe(null);
+      // iOS's module answers closedByUser only.
+      NativeModules.QNetTaskState = { closedByUser: jest.fn(async () => false) };
+      expect(await lastExit()).toBe(null);
+    } finally {
+      delete NativeModules.QNetTaskState;
+    }
+    const kt = read('android/app/src/main/java/com/qnetmobile/TaskState.kt');
+    // One reader of the exit records, for the swipe and for this; the newest only, newer than the last one taken.
+    expect(kt.match(/getHistoricalProcessExitReasons\(/g)).toHaveLength(1);
+    expect(kt).toMatch(/exitRecords\(context, 1\)\.firstOrNull\(\)\?\.takeIf \{ it\.timestamp > sinceMs \}/);
+    expect(kt).toMatch(/putInt\("api", Build\.VERSION\.SDK_INT\)/);
+    const mapping = kt.slice(kt.indexOf('internal fun exitReasonName('), kt.indexOf('internal const val EXIT_SUBREASON_REMOVE_TASK'));
+    expect([...new Set([...mapping.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]))].sort()).toEqual([...EXIT_REASONS].sort());
+    expect(read('ios/QNetMobile/QNetTaskState.m')).not.toMatch(/lastExit/);
   });
 
   it('iOS: a background launch after a close from the app switcher answers nothing; the app in front, and once opened, it does', async () => {
@@ -249,14 +275,17 @@ describe('A2: deleting the wallet stops its node for good', () => {
     }
   });
 
-  it('the screen: progress first, the local wipe before the network\'s answer, a word when it is done', () => {
+  it('the screen: progress first, the local wipe before the network\'s answer, then the next screen with no notice', () => {
     const ws = read('src/screens/WalletScreen.js');
     const erase = ws.slice(ws.indexOf('const eraseWallet = async'), ws.indexOf('// Settings → Delete wallet'));
     expect(erase).toMatch(/setErasing\(true\);[\s\S]*stopLightNode\(\{ waitForNetwork: false, forgetDevice: true \}\)[\s\S]*eraseAllData\(\)[\s\S]*await Promise\.resolve\(sent\)/);
     expect(erase).toMatch(/finally \{\s*setErasing\(false\);/);
-    expect(ws).toMatch(/\{erasing \? <Text style=\{styles\.subtitle\}>\{t\('deleting_wallet'\)\}<\/Text> : null\}/);
-    expect(ws.match(/showAlert\('', t\('wallet_deleted'\)\)/g)).toHaveLength(2);
-    expect(t('wallet_deleted')).toBe('The wallet was deleted from this device.');
+    expect(ws).toMatch(/\{erasing \? <Text style=\{\[styles\.subtitle, styles\.markLine\]\}>\{t\('deleting_wallet'\)\}<\/Text> : null\}/);
+    // Delete (the screen lock, the password) ends on the welcome screen, erase on the import.
+    const doors = ws.slice(ws.indexOf('// Settings → Delete wallet'), ws.indexOf('// Terms of Service Modal'));
+    expect(doors.match(/await eraseWallet\(\);\s*\} catch/g)).toHaveLength(3);
+    expect(doors).toMatch(/return;\s*\}\s*\/\/[^\n]*\n\s*await startImport\(\);\s*\};/);
+    expect(['wallet_deleted', 'erased_title', 'erased_body'].filter(require('../src/i18n').hasKey)).toEqual([]);
   });
 });
 
@@ -275,7 +304,7 @@ describe('A1: the lock screen', () => {
     // The field with the focus lets go of it first (06.10: nothing is focused by itself), then the session closes.
     expect(ws).toMatch(/const lockSession = \(\) => \{\s*(\/\/[^\n]*\n\s*)*Keyboard\.dismiss\(\);\s*walletManager\.closeSession\(\);[\s\S]{0,200}setUnlockPrompting\(true\);/);
     expect(ws).toMatch(/if \(erasing \|\| !walletKnown\) \{/);
-    expect(ws).toMatch(/setTimeout\(\(\) => \{\s*if \(autoUnlockOwedRef\.current && AppState\.currentState === 'active' && autoUnlockRef\.current\) autoUnlockRef\.current\(\);\s*\}, AUTO_UNLOCK_RECHECK_MS\);/);
+    expect(ws).toMatch(/later\(\(\) => \{\s*if \(autoUnlockOwedRef\.current && AppState\.currentState === 'active' && autoUnlockRef\.current\) autoUnlockRef\.current\(\);\s*\}, AUTO_UNLOCK_RECHECK_MS\);/);
   });
 });
 
@@ -302,16 +331,18 @@ describe('A4: History', () => {
     for (const n of [0.12345678, 1e-9, 99999.9999, 123456789012.345, 1e18]) expect(H.compactAmount(n)).not.toMatch(/[KMBTe]/);
   });
 
-  it('a row: what happened over its status and whom with, and the amount; the number never shrinks, only the symbol may', async () => {
-    const tx = { hash: 'p'.repeat(64), from: QNET, to: OTHER, amount: 1234567.12345, fee: 0.00015, status: 'pending', timestamp: Date.UTC(2026, 9, 4, 12), type: 'send' };
+  it('a row: what happened over its status and whom with, and the amount beside the title; the number shrinks only to fit', async () => {
+    // A number that sits beside the title in a History card, its symbol on its line (HistoryTab fitsBeside).
+    const tx = { hash: 'p'.repeat(64), from: QNET, to: OTHER, amount: 12345, fee: 0.00015, status: 'pending', timestamp: Date.UTC(2026, 9, 4, 12), type: 'send' };
     const onOpen = jest.fn();
     let tree;
     await act(async () => { tree = renderer.create(<H.HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={onOpen} />); });
     const shown = texts(tree);
-    expect(shown).toEqual(expect.arrayContaining([t('hist_sent'), '−1,234,567', ' QNC', t('hist_status_pending')]));
-    const amount = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === '−1,234,567');
+    expect(shown).toEqual(expect.arrayContaining([t('hist_sent'), '−12,345', ' QNC', t('hist_status_pending')]));
+    expect(H.fitsBeside(H.describeTx(tx).legs[0])).toBe(true);
+    const amount = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === '−12,345');
     expect(amount.props.numberOfLines).toBe(1);
-    expect(amount.props.adjustsFontSizeToFit).toBeFalsy();
+    expect(tree.root.find((n) => n.props.testID === 'history-row-top' && typeof n.type === 'string').findAllByType(Text)).toContain(amount);
     const symbol = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === ' QNC');
     expect(symbol.props.ellipsizeMode).toBe('tail');
     await act(async () => { tree.root.find((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function').props.onPress(); });
@@ -327,10 +358,10 @@ describe('A4: History', () => {
   it('the detail screen: every field the app holds, the explorer for a QNet transaction in a block and a Solana one that ran', async () => {
     const tx = { hash: 'c'.repeat(64), from: QNET, to: OTHER, amount: 1234567.12345, fee: 0.00015, status: 'confirmed', timestamp: Date.UTC(2026, 9, 4, 12), type: 'send', block: 2345678 };
     const onExplorer = jest.fn();
-    const onCopy = jest.fn();
     const onBack = jest.fn();
+    const Clipboard = require('@react-native-clipboard/clipboard').default;
     let tree;
-    await act(async () => { tree = renderer.create(<H.TxDetail tx={tx} t={t} onBack={onBack} onCopy={onCopy} onExplorer={onExplorer} />); });
+    await act(async () => { tree = renderer.create(<H.TxDetail tx={tx} t={t} onBack={onBack} onExplorer={onExplorer} />); });
     const shown = texts(tree).join('\n');
     for (const s of ['−1,234,567.12345 QNC', t('tx_detail_fee'), '0.00015 QNC', t('tx_detail_from'), QNET, t('tx_detail_to'), OTHER,
       t('tx_detail_time'), t('tx_label'), tx.hash, t('tx_detail_block'), '2345678', t('hist_status_confirmed')]) {
@@ -341,21 +372,22 @@ describe('A4: History', () => {
     await act(async () => { tree.root.find((n) => n.props.testID === 'tx-detail-back').props.onPress(); });
     expect(onBack).toHaveBeenCalled();
     const sol = { hash: 's'.repeat(88), chain: 'solana', from: 'a', to: 'b', solSymbol: '1DEV', solAmount: '12.5', solFee: '0.000005', status: 'confirmed', timestamp: 1, type: 'send' };
-    await act(async () => { tree.update(<H.TxDetail tx={sol} t={t} onBack={onBack} onCopy={onCopy} onExplorer={onExplorer} />); });
+    await act(async () => { tree.update(<H.TxDetail tx={sol} t={t} onBack={onBack} onExplorer={onExplorer} />); });
     await act(async () => { tree.root.find((n) => n.props.testID === 'tx-detail-explorer').props.onPress(); });
     expect(onExplorer).toHaveBeenLastCalledWith(sol.hash, 'solana');
     expect(require('../src/config/nodes').solanaExplorerTxUrl(sol.hash)).toBe(`https://explorer.solana.com/tx/${sol.hash}?cluster=devnet`);
     // A Solana send that expired unrun (no fee charged) never reached the ledger, and one still pending is not there yet:
-    // the hash is copied.
+    // no explorer; its hash is copied by a tap on it, as every field is.
     for (const notRun of [{ ...sol, status: 'failed', solFee: null }, { ...sol, status: 'pending' }]) {
-      await act(async () => { tree.update(<H.TxDetail tx={notRun} t={t} onBack={onBack} onCopy={onCopy} onExplorer={onExplorer} />); });
+      await act(async () => { tree.update(<H.TxDetail tx={notRun} t={t} onBack={onBack} onExplorer={onExplorer} />); });
       expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-explorer')).toHaveLength(0);
     }
-    await act(async () => { tree.root.find((n) => n.props.testID === 'tx-detail-copy').props.onPress(); });
-    expect(onCopy).toHaveBeenCalledWith(sol.hash, 'detail-hash');
-    // A pending QNet transaction is not in the explorer yet: its hash is copied too.
-    await act(async () => { tree.update(<H.TxDetail tx={{ ...tx, status: 'pending' }} t={t} onBack={onBack} onCopy={onCopy} onExplorer={onExplorer} />); });
+    await act(async () => { await tree.root.find((n) => n.props.testID === 'tx-detail-copy-hash' && n.props.onPress).props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(sol.hash);
+    // A pending QNet transaction is not in the explorer yet.
+    await act(async () => { tree.update(<H.TxDetail tx={{ ...tx, status: 'pending' }} t={t} onBack={onBack} onExplorer={onExplorer} />); });
     expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-explorer')).toHaveLength(0);
+    await act(async () => { tree.unmount(); });
   });
 
   it('the tab: the same QNet · Solana selector as Assets, no filter chips', () => {
@@ -364,8 +396,9 @@ describe('A4: History', () => {
     expect(tab).toMatch(/<Tabs\s+items=\{\[\{ key: 'qnet', label: CHAIN_NAME \}, \{ key: 'solana', label: 'Solana' \}\]\}/);
     expect(tab).toMatch(/onChange=\{setSelectedNetwork\}/);
     expect(tab).not.toMatch(/historyChip|assetChips|matchesAsset/);
-    // One row per transaction under a header for its day (06.10).
-    expect(tab).toMatch(/const listed = historySections\(historyEntries\(onQnet/);
+    // One row per transaction under a header for its day, from the one list a token's own screen reads too.
+    expect(tab).toMatch(/const listed = historySections\(historyOn\(selectedNetwork\)\);/);
+    expect(ws).toMatch(/const historyOn = \(network\) => historyEntries\(network === 'qnet'/);
     expect(tab).toMatch(/renderItem=\{\(\{ item \}\) => \(item\.dayHeader \? <DayHeader item=\{item\} t=\{t\} \/>\s*: <HistoryRow tx=\{item\} onOpen=\{openTxDetail\}/);
   });
 });
@@ -376,15 +409,17 @@ describe('M10: the crash screen\'s Clear cache', () => {
   const { CACHE_KEYS } = require('../src/components/ErrorBoundary');
 
   it('removes the caches the app reads again by itself, by exact key, and says success only when one was there', async () => {
-    expect([...CACHE_KEYS].sort()).toEqual(['qnet_cached_server_status', 'qnet_node_pool', 'qnet_node_rewards', 'qnet_tx_history']);
+    expect([...CACHE_KEYS].sort()).toEqual(['qnet_node_pool', 'qnet_node_rewards', 'qnet_tx_history']);
     const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
-    await AsyncStorage.multiSet([['qnet_node_rewards', '{}'], ['qnet_tx_history', '[]'], ['qnet_wallet', 'vault'], ['qnet_language', 'en']]);
+    await AsyncStorage.multiSet([['qnet_node_rewards', '{}'], ['qnet_tx_history', '[]'], ['qnet_wallet', 'vault'], ['qnet_language', 'en'],
+      ['qnet_wallet_node', '{"owner":"w","nodeId":"super_node_5555666677778888","nodeType":"super","status":null,"at":1}']]);
     const boundary = new ErrorBoundary({});
     boundary.setState = () => {};
     await boundary.handleClearCache();
     expect(await AsyncStorage.getItem('qnet_node_rewards')).toBe(null);
     expect(await AsyncStorage.getItem('qnet_tx_history')).toBe(null);
-    expect(await AsyncStorage.getItem('qnet_wallet')).toBe('vault'); // the wallet and the settings stay
+    expect(await AsyncStorage.getItem('qnet_wallet')).toBe('vault'); // the wallet, its node record and the settings stay
+    expect(await AsyncStorage.getItem('qnet_wallet_node')).toContain('super_node_5555666677778888');
     expect(await AsyncStorage.getItem('qnet_language')).toBe('en');
     expect(alert.mock.calls[0].slice(0, 2)).toEqual([t('crash_cache_cleared_title'), t('crash_cache_cleared_body')]);
     await boundary.handleClearCache();

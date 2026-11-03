@@ -45,3 +45,22 @@ export function accountView(read: NodeAccountRead): { balance_raw: string | null
   const balance = typeof b === 'string' && /^\d+$/.test(b) ? b : typeof b === 'number' && Number.isFinite(b) && b > 0 ? String(Math.trunc(b)) : '0';
   return { balance_raw: balance, genesisAllocation: read.account?.genesis_allocation === true };
 }
+
+// The node's own words for no token at a contract (development/qnet-integration/src/rpc/misc_api.rs handle_token_info):
+// no contract there, or a contract that is no token.
+const NODE_NO_TOKEN = new Set(['Token not found', 'Contract exists but is not a QRC-20/QRC-721 token']);
+
+// The node's answer to GET /api/v1/token/{contract} as the token route reads it (`status` null: no node answered): the
+// token's record, `missing` only for the node's own not-found, and `unavailable` for anything else (no answer, a failed
+// node, a body that is not its answer), so an outage never reads as "no token".
+export type NodeTokenRead = { kind: 'token'; token: Record<string, unknown> } | { kind: 'missing' } | { kind: 'unavailable' };
+
+export function nodeTokenRead(status: number | null, body: unknown): NodeTokenRead {
+  if (status === 404) return { kind: 'missing' };
+  if (status === null || status < 200 || status > 299 || body === null || typeof body !== 'object') return { kind: 'unavailable' };
+  const answer = body as { success?: unknown; token?: unknown; error?: unknown };
+  if (answer.success === true && answer.token !== null && typeof answer.token === 'object' && !Array.isArray(answer.token)) {
+    return { kind: 'token', token: answer.token as Record<string, unknown> };
+  }
+  return answer.success === false && typeof answer.error === 'string' && NODE_NO_TOKEN.has(answer.error) ? { kind: 'missing' } : { kind: 'unavailable' };
+}

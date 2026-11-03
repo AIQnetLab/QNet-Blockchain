@@ -3,19 +3,18 @@
 // The parts of the activation page (src/components/cabinet/NodeActivate.tsx) that only show what the record holds:
 // the payment address and what to send to it, the receipt, QNet Wallet's answer and its check number, sending what is
 // left back after the burn, what is left going back to the wallet, and the node once it is registered. Every text is the
-// cabinet's own (src/lib/texts.ts).
+// cabinet's own (src/i18n/locales/en.ts). Addresses, amounts, codes and live readouts carry translate="no": a browser's page
+// translation would rewrite them and the text nodes the page updates; the words around them stay translatable.
 
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
-import Link from 'next/link';
+import { useEffect, useRef, useState, type FormEvent, type MouseEvent, type ReactNode } from 'react';
 import { useWallet } from '@/contexts/AppContext';
 import Action from '@/components/ui/Action';
 import Copy from '@/components/ui/Copy';
-import EntityLink from '@/components/ui/EntityLink';
-import TokenIcon from '@/components/TokenIcon';
+import EntityLink, { Amount } from '@/components/ui/EntityLink';
 import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import ViewTabs from '@/components/ui/ViewTabs';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
-import { number, t } from '@/lib/texts';
+import { number } from '@/lib/texts';
 import { useNodeStatus } from '@/hooks/useNodeStatus';
 import type { PaymentBalance } from '@/lib/cabinet/activation';
 import { FUNDING_SOL_LAMPORTS } from '@/lib/cabinet/burn-tx';
@@ -25,28 +24,29 @@ import { formatUnits } from '@/lib/cabinet/node-view';
 import {
   FUNDING_DECIMALS, PHONE_LINK, fundingButtons, fundingLeft, fundingReceived, fundingSol, fundingTransfer, requestLink, type FundingToken,
 } from '@/lib/cabinet/payment-request';
-import { handOver, handOverPass, requestFaucetPass } from '@/lib/faucet-handover';
+import { PASS_WAIT_MS, faucetPasses, handOver, handOverPass } from '@/lib/faucet-handover';
 import { ACTIVATION_NETWORK, ONE_DEV_DECIMALS, ONE_DEV_UNIT, SOL_DECIMALS } from '@/lib/one-dev';
 import { formatCheckNumber } from '@/lib/qnet-link';
 import type { SolanaTransfer, SolanaTransferResult } from '@/lib/qnet-provider';
-import { rich } from '@/lib/rich';
 import { decodeKey } from '@/lib/solana-message';
 import { useCabinet } from './CabinetProvider';
 import { QrCode, openHref } from './LinkWaiting';
 import { DeviceRows, StatusGate } from './NodeStatus';
 import { Fact, Facts } from './parts';
+import { Link, useI18n, useLocaleRouter } from '@/i18n/client';
 
 type Mode = 'wallet' | 'manual';
+const FAUCET_HREF = '/testnet#faucet';
 
-// The payment address and what to send to it from the user's own wallet (owner, 19.10): one sentence with both amounts,
+// The payment address and what to send to it from the user's own wallet: one sentence with both amounts,
 // then the two ways as tabs. "Send from your wallet": one row per transfer, with the button for what the address still
 // lacks of it, opening a wallet with it filled in (the QNet extension once it takes qnet_sendSolanaTransfer, on any
 // device; else on a phone the release's link, PHONE_LINK), done once the balance read holds its amount. "Send it
 // yourself": the address with Copy, the amounts and one QR code of it (on a phone the address and amounts come first).
 // Without a way to send from the wallet, only the address, without tabs. Under both, what has arrived, per amount. The
 // node is for the QNet wallet that confirmed it, never this address. On testnet the faucet link hands over the wallet's
-// Solana address and the faucet pass without a URL (src/lib/faucet-handover.ts, SITE M-13); test tokens are named as
-// such (SITE-R3-01).
+// Solana address and the faucet pass without a URL (src/lib/faucet-handover.ts); test tokens are named as
+// such.
 export function Funding({
   record,
   price,
@@ -65,8 +65,9 @@ export function Funding({
   // The page is open on a phone or tablet.
   phone?: boolean;
 }) {
+  const { t, say, rich } = useI18n();
   const sol = fundingSol();
-  const tokens: Record<FundingToken, string> = { oneDev: '1DEV', sol: 'SOL' };
+  const tokens: Record<FundingToken, '1DEV' | 'SOL'> = { oneDev: '1DEV', sol: 'SOL' };
   const tokenName = (token: FundingToken) => (ACTIVATION_NETWORK === 'testnet' ? t('act_test_token', { token: tokens[token] }) : tokens[token]);
   const full: Record<FundingToken, string> = { oneDev: number(price), sol };
   const left = fundingLeft(balance, price);
@@ -126,28 +127,47 @@ export function Funding({
       <button key={token} type="button" className={className} onClick={() => void send(token, transfer, amount)} disabled={sending !== null}>{label}</button>
     );
   };
-  // The faucet pass for the wallet the record holds; none without its signed reservation or off testnet.
-  const [pass, setPass] = useState<string | null>(null);
+  // The faucet pass for the wallet the record holds (none without its signed reservation or off testnet), asked for only
+  // when the link is followed: the click waits for it a moment, the link busy and taking no second click, then goes on
+  // with or without one, unless the visitor has gone elsewhere meanwhile.
+  const router = useLocaleRouter();
   const hold = ACTIVATION_NETWORK === 'testnet' ? record.hold ?? null : null;
-  const [holdWallet, holdPk, holdSig, holdTime] = hold ? [hold.wallet, hold.pk, hold.sig, hold.time] : [null, null, null, null];
+  const [passWait, setPassWait] = useState(false);
+  const shown = useRef(false);
   useEffect(() => {
-    if (holdWallet === null || holdPk === null || holdSig === null || holdTime === null) return undefined;
-    let live = true;
-    void requestFaucetPass({ wallet: holdWallet, pk: holdPk, sig: holdSig, time: holdTime }, record.pub).then((got) => {
-      if (live) setPass(got);
-    });
+    shown.current = true;
     return () => {
-      live = false;
+      shown.current = false;
     };
-  }, [holdWallet, holdPk, holdSig, holdTime, record.pub]);
-  const toFaucet = () => {
+  }, []);
+  const toFaucet = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (passWait) {
+      event.preventDefault();
+      return;
+    }
     if (walletSolana) handOver(walletSolana);
-    if (pass) handOverPass(pass);
+    if (!hold) return;
+    const kept = faucetPasses.ready(hold);
+    if (kept) handOverPass(kept);
+    // A pass already kept, or a new tab or window, which opens at once.
+    if (kept || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    const from = window.location.href;
+    setPassWait(true);
+    void faucetPasses.obtain(hold, record.pub, PASS_WAIT_MS).then((got) => {
+      if (got) handOverPass(got);
+      if (!shown.current) return;
+      setPassWait(false);
+      if (window.location.href === from) router.push(FAUCET_HREF);
+    });
   };
+  // A transfer's amount with its token's icon, the same in both ways; the word that marks a test token stands in the
+  // label beside it, in the page's language and direction, never inside the amount's left-to-right run.
+  const amount = (token: FundingToken) => <Amount value={full[token]} solana={tokens[token]} />;
   const row = (token: FundingToken) => (
     <div className="cab-send" data-done={received[token] || undefined}>
-      <span className="cab-send-k">{tokens[token]}</span>
-      <span className="cab-send-amt">{full[token]} {tokenName(token)}</span>
+      <span className="cab-send-k">{tokenName(token)}</span>
+      <span className="cab-send-amt" translate="no">{amount(token)}</span>
       {fundButton(token)}
     </div>
   );
@@ -156,12 +176,12 @@ export function Funding({
       {row('oneDev')}
       {row('sol')}
       <p className="note">
-        {t(buttons === 'extension' ? 'act_fund_auto_extension' : PHONE_LINK === 'transfer' ? 'act_fund_auto_phone_transfer' : 'act_fund_auto_phone')}
+        {say(buttons === 'extension' ? 'act_fund_auto_extension' : PHONE_LINK === 'transfer' ? 'act_fund_auto_phone_transfer' : 'act_fund_auto_phone')}
       </p>
       {sending !== null && <Waiting>{t('wallet_extension_waiting')}</Waiting>}
       {outcome && !received[outcome.token] && (outcome.result.ok
-        ? <Answered>{t(transferKey(outcome.result))}</Answered>
-        : <Failed>{t(transferKey(outcome.result))}</Failed>)}
+        ? <Answered>{say(transferKey(outcome.result))}</Answered>
+        : <Failed>{say(transferKey(outcome.result))}</Failed>)}
     </>
   );
   const yourself = (
@@ -172,12 +192,12 @@ export function Funding({
       <div className="cab-manual-t">
         <p className="label">{t('act_address_title')}</p>
         <p className="ent-copy">
-          <span className="ent ent-full">{record.pub}</span>
+          <span className="ent ent-full" translate="no">{record.pub}</span>
           <Copy value={record.pub} />
         </p>
         <dl className="cab-amts">
-          <div><dt>1DEV</dt><dd className="amount"><span className="amount-v num">{full.oneDev}</span> <span className="ent ent-unit"><TokenIcon solana="1DEV" size="text" />{tokenName('oneDev')}</span></dd></div>
-          <div><dt>SOL</dt><dd className="amount"><span className="amount-v num">{full.sol}</span> <span className="ent ent-unit"><TokenIcon solana="SOL" size="text" />{tokenName('sol')}</span></dd></div>
+          <div><dt>{tokenName('oneDev')}</dt><dd>{amount('oneDev')}</dd></div>
+          <div><dt>{tokenName('sol')}</dt><dd>{amount('sol')}</dd></div>
         </dl>
       </div>
     </div>
@@ -189,20 +209,22 @@ export function Funding({
     return (
       <div className="cab-meter">
         <span className="label">{t('act_meter_label', { token: tokens[token] })}</span>
-        <span className="cab-meter-v">{has === null ? <span className="dash">—</span> : t('act_meter', { received: formatUnits(has, decimals), need: of })}</span>
+        <span className="cab-meter-v" translate="no">{has === null ? <span className="dash">—</span> : t('act_meter', { received: formatUnits(has, decimals), need: of })}</span>
         <span className="ro-bar" aria-hidden="true"><i style={{ transform: `scaleX(${share.toFixed(4)})` }} /></span>
       </div>
     );
   };
+  // The wallet without a link: its explorer page shows no payment; the meters below show what arrived.
   return (
     <div className="cab-pay">
-      {wallet && <p className="cab-step-s">{rich('act_owner', { wallet: <EntityLink kind="address" value={wallet} /> })}</p>}
+      {wallet && <p className="cab-step-s">{rich('act_owner', { wallet: <EntityLink kind="address" value={wallet} link={false} /> })}</p>}
       <p className="cab-pay-h">{t(ACTIVATION_NETWORK === 'mainnet' ? 'act_mainnet_send' : 'act_testnet_send', { price: number(price), sol })}</p>
-      {ACTIVATION_NETWORK === 'testnet' && (
+      {/* Once both amounts are on the address the meters say so, and no test tokens are needed. */}
+      {ACTIVATION_NETWORK === 'testnet' && !(received.oneDev && received.sol) && (
         <p>
           {rich('act_no_tokens', {
             link: (
-              <Link href="/testnet#faucet" onClick={toFaucet}>{t('act_no_tokens_link')}</Link>
+              <Link href={FAUCET_HREF} onClick={toFaucet} aria-busy={passWait || undefined}>{t('act_no_tokens_link')}</Link>
             ),
           })}
         </p>
@@ -229,6 +251,7 @@ export function Funding({
 // The burn, and its activation code: the code encodes the wallet that signed the reservation, so it shows once the burn is
 // final. A burn whose wallet's node came from another burn (`unused`) shows no code.
 export function Receipt({ record, unused = false }: { record: PaymentRecord; unused?: boolean }) {
+  const { t, say } = useI18n();
   const code = unused ? null : receiptCode(record);
   if (!record.burn) return null;
   return (
@@ -239,18 +262,19 @@ export function Receipt({ record, unused = false }: { record: PaymentRecord; unu
         <Fact label={t('act_burn_tx')}><EntityLink kind="solana-tx" value={record.burn.tx} /></Fact>
         {code && (
           <Fact label={t('act_code')}>
-            <span className="ent-copy"><span className="ent cab-code">{code}</span><Copy value={code} /></span>
+            <span className="ent-copy"><span className="ent cab-code" translate="no">{code}</span><Copy value={code} /></span>
           </Fact>
         )}
       </Facts>
-      {code && <p className="note">{t('act_code_note')}</p>}
+      {code && <p className="note">{say('act_code_note')}</p>}
     </div>
   );
 }
 
 // A step that deletes the payment key and loses something with it: the page names what is lost, and nothing happens
-// before the user confirms (SITE-1, SITE-3).
+// before the user confirms.
 function ConfirmLoss({ warning, confirm, busy, onConfirm, onBack }: { warning: string; confirm: string; busy: boolean; onConfirm: () => void; onBack: () => void }) {
+  const { t } = useI18n();
   return (
     <div className="cab-next" role="alert">
       <p className="rq-failed">{warning}</p>
@@ -265,6 +289,7 @@ function ConfirmLoss({ warning, confirm, busy, onConfirm, onBack }: { warning: s
 // After the burn (flow.ts mayReturnLeftovers): what is left goes back to the wallet now and the key goes; the burn stays
 // the wallet's activation, registered later from any browser where the wallet is connected.
 export function LeftoversNow({ busy, onSend }: { busy: boolean; onSend: () => void }) {
+  const { t } = useI18n();
   return (
     <div className="cab-next">
       <p className="note">{t('act_leftovers_now_note')}</p>
@@ -275,21 +300,22 @@ export function LeftoversNow({ busy, onSend }: { busy: boolean; onSend: () => vo
 
 // QNet Wallet's answer, and the check number when the request asked for it.
 export function AnswerCheck({ record, onAnswer }: { record: PaymentRecord; onAnswer: (matches: boolean) => void }) {
+  const { t, say, rich } = useI18n();
   if (!record.answer || !record.link) return null;
   const asks = record.link.request.check && !record.answer.checkConfirmed;
   return (
     <div className="cab-sub">
-      <p>{rich('act_answer_for', { node: record.answer.nodeId, wallet: <EntityLink kind="address" value={record.answer.qnet} /> })}</p>
+      <p>{rich('act_answer_for', { node: record.answer.nodeId, wallet: <EntityLink kind="address" value={record.answer.qnet} link={false} /> })}</p>
       {asks ? (
         <>
-          <p className="cab-check-number">{t('act_check', { number: formatCheckNumber(record.answer.checkNumber) })}</p>
+          <p className="cab-check-number">{rich('act_check', { number: <span translate="no">{formatCheckNumber(record.answer.checkNumber)}</span> })}</p>
           <div className="actions cab-next-act">
             <Action kind="solid" onClick={() => onAnswer(true)}>{t('act_check_yes')}</Action>
             <Action kind="text" onClick={() => onAnswer(false)}>{t('act_check_no')}</Action>
           </div>
         </>
       ) : (
-        <Waiting>{t('act_checking_node')}</Waiting>
+        <Waiting>{say('act_checking_node')}</Waiting>
       )}
     </div>
   );
@@ -297,10 +323,10 @@ export function AnswerCheck({ record, onAnswer }: { record: PaymentRecord; onAns
 
 // What is left on the payment address, sent back to the wallet: by itself to the Solana address the wallet shared
 // (`dest`), else, on mainnet, to the one QNet Wallet on this device shares (`ask`) or the user gives (test tokens are
-// not asked for). Leaving it there deletes the key only after the page named what is lost (SITE-3). An unrecorded
-// mainnet activation with nothing on its address (`empty`) keeps its key for a transfer still on its way, until the
-// user deletes it (SITE-1). When the address lacks the SOL to send them back (`short`, in lamports), the page shows the
-// payment address and what it lacks, and offers no "Leave it" while 1DEV would stay behind (SITE-R2-02).
+// not asked for). Leaving it there deletes the key only after the page named what is lost. An unrecorded mainnet
+// activation with nothing on its address (`empty`) keeps its key for a transfer still on its way, until the user deletes
+// it. When the address lacks the SOL to send them back (`short`, in lamports), the page shows the payment address and
+// what it lacks, and offers no "Leave it" while 1DEV would stay behind.
 export function Leftovers({
   pub,
   short,
@@ -326,6 +352,7 @@ export function Leftovers({
   onSend: (dest: string) => void;
   onLeave: () => void;
 }) {
+  const { t, say } = useI18n();
   const [typed, setTyped] = useState('');
   const [invalid, setInvalid] = useState(false);
   const [leaving, setLeaving] = useState(false);
@@ -345,7 +372,7 @@ export function Leftovers({
       <figure className="cab-pay-qr"><QrCode text={pub} label={t('act_address_qr')} size={196} /></figure>
       <div className="cab-manual-t">
         <p className="rq-failed">{t(ACTIVATION_NETWORK === 'testnet' ? 'act_refund_short_testnet' : 'act_refund_short', { sol: formatUnits(short, SOL_DECIMALS) })}</p>
-        <p className="ent-copy"><span className="ent ent-full">{pub}</span><Copy value={pub} /></p>
+        <p className="ent-copy"><span className="ent ent-full" translate="no">{pub}</span><Copy value={pub} /></p>
       </div>
     </div>
   ) : null;
@@ -370,7 +397,7 @@ export function Leftovers({
         {expired && <p>{t('act_expired')}</p>}
         {left && <p>{left}</p>}
         <Waiting>
-          {t('act_refund_to')} <span className="ent">{dest}</span>
+          {t('act_refund_to')} <span className="ent ent-full" translate="no">{dest}</span>
         </Waiting>
         {lacking}
         {failed && !lacking && <Failed>{t('act_refund_failed')}</Failed>}
@@ -382,7 +409,7 @@ export function Leftovers({
       {expired && <p>{t('act_expired')}</p>}
       {left && <p>{left}</p>}
       {lacking}
-      <p className="note">{t(ask ? 'act_refund_ask' : 'act_refund_enter')}</p>
+      <p className="note">{say(ask ? 'act_refund_ask' : 'act_refund_enter')}</p>
       {ask}
       <form className="cab-form" onSubmit={submit} noValidate>
         <label className="label" htmlFor="cabinet-refund">{t('act_refund_label')}</label>
@@ -411,15 +438,16 @@ export function Leftovers({
   );
 }
 
-// The registered node, as the nodes report it now. One wallet, one node: nothing else to activate for it (SITE-F12).
+// The registered node, as the nodes report it now. One wallet, one node: nothing else to activate for it.
 export function Registered({ nodeId }: { nodeId: string }) {
+  const { t, say } = useI18n();
   const { viewOnly } = useCabinet();
   const { state, retry } = useNodeStatus(nodeId, viewOnly);
   return (
     <div className="cab-sub">
-      <Answered>{t('act_done')}</Answered>
+      <Answered>{say('act_done')}</Answered>
       <StatusGate state={state} retry={retry}>
-        {(status) => (status.deviceBound ? <DeviceRows status={status} /> : <p className="note">{t('act_done_device')}</p>)}
+        {(status) => (status.deviceBound !== false ? <DeviceRows status={status} /> : <p className="note">{say('act_done_device')}</p>)}
       </StatusGate>
       <div className="cab-next-act">
         <Action kind="solid" href="/node?tab=overview">{t('act_go_cabinet')}</Action>

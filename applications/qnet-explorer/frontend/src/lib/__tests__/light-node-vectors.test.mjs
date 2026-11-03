@@ -123,7 +123,7 @@ test('the consent and owner bind preimages, and the owner bind under WebCrypto E
   }
 });
 
-// C4: the payment key's v2 owner bind, with no time, under WebCrypto Ed25519 (the payment key's algorithm).
+// The payment key's v2 owner bind, with no time, under WebCrypto Ed25519 (the payment key's algorithm).
 test('the v2 owner bind preimage, and its signature under WebCrypto Ed25519', async () => {
   const key = await subtle.importKey('raw', bytes(V.burner.publicKey), { name: 'Ed25519' }, false, ['verify']);
   for (const n of V.node) {

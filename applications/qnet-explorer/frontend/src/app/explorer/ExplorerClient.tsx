@@ -1,6 +1,6 @@
 'use client';
 
-// The explorer (B-SPEC 6.2): the title band with the search and the readouts, the Latest blocks strip, then All
+// The explorer: the title band with the search and the readouts, the Latest blocks strip, then All
 // transactions across the full width, the page's main content. First paint comes from the server's head snapshot; the
 // head stream keeps it live with no timers: the readouts and the blocks follow each head, the first page of
 // transactions is read again at most every 1.5 s, other pages move by cursor and numbered jumps stay within the offset
@@ -12,14 +12,17 @@ import OnHead from '@/components/explorer/OnHead';
 import LatestBlocks from '@/components/explorer/LatestBlocks';
 import NetworkReadouts, { type HeadFacts } from '@/components/explorer/NetworkReadouts';
 import { TxAmount } from '@/components/explorer/cells';
-import { amountCol, blockCol, fromToCol, hashCol, timeCol, typeCol } from '@/components/explorer/columns';
+import { amountCol, amountsWidth, blockCol, fromToCol, hashCol, timeCol, typeCol, useSteadyWidth } from '@/components/explorer/columns';
 import Action from '@/components/ui/Action';
 import DataTable, { type Column } from '@/components/ui/DataTable';
 import PageHead from '@/components/ui/PageHead';
 import Pager from '@/components/ui/Pager';
 import { useActivationContent, useWallet } from '@/contexts/AppContext';
+import { useI18n, useT } from '@/i18n/client';
 import { batchCache, getListCache, noteChainHeight, setListCache } from '@/lib/explorer-cache';
 import { emptyListText, listSummary, rowAmount, type RecentBlock } from '@/lib/explorer-view';
+import { siteRequest } from '@/lib/site-request';
+import type { T } from '@/lib/texts';
 import { txTypeLabel } from '@/lib/tx-labels';
 
 // A row of /api/activity (src/lib/enrich-activity.ts): amounts raw, written exactly by rowAmount.
@@ -69,20 +72,22 @@ const cacheRows = (rows: ActivityItem[]) => batchCache('tx', rows.map((tx) => ({
   key: tx.hash, data: { hash: tx.hash, type: tx.type, status: 'confirmed' as const, block: tx.block, timestamp: tx.timestamp, from: tx.from, to: tx.to, amount_raw: tx.amount_raw },
 })));
 
-// The list's columns, the loading page's too. Fixed columns of 657 px; From / To takes the rest of the width, its sides
-// as whole as the cell allows. `block` is the Block header's sort control and the order it shows.
-export function listColumns(full: boolean, block?: { header: ReactNode; sort: 'ascending' | 'descending' }): Column<ActivityItem>[] {
+// The list's columns, the loading page's too. Fixed columns of 657 px, the amount's `amountW` where a page's token amount
+// runs longer (columns.tsx amountsWidth); From / To takes the rest of the width, its sides as whole as the cell allows.
+// `block` is the Block header's sort control and the order it shows.
+export function listColumns(t: T, full: boolean, block?: { header: ReactNode; sort: 'ascending' | 'descending' }, amountW?: number): Column<ActivityItem>[] {
   return [
-    hashCol<ActivityItem>((r) => r.hash),
-    typeCol<ActivityItem>((r) => r.type, full),
-    fromToCol<ActivityItem>((r) => r.from, (r) => r.to, full),
-    amountCol<ActivityItem>((r) => <TxAmount parts={rowAmount(r)} logo={r.tokenLogo} />),
-    { ...blockCol<ActivityItem>((r) => r.block, 92), ...block },
-    timeCol<ActivityItem>((r) => r.timestamp, 72),
+    hashCol<ActivityItem>(t, (r) => r.hash),
+    typeCol<ActivityItem>(t, (r) => r.type, full),
+    fromToCol<ActivityItem>(t, (r) => r.from, (r) => r.to, full),
+    amountCol<ActivityItem>(t, (r) => <TxAmount parts={rowAmount(r, t('token_unnamed'))} logo={r.tokenLogo} />, t('col_amount'), amountW),
+    { ...blockCol<ActivityItem>(t, (r) => r.block, 92), ...block },
+    timeCol<ActivityItem>(t, (r) => r.timestamp, 72),
   ];
 }
 
 function Transactions({ initial }: { initial: ExplorerInitial }) {
+  const t = useT();
   const full = useActivationContent();
   const { providerStatus } = useWallet();
   const [rows, setRows] = useState<ActivityItem[] | null>(initial.rows.length > 0 ? initial.rows : null);
@@ -125,7 +130,7 @@ function Transactions({ initial }: { initial: ExplorerInitial }) {
         params.set('cursor', target.cursor);
         params.set('dir', target.dir);
       } else if (target.page > 1) params.set('page', String(target.page));
-      const res = await fetch(`/api/activity?${params.toString()}`, { cache: 'no-store' });
+      const res = await fetch(`/api/activity?${params.toString()}`, siteRequest());
       const data = await res.json();
       if (seq !== fetchSeq.current) return;
       if (!data.success || !Array.isArray(data.data)) throw new Error(data.error || 'list read failed');
@@ -154,8 +159,8 @@ function Transactions({ initial }: { initial: ExplorerInitial }) {
       settled.current = true;
       if (initial.rows.length > 0) return;
     }
-    const t = setTimeout(() => void fetchList(pos, false), rows === null ? 0 : 150);
-    return () => clearTimeout(t);
+    const timer = setTimeout(() => void fetchList(pos, false), rows === null ? 0 : 150);
+    return () => clearTimeout(timer);
   }, [pos, sortOrder, typeFilters, fetchList]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A new head: the live first page is read again (at most every 1.5 s); another page keeps what it shows.
@@ -178,7 +183,7 @@ function Transactions({ initial }: { initial: ExplorerInitial }) {
     if (n >= 1 && n <= pagination.maxPage && !(n === pos.page && !pos.cursor)) move({ page: n, cursor: null, dir: 'next' });
   };
   const toggleType = (type: string | null) => {
-    setTypeFilters((prev) => (type === null ? [] : prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]));
+    setTypeFilters((prev) => (type === null ? [] : prev.includes(type) ? prev.filter((x) => x !== type) : [...prev, type]));
     setPos(FIRST);
   };
   const toggleSort = () => {
@@ -186,44 +191,47 @@ function Transactions({ initial }: { initial: ExplorerInitial }) {
     setPos(FIRST);
   };
 
-  const labels = typeFilters.map((type) => txTypeLabel(type, full));
+  const labels = typeFilters.map((type) => txTypeLabel(type, full, t));
+  // Kept for the page, order and types shown: the live rows coming and going never move From / To under the reader.
+  const amountW = useSteadyWidth(useMemo(() => amountsWidth((rows ?? []).map((r) => rowAmount(r, t('token_unnamed')))), [rows, t]),
+    `${pos.page}:${pos.cursor ?? ''}:${sortOrder}:${typeFilters.join(',')}`);
   // The order in words is the list's datum ("· oldest first") and the sort button's name.
-  const columns = useMemo(() => listColumns(full, {
+  const columns = useMemo(() => listColumns(t, full, {
     sort: sortOrder === 'desc' ? 'descending' : 'ascending',
     header: (
-      <button type="button" className="ex-sort" onClick={toggleSort} aria-label={sortOrder === 'desc' ? 'Block, newest first. Show the oldest first' : 'Block, oldest first. Show the newest first'}>
-        Block
+      <button type="button" className="ex-sort" onClick={toggleSort} aria-label={t(sortOrder === 'desc' ? 'ex_sort_newest' : 'ex_sort_oldest')}>
+        {t('col_block')}
       </button>
     ),
-  }), [full, sortOrder]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, amountW), [t, full, sortOrder, amountW]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filters = (
     // The app's view names reward and activation by what they change (src/lib/tx-labels.ts): until the wallet check ends
     // the names are laid out but not shown, as the header's links are, and then each name is its own width.
-    <div className="ex-filters" role="group" aria-label="Filter by type" data-pending={providerStatus === 'detecting' || undefined}>
-      <button type="button" className="ex-filter" aria-pressed={typeFilters.length === 0} onClick={() => toggleType(null)}>All</button>
+    <div className="ex-filters" role="group" aria-label={t('ex_filter')} data-pending={providerStatus === 'detecting' || undefined}>
+      <button type="button" className="ex-filter" aria-pressed={typeFilters.length === 0} onClick={() => toggleType(null)}>{t('ex_filter_all')}</button>
       {TX_TYPES.map((type) => (
         <button key={type} type="button" className="ex-filter" aria-pressed={typeFilters.includes(type)} onClick={() => toggleType(type)}>
-          {txTypeLabel(type, full)}
+          {txTypeLabel(type, full, t)}
         </button>
       ))}
     </div>
   );
 
-  const retry = <Action kind="act" onClick={() => void fetchList(pos, false)}>Try again</Action>;
+  const retry = <Action kind="act" onClick={() => void fetchList(pos, false)}>{t('try_again')}</Action>;
   const error = failed && rows && rows.length > 0
-    ? (isLiveView ? 'Could not read the latest transactions. Trying again with the next block.' : <>Could not read this page. {retry}</>)
+    ? (isLiveView ? t('ex_latest_unreadable') : <>{t('ex_page_unreadable')} {retry}</>)
     : null;
-  const empty = failed ? <>Could not read the transactions. {retry}</> : emptyListText(labels);
+  const empty = failed ? <>{t('ex_txs_unreadable')} {retry}</> : emptyListText(labels, t);
   const pages = Math.max(1, Math.ceil(pagination.total / ITEMS_PER_PAGE));
 
   // The table renders again only when its own data changes, never for a head that brings nothing to it.
   const table = useMemo(() => (
     <DataTable
       className="ex-txs-tbl"
-      title="All transactions"
-      caption={`All transactions, ${sortOrder === 'desc' ? 'newest' : 'oldest'} first`}
-      meta={isLiveView ? undefined : <span className="label">{listSummary(labels, sortOrder === 'asc', pos.page)}</span>}
+      title={t('ex_all_txs')}
+      caption={t(sortOrder === 'desc' ? 'ex_all_txs_newest' : 'ex_all_txs_oldest')}
+      meta={isLiveView ? undefined : <span className="label">{listSummary(labels, sortOrder === 'asc', pos.page, t)}</span>}
       tools={filters}
       columns={columns}
       rows={rows}
@@ -233,7 +241,7 @@ function Transactions({ initial }: { initial: ExplorerInitial }) {
       empty={empty}
       error={error}
     />
-  ), [rows, columns, isLiveView, failed, typeFilters, sortOrder, pos, full, fetchList]); // eslint-disable-line react-hooks/exhaustive-deps
+  ), [rows, columns, isLiveView, failed, typeFilters, sortOrder, pos, full, fetchList, t]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <section ref={section} className="ex-txs" aria-busy={loading || undefined}>
@@ -245,9 +253,10 @@ function Transactions({ initial }: { initial: ExplorerInitial }) {
 }
 
 export default function ExplorerClient({ initial, blocks, blocksHidden }: { initial: ExplorerInitial; blocks: RecentBlock[]; blocksHidden: boolean }) {
+  const { t, say } = useI18n();
   return (
     <div className="ex ex-list">
-      <PageHead title="QNet Blockchain Explorer" lead="All transactions from Genesis to Now" strength={0.55} more={<NetworkReadouts initial={initial} />}>
+      <PageHead title={say('ex_title')} lead={t('ex_lead')} strength={0.55} more={<NetworkReadouts initial={initial} />}>
         <ExplorerSearch />
       </PageHead>
       <div className="wrap ex-main">

@@ -11,6 +11,7 @@ import com.facebook.react.ReactPackage
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.react.modules.network.OkHttpClientProvider
+import com.facebook.react.modules.websocket.WebSocketModule
 import com.facebook.react.views.view.setEdgeToEdgeFeatureFlagOn
 import java.io.File
 
@@ -42,8 +43,15 @@ class MainApplication : Application(), ReactApplication {
     // mode, in its modal sheets too, where the app cannot change it; there the app keeps its own dark bars.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setEdgeToEdgeFeatureFlagOn()
     // The wallet's network reads (balances, history, the nodes' answers) are never kept on disk: React Native's client
-    // would cache them under cacheDir; this one has no cache, and the cache an earlier build left is deleted.
-    OkHttpClientProvider.setOkHttpClientFactory { OkHttpClientProvider.createClientBuilder().build() }
+    // would cache them under cacheDir; this one has no cache, and the cache an earlier build left is deleted. Every client
+    // it builds shares one connection pool, whose dead connections a ping retires, and a change of network all of those
+    // made before it (AppNetwork).
+    OkHttpClientProvider.setOkHttpClientFactory { AppNetwork.clientBuilder(OkHttpClientProvider.createClientBuilder()).build() }
+    // Its WebSocket client pings the same way and bounds its opening handshake: an address socket gone silent fails within
+    // two pings, one that never opens within SOCKET_OPEN_MS, and the screen opens a new one (React Native's own sets no
+    // ping and no read timeout).
+    WebSocketModule.setCustomClientBuilder { AppNetwork.socketBuilder(it) }
+    AppNetwork.watchNetwork(this)
     Thread { File(cacheDir, HTTP_CACHE_DIR).deleteRecursively() }.start()
     loadReactNative(this)
   }

@@ -2,7 +2,7 @@
 // keys, an in-memory vault state with the contract's shape checks, a session, and a fetch that serves
 // only what a test routes (anything else fails: these tests never reach the network).
 import * as core from '../../dist/lib/qnet-core.js';
-import { RECORD_ORIGIN, SOLANA } from '../../dist/background/config.js';
+import { QNET, RECORD_ORIGIN, SOLANA } from '../../dist/background/config.js';
 import { WalletError } from '../../dist/background/errors.js';
 
 export const KAT_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -122,6 +122,9 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
       async requireUnlocked() {
         if (env.locked) throw new WalletError('LOCKED');
         return { walletId: WALLET.walletId, qnetAddress: WALLET.qnetAddress, solanaAddress: WALLET.solanaAddress, lockDeadline: Date.now() + 900000 };
+      },
+      async isUnlocked() {
+        return !env.locked;
       },
       async touch() {
         env.calls.touch++;
@@ -250,10 +253,10 @@ export function installEnv({ state = emptyState(), locked = false } = {}) {
         env.calls.signNodeClaim++;
         return { signature: core.signClaimQuote({ nodeId, wallet }, qnetKeys.secretKey, qnetKeys.publicKey).signature, publicKey: qnetKeys.publicKey.slice() };
       },
-      async signClaimPayload({ wallet, timestamp, claimsData }) {
+      async signClaimPayload({ wallet, timestamp, claimsData, validUntil = null }) {
         if (env.locked) throw new WalletError('LOCKED');
         env.calls.signClaimPayload++;
-        const signed = core.signClaimPayload({ wallet, ts: timestamp, claimsData }, qnetKeys.secretKey, qnetKeys.publicKey);
+        const signed = core.signClaimPayload({ wallet, ts: timestamp, claimsData, validUntil }, qnetKeys.secretKey, qnetKeys.publicKey);
         return { signature: signed.signature, publicKey: qnetKeys.publicKey.slice() };
       },
       async signNodeStatus({ nodeId, wallet, timestamp }) {
@@ -333,14 +336,48 @@ export function installFetch(route) {
   return requests;
 }
 
+/** aiqnet.io's relay of the wallet's Solana calls (decision 56): it passes each call on to the endpoint unchanged. */
+export const RELAY_URL = QNET.EXPLORER_API + SOLANA.RELAY_PATH;
+
+/**
+ * The JSON-RPC method of a Solana call, sent to the endpoint or through the relay; null for any other request.
+ * @param {{url: string, body: string|null}} request
+ * @returns {string|null}
+ */
+export function solanaCallOf(request) {
+  return SOLANA.RPC_URLS.includes(request.url) || request.url === RELAY_URL ? JSON.parse(request.body).method : null;
+}
+
 /**
  * A route for the Solana RPC URL: `methods[name](params, request)` returns the JSON-RPC result, or
  * {rpcError: {code, message}} for an error answer; a missing method fails the test.
  * @param {Record<string, Function>} methods
  */
 export function solanaRoute(methods) {
+  return rpcRoute(SOLANA.RPC_URLS, methods);
+}
+
+/**
+ * The same for the relay (RELAY_URL), which answers what the endpoint answers.
+ * @param {Record<string, Function>} methods
+ */
+export function relayRoute(methods) {
+  return rpcRoute([RELAY_URL], methods);
+}
+
+/**
+ * A route under which the Solana endpoint gives no answer at all, as in a network that blocks it.
+ * @param {{url: string}} request
+ * @returns {undefined}
+ */
+export function unreachableEndpoint(request) {
+  if (SOLANA.RPC_URLS.includes(request.url)) throw new TypeError('offline test: the Solana endpoint is unreachable');
+  return undefined;
+}
+
+function rpcRoute(urls, methods) {
   return async (request) => {
-    if (!SOLANA.RPC_URLS.includes(request.url)) return undefined;
+    if (!urls.includes(request.url)) return undefined;
     const { method, params, id } = JSON.parse(request.body);
     if (!Object.hasOwn(methods, method)) throw new TypeError(`offline test: unexpected Solana call ${method}`);
     const result = await methods[method](params, request);
@@ -372,3 +409,11 @@ export function fakeSignature(n) {
 export const flush = async (rounds = 5) => {
   for (let i = 0; i < rounds; i++) await new Promise((resolve) => setImmediate(resolve));
 };
+
+let workers = 0;
+/**
+ * solana.js as a new worker loads it: its own route (decision 56) and caches, so a test whose endpoint gives no answer
+ * leaves the other tests' worker on the endpoint.
+ * @returns {Promise<object>}
+ */
+export const freshSolana = () => import(`../../dist/background/solana.js?worker=${++workers}`);

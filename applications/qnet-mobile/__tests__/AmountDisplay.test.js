@@ -80,8 +80,9 @@ describe('the Node tab, the QNet Link sheet and the browser\'s sheet', () => {
     const read = (f) => fs.readFileSync(require('path').join(__dirname, '..', f), 'utf8');
     expect(read('src/screens/NodeTab.js')).not.toMatch(/balanceText|toFixed\(6\)/);
     expect(read('src/screens/QNetLinkScreen.js')).not.toMatch(/from '\.\/NodeTab'|balanceText/);
-    expect(read('src/screens/QNetLinkScreen.js')).toMatch(/\{ amount: qncText\(n\.appliedNano\) \}/);
-    expect(read('src/screens/WalletScreen.js')).toMatch(/\{ amount: qncText\(n\.appliedNano\) \}/);
+    // A move's note, the sheet's and the result card's, is one composition (utils/moveText) given this helper.
+    expect(read('src/utils/moveText.js')).toMatch(/\{ amount: amountText\(n\.appliedNano\) \}/);
+    expect(read('src/screens/QNetLinkScreen.js')).toMatch(/moveNoteText\(t, n, \(nano\) => qncText\(nano\)\)/);
   });
 
   it('QNC on the sheet and the line of an unconfirmed transfer, in every language alike', () => {

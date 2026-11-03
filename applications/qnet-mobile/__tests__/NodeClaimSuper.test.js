@@ -85,8 +85,10 @@ it('the sheet names the super node, and Confirm moves its balance under its id, 
   const wm = manager();
   const link = parseLink(CASE.link);
   const authenticate = jest.fn(async () => true);
-  const onClaimed = jest.fn();
-  const node = nodeLinkActions({ walletManager: wm, credential: 'pw', onClaimed });
+  // The screen's run (WalletScreen startMove), each part the network took put in transit.
+  const record = jest.fn(() => false);
+  const run = require('../test-support/moveRun').sheetMove(wm, { walletAddress: W.address, credential: 'pw', record });
+  const node = nodeLinkActions({ walletManager: wm, credential: 'pw', move: run.move, claimBusy: run.claimBusy });
   let tree;
   await act(async () => {
     tree = renderer.create(
@@ -119,7 +121,7 @@ it('the sheet names the super node, and Confirm moves its balance under its id, 
   expect(wm._hedged.mock.calls[0][0]).toBe('/api/v1/rewards/claim');
   expect(wm._hedged.mock.calls[0][1].body).toMatchObject({ node_id: S, wallet_address: W.address });
   expect(wm._submitClaim).toHaveBeenCalledWith(expect.objectContaining({ node_id: S, wallet_address: W.address }));
-  expect(onClaimed).toHaveBeenCalledWith(S, expect.objectContaining({ success: true, txHash: TX }), 48000000000);
+  expect(record).toHaveBeenCalledWith(S, expect.objectContaining({ success: true, txHash: TX }), 48000000000);
 
   // The answer the site opens names the super node, and passes the site's checks for the request.
   expect(posted).toHaveLength(1);

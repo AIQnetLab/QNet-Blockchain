@@ -1,14 +1,13 @@
-import * as path from 'path';
 import { Pool, Client } from 'pg';
 import { NodeClient } from './node-client';
 import { Writer } from './writer';
 import { Chain } from './chain';
-import { runMigrations } from './migrate';
+import { migrationsDir, runMigrations } from './migrate';
 import { rebuildStatsIfNeeded, auditStats } from './stats';
 import { log, errText } from './log';
 
-// qnet-indexer: the explorer's only writer. Runs beside the web tier under PM2; the web tier only reads
-// and listens for the head NOTIFY this process emits.
+// qnet-indexer: the explorer's only writer. Runs beside the web tier as its own systemd service; the web tier
+// only reads and listens for the head NOTIFY this process emits.
 
 function pool(): Pool {
   const url = process.env.DATABASE_URL;
@@ -39,7 +38,14 @@ async function main(): Promise<void> {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
   const lock = await claimWriter();
   const db = pool();
-  await runMigrations(db, path.join(process.cwd(), 'migrations'));
+  await runMigrations(db, migrationsDir());
+  // The unit's ExecStartPre stops here, so the site, ordered after the unit, starts only once these are committed.
+  if (process.argv.includes('--migrate-only')) {
+    await db.end();
+    await lock.end();
+    log.info('MIGRATE', 'migrate_only_done');
+    process.exit(0);
+  }
   await rebuildStatsIfNeeded(db);
   const node = new NodeClient();
   const chain = new Chain(node, new Writer(db), db);

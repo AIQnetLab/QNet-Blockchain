@@ -1,9 +1,9 @@
 // My node's Node details (src/lib/cabinet/code-check.ts, src/server/cabinet/registration-record.ts): the chosen wallet's
-// activation shown by itself, with no field to check another code (owner, 29.09; SITE-F9): the network's registration
+// activation shown by itself, with no field to check another code: the network's registration
 // record, else the other sources of the wallet (the site's record, the QNet extension, the kept answer of
-// src/lib/cabinet/kept-activation.ts), else an activation of this browser; a code names a wallet (owner rule, 26.09): a
+// src/lib/cabinet/kept-activation.ts), else an activation of this browser; a code names a wallet: a
 // payment key's burn gives the wallet's code, found through the registration (burn -> wallet), a burn from the wallet's
-// own Solana address the code of that address (always so for a super node). Exactly one code (owner, 06.10): whose burn
+// own Solana address the code of that address (always so for a super node). Exactly one code: whose burn
 // it is comes from what the page knows (the wallet's shared Solana address, this browser's payment addresses, the burn
 // the other sources know), else from the route, which reads the activation registry, then the burn on Solana; none until
 // either tells. The route reads only that wallet's row of the node type asked. Run: npm run test:wallet
@@ -25,7 +25,7 @@ import { checkBurn } from '../../server/cabinet/burn-scan.ts';
 import {
   BURN_BY_CACHE_MS, BURN_BY_CHECKS_PER_MINUTE, RECORD_SQL, createBurnByReader, createRecordReader, recordFrom, resolveBurnBy,
 } from '../../server/cabinet/registration-record.ts';
-import { TEXTS } from '../texts.ts';
+import { TEXTS } from './texts-helper.mjs';
 
 const V = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
 const OWN = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node-own-burn.vectors.json', import.meta.url), 'utf8'));
@@ -107,7 +107,7 @@ test('the chosen wallet\'s registration: none, its one code, not in the archive,
 test('a receipt names the wallet its burn was bound to; Node details show one code and no other form', () => {
   const mine = receipt();
   // A receipt names the wallet the burn is for, not the payment address: the one that signed the reservation, whose
-  // reservation the burn was made under, from the burn on (C4: the owner bind comes with the burn).
+  // reservation the burn was made under, from the burn on (the owner bind comes with the burn).
   assert.equal(receiptCode(mine), activationCode('light', KAT.address, V.node[0].burnTx, 1500));
   assert.notEqual(receiptCode(mine), activationCode('light', V.burner.address, V.node[0].burnTx, 1500));
   assert.equal(receiptCode(receipt({ submit: null })), null, 'a record from before, bound to no wallet');
@@ -235,7 +235,7 @@ test('whose burn on the server: the registry\'s row of this burn, else the burn 
     await store.record(row, null);
     return createActivationRegistry({ store, check: solana.check }).paymentRecord(row.wallet);
   };
-  // A payment address's burn: the registry holds it (C4: announced before it left), and Solana is not asked.
+  // A payment address's burn: the registry holds it (announced before it left), and Solana is not asked.
   assert.equal(await resolveBurnBy(await rowIn(rowOf(KAT.address, 'payment', BURN.burner, BURN.burnTx)), RECORD, solana.check), 'payment');
   // The extension's burn from the wallet's own Solana address, recorded with the wallet's proof.
   assert.equal(await resolveBurnBy(await rowIn(rowOf(KAT.address, 'extension', BURN.burner, BURN.burnTx)), RECORD, solana.check), 'own');
@@ -449,7 +449,7 @@ test('the wallet\'s activation in Node details: the network\'s record first, the
   assert.equal(browserActivation([receipt({ updatedAt: 1 }), receipt({ pub: 'newer', updatedAt: 9 })], KAT.address).pub, 'newer');
 });
 
-test('Node details show the activation by themselves, with no field to check another code (SITE-F9)', () => {
+test('Node details show the activation by themselves, with no field to check another code', () => {
   const page = readFileSync(new URL('../../components/cabinet/NodeDetails.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   assert.match(page, /const facts = wallet \? activationFacts\(registration, known, nodeType === 'light' \? browserActivation\(records, wallet\) : null, nodeType\) : null;/);
   // What tells whose burn it was: the wallet's own Solana address (the one it shared, else the one its extension burned
@@ -467,13 +467,19 @@ test('Node details show the activation by themselves, with no field to check ano
   // Registered without burn details: the explorer keeps none, or it could not be read (not the network).
   assert.match(page, /\{t\(registration\.kind === 'notArchived' \? 'code_not_archived' : 'code_archive_unavailable'\)\}/);
   // Status on the network, type, node id, code, burn and amount, and where the page learned them.
-  for (const key of ['code_field_status', 'ext_field_type', 'code_field_node', 'act_code', 'act_burn_tx', 'code_field_amount', 'super_id']) assert.ok(page.includes(`'${key}'`), key);
+  for (const key of ['code_field_status', 'ext_field_type', 'code_field_node', 'act_code', 'act_burn_tx', 'code_field_amount']) assert.ok(page.includes(`'${key}'`), key);
+  // A super node's type and id named as a genesis node's for one of the network's genesis nodes (node-view.ts serverWord),
+  // whose activation has no code, burn or record: one note says so.
+  assert.match(page, /<Fact label=\{t\('ext_field_type'\)\}>\{say\(light \? 'ext_type_light' : serverWord\(nodeId, 'type'\)\)\}<\/Fact>/);
+  assert.match(page, /<Fact label=\{say\(light \? 'code_field_node' : serverWord\(nodeId, 'id'\)\)\}>/);
+  assert.match(page, /const genesis = !light && isGenesisNodeId\(nodeId\);/);
+  assert.match(page, /\{genesis \? \(\s*<p className="note">\{t\('genesis_details_note'\)\}<\/p>\s*\) : facts \? \(/);
   // The burn is a Solana transaction: its link leaves the site (EntityLink solana-tx), the node id links to the wallet's
   // address page, the block the node was recorded at to its block.
   assert.match(page, /<Fact label=\{t\('act_burn_tx'\)\}><EntityLink kind="solana-tx" value=\{facts\.burnTx\} \/><\/Fact>/);
   assert.match(page, /<EntityLink kind="node" value=\{nodeId\} address=\{choice\?\.qnet \?\? null\} full \/>/);
   assert.match(page, /rich\('code_status_recorded_at', \{ height: <EntityLink kind="block" value=\{height\} \/> \}\)/);
-  assert.match(page, /<p className="note">\{t\(SOURCE_TEXT\[facts\.source\]\)\}<\/p>/);
+  assert.match(page, /<p className="note">\{say\(SOURCE_TEXT\[facts\.source\]\)\}<\/p>/);
   // Nothing to type: no form, no check button, no text of one.
   assert.doesNotMatch(page, /<form |<input |CheckAnother|code_check/);
   for (const key of ['code_check_other', 'code_input', 'code_check', 'code_malformed', 'code_match', 'code_no_match']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);

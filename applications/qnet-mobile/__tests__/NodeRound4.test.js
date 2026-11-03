@@ -367,16 +367,20 @@ describe('MN-R2-04: a binding the network holds no more stops waking here', () =
     expect(read('src/services/PushService.js')).toMatch(/const status = await readNodeStatus\(nodeId, \{ signStatus: signStatusWithPingKey, timeoutMs: 5000, deadline \}\);\s*await resendPendingBinding\(nodeId, status, \{ deadline \}\);/);
   });
 
-  it('a stale_seq retry whose second read finds no owner gives the push token back', async () => {
-    let statusReads = 0;
+  // The retry reads only the binding's sequence, the verdict before standing. A read that names nothing above the
+  // refused sequence sends nothing again: the node's refusal is the answer.
+  it('a stale_seq whose second read finds no owner goes no further and gives the push token back', async () => {
+    const ahead = Math.floor(Date.now() / 1000) + 5000;
+    let bindTries = 0;
     answers = (url, body) => {
-      if (url.includes('/light-node/status') && !body) { statusReads += 1; return statusReads <= 3 ? pub({ features: ['bind_v2', 'status_signed'] }) : new Error('offline'); }
-      if (url.endsWith('/light-node/status')) return { ...pub(), binding_seq: SEQ };
-      if (url.endsWith('/light-node/bind')) return { success: false, reason: 'stale_seq' };
+      if (url.includes('/light-node/status') && !body) return pub({ features: ['bind_v2', 'status_signed'] });
+      if (url.endsWith('/light-node/status')) return bindTries ? new Error('offline') : { ...pub(), binding_seq: ahead };
+      if (url.endsWith('/light-node/bind')) { bindTries += 1; return { success: false, reason: 'stale_seq' }; }
       return {};
     };
     const r = await Push.bindThisDevice({ signer: signer(), credential: {}, nodeId: NODE, device: DEVICE });
-    expect(r).toMatchObject({ ok: false, reason: 'network' });
+    expect(r).toMatchObject({ ok: false, reason: 'stale_seq' });
+    expect(bindTries).toBe(1);
     expect(messaging().getToken).toHaveBeenCalled();
     expect(messaging().deleteToken).toHaveBeenCalled();
   });

@@ -27,6 +27,7 @@ import {
   type ExtensionUnlink, type NodeType,
 } from '@/lib/qnet-link';
 import { showsActivationContent } from '@/lib/activate-view';
+import type { MessageKey } from '@/lib/texts';
 
 interface WalletContextValue {
   providerStatus: ProviderStatus;
@@ -38,7 +39,8 @@ interface WalletContextValue {
   accountsKnown: boolean;
   view: AddressView;
   connecting: boolean;
-  error: string | null;
+  // What went wrong with the wallet, by the key of its words (src/i18n/locales/en.ts).
+  error: MessageKey | null;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   setView: (view: AddressView) => void;
@@ -76,7 +78,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [accountsKnown, setAccountsKnown] = useState(false);
   const [view, setViewState] = useState<AddressView>('qnet');
   const [connecting, setConnecting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<MessageKey | null>(null);
   const inFlight = useRef(false);
   // Each read, connect or disconnect takes a number; only the latest may set the accounts.
   const seq = useRef(0);
@@ -156,7 +158,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setAccountsKnown(true);
     setError(null);
     if (provider && !(await revokeAccess(provider))) {
-      setError('The wallet did not confirm. The site can also be removed under Connected sites in the extension settings.');
+      setError('wallet_disconnect_unconfirmed');
     }
   }, [provider]);
 

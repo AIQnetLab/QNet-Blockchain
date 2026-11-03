@@ -1,13 +1,15 @@
 'use client';
 
-// The explorer's search (B-SPEC 5.15): one field with Search attached and a list of what the query matches under it
+// The explorer's search: one field with Search attached and a list of what the query matches under it
 // (/api/search/suggest, 250 ms after typing stops). Arrow keys move through the list, Enter opens the active match (or
 // the first), Escape closes it. A match opens with a full navigation. On a computer "/" focuses the field; nothing on
 // the page shows that key.
 
 import { useEffect, useId, useRef, useState } from 'react';
 import TokenIcon from '@/components/TokenIcon';
+import { useI18n } from '@/i18n/client';
 import { heightOf, suggestionView, type Suggestion } from '@/lib/explorer-view';
+import { siteRequest } from '@/lib/site-request';
 
 const DEBOUNCE_MS = 250;
 
@@ -22,6 +24,7 @@ function directHref(q: string): string | null {
 }
 
 export default function ExplorerSearch({ className }: { className?: string }) {
+  const { t, href: local } = useI18n();
   const id = useId();
   const listId = `${id}-list`;
   const input = useRef<HTMLInputElement>(null);
@@ -62,7 +65,7 @@ export default function ExplorerSearch({ className }: { className?: string }) {
       const ac = new AbortController();
       abort.current = ac;
       try {
-        const res = await fetch(`/api/search/suggest?q=${encodeURIComponent(q.replace(/,/g, ''))}`, { signal: ac.signal });
+        const res = await fetch(`/api/search/suggest?q=${encodeURIComponent(q.replace(/,/g, ''))}`, siteRequest({ signal: ac.signal }));
         const body = await res.json();
         if (ac.signal.aborted) return;
         setItems(Array.isArray(body?.results) ? body.results : []);
@@ -81,8 +84,9 @@ export default function ExplorerSearch({ className }: { className?: string }) {
     };
   }, [query]);
 
+  // A match opens in the page's language.
   const go = (href: string) => {
-    window.location.href = href;
+    window.location.href = local(href);
   };
   const submit = () => {
     const pick = active >= 0 ? items[active] : items[0];
@@ -103,7 +107,7 @@ export default function ExplorerSearch({ className }: { className?: string }) {
         submit();
       }}
     >
-      <label className="sr-only" htmlFor={`${id}-q`}>Search by block, transaction hash, address or token</label>
+      <label className="sr-only" htmlFor={`${id}-q`}>{t('search_label')}</label>
       {/* One group at one height: the field and Search flush, focus marking the whole group (styles/explorer.css). */}
       <div className="ex-search-row">
         <input
@@ -140,16 +144,16 @@ export default function ExplorerSearch({ className }: { className?: string }) {
           }}
         />
         <span className="ex-search-ph" aria-hidden="true">
-          <span className="ex-ph-long">Search by block, transaction hash, address or token</span>
-          <span className="ex-ph-short">Block, hash, address or token</span>
+          <span className="ex-ph-long">{t('search_label')}</span>
+          <span className="ex-ph-short">{t('search_short')}</span>
         </span>
-        <button type="submit" className="btn btn-solid btn-sm ex-search-go">Search</button>
+        <button type="submit" className="btn btn-solid btn-sm ex-search-go">{t('search_go')}</button>
       </div>
-      <div className="ex-sugg" id={listId} role="listbox" hidden={!shown} aria-label="Matches">
-        {searching && items.length === 0 && <p className="ex-sugg-note">Searching…</p>}
-        {!searching && items.length === 0 && <p className="ex-sugg-note">Nothing found. Try a block number, a transaction hash, an address or a token.</p>}
+      <div className="ex-sugg" id={listId} role="listbox" hidden={!shown} aria-label={t('search_matches')}>
+        {searching && items.length === 0 && <p className="ex-sugg-note">{t('search_searching')}</p>}
+        {!searching && items.length === 0 && <p className="ex-sugg-note">{t('search_nothing')}</p>}
         {items.map((s, i) => {
-          const v = suggestionView(s);
+          const v = suggestionView(s, t);
           return (
             <a
               key={`${s.type}-${s.href}`}
@@ -157,7 +161,7 @@ export default function ExplorerSearch({ className }: { className?: string }) {
               role="option"
               aria-selected={i === active}
               className="ex-sugg-opt"
-              href={s.href}
+              href={local(s.href)}
               onMouseDown={(e) => {
                 e.preventDefault();
                 go(s.href);
@@ -167,7 +171,7 @@ export default function ExplorerSearch({ className }: { className?: string }) {
               <span className="ex-sugg-kind">
                 {s.type === 'token' ? <TokenIcon logo={s.logo} symbol={s.symbol} address={s.address} size={20} /> : v.kind}
               </span>
-              <span className="ex-sugg-val">{v.value}</span>
+              <span className="ex-sugg-val" translate="no">{v.value}</span>
               <span className="ex-sugg-note2">{v.note}</span>
             </a>
           );

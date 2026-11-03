@@ -2,11 +2,12 @@
  * This wallet's light node on the genesis nodes (docs/protocols/light-node-messages.md sections 4, 7 and 8): the status
  * the network keeps for it, and the binding that makes one device the one that answers for it. Only the node's shard
  * owners among the five genesis names are asked. Nothing here signs: callers pass signatures made over the preimages of
- * crypto/NodePreimages. And whether the chain lists the wallet's super node, whose balance a site's move may name too
- * (readServerNodeListed).
+ * crypto/NodePreimages. And whether the chain lists the wallet's super node, whose balance a site's move may name too,
+ * with that node's status for the Node tab (readServerNodeListed, serverStatusOf).
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { GENESIS_NODES_HTTPS, lightShardOwnerUrls } from '../config/nodes';
+import { settleReads } from '../utils/settleReads';
 import { isModel } from './DeviceModel';
 
 // A status is the network's only when this many genesis nodes agree, and a client switches a form on only when this
@@ -220,12 +221,98 @@ function joinedDevice(list) {
   };
 }
 
+// How many of `values` name each value (absent ones left out).
+function tally(values) {
+  const count = new Map();
+  for (const v of values) if (v !== null && v !== undefined) count.set(v, (count.get(v) || 0) + 1);
+  return count;
+}
+
+// The one value at least MIN_AGREEMENT of `values` name alike (absent ones left out), else null.
+function agreedValue(values) {
+  const agreed = [...tally(values)].filter(([, n]) => n >= MIN_AGREEMENT).map(([v]) => v);
+  return agreed.length === 1 ? agreed[0] : null;
+}
+
+// Whether `left` more values could change agreedValue(values): not once one value has MIN_AGREEMENT (three owners leave
+// no room for a second), nor when none could still reach it.
+function agreementSettled(values, left) {
+  const counts = [...tally(values).values()];
+  return counts.some((n) => n >= MIN_AGREEMENT) || (left < MIN_AGREEMENT && counts.every((n) => n + left < MIN_AGREEMENT));
+}
+
+const DAY_SECS = 86400;
+
+/**
+ * Whether two owners name a binding newer than this device's of sequence `seq` by the one thing the public status says
+ * of it: the UTC day it was made (`linkedSinceAgreed`), later than this binding's day. A read with no binding sequence
+ * (the owners refuse the ping key of a binding that was replaced, so no signed answer names one) tells it all the same.
+ */
+export function newerBindingDay(status, seq) {
+  const day = status ? status.linkedSinceAgreed : null;
+  return Number.isSafeInteger(day) && Number.isSafeInteger(seq) && seq > 0 && day > seq - (seq % DAY_SECS);
+}
+
+/**
+ * Where the node runs ('here', 'linking', 'elsewhere', 'no_device', 'unknown') from this device's binding `local`, the
+ * sequence two signed answers name (`bindingSeqAgreed`) and two owners' word on a bound device, by the table of
+ * docs/applications/mobile-wallet.md; the Node tab and the answers this device sends by itself read it alike.
+ */
+export function bindingVerdict(status, local, now = Date.now()) {
+  const D = status.deviceBoundAgreed;
+  if (!local) return D === true ? 'elsewhere' : (D === false ? 'no_device' : 'unknown');
+  const B = Number.isSafeInteger(status.bindingSeqAgreed) ? status.bindingSeqAgreed : null;
+  if (B === null) {
+    if (D === true && newerBindingDay(status, local.seq)) return 'elsewhere';
+    return local.unconfirmed === true ? 'linking' : 'here';
+  }
+  const seq = Number.isSafeInteger(local.seq) ? local.seq : 0;
+  if (B < seq) {
+    const age = Number.isSafeInteger(local.boundAt) ? now - local.boundAt * 1000 : Infinity;
+    if (age >= 0 && age < BIND_SETTLE_MS) return 'linking';
+    return D === true ? 'elsewhere' : (D === false ? 'no_device' : 'here');
+  }
+  if (D === false) return 'no_device';
+  return B === seq ? 'here' : 'elsewhere';
+}
+
+/** Whether this device answers for the node now (bindingVerdict 'here' or 'linking'). */
+export function linkedHere(status, local, now = Date.now()) {
+  const v = bindingVerdict(status, local, now);
+  return v === 'here' || v === 'linking';
+}
+
+const featureCounts = (answers) => tally(answers.flatMap((a) => [...new Set(a.features)]));
+
 /** The features at least MIN_AGREEMENT answers list. */
 export function agreedFeatures(answers) {
-  const count = new Map();
-  for (const a of answers) for (const f of new Set(a.features)) count.set(f, (count.get(f) || 0) + 1);
-  return [...count].filter(([, n]) => n >= MIN_AGREEMENT).map(([f]) => f).sort();
+  return [...featureCounts(answers)].filter(([, n]) => n >= MIN_AGREEMENT).map(([f]) => f).sort();
 }
+
+// Whether `left` more answers could change agreedFeatures(answers).
+const featuresSettled = (answers, left) => left < MIN_AGREEMENT
+  && [...featureCounts(answers).values()].every((n) => n >= MIN_AGREEMENT || n + left < MIN_AGREEMENT);
+
+// Whether the owners still out (`left`) could change a verdict two of them must give alike: whether the node is on the
+// chain, the features, and of a node on the chain whether a device is bound and the day it was linked. What one owner's
+// word refines (answered, counted, the device view, the latest miss and answer) is not waited for.
+function publicSettled(answers, left) {
+  if (!agreementSettled(answers.map((a) => a.onChain), left) || !featuresSettled(answers, left)) return false;
+  const yes = answers.filter((a) => a.onChain === true);
+  if (yes.length < MIN_AGREEMENT) return true;
+  return agreementSettled(yes.map((a) => a.deviceBound), left)
+    && agreementSettled(yes.map((a) => (a.device ? a.device.linkedSince : null)), left);
+}
+
+// An owner's reply that took the signed status.
+const tookSigned = (a) => !!a && a.success !== false && typeof a.onchain_registered === 'boolean';
+
+// Whether the owners still out (`left`) could change the binding two signed answers name alike.
+const signedSettled = (replies, left) => agreementSettled(replies.filter(tookSigned).map((a) => natural(a.binding_seq)), left);
+
+// Each read answers { i, a }: its owner's rank and its answer (null for none), so a read settled early keeps their order.
+const ranked = (reads) => reads.map((p, i) => Promise.resolve(p).then((a) => ({ i, a }), () => ({ i, a: null })));
+const inRank = (got) => got.slice().sort((x, y) => x.i - y.i).map((r) => r.a);
 
 /**
  * The node's status from its three shard owners (section 7). `onChain` is true or false only when two of them say so,
@@ -242,8 +329,10 @@ export function agreedFeatures(answers) {
  * it explicitly before one took it (one owner behind the others, during a roll or a lagging sync, still holds the binding
  * before; its word alone ends nothing on this device), null when nothing was learned or the wallet key signed (`signer`).
  * `bindingSeqAgreed`: the `binding_seq` MIN_AGREEMENT signed answers report alike, whichever key signed, else null: the
- * binding the network holds, which decides whether this device's binding is the current one (NodeTab nodeView,
- * forgetIfReplaced). `device`: the agreed answer's public device view (deviceOf), or null. `lastMiss`: the latest epoch an
+ * binding the network holds, which decides whether this device's binding is the current one (bindingVerdict,
+ * forgetIfReplaced). `device`: the agreed answer's public device view (deviceOf), or null. `linkedSinceAgreed`: the UTC
+ * day the bound device was linked (`device.linked_since`) that two owners saying the node is on the chain report alike,
+ * else null (newerBindingDay). `lastMiss`: the latest epoch an
  * owner that says the node is on the chain did not count it in, the most specific record at equal epochs (latestMiss),
  * or null. `lastAnswer`: the latest `device.last_answer` of those owners ({ at, deliveryDelaySecs, handlingSecs }), or
  * null. `deviceTags`: the
@@ -255,19 +344,80 @@ export function agreedFeatures(answers) {
  * `noStatusKey`: signStatus had no key to sign with, so no owner was asked and no tag came.
  * `deadline` (ms, a background wake's): every call stays within it, and none is started once too little of it is left
  * (MN-R3-05); what could not be asked in time reads as not learned.
+ * `onAgreed(status)`: the status once the verdicts two owners give alike can no longer change, before the slowest owner
+ * answers. `known` ({ onChain: true, features }): two owners' verdicts read a moment ago, which stand unread again. Both
+ * are described in docs/applications/mobile-wallet.md (the Node tab's status read).
  */
-export async function readNodeStatus(nodeId, { signStatus = null, timeoutMs = STATUS_MS, deadline = null } = {}) {
+export async function readNodeStatus(nodeId, {
+  signStatus = null, timeoutMs = STATUS_MS, deadline = null, onAgreed = null, known = null,
+} = {}) {
   const owners = lightShardOwnerUrls(nodeId);
   const publicMs = postMs(timeoutMs, deadline);
-  const answers = publicMs < MIN_POST_MS ? [] : (await Promise.all(owners.map((u) => call(
+  const given = known && known.onChain === true && Array.isArray(known.features) ? known.features.slice() : null;
+  const asked = given || publicMs < MIN_POST_MS ? [] : ranked(owners.map((u) => call(
     `${u}/api/v1/light-node/status?node_id=${enc(nodeId)}`, { timeoutMs: publicMs },
-  ).then(publicOf, () => null)))).filter(Boolean);
+  ).then(publicOf)));
+  const answersOf = (got) => inRank(got).filter(Boolean);
+  const early = await settleReads(asked, (got, left) => publicSettled(answersOf(got), left));
+  const publicPart = (answers) => (given ? { ...publicStatus([]), onChain: true, features: given.slice() } : publicStatus(answers));
+  const verdict = publicPart(answersOf(early));
+  let signing = null;
+  let noStatusKey = false;
+  if (signStatus && verdict.onChain === true && verdict.features.includes('status_signed')) {
+    const ts = Math.floor(Date.now() / 1000);
+    let s = null;
+    try {
+      s = await signStatus(nodeId, ts);
+      noStatusKey = s === null;
+    } catch (_) {
+      s = null;
+    }
+    const ms = postMs(timeoutMs, deadline);
+    if (s && (s.signer === 'ping' || s.signer === 'wallet') && typeof s.sig === 'string' && ms >= MIN_POST_MS) {
+      const nonce = randomHex(16);
+      const body = { node_id: nodeId, ts, signer: s.signer, sig: s.sig, nonce };
+      if (s.signer === 'wallet' && typeof s.identityPublicKey === 'string') body.identity_pubkey = s.identityPublicKey;
+      signing = { s, nonce, replies: ranked(owners.map((u) => call(`${u}/api/v1/light-node/status`, { body, timeoutMs: ms }))) };
+    }
+  }
+  const statusOf = (answers, replies) => {
+    const out = publicPart(answers);
+    out.noStatusKey = noStatusKey;
+    if (!replies) return out;
+    addSigned(out, signing.s, signing.nonce, replies);
+    if (given && replies.filter((a) => !!a && a.success === false && a.reason === 'not_registered').length >= MIN_AGREEMENT) {
+      out.onChain = false;
+    }
+    return out;
+  };
+  if (onAgreed) {
+    const signedEarly = signing ? await settleReads(signing.replies, (got, left) => signedSettled(inRank(got), left)) : null;
+    if (early.length < asked.length || (signing && signedEarly.length < signing.replies.length)) {
+      try { onAgreed(statusOf(answersOf(early), signedEarly && inRank(signedEarly))); } catch (_) { /* the full read follows */ }
+    }
+  }
+  const all = answersOf(await Promise.all(asked));
+  return statusOf(all, signing ? inRank(await Promise.all(signing.replies)) : null);
+}
+
+/**
+ * readNodeStatus resolved with its `onAgreed` status when there is one: the owners' verdicts without the refinements of
+ * an owner still out, for a read that decides something now (a QNet Link sheet's offer).
+ */
+export function readAgreedNodeStatus(nodeId, options = {}) {
+  return new Promise((resolve, reject) => {
+    readNodeStatus(nodeId, { ...options, onAgreed: resolve }).then(resolve, reject);
+  });
+}
+
+// The public part of a status from the owners' answers (publicOf, none null); readNodeStatus says what each field is.
+function publicStatus(answers) {
   const yes = answers.filter((a) => a.onChain === true);
   const no = answers.filter((a) => a.onChain === false);
   const onChain = yes.length >= MIN_AGREEMENT ? true : (no.length >= MIN_AGREEMENT ? false : null);
   const view = onChain === true ? yes[0] : (onChain === false ? no[0] : null);
   const features = agreedFeatures(answers);
-  const out = {
+  return {
     reachable: answers.length > 0,
     onChain,
     registrationPending: view ? view.registrationPending : false,
@@ -279,6 +429,7 @@ export async function readNodeStatus(nodeId, { signStatus = null, timeoutMs = ST
     needsReactivation: onChain === true ? yes.every((a) => a.needsReactivation) : (view ? view.needsReactivation : false),
     counted: onChain === true ? latestCounted(yes.map((a) => a.counted)) : (view ? view.counted : null),
     device: onChain === true ? joinedDevice(yes.map((a) => a.device)) : (view ? view.device : null),
+    linkedSinceAgreed: onChain === true ? agreedValue(yes.map((a) => (a.device ? a.device.linkedSince : null))) : null,
     lastMiss: onChain === true ? latestMiss(yes.map((a) => a.lastMiss)) : null,
     lastAnswer: onChain === true ? latestAnswer(yes.map((a) => a.lastAnswer)) : null,
     deviceTags: [],
@@ -291,40 +442,27 @@ export async function readNodeStatus(nodeId, { signStatus = null, timeoutMs = ST
     signer: null,
     pushReregister: null,
   };
-  if (!signStatus || onChain !== true || !features.includes('status_signed')) return out;
-  const ts = Math.floor(Date.now() / 1000);
-  let s = null;
-  try {
-    s = await signStatus(nodeId, ts);
-    out.noStatusKey = s === null;
-  } catch (_) {
-    s = null;
-  }
-  if (!s || (s.signer !== 'ping' && s.signer !== 'wallet') || typeof s.sig !== 'string') return out;
-  const ms = postMs(timeoutMs, deadline);
-  if (ms < MIN_POST_MS) return out;
-  const nonce = randomHex(16);
-  const body = { node_id: nodeId, ts, signer: s.signer, sig: s.sig, nonce };
-  if (s.signer === 'wallet' && typeof s.identityPublicKey === 'string') body.identity_pubkey = s.identityPublicKey;
-  const replies = await Promise.all(owners.map((u) => call(`${u}/api/v1/light-node/status`, { body, timeoutMs: ms })
-    .catch(() => null)));
+}
+
+// The signed part of a status, signed by `s` for `nonce`, from the owners' replies in rank order (null for none), into
+// `out`; readNodeStatus says what each field is.
+function addSigned(out, s, nonce, replies) {
   out.nonce = nonce;
   out.signer = s.signer;
   out.pushReregister = false;
   let refused = 0;
   let taken = false;
-  const seqs = new Map();
+  const seqs = [];
   for (const a of replies) {
     if (!a) continue;
-    if (a.success !== false && typeof a.onchain_registered === 'boolean') {
+    if (tookSigned(a)) {
       if (!taken) {
         taken = true;
         out.signed = signedOf(a);
         // Only the ping key is this device's own: an answer to the wallet key says nothing of this device's binding.
         if (out.keyOurs === null && s.signer === 'ping') out.keyOurs = true;
       }
-      const seq = natural(a.binding_seq);
-      if (seq !== null) seqs.set(seq, (seqs.get(seq) || 0) + 1);
+      seqs.push(natural(a.binding_seq));
       if (a.onchain_registered === true && a.push_reregister === true) out.pushReregister = true;
       const tag = a.onchain_registered === true ? tagOf(a) : null;
       if (tag) out.deviceTags.push(tag);
@@ -333,23 +471,75 @@ export async function readNodeStatus(nodeId, { signStatus = null, timeoutMs = ST
       if (refused >= MIN_AGREEMENT) out.keyOurs = false;
     }
   }
-  const agreed = [...seqs].filter(([, n]) => n >= MIN_AGREEMENT).map(([seq]) => seq);
-  out.bindingSeqAgreed = agreed.length === 1 ? agreed[0] : null;
+  out.bindingSeqAgreed = agreedValue(seqs);
   return out;
 }
+
+// The admission states a node's status reports for a super node (rewards_api.rs, light_nodes.rs).
+const ADMISSION_STATES = ['admitted', 'waiting', 'not_required'];
+
+/**
+ * A server node's status from one genesis node's GET /api/v1/node/status answer with `success: true`, as the Node tab
+ * reads it. `registered`: whether the chain records the node (`onchain_registered`, else `registered`; undefined when
+ * the node says neither). `admission`: 'admitted', 'waiting' (registered, not admitted to consensus yet) or
+ * 'not_required', else undefined. `pendingRewards` is the answering node's own figure: the tab shows the balance three
+ * genesis nodes give (PushService.getPendingRewards) in its place.
+ */
+export function serverStatusOf(a) {
+  return {
+    success: true,
+    nodeId: a.node_id,
+    nodeType: a.node_type,
+    registered: typeof a.onchain_registered === 'boolean' ? a.onchain_registered
+      : (typeof a.registered === 'boolean' ? a.registered : undefined),
+    isOnline: a.is_online,
+    lastSeen: a.last_seen,
+    lastSeenAgoSeconds: a.last_seen_ago_seconds,
+    heartbeatCount: a.heartbeat_count || 0,
+    requiredHeartbeats: a.required_heartbeats || 9,
+    isRewardEligible: a.is_reward_eligible,
+    admission: ADMISSION_STATES.includes(a.admission) ? a.admission : undefined,
+    reputation: a.reputation,
+    currentBlockHeight: a.current_block_height,
+    needsAttention: a.needs_attention,
+    message: a.message,
+    pendingRewards: a.pending_rewards,
+  };
+}
+
+/** Whether a server node's status (serverStatusOf) is one the network registered. */
+export function serverRegistered(status) {
+  return !!status && status.success === true && status.registered !== false;
+}
+
+/** Whether `status` names the server node `nodeId` registered: the only answer that node's card and record take. */
+export function serverStatusNames(status, nodeId) {
+  return serverRegistered(status) && !!nodeId && status.nodeId === nodeId;
+}
+
+// Of two statuses of one server node, whether `s` says more of it than `best`: online first, then more heartbeats.
+const saysMore = (s, best) => !best
+  || (!!s.isOnline !== !!best.isOnline ? !!s.isOnline : (s.heartbeatCount || 0) > (best.heartbeatCount || 0));
 
 /**
  * Whether the chain lists the super node `nodeId`, as two genesis nodes say alike (GET /api/v1/node/status: its
  * `onchain_registered`, else `registered`, in an answer with `success: true` that names that node or none): true, false,
  * or null when no two agree (two say each, or fewer answer). The node a site's move of the node balance names when it
- * is the wallet's super node (qnet-link-v1 section 14.8).
+ * is the wallet's super node (qnet-link-v1 section 14.8). `onStatus(status)` hears the node's status (serverStatusOf)
+ * from each answer that names it and does not say it is unregistered, as soon as it says more than the ones before it:
+ * the Node tab's server card, which then never waits for the slowest genesis node.
  */
-export async function readServerNodeListed(nodeId, { timeoutMs = STATUS_MS } = {}) {
+export async function readServerNodeListed(nodeId, { timeoutMs = STATUS_MS, onStatus = null } = {}) {
+  let best = null;
   const words = await Promise.all(GENESIS_NODES_HTTPS.map((u) => call(`${u}/api/v1/node/status?node_id=${enc(nodeId)}`, { timeoutMs })
     .then((a) => {
       if (a.success !== true || (a.node_id !== nodeId && a.node_id !== null)) return null;
-      const listed = typeof a.onchain_registered === 'boolean' ? a.onchain_registered : a.registered;
-      return typeof listed === 'boolean' ? listed : null;
+      const status = serverStatusOf(a);
+      if (onStatus && status.registered !== false && a.node_id === nodeId && saysMore(status, best)) {
+        best = status;
+        try { onStatus(status); } catch (_) { /* the listing verdict stands */ }
+      }
+      return typeof status.registered === 'boolean' ? status.registered : null;
     }, () => null)));
   const yes = words.filter((w) => w === true).length;
   const no = words.filter((w) => w === false).length;

@@ -1,12 +1,17 @@
 // Solana for the wallet's own account on the build's cluster (SOLANA.CLUSTER, never a setting):
 // balances, the history, sends of SOL and the listed SPL tokens (1DEV), the activation burn transaction, and the burn
-// matcher.
+// matcher. Every call goes to the build's endpoint, or through aiqnet.io's relay while the endpoint gives this browser
+// no answer (rpc).
 // Transactions are legacy-format, built here from typed fields, signed through keys.signSolanaMessage.
 import * as core from '../lib/qnet-core.js';
 import { U64_MAX, formatUnits, parseUnits } from './amount.js';
-import { DECIMALS, LIMITS, PAYMENT_REQUEST, SOLANA, TIMINGS, isPaymentRequestMemo } from './config.js';
+import {
+  DECIMALS, LIMITS, PAYMENT_REQUEST, QNET, SITE_HEADERS, SOLANA, STORAGE_KEYS, TIMINGS, isPaymentRequestMemo,
+} from './config.js';
 import { WalletError } from './errors.js';
 import * as keys from './keys.js';
+import { log } from './log.js';
+import { chromeApi, sleep } from './platform.js';
 import * as session from './session.js';
 import * as vault from './vault.js';
 
@@ -82,10 +87,6 @@ const PUBKEY_ORDER = new Intl.Collator('en', {
   usage: 'sort', sensitivity: 'variant', ignorePunctuation: false, numeric: false, caseFirst: 'lower',
 });
 
-const sleep = (ms) => new Promise((resolve) => {
-  setTimeout(resolve, ms);
-});
-
 function unavailable(rpcCode) {
   const error = new WalletError('SOLANA_UNAVAILABLE');
   if (Number.isSafeInteger(rpcCode)) error.rpcCode = rpcCode;
@@ -94,13 +95,64 @@ function unavailable(rpcCode) {
 
 // ---------------------------------------------------------------- RPC
 
-async function post(url, body, timeoutMs) {
+// aiqnet.io's relay of this wallet's own calls (decision 56): the same JSON-RPC body, while the endpoint gives no answer.
+const RELAY_URL = QNET.EXPLORER_API + SOLANA.RELAY_PATH;
+const PROBE_BODY = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBlockHeight', params: [{ commitment: 'confirmed' }] });
+
+// The way the calls go (core.solanaRouteOf): read from chrome.storage.local once per worker, then kept here.
+let route = null;
+let routeRead = null;
+let probing = false;
+
+async function loadRoute() {
+  routeRead ??= (async () => {
+    let stored;
+    try {
+      stored = (await chromeApi().storage.local.get(STORAGE_KEYS.SOLANA_ROUTE))?.[STORAGE_KEYS.SOLANA_ROUTE];
+    } catch {
+      stored = undefined;
+    }
+    route = core.solanaRouteOf(stored);
+  })();
+  await routeRead;
+}
+
+// Takes `next` when it moves the calls or the endpoint's last try, in memory at once; a write that fails costs a
+// restarted worker one more try of the endpoint.
+async function keepRoute(next, reason) {
+  if (next.via === route.via && next.probeAt === route.probeAt) return;
+  if (next.via !== route.via) log.info('solana route_changed', `via=${next.via}`, `reason=${reason}`);
+  route = next;
+  try {
+    await chromeApi().storage.local.set({ [STORAGE_KEYS.SOLANA_ROUTE]: next });
+  } catch {
+    // kept in memory only
+  }
+}
+
+// On the relay route, one direct getBlockHeight at a time runs beside a call once core.SOLANA_DIRECT_RETRY_MS passed
+// since the endpoint was last tried (a worker hears of no network change). Its time is kept before it runs, so a
+// restarted worker does not repeat it; a number brings the calls back to the endpoint.
+function probeWhenDue() {
+  if (probing || !core.solanaProbeDue(route, Date.now())) return;
+  probing = true;
+  (async () => {
+    await keepRoute(core.solanaRouteAfter(false, Date.now()), 'probe');
+    const reply = await post(SOLANA.RPC_URLS[0], PROBE_BODY, TIMINGS.SOLANA_TIMEOUT_MS);
+    const height = reply.status === 200 ? rpcAnswer(reply.text)?.result : null;
+    if (Number.isSafeInteger(height)) await keepRoute(core.solanaRouteAfter(true, Date.now()), 'probe_answered');
+  })().catch(() => {}).finally(() => {
+    probing = false;
+  });
+}
+
+async function post(url, body, timeoutMs, headers = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...headers },
       body,
       credentials: 'omit',
       cache: 'no-store',
@@ -116,14 +168,34 @@ async function post(url, body, timeoutMs) {
   }
 }
 
+// A reply's JSON-RPC answer, {error} (an error object) or {result}; null for anything else.
+function rpcAnswer(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed.error && typeof parsed.error === 'object') return { error: parsed.error };
+  return 'result' in parsed ? { result: parsed.result } : null;
+}
+
 /**
- * JSON-RPC call to SOLANA.RPC_URLS with timeout, backoff on 429/5xx and endpoint rotation.
+ * JSON-RPC call with timeout, back-off and endpoint rotation, each attempt the way core.solanaAttemptAfter gives (the
+ * app's rule, decision 56), the first the kept route's: to SOLANA.RPC_URLS, or to aiqnet.io's relay (QNET.EXPLORER_API +
+ * SOLANA.RELAY_PATH, with SITE_HEADERS). A direct attempt that gets no HTTP answer at all puts the calls on the relay route
+ * and sends the same body there at once; a relay attempt with no usable JSON-RPC answer is followed at once by one at the
+ * endpoint, whose usable answer puts the calls back on it; the endpoint's 429, 5xx or unreadable body, and a retryable
+ * JSON-RPC code either way, are asked again the same way after the back-off. Beside a call on the relay route the
+ * endpoint is tried again every core.SOLANA_DIRECT_RETRY_MS.
  * @param {string} method
  * @param {unknown[]} params
  * @param {{timeoutMs?: number, attempts?: number, backoffMs?: number, retryRpcErrors?: boolean}} [options]
  *   retryRpcErrors false: a JSON-RPC error answer is returned at once (sendTransaction)
  * @returns {Promise<unknown>} the `result` member
- * @throws {WalletError} SOLANA_UNAVAILABLE; `rpcCode` carries the JSON-RPC error code when there was one
+ * @throws {WalletError} SOLANA_UNAVAILABLE; `rpcCode` carries the JSON-RPC error code when there was one, and
+ *   `afterUnanswered` is true when an attempt before that answer got no usable one (it may have been taken)
  */
 export async function rpc(method, params, options = {}) {
   const {
@@ -133,40 +205,43 @@ export async function rpc(method, params, options = {}) {
     throw new WalletError('INTERNAL');
   }
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+  await loadRoute();
+  probeWhenDue();
+  let via = route.via;
+  let backOff = false;
+  let unanswered = false;
   let last = null;
   for (let attempt = 0; attempt < attempts; attempt++) {
-    if (attempt > 0) await sleep(backoffMs * 2 ** (attempt - 1));
-    const url = SOLANA.RPC_URLS[attempt % SOLANA.RPC_URLS.length];
-    let reply;
+    if (backOff) await sleep(backoffMs * 2 ** (attempt - 1));
+    const relayed = via === 'site';
+    const url = relayed ? RELAY_URL : SOLANA.RPC_URLS[attempt % SOLANA.RPC_URLS.length];
+    let reply = null;
     try {
-      reply = await post(url, body, timeoutMs);
+      reply = await post(url, body, timeoutMs, relayed ? SITE_HEADERS : {});
     } catch {
+      reply = null;
+    }
+    const parsed = reply?.status === 200 ? rpcAnswer(reply.text) : null;
+    const step = core.solanaAttemptAfter(via, reply === null ? 'none' : parsed === null ? 'unusable' : 'usable', Date.now());
+    if (step.route !== null) keepRoute(step.route, step.route.via === 'site' ? 'no_answer' : 'answered');
+    // the same way again waits for a server that is busy; the other way is asked at once
+    backOff = step.next === via;
+    via = step.next;
+    if (parsed === null) {
+      // an endpoint that refused the request itself is not asked again
+      if (!relayed && reply !== null && reply.status !== 200 && reply.status !== 429 && reply.status < 500) throw unavailable();
+      unanswered = true;
       last = unavailable();
       continue;
     }
-    if (reply.status === 429 || reply.status >= 500) {
-      last = unavailable();
-      continue;
-    }
-    if (reply.status !== 200) throw unavailable();
-    let parsed;
-    try {
-      parsed = JSON.parse(reply.text);
-    } catch {
-      last = unavailable();
-      continue;
-    }
-    if (parsed && typeof parsed === 'object' && parsed.error) {
+    if ('error' in parsed) {
       const error = unavailable(parsed.error.code);
+      if (unanswered) error.afterUnanswered = true;
       if (retryRpcErrors && RETRYABLE_RPC_CODES.has(parsed.error.code)) {
         last = error;
         continue;
       }
       throw error;
-    }
-    if (!parsed || typeof parsed !== 'object' || !('result' in parsed)) {
-      last = unavailable();
-      continue;
     }
     return parsed.result;
   }
@@ -610,26 +685,17 @@ export async function sendAndConfirm(transaction, options = {}) {
   const { signature } = splitTransaction(transaction);
   const deadline = Date.now() + timeoutMs;
   const wire = core.base64Encode(transaction);
-  // An attempt whose answer was lost may have forwarded the transaction, so only a refusal of a clean
-  // first attempt, for a signature the chain has not seen, means it cannot land.
-  let uncertain = false;
+  // An attempt whose answer was lost may have forwarded the transaction, so only a refusal with no such attempt
+  // before it, for a signature the chain has not seen, means it cannot land.
   let refusal = null;
-  for (let attempt = 0; attempt < RPC_ATTEMPTS; attempt++) {
-    if (attempt > 0) await sleep(RPC_BACKOFF_MS * 2 ** (attempt - 1));
-    try {
-      await rpc('sendTransaction', [wire, {
-        encoding: 'base64', skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 5,
-      }], { attempts: 1, retryRpcErrors: false });
-      break;
-    } catch (error) {
-      if (error instanceof WalletError && error.rpcCode !== undefined) {
-        refusal = error;
-        break;
-      }
-      uncertain = true;
-    }
+  try {
+    await rpc('sendTransaction', [wire, {
+      encoding: 'base64', skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 5,
+    }], { retryRpcErrors: false });
+  } catch (error) {
+    if (error instanceof WalletError && error.rpcCode !== undefined && error.afterUnanswered !== true) refusal = error;
   }
-  if (refusal && !uncertain) {
+  if (refusal) {
     const seen = await statusOf(signature, true).catch(() => null);
     if (!seen) {
       throw new WalletError(PREFLIGHT_RPC_CODES.has(refusal.rpcCode) ? 'SIMULATION_FAILED' : 'SOLANA_UNAVAILABLE');

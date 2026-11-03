@@ -124,6 +124,16 @@ describe('Solana devnet only, with no prices, in every build', () => {
     expect(nodes.getSolanaRpcUrl()).toBe(nodes.SOLANA_RPC_ENDPOINTS[0]);
   });
 
+  // The calls the endpoint gives no answer go to the site the wallet already uses: built from EXPLORER_API, whose line
+  // the sandbox overlay replaces exactly, so a sandbox build sends them to its own site.
+  it('the Solana route through the site follows the site the build names', () => {
+    const nodes = require('../src/config/nodes');
+    expect(nodes.SOLANA_RELAY_URL).toBe(`${nodes.EXPLORER_API}/api/cabinet/solana`);
+    const lines = read('src/config/nodes.js').split('\n');
+    expect(lines).toContain("export const EXPLORER_API = 'https://aiqnet.io';");
+    expect(lines).toContain('export const SOLANA_RELAY_URL = `${EXPLORER_API}/api/cabinet/solana`;');
+  });
+
   it('no source reaches another cluster or a price', () => {
     for (const re of [/mainnet-beta/, /api\.mainnet/, /coingecko/i, /tokenPrices/, /fetchTokenPrices/, /\busd\b/i,
       /getItem\(\s*'qnet_testnet'/, /setTestnet|isTestnet/]) {
@@ -166,11 +176,12 @@ describe('a QNet Link connects, reserves, links, unlinks and moves, and nothing 
     expect(holding(sources, /<QNetLinkScreen\b/)).toEqual(['src/screens/WalletScreen.js']);
   });
 
+  // The answer still on its way once its sheet went says so wherever the app is (components/AnswerAway).
   it('outside the link screen, only the neutral link texts and the device check of "Use this device" appear', () => {
     const outside = sources.filter((s) => s.name !== 'src/screens/QNetLinkScreen.js');
     const used = [...new Set(outside.flatMap((s) => [...s.text.matchAll(/'(link_[a-zA-Z_]+)'/g)].map((m) => m[1])))].sort();
     expect(used).toEqual(['link_device_check_body', 'link_device_check_title', 'link_invalid', 'link_refused_title',
-      'link_waiting_unlock']);
+      'link_waiting_unlock', 'link_working_send']);
   });
 });
 

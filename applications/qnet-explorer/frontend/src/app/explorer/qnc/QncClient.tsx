@@ -1,6 +1,6 @@
 'use client';
 
-// QNC, the native coin (B-SPEC 6.6): no contract, so this is the coin's own view: its supply as readouts, the top
+// QNC, the native coin: no contract, so this is the coin's own view: its supply as readouts, the top
 // holders (the node's rich list, /api/qnc) and the recent QNC transfers (the explorer's list, value types only). The
 // server renders the first answers into the page (page.tsx), so the tables have their final rows from the first paint;
 // both are read again as the chain head moves, at most every 10 s and only while the tab is shown.
@@ -9,14 +9,16 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import TokenIcon from '@/components/TokenIcon';
 import OnHead from '@/components/explorer/OnHead';
 import { TxAmount } from '@/components/explorer/cells';
-import { amountCol, blockCol, fromToCol, hashCol, holderCols, timeCol } from '@/components/explorer/columns';
+import { amountCol, amountsWidth, blockCol, fromToCol, hashCol, holderCols, timeCol, useSteadyWidth } from '@/components/explorer/columns';
 import DataTable from '@/components/ui/DataTable';
 import { Amount } from '@/components/ui/EntityLink';
 import PageHead from '@/components/ui/PageHead';
 import { Readout, Readouts } from '@/components/ui/Readouts';
 import { useActivationContent } from '@/contexts/AppContext';
+import { useI18n } from '@/i18n/client';
 import { QNC_PATH, QNC_TRANSFERS_PATH } from '@/lib/explorer-reads';
 import { rowAmount } from '@/lib/explorer-view';
+import { siteRequest } from '@/lib/site-request';
 import { number } from '@/lib/texts';
 import type { FirstAnswer } from '@/server/first-answer';
 
@@ -58,13 +60,13 @@ export interface QncFirst {
 }
 
 const REFRESH_MS = 10_000;
-const UNREADABLE = 'The supply and the holders cannot be read right now.';
 
-// One reading of each answer, for the server's first answer and the client's later reads alike.
-function readQnc(body: unknown): { data: QncData } | { error: string } {
-  const result = body as { success?: boolean; holders?: unknown; error?: string } | null;
+// One reading of each answer, for the server's first answer and the client's later reads alike; a failed read shows
+// the page's own words for it.
+function readQnc(body: unknown): { data: QncData } | { failed: true } {
+  const result = body as { success?: boolean; holders?: unknown } | null;
   if (result?.success && Array.isArray(result.holders)) return { data: result as unknown as QncData };
-  return { error: result?.error || UNREADABLE };
+  return { failed: true };
 }
 
 function readTransfers(body: unknown): QncTransfer[] {
@@ -76,35 +78,36 @@ function readTransfers(body: unknown): QncTransfer[] {
 
 // `first` is absent while the route loads (loading.tsx): the page's final shape with nothing in it, and no reads.
 export default function QncClient({ first }: { first?: QncFirst }) {
-  // The app's view shows no burned supply (L-14).
+  const { t, say, rich } = useI18n();
+  // The app's view shows no burned supply.
   const full = useActivationContent();
   const [initial] = useState(() => (first?.qnc ? readQnc(first.qnc.body) : null));
   const [data, setData] = useState<QncData | null>(initial && 'data' in initial ? initial.data : null);
-  const [error, setError] = useState<string | null>(initial && 'error' in initial ? initial.error : null);
+  const [failed, setFailed] = useState(Boolean(initial && 'failed' in initial));
   const [transfers, setTransfers] = useState<QncTransfer[] | null>(() => (first?.transfers ? readTransfers(first.transfers.body) : null));
 
   const fetchQnc = useCallback(async () => {
     try {
-      const res = await fetch(QNC_PATH, { cache: 'no-store' });
+      const res = await fetch(QNC_PATH, siteRequest());
       const read = readQnc(await res.json());
       if ('data' in read) {
         setData(read.data);
-        setError(null);
+        setFailed(false);
       } else {
-        setError(read.error);
+        setFailed(true);
       }
     } catch {
-      setError(UNREADABLE);
+      setFailed(true);
     }
   }, []);
 
   // Recent native QNC transfers, from the main list (value-moving types only).
   const fetchTransfers = useCallback(async () => {
     try {
-      const res = await fetch(QNC_TRANSFERS_PATH, { cache: 'no-store' });
+      const res = await fetch(QNC_TRANSFERS_PATH, siteRequest());
       setTransfers(readTransfers(await res.json()));
     } catch {
-      setTransfers((t) => t ?? []);
+      setTransfers((shown) => shown ?? []);
     }
   }, []);
 
@@ -119,36 +122,42 @@ export default function QncClient({ first }: { first?: QncFirst }) {
     if (!first.transfers) void fetchTransfers();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const holderColumns = useMemo(() => holderCols<QncHolder & { rank: number }>((h) => <Amount value={h.balance} />, full), [full]);
+  // Each amount column as wide as its longest value (columns.tsx amountsWidth).
+  const holderColumns = useMemo(
+    () => holderCols<QncHolder & { rank: number }>(t, (h) => <Amount value={h.balance} />, full, (data?.holders ?? []).map((h) => ({ value: h.balance, unit: 'QNC' }))),
+    [t, full, data?.holders],
+  );
 
+  // The transfers' amounts keep their widest width while the list refreshes, so From / To never moves under the reader.
+  const transferAmountW = useSteadyWidth(useMemo(() => amountsWidth((transfers ?? []).map((x) => rowAmount(x, t('token_unnamed')))), [transfers, t]), 'qnc');
   const transferColumns = useMemo(() => [
-    hashCol<QncTransfer>((t) => t.hash),
-    fromToCol<QncTransfer>((t) => t.from, (t) => t.to, full),
-    amountCol<QncTransfer>((t) => <TxAmount parts={rowAmount(t)} />),
-    blockCol<QncTransfer>((t) => t.block),
-    timeCol<QncTransfer>((t) => t.timestamp),
-  ], [full]);
+    hashCol<QncTransfer>(t, (x) => x.hash),
+    fromToCol<QncTransfer>(t, (x) => x.from, (x) => x.to, full),
+    amountCol<QncTransfer>(t, (x) => <TxAmount parts={rowAmount(x, t('token_unnamed'))} />, t('col_amount'), transferAmountW),
+    blockCol<QncTransfer>(t, (x) => x.block),
+    timeCol<QncTransfer>(t, (x) => x.timestamp),
+  ], [t, full, transferAmountW]);
 
   const holders = data ? data.holders.map((h, i) => ({ ...h, rank: i + 1 })) : null;
 
   return (
     <div className="ex ex-detail">
       <PageHead
-        kicker="Native coin"
-        title={<span className="ex-title-icon"><TokenIcon native size={44} />QNC</span>}
+        kicker={t('qnc_kicker')}
+        title={<span className="ex-title-icon" translate="no"><TokenIcon native size={44} />QNC</span>}
         more={(
           <div className="ex-ro" data-field-dim="0.1">
-            <Readouts cols={4} size="tool" label="QNC supply">
-              <Readout label="Total supply" value={data ? data.total_supply : null} amount={{ link: false }} sub="Issued so far" />
-              <Readout label="Circulating" value={data ? data.circulating : null} amount={{ link: false }} sub="Held by accounts" />
-              <Readout label="Holders" value={data ? number(data.holder_count) : null} sub="Accounts with a balance" />
-              {full ? <Readout label="Burned" value={data ? data.burned : null} amount={{ link: false }} sub="Out of the supply" /> : <span />}
+            <Readouts cols={4} size="tool" label={t('ro_supply')}>
+              <Readout label={t('qnc_total')} value={data ? data.total_supply : null} amount={{ link: false }} sub={t('qnc_total_sub')} />
+              <Readout label={t('ro_supply_sub')} value={data ? data.circulating : null} amount={{ link: false }} sub={t('qnc_circulating_sub')} />
+              <Readout label={t('tok_holders')} value={data ? number(data.holder_count) : null} sub={t('qnc_holders_sub')} />
+              {full ? <Readout label={t('qnc_burned')} value={data ? data.burned : null} amount={{ link: false }} sub={t('qnc_burned_sub')} /> : <span />}
             </Readouts>
           </div>
         )}
       >
-        <p className="ex-facts"><span>The coin of QNet Blockchain itself: it has no contract address.</span></p>
-        {error && <p className="ex-error" role="status">{error}</p>}
+        <p className="ex-facts"><span>{say('qnc_note')}</span></p>
+        {failed && <p className="ex-error" role="status">{t('qnc_unreadable')}</p>}
       </PageHead>
 
       <div className="wrap ex-body">
@@ -156,31 +165,32 @@ export default function QncClient({ first }: { first?: QncFirst }) {
         <section className="ex-group">
           <DataTable
             stack="holders"
-            title="Top holders"
-            caption="The accounts holding the most QNC"
+            title={t('qnc_top')}
+            caption={t('qnc_top_caption')}
             columns={holderColumns}
             rows={holders}
             rowKey={(h) => h.address}
             loadingRows={10}
-            empty={error ? 'The holders cannot be read right now.' : 'No holders yet.'}
+            empty={failed ? t('qnc_holders_unreadable') : t('qnc_no_holders')}
           />
           {/* Under the table, so it moves nothing above it when a later answer brings it. */}
           {data?.genesis_allocations && data.genesis_allocations.accounts > 0 && (
             <p className="note">
-              {number(data.genesis_allocations.accounts)} load-test accounts were funded in the genesis block for stress tests,
-              holding {data.genesis_allocations.balance} QNC. Their keys are public; they are not part of the supply above and
-              are left out of holders and shares.
+              {rich('qnc_load_test', {
+                accounts: <span className="num" translate="no">{number(data.genesis_allocations.accounts)}</span>,
+                amount: <span className="num" translate="no">{data.genesis_allocations.balance}</span>,
+              })}
             </p>
           )}
         </section>
         <DataTable
-          title="Recent QNC transfers"
-          caption="The newest QNC transfers"
+          title={t('qnc_recent')}
+          caption={t('qnc_recent_caption')}
           columns={transferColumns}
           rows={transfers}
-          rowKey={(t) => t.hash}
+          rowKey={(x) => x.hash}
           loadingRows={15}
-          empty="No transfers yet."
+          empty={t('qnc_no_transfers')}
         />
       </div>
     </div>

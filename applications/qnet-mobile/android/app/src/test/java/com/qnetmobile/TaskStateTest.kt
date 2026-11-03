@@ -88,41 +88,48 @@ class TaskStateTest {
         assertFalse(watchStopsItself(36, startedInFront = false))
     }
 
+    // A swipe that cannot be told for sure is answered. The system's trim of the recent apps leaves the task missing with
+    // neither sure sign: the living process takes its removal mark back, and the process the system ends later gets a
+    // record of its own reason, not "remove task".
     @Test
-    fun aTaskMissingFromTheRecentAppsInsideTheKeepWindowIsTakenForTheUsersRemoval() {
-        val keep = recentsKeepMs(-1, DEFAULT_KEEP_HOURS)
-        val hour = 3_600_000L
-        // A swipe of a task whose process had already ended, an hour after the app left the front.
-        assertTrue(removedInsideKeepWindow(true, hour, keep) { true })
-        assertTrue(removedInsideKeepWindow(true, 0L, keep) { true })
-        assertTrue(removedInsideKeepWindow(true, keep - KEEP_WINDOW_MARGIN_MS - 1, keep) { true })
-        // The task is still listed: nothing to say.
-        assertFalse(removedInsideKeepWindow(true, hour, keep) { false })
+    fun aTaskMissingFromTheRecentAppsAloneIsNeverASwipe() {
+        val dir = java.nio.file.Files.createTempDirectory("marks").toFile()
+        try {
+            RemovalMarks(dir, 100) { _, takeBack -> takeBack() }.mark()
+            val next = RemovalMarks(dir, 200) { _, _ -> }
+            val low = ApplicationExitInfo.REASON_LOW_MEMORY
+            assertFalse(swipedAway({ next.leftByEndedProcess() }) { removedTaskExit(low, record(low, 0, null), null) })
+            // No mark and no record at all: a task trimmed after its process had ended.
+            assertFalse(swipedAway({ next.leftByEndedProcess() }) { false })
+        } finally {
+            dir.deleteRecursively()
+        }
+        // Either sure sign is one; the exit records are read only while the removal marks say nothing.
+        assertTrue(swipedAway({ true }) { throw AssertionError("the exit records were read") })
+        assertTrue(swipedAway({ false }) { removedTaskExit(user, record(user, 22, "remove task"), "remove task") })
     }
 
+    // Why the app's last process ended, in the fixed words the node logs with the next answer.
     @Test
-    fun outsideTheKeepWindowTheMissingTaskSaysNothingAndTheListIsNotRead() {
-        val keep = recentsKeepMs(-1, DEFAULT_KEEP_HOURS)
-        val read = mutableListOf<Unit>()
-        val gone = { read += Unit; true }
-        // The system may have trimmed it: inactive past the window (less the margin), or in another boot.
-        assertFalse(removedInsideKeepWindow(true, keep - KEEP_WINDOW_MARGIN_MS, keep, gone))
-        assertFalse(removedInsideKeepWindow(true, 7 * 3_600_000L, keep, gone))
-        assertFalse(removedInsideKeepWindow(false, 3_600_000L, keep, gone))
-        assertFalse(removedInsideKeepWindow(true, -1L, keep, gone))
-        // A device that keeps recent apps by count alone has no window.
-        assertFalse(removedInsideKeepWindow(true, 0L, recentsKeepMs(9, DEFAULT_KEEP_HOURS), gone))
-        assertEquals(0, read.size)
-    }
-
-    @Test
-    fun theKeepWindowIsThePlatformsSessionTimeUnlessACountLimitsTheList() {
-        assertEquals(6 * 3_600_000L, recentsKeepMs(-1, 6))
-        assertEquals(3_600_000L, recentsKeepMs(-1, 1))
-        assertEquals(0L, recentsKeepMs(9, 6))
-        assertEquals(0L, recentsKeepMs(0, 6))
-        assertEquals(0L, recentsKeepMs(-1, 0))
-        assertEquals(0L, recentsKeepMs(-1, -1))
+    fun anExitRecordReadsAsOneOfTheFixedReasons() {
+        val name = { reason: Int, sub: Int, d: String? -> exitReasonName(reason, record(reason, sub, d), d) }
+        assertEquals("crash", name(ApplicationExitInfo.REASON_CRASH, 0, "crash"))
+        assertEquals("crash", name(ApplicationExitInfo.REASON_CRASH_NATIVE, 0, null))
+        assertEquals("anr", name(ApplicationExitInfo.REASON_ANR, 0, "Input dispatching timed out"))
+        assertEquals("low_memory", name(ApplicationExitInfo.REASON_LOW_MEMORY, 0, null))
+        assertEquals("system_killed", name(ApplicationExitInfo.REASON_SIGNALED, 0, null))
+        assertEquals("system_killed", name(ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE, 0, null))
+        assertEquals("system_killed", name(ApplicationExitInfo.REASON_FREEZER, 0, null))
+        // The user removed the task from the recent apps; any other end the user asked for (a force stop) is closed.
+        assertEquals("swiped", name(user, 22, "remove task"))
+        assertEquals("swiped", name(user, 0, "remove task"))
+        assertEquals("user_closed", name(user, 23, "fully stop io.aiqnet.wallet/0 by user request"))
+        assertEquals("user_closed", name(ApplicationExitInfo.REASON_USER_STOPPED, 0, null))
+        assertEquals("other", name(ApplicationExitInfo.REASON_EXIT_SELF, 0, null))
+        assertEquals("other", name(ApplicationExitInfo.REASON_OTHER, 0, null))
+        assertEquals("unknown", name(ApplicationExitInfo.REASON_UNKNOWN, 0, null))
+        // A reason a later Android adds.
+        assertEquals("other", name(99, 0, null))
     }
 
     @Test

@@ -4,12 +4,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { ANDROID_PLAY_URL, GET_APP_URL, IOS_APP_STORE_URL, IOS_INSTALL_URL, IOS_TESTFLIGHT_URL } from '../app-links.ts';
 import { GET_PAGE_PATH, installTarget, storeUrl } from '../install-target.ts';
 import { qrMatrix } from '../qr.ts';
-
-const read = (rel) => readFileSync(new URL(`../../${rel}`, import.meta.url), 'utf8');
+import { read } from './source.mjs';
 
 const UA = {
   iphone: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
@@ -60,11 +58,11 @@ test('GET /get redirects by device and is never cached across devices', () => {
 
 test('the block shows the QR code only on a computer and the own store first on a phone, decided at first paint', () => {
   const source = read('components/GetTheApp.tsx');
-  // No device check after load (B-SPEC 3.2): the root layout names the device from the request, CSS shows the variant.
+  // No device check after load: the root layout names the device from the request, CSS shows the variant.
   assert.doesNotMatch(source, /useEffect|useState|navigator\./);
   const layout = read('app/layout.tsx');
   assert.match(layout, /const device = installTarget\(request\.get\('user-agent'\)\);/);
-  assert.match(layout, /<html lang="en" data-device=\{device\}/);
+  assert.match(layout, /<html lang=\{locale\} dir=\{dir\} data-device=\{device\}/);
   // Only an iPad in desktop mode is corrected in the browser, by its touch points.
   assert.match(read('components/SiteShell.tsx'), /const target = installTarget\(navigator\.userAgent, navigator\.maxTouchPoints \|\| 0\);/);
   const css = read('styles/home.css');
@@ -72,11 +70,11 @@ test('the block shows the QR code only on a computer and the own store first on 
   assert.match(css, /\[data-device='ios'\] \.own-ios, \[data-device='android'\] \.own-android \{ display: block; \}/);
   assert.match(css, /\[data-device='ios'\] \.get \.qr, \[data-device='ios'\] \.get \.stores, \[data-device='android'\] \.get \.qr, \[data-device='android'\] \.get \.stores \{ display: none; \}/);
   // The two phone stores have their own button; a phone cannot install the extension, so it has none.
-  assert.match(source, /<OwnStore store=\{ios\} other=\{android\} \/>\s*<OwnStore store=\{android\} other=\{ios\} \/>/);
+  assert.match(source, /<OwnStore store=\{IOS\} other=\{ANDROID\} \/>\s*<OwnStore store=\{ANDROID\} other=\{IOS\} \/>/);
   assert.match(source, /href=\{store\.href\} target="_blank" rel="noopener noreferrer"/);
   // One measurement: the 264 px code and three rows a third of it each.
   assert.match(source, /width=\{264\} height=\{264\}/);
-  assert.match(css, /\.stores \{ display: grid; grid-template-rows: repeat\(3, 88px\);/);
+  assert.match(css, /\.stores \{ display: grid; grid-template-columns: minmax\(0, 1fr\); grid-template-rows: repeat\(3, 88px\);/);
   // The wallet page's title band already says the lead, and the section takes the tool pages' rhythm.
-  assert.match(read('app/wallet/page.tsx'), /<GetTheApp lead=\{null\} variant="tool" \/>/);
+  assert.match(read('app/wallet/page.tsx'), /<GetTheApp lead=\{false\} variant="tool" \/>/);
 });

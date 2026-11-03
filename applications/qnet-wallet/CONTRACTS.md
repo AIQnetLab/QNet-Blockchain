@@ -1,4 +1,4 @@
-# QNet Wallet extension 3.1.6: contracts
+# QNet Wallet extension 3.1.7: contracts
 
 This file is the single agreement between the modules of the rebuilt extension. The rebuild spec and the
 three audit reports (ext-secrets, ext-surface, ext-crypto) are normative; this file turns them into
@@ -23,8 +23,8 @@ Implementation areas:
 
 | Area | Files |
 |---|---|
-| A. Vault and session | `background/vault.js`, `session.js`, `keys.js`, `clipboard.js` (the clipboard clear after a copied secret, section 8), `platform.js` (the chrome.* helpers session.js and clipboard.js share) |
-| B. Chains and activation | `background/qnet.js`, `solana.js`, `activation.js`, `nodes.js` (the wallet's nodes on QNet Blockchain: the light node's registration and the unlink of its device, and the move of the balance of the light or super node a site names, section 4.10) |
+| A. Vault and session | `background/vault.js`, `session.js`, `keys.js`, `clipboard.js` (the clipboard clear after a copied secret, section 8), `platform.js` (the chrome.* helpers session.js, clipboard.js and solana.js share, and the worker's one wait, `sleep`) |
+| B. Chains and activation | `background/qnet.js`, `solana.js` (its calls on the build's endpoint, or through aiqnet.io's relay while the endpoint gives no answer, decision 56), `activation.js`, `nodes.js` (the wallet's nodes on QNet Blockchain: the light node's registration and the unlink of its device, and the move of the balance of the light or super node a site names, section 4.10) |
 | C. dApp | `background/provider.js`, `content/relay.js`, `inject/provider.js` |
 | D. Pages | `ui/popup.*`, `ui/setup.*`, `ui/approve.*`, `ui/offscreen.*` (the offscreen document of `clipboard.js`; no UI page), `ui/kit.js`, `ui/i18n/*`, `ui/qr.js`, the area-D functions of `ui/common.js`, `_locales/*` |
 
@@ -170,7 +170,7 @@ lowercase hex characters.
 | `qnet.preview` | P | U | | `{to: qnetAddress, amount: qnc, replaceNonce?: u64}` (`replaceNonce`: review a transfer that replaces the outstanding one of that nonce) | `TransferPreview` with `recipient: RecipientCheck\|null`; a recipient that is a contract gets no review (`qnet.assertPayableRecipient`, EXT-R2A-01) | `NETWORK, BALANCE_UNCONFIRMED, NONCE_UNAVAILABLE, NONCE_CHANGED, INVALID_AMOUNT, RECIPIENT_IS_CONTRACT, RECIPIENT_UNCHECKED` |
 | `qnet.sendWarm` | P | U | | `{to?: qnetAddress}` | `{started: true}`: starts, without waiting, what a QNC review reads beside its one live read (decisions 48, 50): the certified head, and with `to` that recipient's certified account leaf (background only; the review's contract check joins that read) and the archive page the recipient check reads | `INVALID_ADDRESS` |
 | `qnet.send` | P | U | T | `{to, amount: qnc, expectedFeeNano: u64, expectedNonce?: u64, replaceNonce?: u64}` | `{txHash: string\|null, status: 'submitted'\|'unknown', nonce}` (`txHash`: what one node returned, not shown or linked: R2-EXTQ-06) | `SIGNING_DISABLED, FEE_CHANGED, NONCE_CHANGED, NONCE_UNAVAILABLE, BALANCE_UNCONFIRMED, INSUFFICIENT_FUNDS, TOO_MANY_PENDING, NODE_REJECTED, NETWORK, RECIPIENT_IS_CONTRACT, RECIPIENT_UNCHECKED` |
-| `qnet.sentStatus` | P | U | | `{nonce: u64 > 0}` (from `qnet.send` or `qnet.tokenSend`) | `{status: 'pending'\|'in_block'\|'replaced'\|'unknown'}` (`qnet.sentStatus`, decision 50): by the account nonce two pinned nodes report live, `pending` while it is below `nonce`; once used, `in_block` when two pinned nodes list at it the transaction this wallet kept there (or none is kept there any more), `replaced` when another, `unknown` while no two agree; a decided one starts `resubmitPending` with the rows it read (`qnet.passedRows`: every passed nonce of the vault's transactions in the same one request per node). The sent screen asks every 2 s for the first 10 s, every 5 s to the first minute, then every 10 s, five minutes in all (`popup.SENT_STATUS_STEPS`), and turns Confirmed at `in_block` | `INVALID_PARAMS` |
+| `qnet.sentStatus` | P | U | | `{nonce: u64 > 0}` (from `qnet.send` or `qnet.tokenSend`) | `{status: 'pending'\|'dropped'\|'in_block'\|'replaced'\|'unknown'}` (`qnet.sentStatus`, decision 50): by the account nonce two pinned nodes report live, `pending` while it is below `nonce`, `dropped` once every transaction kept there is a V2 one whose `valid_until` the tip they report is past (the sent screen says Expired, nothing spent); once used, `in_block` when two pinned nodes list at it the transaction this wallet kept there (or none is kept there any more), `replaced` when another, `unknown` while no two agree; a decided one starts `resubmitPending` with the rows it read (`qnet.passedRows`: every passed nonce of the vault's transactions in the same one request per node). The sent screen asks every 2 s for the first 10 s, every 5 s to the first minute, then every 10 s, five minutes in all (`popup.SENT_STATUS_STEPS`), and turns Confirmed at `in_block` | `INVALID_PARAMS` |
 | `solana.balances` | P | U | | none | `SolanaBalances` | `SOLANA_UNAVAILABLE` |
 | `solana.history` | P | U | | `{cursor?: string\|null (printable ASCII <= 512), limit?: 1..LIMITS.SOLANA_HISTORY_PAGE_MAX (25)}` (decision 39) | `{items: SolanaHistoryItem[], cursor: string\|null}`: the wallet's own Solana transactions, newest first, at confirmed (section 2.5) | `SOLANA_UNAVAILABLE`, `INVALID_PARAMS` (a cursor it did not give) |
 | `solana.quote` | P | U | | `{asset: 'sol'\|'1dev', to: solanaAddress, amount, references?: solanaAddress[], memo?: string}`; amount > 0 with at most the asset's decimals; `references` and `memo`: a payment request's (decision 34), at most `PAYMENT_REQUEST.REFERENCES_MAX` (4) distinct addresses and a memo of `config.isPaymentRequestMemo` | `SolanaQuote` (with the recipient check and `shortfall`: why the send would fail as reviewed, which the review names and `solana.send` refuses; `references` and `memo` as the transaction carries them) | `SOLANA_UNAVAILABLE, INVALID_AMOUNT, INVALID_ADDRESS, TX_TOO_LARGE` (the signed transaction would exceed `SOLANA.TRANSACTION_MAX_BYTES`) |
@@ -214,8 +214,8 @@ lowercase hex characters.
   0 and never kept across sessions. The certified read runs beside the live one and is waited for only without a live
   figure; no figure at all is `NETWORK` (no node answered) or `BALANCE_UNCONFIRMED`. Two agreeing nodes verify nothing.
   `spendableNano`: the send rule's "available" (`qnet.liveSend`): the live balance less what this wallet's own
-  transactions took after its nonce up to the nonce floor and may still take above it (a dropped one the next send takes
-  the place of left out); null without a live figure, and the Send form then says nothing is available.
+  transactions took after its nonce up to the nonce floor and may still take above it (a released one the next send takes
+  the place of left out, `qnet.isReleased`); null without a live figure, and the Send form then says nothing is available.
 - `TransferPreview`: `{from, to, amountNano, feeNano, totalNano, nonce, balanceNano, verified: false,
   verification: 'live', outstanding: OutstandingTransfer[], replacesNonce: string|null, inFlight}`: the send rule of
   decision 50 (`qnet.transferSnapshot`): one live read (`qnet.ownLiveRead`; none: `NETWORK`, no proof of the account:
@@ -266,12 +266,15 @@ lowercase hex characters.
   QRC-20 token (`source: 'token'`, decision 40) is `kind: 'token'` with `token: {contract, symbol, decimals, reserved}` (as
   the archive names it, shown only: the symbol as `TokenList` shows one, `reserved` as it marks one), `amountBase` (u128,
   the token's units) and `amountNano: '0'`; it is `included` when this wallet sent it (`direction` not `in`) and two
-  pinned nodes list its call's hash (a node lists a contract call only under its caller), or when its own logs proof
-  verifies (`GET /api/v1/logs/proof`: the row's own event leaf, `core.transferLogLeaf`, folds to the window's logs_root,
-  and that root is the one the committee certified, `core.verifyMacroblockLogsRoot`), else `unverified`; a proof that
-  contradicts the row (another leaf, or another root) leaves it `unverified` whatever the nodes list (decisions 48, 50).
-  At most 8 proofs start per read, in the background (`qnet.tokenRowVerdicts`); no read waits for one, and a later read
-  finds the verdicts. Its detail asks no node (`qnet.txLookup` is not called for it). A transaction of this wallet the
+  pinned nodes list or report its call's hash (a node lists a contract call only under its caller), or when its own logs
+  proof verifies (`GET /api/v1/logs/proof`: the row's own event leaf, `core.transferLogLeaf`, folds to the window's
+  logs_root, and that root is the one the committee certified, `core.verifyMacroblockLogsRoot`), or when its block is
+  past the pinned nodes' index or at or below the logs floor (below), else `unverified`; a proof that contradicts the row
+  (another leaf, or another root) leaves it `unverified` whatever the nodes list or its block, while the worker keeps
+  that verdict (`qnet.rowVerdicts`, in memory, the newest 256) (decisions 48, 50, 53, 54).
+  At most 8 proofs start per read, in the background (`qnet.tokenRowVerdicts`), only for a row of a block above the logs
+  floor; no read waits for one, and a later read finds the verdicts. Its detail asks no node (`qnet.txLookup` is not
+  called for it). A transaction of this wallet the
   chain took (vault outcome `confirmed`) is a pending-list row `included`, with the hash two pinned nodes list for it,
   until the archive page lists its row (`qnet.archiveClaims`: the row with that hash, of its kind first, a transfer, a
   token row for a token transfer, a call row for any other call, then any, since a token transfer that failed at apply
@@ -280,18 +283,40 @@ lowercase hex characters.
   transaction holds; each row goes to one transaction at most). That row then reads `included` (unless a logs proof
   contradicts it), the record stays out of the pending list, and it leaves the vault once the page's own reads list the
   row `included`, so it is one row at every moment and never `unverified` after Confirmed (decision 50).
-  `dropped` (decision 40): a transaction this wallet no longer sends
-  (stale, or refused) whose nonce the last nonce read shows free, past the node's mempool lifetime after it last went
-  out (`max(createdAt, lastSubmitAt)` + 30 min + 5 min, the mobile `mayLandUntil`): no node can hold it, so it did not go
-  through and never will by itself; the next transfer takes its nonce by default, its amount is no longer kept back from
-  the send form's "available", and `resubmitPending` drops its record a day after it was dropped. An archive row is
-  `included` (in a block) only when at least two pinned nodes list it alike (hash, both parties, amount) in their newest history
-  (`/api/v1/transactions/history`, 100 rows), else `unverified` (older than their window, a batch row, or not theirs):
-  the archive is the site's host, and the balance, which the wallet verifies, is the authority (R4-EXTQ-04). Listed is
+  `dropped` (decisions 40, 55; `qnet.isDropped`): a V2 transaction (its body names `valid_until`), pending or refused,
+  whose last height the tip two pinned nodes report with this account (`qnet.tipSeen`: the highest of the lowest
+  `next_height` of the answers that give the agreed nonce, `agreedAccountOf`, noted only when at least two of those
+  answers name one) is past, its nonce free there, by height alone (`core.expiredAt`: `next_height` - 1 >
+  `valid_until`): no block can take it, so it did not go through. A V1 one is never `dropped`: it has no last height and
+  its signed body stays valid until its nonce is used, so it reads `pending`, `stale` or `refused` while it is listed and
+  only its nonce used decides it. The wallet releases (`qnet.isReleased`) a dropped one, and a V1 one it no longer sends
+  (stale, or refused) whose nonce the last nonce read shows free, past the node's mempool lifetime after it last went out
+  (`max(createdAt, lastSubmitAt)` + 30 min + 5 min, the mobile `mayLandUntil`): it is never sent again, the next transfer
+  takes its nonce by default (as a refused one's, the lowest first), its amount is then no longer kept back from the send
+  form's "available", and `resubmitPending` drops its record a day after `mayLandUntil`. An archive row is
+  `included` (in a block) when at least two pinned nodes list it alike (hash, both parties, amount) in their newest history
+  (`/api/v1/transactions/history`, 100 rows); or, a row past those rows, when the two pinned nodes `qnet.lookupAgreement`
+  asks (`GET /api/v1/transaction/{hash}`, never a `page` of their history, which skips rows) both report it `confirmed`
+  at its block with its identity (`qnet.nodeRowIdentities`: hash, both parties and amount; the hash alone for a call,
+  deploy or registration, and only when the answer's `from` is this wallet, as a lookup is not read under its address):
+  `qnet.lookupRows`, at most `ROW_LOOKUPS` (8) rows a read, newest first, each once per worker once both answered (one
+  fewer answered is asked again by a later read), kept by row identity (`rowLookups`, the newest 256), History waiting
+  for them at most `ROW_LOOKUP_WAIT_MS` (1.5 s), never for a batch row (a lookup names the batch, not this wallet's part);
+  or when its `block` is `TX_INDEX_RETENTION_BLOCKS` (100,000) or more below
+  the head two pinned nodes report (`qnet.historyHeadIndex`: the macroblock of `networkHeadIndex` × 90, the highest read
+  in this worker, dropped with the chain by `forgetChain`; a pinned node keeps at least the newest 100,000 blocks of its
+  transaction index and lists, looks up or proves nothing below them, decision 53); or, a token row, when its block is
+  at or below the logs floor: the highest `oldest_available` a pinned node's
+  `GET /api/v1/account/{a}/token-transfers?limit=1` gave in this worker (`qnet.historyLogsFloor`, read at most once a
+  minute, dropped with the chain), never above `MICROBLOCK_BODY_RETENTION_BLOCKS` (86,400) below the head two pinned nodes
+  report, which stands in while none gave one (a node keeps the logs of its newest 86,400 blocks at least and no token
+  transfer, log or logs proof at or below its floor; decision 54); else `unverified` (a row not asked for yet, a batch
+  row, or not theirs): the archive is the site's host, and the balance, which the wallet
+  verifies, is the authority (R4-EXTQ-04). Listed is
   never "applied" in the worker: a node lists every transfer a block carries, one skipped at apply (a balance too low, a
   nonce already used) too, and its history carries no outcome (R5-EXTQ-01, needs the node). History names the states
   (owner, 28.09; 06.10): `included` Confirmed, `replaced` Failed, `dropped` Not found, `unverified` Unverified (never
-  Pending for ever: an archive row of a chain the nodes no longer serve, or older than what they keep), every other state
+  Pending for ever: an archive row of a chain the nodes no longer serve), every other state
   Pending; a row says its state only while it is not Confirmed, and its detail shows the badge of every state (decision
   42); no text on where the list comes from. Every row opens its detail (decision 40). `refused`: the only node sent it refused it (R5-EXTQ-02). A transfer of this wallet not
   seen applied has `hash: ''` (a node's hash is no identity: every node that took the body stamps its own copy,
@@ -474,7 +499,7 @@ Shared with the future mobile in-app browser: the same page API, methods, result
 | `qnet_activateNode` | `{nodeType: 'light'\|'super'}` | `SiteActivationResult` (below), keys unchanged | `router.isActivationOrigin` only: exactly `https://aiqnet.io`, the dev build also plain-HTTP localhost / 127.0.0.1; any other origin → 4100 before the params are read (PROVIDER_METHODS `origins`), checked again in provider.js. No grant read or created, no `accountsChanged`. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise an `activateNode` approval (cooldown and queue as 4.8), its armed confirm (no password), then `activation.activateForSite`; a light activation is then recorded on QNet Blockchain (section 4.10: queued with the burn's activation, or with the wallet's existing one not recorded yet), so the site reads the chain for "Registered" |
 | `qnet_getActivation` | none | `SiteActivationRead` (below) | Decision 35. `router.isActivationOrigin` only (4100 for any other origin before the params). Read-only and never a window: no approval queue, budget or cooldown, no grant read-or-written besides the check, no `accountsChanged`, nothing signed for the site or burned; a burn the kept search finds is stored as `activation.recover` stores it (a Light activation's record on QNet Blockchain then starts, as after Recover), and the vault's own burn may be recorded on aiqnet.io (`syncRecord`). At most `LIMITS.ACTIVATION_READS_PER_MINUTE` (30) a minute per origin (more: 4001). `{status: 'no_wallet'}` without a vault, `{status: 'locked'}`, `{status: 'not_connected'}` while this origin holds no valid grant of the session's wallet; otherwise `activation.siteActivation`, checked by provider.js before it leaves (the wallet's own addresses, a known status with exactly its keys, a well-formed burn, the code the node's derivation of it; anything else -32603) |
 | `qnet_unlinkNodeDevice` | none | `SiteUnlinkResult` (below) | Decision 38. `router.isActivationOrigin` only (4100 for any other origin before the params). No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise an `unlinkNodeDevice` approval (cooldown and queue as 4.8) showing `nodes.unlinkView`; its armed confirm (no password, like every approval) runs `nodes.unlinkForSite` (section 4.10). The wallet's own light node only; an extension without the method answers 4200 |
-| `qnet_claimNodeBalance` | `{nodeId}`: a light (`light_mobile_` + 16 hex) or super (`super_node_` + 16 hex) node id | `SiteClaimResult` (below) | Decision 47. `router.isActivationOrigin` only (4100 for any other origin before the params); another form of `nodeId`, a genesis node's among them, or none → -32602 before any window. No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `claimNodeBalance` approval (cooldown and queue as 4.8) showing `nodes.claimView` of that node; its armed confirm (no password, like every approval) runs `nodes.claimForSite` (section 4.10). Only this wallet's own light or super node (`core.lightNodeId`, `core.superNodeId` of its address): any other is `WALLET_MISMATCH`, shown in the window and answered as an error, nothing signed. The popup offers no move of its own |
+| `qnet_claimNodeBalance` | `{nodeId}`: a light (`light_mobile_` + 16 hex) or super (`super_node_` + 16 hex) node id | `SiteClaimResult` (below) | Decision 47. `router.isActivationOrigin` only (4100 for any other origin before the params); another form of `nodeId`, a genesis node's among them, or none → -32602 before any window. No grant read or created. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `claimNodeBalance` approval (cooldown and queue as 4.8) showing `nodes.claimView` of that node; its armed confirm (no password, like every approval) runs `nodes.claimForSite` with the balance the window showed and `until` = the approval's `createdAt` + 150 s (section 4.10, decision 54). Only this wallet's own light or super node (`core.lightNodeId`, `core.superNodeId` of its address): any other is `WALLET_MISMATCH`, shown in the window and answered as an error, nothing signed. The popup offers no move of its own |
 | `qnet_sendSolanaTransfer` | `{to: solanaAddress, mint: solanaAddress \| null, amount: string}` | `{status: 'submitted', signature}` or `{status: 'error', error}` (`SiteTransferResult`, below) | Decision 52. `router.isActivationOrigin` only (4100 for any other origin, games.aiqnet.io included, before the params). Params checked by the router before anything else (-32602, no window): `to` `F.solanaAddress`; `mint` null (SOL) or exactly `config.SOLANA.ONE_DEV_MINT` of the build's cluster (1DEV), any other mint -32602; `amount` `F.transferAmount` (`/^(0\|[1-9][0-9]{0,19})(\.[0-9]{0,17}[1-9])?$/`: plain decimal whole tokens, no trailing fraction zero) above zero with at most the token's decimals (`DECIMALS.SOL` 9, `DECIMALS.ONE_DEV` 6: the router's `transferCheck`); no other key. **The probe:** a call without params (absent, `null`, `[]`, `{}`) is -32602 from that check at once: no window, nothing counted toward the budget or the cooldown, no Solana read; an extension without the method answers 4200. provider.js checks the request again, maps `mint` to the send's asset (`'sol'`/`'1dev'`) and refuses the wallet's own Solana address (`INVALID_RECIPIENT`, -32602) before any window while the session knows it, else in the window once unlocked (its Close answers -32602). No grant read or created, no `accountsChanged`. No vault → `{status: 'error', error: 'NO_WALLET'}` at once. Otherwise a `solanaTransfer` approval (cooldown, budget and queue as 4.8) showing `solana.quote` of exactly `{asset, to, amount}`, read-only; its armed confirm (no password) runs `solana.send` with the reviewed `feeLamports` and `rentLamports` |
 
 `SiteActivationResult` (QNet Link v1 sections 7 and 10): `ok` and `exists` `{status, qnet, solana, nodeType,
@@ -507,9 +532,12 @@ that settles as such while this one is answered (`activation.activateForSite` co
 the pending burn's check).
 
 `SiteClaimResult` (QNet Link v1 section 14.10: the `claim` answer of section 14.7 without `v` and `intent`; decision 47): `ok`
-`{status, qnet, nodeId, amountNano, txHash, stoppedAtEpoch}` (`nodeId` the node the site named; `amountNano` decimal nano, at
-least `CLAIM_MIN_NANO`, or above zero for a part of the balance; `txHash` 64 lowercase hex; `stoppedAtEpoch` the epoch the
-node's quote stopped at when the move took part of the balance, decimal, or null);
+`{status, qnet, nodeId, amountNano, txHash, stoppedAtEpoch}` (`nodeId` the node the site named; `amountNano` decimal nano,
+the sum of the parts of the move as submitted, except that a last part the wallet's live figure showed taken in part
+counts its epochs up to the watermark and one it showed expired counts nothing (decision 54), at least `CLAIM_MIN_NANO`, or
+above zero when `stoppedAtEpoch` is set; `txHash` 64 lowercase hex, the last counted part's; `stoppedAtEpoch` null when
+the whole balance moved, at least `CLAIM_MIN_NANO` in all, else decimal, the first epoch that part did not take: a rest
+stays on the node, or the whole balance came to less than 1 QNC);
 `empty` `{status, qnet, nodeId}` (a balance below 1 QNC, or none); `error` `{status: 'error', error}` with one of
 `NO_WALLET, WALLET_MISMATCH, NO_NODE, NETWORK, CLAIM_REFUSED, CLAIM_BUSY, INTERNAL` (`CLAIM_ERRORS`; any other code is
 `INTERNAL`). A reject or a closed window is 4001. Before a result leaves, provider.js checks it once more: this wallet's
@@ -737,8 +765,9 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   approval, takes no password (refused with `INVALID_PARAMS`). A balance below 1 QNC (`empty`) or an `unavailable` view
   (another wallet's node among them) offers one Close that sends `approved: false`: the dApp gets `{status: 'empty', qnet,
   nodeId}` or `{status: 'error', error: reason}` (`SIGNING_DISABLED` as `INTERNAL`), counted like an unavailable activation
-  (the first close counts nothing). The outcome (the amount moved, a part of the balance, or the error) stays until
-  closed, at most 30 s.
+  (the first close counts nothing). While the move runs (its parts, a next one starting only up to 150 s after the
+  request: decision 54) the page says the balance is moving; the outcome (the total the parts moved, that a rest stays
+  when it does, or the error) stays until closed, at most 30 s.
 - `unlinkNodeDevice` (decision 38): the page shows what happens (the node stops running on the device it runs on now; the node
   and its balance stay with the wallet, and it can run on any device later), the wallet's light node id, the device the network
   names (Android, iPhone or iPad, or an unknown device) and the day it was linked; its confirm arms after `CONFIRM_ARM_MS`,
@@ -803,8 +832,10 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   the live QNC nonce up to the nonce floor and may still move above it (the one a replacement signs over left out);
   while a contract call of this wallet above the live QNC nonce is known, what it may move is not known and no token
   balance is decided (`BALANCE_UNCONFIRMED`). Signed by `keys.signQnetTokenTransfer` / `signQnetContractCall` (the core builds the calldata and preimage from
-  the typed fields and self-verifies), checked against the builder's preimage, sent as `core.contractCallRequestJson` to
-  `core.TX_ROUTES.call.path`, and kept as a `PendingTransfer` of kind `call` (section 5) under the transfer rules.
+  the typed fields and self-verifies), in the form a send signs (`validUntil`, the V2 form, when a pinned node's account
+  answer says `tx_v2`, with the one re-sign of `withOneResign`), checked against the builder's preimage, sent as
+  `core.contractCallRequestJson` to `core.TX_ROUTES.call.path`, and kept as a `PendingTransfer` of kind `call` (section 5)
+  under the transfer rules.
 - **One transaction in flight**: the node admits a transaction only at the committed nonce + 1. Every preview says
   `inFlight` when an earlier transaction of the wallet still holds the nonce before its own; a site's approval (all three
   kinds) keeps Confirm off and reads the view again every 4 s until it is in a block, and `sendTransfer` / `sendCall` with
@@ -817,9 +848,10 @@ refused. Wipe deletes the vault (and with it `sitesKey`) and clears `storage.loc
   token balance. A call shows the contract with the unknown-contract warning, the method, the input as hex with its
   size and, when it reads as text, as that text, the gas limit, the maximum fee, and that a call moves no QNC and its
   outcome is not seen.
-- **`qnet_getTransactionStatus`** (`qnet.transactionStatus`, decision 50): `pending` while the account nonce two pinned
-  nodes report live (`qnet.chainNonceNow`, never below a nonce the worker saw) is below it and
-  this wallet still sends a transaction there (pending or superseded; a refused one it no longer sends); `in_block` when
+- **`qnet_getTransactionStatus`** (`qnet.transactionStatus`, decisions 50, 55): `pending` while the account nonce two
+  pinned nodes report live (`qnet.chainNonceNow`, never below a nonce the worker saw) is below it and this wallet keeps
+  there a transaction it sent that may still apply (pending, stale or superseded: a V1 one however long ago; not a
+  refused or a `dropped` one), the answer the sent screen's `qnet.sentStatus` gives a stale one too; `in_block` when
   the nonce is used and two pinned nodes list the same one transaction of `from` at it in their newest 100 sends, with the
   hash they list and the height two nodes report alike (`GET /api/v1/transaction/{hash}`), each null otherwise;
   `unknown` in every other case. In a block is never "applied": the node keeps no outcome (decision 25). The site gets
@@ -894,8 +926,10 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   `GET /api/v1/node/status?node_id=N` (else `NO_NODE`; unknown `NETWORK`), and `GET /api/v1/rewards/pending/{N}` until two
   pinned nodes report the same `pending_rewards_nano` (else `NETWORK`); below `CLAIM_MIN_NANO` it is `empty`. The confirm
   signs the quote (`q1337|claim_rewards:{N}:{W}`) and posts `/api/v1/rewards/claim` with `node_id` N (hedged; a node
-  answering that it cannot serve an
-  epoch, `stopped_reason` without a quote, hands over to the next pinned node, EXT-R1-07); the quote must parse, list
+  answering without a quote that it cannot serve an epoch (`stopped_reason`, EXT-R1-07), that this address spent its
+  claim budget there (`code` `rate_limited` or "Rate limit exceeded": the node's per-address limit counts quotes too) or
+  that it is busy with another request for N (`code` `claim_busy` or "already in progress") hands over to the next pinned
+  node, and the last such answer is the refusal when none quotes); the quote must parse, list
   claims strictly ascending above `last_claimed_epoch` with amounts summing to `amount_nano` (at least `CLAIM_MIN_NANO`
   for a full batch; above zero for a part, since the node caps a quote by size and a balance of many small epochs moves
   whole only in several claims: EXT-R1-03, decision 29),
@@ -911,9 +945,39 @@ phrase (decision 41) and its balance is moved with this extension's approval win
   alike, which can only under-report the claim path (below it: an epoch was skipped, `CLAIM_REFUSED`, EXT-R1-06); none
   answering, or for a full batch no two alike: `NETWORK`.
   Then the payload is signed over `q1337|qnet_claim_v1:{W}:{ts}:{sha3(claims_data)}` and sent back to the node that
-  quoted the signed quote with `claims_data`, `claims_signature` and `claim_timestamp`. "Claim already in progress" is `CLAIM_BUSY`,
+  quoted the signed quote with `claims_data`, `claims_signature` and `claim_timestamp`; a quote that offers a last height
+  (`valid_until`) is signed over `q1337|{NETWORK_ID}|qnet_claim_v2:{W}:{valid_until}:{sha3(claims_data)}` and sent with
+  `valid_until` and no timestamp (its `sign_message_v2`, when sent, must be that text, and `valid_until` a height in
+  1..2^53-1: `CLAIM_REFUSED` otherwise, nothing signed). A typed refusal of the form or the height (`core.EXPIRY_REFUSALS`) is answered by one re-sign: the V1 form for
+  `tx_v2_before_gate`, else the V2 form with a pinned node's fresh `next_height` + 600. "Claim already in progress" is `CLAIM_BUSY`,
   "No claimable rewards" `empty`, "not registered on-chain" `NO_NODE`, any other refusal `CLAIM_REFUSED`. The rewards
   are the wallet's (the node checks that N is registered to W), so N decides only which registration vouches for W.
+  One confirm moves the whole balance the window showed, in parts under the one quote signature (decision 54, as the
+  app's Node tab): a part whose quote stopped at a bound of one request (`stopped_reason` `batch_full`,
+  `quote_byte_budget` or `rebuild_budget`: `core.SIZE_STOPS`, the app's `utils/claimRun.js`) is followed by the next once the wallet's live figure
+  (`qnet.liveAccountFigure`, `lastClaimedEpoch`) is at the part's last epoch (`partSettled`: read 2 s after the submit,
+  each wait then 1.5 times the last, at most 10 s; past the quote's `last_claimed_epoch` only: in part, and a V2 part
+  whose `valid_until` a block past it holds none of: expired, both ending the run). Each next part is quoted, held to a
+  second quote and cross-checked as above from `after`, the last part's last epoch, and only at pinned nodes whose
+  `pending` read shows that part applied (`appliedFirst`: a `first_unclaimed_epoch` past `after`, or none with nothing
+  left, first, then those that answered with none; never one at or below it nor one that did not answer, since every
+  quote spends the address's claim budget at the node it goes to); with fewer than two of them the part waits as when
+  every node is behind. A quote whose `last_claimed_epoch` is below
+  `after`, or a cannot-serve answer whose `stopped_at_epoch` is at or below it, hands over like a node that cannot serve,
+  and a `pending` read whose `first_unclaimed_epoch` is at or below it counts for nothing; when every node is behind, the
+  part is asked for again after 3 s, twice (`core.BEHIND_TRIES`, `BEHIND_WAIT_MS`), with no claim request while the reads
+  show none applied it. A next part starts only while
+  the parts took less than the balance shown (`shownNano`) and before `until` (the approval's `createdAt` + 150 s,
+  provider.js `CLAIM_RUN_MS`), which also ends the wait for a part's watermark; the run ends at a batch with no stop, at
+  "No claimable rewards" after a part, at any other stop, at a part not seen through in whole, at a lock and at a next
+  part that fails (logged; only the first part's error is thrown). The outcome counts every part as submitted, except
+  the last as the live figure showed it: taken in part, its epochs at or below the watermark read, its stop the next
+  epoch it quoted; expired, nothing, and the outcome is the parts before it (an expired first part: `CLAIM_REFUSED`,
+  nothing moved). `amountNano` the total, `txHash` the last counted part's, `stoppedAtEpoch` null when the whole balance
+  moved and the total is at least `CLAIM_MIN_NANO`, else that part's stop; `whole` (for the window only: its line that a
+  rest stays shows only without it) when nothing was left to quote. One move per wallet runs at a time in the worker
+  (`moving`): a second `claimForSite` while one runs, for either of its nodes, is `CLAIM_BUSY` before anything is
+  signed. Without `until` it is one part, as before decision 54.
 - **Unlinking the node's device** (decision 38; light-node-messages.md section 4, the wallet form of the unbind): the wallet
   key ends the node on whatever device runs it, at aiqnet.io's request (`qnet_unlinkNodeDevice`; the popup offers it no
   longer, decision 41). `unlinkView` reads the public status (`UnlinkView`, section 2.5).
@@ -1179,6 +1243,7 @@ phrase (decision 41) and its balance is moved with this extension's approval win
 | `chrome.storage.session` | `qnet_clipboard_v1` | `{until}`: when the clipboard is due to be emptied of a secret a page copied (section 8), never the text | clipboard.js | trusted contexts only; removed when the clear runs or a later copy drops it |
 | `chrome.storage.local` | `qnet_sites_v3` | grants with MAC | provider.js | untrusted until the MAC verifies |
 | `chrome.storage.local` | `qnet_settings_v3` | `{language}`, a UI preference (`SUPPORTED_LANGUAGES`) | session.js | untrusted, allow-list validated; the worst a writer can do is change the UI language |
+| `chrome.storage.local` | `qnet_solana_route_v1` | `{v: 1, via: 'direct'\|'site', probeAt}`: whether the Solana calls go to `SOLANA.RPC_URLS` or through aiqnet.io's relay, and when the endpoint was last tried (ms; 0 on the direct route) (decision 56) | solana.js | untrusted, read by `core.solanaRouteOf` (anything else is the direct route); decides no security: a writer can only send the calls the other way, and both ways carry the wallet's own calls only; read once per worker, written when it changes; an erase clears it, and a Solana call still running may write it again after |
 | IndexedDB `QNetWallet` / `vault` | `main` | what the store's 2.1.x pages kept: the recovery phrase and two keys, each sealed under its password (section 5, Earlier version) | never written by this version; never created (a read opens it only when `indexedDB.databases()` lists it, and aborts an upgrade from version 0) | read only by `vault.status` (`earlier`) and `vault.migrate`; deleted with the earlier keys (after a migration read its vault back, by `vault.removeEarlier`, with the first vault when it holds no phrase and no readable record is there, and by Delete wallet and a reset only then) |
 | `chrome.storage.local` | `earlier.EARLIER_KEYS` (`encryptedWallet`, `walletExists`, `walletData`, `encryptedActivationCodes`, `wallet`, `isUnlocked`, `lastUnlockTime`, `currentNetwork`, `mainnet`, `auto_lock_timer`, `connected_sites`) | what the store's 2.1.x left: its encrypted wallet and the keys beside it (section 5, Earlier version) | never written by this version | read only by `vault.migrate` (a record that does not open moves nothing); removed after a migration read its vault back, by `vault.removeEarlier`, or with the first vault, Delete wallet or a reset when no wallet that opens is there |
 
@@ -1232,8 +1297,8 @@ token only when Reset wallet is pressed and spends it at once, so no keepalive h
 Signatures in short; the JSDoc in each file is the full contract (params, returns, throws).
 
 **config.js** (frozen constants): `DEV_BUILD, WALLET_VERSION, RELEASE_CHANNEL, QNET {CHAIN_ID, NETWORK,
-NODES, EXPLORER_API, EXPLORER_TX_PATH}, SOLANA {CLUSTER, RPC_URLS, ONE_DEV_MINT, MEMO_V1_PROGRAM,
-NODE_TYPE_MEMO, FEE_BUFFER_LAMPORTS, EXPLORER_TX_URL, EXPLORER_CLUSTER_QUERY, TRANSACTION_MAX_BYTES}, PAYMENT_REQUEST
+NODES, EXPLORER_API, EXPLORER_TX_PATH}, SITE_HEADERS, SOLANA {CLUSTER, RPC_URLS, ONE_DEV_MINT, MEMO_V1_PROGRAM,
+NODE_TYPE_MEMO, FEE_BUFFER_LAMPORTS, EXPLORER_TX_URL, EXPLORER_CLUSTER_QUERY, TRANSACTION_MAX_BYTES, RELAY_PATH}, PAYMENT_REQUEST
 {REFERENCES_MAX, MEMO_MAX_BYTES}, DECIMALS, UI_PAGES, PROVIDER, VIEW_EVENT_CHANNEL, VIEW_EVENTS, STORAGE_KEYS, VAULT_DB,
 AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, RTL_LANGUAGES, LIMITS, TIMINGS,
 AUTO_LOCK_ALARM, REGISTRATION_ALARM, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, CLIPBOARD_ALARM, CLAIM_MIN_NANO, POPUP_TABS, OFFSCREEN {PAGE,
@@ -1254,7 +1319,9 @@ s), `WALLET_SEARCH_FRESH_MS` (60 s), `ACTIVATE_RECHECK_MS` (5 s).
 `APPROVAL_COOLDOWN_LONG_MS`, `APPROVAL_COOLDOWN_WINDOW_MS`, `APPROVAL_BUDGET_SHORT_MS`, `CONFIRM_ARM_VALUE_MS`,
 `RESET_TOKEN_TTL_MS`, `CLIPBOARD_CLEAR_MS`, `PHRASE_CLIPBOARD_CLEAR_MS` (section 8),
 `POPUP_REFRESH_MS`, `ACTIVITY_TOUCH_MS`, `DRAFT_REMEMBER_MS` (section 9, Pages); `STORAGE_KEYS` includes `CLIPBOARD`
-(decision 51).
+(decision 51). Decision 56: `SOLANA.RELAY_PATH` (`'/api/cabinet/solana'`, aiqnet.io's relay of the wallet's Solana calls
+under `QNET.EXPLORER_API`), `STORAGE_KEYS.SOLANA_ROUTE` (`'qnet_solana_route_v1'`, the app's key too) and `SITE_HEADERS`
+(`{'x-qnet-client': 'QNetWallet-Extension/' + WALLET_VERSION}`, on every request to aiqnet.io: `qnet.js` and the relay).
 
 **errors.js**: `ERROR_MESSAGES`, `PROVIDER_ERROR_CODES`, `class WalletError(code, {retryAfterMs?, field?})`,
 `class ProviderError(code)`, `toUiError(error) → {code, message, …}`, `toProviderError(error) → {code,
@@ -1329,24 +1396,29 @@ alarm listener). It holds only the due time and writes the clipboard only throug
 (`OFFSCREEN.PAGE`, `chrome.offscreen`, one at a time). `ui/offscreen.js` answers only the worker's
 `{target: OFFSCREEN.TARGET, type: 'clear'}` with `{cleared}`.
 
-**platform.js** (area A, decision 51): the chrome.* calls session.js and clipboard.js share: `chromeApi()` (the global as
-it is now), `attempt(fn) → Promise` (a call that may throw or reject), `armAlarm(name, when|null)` (a one-shot alarm, or
-its clear) and `ALARM_EARLY_MS` (1 s: an alarm that fires this close to its time has reached it).
+**platform.js** (area A, decision 51): the chrome.* calls session.js, clipboard.js and solana.js share: `chromeApi()` (the
+global as it is now), `attempt(fn) → Promise` (a call that may throw or reject), `armAlarm(name, when|null)` (a one-shot
+alarm, or its clear) and `ALARM_EARLY_MS` (1 s: an alarm that fires this close to its time has reached it); and
+`sleep(ms)`, the worker's one wait, which solana.js and nodes.js use.
 
 **keys.js** (area A): `startKeys() → Promise<boolean>` (worker start: a cached self-test pass for this
 bundle, else `core.selfTest()` and cache the pass; section 6), `initKeys() → boolean` (synchronous gate:
 runs `core.selfTest()` if nothing decided yet; failure disables signing), `signingEnabled()`,
 `deriveAddresses(entropy) → {qnetAddress, solanaAddress}`, handler `exportPrivateKey({password, network}) →
 {network, address, privateKey}` (`vault.exportKey`, decision 40),
-`signQnetTransfer(fields) → {preimage, signature, publicKey}`, `signQnetTokenTransfer({from, token, to, amount, nonce})`
-and `signQnetContractCall({from, contract, method, args, nonce, gasLimit})` → `{tx, preimage, signature, publicKey}`
-(`core.signTokenTransfer` / `core.signContractCall`), `signOffchain(origin, message) →
+`signQnetTransfer({from, to, amountNano, nonce, gasPrice, gasLimit, validUntil?}) → {preimage, signature, publicKey}`,
+`signQnetTokenTransfer({from, token, to, amount, nonce, validUntil?})`
+and `signQnetContractCall({from, contract, method, args, nonce, gasLimit, validUntil?})` → `{tx, preimage, signature, publicKey}`
+(`core.signTokenTransfer` / `core.signContractCall`; `validUntil`, u64 digits, signs the V2 form under the build's
+`NETWORK_ID` through `core.expiryAt`, the one expiry every signer and the worker build, a height outside 1..2^53-1 is
+`INVALID_EXPIRY`, null or absent the V1 form), `signOffchain(origin, message) →
 {signature, publicKey, address}`, `signSolanaMessage(messageBytes) → {signature, publicKey}`,
 `getQnetPublicKey() → Uint8Array(1952)`; the light node (section 4.10): `signNodeRegistration({nodeId, wallet, burnTx, burner,
 timestamp}) → {proof, consentSignature, ownerSignature, publicKey}` (`burnTx` and `burner` must be those of the vault's
 light activation, burned from the wallet's Solana address, whose key signs the owner bind), `signNodeClaim({nodeId,
 wallet}) → {signature, publicKey}` (`nodeId` the wallet's light or super node id, decision 47), `signClaimPayload({wallet,
-timestamp, claimsData}) → {signature, publicKey}`,
+timestamp, claimsData, validUntil?}) → {signature, publicKey}` (with `validUntil` the V2 form over that last height, no
+timestamp, a height outside 1..2^53-1 `INVALID_EXPIRY`),
 `signNodeStatus({nodeId, wallet, timestamp}) → {signature, publicKey}` (the signed status request of the wallet's own
 light node), `signNodeUnbind({nodeId, wallet, seq, timestamp}) → {signature, publicKey}` (the wallet key's unbind of its own
 node's device binding `seq`, decision 38: `core.signNodeUnbind` over `q1337|light_unbind_wallet:{N}:{seq}:{timestamp}`); decision 35: pure `burnRecordMessage({wallet, nodeType, burner, burnTx, burnAmount})` and `signBurnRecord(same) →
@@ -1365,12 +1437,14 @@ self-verifies) and zeroize.
 wait, by `Retry-After` or the typed body's `retry_after_seconds`, puts that node last in proof reads until then),
 `siteRequest(method, path, body?)
 → {status, body}` (decision 35: `QNET.EXPLORER_API` under `RECORD_PATH` only, one host, no hedging, `credentials: 'omit'`,
-JSON, `TIMINGS.RECORD_TIMEOUT_MS`; no answer is `RECORD_UNAVAILABLE`; the archive's `/api/address/` reads stay apart),
+JSON, `TIMINGS.RECORD_TIMEOUT_MS`; no answer is `RECORD_UNAVAILABLE`; the archive's `/api/address/` reads stay apart; both,
+and no node request, carry `x-qnet-client: QNetWallet-Extension/{WALLET_VERSION}`, `config.SITE_HEADERS`),
 handlers `getBalance()`, `getHistory(p)`, `preview(p)`, `send(p)`, `sentStatus({nonce})` (`qnet.sentStatus`, decision 50);
-`liveAccountFigure(address) → {balanceNano, nonce, blockHeight}|null` (decision 50: the account at a pinned node's live
-tip, the proof route without `mb` folded to that node's root; never verified, never kept as certified, no node marked
-old for its body; an account two pinned nodes hold none of is `'0'` with `blockHeight` null, the wallet's own only while
-its nonce floor knows no nonce above 0 taken); `backgroundReads()`
+`liveAccountFigure(address) → {balanceNano, nonce, blockHeight, lastClaimedEpoch}|null` (decision 50: the account at a
+pinned node's live tip, the proof route without `mb` folded to that node's root; `lastClaimedEpoch` its leaf's claim
+watermark, u64 decimal, which a move of a node balance follows, decision 54; never verified, never kept as certified, no
+node marked old for its body; an account two pinned nodes hold none of is `'0'` with `blockHeight` and `lastClaimedEpoch`
+null, the wallet's own only while its nonce floor knows no nonce above 0 taken); `backgroundReads()`
 (exported for tests: resolves once what the module left running, a certified check beside a live figure, a walk past its
 budget, a run of `resubmitPending`, has ended); internal `resolveNonce(address) → {nextNonce, pkBound}` (the send rule's for the session's address,
 the live nonce + 1 for another, never a default; `pkBound` two pinned nodes' word),
@@ -1378,7 +1452,15 @@ the live nonce + 1 for another, never a default; `pkBound` two pinned nodes' wor
 `sendTransfer({to, amountNano, expectedFeeNano, expectedNonce?, replaceNonce?}) → {txHash, status, nonce, from}` (stores the
 PendingTransfer before the first POST and its recipient in `VaultState.recipients`; reports submitted, never
 confirmed; a refusal from the only node sent it keeps the transfer as `refused` and is `NODE_REJECTED`, "it may still
-apply", and a transfer without `replaceNonce` takes the nonce of a refused one: R5-EXTQ-02),
+apply", and a transfer without `replaceNonce` takes the nonce of a refused one, or of a released one
+(`qnet.isReleased`, section 2.5); signs the V2 form with
+`validUntil` = `next_height` + `core.TX_V2_LIFETIME_BLOCKS` (600) when a pinned node's account answer, read beside the
+snapshot and waited for at most `FORM_READ_MS` (2 s), says `tx_v2`, else the V1 form; a typed refusal of the form or the
+height, `core.expiryRefusalOf`, counts as definitive however many nodes were sent the body and is answered by one
+re-sign at the same nonce in the refused one's place, `withOneResign`), `resignUntil(address, code) → {validUntil}|null`
+(the one re-sign a typed refusal asks for, sends and claims alike: `{validUntil: null}` the V1 form for
+`tx_v2_before_gate`, else the V2 form with a pinned node's fresh `next_height` + 600; null for any other code or no
+`next_height`),
 `resubmitPending() → {resubmitted, confirmed, replaced, passed}` (decided by the account nonce two pinned nodes report
 live, `chainNonceNow`, read with the rows before the send queue is entered; a verdict needs the same row at
 (from, nonce) from two pinned nodes, R3-EXTQ-04, and no node listing two transactions at that nonce, since the
@@ -1391,7 +1473,7 @@ decimals}|{kind: 'contract'}|{kind: 'none'}`, `assertPayableRecipient(to, from?)
 oneInFlight?}) → {txHash, status, nonce, from}` (shares `storeAndSubmit` with `sendTransfer`, whose `oneInFlight` is the
 same rule), `transactionStatus({from, nonce}) → {status, from, nonce, txHash, blockHeight}` (the live nonce, decision
 50); `transferBody` is
-`core.transferRequestJson`; `readAccount(address, {display?}) → {balanceNano, nonce, verified, verification, blockHeight,
+`core.transferRequestJson` (with `valid_until` for the V2 form); `readAccount(address, {display?}) → {balanceNano, nonce, verified, verification, blockHeight,
 index}` (decision 44: the certified account proof; `display`: the popup's certified read waits for the committee check
 at most 1.5 s once a figure is read, then gives it as not verified while the walk goes on), pure `certifiedIndexStands(index,
 head)` (R2-EXTQ-01); the wallet's tokens and the popup's token send (decision 40): `listTokens() →
@@ -1412,7 +1494,9 @@ Mobile references: `WalletManager.liveQncFigure`, `getQNCBalanceWithProof`, `get
 `checkedTokenBalance`, `services/PendingTx.spendableFrom`, `resolveSubmitByNonce`, `resolveNonce`, `sendQNC`, `_hedged`;
 history like `WalletScreen` (`EXPLORER_API/api/address/{a}/history`).
 
-**solana.js** (area B): `rpc(method, params, {timeoutMs?})`, handlers `getBalances()`, `getHistory({cursor?, limit?})`
+**solana.js** (area B): `rpc(method, params, {timeoutMs?, attempts?, backoffMs?, retryRpcErrors?})` (each attempt to the
+build's endpoint or to aiqnet.io's relay, as `core.solanaAttemptAfter` says: decision 56; a refusal after an attempt with
+no usable answer carries `afterUnanswered`), handlers `getBalances()`, `getHistory({cursor?, limit?})`
 (`solana.history`, decision 39) with its pure row reader `historyItem(signature, tx, owner, ata, blockTime?)`, `quote(p)`,
 `send(p)`, `maxAmount(p)` (`solana.max`), `transferStatus(p)` (`solana.status`); the send's message
 `transferMessage({owner, to, mint?, amountRaw, decimals, createAccount?, references?, memo?, recentBlockhash})` (SOL: one
@@ -1478,9 +1562,9 @@ R4-ESA-01, R5-ESA-01; the valid burns are looked at before a search that is inco
 QNet Blockchain vouches that the wallet has no node (`refuseExistingNodes`, fail closed, EXT-R1-01: the searches of the
 phrase's addresses are no complete evidence, since a light burn aiqnet.io's one-time payment key made for the wallet
 leaves no trace there): `GET /api/v1/verify-activation` with header `x-qnet-wallet` for the wallet's QNet address, two
-pinned nodes first and then one more at a time (`verified: true` → `NODE_EXISTS`; one
-authoritative "no" goes on; a non-authoritative "no" is no proof, and no authoritative answer from any node is
-`NETWORK`), then `nodes.lightNodeKnown(lightNodeId(W))`: every pinned node's public status at once, any one listing
+pinned nodes first and then one more at a time (`verified: true` → `NODE_EXISTS`; two
+authoritative "no" answers go on; one node's word or a non-authoritative "no" is no proof, and fewer than two
+authoritative answers from all the nodes is `NETWORK`), then `nodes.lightNodeKnown(lightNodeId(W))`: every pinned node's public status at once, any one listing
 the light node or holding its registration (`onchain_registered`, `registration_pending`) → `NODE_EXISTS`, fewer than
 two answers → `NETWORK` (aiqnet.io's record is asked first, decision 35: `ACTIVATION_RECORDED`, `ACTIVATION_RESERVED`,
 `RECORD_UNAVAILABLE`) → re-fetch price (every pinned node that answers, at least two, quoting alike: decision 48; phase 1,
@@ -1528,8 +1612,10 @@ registration → true, at least two answering and none → false); `registeredBu
 string|null` (the burn the registration record names, two pinned nodes alike; throws `LOCKED`, `SIGNING_DISABLED`);
 `resumeRegistration({recheck?})` (never throws), handlers `requestRecord()` (`activation.register`), `getRegistration()` (`activation.registration`); listener
 `onAlarm(alarm)`; for the provider (decision 47) pure `ownNodeType(nodeId, wallet) → 'light'|'super'|null`,
-`claimView(nodeId) → {mode, reason, nodeId, nodeType, amountNano}` and `claimForSite(nodeId) →
-{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}|{status: 'empty', qnet, nodeId}` (throws
+`claimView(nodeId) → {mode, reason, nodeId, nodeType, amountNano}` and `claimForSite(nodeId, {shownNano?, until?}) →
+{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch, whole}|{status: 'empty', qnet, nodeId}` (decision 54: the
+parts of the move up to `shownNano`, a next one only before `until`, ms; without `until` one part; one run per wallet at a
+time; `whole` for the window only; throws the first part's
 `WALLET_MISMATCH`, `NO_NODE`, `NETWORK`, `CLAIM_REFUSED`, `CLAIM_BUSY`, `LOCKED`, `SIGNING_DISABLED`); for the provider
 and the popup (decision 38)
 `unlinkView() → UnlinkView` (`node.unlinkView`; throws `LOCKED`) and `unlinkForSite() → {status: 'ok', qnet, nodeId,
@@ -1666,11 +1752,13 @@ only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIP
 - `qnet` → `session` (and its `forgetViews`, decision 40), `vault.readState`/`updateState`/`withRecipient` (pending
   transfers, recipients), `vault.readLightAnchors`/`writeLightAnchors`, `vault.readCapsule`/`writeCapsule`, `vault.readChainCache`/`updateChainCache`, `keys.signQnetTransfer`, `keys.signQnetTokenTransfer`,
   `keys.signQnetContractCall`, `keys.getQnetPublicKey`, core light client and transaction builders.
-- `solana` → `session` (and its `cachedViews`, decision 39), `keys.signSolanaMessage`, core.
+- `solana` → `session` (and its `cachedViews`, decision 39), `keys.signSolanaMessage`, `chrome.storage.local` (its route,
+  decision 56), core.
 - `activation` → `session`, `vault` (state), `solana`, `qnet.nodeRequest`, `qnet.siteRequest`, `keys.signingEnabled`,
   `keys.signBurnRecord`, `nodes.registrationFor` / `publicRegistration` (pure), core.
 - `nodes` → `session`, `vault` (readState, updateState), `keys.signNodeRegistration`, `keys.signNodeClaim`,
   `keys.signClaimPayload`, `keys.signNodeStatus`, `keys.signNodeUnbind`, `keys.signingEnabled`, `qnet.nodeRequest` / `parseJsonLossless`,
+  `qnet.liveAccountFigure` (a part's watermark), `qnet.resignUntil` (a claim's one re-sign), `platform.sleep`,
   `chrome.alarms` (its own alarm), core. It never imports activation.js (activation.js starts it through
   `setRegistrationHook`, and Recover calls `nodes.registeredBurn`).
 - `provider` → `session`, `vault.readSiteBinding`, `vault.rotateSitesKey`, `vault.vaultExists`, `keys.signOffchain`,
@@ -1683,7 +1771,7 @@ only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIP
 - sw.js → `activation.setRegistrationHook(nodes.resumeRegistration)`, `nodes.resumeRegistration` and `activation.syncRecord`
   after every unlock, `nodes.onAlarm` and `clipboard.onAlarm` from its one alarm listener, `createRouter({tabs: chrome.tabs})`.
 - Network: only `qnet.nodeRequest` (QNET.NODES and EXPLORER_API), `qnet.siteRequest` (EXPLORER_API under `RECORD_PATH`) and
-  `solana.rpc` (SOLANA.RPC_URLS);
+  `solana.rpc` (SOLANA.RPC_URLS, and QNET.EXPLORER_API + SOLANA.RELAY_PATH when the endpoint gave no answer, decision 56);
   HTTPS only; no other host, no third-party QR, price or RPC service.
 
 ## 11. Tests each area adds (`test/<area>.test.mjs`, offline, `npm test`)
@@ -1709,8 +1797,9 @@ only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIP
   aborts its transaction, an aborted first upgrade leaves no database); WebCrypto is Node's.
 - B: burn transaction bytes (instruction data, account order, memo signer); matcher on poisoned
   histories (foreign memo mentions, wrong mint, non-signer, fractional amounts, more than 1000
-  signatures, several burns → oldest); price refusal (phase 2, non-integer, changed); fee/nonce change
-  refusals; pending transfer resent byte for byte; `'confirmed'` burn scan, `lastValidBlockHeight` expiry and
+  signatures, several burns → oldest); price refusal (phase 2, non-integer, changed); a burn only after two
+  authoritative "no" answers of verify-activation, one node's word `NETWORK` with nothing reserved, signed or burned;
+  fee/nonce change refusals; pending transfer resent byte for byte; `'confirmed'` burn scan, `lastValidBlockHeight` expiry and
   oldest-burn settle (`chains-activation-activation`); 1DEV only to a system-owned on-curve owner
   (`chains-activation-solana`); recipient check and anchors walk (`chains-activation-qnet`); fixtures in
   `test/fixtures/`.
@@ -1725,6 +1814,19 @@ only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIP
   `BLOCKHASH_EXPIRED`, the single status read and `transferStatus` with its expiry (`chains-activation-solana`); the
   popup's burn, code and record without a password (`chains-activation-activation`, `nodes-registration`,
   `integration`, `router`).
+- B, Solana through aiqnet.io's relay (decision 56): a direct attempt nobody answered sends the same body to the relay at
+  once with `x-qnet-client`, and the route is kept and taken by a restarted worker (a malformed one is the direct route);
+  a 429, a 5xx, an unreadable body and a retryable code back off on the endpoint and never reach the relay; an answer of
+  the endpoint that comes later brings the calls back; a relay with no usable answer (404, 503, 429, an unreadable body,
+  none at all) hands the same call to the endpoint at once and its answer brings the calls back, while neither way
+  answering keeps the relay route dated by the endpoint's try; the probe once 300 s passed, its time kept before it goes
+  out, one at a time, a number bringing the calls back and anything else keeping the relay (`chains-solana-relay`); a send
+  quoted, simulated and sent through the relay, a refusal there keeping its JSON-RPC code, a send whose answer was lost
+  sent again through it, and one the relay gave no usable answer to sent on to the endpoint, the same bytes
+  (`chains-activation-solana`); every send and burn of the relay vectors
+  (`docs/protocols/solana-relay.vectors.json`, which the site's test reads too) built byte for byte
+  (`chains-activation-solana`); the burn announced on aiqnet.io, then sent through the relay
+  (`chains-activation-activation`); the erase while a call writes the route (`vault-session-vault`).
 - C: no grant → 4100; queue cap → 4001; revoke emits `accountsChanged {}` and `disconnect`; forged or
   foreign-wallet grant ignored; closed window → 4001; relay/provider behaviour with a DOM-less window
   mock (same-window/same-origin filter, duplicate id dropped, 4900 on disconnect); the approval cooldown,
@@ -1865,8 +1967,9 @@ only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIP
   end to end (`integration`).
 - Decision 40 (the sandbox round): a silent node does not hold the account read, the popup's read waits at most 1.5 s for a
   proof's check, the chain check (a head far below the one seen drops the anchors, pending sends and cached QNet views; an
-  anchor above the head goes; the light client's lineage reset drops the vault's copy of the kept anchors), the dropped transaction
-  (status, default replace, freed amount, the day's expiry), token rows with their block and hash-based inclusion,
+  anchor above the head goes; the light client's lineage reset drops the vault's copy of the kept anchors), the released
+  V1 transaction (History `stale` or `refused`, `pending` to the sent screen and a site, default replace, freed amount, the
+  day's expiry: decision 55), token rows with their block and hash-based inclusion,
   `listTokens` (two nodes' lists together, each token named by two nodes, each balance certified since decision 44), `tokenPreview` / `tokenSend`
   through `prepareCall` / `sendCall`, `txLookup` (`chains-activation-qnet`); the chain cache's MAC, a planted or old-password
   cache read as none, the balances kept across sessions and never an unverified one (`vault-session-vault`); the export of
@@ -1941,6 +2044,40 @@ only by its Copy button, with its warning and a clear after `TIMINGS.PHRASE_CLIP
   scripted Solana seeing exactly one TransferChecked after the idempotent account create, then one System Transfer
   (`integration`); one amount format in every language and the amount field's one paste rule (`core`, `ui-common`,
   `ui-history`, `ui-popup`, `provider-approve-page`).
+
+- Decision 54 (01.11): the rows past the newest 100 two pinned nodes list looked up by hash, 8 a read, newest first, once
+  each once two answered, in a block only at the row's block with its identity (another amount on one node, another
+  block, another sender of a deploy: unverified), a row fewer than two answered asked again, a batch row never, no page
+  of a node's history, the lookups dropped with the chain; a token row at or below the logs floor a node reported in a
+  block with no proof asked, 86,400
+  below the head standing in and clamping a higher floor, nothing judged without a head, a row its proof contradicted
+  staying unverified once past the floor; the live figure's claim watermark (`chains-activation-qnet`); the move in parts
+  under one quote signature, each part quoted from the last one's epoch once the live figure shows it, a node behind
+  passed over, the total, the last hash and null, no next part once the parts reach the balance shown, the run ended by
+  another stop, a lock, a refused next part, the time before the next part or during its wait, a whole total below 1 QNC
+  answered with the last part's stop, every node behind asked again 3 s apart twice with no claim request while their
+  pending heads show the part not applied, a next part quoted only at nodes whose head shows it applied, a node that
+  spent the address's claim budget or is busy handing the quote over, a last part seen taken in part counted up to the
+  watermark and one seen expired not at all, one move per wallet at a time (`nodes-registration`); the confirm passing
+  the window's balance and `createdAt` + 150 s and answering the total, the window's rest line only when a rest stays
+  (`provider-node-claim`); the logs floor dropped with the chain (`chains-activation-qnet`).
+
+- The V2 form (a signed last height): the shared builders' signed text of a transfer, contract call, deploy and claim
+  and the node's lifetimes and refusal codes held to `docs/protocols/tx-v2.vectors.json`, the bundle's signers signing
+  the V2 text under the build's `NETWORK_ID` and never a malformed last height, every signer refusing one
+  `INVALID_EXPIRY` through `core.expiryAt` (`tx-v2-vectors`); the bundle's V2 exports (`core`); a send, and a site's
+  token transfer and contract call (`sendCall`), in the V2 form at `next_height` + 600 when the account answers say
+  `tx_v2` and in the V1 form when they name no form, one re-sign at the same nonce in the V1 form for `tx_v2_before_gate`
+  and in the V2 form for `tx_expiry_required`, `tx_expired` and `tx_expiry_beyond_horizon`, a second refusal
+  `NODE_REJECTED` with both kept `refused`, any other refusal never re-signed; a V2 transaction at its last height still
+  `pending`, one past it with its nonce free `dropped` in `qnet.sentStatus` and History, never posted again, `unknown`
+  to `qnet_getTransactionStatus` and its nonce taken by the next send, one node alone naming a height past it dropping
+  nothing, a V1 one dropped by no height and no clock: past the node's mempool lifetime `pending` to
+  `qnet_getTransactionStatus` and `qnet.sentStatus` alike and `stale` in History; `x-qnet-client` on every request to aiqnet.io
+  and on none to a pinned node (`chains-activation-qnet`); the sent screen's Expired title and dropped notice at
+  `dropped`, with no further question (`ui-popup`); a claim quote with `valid_until` signed and posted in the V2
+  form with no timestamp, another `sign_message_v2` or a malformed last height `CLAIM_REFUSED` before anything is signed,
+  the claim's one re-sign and a second refusal its answer (`nodes-registration`).
 
 ## 12. Decisions to confirm with the owner
 
@@ -2047,7 +2184,7 @@ These follow the audits where the spec text was silent or looser; each is small 
     `qnet_sendTransaction` and follow them with `qnet_getTransactionStatus` (section 4.9); a call carries no QNC value and
     no access list, which the network does not accept today (`UNSUPPORTED_PARAM`, the one error with data); status is
     `pending`, `in_block` or `unknown`, never a success, since the node keeps no outcome; a site's transaction waits in
-    its window while an earlier one holds the nonce (the node admits committed + 1 only); `https://games.aiqnet.io/*`
+    its window while an earlier one holds the nonce (it is signed at committed + 1 only); `https://games.aiqnet.io/*`
     joins the content-script matches (connect and send only, no activation). A token's name, symbol and decimals are two
     pinned nodes' word; its balances are certified since decision 44 (the token proof and its verifier, the shared one the
     bundle compiles). XP-R5-03: the
@@ -2301,7 +2438,8 @@ These follow the audits where the spec text was silent or looser; each is small 
     changed: `config.js` (`STORAGE_KEYS.VIEW_CACHE`, `LIMITS.SOLANA_HISTORY_PAGE_MAX`), `router.js` (`wallet.cached`,
     `solana.history`, the view cache's keeping of `qnet.balance`, `qnet.history`, `solana.balances`, `solana.history`),
     `test/router.test.mjs`, `test/skeleton.test.mjs`.
-40. Owner command of 2026-10-06 (the sandbox round of the extension). (a) Balances load fast: the account is read from two
+40. (Its (c) Not found for a V1 transaction superseded by decision 55.) Owner command of 2026-10-06 (the sandbox round
+    of the extension). (a) Balances load fast: the account is read from two
     nodes at once with the next one joining on a failure and every 700 ms of silence (the first two alike decide; two that
     differ bring in every node, as before), the network head is decided 700 ms after its second answer, and the popup's
     balance read (`readAccount(address, {display: true})`) waits for the proof's QC check at most 1.5 s once two nodes agree
@@ -2649,6 +2787,75 @@ These follow the audits where the spec text was silent or looser; each is small 
     Frozen files changed: `router.js` (`PROVIDER_METHODS.qnet_sendSolanaTransfer`, `F.transferAmount`, `transferCheck`,
     the `SOLANA` import), `errors.js` (`INVALID_RECIPIENT`, a -32602 input code), the bundle (`amountText` without a
     language, `amountInput` without `lang`), `test/router.test.mjs`.
+
+53. Owner command of 2026-11-01 (no Unverified on a row in a block). A pinned node keeps at least the newest
+    `TX_INDEX_RETENTION_BLOCKS` (100,000, the node's constant of that name) blocks of its transaction index and lists,
+    looks up or proves no transaction below them, so the archive's row of an older block is the chain's only record of
+    it: an archive row, a token row too, whose `block` is 100,000 or more below the head two pinned nodes report is
+    `included` at once, on every page (`qnet.historyOf`), unless its logs proof contradicted it. The head is
+    `networkHeadIndex`'s, read beside the archive page and taken as it is for a minute, and History keeps the highest it
+    read in the worker (`qnet.historyHeadIndex`), so a read no two nodes answer, or nodes behind, never moves the window
+    back; `forgetChain` drops it with the chain. Inside the window the nodes' listing decides as before.
+    `historyUnverifiedLead` no longer says the row may be older than what the nodes keep, in every language. The mobile
+    app takes the same window by the height of its newest figure (`utils/txHistory.js` `TX_INDEX_RETENTION_BLOCKS`);
+    `docs/tools/docs-claims.test.mjs` pins both to the node.
+54. Owner command of 2026-11-01 (History follow-ups; Move to wallet moves the whole balance shown with one approval).
+    (a) **Rows past the listing.** An archive row inside the nodes' index but past the newest 100 rows two pinned nodes
+    list is looked up by its hash on two pinned nodes (`qnet.lookupRows` through `qnet.lookupAgreement`, the one lookup
+    `qnet.txLookup` and `transactionStatus` use too), at most 8 a read, newest first, each once per worker once both
+    answered, and is `included` when both report it with its identity at its block; the node's `page` parameter is never
+    used (it skips rows). (b) **Logs window.** A pinned node keeps token transfers, their logs and their proofs only
+    above its log floor (the `oldest_available` of its token-transfer answer; the node's
+    `MICROBLOCK_BODY_RETENTION_BLOCKS`, 6 × 14,400): a token row at or below the highest floor a node reported, never
+    above 86,400 below the head, which stands in without one, is `included`, and no proof is asked for it. A contradicted
+    token row's verdict is kept by the worker while it runs (`rowVerdicts`, in memory), as decision 48 has it. (c) **The
+    move in parts.** `qnet_claimNodeBalance`'s confirm runs `nodes.claimForSite(nodeId, {shownNano, until})`: one quote
+    signature, the parts of the move as the app's Node tab moves them (section 4.10), a next part only before `until` =
+    the approval's `createdAt` + 150 s (`CLAIM_RUN_MS`): the site waits 5 minutes from its call, the review included, so
+    the answer reaches it inside that. The answer keeps its keys: `amountNano`
+    the total, `txHash` the last part's, `stoppedAtEpoch` null when the whole balance moved (at least 1 QNC in all), else
+    the first epoch the last part did not take; an older site reads it as one claim's, truthfully. A last part the live
+    figure shows taken in part counts its share, one it shows expired nothing. A next part is quoted only at nodes whose
+    pending head shows the part before applied, a node that spent the address's claim budget (the node's limit per
+    address counts quotes too) or is busy hands a quote over, and one move per wallet runs at a time (`CLAIM_BUSY`). The
+    live figure carries the leaf's claim watermark (`lastClaimedEpoch`) for it. The stops that let a next part go and the
+    waits behind a part are the app's (`utils/claimRun.js`, compiled into the bundle: `core.SIZE_STOPS`, `BEHIND_TRIES`,
+    `BEHIND_WAIT_MS`). No frozen file, error code, stored field or version changed.
+55. Owner rule of 2026-10-12 for the wallets (a transaction fails only by the chain: in a block, its nonce taken by
+    another transaction, or its signed last height passed; never by a clock), applied to decision 40 (c).
+    `qnet.isDropped` is the V2 rule alone, by height: a V1 transaction (no `valid_until`) is never `dropped`, since its
+    signed body stays valid until its nonce is used. What the wallet does once a V1 one it no longer sends (stale, or
+    refused) can be held by no node (`mayLandUntil` passed) is `qnet.isReleased`, which a dropped one meets too: it is
+    never sent again, the next transfer takes its nonce by default and its amount is then no longer kept back, and its
+    record leaves the vault a day after `mayLandUntil`. Until its nonce is used History shows it `stale` or `refused`
+    (Pending), and `qnet.sentStatus` and `qnet_getTransactionStatus` both answer `pending` for a stale one; no clock makes
+    it Not found. No frozen file, text, error code, stored field or version changed.
+56. Owner command of 2026-11-02 (Solana through aiqnet.io where the endpoint gives no answer; the sandbox first). Every
+    Solana call goes to `SOLANA.RPC_URLS` as before. A direct attempt that gets no HTTP answer at all (a transport
+    failure, or `TIMINGS.SOLANA_TIMEOUT_MS`, 15 s) sends the same JSON-RPC body at once, without the back-off, to
+    aiqnet.io's relay, `QNET.EXPLORER_API` + `SOLANA.RELAY_PATH` (`/api/cabinet/solana`, docs/applications/explorer.md),
+    with the same timeout, answer cap (8 MiB) and fetch options, and `SITE_HEADERS`; the worker keeps that route in memory
+    and in `chrome.storage.local` `qnet_solana_route_v1` (section 7), so a restarted worker goes there at once. The rule is
+    the app's (`utils/solanaRoute.js`, compiled into the bundle: `core.solanaAttemptAfter`, `solanaRouteOf`,
+    `solanaRouteAfter`, `solanaProbeDue`, `SOLANA_DIRECT_RETRY_MS`). On that route a call goes to the relay first; an
+    attempt there with no usable JSON-RPC answer (none at all, a status other than 200, an unreadable body) is followed at
+    once by one at `SOLANA.RPC_URLS`, whose usable answer puts the calls back on the endpoint (`answered`), while no answer
+    keeps the relay route from that moment. A 429, a 5xx or an unreadable body of the endpoint is an answer that moves
+    nothing; it and a retryable JSON-RPC code are asked the same way again after the back-off of 500 ms, then 1 s. A
+    worker hears of no network change, so beside a call on the relay route one direct
+    `getBlockHeight` at `confirmed` runs once `SOLANA_DIRECT_RETRY_MS` (300 s) passed since the endpoint was last tried
+    (or that try is dated after now: a clock set back), its time kept before it goes out (a restarted worker does not
+    repeat it); a number brings the calls back. Only the wallet's own calls go there, and of transactions only the signed
+    ones: no key leaves the worker. A send's three attempts are one `rpc` call's, each with the same signed bytes and the
+    way above (the relay after an endpoint that gave no answer, the endpoint after a relay with no usable one); an attempt
+    with no usable answer leaves the send uncertain, so a refusal after it carries `afterUnanswered` and `sendAndConfirm`
+    polls it rather than calling it unable to land; a refusal keeps its JSON-RPC code, so `SIMULATION_FAILED` and
+    `SOLANA_UNAVAILABLE` read as before. The relay passes an activation burn on only once aiqnet.io's record holds it as this wallet's announced burn,
+    with its burner, amount and node type, so the relay can send no burn the one-code record (decision 35) does not hold;
+    this wallet announces before it sends, so its burn goes the same way on either route. An erase lets the route be
+    written again while it runs. Frozen files changed: `config.js` (`SOLANA.RELAY_PATH`, `STORAGE_KEYS.SOLANA_ROUTE`, and
+    the new `SITE_HEADERS`: the `x-qnet-client` header of every request to aiqnet.io), `test/skeleton.test.mjs`; the bundle
+    compiles `utils/solanaRoute.js`. No permission, manifest entry, page text, error code, vault field or version changed.
 
 ## 13. Languages (`ui/i18n`, `_locales`)
 

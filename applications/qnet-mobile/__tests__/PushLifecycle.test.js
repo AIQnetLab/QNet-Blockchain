@@ -102,6 +102,61 @@ describe('a token only while linked', () => {
   });
 });
 
+// A network where Firebase's servers cannot be reached answers nothing: the token is waited for PUSH_TOKEN_WAIT_MS.
+describe('Firebase that does not answer', () => {
+  let issue;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    messaging().getToken.mockImplementation(() => new Promise((resolve) => { issue = resolve; }));
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    messaging().getToken.mockResolvedValue('test-fcm-token');
+  });
+  const timedOut = async () => {
+    let target = null;
+    const read = Push.pushTarget().then((t) => { target = t; });
+    await jest.advanceTimersByTimeAsync(Push.PUSH_TOKEN_WAIT_MS - 1);
+    expect(target).toBe(null);
+    await jest.advanceTimersByTimeAsync(1);
+    await read;
+    return target;
+  };
+
+  it('polling after 8 s, said in the log; a token that comes later is given back while nothing is linked here', async () => {
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    expect(await timedOut()).toEqual({ type: 'polling', target: '' });
+    expect(Push.PUSH_TOKEN_WAIT_MS).toBe(8000);
+    expect(info).toHaveBeenCalledWith('[INFO][PUSH] token_unavailable reason=timeout wait_ms=8000');
+    issue('late-token');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(messaging().deleteToken).toHaveBeenCalledTimes(1);
+    info.mockRestore();
+  });
+
+  // Firebase issues one token to every read: the one a later read handed out to the binding being made stays.
+  it('a token that comes later stays when a later read is running or handed the same token out', async () => {
+    expect(await timedOut()).toEqual({ type: 'polling', target: '' });
+    let second;
+    messaging().getToken.mockImplementationOnce(() => new Promise((resolve) => { second = resolve; }));
+    const again = Push.pushTarget();
+    issue('late-token');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(messaging().deleteToken).not.toHaveBeenCalled();
+    second('late-token');
+    expect(await again).toEqual({ type: 'fcm', token: 'late-token', target: 'late-token' });
+    expect(messaging().deleteToken).not.toHaveBeenCalled();
+  });
+
+  it('a token that comes later to a device where a node is linked by then stays, for the next open to send', async () => {
+    expect(await timedOut()).toEqual({ type: 'polling', target: '' });
+    await linked();
+    issue('late-token');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(messaging().deleteToken).not.toHaveBeenCalled();
+  });
+});
+
 describe('Use this device', () => {
   const signer = (over = {}) => {
     const b = {
@@ -154,6 +209,54 @@ describe('Use this device', () => {
     expect(messaging().deleteToken).not.toHaveBeenCalled();
     expect(BackgroundFetch.configure).toHaveBeenCalled();
     await new Promise((r) => setTimeout(r, 50)); // the first answer it sends at once
+  });
+
+  it('Firebase silent: the binding goes as polling 8 s on, with no token, and the node takes it', async () => {
+    jest.useFakeTimers();
+    try {
+      messaging().getToken.mockImplementation(() => new Promise(() => {}));
+      const s = signer();
+      network((body) => ({ success: true, bound: true, seq: body.seq }));
+      let r = null;
+      const run = Push.bindThisDevice({ signer: s, credential: 'c', nodeId: NODE }).then((x) => { r = x; });
+      for (let i = 0; i < 100 && r === null; i++) await jest.advanceTimersByTimeAsync(100);
+      await run;
+      const bind = calls.find((c) => c.url.endsWith('/light-node/bind'));
+      expect(r).toEqual({ ok: true, seq: bind.body.seq });
+      expect(bind.body.push_type).toBe('polling');
+      expect(bind.body).not.toHaveProperty('device_token');
+      expect(s.prepareLightNodeBinding).toHaveBeenCalledWith('c', { seq: bind.body.seq, ts: bind.body.ts, pushTarget: '' });
+      expect(JSON.parse(await AsyncStorage.getItem('qnet_light_node_info'))).toMatchObject({ pushType: 'polling' });
+    } finally {
+      jest.useRealTimers();
+      messaging().getToken.mockResolvedValue('test-fcm-token');
+    }
+  });
+
+  // The token sent for the binding before is not this one's: Firebase giving the same token again, within the hour of
+  // that send, still goes to the owners of the binding made for polling.
+  it('a binding made for polling where a token was sent before takes that token at the next open', async () => {
+    await AsyncStorage.multiSet([
+      ['qnet_last_sent_fcm_token', 'test-fcm-token'], ['qnet_last_token_refresh_ts', String(Math.floor(Date.now() / 1000))],
+    ]);
+    jest.useFakeTimers();
+    try {
+      messaging().getToken.mockImplementation(() => new Promise(() => {}));
+      network((body) => ({ success: true, bound: true, seq: body.seq }));
+      let r = null;
+      const run = Push.bindThisDevice({ signer: signer(), credential: 'c', nodeId: NODE }).then((x) => { r = x; });
+      for (let i = 0; i < 100 && r === null; i++) await jest.advanceTimersByTimeAsync(100);
+      await run;
+      expect(r.ok).toBe(true);
+    } finally {
+      jest.useRealTimers();
+      messaging().getToken.mockResolvedValue('test-fcm-token');
+    }
+    Keychain.getGenericPassword.mockResolvedValue({ password: 'sk' });
+    expect(await Push.readdressIfOwed(NODE)).toBe(true);
+    const refresh = calls.find((c) => c.url.endsWith('/api/v1/light-node/token-refresh'));
+    expect(refresh.body).toMatchObject({ node_id: NODE, push_type: 'fcm', device_token: 'test-fcm-token' });
+    expect(JSON.parse(await AsyncStorage.getItem('qnet_light_node_info')).pushType).toBe('fcm');
   });
 
   it('a refused binding keeps no key and gives the token back', async () => {
@@ -286,6 +389,10 @@ describe('the unlink this device confirms, and every other end of the binding', 
     // A refused key, or owners that cannot say whether a device is bound, end nothing.
     expect(await Push.forgetIfReplaced(NODE, { keyOurs: false, deviceBound: true, deviceBoundAgreed: true })).toBe(false);
     expect(await Push.forgetIfReplaced(NODE, { bindingSeqAgreed: SEQ + 3, deviceBoundAgreed: null })).toBe(false);
+    // Without B, a bound device the owners date to this binding's own day (or an earlier one) ends nothing either.
+    const day = SEQ - (SEQ % 86400);
+    expect(await Push.forgetIfReplaced(NODE, { deviceBoundAgreed: true, linkedSinceAgreed: day })).toBe(false);
+    expect(await Push.forgetIfReplaced(NODE, { deviceBoundAgreed: null, linkedSinceAgreed: day + 86400 })).toBe(false);
     expect(messaging().deleteToken).not.toHaveBeenCalled();
     // A status read for an earlier binding does not end the one made since.
     expect(await Push.forgetIfReplaced(NODE, newer, SEQ - 1)).toBe(false);
@@ -359,6 +466,97 @@ describe('the unlink this device confirms, and every other end of the binding', 
     const erase = screen.slice(screen.indexOf('const eraseWallet = async'), screen.indexOf('eraseAllData', screen.indexOf('const eraseWallet = async')));
     // At once and for good, the device key with it; the network's answer is awaited after the local wipe (A2, 04.10).
     expect(erase).toContain('await stopLightNode({ waitForNetwork: false, forgetDevice: true });');
+  });
+});
+
+// The answer at an open goes only from the device the node is bound to, by the Node tab's verdict; with no binding
+// sequence in the read, a later day two owners date the network's binding to ends the binding here and sends nothing.
+describe('the answer at an open', () => {
+  const H = 2241840;
+  const DAY = SEQ - (SEQ % 86400);
+  // `held`: the signed status replies wait for it (a slow owner), so the open's round waits on the launch's read.
+  const serve = ({ linkedSince, signed, height = H, held = null }) => {
+    global.fetch = jest.fn((url, opts) => {
+      const body = opts && opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ url, body });
+      if (url.includes('/light-node/status') && !body) {
+        return reply({ onchain_registered: true, device_bound: true, features: ['status_signed'],
+          device: { platform: 'ios', model: 'iPhone 15 Pro', linked_since: linkedSince, last_answer_epoch: 150, state: 'online' } });
+      }
+      if (url.endsWith('/light-node/status')) return held ? held.then(() => reply(signed)) : reply(signed);
+      if (url.endsWith('/api/v1/height')) return reply({ height });
+      if (url.includes('/microblock/')) return reply({ previous_hash: new Array(32).fill(7) });
+      return reply({ success: true });
+    });
+  };
+  // `release`: lets held status replies go once the open's round waits on them.
+  const launchInFront = async (release = null) => {
+    const { AppState } = require('react-native');
+    const state = AppState.currentState;
+    AppState.currentState = 'active';
+    try {
+      await Push.initializePushService();
+      if (release) {
+        await new Promise((r) => setTimeout(r, 50));
+        release();
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    } finally {
+      AppState.currentState = state;
+    }
+  };
+  const answers = () => calls.filter((c) => c.url.endsWith('/light-node/ping-response'));
+  const refused = { success: false, reason: 'bad_signature' };
+
+  it('a launch: a newer binding dated a later day ends this one unanswered; the same day the status read, then the answer', async () => {
+    await linked();
+    serve({ linkedSince: DAY + 86400, signed: refused });
+    await launchInFront();
+    expect(answers()).toEqual([]);
+    expect(await AsyncStorage.getItem('qnet_ping_node_id')).toBe(null);
+    expect(messaging().deleteToken).toHaveBeenCalled();
+    expect(calls.some((c) => c.url.endsWith('/unbind'))).toBe(false);
+
+    await linked();
+    calls = [];
+    serve({ linkedSince: DAY, signed: refused });
+    await launchInFront();
+    expect(answers()).toHaveLength(1);
+    expect(await AsyncStorage.getItem('qnet_ping_node_id')).toBe(NODE);
+    const first = (p) => calls.findIndex(p);
+    expect(first((c) => c.url.includes('/light-node/status'))).toBeLessThan(first((c) => c.url.endsWith('/ping-response')));
+  });
+
+  it('a launch ends a replaced binding once: the open\'s answer reads the launch\'s status and leaves the ending to it', async () => {
+    await linked();
+    let release;
+    serve({ linkedSince: DAY + 86400, signed: refused, held: new Promise((r) => { release = r; }) });
+    await launchInFront(() => release());
+    expect(answers()).toEqual([]);
+    expect(messaging().deleteToken).toHaveBeenCalledTimes(1);
+    expect(BackgroundFetch.stop.mock.calls.filter((c) => c.length === 0)).toHaveLength(1);
+  });
+
+  it('a return to the app: the round reads the binding first, and only an open\'s round does', async () => {
+    await linked();
+    serve({ linkedSince: DAY, signed: { onchain_registered: true, device_bound: true, binding_seq: SEQ } });
+    expect(await Push.selfAttestIfNeeded(NODE, false, undefined, null, { opened: true })).toBe(true);
+    expect(answers()).toHaveLength(1);
+    // The next epoch: another device took the node on a later day.
+    await AsyncStorage.removeItem('qnet_self_attest_hold');
+    calls = [];
+    serve({ linkedSince: DAY + 86400, signed: refused, height: H + 14400 });
+    expect(await Push.selfAttestIfNeeded(NODE, false, undefined, null, { opened: true })).toBe(false);
+    expect(answers()).toEqual([]);
+    expect(await AsyncStorage.getItem('qnet_ping_node_id')).toBe(null);
+    // A background wake's own round reads no status for it: what it sends the network judges (its `superseded`).
+    await linked();
+    await AsyncStorage.removeItem('qnet_self_attest_hold');
+    calls = [];
+    serve({ linkedSince: DAY + 86400, signed: refused, height: H + 2 * 14400 });
+    await Push.selfAttestIfNeeded(NODE);
+    expect(calls.some((c) => c.url.endsWith('/light-node/status'))).toBe(false);
+    expect(answers()).toHaveLength(1);
   });
 });
 

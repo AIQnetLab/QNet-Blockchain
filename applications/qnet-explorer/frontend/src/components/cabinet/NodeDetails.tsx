@@ -1,12 +1,12 @@
 'use client';
 
-// The Overview's Node details (owner, 29.09; before, the Activation code page): the chosen wallet's activation, from
-// where the page learns it, by the code priority of the shared contracts (the network's registration record in the
+// The Overview's Node details: the chosen wallet's activation, from
+// where the page learns it, by the code priority (the network's registration record in the
 // explorer's archive, the server's record, the QNet extension that holds the wallet, the burn on its own Solana address,
 // the extension's answer kept in this browser, an activation of this browser; src/lib/cabinet/code-check.ts
 // activationFacts): the activation code with Copy, the node type, the node id, the burn with its link and amount, and the
 // block the QNet network recorded the node at. A light or a super node. The code is shown by itself, with no field to
-// check another one (owner, 29.09), and only one: the form of whose burn it is (owner, 06.10; code-check.ts burnByOf),
+// check another one, and only one: the form of whose burn it is (code-check.ts burnByOf),
 // none until that is known. A code authorizes nothing; every read here is public.
 
 import { useEffect, useState, type ReactNode } from 'react';
@@ -14,8 +14,7 @@ import Action from '@/components/ui/Action';
 import Copy from '@/components/ui/Copy';
 import EntityLink from '@/components/ui/EntityLink';
 import { Waiting } from '@/components/ui/RequestState';
-import { number, t, type MessageKey } from '@/lib/texts';
-import { rich } from '@/lib/rich';
+import { number, type MessageKey } from '@/lib/texts';
 import { useNodeStatus, useSuperStatus } from '@/hooks/useNodeStatus';
 import { usePaymentRecords } from '@/hooks/usePaymentRecords';
 import {
@@ -26,12 +25,15 @@ import type { PaymentRecord } from '@/lib/cabinet/flow';
 import { TAB_HREF } from '@/lib/cabinet/tabs';
 import { ownSolanaOf } from '@/lib/cabinet/wallet-choice';
 import type { NodeState } from '@/lib/cabinet/node-view';
-import type { NodeType } from '@/lib/qnet-link';
+import { serverWord } from '@/lib/cabinet/server-words';
+import { isGenesisNodeId, type NodeType } from '@/lib/qnet-link';
+import { siteRequest } from '@/lib/site-request';
 import { useCabinet } from './CabinetProvider';
 import { SuperNext } from './NextSteps';
 import { Fact, Facts, Group, Notes } from './parts';
+import { useI18n } from '@/i18n/client';
+import type { I18n } from '@/i18n/core';
 
-const REQUEST: RequestInit = { cache: 'no-store', credentials: 'omit', redirect: 'error' };
 // While whose burn a registration's is cannot be told, its record is read again this often (the route keeps an answer
 // half a minute).
 const BURN_BY_RETRY_MS = 30_000;
@@ -47,7 +49,7 @@ const SOURCE_TEXT: Record<ActivationFacts['source'], MessageKey> = {
 
 async function readArchived(wallet: string, nodeType: NodeType): Promise<ArchivedRecord | null> {
   try {
-    const res = await fetch(`/api/cabinet/registration/${encodeURIComponent(wallet)}${nodeType === 'super' ? '?type=super' : ''}`, REQUEST);
+    const res = await fetch(`/api/cabinet/registration/${encodeURIComponent(wallet)}${nodeType === 'super' ? '?type=super' : ''}`, siteRequest());
     return res.status === 200 ? parseArchivedRecord(await res.json()) : null;
   } catch {
     return null;
@@ -115,6 +117,7 @@ export function useWalletActivation(nodeType: NodeType = 'light'): WalletActivat
 // The one code with Copy, or that it follows later (a burn not final yet, or a registration whose burn the page cannot
 // tell yet).
 function CodeValue({ facts }: { facts: ActivationFacts }) {
+  const { t } = useI18n();
   if (!facts.code) return <span className="note">{t('code_code_later')}</span>;
   return (
     <span className="ent-copy">
@@ -127,16 +130,19 @@ function CodeValue({ facts }: { facts: ActivationFacts }) {
 // The details of the wallet's node of `nodeType`, and a super node's server settings. `statusText`: how the node stands
 // on the network; `nodeId`: the node's id.
 export default function NodeDetails({ nodeType = 'light', nodeId, statusText, known }: { nodeType?: NodeType; nodeId: string; statusText: ReactNode; known: WalletActivation }) {
+  const { t, say } = useI18n();
   const { viewOnly, choice } = useCabinet();
   const { facts, registration } = known;
   const light = nodeType === 'light';
+  // A genesis node is the network's own from its first block: no activation, so no code, burn or record to look for.
+  const genesis = !light && isGenesisNodeId(nodeId);
   return (
     <>
       <Group title={t('details_title')}>
         <Facts>
-          <Fact label={t('code_field_status')}>{statusText}</Fact>
-          <Fact label={t('ext_field_type')}>{t(light ? 'ext_type_light' : 'ext_type_super')}</Fact>
-          <Fact label={t(light ? 'code_field_node' : 'super_id')}>
+          <Fact label={say('code_field_status')}>{statusText}</Fact>
+          <Fact label={t('ext_field_type')}>{say(light ? 'ext_type_light' : serverWord(nodeId, 'type'))}</Fact>
+          <Fact label={say(light ? 'code_field_node' : serverWord(nodeId, 'id'))}>
             <EntityLink kind="node" value={nodeId} address={choice?.qnet ?? null} full />
           </Fact>
           {facts && (
@@ -148,10 +154,12 @@ export default function NodeDetails({ nodeType = 'light', nodeId, statusText, kn
           )}
         </Facts>
         <Notes>
-          {facts ? (
-            <p className="note">{t(SOURCE_TEXT[facts.source])}</p>
+          {genesis ? (
+            <p className="note">{t('genesis_details_note')}</p>
+          ) : facts ? (
+            <p className="note">{say(SOURCE_TEXT[facts.source])}</p>
           ) : registration === null ? (
-            <Waiting>{t('checking')}</Waiting>
+            <Waiting>{say('checking')}</Waiting>
           ) : registration.kind === 'none' ? null : (
             // Registered, without its burn details here: the explorer keeps none, or could not be read.
             <p className="note">{t(registration.kind === 'notArchived' ? 'code_not_archived' : 'code_archive_unavailable')}</p>
@@ -168,13 +176,13 @@ export default function NodeDetails({ nodeType = 'light', nodeId, statusText, kn
 
 // How a node stands on the network, for its details: recorded at its block (a link to it), recorded, being recorded, or
 // not yet.
-export function recordedText(state: 'none' | 'pending' | 'recorded', height: number | null): ReactNode {
+export function recordedText(state: 'none' | 'pending' | 'recorded', height: number | null, { t, rich }: I18n): ReactNode {
   if (state === 'none') return t('code_status_not_yet');
   if (state === 'pending') return t('code_status_pending');
   return height != null ? rich('code_status_recorded_at', { height: <EntityLink kind="block" value={height} /> }) : t('code_status_recorded');
 }
 
 // How a light node stands on the network, for its details.
-export function lightStatusText(state: NodeState, height: number | null): ReactNode {
-  return recordedText(state === 'none' ? 'none' : state === 'pending' ? 'pending' : 'recorded', height);
+export function lightStatusText(state: NodeState, height: number | null, i18n: I18n): ReactNode {
+  return recordedText(state === 'none' ? 'none' : state === 'pending' ? 'pending' : 'recorded', height, i18n);
 }

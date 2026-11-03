@@ -33,10 +33,15 @@ describe('light shard owners', () => {
       .toEqual([GENESIS_NODES[3], GENESIS_NODES[4], GENESIS_NODES[0]]);
   });
 
-  it('never returns an empty target list', () => {
-    // A device with nothing to hash still has to reach someone, or the return is silently lost.
-    expect(lightShardOwnerUrls('').length).toBe(GENESIS_NODES.length);
-    expect(lightShardOwnerUrls(null).length).toBe(GENESIS_NODES.length);
+  // Neither case is every genesis node: a push target goes to its shard's owners and to no other node.
+  it('no node id, or a hash this device cannot compute, has no owners: never every genesis node instead', () => {
+    expect(lightShardOwnerUrls('')).toEqual([]);
+    expect(lightShardOwnerUrls(null)).toEqual([]);
+    jest.isolateModules(() => {
+      jest.doMock('@noble/hashes/blake3.js', () => ({ blake3: () => { throw new Error('no hash here'); } }));
+      expect(require('../src/config/nodes').lightShardOwnerUrls('light_mobile_83afab763b9058fd')).toEqual([]);
+    });
+    jest.dontMock('@noble/hashes/blake3.js');
     expect(lightShardOwnerUrls('light_mobile_83afab763b9058fd').length).toBe(3);
   });
 });
@@ -84,6 +89,28 @@ describe('light node wakes and token refresh', () => {
     expect(calls).toEqual(lightShardOwnerUrls(NODE).slice(0, 2).map(u => u + REFRESH));
   });
 
+  it('sends no push target and no ping answer anywhere for a node whose owners this device cannot work out, and says why', async () => {
+    await withPingKey();
+    await linkedHere();
+    const nodes = require('../src/config/nodes');
+    const owners = jest.spyOn(nodes, 'lightShardOwnerUrls').mockReturnValue([]);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    global.fetch = jest.fn((url) => { calls.push(url); return reply(url.endsWith('/api/v1/height') ? { height: 1000 } : { success: true }); });
+    try {
+      expect(await Push.refreshFcmTokenOnServer(NODE)).toEqual({ success: false, error: 'owners_unknown' });
+      // A ping that names no node to answer at goes to the node's owner, and so to nobody here.
+      expect(await Push.respondToChallenge(NODE, `selfattest:998:${'ab'.repeat(32)}`, null)).toBe(false);
+      expect(calls.filter((u) => u.endsWith(REFRESH) || u.endsWith('/api/v1/light-node/ping-response'))).toEqual([]);
+      const said = warn.mock.calls.map((c) => c.join(' '));
+      expect(said).toEqual(expect.arrayContaining([
+        '[WARN][PUSH] token_refresh_not_sent reason=owners_unknown', '[WARN][PUSH] ping_not_answered reason=owners_unknown',
+      ]));
+    } finally {
+      owners.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
   it('sends no push target for a node that is not linked to this device', async () => {
     await withPingKey();
     global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: true }); });
@@ -91,14 +118,18 @@ describe('light node wakes and token refresh', () => {
     expect(calls).toEqual([]);
   });
 
-  it('falls back to another node only after every owner failed', async () => {
+  it('asks only the three shard owners: the other genesis nodes keep no binding of the node and answer not_owner', async () => {
     await withPingKey();
     await linkedHere();
-    global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: calls.length === 4 }); });
+    global.fetch = jest.fn((url) => {
+      calls.push(url);
+      const owner = lightShardOwnerUrls(NODE).some((u) => url === u + REFRESH);
+      return reply(owner ? { success: false, error: 'unavailable' } : { success: false, error: 'not_owner' });
+    });
     const res = await Push.refreshFcmTokenOnServer(NODE);
-    expect(res.success).toBe(true);
-    expect(calls.slice(0, 3)).toEqual(lightShardOwnerUrls(NODE).map(u => u + REFRESH));
-    expect(GENESIS_NODES.map(u => u + REFRESH)).toContain(calls[3]);
+    expect(res.success).toBe(false);
+    expect(res.sent).toBeUndefined();
+    expect(calls).toEqual(lightShardOwnerUrls(NODE).map(u => u + REFRESH));
   });
 
   it('self-attests when a pushed ping is refused', async () => {

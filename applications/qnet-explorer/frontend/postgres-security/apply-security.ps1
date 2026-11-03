@@ -60,27 +60,31 @@ Write-Host "   Backups saved to: $backupDir" -ForegroundColor Green
 # 3. Generate or read secure password
 # ============================================================================
 
+# The writer's password lives in the operator's home: no file of the checkout holds a secret that the site's tools or
+# a commit could carry.
+$passwordFile = Join-Path $HOME ".qnet-explorer-writer-password"
+
 if (-not $SkipPasswordChange) {
     Write-Host "[3/8] Managing database password..." -ForegroundColor Yellow
-    
-    $passwordFile = Join-Path $PSScriptRoot "..\..\.postgres_password"
-    
+
     if (-not (Test-Path $passwordFile)) {
         Write-Host "   Generating new secure password..." -ForegroundColor Cyan
-        $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*_+-="
-        $newPassword = -join ((1..32) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
-        $newPassword | Out-File $passwordFile -Force -NoNewline
+        # Letters and digits from the system's cryptographic generator: a DATABASE_URL carries it as it is.
+        $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        $bytes = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        $newPassword = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
+        $newPassword | Out-File $passwordFile -Force -NoNewline -Encoding ascii
         Write-Host "   New password generated and saved to: $passwordFile" -ForegroundColor Green
     } else {
         $newPassword = Get-Content $passwordFile -Raw
         $newPassword = $newPassword.Trim()
         Write-Host "   Using existing password from: $passwordFile" -ForegroundColor Green
     }
-    
-    Write-Host ""
-    Write-Host "   IMPORTANT: Save this password securely!" -ForegroundColor Red
-    Write-Host "   Password: $newPassword" -ForegroundColor Cyan
-    Write-Host ""
+    # It goes into SQL and a URL as it is, so it holds nothing else.
+    if ($newPassword -notmatch '^[A-Za-z0-9]+$') {
+        throw "$passwordFile must hold letters and digits only"
+    }
 } else {
     Write-Host "[3/8] Skipping password change (--SkipPasswordChange flag)" -ForegroundColor Yellow
 }
@@ -130,11 +134,11 @@ $targetHba = Join-Path $pgDataDir "pg_hba.conf"
 if (Test-Path $pgHbaConf) {
     $securityHba = Get-Content $pgHbaConf
     
-    # For production, add allowed IP
+    # For production, each commented application server rule (the indexer's role and the site's) becomes a live one,
+    # with the same pattern as apply-security.sh.
     if ($Production -and $AllowedIP) {
-        $productionRule = "hostssl qnet_explorer   qnet_user       $AllowedIP/32           scram-sha-256"
-        $securityHba = $securityHba -replace "# hostssl qnet_explorer   qnet_user       XXX.XXX.XXX.XXX/32", $productionRule
-        Write-Host "   Production mode: Added hostssl rule for $AllowedIP" -ForegroundColor Cyan
+        $securityHba = $securityHba -replace '^# hostssl qnet_explorer   ([a-z_]+) +XXX\.XXX\.XXX\.XXX/32 .*$', "hostssl qnet_explorer   `$1 $AllowedIP/32 scram-sha-256"
+        Write-Host "   Production mode: Added hostssl rules for $AllowedIP" -ForegroundColor Cyan
     }
     
     $securityHba | Out-File $targetHba -Force -Encoding UTF8
@@ -144,27 +148,15 @@ if (Test-Path $pgHbaConf) {
 }
 
 # ============================================================================
-# 6. Update .env file
+# 6. Settings of the indexer and the site
 # ============================================================================
 
-if (-not $SkipPasswordChange) {
-    Write-Host "[6/8] Updating .env file..." -ForegroundColor Yellow
-    
-    $envFile = Join-Path $PSScriptRoot "..\.env.local"
-    $envContent = @"
-# QNet Explorer - Database Configuration
-# Generated: $timestamp
-
-DATABASE_URL=postgresql://qnet_user:$newPassword@localhost:5432/qnet_explorer
-QNET_API_URL=https://162.244.25.114:8001
-DB_SSL=false
-"@
-    
-    $envContent | Out-File $envFile -Force
-    Write-Host "   .env.local created with new password" -ForegroundColor Green
-} else {
-    Write-Host "[6/8] Skipping .env update (--SkipPasswordChange flag)" -ForegroundColor Yellow
-}
+# Each process takes its settings from its own environment, never from a file of the checkout. Only the indexer, the
+# explorer's one writer, connects as qnet_user; the site connects as explorer_reader. The node URLs are the operator's.
+Write-Host "[6/8] Settings, each in the environment of its own process:" -ForegroundColor Yellow
+Write-Host "   Indexer: DATABASE_URL=postgresql://qnet_user:<the password in $passwordFile>@localhost:5432/qnet_explorer" -ForegroundColor Cyan
+Write-Host "            QNET_API_URLS=<the node URLs it reads, comma-separated>" -ForegroundColor Cyan
+Write-Host "   Site:    DATABASE_URL=postgresql://explorer_reader:<its password>@localhost:5432/qnet_explorer" -ForegroundColor Cyan
 
 # ============================================================================
 # 7. Restart PostgreSQL service
@@ -212,7 +204,7 @@ if (-not $SkipPasswordChange) {
             } else {
                 Write-Host "   WARNING: Could not update password automatically" -ForegroundColor Red
                 Write-Host "   Please run manually:" -ForegroundColor Yellow
-                Write-Host "   psql -U postgres -c `"ALTER USER qnet_user WITH PASSWORD '$newPassword';`"" -ForegroundColor Cyan
+                Write-Host "   psql -U postgres -c `"ALTER USER qnet_user WITH PASSWORD '<the password in $passwordFile>';`"" -ForegroundColor Cyan
             }
         } catch {
             Write-Host "   WARNING: Error updating password: $_" -ForegroundColor Red
@@ -236,9 +228,7 @@ Write-Host ""
 Write-Host "1. Test database connection:" -ForegroundColor White
 Write-Host "   psql -U qnet_user -d qnet_explorer -h localhost" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "2. Update Explorer environment:" -ForegroundColor White
-Write-Host "   cd applications/qnet-explorer/frontend" -ForegroundColor Cyan
-Write-Host "   Copy .env.local to .env" -ForegroundColor Cyan
+Write-Host "2. Set the settings of step 6 in the environment of the indexer and of the site." -ForegroundColor White
 Write-Host ""
 Write-Host "3. For production deployment:" -ForegroundColor White
 Write-Host "   - Generate SSL certificates (see postgresql.security.conf)" -ForegroundColor Cyan

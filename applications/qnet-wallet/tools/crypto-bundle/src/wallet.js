@@ -10,7 +10,7 @@ import {
 import { assertBytes, zeroize } from './bytes.js';
 import { fail } from './errors.js';
 import { ML_DSA65, signChecked } from './signing.js';
-import { buildContractCall, buildTokenTransfer, toU64String } from './tx.js';
+import { buildContractCall, buildTokenTransfer, expiryAt, toU64String } from './tx.js';
 
 export {
   QNET_CHAIN_TAG, WALLET_SEED_PREFIX, contractCallPreimage, contractDeployPreimage,
@@ -71,16 +71,17 @@ function transferFields(tx) {
     nonce: toU64String(tx.nonce),
     gasPrice: toU64String(tx.gasPrice),
     gasLimit: toU64String(tx.gasLimit),
+    expiry: expiryAt(tx.validUntil),
   };
   if (fields.amountNano === '0' || fields.gasPrice === '0' || fields.gasLimit === '0') fail('INVALID_TRANSFER');
   return fields;
 }
 
-const preimageOf = (f) => transferPreimage(f.from, f.to, f.amountNano, f.nonce, f.gasPrice, f.gasLimit);
+const preimageOf = (f) => transferPreimage(f.from, f.to, f.amountNano, f.nonce, f.gasPrice, f.gasLimit, f.expiry);
 
 /**
  * Signs a QNC transfer: the preimage is built here from typed fields, never taken from a caller, and
- * the signature is checked under the account key before it is returned.
+ * the signature is checked under the account key before it is returned. `validUntil` (optional): the V2 form.
  * Returns { preimage, signature: Uint8Array(3309) }.
  */
 export function signTransfer(tx, secretKey, publicKey) {
@@ -90,18 +91,18 @@ export function signTransfer(tx, secretKey, publicKey) {
 }
 
 /**
- * Signs a built-in token transfer ({ from, token, to, amount, nonce, gasPrice?, gasLimit? }), built here by
+ * Signs a built-in token transfer ({ from, token, to, amount, nonce, gasPrice?, gasLimit?, validUntil? }), built here by
  * buildTokenTransfer. Returns { tx, preimage, signature: Uint8Array(3309) }; the request is
  * contractCallRequestJson(tx, hex(signature), publicKeyHex or null).
  */
 export function signTokenTransfer(fields, secretKey, publicKey) {
-  const tx = buildTokenTransfer(fields);
+  const tx = buildTokenTransfer({ ...fields, expiry: expiryAt(fields?.validUntil) });
   return { tx, preimage: tx.preimage, signature: signChecked(tx.from, tx.preimage, secretKey, publicKey) };
 }
 
-/** Signs a WASM contract call (buildContractCall fields), as signTokenTransfer. */
+/** Signs a WASM contract call (buildContractCall fields, and validUntil?), as signTokenTransfer. */
 export function signContractCall(fields, secretKey, publicKey) {
-  const tx = buildContractCall(fields);
+  const tx = buildContractCall({ ...fields, expiry: expiryAt(fields?.validUntil) });
   return { tx, preimage: tx.preimage, signature: signChecked(tx.from, tx.preimage, secretKey, publicKey) };
 }
 

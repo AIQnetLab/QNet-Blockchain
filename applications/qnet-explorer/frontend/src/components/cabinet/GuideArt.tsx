@@ -5,8 +5,10 @@
 // the site's text of its key. The step's words say the same, so the picture is hidden from screen readers.
 
 import { useId, type ReactNode, type SVGProps } from 'react';
-import { t } from '@/lib/texts';
+import { useI18n } from '@/i18n/client';
 import type { ButtonPart, Label, Part, Scene } from '@/lib/cabinet/guide';
+import { fitLines, textLength } from '@/lib/geometry';
+import type { T } from '@/lib/texts';
 
 // The site's tokens (styles/tokens.css), so a picture reads in the page's own colours; white and black only for the
 // pattern that stands for a QR code.
@@ -31,37 +33,20 @@ const C = {
 // Text takes the site's two stacks (--f-sans, --font-mono in styles/tokens.css); monospace only where MONO says.
 const SANS = { fontFamily: 'var(--f-sans)' };
 const MONO = { fontFamily: 'var(--font-mono)' };
+// The mono face's advance at the normal width the pictures draw it at, in ems.
+const MONO_EM = 0.7;
+// A sample value (an ID, an address, a code) stays whole on one line, set smaller where it would not fit `width`.
+const monoSize = (value: string, width: number, size: number) => Math.min(size, width / (textLength(value, MONO_EM) * MONO_EM));
 
-function say(label: Label): string {
+// A label in the page's language: the app's, the extension's and the site's own words as each shows them there; a value
+// filled in may itself be a label (a time in the app's words).
+function labelText(label: Label, t: T): string {
   if (typeof label === 'string') return t(label);
   if ('raw' in label) return label.raw;
-  return t(label.key, label.vars);
+  return t(label.key, Object.fromEntries(Object.entries(label.vars).map(([name, v]) => [name, typeof v === 'string' ? v : t(v.key, v.vars)])));
 }
 
 const isRaw = (label: Label) => typeof label !== 'string' && 'raw' in label;
-
-// Lines of `text` that fit `width` at `size`, by the average glyph width of the face (`em`); at most `most` lines.
-function wrap(text: string, width: number, size: number, em = 0.56, most = 4): string[] {
-  const max = Math.max(4, Math.floor(width / (size * em)));
-  const lines: string[] = [];
-  let line = '';
-  for (const word of text.split(' ')) {
-    if (line === '') line = word;
-    else if (`${line} ${word}`.length <= max) line = `${line} ${word}`;
-    else {
-      lines.push(line);
-      line = word;
-    }
-  }
-  if (line !== '') lines.push(line);
-  if (lines.length <= most) return lines;
-  const kept = lines.slice(0, most);
-  // The last line ends in …: without its last word when … would not fit, and a single word is cut, never dropped.
-  const last = kept[most - 1];
-  const cut = last.length < max ? last : last.includes(' ') ? last.replace(/\s*\S*$/, '') : last.slice(0, max - 1);
-  kept[most - 1] = `${cut}…`;
-  return kept;
-}
 
 const GAP = 6;
 
@@ -81,14 +66,14 @@ function textLines(lines: string[], x: number, y: number, size: number, props: S
   ));
 }
 
-function drawButton(b: ButtonPart, x: number, y: number, w: number, s: number, key: string): Drawn {
+function drawButton(b: ButtonPart, x: number, y: number, w: number, s: number, key: string, t: T): Drawn {
   // The site's buttons are sentence case with the one 2 px radius; the app's and the extension's keep their own shape.
-  const label = say(b.label);
+  const label = labelText(b.label, t);
   const em = 0.6;
   const radius = b.site ? 2 : 5;
   let size = 8.2 * s;
-  while (size > 6 * s && label.length * size * em > w - 12) size -= 0.5;
-  const lines = label.length * size * em > w - 12 ? wrap(label, w - 12, size, em, 2) : [label];
+  while (size > 6 * s && textLength(label, em) * size * em > w - 12) size -= 0.5;
+  const lines = textLength(label, em) * size * em > w - 12 ? fitLines(label, w - 12, size, em, 2) : [label];
   const h = lines.length > 1 ? 10 * s + lines.length * size * 1.2 : 21 * s;
   const tone = b.tone ?? 'primary';
   const fill = tone === 'primary' ? C.cyan : tone === 'done' ? C.soft : 'none';
@@ -141,17 +126,39 @@ function FakeQr({ x, y, size }: { x: number; y: number; size: number }) {
 }
 
 // One part of a screen at `y`, `w` wide; `s` scales the type and the controls.
-function drawPart(part: Part, x: number, y: number, w: number, s: number, key: string): Drawn {
+function drawPart(part: Part, x: number, y: number, w: number, s: number, key: string, t: T): Drawn {
   switch (part.kind) {
+    case 'mark': {
+      // The app's mark is the site's icon, round as the app draws it; under it the app's name in bold Signal, then its
+      // line, all centred.
+      const size = Math.min(30 * s, w * 0.36);
+      const head = 9.6 * s;
+      const text = 7.6 * s;
+      const name = fitLines(labelText(part.name, t), w, head, 0.58, 2);
+      const lines = fitLines(labelText(part.label, t), w, text, 0.55, 3);
+      const named = y + size + 6 * s;
+      const under = named + name.length * head * 1.2 + 3 * s;
+      return {
+        h: under - y + lines.length * text * 1.25,
+        node: (
+          <g key={key}>
+            <image href="/icon-192.png" x={x + (w - size) / 2} y={y} width={size} height={size} style={{ clipPath: 'circle(50%)' }} />
+            {textLines(name, x + w / 2, named - 1, head, { fill: C.cyan, fontWeight: 700, textAnchor: 'middle' }, 1.2)}
+            {textLines(lines, x + w / 2, under - 1, text, { fill: C.text, textAnchor: 'middle' })}
+          </g>
+        ),
+      };
+    }
     case 'title': {
       const size = 9.6 * s;
-      const lines = wrap(say(part.label), w, size, 0.58, 3);
+      const lines = fitLines(labelText(part.label, t), w, size, 0.58, 3);
       return { h: lines.length * size * 1.2, node: <g key={key}>{textLines(lines, x, y - 1, size, { fill: C.text, fontWeight: 700 }, 1.2)}</g> };
     }
     case 'small': {
-      const size = 7.6 * s;
-      const lines = wrap(say(part.label), w, size, 0.55, 3);
+      const label = labelText(part.label, t);
       const raw = isRaw(part.label);
+      const size = raw ? monoSize(label, w, 7.6 * s) : 7.6 * s;
+      const lines = raw ? [label] : fitLines(label, w, size, 0.55, 3);
       return { h: lines.length * size * 1.25, node: <g key={key}>{textLines(lines, x, y - 1, size, { fill: raw ? C.text : C.muted, style: raw ? MONO : undefined })}</g> };
     }
     case 'lines': {
@@ -169,32 +176,32 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
       };
     }
     case 'button':
-      return drawButton(part, x, y, w, s, key);
+      return drawButton(part, x, y, w, s, key, t);
     case 'pair': {
       const half = (w - 6) / 2;
       // Side by side as the app and the extension show them, unless a label would not fit half the width: then stacked.
-      const fits = [part.left, part.right].every((b) => say(b.label).length * 7.6 * s * 0.6 <= half - 12);
+      const fits = [part.left, part.right].every((b) => textLength(labelText(b.label, t), 0.6) * 7.6 * s * 0.6 <= half - 12);
       if (!fits) {
-        const top = drawButton(part.left, x, y, w, s, 'l');
-        const below = drawButton(part.right, x, y + top.h + GAP, w, s, 'r');
+        const top = drawButton(part.left, x, y, w, s, 'l', t);
+        const below = drawButton(part.right, x, y + top.h + GAP, w, s, 'r', t);
         return { h: top.h + GAP + below.h, node: <g key={key}>{top.node}{below.node}</g> };
       }
-      const left = drawButton(part.left, x, y, half, s, 'l');
-      const right = drawButton(part.right, x + half + 6, y, half, s, 'r');
+      const left = drawButton(part.left, x, y, half, s, 'l', t);
+      const right = drawButton(part.right, x + half + 6, y, half, s, 'r', t);
       return { h: Math.max(left.h, right.h), node: <g key={key}>{left.node}{right.node}</g> };
     }
     case 'field': {
       const size = 7.4 * s;
       const box = 17 * s;
       const labelH = part.label ? size * 1.5 : 0;
-      const value = part.secret ? '••••••••' : part.value ? say(part.value) : '';
+      const value = part.secret ? '••••••••' : part.value ? labelText(part.value, t) : '';
       const raw = part.value !== undefined && isRaw(part.value);
-      const shown = wrap(value, w - 10, size, raw ? 0.62 : 0.55, 1)[0] ?? '';
+      const shown = fitLines(value, w - 10, size, raw ? MONO_EM : 0.55, 1)[0] ?? '';
       return {
         h: labelH + box,
         node: (
           <g key={key}>
-            {part.label && <text x={x} y={y + size} fontSize={size} fill={C.muted}>{say(part.label)}</text>}
+            {part.label && <text x={x} y={y + size} fontSize={size} fill={C.muted}>{labelText(part.label, t)}</text>}
             {part.hot && <Ring x={x} y={y + labelH} w={w} h={box} r={4} />}
             <rect x={x} y={y + labelH} width={w} height={box} rx={4} fill={C.field} stroke={C.frame} strokeWidth={0.8} />
             {shown && (
@@ -213,8 +220,8 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
         h: size * 1.6,
         node: (
           <g key={key}>
-            <text x={x} y={y + size} fontSize={size} fill={C.muted}>{say(part.label)}</text>
-            <text x={x + w} y={y + size} fontSize={size} fontWeight={700} textAnchor="end" fill={C.text} style={raw ? MONO : undefined}>{say(part.value)}</text>
+            <text x={x} y={y + size} fontSize={size} fill={C.muted}>{labelText(part.label, t)}</text>
+            <text x={x + w} y={y + size} fontSize={size} fontWeight={700} textAnchor="end" fill={C.text} style={raw ? MONO : undefined}>{labelText(part.value, t)}</text>
           </g>
         ),
       };
@@ -222,7 +229,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
     case 'check': {
       const size = 7.4 * s;
       const box = 9 * s;
-      const lines = wrap(say(part.label), w - box - 5, size, 0.55, 2);
+      const lines = fitLines(labelText(part.label, t), w - box - 5, size, 0.55, 2);
       return {
         h: Math.max(box + 1, lines.length * size * 1.25),
         node: (
@@ -267,7 +274,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
         h: size * 1.5 + pillH,
         node: (
           <g key={key}>
-            <text x={x} y={y + size} fontSize={size} fill={C.muted}>{say(part.label)}</text>
+            <text x={x} y={y + size} fontSize={size} fill={C.muted}>{labelText(part.label, t)}</text>
             {Array.from({ length: part.count }, (_, i) => {
               const cx = x + i * (pillW + 4);
               const cy = y + size * 1.5;
@@ -288,7 +295,8 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
       return { h: size, node: <FakeQr key={key} x={x + (w - size) / 2} y={y} size={size} /> };
     }
     case 'code': {
-      const size = 7.8 * s;
+      const label = labelText(part.label, t);
+      const size = monoSize(label, w - 8, 7.8 * s);
       const box = 18 * s;
       return {
         h: box,
@@ -296,7 +304,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
           <g key={key}>
             <rect x={x} y={y} width={w} height={box} rx={4} fill={C.field} stroke={C.frame} strokeWidth={0.8} />
             <text x={x + w / 2} y={y + box / 2 + size * 0.36} fontSize={size} fontWeight={700} textAnchor="middle" fill={C.white} style={MONO}>
-              {wrap(say(part.label), w - 8, size, 0.62, 1)[0]}
+              {label}
             </text>
           </g>
         ),
@@ -304,7 +312,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
     }
     case 'status': {
       const size = 7.6 * s;
-      const lines = wrap(say(part.label), w - 10, size, 0.55, 3);
+      const lines = fitLines(labelText(part.label, t), w - 10, size, 0.55, 3);
       return {
         h: lines.length * size * 1.25,
         node: (
@@ -319,7 +327,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
       const box = 15 * s;
       const each = (w - (part.items.length - 1) * 3) / part.items.length;
       // Smaller type where the longest label would not fit its tab, never below 5.
-      const longest = Math.max(...part.items.map((item) => say(item).length));
+      const longest = Math.max(...part.items.map((item) => textLength(labelText(item, t), 0.56)));
       const size = Math.max(5, Math.min(7 * s, (each - 4) / (longest * 0.56)));
       return {
         h: box,
@@ -332,7 +340,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
                 <g key={i}>
                   <rect x={cx} y={y} width={each} height={box} rx={box / 2} fill={on ? C.soft : 'none'} stroke={on ? C.hot : C.line} strokeWidth={on ? 1 : 0.8} />
                   <text x={cx + each / 2} y={y + box / 2 + size * 0.36} fontSize={size} fontWeight={on ? 700 : 500} textAnchor="middle" fill={on ? C.white : C.muted}>
-                    {wrap(say(item), each - 4, size, 0.56, 1)[0]}
+                    {fitLines(labelText(item, t), each - 4, size, 0.56, 1)[0]}
                   </text>
                 </g>
               );
@@ -348,7 +356,7 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
       const cardW = (w - (cols - 1) * 6) / cols;
       const name = 8.8 * s;
       const small = 7.2 * s;
-      const notes = part.items.map((item) => wrap(say(item.note), cardW - 12, small, 0.55, 3));
+      const notes = part.items.map((item) => fitLines(labelText(item.note, t), cardW - 12, small, 0.55, 3));
       const nodes: ReactNode[] = [];
       let top = y;
       for (let first = 0; first < part.items.length; first += cols) {
@@ -362,9 +370,9 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
           nodes.push(
             <g key={i}>
               <rect x={cx} y={top} width={cardW} height={h} rx={6} fill={on ? C.soft : C.field} stroke={on ? C.hot : C.line} strokeWidth={on ? 1.2 : 0.8} />
-              <text x={cx + 6} y={top + 5 * s + name} fontSize={name} fontWeight={700} fill={on ? C.white : C.text}>{say(item.label)}</text>
+              <text x={cx + 6} y={top + 5 * s + name} fontSize={name} fontWeight={700} fill={on ? C.white : C.text}>{labelText(item.label, t)}</text>
               {textLines(notes[i], cx + 6, noteTop, small, { fill: C.muted })}
-              <text x={cx + 6} y={noteTop + small * (most * 1.25 + 1.1)} fontSize={small} fontWeight={700} fill={C.cyan}>{say(item.price)}</text>
+              <text x={cx + 6} y={noteTop + small * (most * 1.25 + 1.1)} fontSize={small} fontWeight={700} fill={C.cyan}>{labelText(item.price, t)}</text>
             </g>,
           );
         }
@@ -376,10 +384,10 @@ function drawPart(part: Part, x: number, y: number, w: number, s: number, key: s
 }
 
 // The parts of a screen, top to bottom from `y`, and where they end.
-function layout(parts: Part[], x: number, y0: number, w: number, s = 1): { nodes: ReactNode[]; end: number } {
+function layout(parts: Part[], x: number, y0: number, w: number, s: number, t: T): { nodes: ReactNode[]; end: number } {
   let y = y0;
   const nodes = parts.map((part, index) => {
-    const drawn = drawPart(part, x, y, w, s, `p${index}`);
+    const drawn = drawPart(part, x, y, w, s, `p${index}`, t);
     y += drawn.h + GAP;
     return drawn.node;
   });
@@ -390,6 +398,7 @@ function layout(parts: Part[], x: number, y0: number, w: number, s = 1): { nodes
 function Phone({ x, y, w, h, screen, url, urlHot, parts, clip, s = 1 }: {
   x: number; y: number; w: number; h: number; screen: 'app' | 'web'; url?: string; urlHot?: boolean; parts: Part[]; clip: string; s?: number;
 }) {
+  const { t } = useI18n();
   const web = screen === 'web' && url !== undefined;
   const inner = { x: x + 5, y: y + 5, w: w - 10, h: h - 10 };
   const top = web ? y + 42 : y + 24;
@@ -409,7 +418,7 @@ function Phone({ x, y, w, h, screen, url, urlHot, parts, clip, s = 1 }: {
             <text x={x + w / 2} y={y + 30.6} fontSize={7.8} textAnchor="middle" fill={C.text} style={MONO}>{url}</text>
           </g>
         )}
-        {layout(parts, x + 13, top, w - 26, s).nodes}
+        {layout(parts, x + 13, top, w - 26, s, t).nodes}
       </g>
       <rect x={x + w / 2 - 17} y={y + h - 9} width={34} height={3} rx={1.5} fill={C.frame} opacity={0.6} />
     </g>
@@ -426,22 +435,22 @@ const POPUP_S = 1.18;
 
 // A computer's browser, as tall as what it shows; the extension's window over the right of the page (`narrow`: over
 // its lower part).
-function Browser({ scene, clip, narrow = false }: { scene: Extract<Scene, { frame: 'browser' }>; clip: string; narrow?: boolean }): { node: ReactNode; height: number; width: number } {
+function Browser({ scene, clip, narrow = false, t }: { scene: Extract<Scene, { frame: 'browser' }>; clip: string; narrow?: boolean; t: T }): { node: ReactNode; height: number; width: number } {
   const width = narrow ? BROWSER_NARROW_W : BROWSER_W;
   const x = 4;
   const y = 4;
   const w = width - 8;
   const pageW = scene.popup && !narrow ? 146 - 24 : w - 24;
-  const page = layout(scene.parts, x + 12, y + 38, pageW, PAGE_S);
+  const page = layout(scene.parts, x + 12, y + 38, pageW, PAGE_S, t);
   const onlyLines = scene.parts.every((part) => part.kind === 'lines');
   // Where the extension's window starts, left and top, and its width.
   const popupX = narrow ? x + 8 : x + 146;
   const popupTop = narrow && !onlyLines ? page.end + 10 : y + 22;
   const popupW = narrow ? w - 16 : w - 146 - 4;
-  const popup = scene.popup ? layout(scene.popup, popupX + 8, popupTop + 28, popupW - 16, POPUP_S) : null;
+  const popup = scene.popup ? layout(scene.popup, popupX + 8, popupTop + 28, popupW - 16, POPUP_S, t) : null;
   const popupEnd = popup ? popup.end + 12 : 0;
   const h = Math.max(narrow ? 120 : 150, page.end + 18 - y, popupEnd + 10 - y);
-  const address = scene.url ?? (scene.tab ? say(scene.tab) : '');
+  const address = scene.url ?? (scene.tab ? labelText(scene.tab, t) : '');
   const barEnd = scene.pin ? w - 30 : w - 8;
   return {
     width,
@@ -485,8 +494,9 @@ const SCAN_W = 320;
 const SCAN_NARROW_W = 236;
 
 function Scan({ scene, clip, narrow = false }: { scene: Extract<Scene, { frame: 'scan' }>; clip: string; narrow?: boolean }) {
+  const { t } = useI18n();
   const panelW = narrow ? 106 : 176;
-  const page = narrow ? layout(scene.parts, 12, 58, 90, 1.2) : layout(scene.parts, 16, 58, 150, PAGE_S);
+  const page = narrow ? layout(scene.parts, 12, 58, 90, 1.2, t) : layout(scene.parts, 16, 58, 150, PAGE_S, t);
   const bottom = Math.max(page.end + 14, 150);
   return (
     <g>
@@ -502,7 +512,7 @@ function Scan({ scene, clip, narrow = false }: { scene: Extract<Scene, { frame: 
 }
 
 // A computer's picture twice: as wide as a computer shows it, and narrower for a phone's screen, where the stylesheet
-// shows it instead (globals.css, .guide-art-narrow).
+// shows it instead (styles/pages.css, .guide-art-narrow).
 function Both({ clip, wide, narrow }: { clip: string; wide: (clip: string) => { node: ReactNode; width: number; height: number }; narrow: (clip: string) => { node: ReactNode; width: number; height: number } }) {
   return (
     <>
@@ -516,6 +526,7 @@ function Both({ clip, wide, narrow }: { clip: string; wide: (clip: string) => { 
 }
 
 export default function GuideArt({ scene }: { scene: Scene }) {
+  const { t } = useI18n();
   const clip = `guide-art-${useId().replace(/:/g, '')}`;
   if (scene.frame === 'phone') {
     return (
@@ -533,5 +544,5 @@ export default function GuideArt({ scene }: { scene: Scene }) {
       />
     );
   }
-  return <Both clip={clip} wide={(id) => Browser({ scene, clip: id })} narrow={(id) => Browser({ scene, clip: id, narrow: true })} />;
+  return <Both clip={clip} wide={(id) => Browser({ scene, clip: id, t })} narrow={(id) => Browser({ scene, clip: id, narrow: true, t })} />;
 }

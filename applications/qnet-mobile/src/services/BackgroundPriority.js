@@ -13,6 +13,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import BackgroundFetch from 'react-native-background-fetch';
 import { Linking, NativeModules, Platform } from 'react-native';
+import { valueBy } from '../utils/deadline';
 
 // The last Background App Refresh status a configure or a return to the app read (iOS rejects the configure with it):
 // what readBackground answers when the status cannot be read now.
@@ -28,11 +29,8 @@ const REFRESH = { 0: 'restricted', 1: 'denied', 2: 'available' };
 // A read of the system's state never holds a wake up longer than this.
 export const BG_READ_MS = 1000;
 
-const within = (promise) => {
-  let timer;
-  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), BG_READ_MS); });
-  return Promise.race([Promise.resolve(promise).catch(() => null), late]).finally(() => clearTimeout(timer));
-};
+// The read's value, or null when it fails or comes later than that.
+const within = (promise) => valueBy(Promise.resolve(promise).catch(() => null), Date.now() + BG_READ_MS, null);
 const bool = (v) => (typeof v === 'boolean' ? v : null);
 
 /** Android's state (`QNetBackground.state`: { exempt, bucket, userRestricted }) as readBackground answers it. */

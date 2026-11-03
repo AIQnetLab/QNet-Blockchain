@@ -33,8 +33,8 @@ test('the link host serves the two link pages and the app-association files itse
   assert.equal(hostRedirect(LINK_HOST, '/send', '?_rsc=abc'), null);
 });
 
-// SITE-R4-CSP-01: the rule let /icon-<any digits>.png through, and a path without a file there rendered the
-// site's 404 page, shell and all, on the link host. It serves exactly the icons the page head names.
+// A rule that let /icon-<any digits>.png through would render the site's 404 page, shell and all, on the link host
+// for a path without a file: it serves exactly the icons the page head names.
 test('the link host serves exactly the icons the page head and the manifest name, each a file of the site', () => {
   const layout = readFileSync(new URL('../../app/layout.tsx', import.meta.url), 'utf8');
   const named = new Set([...layout.matchAll(/'(\/icon-\d+\.png|\/favicon\.ico)'/g)].map((m) => m[1]));
@@ -74,7 +74,7 @@ test('aiqnet.io and a local run serve every path', () => {
   }
 });
 
-// SITE-R3-CSP-01 / SITE-R3-02: www., explorer. or any other Host header would be a second origin running
+// www., explorer. or any other Host header would be a second origin running
 // the whole site (Connect wallet, /activate, /l, the relay, the faucet) that the rest of the system does
 // not know. A production build sends each of them to the same path on aiqnet.io.
 test('every other host goes to the same path on aiqnet.io, API routes included', () => {
@@ -113,5 +113,5 @@ test('the proxy applies it to every host, and its API matcher covers every host 
 test('the header links the explorer on this origin, never another host', () => {
   const header = readFileSync(new URL('../../components/Header.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(header, /explorer\.aiqnet\.io|https:\/\/aiqnet\.io|isExplorerDomain/);
-  assert.match(header, /\{ href: '\/explorer', label: 'Explorer' \}/);
+  assert.match(header, /\{ href: '\/explorer', label: 'hdr_explorer' \}/);
 });

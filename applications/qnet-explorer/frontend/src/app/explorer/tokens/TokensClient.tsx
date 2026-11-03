@@ -1,19 +1,21 @@
 'use client';
 
-// The token directory (B-SPEC 6.6): every QRC-20 token deployed on QNet Blockchain, from the explorer's own index of
+// The token directory: every QRC-20 token deployed on QNet Blockchain, from the explorer's own index of
 // deploy transactions (/api/tokens), with a filter and pages; and a lookup that opens a token by its contract address
 // once the token route knows it. Each token, contract, deployer and deploy transaction is a link. The server renders
 // the first page into the page (page.tsx), so the table has its final rows and count from the first paint.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { useRouter } from 'next/navigation';
 import { textCol } from '@/components/explorer/columns';
 import DataTable from '@/components/ui/DataTable';
 import EntityLink, { Amount } from '@/components/ui/EntityLink';
 import PageHead from '@/components/ui/PageHead';
 import Pager from '@/components/ui/Pager';
+import { useI18n, useLocaleRouter } from '@/i18n/client';
 import { TOKENS_PER_PAGE as PER_PAGE, tokensPath } from '@/lib/explorer-reads';
 import { day, int } from '@/lib/format';
+import { amountWidth, wordsWidth } from '@/lib/geometry';
+import { siteRequest } from '@/lib/site-request';
 import type { FirstAnswer } from '@/server/first-answer';
 
 interface TokenListEntry {
@@ -29,28 +31,27 @@ interface TokenListEntry {
   deploy_hash: string;
 }
 
-// A failed read has no rows and no count: what is shown stays.
+// A failed read has no rows and no count: what is shown stays, and the page says the directory could not be read.
 interface Directory {
   tokens: TokenListEntry[] | null;
   total: number | null;
-  error: string | null;
+  failed: boolean;
 }
-
-const UNREADABLE = 'The token directory cannot be read right now.';
 
 // One reading of a directory answer, for the server's first answer and the client's later reads alike.
 function readDirectory(ok: boolean, body: unknown): Directory {
-  const result = body as { success?: boolean; data?: { tokens?: unknown; total?: unknown }; error?: string } | null;
+  const result = body as { success?: boolean; data?: { tokens?: unknown; total?: unknown } } | null;
   if (ok && result?.success && result.data) {
-    return { tokens: Array.isArray(result.data.tokens) ? (result.data.tokens as TokenListEntry[]) : [], total: Number(result.data.total) || 0, error: null };
+    return { tokens: Array.isArray(result.data.tokens) ? (result.data.tokens as TokenListEntry[]) : [], total: Number(result.data.total) || 0, failed: false };
   }
-  return { tokens: null, total: null, error: result?.error || UNREADABLE };
+  return { tokens: null, total: null, failed: true };
 }
 
 // `first` is the server's answer for the first page (null: it had none, the client reads it); absent while the route
 // loads (loading.tsx): the page's final shape with nothing in it, and no reads.
 export default function TokensClient({ first }: { first?: FirstAnswer | null }) {
-  const router = useRouter();
+  const { t, say } = useI18n();
+  const router = useLocaleRouter();
 
   // Lookup by contract: checked against the token route before the page opens.
   const [contract, setContract] = useState('');
@@ -61,22 +62,22 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
     e.preventDefault();
     const value = contract.trim();
     if (!value) {
-      setLookupError('Enter a token contract address.');
+      setLookupError(t('tokens_lookup_empty'));
       return;
     }
     setChecking(true);
     setLookupError(null);
     try {
-      const res = await fetch(`/api/token/${encodeURIComponent(value)}`);
+      const res = await fetch(`/api/token/${encodeURIComponent(value)}`, siteRequest());
       const result = await res.json().catch(() => null);
       if (res.ok && result?.success) router.push(`/explorer/token/${value}`);
-      else setLookupError(result?.error || 'No QRC-20 token found at that contract address.');
+      else setLookupError(t('tokens_lookup_none'));
     } catch {
-      setLookupError('Could not reach the token service. Try again.');
+      setLookupError(t('tokens_lookup_unreachable'));
     } finally {
       setChecking(false);
     }
-  }, [contract, router]);
+  }, [contract, router, t]);
 
   // The directory.
   const [initial] = useState(() => (first ? readDirectory(first.status < 400, first.body) : null));
@@ -84,7 +85,7 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
   const [total, setTotal] = useState(initial?.total ?? 0);
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState('');
-  const [listError, setListError] = useState<string | null>(initial ? initial.error : null);
+  const [listFailed, setListFailed] = useState(initial ? initial.failed : false);
   // The read whose rows are on screen: the server's first page, when it read it.
   const shownPath = useRef(first ? tokensPath(1) : null);
 
@@ -96,18 +97,18 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
     const controller = new AbortController();
     const load = async () => {
       try {
-        const res = await fetch(path, { signal: controller.signal });
+        const res = await fetch(path, siteRequest({ signal: controller.signal }));
         const body = await res.json().catch(() => null);
         if (!active) return;
         const read = readDirectory(res.ok, body);
         shownPath.current = path;
         setTokens((shown) => read.tokens ?? shown ?? []);
         if (read.total !== null) setTotal(read.total);
-        setListError(read.error);
+        setListFailed(read.failed);
       } catch (err) {
         if (!active || (err instanceof DOMException && err.name === 'AbortError')) return;
-        setTokens((t) => t ?? []);
-        setListError(UNREADABLE);
+        setTokens((shown) => shown ?? []);
+        setListFailed(true);
       }
     };
     // A short pause while the filter is typed.
@@ -120,27 +121,32 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
   }, [page, search, first]);
 
   const columns = useMemo(() => [
-    textCol<TokenListEntry>('token', 'Token', (t) => <EntityLink kind="token" value={t.contract_address} symbol={t.name || t.symbol} />, 220),
-    textCol<TokenListEntry>('symbol', 'Symbol', (t) => t.symbol || null, 104),
+    textCol<TokenListEntry>('token', t('col_token'), (x) => <EntityLink kind="token" value={x.contract_address} symbol={x.name || x.symbol} />, 220),
+    textCol<TokenListEntry>('symbol', t('tokens_symbol'), (x) => x.symbol || null, 104),
     // The same entity as the token cell's link, so plain text (one link per entity in a row).
-    textCol<TokenListEntry>('contract', 'Contract', (t) => <EntityLink kind="address" value={t.contract_address} link={false} />, undefined, undefined, 128),
-    textCol<TokenListEntry>('supply', 'Total supply', (t) => <Amount value={t.total_supply} token={t.contract_address} symbol={t.symbol} />, 220, 'right'),
-    textCol<TokenListEntry>('deployer', 'Deployer', (t) => <EntityLink kind="address" value={t.deployer} />, 156),
-    textCol<TokenListEntry>('deployed', 'Deployed', (t) => (t.deploy_hash ? <EntityLink kind="tx" value={t.deploy_hash} /> : null), 136),
-    textCol<TokenListEntry>('day', 'Day', (t) => (t.deployed_at ? day(t.deployed_at) : 'Genesis'), 108, 'right'),
-  ], []);
+    textCol<TokenListEntry>('contract', t('tx_contract'), (x) => <EntityLink kind="address" value={x.contract_address} link={false} />, undefined, undefined, 128),
+    // As wide as the page's longest exact supply, so no amount runs into the next column.
+    textCol<TokenListEntry>('supply', t('qnc_total'), (x) => <Amount value={x.total_supply} token={x.contract_address} symbol={x.symbol} />,
+      amountWidth((tokens ?? []).map((x) => ({ value: x.total_supply, unit: x.symbol || t('token_unnamed') })), 220), 'right'),
+    textCol<TokenListEntry>('deployer', t('tok_deployer'), (x) => <EntityLink kind="address" value={x.deployer} />, 156),
+    textCol<TokenListEntry>('deployed', t('tok_deployed'), (x) => (x.deploy_hash ? <EntityLink kind="tx" value={x.deploy_hash} /> : null), 136),
+    // Wider where the page's language writes a longer date ("28 окт. 2026 г."), so none is cut.
+    textCol<TokenListEntry>('day', t('tokens_day'), (x) => (x.deployed_at ? day(x.deployed_at, t) : t('genesis')),
+      Math.max(108, wordsWidth([...Array.from({ length: 12 }, (_, m) => day(Date.UTC(2026, m, 28), t)), t('genesis')])), 'right'),
+  ], [t, tokens]);
 
   const pages = Math.max(1, Math.ceil(total / PER_PAGE));
+  const listError = listFailed ? t('tokens_unreadable') : null;
 
   return (
     <div className="ex ex-detail">
       <PageHead
-        kicker="Tokens"
-        title="Token Directory"
-        lead="Every QRC-20 token deployed on QNet Blockchain, from the explorer's own index of deploy transactions. A token also shows under Other tokens on the address page of anyone who holds it."
+        kicker={t('tokens_kicker')}
+        title={t('tokens_title')}
+        lead={say('tokens_lead')}
       >
         <form className="ex-lookup" onSubmit={(e) => void lookup(e)} data-field-clear>
-          <label className="label form-label" htmlFor="token-lookup">Look up a QRC-20 token</label>
+          <label className="label form-label" htmlFor="token-lookup">{t('tokens_lookup_label')}</label>
           <div className="form-row">
             <input
               id="token-lookup"
@@ -148,7 +154,7 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
               type="text"
               value={contract}
               onChange={(e) => setContract(e.target.value)}
-              placeholder="Token contract address"
+              placeholder={t('tokens_lookup_placeholder')}
               disabled={checking}
               spellCheck={false}
               autoComplete="off"
@@ -156,7 +162,7 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
               aria-describedby={lookupError ? 'token-lookup-error' : undefined}
             />
             <button type="submit" className="btn btn-solid" disabled={checking} aria-busy={checking || undefined}>
-              <span className="swap"><span data-on={!checking}>Open</span><span data-on={checking}>Checking…</span></span>
+              <span className="swap"><span data-on={!checking}>{t('tokens_open')}</span><span data-on={checking}>{t('proof_checking')}</span></span>
             </button>
           </div>
           <p id="token-lookup-error" className="ex-error form-note" role="alert">{lookupError ?? '\u00a0'}</p>
@@ -166,11 +172,11 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
       <div className="wrap ex-body">
         <section className="ex-group">
           <DataTable
-            title="All tokens"
-            meta={<span className="label">{tokens ? `${int(total)} tokens` : '— tokens'}</span>}
+            title={t('tokens_all')}
+            meta={<span className="label">{t('tokens_count', { count: tokens ? int(total) : '—' })}</span>}
             tools={(
               <div className="ex-filter-field">
-                <label className="sr-only" htmlFor="token-filter">Filter by symbol, name or contract address</label>
+                <label className="sr-only" htmlFor="token-filter">{t('tokens_filter')}</label>
                 <input
                   id="token-filter"
                   className="field"
@@ -180,19 +186,19 @@ export default function TokensClient({ first }: { first?: FirstAnswer | null }) 
                     setSearch(e.target.value);
                     setPage(1);
                   }}
-                  placeholder="Filter by symbol, name or contract address"
+                  placeholder={t('tokens_filter')}
                   spellCheck={false}
                   autoComplete="off"
                 />
               </div>
             )}
-            caption="QRC-20 tokens deployed on QNet Blockchain"
+            caption={say('tokens_caption')}
             columns={columns}
             rows={tokens}
-            rowKey={(t) => t.contract_address}
+            rowKey={(x) => x.contract_address}
             loadingRows={PER_PAGE}
             error={listError && tokens && tokens.length > 0 ? listError : undefined}
-            empty={listError ?? (search.trim() ? 'No tokens match this filter.' : 'No QRC-20 tokens have been deployed yet.')}
+            empty={listError ?? (search.trim() ? t('tokens_no_match') : t('tokens_none'))}
           />
           {total > PER_PAGE && <Pager page={page} pages={pages} total={total} onPage={(n) => setPage(Math.min(Math.max(1, n), pages))} />}
         </section>

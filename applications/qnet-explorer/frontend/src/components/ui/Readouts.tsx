@@ -1,10 +1,13 @@
-// Readouts, the instrument panel (B-SPEC 5.11): each reading a short top rule, a label, a value in light mono and one
+'use client';
+
+// Readouts, the instrument panel: each reading a short top rule, a label, a value in light mono and one
 // line under it. A value with a page is a link; an unknown value is "—" in Fog at full height, so nothing moves when it
 // arrives. A value is never cut and never wraps: a long one is set smaller by its length (styles/base.css .ro-v).
 
 import IntentLink from './IntentLink';
 import type { CSSProperties, ReactNode } from 'react';
-import { readoutLength } from '@/lib/geometry';
+import { useT } from '@/i18n/client';
+import { amountLength, readoutLength } from '@/lib/geometry';
 import Flash from './Flash';
 import { AmountUnit, unitText, type AmountToken } from './EntityLink';
 
@@ -44,9 +47,10 @@ interface ReadoutProps {
 }
 
 export function Readout({ label, value, unit, href, unitHref, amount, sub, subTone, progress, flash, wide, mark, children }: ReadoutProps) {
+  const t = useT();
   const known = value !== null && value !== undefined && value !== '';
-  // An amount's unit is as large as its number, with its icon (about one character): it counts in full.
-  const len = !known ? 1 : (amount ? readoutLength(`${value} ${unitText(amount)}`, undefined, true) + (mark ? 1.6 : 0)
+  // An amount's unit is as large as its number, with its icon and gap: both count in full (geometry.ts amountLength).
+  const len = !known ? 1 : (amount ? amountLength(value, unitText(amount, t('token_unnamed'))) + (mark ? 1.6 : 0)
     : readoutLength(value, unit, Boolean(mark)));
   const length = { '--ro-len': len } as CSSProperties;
   const inner = known ? (flash ? <Flash value={value} /> : value) : <span className="dash">—</span>;

@@ -7,6 +7,7 @@ const env = () => {
 };
 
 export const requireUnlocked = (...args) => env().session.requireUnlocked(...args);
+export const isUnlocked = (...args) => env().session.isUnlocked(...args);
 export const touch = (...args) => env().session.touch(...args);
 export const cachedViews = (...args) => env().session.cachedViews(...args);
 export const forgetViews = (...args) => env().session.forgetViews(...args);

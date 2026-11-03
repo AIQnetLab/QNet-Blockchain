@@ -20,15 +20,18 @@ test('the workspace root has no dependencies of its own, and the lockfile none t
   assert.equal(root.devDependencies, undefined);
   const lock = json('package-lock.json');
   assert.deepEqual(Object.keys(lock.packages['']).filter((k) => /dependencies/i.test(k)), []);
-  // react-simple-maps, never imported, pulled d3-color (GHSA-36jr-mh4h-2g58) onto the production host.
-  for (const name of ['react-simple-maps', 'd3-color', 'd3-zoom', 'd3-geo']) {
-    assert.equal(lock.packages[`node_modules/${name}`], undefined, name);
+  // A package no file imports is installed at no depth: react-simple-maps, never imported, pulled d3-color
+  // (GHSA-36jr-mh4h-2g58) onto the production host.
+  const keys = Object.keys(lock.packages);
+  for (const name of ['react-simple-maps', 'd3-color', 'd3-zoom', 'd3-geo', '@radix-ui/react-dialog',
+    '@radix-ui/react-dropdown-menu', '@radix-ui/react-label', '@radix-ui/react-slot', '@radix-ui/react-tabs',
+    'class-variance-authority', 'clsx', 'lucide-react', 'next-themes', 'tailwind-merge']) {
+    assert.deepEqual(keys.filter((k) => k.endsWith(`node_modules/${name}`)), [], name);
   }
 });
 
-// SITE-R4-DEP-01: 380 of 500 entries had neither `resolved` nor `integrity`, @noble/hashes (the faucet
-// signer's and the /activate key exchange's SHA-512) among them, so `npm ci` on the host took whatever tarball
-// its configured registry served for that version. Every installed entry now pins its tarball by hash.
+// An entry with neither `resolved` nor `integrity` lets `npm ci` on the host take whatever tarball its configured
+// registry serves for that version, so every installed entry pins its tarball by hash.
 test('every package of the lockfile pins its tarball: a registry URL and a sha512 integrity', () => {
   const lock = json('package-lock.json');
   assert.equal(lock.lockfileVersion, 3);
@@ -57,10 +60,10 @@ test('every package of the lockfile pins its tarball: a registry URL and a sha51
   assert.deepEqual(unpinned(stripped), ['node_modules/@noble/hashes: no sha512 integrity']);
 });
 
-// The deploy scripts check the lockfile before every `npm ci`.
-test('every npm ci of the deploy scripts runs after the lockfile gate', () => {
+// The deploy script checks the lockfile before every `npm ci`.
+test('every npm ci of the deploy script runs after the lockfile gate', () => {
   const REPO = new URL('../../../../../../', import.meta.url);
-  for (const path of ['deployment/deploy-aiqnet.sh', 'deployment/deploy-to-1984.sh']) {
+  for (const path of ['deployment/deploy-aiqnet.sh']) {
     const text = readFileSync(new URL(path, REPO), 'utf8').replace(/\r\n/g, '\n');
     const installs = [...text.matchAll(/^(\s*)npm ci$/gm)];
     assert.ok(installs.length >= 2, path);
@@ -106,7 +109,7 @@ test('the gate passes an allow-listed advisory and its dependents until the entr
   assert.equal(unexplained(known, allow.map((a) => ({ ...a, why: ' ' })), before).length, allow.length);
   assert.deepEqual(stale([{ vulnerabilities: {} }], allow), allow.map((a) => a.id));
 
-  // SITE-R5-CSP-01: a reason that waits for an upgrade expires. The day after `until` the advisory fails again,
+  // A reason that waits for an upgrade expires. The day after `until` the advisory fails again,
   // and so does an entry without a valid date.
   assert.deepEqual(unexplained(known, allow, day('2026-10-22')), [
     'postcss GHSA-qx2v-qp2m-jg93 (high): t [allowlist entry expired 2026-10-21]',
@@ -117,7 +120,7 @@ test('the gate passes an allow-listed advisory and its dependents until the entr
   }
 });
 
-// SITE-R5-CSP-01: npm audit never reports a framework line that is out of support (its unfixed advisories have
+// npm audit never reports a framework line that is out of support (its unfixed advisories have
 // no fixed version on that line), so the gate compares the pinned lines with their security support dates.
 test('the gate fails on a release line past its security support or without a date, and warns ahead', () => {
   const support = {
@@ -179,4 +182,15 @@ test('the site pins a Next.js and a Node.js line that release-support.json dates
   // The release checklist runs the live audit and the support check.
   assert.equal(pkg.scripts['audit:check'], 'node scripts/audit-check.mjs');
   assert.match(readFileSync(new URL('../__release__/npm-audit.release.test.mjs', import.meta.url), 'utf8'), /check\(\)/);
+});
+
+// A check changes nothing: `lint`, what CI and a contributor run, only reads the sources and the types; the scripts that
+// rewrite files say so in their names. Biome and tsc come from the workspace's own dependencies, never fetched by a runner.
+test('the lint check rewrites no file, and only the scripts named for it write', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.scripts.lint, 'biome lint src scripts lib && tsc --noEmit -p tsconfig.json');
+  const writes = Object.entries(pkg.scripts).filter(([, cmd]) => /--write|--apply|--fix\b/.test(cmd)).map(([name]) => name);
+  assert.deepEqual(writes.sort(), ['format', 'lint:fix']);
+  for (const [name, cmd] of Object.entries(pkg.scripts)) assert.doesNotMatch(cmd, /\bbunx\b/, name);
+  assert.ok(pkg.devDependencies['@biomejs/biome'] && pkg.devDependencies.typescript);
 });

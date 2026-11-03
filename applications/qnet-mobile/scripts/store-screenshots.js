@@ -450,6 +450,6 @@ if (require.main === module) {
 
 module.exports = {
   DEVICES, STATUS_BAR, SETTLE_MS, PHRASE_ENV, PNG_SIGNATURE,
-  flowScenes, shotNames, flowAppId, pngInfo, pngChunks, pngChunk, flattenPng, flattenShots, shotProblem, checkDir,
+  flowScenes, shotNames, flowAppId, pngInfo, pngChunks, pngChunk, unfilter, flattenPng, flattenShots, shotProblem, checkDir,
   pickDeviceTypes, pasteboard, controlHandler, controlServer, maestroEnv, flowArgs, runSecrets,
 };

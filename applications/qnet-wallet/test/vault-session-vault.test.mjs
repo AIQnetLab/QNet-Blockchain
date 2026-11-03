@@ -818,6 +818,31 @@ describe('vault: password change, reveal, wipe', () => {
     await create();
     assert.notEqual(record().aad.walletId, walletId, 'a new wallet is a new identity');
   });
+
+  // The Solana route (solana.js, decision 56) is no wallet data, and a Solana call still running may write it meanwhile.
+  it('wipes the vault also when a Solana call writes its route again while storage.local is cleared', async () => {
+    await create();
+    const local = env.chrome.storage.local;
+    const route = (probeAt) => ({ [STORAGE_KEYS.SOLANA_ROUTE]: { v: 1, via: 'site', probeAt } });
+    await local.set(route(1));
+    const { clear, remove } = local;
+    local.clear = async () => {
+      await clear();
+      await local.set(route(2));
+    };
+    local.remove = async (keys) => {
+      await remove(keys);
+      await local.set(route(2));
+    };
+    try {
+      assert.deepEqual(await vault.wipe({ password: PASSWORD, confirm: 'DELETE' }), { wiped: true });
+    } finally {
+      Object.assign(local, { clear, remove });
+    }
+    assert.deepEqual(await env.idb.databases(), []);
+    assert.equal(await vault.vaultExists(), false);
+    assert.deepEqual(local.dump(), route(2), 'the route the call wrote after the clear, and nothing else');
+  });
 });
 
 describe('vault: durability and earlier records (EXT-VAULT-R2-03)', () => {

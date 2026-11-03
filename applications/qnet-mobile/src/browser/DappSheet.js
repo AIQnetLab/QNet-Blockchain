@@ -14,6 +14,7 @@ import { Answer, Answers } from '../components/ui/Action';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { describeOrigin } from './url';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
+import { useHoldForUser } from '../utils/userAction';
 import {
   ARM_MS, SEND_ARM_MS, armDelayFor, previewShort, previewUnread, spendableNano, spendableTokenBase,
 } from './dappProvider';
@@ -118,6 +119,8 @@ export function looksLikeKnownAddress(candidate, known) {
 
 export default function DappSheet({ view, actions, t, authenticate, accounts }) {
   const [acting, setActing] = useState(false);
+  // A confirmed request being carried out has the network before the background verification (utils/userAction).
+  useHoldForUser(acting || view.busy === true);
   const [pick, setPick] = useState(null); // 'replace' while the wallet's one unconfirmed transaction may be replaced
   // A confirm that did nothing (the approval refused it) says so on the sheet, which stays.
   const [failNote, setFailNote] = useState(false);

@@ -1,4 +1,4 @@
-// Where each entity the site names leads, and how it is written (B-SPEC 5.7, owner 19.10): blocks, transactions,
+// Where each entity the site names leads, and how it is written: blocks, transactions,
 // addresses, node ids, tokens, QNC, epochs and Solana transactions. One rule set for every table, readout, detail row
 // and menu; only a node id without a known address and a name without a page are text. components/ui/EntityLink.tsx
 // renders it.
@@ -6,6 +6,7 @@
 import { EPOCH_BLOCKS } from './cabinet/epochs.ts';
 import { int, short } from './format.ts';
 import { solanaTxUrl } from './one-dev.ts';
+import type { T } from './texts.ts';
 
 export type EntityKind = 'block' | 'tx' | 'address' | 'node' | 'token' | 'qnc' | 'epoch' | 'solana-tx';
 
@@ -41,7 +42,7 @@ export const isHeight = (value: unknown): boolean => (typeof value === 'number' 
 // An epoch has no page of its own: it leads to its first block (epoch N holds blocks N × 14,400 to (N + 1) × 14,400 - 1).
 export const epochHref = (epoch: number): string => `/explorer/block/${epoch * EPOCH_BLOCKS}`;
 
-export function entity(kind: EntityKind, value: string | number, options: EntityOptions = {}): Entity {
+export function entity(kind: EntityKind, value: string | number, t: T, options: EntityOptions = {}): Entity {
   const raw = String(value);
   const plain = (text: string): Entity => ({ href: null, text, title: raw, external: false });
   const page = (href: string, text: string): Entity => ({ href, text, title: raw, external: false });
@@ -66,7 +67,7 @@ export function entity(kind: EntityKind, value: string | number, options: Entity
     case 'epoch': {
       if (!isHeight(value)) return plain(raw);
       const n = Number(raw);
-      return { href: epochHref(n), text: `Epoch ${int(n)}`, title: `Epoch ${int(n)}, from block ${int(n * EPOCH_BLOCKS)}`, external: false };
+      return { href: epochHref(n), text: t('epoch_n', { epoch: int(n) }), title: t('epoch_from', { epoch: int(n), block: int(n * EPOCH_BLOCKS) }), external: false };
     }
     case 'solana-tx':
       return SOLANA_SIGNATURE.test(raw)

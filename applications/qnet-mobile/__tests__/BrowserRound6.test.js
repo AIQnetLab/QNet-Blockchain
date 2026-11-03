@@ -13,7 +13,8 @@ const fs = require('fs');
 const path = require('path');
 const { sha3_256 } = require('js-sha3');
 const AsyncStorage = require('@react-native-async-storage/async-storage');
-const { createDappProvider, CODES, TIMINGS } = require('../src/browser/dappProvider');
+const { CODES, TIMINGS } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 const DappSheet = require('../src/browser/DappSheet').default;
 const { WalletManager } = require('../src/components/WalletManager');
 const { CANONICAL_BURN_ADDRESS } = require('../src/crypto/TxBuilders');
@@ -55,7 +56,7 @@ function setup(over = {}) {
     onChange: (v) => views.push(v),
     ...over,
   };
-  const p = createDappProvider(deps);
+  const p = testProvider(deps);
   const ctx = { origin: SITE, binding: { origin: SITE, doc: 'd', id: 'x', nav: 1 } };
   return { p, deps, ctx, views, shown: () => views[views.length - 1] };
 }
@@ -192,7 +193,7 @@ describe('MOB-BR-R4-02: a site\'s send signs only at the confirmed nonce + 1', (
     expect(sign).not.toHaveBeenCalled();
     wm.resolveNonce = async () => ({ nonce: 6, confirmed: 5, replaces: null });
     await expect(wm._signAndSubmit(QNET, sign, {}, { oneInFlight: true })).rejects.toMatchObject({ code: 'SIGNED' });
-    expect(sign).toHaveBeenCalledWith(6);
+    expect(sign).toHaveBeenCalledWith(6, null); // no genesis answer names the V2 form here: the V1 form
     const browser = read('src/browser/BrowserScreen.js');
     expect(browser).toMatch(/const opts = \{ expectNonce: d\.nonce, choice: d\.choice, oneInFlight: true \};/);
     expect(browser).toMatch(/confirmed: plan\.confirmed,/);

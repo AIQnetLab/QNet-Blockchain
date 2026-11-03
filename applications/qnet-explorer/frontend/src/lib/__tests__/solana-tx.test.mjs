@@ -107,9 +107,10 @@ function scripted(answers) {
 
 const status = (confirmationStatus, err = null) => ({ value: [{ confirmationStatus, err }] });
 const none = { value: [null] };
+// A confirmation's options on a scripted clock: 10 s of its time.
 const clock = () => {
   let t = 0;
-  return { now: () => t, sleep: async (ms) => { t += ms; } };
+  return { now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 10_000 };
 };
 
 test('confirmation: confirmed lands, an on-chain error fails, expiry with no trace fails, a deadline is unknown', async () => {
@@ -133,11 +134,23 @@ test('confirmation: confirmed lands, an on-chain error fails, expiry with no tra
 
   // The RPC keeps failing: never taken as an answer; the deadline makes it unknown.
   ({ rpc } = scripted({ getSignatureStatuses: [new Error('down')], getBlockHeight: [new Error('down')] }));
-  assert.deepEqual(await confirmSignature(rpc, sig, 200, { ...clock(), timeoutMs: 10_000 }), { status: 'unknown', reason: 'confirmation_timeout' });
+  assert.deepEqual(await confirmSignature(rpc, sig, 200, clock()), { status: 'unknown', reason: 'confirmation_timeout' });
 
   // Still valid and nowhere at the deadline: unknown, because it may still land.
   ({ rpc } = scripted({ getSignatureStatuses: [none], getBlockHeight: [150] }));
-  assert.equal((await confirmSignature(rpc, sig, 200, { ...clock(), timeoutMs: 10_000 })).status, 'unknown');
+  assert.equal((await confirmSignature(rpc, sig, 200, clock())).status, 'unknown');
+});
+
+// The claim's answer keeps to its time whatever the RPC does: a read that never answers is not waited for.
+test('confirmation answers within its time when a read never answers', { timeout: 5_000 }, async () => {
+  const sig = VECTORS.txs[0].signature;
+  const hung = () => new Promise(() => {});
+  for (const answers of [{ getSignatureStatuses: [hung] }, { getSignatureStatuses: [none], getBlockHeight: [hung] }]) {
+    const { rpc } = scripted(answers);
+    const started = Date.now();
+    assert.deepEqual(await confirmSignature(rpc, sig, 200, { timeoutMs: 300, pollMs: 50 }), { status: 'unknown', reason: 'confirmation_timeout' });
+    assert.ok(Date.now() - started < 1_500, 'answered near its time');
+  }
 });
 
 test('sending: a JSON-RPC error is a refusal; no answer is unknown, never a refusal', async () => {
@@ -146,9 +159,10 @@ test('sending: a JSON-RPC error is a refusal; no answer is unknown, never a refu
   assert.deepEqual(await sendTransaction(rpc, wire), { state: 'sent' });
   assert.deepEqual(calls[0].params, ['AQID', { encoding: 'base64', preflightCommitment: 'confirmed', maxRetries: 3 }]);
   ({ rpc } = scripted({ sendTransaction: [new RpcError(-32002, 'Transaction simulation failed')] }));
-  assert.deepEqual(await sendTransaction(rpc, wire), { state: 'refused', error: 'Transaction simulation failed' });
-  ({ rpc } = scripted({ sendTransaction: [new Error('timeout')] }));
-  assert.deepEqual(await sendTransaction(rpc, wire), { state: 'unknown' });
+  assert.deepEqual(await sendTransaction(rpc, wire), { state: 'refused', error: 'Transaction simulation failed', code: -32002 });
+  const lost = new Error('timeout');
+  ({ rpc } = scripted({ sendTransaction: [lost] }));
+  assert.deepEqual(await sendTransaction(rpc, wire), { state: 'unknown', cause: lost });
 });
 
 test('the RPC client: JSON-RPC errors, HTTP errors and malformed answers are told apart', async () => {

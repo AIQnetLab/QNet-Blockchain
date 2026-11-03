@@ -1,8 +1,10 @@
-// A request to a wallet, the network or a server, in the slot of the control that started it (B-SPEC 5.22): waiting
+// A request to a wallet, the network or a server, in the slot of the control that started it: waiting
 // (what to do, the blinking cursor, Cancel where it can be cancelled), answered (the answer, Start again where it applies)
-// or failed (what happened and what to do, Try again). Answers to the visitor's own actions are announced.
+// or failed (what happened and what to do, Try again). Answers to the visitor's own actions are announced. A line given
+// as a string (a message the page put together) keeps its product names out of page translation (lib/rich.tsx named).
 
 import type { ReactNode } from 'react';
+import { named } from '@/lib/rich';
 import Action from './Action';
 
 interface LineProps {
@@ -14,7 +16,7 @@ interface LineProps {
 export function Waiting({ children, action }: LineProps) {
   return (
     <div className="rq">
-      <p className="wait" role="status">{children}</p>
+      <p className="wait" role="status">{named(children)}</p>
       {action && <Action kind="quiet" onClick={action.onClick}>{action.label}</Action>}
     </div>
   );
@@ -23,7 +25,7 @@ export function Waiting({ children, action }: LineProps) {
 export function Answered({ children, action }: LineProps) {
   return (
     <div className="rq">
-      <p className="rq-answer" role="status">{children}</p>
+      <p className="rq-answer" role="status">{named(children)}</p>
       {action && <Action kind="act" onClick={action.onClick}>{action.label}</Action>}
     </div>
   );
@@ -32,7 +34,7 @@ export function Answered({ children, action }: LineProps) {
 export function Failed({ children, action }: LineProps) {
   return (
     <div className="rq">
-      <p className="rq-failed" role="alert">{children}</p>
+      <p className="rq-failed" role="alert">{named(children)}</p>
       {action && <Action kind="act" onClick={action.onClick}>{action.label}</Action>}
     </div>
   );

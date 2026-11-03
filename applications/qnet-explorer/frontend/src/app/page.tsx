@@ -1,5 +1,6 @@
 import HomeClient from './HomeClient';
 import InAppGuard from '@/components/InAppGuard';
+import AreaTexts from '@/i18n/area';
 import type { RecentBlock } from '@/lib/explorer-view';
 import { headHub } from '@/server/head-hub';
 
@@ -20,7 +21,9 @@ export default async function HomePage() {
   // Not part of the QNet app's view (the tokenomics describe activation and its cost): there it goes to the explorer.
   return (
     <InAppGuard>
-      <HomeClient initialStats={initialStats} blocks={blocks} />
+      <AreaTexts area="home">
+        <HomeClient initialStats={initialStats} blocks={blocks} />
+      </AreaTexts>
     </InAppGuard>
   );
 }

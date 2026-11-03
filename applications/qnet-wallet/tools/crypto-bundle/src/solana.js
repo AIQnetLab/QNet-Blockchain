@@ -6,6 +6,11 @@ import { base58 } from '@scure/base';
 import { assertBytes, concatBytes, zeroize } from './bytes.js';
 import { CoreError, fail } from './errors.js';
 
+// The way the worker's Solana calls go, to the endpoint or through aiqnet.io's relay: the app's own rule.
+export {
+  SOLANA_DIRECT_RETRY_MS, solanaAttemptAfter, solanaProbeDue, solanaRouteAfter, solanaRouteOf,
+} from '../../../../qnet-mobile/src/utils/solanaRoute.js';
+
 // Account 0 of the Solana path the mobile app uses.
 export const SOLANA_DERIVATION_PATH = "m/44'/501'/0'/0'";
 

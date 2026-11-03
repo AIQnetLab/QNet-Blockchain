@@ -7,18 +7,23 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import Ago from '@/components/explorer/Ago';
-import { textCol } from '@/components/explorer/columns';
+import { ageWidth, textCol } from '@/components/explorer/columns';
 import Action from '@/components/ui/Action';
 import DataTable from '@/components/ui/DataTable';
 import EntityLink from '@/components/ui/EntityLink';
 import PageHead from '@/components/ui/PageHead';
 import Pager from '@/components/ui/Pager';
 import { useChainHead } from '@/hooks/useChainHead';
+import { useI18n, useT } from '@/i18n/client';
 import { blocksPath } from '@/lib/explorer-reads';
 import {
   BLOCKS_PER_PAGE, blockWindow, blocksAnchor, blocksPage, blocksPageTop, heightOf, txCountText, type RecentBlock,
 } from '@/lib/explorer-view';
 import { int } from '@/lib/format';
+import { wordsWidth } from '@/lib/geometry';
+import { named } from '@/lib/rich';
+import { siteRequest } from '@/lib/site-request';
+import type { T } from '@/lib/texts';
 import type { FirstAnswer } from '@/server/first-answer';
 
 interface Place {
@@ -26,25 +31,25 @@ interface Place {
   top: number;
 }
 
-const UNREADABLE = 'Could not read these blocks.';
-
 const readRows = (top: number, ok: boolean, body: unknown): RecentBlock[] | null => {
   const result = body as { success?: boolean; data?: unknown } | null;
   return ok && result?.success && Array.isArray(result.data) ? blockWindow(top, result.data as RecentBlock[]) : null;
 };
 
 // A height the index does not hold yet has no hash: its row shows the height alone.
-const COLUMNS = [
-  textCol<RecentBlock>('block', 'Block', (b) => <EntityLink kind="block" value={b.height} />, 112),
-  textCol<RecentBlock>('time', 'Time', (b) => (b.hash !== null ? <Ago ts={b.timestamp} /> : null), 88),
-  textCol<RecentBlock>('producer', 'Producer', (b) => (b.producer ? <EntityLink kind="node" value={b.producer} address={b.producerAddress} /> : null)),
-  textCol<RecentBlock>('txs', 'Transactions', (b) => (b.txCount === null ? null : txCountText(b.txCount)), 120, 'right'),
+const columns = (t: T) => [
+  textCol<RecentBlock>('block', t('col_block'), (b) => <EntityLink kind="block" value={b.height} />, 112),
+  textCol<RecentBlock>('time', t('col_time'), (b) => (b.hash !== null ? <Ago ts={b.timestamp} /> : null), ageWidth(t, 88)),
+  textCol<RecentBlock>('producer', t('col_producer'), (b) => (b.producer ? <EntityLink kind="node" value={b.producer} address={b.producerAddress} /> : null)),
+  // Wider where the page's language writes a longer count, so none is cut.
+  textCol<RecentBlock>('txs', t('col_transactions'), (b) => (b.txCount === null ? null : txCountText(b.txCount, t)), Math.max(120, wordsWidth([txCountText(99_999, t)])), 'right'),
   // The height is the row's link; its hash is a second view of the same block.
-  textCol<RecentBlock>('hash', 'Hash', (b) => (b.hash ? <EntityLink kind="block" value={b.hash} link={false} /> : null), 136),
+  textCol<RecentBlock>('hash', t('col_hash'), (b) => (b.hash ? <EntityLink kind="block" value={b.hash} link={false} /> : null), 136),
 ];
 
 // How many blocks are newer than page 1, and Show newest: the only part that renders for each head.
 function NewerBlocks({ anchor, onHead, onNewest }: { anchor: number | null; onHead: (height: number) => void; onNewest: (height: number) => void }) {
+  const t = useT();
   const { height } = useChainHead();
   useEffect(() => {
     if (height > 0) onHead(height);
@@ -52,8 +57,8 @@ function NewerBlocks({ anchor, onHead, onNewest }: { anchor: number | null; onHe
   const newer = anchor === null ? 0 : Math.max(0, height - anchor);
   return (
     <p className="ex-newer" data-on={newer > 0}>
-      <span className="num">{newer > 0 ? `${int(newer)} newer ${newer === 1 ? 'block' : 'blocks'}` : '\u00a0'}</span>
-      <Action kind="act" onClick={() => onNewest(height)} disabled={newer === 0}>Show newest</Action>
+      <span className="num">{newer > 0 ? t(newer === 1 ? 'blocks_newer_one' : 'blocks_newer', { count: int(newer) }) : '\u00a0'}</span>
+      <Action kind="act" onClick={() => onNewest(height)} disabled={newer === 0}>{t('blocks_show_newest')}</Action>
     </p>
   );
 }
@@ -61,6 +66,9 @@ function NewerBlocks({ anchor, onHead, onNewest }: { anchor: number | null; onHe
 // `first` is the server's read of the page starting at `top`, placed in the pages from `anchor` (null: the server had no
 // head, the page places itself on the first head); absent while the route loads (loading.tsx): the page's shape, no reads.
 export default function BlocksClient({ first, top, anchor }: { first?: FirstAnswer | null; top?: number; anchor?: number }) {
+  const { t, say } = useI18n();
+  const UNREADABLE = t('blocks_unreadable');
+  const COLUMNS = useMemo(() => columns(t), [t]);
   const [place, setPlace] = useState<Place | null>(top !== undefined && anchor !== undefined ? { anchor, top } : null);
   const [rows, setRows] = useState<RecentBlock[] | null>(() => (first && top !== undefined ? readRows(top, first.status < 400, first.body) : null));
   // The first height of the rows on screen.
@@ -88,7 +96,7 @@ export default function BlocksClient({ first, top, anchor }: { first?: FirstAnsw
     setLoading(true);
     void (async () => {
       try {
-        const res = await fetch(blocksPath(at), { signal: controller.signal });
+        const res = await fetch(blocksPath(at), siteRequest({ signal: controller.signal }));
         const read = readRows(at, res.ok, await res.json().catch(() => null));
         if (controller.signal.aborted) return;
         if (read) shownTop.current = at;
@@ -103,12 +111,14 @@ export default function BlocksClient({ first, top, anchor }: { first?: FirstAnsw
       }
     })();
     return () => controller.abort();
-  }, [place, retry, first]);
+  }, [place, retry, first]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // A new page starts at the list's top, scrolled there only when the reader is below it; the address bar keeps it.
+  // A new page starts at the list's top, scrolled there only when the reader is below it; the address bar keeps it, in
+  // the page's language.
   const go = useCallback((next: Place, newest = false) => {
     setPlace(next);
-    window.history.replaceState(null, '', newest ? '/explorer/blocks' : `/explorer/blocks?at=${next.top}`);
+    const path = window.location.pathname;
+    window.history.replaceState(null, '', newest ? path : `${path}?at=${next.top}`);
     const el = section.current;
     if (el && el.getBoundingClientRect().top < 0) el.scrollIntoView({ block: 'start' });
   }, []);
@@ -126,8 +136,8 @@ export default function BlocksClient({ first, top, anchor }: { first?: FirstAnsw
     if (!place) return;
     const h = heightOf(asked);
     const newest = Math.max(head.current, place.anchor);
-    if (h === null) return setAskError('Enter a block height, a whole number such as 17,500.');
-    if (h > newest) return setAskError(`Block ${int(h)} is not on QNet Blockchain yet. The newest is ${int(newest)}.`);
+    if (h === null) return setAskError(t('blocks_ask_invalid'));
+    if (h > newest) return setAskError(t('blocks_ask_ahead', { height: int(h), newest: int(newest) }));
     setAskError(null);
     go({ anchor: blocksAnchor(h, newest), top: h });
   };
@@ -139,19 +149,19 @@ export default function BlocksClient({ first, top, anchor }: { first?: FirstAnsw
     if (page !== at.page) go({ anchor: place.anchor, top: blocksPageTop(place.anchor, page) });
   };
 
-  const shownRange = rows && rows.length > 0 ? `${int(rows[0].height)} to ${int(rows[rows.length - 1].height)}` : '—';
-  const failed = listError ? <>{listError} <Action kind="act" onClick={() => setRetry((n) => n + 1)}>Try again</Action></> : null;
+  const shownRange = rows && rows.length > 0 ? t('blocks_range', { from: int(rows[0].height), to: int(rows[rows.length - 1].height) }) : '—';
+  const failed = listError ? <>{listError} <Action kind="act" onClick={() => setRetry((n) => n + 1)}>{t('try_again')}</Action></> : null;
   const error = rows && rows.length > 0 ? failed : null;
-  const empty = failed ?? 'No blocks here yet.';
+  const empty = failed ?? t('blocks_empty');
 
   // The table renders again only for its own rows, never for a head.
   const table = useMemo(() => (
     <DataTable
       className="ex-blocks-tbl"
-      title="Blocks"
+      title={t('blocks_title')}
       meta={<span className="label num">{shownRange}</span>}
       tools={<NewerBlocks anchor={place?.anchor ?? null} onHead={onHead} onNewest={onNewest} />}
-      caption="Blocks of QNet Blockchain, newest first"
+      caption={say('blocks_caption')}
       columns={COLUMNS}
       rows={rows}
       rowKey={(b) => String(b.height)}
@@ -159,13 +169,13 @@ export default function BlocksClient({ first, top, anchor }: { first?: FirstAnsw
       empty={empty}
       error={error}
     />
-  ), [rows, shownRange, place?.anchor, listError, onHead, onNewest]); // eslint-disable-line react-hooks/exhaustive-deps
+  ), [rows, shownRange, place?.anchor, listError, onHead, onNewest, COLUMNS]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="ex ex-detail">
-      <PageHead kicker="Blocks" title="All blocks" lead="Every block of QNet Blockchain from the newest to Genesis. Each height opens its block.">
+      <PageHead kicker={t('blocks_title')} title={t('ex_all_blocks')} lead={say('blocks_lead')}>
         <form className="ex-lookup" onSubmit={ask} data-field-clear>
-          <label className="label form-label" htmlFor="blocks-at">Go to a block height</label>
+          <label className="label form-label" htmlFor="blocks-at">{t('blocks_ask_label')}</label>
           <div className="form-row">
             <input
               id="blocks-at"
@@ -175,15 +185,15 @@ export default function BlocksClient({ first, top, anchor }: { first?: FirstAnsw
               enterKeyHint="go"
               value={asked}
               onChange={(e) => setAsked(e.target.value)}
-              placeholder="Block height"
+              placeholder={t('ro_height')}
               spellCheck={false}
               autoComplete="off"
               aria-invalid={askError ? true : undefined}
               aria-describedby={askError ? 'blocks-at-error' : undefined}
             />
-            <button type="submit" className="btn btn-solid">Show</button>
+            <button type="submit" className="btn btn-solid">{t('ex_show')}</button>
           </div>
-          <p id="blocks-at-error" className="ex-error form-note" role="alert">{askError ?? '\u00a0'}</p>
+          <p id="blocks-at-error" className="ex-error form-note" role="alert">{askError ? named(askError) : '\u00a0'}</p>
         </form>
       </PageHead>
 

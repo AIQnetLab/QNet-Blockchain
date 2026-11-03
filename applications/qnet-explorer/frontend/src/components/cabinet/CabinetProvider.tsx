@@ -6,7 +6,7 @@
 // shows it approved this site, unless Disconnect was the last word here (extensionReconnect).
 // Also whether the cabinet sends QNet Wallet its `link`, `reserve`, `unlink` and `claim` requests yet (src/server/phone-flows.ts, read by
 // the layout), the activation the QNet extension reported here for a wallet (src/lib/cabinet/kept-activation.ts), and
-// where the wallet's activation stands from every source (src/lib/cabinet/wallet-activation.ts, unified plan R1 and R6):
+// where the wallet's activation stands from every source (src/lib/cabinet/wallet-activation.ts):
 // the network (its node of either type), the server's activation record with the search of the wallet's own Solana
 // address, and the QNet extension that holds the wallet (qnet_getActivation, never a window). Every page shows that one
 // state, and none offers a burn unless it is `none`.
@@ -26,9 +26,12 @@ import {
 } from '@/lib/cabinet/wallet-choice';
 import { ACTIVATIONS_KEY, keepAnswer, loadKept, type KeptActivation, type KeptActivations } from '@/lib/cabinet/kept-activation';
 import { SCAN_CACHE_MS, parseActivationRecord, type ActivationRecordView, type ScanView } from '@/lib/cabinet/burn-record';
-import { WATCH_MAX_MS, activationView, nextStep, watchInterval, type ActivationView, type ExtensionRead, type Read } from '@/lib/cabinet/wallet-activation';
+import {
+  WATCH_MAX_MS, activationView, followedSuperId, nextStep, watchInterval, type ActivationView, type ExtensionRead, type Read,
+} from '@/lib/cabinet/wallet-activation';
 import type { DevicePlatform } from '@/lib/cabinet/node-view';
-import { superNodeId, type ActivationAnswer } from '@/lib/qnet-link';
+import { siteRequest } from '@/lib/site-request';
+import type { ActivationAnswer } from '@/lib/qnet-link';
 
 interface CabinetValue {
   // False until the remembered choice was read and, while the extension's first answer may still set the wallet, until
@@ -51,7 +54,7 @@ interface CabinetValue {
   view: ActivationView;
   // The server's record of the shown wallet, when read.
   record: ActivationRecordView | null;
-  // The super node id the page follows for the shown wallet: the one the network lists, else the wallet's own.
+  // The super node id the page follows for the shown wallet (wallet-activation.ts followedSuperId).
   superId: string | null;
   // Reads every source again now (after an answer of the extension, a burn, a Try again).
   refreshActivation: () => void;
@@ -75,15 +78,13 @@ const RECORD_IDLE_MS = 30_000;
 // The search of the wallet's Solana address is asked for at most this often when it failed or did not finish: two tabs
 // stay within the server's 10 searches per client per 10 minutes.
 const SCAN_RETRY_MS = 120_000;
-// The extension (shared contract C5): while it searches, while a burn is on its way, while it is locked or not
+// The extension: while it searches, while a burn is on its way, while it is locked or not
 // connected, and otherwise.
 // Within the contract's 3-5 s, and slow enough that two tabs stay under the extension's 30 calls a minute per site.
 const EXT_SEARCHING_MS = 5_000;
 const EXT_BUSY_MS = 10_000;
 const EXT_LOCKED_MS = 15_000;
 const EXT_IDLE_MS = 60_000;
-
-const REQUEST: RequestInit = { cache: 'no-store', credentials: 'omit', redirect: 'error' };
 
 function localStore(): Storage | null {
   try {
@@ -169,7 +170,7 @@ function useServerRecord(wallet: string | null, solana: string | null, pulse: nu
       if (withScan) tried.current = { key, at: now };
       let value: ActivationRecordView | null = null;
       try {
-        const res = await fetch(`/api/cabinet/activation/${encodeURIComponent(wallet)}${withScan ? `?solana=${encodeURIComponent(solana)}` : ''}`, REQUEST);
+        const res = await fetch(`/api/cabinet/activation/${encodeURIComponent(wallet)}${withScan ? `?solana=${encodeURIComponent(solana)}` : ''}`, siteRequest());
         value = res.status === 200 ? parseActivationRecord(await res.json(), wallet) : null;
       } catch {
         value = null;
@@ -177,7 +178,7 @@ function useServerRecord(wallet: string | null, solana: string | null, pulse: nu
       if (!live) return;
       if (value?.scan) setScan({ key, at: Date.now(), view: value.scan });
       // A read that failed keeps an earlier answer that knows something (a record, a reservation, a burn on its way); an
-      // earlier "none" is no answer now, so nothing is offered while the record cannot be read (R6).
+      // earlier "none" is no answer now, so nothing is offered while the record cannot be read.
       setRead((cur) => (value ? { wallet, read: { phase: 'ok', value } }
         : cur.wallet === wallet && cur.read.phase === 'ok' && cur.read.value.state !== 'none' ? cur : { wallet, read: { phase: 'unavailable' } }));
     };
@@ -264,7 +265,7 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
       setDisconnected(heldHere.disconnected);
       setViewing(heldHere.viewing);
     };
-    // A Disconnect, another wallet or another kept answer in another tab (SITE-F11): this tab's memory of it is over; a
+    // A Disconnect, another wallet or another kept answer in another tab: this tab's memory of it is over; a
     // wallet connected there ends this tab's view too.
     const onStorage = (event: StorageEvent) => {
       if (event.key !== null && event.key !== WALLET_KEY && event.key !== DISCONNECTED_KEY && event.key !== ACTIVATIONS_KEY) return;
@@ -321,9 +322,7 @@ export function CabinetProvider({ phoneFlows, children }: { phoneFlows: boolean;
   const cv = current ? choiceView(current) : null;
   const network = useWalletNode(wallet);
   const light = useNodeStatus(cv?.nodeId ?? null, viewOnly);
-  const listedSuper = network.state.phase === 'ok' && network.state.value.state === 'registered' && network.state.value.nodeType === 'super'
-    ? network.state.value.nodeId : null;
-  const superId = wallet ? listedSuper ?? superNodeId(wallet) : null;
+  const superId = followedSuperId(wallet, network.state);
   const superRead = useSuperStatus(superId);
   const server = useServerRecord(wallet, current?.solana ?? null, pulse);
   const busyRecord = server.read.phase === 'ok' && ['reserved', 'sending'].includes(server.read.value.state);

@@ -10,6 +10,7 @@
  * (light_binding::model_hint); null when nothing fits. Read once per launch.
  */
 import { NativeModules, Platform } from 'react-native';
+import { valueBy } from '../utils/deadline';
 
 export const MODEL_MAX = 40;
 const MODEL_RE = /^[A-Za-z0-9 .,+()/-]+$/;
@@ -147,17 +148,11 @@ export function iosModel({ machine = '', idiom = null } = {}) {
 async function readModel() {
   const N = NativeModules.QNetSecurity;
   if (!N || typeof N.deviceModel !== 'function') return null;
-  let timer = null;
-  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), READ_MS); });
-  try {
-    const raw = await Promise.race([N.deviceModel(), late]);
-    if (!raw || typeof raw !== 'object') return null;
-    if (Platform.OS === 'android') return androidModel(raw);
-    if (Platform.OS === 'ios') return iosModel(raw);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  const raw = await valueBy(N.deviceModel(), Date.now() + READ_MS, null);
+  if (!raw || typeof raw !== 'object') return null;
+  if (Platform.OS === 'android') return androidModel(raw);
+  if (Platform.OS === 'ios') return iosModel(raw);
+  return null;
 }
 
 let read = null;

@@ -173,7 +173,7 @@ export default Object.freeze({
   historyNotFound: '찾을 수 없음',
   historyUnverified: '검증되지 않음',
   historyDroppedLead: 'QNet Blockchain이 더 이상 이 거래를 보관하지 않으며 거래는 완료되지 않았습니다. 아무것도 지출되지 않았고, 다음 송금이 그 자리를 대신합니다.',
-  historyUnverifiedLead: '익스플로러에는 이 거래가 있지만 QNet Blockchain 노드에는 없습니다. 노드가 보관하는 기간보다 오래된 거래일 수 있습니다.',
+  historyUnverifiedLead: '익스플로러에는 이 거래가 있지만 QNet Blockchain 노드에는 없습니다.',
   historyTokenUnverifiedLead: '익스플로러에는 이 토큰 전송이 있지만 지갑이 아직 QNet Blockchain에서 증명하지 못했습니다.',
   historyReplacedLead: '이 지갑의 다른 거래가 해당 nonce를 사용했습니다. 이 거래는 절대 완료될 수 없습니다.',
   historyType: '유형',

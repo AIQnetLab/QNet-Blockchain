@@ -132,7 +132,9 @@ describe('MPLAT-R3-02: the integrity check runs when a phrase is shown or typed'
     expect(screen).toMatch(/t\('rooted_title'\),\s*t\('rooted_body_phrase'\)/);
     // A password wallet: after the password step; under the screen lock the import starts at the phrase field.
     expect(screen).toMatch(/if \(!\(await confirmPhraseScreen\(\)\)\) return;\s*setImportStep\(2\);/);
-    expect(screen).toMatch(/if \(deviceAuth && !\(await confirmPhraseScreen\(\)\)\) return;/);
+    // One way into the import (the welcome screen, an erase), with no wallet's own screen lock left to read.
+    expect(screen).toMatch(/const startImport = async \(\) => \{\s*const underLock = !!\(await walletManager\.deviceAuthAvailable\(\)\.catch\(\(\) => false\)\);\s*setDeviceAuthAvail\(underLock\);\s*if \(underLock && !\(await confirmPhraseScreen\(\)\)\) return;/);
+    expect(screen.match(/setShowCreateOptions\('import'\)/g)).toHaveLength(1);
     // Export of the phrase and of the private keys run one reveal (revealSecret), which checks first.
     expect(screen).toMatch(/const exportSeedPhrase = \(readersAcknowledged = false\) => revealSecret\('phrase', readersAcknowledged\);/);
     expect(screen).toMatch(/const exportPrivateKey = \(readersAcknowledged = false\) => revealSecret\('key', readersAcknowledged\);/);

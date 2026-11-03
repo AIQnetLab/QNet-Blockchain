@@ -3,12 +3,14 @@
 // field. Nothing is sent anywhere by the hand-over itself; the faucet sends only when the visitor presses its button.
 // The storage may be missing or blocked: then nothing is handed over and nothing throws.
 //
-// The card also hands over the faucet pass the site gave for the QNet wallet it activates (src/server/faucet-pass.ts,
-// SITE M-13): asked for with the wallet's signed reservation the page holds, kept the same way, and sent by the Testnet
-// page with its claims, which then take a place of the hour's larger share kept for such claims (one claim of each token
-// per wallet a day).
+// The card also hands over the faucet pass the site gave for the QNet wallet it activates (src/server/faucet-pass.ts):
+// asked for with the wallet's signed reservation the page holds when the visitor follows the link, kept the same way,
+// and sent by the Testnet page with its claims, which then take a place of the hour's larger share kept for such claims
+// (one claim of each token per wallet a day).
 
+import { within } from './deadline.ts';
 import { isSolanaAddress } from './qnet-provider.ts';
+import { SITE_REQUEST_MS, siteRequest } from './site-request.ts';
 
 export const HANDOVER_KEY = 'qnet.faucet.address';
 export const PASS_HANDOVER_KEY = 'qnet.faucet.pass';
@@ -65,7 +67,7 @@ export function takeHandedPass(storage: Store | null = sessionStore()): string |
   }
 }
 
-// The wallet's signed reservation of a payment address (the activation record's hold, C1).
+// The wallet's signed reservation of a payment address (the activation record's hold).
 export interface PassHold {
   wallet: string;
   pk: string;
@@ -75,22 +77,88 @@ export interface PassHold {
 
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
-// POST /api/faucet/pass with the hold and its payment address: the pass, or null when the site gave none.
-export async function requestFaucetPass(hold: PassHold, burner: string, fetchFn: FetchLike = fetch): Promise<string | null> {
+// The site's answer for a pass: the pass, or none and until when not to ask again for the same confirmation (the
+// refusal's own time past the hourly passes, never for a confirmation it refused, null when it could not be asked).
+export type PassAnswer = { pass: string } | { pass: null; retryAt: number | null };
+
+// POST /api/faucet/pass with the hold and its payment address.
+export async function requestFaucetPass(hold: PassHold, burner: string, fetchFn: FetchLike = fetch, nowMs: number = Date.now()): Promise<PassAnswer> {
   try {
-    const res = await fetchFn('/api/faucet/pass', {
+    const res = await fetchFn('/api/faucet/pass', siteRequest({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ wallet: hold.wallet, burner, proof: { pk: hold.pk, sig: hold.sig, time: hold.time } }),
-    });
-    if (res.status !== 200) return null;
-    const body: unknown = await res.json();
-    const pass = body !== null && typeof body === 'object' ? (body as Record<string, unknown>).pass : null;
-    return typeof pass === 'string' && FAUCET_PASS_RE.test(pass) ? pass : null;
+    }));
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+    if (res.status === 429) return { pass: null, retryAt: retryAt(body, nowMs) ?? nowMs + PASS_RETRY_MS };
+    if (res.status === 400 || res.status === 404) return { pass: null, retryAt: Infinity };
+    const pass = res.status === 200 && body !== null && typeof body === 'object' ? (body as Record<string, unknown>).pass : null;
+    return typeof pass === 'string' && FAUCET_PASS_RE.test(pass) ? { pass } : { pass: null, retryAt: null };
   } catch {
-    return null;
+    return { pass: null, retryAt: null };
   }
 }
+
+// A refusal past the hourly passes that names no time is not asked again for this long.
+export const PASS_RETRY_MS = 60_000;
+// A pass is handed over only with this much of it left, so the claim it goes with still finds it valid.
+export const PASS_MARGIN_MS = 60_000;
+// How long following the link waits for a pass before it goes to the faucet without one.
+export const PASS_WAIT_MS = 4_000;
+
+export interface FaucetPasses {
+  // The pass kept for this confirmation, without asking.
+  ready(hold: PassHold): string | null;
+  // The kept pass, else one asked for once (a second call meanwhile shares the request), at most `waitMs` waited for:
+  // a pass that comes later is kept for the next time. Nothing is asked while a refusal holds.
+  obtain(hold: PassHold, burner: string, waitMs?: number): Promise<string | null>;
+}
+
+// The page asks for a pass only when the visitor follows the link to the faucet, and per wallet's confirmation once
+// for as long as the pass lasts or a refusal holds, in this page's memory only: the server gives few passes an hour.
+export function createFaucetPasses(fetchFn: FetchLike = (url, init) => fetch(url, init), now: () => number = Date.now): FaucetPasses {
+  const kept = new Map<string, { pass: string | null; until: number }>();
+  const asking = new Map<string, Promise<string | null>>();
+  const keyOf = (hold: PassHold) => `${hold.wallet}:${hold.time}`;
+  const live = (key: string) => {
+    const k = kept.get(key);
+    return k !== undefined && k.until > now() ? k : null;
+  };
+  return {
+    ready: (hold) => live(keyOf(hold))?.pass ?? null,
+    obtain(hold, burner, waitMs = Infinity) {
+      const key = keyOf(hold);
+      const k = live(key);
+      if (k) return Promise.resolve(k.pass);
+      let request = asking.get(key);
+      if (!request) {
+        request = requestFaucetPass(hold, burner, fetchFn, now()).then((got) => {
+          asking.delete(key);
+          if (got.pass !== null) kept.set(key, { pass: got.pass, until: Number(FAUCET_PASS_RE.exec(got.pass)?.[2] ?? 0) * 1000 - PASS_MARGIN_MS });
+          else if (got.retryAt !== null) kept.set(key, { pass: null, until: got.retryAt });
+          return got.pass;
+        });
+        asking.set(key, request);
+      }
+      if (waitMs === Infinity) return request;
+      return within(waitMs, request);
+    },
+  };
+}
+
+// The page's passes, shared by every payment card it shows.
+export const faucetPasses = createFaucetPasses();
+
+// The claim route answers at most this long after it took a claim (src/app/api/faucet/claim): a transfer not settled on
+// Solana by then is answered unconfirmed, with its signature, and keeps its reservation.
+export const FAUCET_CLAIM_MS = 132_000;
+// The page waits for a claim that long and a read more; nginx's read timeout of the route lies between the two.
+export const FAUCET_CLAIM_REQUEST_MS = FAUCET_CLAIM_MS + SITE_REQUEST_MS;
 
 // When a refused claim may be made again, from the faucet's answer (`retryAfterS`, or `nextClaimTime` for an address or
 // wallet that had its tokens today): ms since the epoch, or null when the answer names none.

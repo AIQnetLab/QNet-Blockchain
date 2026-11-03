@@ -85,6 +85,12 @@ const mockSOL = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
 const QNET = mockQNET;
 const SOL = mockSOL;
 const mockState = {};
+// A server node's status as a genesis node answers it for node `nodeId`, with what the state's `server` adds.
+const mockServerStatus = (nodeId) => ({
+  success: true, registered: true, isOnline: true, nodeId, pendingRewards: 1_234_567_891_000, reputation: 50,
+  currentBlockHeight: 123456, heartbeatCount: 3, requiredHeartbeats: 9, lastSeen: 1790000000, lastSeenAgoSeconds: 12 * 86400 + 23 * 3600,
+  ...(mockState.server || {}),
+});
 const mockReset = () => Object.assign(mockState, {
   vault: 'none',
   locked: null,
@@ -106,33 +112,29 @@ const mockReset = () => Object.assign(mockState, {
   qncRead: 'ok', // the QNC read: 'ok', 'hang' (still running) or 'fail' (no figure)
   // The QRC-20 tokens the wallet holds (WalletManager.getTokenHoldings), a balance as its exact decimal string.
   holdings: [{ contract: 'a'.repeat(64), name: 'A token with a rather long display name', symbol: 'LONGSYM', decimals: 6, balance: '1234567.891234' }],
+  qncSupply: { totalNano: '4294967295123456789', circulatingNano: '4294967290123456789', holders: 1234567 },
+  tokenInfo: {
+    contract: 'a'.repeat(64), name: 'A token with a rather long display name', symbol: 'LONGSYM', decimals: 6,
+    totalSupply: '123456789012345678', deployer: mockQNET, deployedAt: Date.UTC(2026, 8, 20, 9, 30, 0),
+    // What its contract allows, as a node that reports it answers (WalletManager.tokenInfoOf).
+    mintable: true, mintAuthority: mockQNET, burnable: true, metadataMutable: true, freezable: false,
+  },
   snapshot: null, // the last verified balances kept from an earlier session
   pause: null, // WalletManager.networkPause: the network stopped certifying ({ index, since }), or null
-  server: null, // fields the super node's status adds (PushService.checkServerNodeStatus)
+  server: null, // fields the super node's status adds (mockServerStatus)
   epochs: null, // fields a server node's epochs add (PushService.getNodeEpochs)
   walk: null, // WalletManager.walkSteps: the steps a long lineage walk still takes, or null
 });
 
 jest.mock('../src/components/WalletManager', () => {
-  class VaultCorruptError extends Error {}
-  const words = 'abandon ability able about above absent absorb abstract absurd abuse access accident'.split(' ');
-  class FakeWalletManager {
-    constructor() {
-      return new Proxy(this, {
-        get: (target, prop) => {
-          if (prop in target || typeof prop === 'symbol' || prop === 'then') return target[prop];
-          return async () => null;
-        },
-      });
-    }
-    async prepareInstall() {}
+  const { WORDS, fakeWalletManager, walletManagerModule } = require('../test-support/walletMocks');
+  class FakeWalletManager extends fakeWalletManager({
+    qnet: mockQNET, sol: mockSOL, light: 'light_9f3a2c1d0e7b', superNode: 'super_9f3a2c1d0e7b',
+  }) {
     async vaultState() { return mockState.vault; }
-    async isBiometricEnabled() { return false; }
     async isBiometricSupported() { return true; }
     async getPasswordLockStatus() { return mockState.locked || { locked: false }; }
-    async unlockWithPassword() { return { ok: true, token: 'session-token' }; }
-    async checkPassword() { return { ok: true }; }
-    async revealMnemonic() { return { ok: true, mnemonic: words.join(' ') }; }
+    async revealMnemonic() { return { ok: true, mnemonic: WORDS.join(' ') }; }
     async revealPrivateKeys() {
       return {
         ok: true,
@@ -141,14 +143,8 @@ jest.mock('../src/components/WalletManager', () => {
       };
     }
     async loadBalanceSnapshot() { return mockState.snapshot || null; }
-    async loadWallet() {
-      return { address: mockSOL, solanaAddress: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET };
-    }
-    async generateWallet() { return { mnemonic: words.join(' '), address: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
-    getBIP39WordList() { return [...words, 'zebra', 'zero', 'zone', 'zoo']; }
+    async generateWallet() { return { mnemonic: WORDS.join(' '), address: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
     generateVaultPassword() { return 'generated'; }
-    getTrustedNodes() { return []; }
-    trustedNodeUrl() { return 'https://node.invalid'; }
     async getBalance() { return 1.5; }
     async getTokenBalance() { return 123456.789; }
     // As the wallet answers it: the exact nano figure the Send form checks against (MB-R2-02).
@@ -158,25 +154,28 @@ jest.mock('../src/components/WalletManager', () => {
       return { ok: true, balance: 1234567.123456, balanceNano: '1234567123456000', verified: true };
     }
     async getTokenHoldings() { return mockState.holdings; }
+    // A token's own screen: QNC's supply from the nodes' index, a QNet token's description (services/TokenFacts).
+    async getQncSupply() { return mockState.qncSupply; }
+    async getTokenInfo(contract) { return mockState.tokenInfo && mockState.tokenInfo.contract === contract ? mockState.tokenInfo : null; }
     async networkPause() { return mockState.pause; }
     walkSteps() { return mockState.walk; }
-    async loadNodeRecord() { return mockState.node; }
+    // The genesis nodes' word on the wallet's node: the node the state names, every one alike, else none.
+    async walletNode(owner, { onNamed = null } = {}) {
+      const n = mockState.node;
+      if (!n) return 'none';
+      const node = { nodeId: n.pseudonym, nodeType: n.nodeType, confirmed: true };
+      if (onNamed) onNamed(node);
+      return node;
+    }
     async deviceAuthAvailable() { return mockState.devAuth; }
     async deviceAuthState() { return mockState.devLock ? 'yes' : 'no'; }
     // The screen lock that kept the wallet's secret was removed: only the recovery phrase opens it now.
     async unlockWithBiometrics() { return { ok: false, gone: true }; }
     async switchToDeviceAuth() { return { ok: false, cancelled: true }; } // the system prompt refused
-    generateQNetAddressFromSolana() { return mockQNET; }
-    generateLightNodePseudonym() { return 'light_9f3a2c1d0e7b'; }
-    generateSuperNodePseudonym() { return 'super_9f3a2c1d0e7b'; }
     qrc20TransferFeeNano() { return 150000; }
     toBaseUnits() { return '0'; }
-    closeSession() {}
   }
-  FakeWalletManager.MIN_PASSWORD_LENGTH = 8;
-  FakeWalletManager.publicWallet = (w) => ({ ...w });
-  FakeWalletManager.canonicalAddress = (a) => a;
-  return { __esModule: true, default: FakeWalletManager, WalletManager: FakeWalletManager, VaultCorruptError };
+  return walletManagerModule(FakeWalletManager);
 });
 
 jest.mock('../src/services/LightNode', () => ({
@@ -188,6 +187,11 @@ jest.mock('../src/services/LightNode', () => ({
   }),
   readLinkPending: jest.fn(async () => mockState.pending),
   dropLinkPending: jest.fn(async () => {}),
+  // The server card's read of the state's super node by its id: every genesis node gives its status.
+  readServerNodeListed: jest.fn(async (nodeId, { onStatus = null } = {}) => {
+    if (onStatus) onStatus(mockServerStatus(nodeId));
+    return true;
+  }),
 }));
 
 jest.mock('../src/services/NodeRecordRead', () => ({
@@ -201,32 +205,13 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
   settleByTag: jest.fn(async () => null),
 }));
 
-jest.mock('../src/services/PushService', () => ({
-  readUnconfirmedBinding: jest.fn(async () => null),
-  settleUnconfirmedBinding: jest.fn(async () => false),
-  BG_REFRESH_STATUS_KEY: 'qnet_bg_refresh_status',
-  LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
+jest.mock('../src/services/PushService', () => require('../test-support/walletMocks').pushServiceModule({
   localBinding: jest.fn(async () => mockState.local),
   localNode: jest.fn(async () => (mockState.local ? { nodeId: mockState.local.nodeId, walletAddress: mockQNET } : null)),
-  forgetIfReplaced: jest.fn(async () => false),
-  signStatusWithPingKey: jest.fn(async () => null),
-  stopLightNode: jest.fn(async () => ({ unbound: true })),
-  bindThisDevice: jest.fn(async () => ({ ok: true })),
-  selfAttestIfNeeded: jest.fn(async () => false),
-  checkServerNodeStatus: jest.fn(async () => ({
-    success: true, registered: true, isOnline: true, nodeId: 'light_9f3a2c1d0e7b', pendingRewards: 1_234_567_891_000, reputation: 50,
-    currentBlockHeight: 123456, heartbeatCount: 3, requiredHeartbeats: 9, lastSeen: 1790000000, lastSeenAgoSeconds: 12 * 86400 + 23 * 3600,
-    ...(mockState.server || {}),
-  })),
-  getAllNodesByWallet: jest.fn(async () => ({ success: true, nodes: [] })),
+  checkServerNodeStatus: jest.fn(async () => mockServerStatus(mockState.node ? mockState.node.pseudonym : null)),
   getWalletNodeEvents: jest.fn(async () => mockState.events),
   getNodeEpochs: jest.fn(async () => ({ counted: 58, missed: 6, ...(mockState.epochs || {}) })),
   getPendingRewards: jest.fn(async () => ({ success: true, pendingRewards: 1_234_567_891_000 })),
-  refreshFcmTokenOnServer: jest.fn(async () => ({})),
-  isTokenRefreshNeeded: jest.fn(async () => false),
-  readdressIfOwed: jest.fn(async () => false),
-  teardownLightNode: jest.fn(async () => {}),
-  teardownLightNodeIfForeign: jest.fn(async () => {}),
 }));
 
 const mockNOW = Date.UTC(2026, 8, 24, 12, 0, 0);
@@ -255,13 +240,13 @@ jest.mock('react-native-qrcode-svg', () => {
 // The link screen's services: a link opens nothing on the wallet screen; the screen itself gets a connect offer.
 jest.mock('../src/services/QNetLink', () => ({
   parseLink: jest.fn(() => null),
-  takeInitialUrl: jest.fn(async () => null),
   openSession: jest.fn(async () => ({ expiresAt: Date.now() + 60_000 })),
   prepareOffer: jest.fn(async () => ({ kind: 'connect', addresses: { qnet: mockQNET, solana: mockSOL } })),
   readOffer: jest.requireActual('../src/services/QNetLink').readOffer,
   performIntent: jest.fn(),
   deliverAnswer: jest.fn(async () => 'delivered'),
   markHandled: jest.fn(async () => {}),
+  otherNodeHint: jest.fn(async () => null),
   LinkRefusal: class LinkRefusal extends Error {},
 }));
 
@@ -286,11 +271,19 @@ function textOf(node) {
 // follows up to its own maxFontSizeMultiplier.
 const { infoStyles } = require('../src/components/InfoRow');
 const mode = { rows: null, strict: false, fontScale: 1, figure: false };
-const styleHas = (node, entry) => [node.props.style].flat(Infinity).includes(entry);
+// A soft-press element (components/ui/Press: a field a tap copies, a token's row) reaches its pressable host with one
+// style object its animation flattened: there a style also counts when every entry of it is there.
+const styleHas = (node, entry) => {
+  if ([node.props.style].flat(Infinity).includes(entry)) return true;
+  if (typeof node.props.onResponderRelease !== 'function') return false;
+  const st = flat(node.props.style);
+  const keys = Object.keys(entry || {});
+  return keys.length > 0 && keys.every((k) => st[k] === entry[k]);
+};
 const isInfoRow = (n) => styleHas(n, infoStyles.row);
 const isInfoField = (n) => styleHas(n, infoStyles.field);
 const isSettingRow = (n) => styleHas(n, infoStyles.setting);
-// A token on Assets (screens/WalletScreen TokenBalance); the styles are read once the screen's module is loaded.
+// A token on Assets and in the token picker (screens/TokenScreens AssetRow); the styles are read once the screen's module is loaded.
 const isTokenRow = (n) => styleHas(n, walletStyles.tokenItemClickable);
 const isRowOfRecord = (n) => isInfoRow(n) || isInfoField(n) || isSettingRow(n) || isTokenRow(n);
 function fontScaleOf(node) {
@@ -504,11 +497,14 @@ const checkWidths = (tree, where) => [SCREEN, ...TABLET_WIDTHS].flatMap((w) => c
 const { makeT } = require('../src/i18n');
 const L = makeT('en'); // the longest table
 const label = (key) => plain(L(key));
-const flush = async (n = 4) => { for (let i = 0; i < n; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
-const texts = (tree) => tree.root.findAllByType(Text).map((n) => plain([].concat(n.props.children).flat(Infinity).filter((c) => typeof c === 'string').join(''))).join('\n');
+const { flush, pressId } = require('../test-support/screen');
+// A Text's words as the screen shows them, its nested runs included (an '&' set apart: ui/amp).
+const shown = (children) => [].concat(children).flat(Infinity)
+  .map((c) => (typeof c === 'string' ? c : (c && c.type === Text ? shown(c.props.children) : ''))).join('');
+const texts = (tree) => tree.root.findAllByType(Text).map((n) => plain(shown(n.props.children))).join('\n');
 
 function pressable(tree, text) {
-  const textOf = (t) => plain([].concat(t.props.children).flat(Infinity).filter((c) => typeof c === 'string').join(''));
+  const textOf = (t) => plain(shown(t.props.children));
   const labelled = (match) => tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.findAllByType(Text).some((t) => match(textOf(t))));
   // A control labelled exactly so wins over one whose longer text merely contains the label (in zh-CN the hidden
   // tokens hint starts with the word of the Send button).
@@ -519,6 +515,8 @@ function pressable(tree, text) {
 }
 const press = async (tree, text) => { await act(async () => { await pressable(tree, text).props.onPress(); }); await flush(); };
 const pressKey = (tree, key) => press(tree, label(key));
+// A row of Send's token picker (screens/TokenScreens pickId: a symbol, or the start of a token's contract).
+const pick = (tree, id) => pressId(tree, `pick-${id}`);
 const pressTab = async (tree, tab) => {
   await act(async () => { tree.root.find((n) => n.props.testID === `tab-${tab}` && typeof n.props.onPress === 'function').props.onPress(); });
   await flush();
@@ -557,7 +555,13 @@ function expectLockMessage(tree, key) {
   expect(StyleSheet.flatten(message.props.style)).toMatchObject({ alignSelf: 'stretch', marginTop: 0 });
   expect(StyleSheet.flatten(message.props.style).textAlign).toBeUndefined();
   const column = tree.root.find((n) => n.props.testID === 'lock-column' && n.props.contentContainerStyle);
-  expect(StyleSheet.flatten(column.props.contentContainerStyle)).toMatchObject({ flexGrow: 1, justifyContent: 'flex-end' });
+  // The column fills the room under the mark (components/ui/StartScreen) and a growing gap keeps the unlock at its foot.
+  expect(StyleSheet.flatten(column.props.contentContainerStyle)).toMatchObject({ flexGrow: 1 });
+  const { startStyles } = require('../src/components/ui/StartScreen');
+  const order = column.findAll(() => true);
+  const gap = order.find((n) => typeof n.type === 'string' && n.props.style === startStyles.gap);
+  expect(StyleSheet.flatten(gap.props.style)).toEqual({ flexGrow: 1 });
+  expect(order.indexOf(gap)).toBeLessThan(order.indexOf(message));
   const pulled = column.findAll((n) => typeof n.type === 'string' && (StyleSheet.flatten(n.props.style) || {}).marginTop < 0);
   expect(pulled.map((n) => n.type)).toEqual([]);
 }
@@ -628,6 +632,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await type(tree, 'confirm_password', 'Otter-Canyon-58');
     await pressKey(tree, 'create_wallet');
     expect(texts(tree)).toContain(label('seed_save_title'));
+    expect(texts(tree)).toContain(label('secret_copy_phrase'));
     issues.push(...check(tree, 'show phrase'));
     await pressKey(tree, 'seed_wrote_it');
     issues.push(...check(tree, 'confirm phrase'));
@@ -733,16 +738,17 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
       const shown = balances.filter((n) => [].concat(n.props.children).join('') === amountText(balance));
       expect([balance, shown.length, shown.length === 1 && shown[0].props.numberOfLines === 1]).toEqual([balance, 1, beside]);
     }
+    // Send opens the token picker first: QNC and the tokens the Assets list shows; the token's form names its contract.
     await pressKey(tree, 'assets_send');
-    issues.push(...check(tree, 'send form'));
-    // QNC and the token the Assets list shows, side by side; the token's form names its contract.
-    expect(tree.root.findAll((n) => n.props.testID === 'qnet-token-QNC' && n.props.onPress).length).toBeGreaterThan(0);
-    await act(async () => { tree.root.find((n) => n.props.testID === `qnet-token-${'a'.repeat(12)}` && n.props.onPress).props.onPress(); });
-    await flush(1);
+    expect(texts(tree)).toContain(label('tok_pick_title'));
+    issues.push(...check(tree, 'send: token picker'));
+    await pick(tree, 'a'.repeat(12));
     expect(texts(tree)).toContain(plain(L('tok_contract_id', { id: 'aaaaaa…aaaa' })));
     issues.push(...check(tree, 'send form: token'));
-    await act(async () => { tree.root.find((n) => n.props.testID === 'qnet-token-QNC' && n.props.onPress).props.onPress(); });
-    await flush(1);
+    await pressKey(tree, 'common_back');
+    await pressKey(tree, 'assets_send');
+    await pick(tree, 'QNC');
+    issues.push(...check(tree, 'send form'));
     // Its target reaches 8 dp past it on every side, on the label's line above the field.
     expect(expectScanInField(tree, label('send_placeholder_eon'), L('scan_title')).props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8, right: 8 });
     await type(tree, 'send_placeholder_eon', 'not-an-address');
@@ -814,6 +820,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     await press(tree, 'Solana');
     const issues = [...check(tree, 'assets: solana')];
     await pressKey(tree, 'assets_send');
+    await pick(tree, 'SOL');
     issues.push(...check(tree, 'solana send form'));
     expect(expectScanInField(tree, label('send_placeholder_solana'), L('scan_title_solana')).props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8, right: 8 });
     await type(tree, 'send_placeholder_solana', 'not-an-address');
@@ -825,6 +832,99 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     issues.push(...check(tree, 'solana send result'));
     await pressKey(tree, 'common_done');
     expect(issues).toEqual([]);
+  });
+
+  // A tap on a token opens its own screen (Receive, Send, its balance, what the chain says about it, its transfers),
+  // every row of it fitting 320 dp; its Send opens the form for it, no picker; Back steps back one screen.
+  it('a token\'s own screen: QNC, a QNet token, SOL and 1DEV with its mint\'s authorities; the Solana picker', async () => {
+    const MINT_AUTHORITY = 'BPFLoaderUpgradeab1e11111111111111111111111';
+    const realFetch = global.fetch;
+    // The Solana RPC endpoint answers the mint and SOL's supply; anything else stays offline.
+    global.fetch = jest.fn(async (url, init) => {
+      const body = init && typeof init.body === 'string' ? JSON.parse(init.body) : null;
+      const answer = (result) => ({ ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result }) });
+      if (body && body.method === 'getAccountInfo') {
+        return answer({ value: { data: { parsed: { type: 'mint', info: { decimals: 6, supply: '123456789000000', mintAuthority: MINT_AUTHORITY, freezeAuthority: null } } } } });
+      }
+      if (body && body.method === 'getSupply') return answer({ value: { total: '598765432109876543', circulating: '512345678901234567' } });
+      return realFetch(url, init);
+    });
+    try {
+      await AsyncStorage.setItem('qnet_shown_tokens', JSON.stringify(['a'.repeat(64)]));
+      const tree = await unlocked();
+      const issues = [];
+      // QNC: no warning, its supply and holders from the nodes, and its transfers: five, then Show all.
+      await pressId(tree, 'qnet-row-QNC');
+      expect(texts(tree)).toContain(label('tok_information'));
+      expect(texts(tree)).toContain(label('tok_holders'));
+      expect(texts(tree)).not.toContain(label('tok_unknown_warning'));
+      expect(texts(tree)).not.toContain(label('tok_security'));
+      const rows = () => tree.root.findAll((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function', { deep: false }).length;
+      expect(rows()).toBe(5);
+      issues.push(...check(tree, 'token: QNC'));
+      await pressId(tree, 'token-show-all');
+      expect(rows()).toBe(6);
+      // A row opens its detail over the token's screen; Back returns to it.
+      await act(async () => { tree.root.findAll((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function')[0].props.onPress(); });
+      await flush(2);
+      expect(texts(tree)).toContain(label('tx_label'));
+      await pressId(tree, 'tx-detail-back');
+      expect(texts(tree)).toContain(label('tok_information'));
+      // Its Send is the form for QNC, no picker; Back from the form is the token's screen again, Back from it Assets.
+      await pressId(tree, 'token-send');
+      expect(texts(tree)).toContain(plain(L('send_title', { symbol: 'QNC' })));
+      expect(texts(tree)).not.toContain(label('tok_pick_title'));
+      await pressKey(tree, 'common_back');
+      expect(texts(tree)).toContain(label('tok_information'));
+      await pressId(tree, 'token-back');
+      expect(tree.root.findAll((n) => n.props.testID === 'assets-send').length).toBeGreaterThan(0);
+      // The Assets tab opens the token list from any screen over it: the token's own screen, a transfer's detail there.
+      await pressId(tree, 'qnet-row-QNC');
+      await pressTab(tree, 'assets');
+      expect(texts(tree)).not.toContain(label('tok_information'));
+      await pressId(tree, 'qnet-row-QNC');
+      await act(async () => { tree.root.findAll((n) => n.props.testID === 'history-row' && typeof n.props.onPress === 'function')[0].props.onPress(); });
+      await flush(2);
+      expect(texts(tree)).toContain(label('tx_label'));
+      await pressTab(tree, 'assets');
+      expect(texts(tree)).not.toContain(label('tx_label'));
+      expect(texts(tree)).not.toContain(label('tok_information'));
+      expect(tree.root.findAll((n) => n.props.testID === 'assets-send').length).toBeGreaterThan(0);
+      // A QNet token: the warning, its long name under its label, its contract and creator copied by a tap, and when.
+      await pressId(tree, `qnet-row-${'a'.repeat(12)}`);
+      for (const key of ['tok_unknown_warning', 'tok_total_supply', 'tok_created', 'tok_creator', 'tok_address']) expect(texts(tree)).toContain(label(key));
+      expect(tree.root.findAll((n) => n.props.testID === 'token-copy-address' && typeof n.props.onPress === 'function').length).toBeGreaterThan(0);
+      // Its Security as its node reports it: more can be issued and by whom, its name can change, no freeze.
+      for (const key of ['tok_security', 'tok_mint_open', 'tok_mint_by', 'tok_metadata_open', 'tok_freeze_open']) {
+        expect(texts(tree)).toContain(label(key));
+      }
+      expect(texts(tree)).not.toContain(label('tok_freeze_by'));
+      issues.push(...check(tree, 'token: a QNet token'));
+      await pressId(tree, 'token-back');
+      // On Solana: Send's picker lists SOL and 1DEV, and its search keeps the one that matches.
+      await press(tree, 'Solana');
+      await pressKey(tree, 'assets_send');
+      expect(['SOL', '1DEV'].map((s) => tree.root.findAll((n) => n.props.testID === `pick-${s}`).length > 0)).toEqual([true, true]);
+      issues.push(...check(tree, 'send: Solana token picker'));
+      await act(async () => { tree.root.findAll((n) => n.type === TextInput && plain(n.props.placeholder || '') === label('tok_search'))[0].props.onChangeText('dev'); });
+      await flush(1);
+      expect(['SOL', '1DEV'].map((s) => tree.root.findAll((n) => n.props.testID === `pick-${s}`).length > 0)).toEqual([false, true]);
+      await pressKey(tree, 'common_close');
+      expect(texts(tree)).not.toContain(label('tok_pick_title'));
+      // SOL: its supply from the cluster; 1DEV: its mint's authorities (more can be issued, by whom; none can freeze).
+      await pressId(tree, 'solana-row-SOL');
+      expect(texts(tree)).toContain(label('tok_circulating'));
+      issues.push(...check(tree, 'token: SOL'));
+      await pressId(tree, 'token-back');
+      await pressId(tree, 'solana-row-1DEV');
+      for (const key of ['tok_security', 'tok_mint_open', 'tok_mint_by', 'tok_freeze_open', 'hist_solana_scope']) expect(texts(tree)).toContain(label(key));
+      expect(texts(tree)).not.toContain(label('tok_freeze_by'));
+      expect(texts(tree)).toContain(MINT_AUTHORITY);
+      issues.push(...check(tree, 'token: 1DEV'));
+      expect(issues).toEqual([]);
+    } finally {
+      global.fetch = realFetch;
+    }
   });
 
   const historyNetwork = async (tree, key) => {
@@ -862,6 +962,13 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     }
     expect(nodeDetail).toBe(true);
     expect(movingDetail).toBe(true);
+    // The History tab, tapped over a row's detail, opens the list.
+    await act(async () => { historyRows()[0].props.onPress(); });
+    await flush();
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-back')).not.toHaveLength(0);
+    await pressTab(tree, 'history');
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-back')).toHaveLength(0);
+    expect(historyRows()).toHaveLength(rowCount);
     // The Solana side says once that it lists only this device's Solana sends.
     await historyNetwork(tree, 'solana');
     expect(texts(tree).split(label('hist_solana_scope')).length - 1).toBe(1);
@@ -945,15 +1052,19 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     shows(tree, ['node_use_title']);
     issues.push(...checkWidths(tree, 'node: use this device alert'));
     await pressKey(tree, 'cancel');
-    // Bound to another device: that, and nothing else; bound to none: what a wallet without a node shows (owner, 11.10).
+    // Bound to another device: which device runs it, why it stopped, its last counted epoch, the balance and Move to
+    // wallet, never Use this device; bound to none: what a wallet without a node shows.
     await reread(tree, { local: null, lightStatus: base });
-    shows(tree, ['node_elsewhere']);
-    expect(tree.root.findAll((n) => n.props.testID === 'node-use' || n.props.testID === 'node-move')).toEqual([]);
+    expect(texts(tree)).toContain(plain(L('node_runs_on', { model: 'Phone Model 13 Pro+' })));
+    expect(texts(tree)).toContain(plain(L('node_elsewhere_stopped', { model: 'Phone Model 13 Pro+' })));
+    shows(tree, ['node_last_counted', 'node_balance', 'node_move']);
+    expect(tree.root.findAll((n) => n.props.testID === 'node-use')).toEqual([]);
     issues.push(...checkWidths(tree, 'node: another device'));
     await reread(tree, { lightStatus: { ...base, deviceBound: false } });
     shows(tree, ['node_none']);
     issues.push(...checkWidths(tree, 'node: no device'));
-    await reread(tree, { lightStatus: { ...base, onChain: false, deviceBound: null } });
+    // No node: two genesis nodes say so, and the light node's owners.
+    await reread(tree, { lightStatus: { ...base, onChain: false, deviceBound: null }, node: null });
     shows(tree, ['node_none']);
     expect(tree.root.findAll((n) => n.props.testID === 'node-use' || n.props.testID === 'node-move')).toEqual([]);
     issues.push(...checkWidths(tree, 'node: none'));
@@ -1042,6 +1153,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     const revealed = texts(tree).split('\n');
     for (const w of 'abandon ability able about above absent absorb abstract absurd abuse access accident'.split(' ')) expect(revealed).toContain(w);
     expect(texts(tree)).not.toContain(label('recovery_phrase_warning'));
+    expect(texts(tree)).toContain(label('secret_copy_phrase'));
     issues.push(...check(tree, 'phrase revealed'));
     await pressKey(tree, 'common_done');
     await pressKey(tree, 'export_private_key'); issues.push(...check(tree, 'export keys'));
@@ -1059,6 +1171,7 @@ describe.each(SUITES)('every screen fits 320 dp: %s', (table) => {
     expect(tree.root.findAll((n) => n.props.testID === 'key-shown-qnet')).toHaveLength(0);
     expect(texts(tree)).not.toContain(label('private_key_warning'));
     expect(tree.root.findAll((n) => typeof n.props.testID === 'string' && n.props.testID.startsWith('key-hold-'))).toHaveLength(0);
+    expect(texts(tree)).toContain(label('secret_copy_key'));
     issues.push(...check(tree, 'keys revealed'));
     await pressKey(tree, 'common_done');
     await pressKey(tree, 'enable_biometric'); issues.push(...check(tree, 'biometric password')); await cancel();
@@ -1161,8 +1274,9 @@ describe.each(SUITES)('the sheets, the link screen, the result card and the cras
   it('the result card in each of its three outcomes', async () => {
     const issues = [];
     for (const props of [
-      { state: 'success', title: L('tx_sent_title'), amount: '1234567.123456', symbol: 'QNC', counterparty: QNET, counterpartyLabel: L('tx_to_self'), note: L('tx_note_still_pending'), hash: 'f'.repeat(64) },
-      { state: 'pending', title: L('tx_not_confirmed_title'), amount: '10', symbol: 'QNC', note: L('tx_note_refused', { reason: 'nonce too low' }) },
+      { state: 'success', status: 'confirmed', title: L('tx_sent_title'), amount: '1234567.123456', symbol: 'QNC', counterparty: QNET, counterpartyLabel: L('tx_to_self'), fee: '0.00015 QNC', block: 12345678, hash: 'f'.repeat(64), onExplorer: () => {} },
+      { state: 'success', status: 'moving', title: L('claim_submitted_title'), amount: '942871.275', symbol: 'QNC', source: L('tx_detail_from_node_balance'), note: L('claim_note_partial', { amount: '12.5 QNC' }), hash: 'f'.repeat(64), onExplorer: () => {} },
+      { state: 'pending', status: 'pending', title: L('tx_not_confirmed_title'), amount: '10', symbol: 'QNC', note: L('tx_note_refused', { reason: 'nonce too low' }) },
       { state: 'failed', title: L('claim_failed_title'), error: L('err_NODE_ID_UNKNOWN') },
     ]) {
       const tree = await render(<TxResultCard {...props} t={L} onAction={() => {}} />);
@@ -1240,7 +1354,7 @@ describe.each(SUITES)('the sheets, the link screen, the result card and the cras
 });
 
 describe('the bottom bar', () => {
-  it('the bottom bar labels fit a fifth of the screen in every language, each cell its name alone', () => {
+  it('the bottom bar labels fit a fifth of the screen in every language, each name under its tab\'s icon', () => {
     const translations = jest.requireActual('../src/i18n/translations').default;
     const { barStyles } = require('../src/components/BottomBar');
     const { setThemeLanguage } = require('../src/theme');
@@ -1297,6 +1411,28 @@ describe('a label with its value is held to one line', () => {
     const issues = await walk(() => <InfoRow label={`${MARK}Ответ в этой эпохе:`} value={`${MARK}13 622 бл. (~3 ч 47 мин)`} />, 'longest');
     expect(issues.some((i) => /one line/.test(i))).toBe(false);
   });
+
+  // A field a tap copies and a token's row answer through the soft press, whose animation flattens their style: both are
+  // walked as rows. A copied field's label is held to one line, and a 64-character contract beside the copy mark is never
+  // cut at its end. The mark shares the value's line, so the label above it has the row's whole width.
+  it('a field a tap copies and a token row are walked as rows; a contract beside the copy mark is not cut at its end', async () => {
+    const { InfoField } = require('../src/components/InfoRow');
+    const { AssetRow } = require('../src/screens/TokenScreens');
+    const hex = 'a'.repeat(64);
+    // 32 letters did not fit beside the mark at full size; above the value's line they do, and twice that is still caught.
+    const issues = await walk(() => <InfoField label={`${MARK}${'a'.repeat(32)}`} value={hex} mono fit copy={hex} t={L} />, 'en');
+    expect(issues).toEqual([]);
+    const wide = await walk(() => <InfoField label={`${MARK}${'b'.repeat(64)}`} value={hex} mono fit copy={hex} t={L} />, 'en');
+    expect(wide.some((i) => /one line, full size\): "b{60}" is cut off/.test(i))).toBe(true);
+    expect(wide.filter((i) => i.includes(hex.slice(0, 60)))).toEqual([]);
+    let tree;
+    await act(async () => {
+      tree = renderer.create(<AssetRow asset={{ key: 'tkn', network: 'qnet', symbol: 'TKN', name: 'Token', figure: '1', contract: hex }}
+        t={L} onPress={() => {}} testID="token" />);
+    });
+    expect(isTokenRow(tree.root.findAll((n) => typeof n.type === 'string' && n.props.testID === 'token')[0])).toBe(true);
+    await act(async () => { tree.unmount(); });
+  });
 });
 
 describe('Arabic is laid out right to left', () => {
@@ -1319,7 +1455,7 @@ describe('Arabic is laid out right to left', () => {
     const main = [].concat(tree.toJSON()).find(isHost);
     expect(flat(main.props.style).direction).toBeUndefined();
     // The address on Assets reads left to right on its one line, and it is the whole address (cut only to fit).
-    const lines = tree.root.findAll((n) => n.type === Text && Array.isArray(n.props.style) && n.props.style[0] === walletStyles.addressPillText);
+    const lines = tree.root.findAll((n) => n.type === Text && n.props.style === walletStyles.addressPillText);
     expect(lines).toHaveLength(1);
     expect(lines.every((n) => flat(n.props.style).fontFamily && flat(n.props.style).writingDirection === 'ltr')).toBe(true);
     expect([].concat(lines[0].props.children).join('')).toBe(QNET);
@@ -1328,6 +1464,7 @@ describe('Arabic is laid out right to left', () => {
     // On Send, Scan sits at the end of the field's label line (the left in a right-to-left layout).
     await act(async () => { await pressable(tree, ar.assets_send).props.onPress(); });
     await flush();
+    await pick(tree, 'QNC');
     const scan = expectScanInField(tree, plain(ar.send_placeholder_eon), makeT('ar')('scan_title'), plain(ar.send_scan));
     expect(scan.props.hitSlop).toEqual({ top: 8, bottom: 8, left: 8, right: 8 });
     expect(flat(require('../src/components/ui/Field').fieldStyles.labelLine)).toMatchObject({ flexDirection: 'row', justifyContent: 'space-between' });

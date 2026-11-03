@@ -1,6 +1,6 @@
 'use client';
 
-// "Unlink the device" (owner, 30.09 and 04.10; docs/protocols/qnet-link-v1.md section 14, light-node-messages section 4).
+// "Unlink the device" (docs/protocols/qnet-link-v1.md section 14, light-node-messages section 4).
 // Once both genesis nodes take the wallet's own unbind (`unbind_wallet`) and a device runs the node, the wallet signs it:
 // the QNet extension of this computer when it holds the chosen wallet (qnet_unlinkNodeDevice, as Move does), otherwise
 // QNet Wallet with this wallet on any device through a QNet Link `unlink` request, its button on this phone or tablet or
@@ -15,13 +15,14 @@ import Action from '@/components/ui/Action';
 import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
-import { t, type MessageKey } from '@/lib/texts';
+import { type MessageKey } from '@/lib/texts';
 import { failureKey, unlinkReport } from '@/lib/cabinet/extension-view';
 import type { NodeStatusView } from '@/lib/cabinet/node-view';
 import type { ClaimFailure, LinkAnswer, UnlinkRequest } from '@/lib/qnet-link';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
 import { ActionBlock } from './parts';
+import { useI18n } from '@/i18n/client';
 
 // What QNet Wallet's answer says, as its report.
 export function unlinkAnswerKey(answer: LinkAnswer): MessageKey {
@@ -41,6 +42,7 @@ export function walletUnlink(status: NodeStatusView): boolean {
 }
 
 export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatusView; onUnlinked: () => void }) {
+  const { t, say } = useI18n();
   const { choice, walletHash, viewOnly, phoneFlows } = useCabinet();
   const { providerStatus, providerChannel, accounts, unlinkNodeDevice } = useWallet();
   const device = useDeviceKind();
@@ -64,7 +66,7 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
 
   // An address only viewed is never offered an unlink.
   if (viewOnly) return null;
-  if (!phoneFlows && !extension) return <ActionBlock title={t(wallet ? 'unlink_title_wallet' : 'unlink_title')}><p>{t('unlink_closed')}</p></ActionBlock>;
+  if (!phoneFlows && !extension) return <ActionBlock title={t(wallet ? 'unlink_title_wallet' : 'unlink_title')}><p>{say('unlink_closed')}</p></ActionBlock>;
   if (!walletHash || !choice) return null;
 
   const withExtension = async () => {
@@ -90,10 +92,10 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
       {!active || active.state.phase === 'idle' ? (
         <>
           <Action kind="text" onClick={ask} disabled={!device}>{t(wallet ? 'unlink_title_wallet' : 'unlink_button')}</Action>
-          {wallet && <p className="note">{t('unlink_app_note')}</p>}
+          {wallet && <p className="note">{say('unlink_app_note')}</p>}
         </>
       ) : active.state.phase === 'done' ? (
-        <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{t(unlinkAnswerKey(active.state.answer))}</Answered>
+        <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{say(unlinkAnswerKey(active.state.answer))}</Answered>
       ) : (
         <LinkWaiting
           state={active.state}
@@ -110,7 +112,7 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
   const again = { label: t('start_again'), onClick: () => setExt({ phase: 'idle' }) };
   return (
     <ActionBlock title={t(wallet ? 'unlink_title_wallet' : 'unlink_title')}>
-      <p>{t(wallet ? 'unlink_lead_wallet' : 'unlink_lead')}</p>
+      <p>{say(wallet ? 'unlink_lead_wallet' : 'unlink_lead')}</p>
       {extension && (
         <div className="cab-move-way">
           {ext.phase === 'idle' && (
@@ -120,12 +122,12 @@ export default function UnlinkDevice({ status, onUnlinked }: { status: NodeStatu
             </>
           )}
           {ext.phase === 'waiting' && <Waiting>{t('wallet_extension_waiting')}</Waiting>}
-          {ext.phase === 'done' && <Answered action={again}>{t(unlinkReport(ext.answer, 'extension'))}</Answered>}
-          {ext.phase === 'failed' && <Failed action={again}>{t(failureKey(ext.failure, 'unlink'))}</Failed>}
+          {ext.phase === 'done' && <Answered action={again}>{say(unlinkReport(ext.answer, 'extension'))}</Answered>}
+          {ext.phase === 'failed' && <Failed action={again}>{say(failureKey(ext.failure, 'unlink'))}</Failed>}
         </div>
       )}
       {app}
-      <p className="note">{t(wallet ? 'unlink_lost_wallet' : 'unlink_lost')}</p>
+      <p className="note">{say(wallet ? 'unlink_lost_wallet' : 'unlink_lost')}</p>
     </ActionBlock>
   );
 }

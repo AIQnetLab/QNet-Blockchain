@@ -1,8 +1,8 @@
 /**
  * The owner's 06.10 round on the app: nothing takes the focus by itself (the unlock screen included); the private keys
  * are exported behind the same check as the recovery phrase, in the compact form the wallet derives them from; the
- * last verified balances are kept per wallet and chain and shown at once; a pending history row resolves instead of
- * staying Pending for ever; the QNet Send screen sends QNC or any QNet token the Assets list shows.
+ * last verified balances are kept per wallet and chain and shown at once; a pending history row resolves as the chain
+ * decides it; the QNet Send screen sends QNC or any QNet token the Assets list shows.
  */
 import fs from 'fs';
 import path from 'path';
@@ -31,9 +31,7 @@ const { WalletManager } = require('../src/components/WalletManager');
 const lc = require('../src/crypto/QcLightClient');
 const { WS_CHECKPOINT } = require('../src/config/genesisConsensus');
 const { createVault, sealRecord } = require('../src/crypto/Vault');
-const {
-  mergeHistory, historyBadge, cacheableHistory, PENDING_ROW_MAX_MS,
-} = require('../src/utils/txHistory');
+const { mergeHistory, historyBadge, cacheableHistory, withNonceAnswer } = require('../src/utils/txHistory');
 const vector = require('./fixtures/wallet_kat.json');
 
 jest.setTimeout(120000);
@@ -185,14 +183,15 @@ describe('Export private key', () => {
     expect(reveal).toMatch(/setKeyReveal\(\{ \[account\]: r\[account\] \}\);/);
     expect(reveal).toMatch(/AppState\.currentState === 'background' \|\| !walletManager\.sessionOpen\(password\)/);
     const overlay = ws.slice(ws.indexOf('const renderKeyReveal = () =>'), ws.indexOf('const renderEraseConfirm = () =>'));
-    // Owner, 06.10: the keys are shown at once after the check, each with its Copy, then Done; no hold to show, no
-    // address, no clipboard text (the copy still leaves the clipboard after SECRET_CLIPBOARD_SECONDS).
-    expect(overlay).toMatch(/<View style=\{styles\.keyRevealBox\}>\s*<Text style=\{styles\.keyRevealKey\} selectable=\{false\} testID=\{'key-shown-' \+ which\}>\{entry\.key\}<\/Text>/);
+    // The keys are shown at once after the check, each in a box, then Done; no hold to show, no address, no clipboard
+    // text. Under each key its own Copy button (components/ui/SecretCopy); the box copies nothing (the copy still leaves
+    // the clipboard after SECRET_CLIPBOARD_SECONDS).
+    expect(overlay).toMatch(/<View style=\{styles\.keyRevealBox\}>\s*<Text style=\{styles\.keyRevealKey\} selectable=\{false\} testID=\{'key-shown-' \+ which\}>\{entry\.key\}<\/Text>\s*<\/View>\s*<SecretCopy secret=\{entry\.key\} label=\{t\('secret_copy_key'\)\} t=\{t\} testID=\{'key-copy-' \+ which\} \/>/);
     expect(overlay).not.toMatch(/onPressIn|onPressOut|keyHeld|private_key_hold|entry\.address|_copy_warning/);
-    // After the password only the secret, Copy and Done: the one warning is said before it.
+    // After the password only the secret and Done: the one warning is said before it.
     expect(overlay).not.toMatch(/_warning/);
     const phrase = ws.slice(ws.indexOf('const renderSeedReveal = () =>'), ws.indexOf('const closeKeyReveal = () =>'));
-    expect(phrase).toMatch(/onPress: \(\) => copyRecoveryPhrase\(seedReveal\)/);
+    expect(phrase).toMatch(/\{renderSeedWords\(seedReveal\)\}\s*<SecretCopy secret=\{seedReveal\.join\(' '\)\} label=\{t\('secret_copy_phrase'\)\} t=\{t\} testID="seed-copy" \/>/);
     expect(phrase).not.toMatch(/seed_copy_warning|_warning'\)/);
     const dialog = ws.slice(ws.indexOf('{/* Export the recovery phrase or the private keys'), ws.indexOf('{/* Auto-Lock Time Picker Modal */}'));
     expect(dialog).toMatch(/t\(exportWhat === 'key' \? 'private_key_warning' : 'recovery_phrase_warning'\)/);
@@ -204,9 +203,12 @@ describe('Export private key', () => {
       }
     }
     expect(read('src/services/DeviceSecurity.js')).toMatch(/export const SECRET_CLIPBOARD_SECONDS = 60;/);
-    expect(ws).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) showCopied\(keyCopiedTimerRef, setKeyCopied, which, null\);/);
+    expect(read('src/components/ui/SecretCopy.js')).toMatch(/useCopied\(COPIED_MS, t\)/);
     // A secret screen while shown; gone on lock, on leaving the app and on back.
     expect(ws).toMatch(/const secretScreen = !!seedReveal \|\| !!keyReveal/);
+    // The start (lock) screen is guarded only while a password is typed on it, never under the device's screen lock.
+    expect(ws).toMatch(/\|\| \(hasWallet && !wallet && !deviceAuth\)\n/);
+    expect(ws).not.toMatch(/\|\| \(hasWallet && !wallet\)\n/);
     const lock = ws.slice(ws.indexOf('const lockSession = () => {'), ws.indexOf('const nextQueuedLink'));
     expect(lock).toMatch(/closeKeyReveal\(\);/);
     expect(ws).toMatch(/if \(keyReveal\) \{ closeKeyReveal\(\); return true; \}/);
@@ -349,55 +351,35 @@ describe('a pending history row resolves', () => {
   const row = (hash, ageMs, extra = {}) => ({ hash, from: ME, to: TO, amount: 1, fee: 0.0001, status: 'pending', timestamp: NOW - ageMs, type: 'send', ...extra });
   const merge = (prev, fresh = []) => mergeHistory(prev, fresh, { myAddress: ME, coveredFromMs: Infinity, nowMs: NOW, nodeEventsOk: true });
 
-  it('Pending while a node may still hold it, Not found once none can, confirmed whenever a source reports it', () => {
-    const young = row('a'.repeat(64), PENDING_ROW_MAX_MS - 1000);
-    const old = row('b'.repeat(64), PENDING_ROW_MAX_MS + 1000);
+  it('Pending until the chain decides it, however long that takes; Expired past its last height; confirmed whenever a source reports it', () => {
+    const young = row('a'.repeat(64), 1000);
+    const old = row('b'.repeat(64), 30 * 86_400_000);
     const out = merge([young, old]);
-    expect(out.find((r) => r.hash === young.hash).status).toBe('pending');
-    expect(out.find((r) => r.hash === old.hash).status).toBe('dropped');
-    expect(historyBadge(out.find((r) => r.hash === old.hash))).toBe('dropped');
+    expect(out.map((r) => [r.status, historyBadge(r)])).toEqual([['pending', 'pending'], ['pending', 'pending']]);
+    // The chain's height passed the last height it signed, its nonce free (WalletManager.resolveSubmitByNonce): Expired.
+    const expired = merge(withNonceAnswer(out, old.hash, { expired: true }));
+    expect(historyBadge(expired.find((r) => r.hash === old.hash))).toBe('expired');
+    expect(historyBadge(expired.find((r) => r.hash === young.hash))).toBe('pending');
     // Late, a source reports it after all: the source's row replaces it.
-    const back = merge(out, [{ ...old, status: 'confirmed', block: 77 }]);
+    const back = merge(expired, [{ ...old, status: 'confirmed', block: 77 }]);
     expect(back.filter((r) => r.hash === old.hash)).toEqual([expect.objectContaining({ status: 'confirmed', block: 77 })]);
-    // Neither Pending nor Not found is kept on the device: only confirmed rows are.
-    expect(cacheableHistory(out)).toEqual([]);
-    // As long as some node may still hold it: the wallet sends it again by itself for AUTO_SEND_MS after signing, and a
-    // node keeps each copy NODE_MEMPOOL_TTL_MS, plus the margin (PendingTx mayLandUntil); never Not found before that.
-    const P = require('../src/services/PendingTx');
-    expect(PENDING_ROW_MAX_MS).toBe(P.AUTO_SEND_MS + P.NODE_MEMPOOL_TTL_MS + P.LANDING_MARGIN_MS);
-    const lastAutoSend = { createdAt: NOW - PENDING_ROW_MAX_MS, lastSentAt: NOW - PENDING_ROW_MAX_MS + P.AUTO_SEND_MS - 1 };
-    expect(P.mayLandUntil(lastAutoSend)).toBeLessThanOrEqual(NOW);
+    // Neither Pending nor Expired is kept on the device: only rows in a block are.
+    expect(cacheableHistory(expired)).toEqual([]);
   });
 
-  it('the detail screen of a row not found offers the hash to copy, not the explorer', () => {
+  it('the detail screen of an expired row says Expired, as its result card, and offers the hash to copy, not the explorer', () => {
     const { TxDetail } = require('../src/screens/HistoryTab');
     const t = require('../src/i18n').makeT('en');
     let tree;
     act(() => {
-      tree = renderer.create(<TxDetail tx={row('c'.repeat(64), PENDING_ROW_MAX_MS + 1, { status: 'dropped' })} t={t}
-        onBack={() => {}} onCopy={() => {}} onExplorer={() => {}} />);
+      tree = renderer.create(<TxDetail tx={row('c'.repeat(64), 1000, { status: 'expired' })} t={t}
+        onBack={() => {}} onExplorer={() => {}} />);
     });
-    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-badge-dropped').length).toBeGreaterThan(0);
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-badge-expired').length).toBeGreaterThan(0);
     expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-explorer')).toHaveLength(0);
-    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-copy').length).toBeGreaterThan(0);
-    expect(t('hist_status_dropped')).toBe('Not found');
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-copy-hash' && typeof n.props.onPress === 'function').length).toBeGreaterThan(0);
+    expect(require('../src/screens/HistoryTab').BADGE_KEY.expired).toBe('tx_expired_title');
+    expect(t('tx_expired_title')).toBe('Expired');
     act(() => tree.unmount());
-  });
-});
-
-describe('the QNet Send screen sends any QNet token', () => {
-  it('offers QNC and every QNet token the Assets list shows, and the send runs for the one chosen', () => {
-    const ws = read('src/screens/WalletScreen.js');
-    const choices = ws.slice(ws.indexOf('const qnetSendChoices = () => ['), ws.indexOf('const switchQnetToken = (choice) =>'));
-    expect(choices).toMatch(/\{ key: 'QNC', symbol: 'QNC', balance: tokenBalances\.qnc, contract: null, decimals: null \}/);
-    expect(choices).toMatch(/qrcTokens\.filter\(\(tk\) => tk\.contract && isTokenShown\(tk\.contract\)\)/);
-    const sw = ws.slice(ws.indexOf('const switchQnetToken = (choice) =>'), ws.indexOf('const switchSolanaToken'));
-    expect(sw).toMatch(/symbol: choice\.symbol, balance: choice\.balance, contract: choice\.contract, decimals: choice\.decimals/);
-    expect(ws).toMatch(/onChange=\{\(key\) => switchQnetToken\(sendChoices\.find\(\(c\) => c\.key === key\)\)\}/);
-    // A token send goes through the same path as a token row's: the token's own decimals, qrc20Transfer, the fee in QNC.
-    const send = ws.slice(ws.indexOf('const handleSendTransaction = async'), ws.indexOf('const pressSend = async'));
-    expect(send).toMatch(/const isTokenSend = sendingToken\.network === 'qnet' && !!sendingToken\.contract;/);
-    expect(send).toMatch(/walletManager\.qrc20Transfer\(/);
-    expect(send).toMatch(/walletManager\.checkedTokenBalance\(sendingToken\.contract/);
   });
 });

@@ -57,6 +57,20 @@ describe('provider: qnet_claimNodeBalance', () => {
     await until(() => !w.openWindows.has(shown.windowId));
   });
 
+  // One approval moves the whole balance it showed, in parts, each next part only within 150 s of the site's
+  // request (the site waits five minutes for the answer); the answer is the total, the last part's hash and its stop.
+  it('the confirm moves up to the balance the window showed, its next parts within 150 s of the request, and answers the total', async () => {
+    const w = createWorld();
+    w.state.claimOutcome = { status: 'ok', qnet: ACCOUNTS.qnet, nodeId: NODE_ID, amountNano: '7500000000', txHash: TX_HASH, stoppedAtEpoch: null };
+    const port = w.connect(`${SITE}/node`);
+    claim(port, 't');
+    const shown = await w.shown();
+    const view = (await shown.get()).result;
+    assert.deepEqual((await shown.resolve(true)).result, { resolved: true, status: 'ok', error: null, amountNano: '7500000000', partial: false });
+    assert.deepEqual(w.log.claimOptions, [{ shownNano: view.details.amountNano, until: view.createdAt + 150_000 }]);
+    assert.deepEqual((await replyTo(port, 't')).result, w.state.claimOutcome);
+  });
+
   it('refuses every other origin with 4100 before any window, and answers NO_WALLET at once without a vault', async () => {
     const w = createWorld();
     const other = w.connect(`${APP}/node`);
@@ -188,6 +202,15 @@ describe('provider: qnet_claimNodeBalance', () => {
     await smallShown.get();
     assert.deepEqual((await smallShown.resolve(true)).result, { resolved: true, status: 'ok', error: null, amountNano: '30000000', partial: true });
     assert.deepEqual((await replyTo(smallPort, 's')).result, part);
+    // a whole balance below 1 QNC names the last part's stop for the site, while the window says no rest stays
+    const whole = createWorld();
+    whole.state.claimOutcome = { ...part, whole: true };
+    const wholePort = whole.connect(`${SITE}/`);
+    claim(wholePort, 'w');
+    const wholeShown = await whole.shown();
+    await wholeShown.get();
+    assert.deepEqual((await wholeShown.resolve(true)).result, { resolved: true, status: 'ok', error: null, amountNano: '30000000', partial: false });
+    assert.deepEqual((await replyTo(wholePort, 'w')).result, part, 'the site gets the answer\'s keys only');
   });
 
   it('answers exactly the claim answers of the shared vectors, without v and intent (QNet Link v1 section 14.10)', async () => {

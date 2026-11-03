@@ -1,4 +1,4 @@
-// The node rows of the header's account menu (B-SPEC 5.2), from the reads My node shares (the wallet's node on the
+// The node rows of the header's account menu, from the reads My node shares (the wallet's node on the
 // network, its light node's status, its super node's status, its newest epochs): with a node, My node, Node balance,
 // Device and History, each with one datum; without one, My node and Activate. A datum not read yet is null ("—").
 
@@ -6,7 +6,8 @@ import { canMove, deviceName, isLinkedState, nodeState, superState, type History
 import { TAB_HREF } from './cabinet/tabs.ts';
 import type { Read, WalletNodeView } from './cabinet/wallet-activation.ts';
 import { int } from './format.ts';
-import { t } from './texts.ts';
+import { isGenesisNodeId } from './qnet-link.ts';
+import type { MessageKey, T } from './texts.ts';
 import { formatQnc } from './token-format.ts';
 
 export type RowTone = 'signal' | 'ember' | null;
@@ -26,18 +27,24 @@ export interface AccountReads {
   light: Read<NodeStatusView>;
   superNode: Read<SuperStatusView>;
   history: Read<HistoryView>;
+  // The id the super node's status is read by: a genesis node's is named as one (qnet-link.ts isGenesisNodeId).
+  superId: string | null;
 }
 
 const ok = <T,>(r: Read<T>): T | null => (r.phase === 'ok' ? r.value : null);
 
-const STATE_WORD: Record<string, string> = {
-  online: t('badge_online'),
-  offline: t('badge_offline'),
-  waiting: t('badge_waiting'),
-  no_device: t('account_no_device'),
-  device_pending: t('account_device_pending'),
-  pending: t('badge_waiting'),
+const STATE_WORD: Record<string, MessageKey> = {
+  online: 'badge_online',
+  offline: 'badge_offline',
+  waiting: 'badge_waiting',
+  no_device: 'account_no_device',
+  device_unknown: 'badge_unknown',
+  device_pending: 'account_device_pending',
+  pending: 'badge_waiting',
 };
+
+// A state in the page's language; an unknown one reads as offline.
+const stateWord = (state: string, t: T): string => t(STATE_WORD[state] ?? 'badge_offline');
 
 export const BALANCE_HREF = `${TAB_HREF.overview}#balance`;
 
@@ -60,22 +67,22 @@ export interface NodeLine {
 
 // Each node the wallet has on the network, light first, with its state in words: the account menu's My node row and My
 // node's identity line read the same words.
-export function nodeLines(reads: AccountReads): NodeLine[] {
+export function nodeLines(reads: AccountReads, t: T): NodeLine[] {
   const light = ok(reads.light);
   const sup = ok(reads.superNode);
   const lines: NodeLine[] = [];
   if (light?.registered) {
     const state = nodeState(light);
-    lines.push({ nodeType: 'light', words: t('account_light', { state: STATE_WORD[state] ?? t('badge_offline') }), mark: state === 'online' ? 'live' : 'ring' });
+    lines.push({ nodeType: 'light', words: t('account_light', { state: stateWord(state, t) }), mark: state === 'online' ? 'live' : 'ring' });
   }
   if (sup?.registered) {
     const state = superState(sup);
-    lines.push({ nodeType: 'super', words: t('account_super', { state: STATE_WORD[state] ?? t('badge_offline') }), mark: state === 'online' ? 'live' : 'ring' });
+    lines.push({ nodeType: 'super', words: t(isGenesisNodeId(reads.superId) ? 'account_genesis' : 'account_super', { state: stateWord(state, t) }), mark: state === 'online' ? 'live' : 'ring' });
   }
   return lines;
 }
 
-export function accountRows(reads: AccountReads): AccountRow[] {
+export function accountRows(reads: AccountReads, t: T): AccountRow[] {
   const network = ok(reads.network);
   const light = ok(reads.light);
   const sup = ok(reads.superNode);
@@ -90,20 +97,21 @@ export function accountRows(reads: AccountReads): AccountRow[] {
     ];
   }
 
-  const lines = nodeLines(reads);
-  const node = lines.length > 1 ? t('account_both') : lines[0]?.words ?? null;
+  const lines = nodeLines(reads, t);
+  const node = lines.length > 1 ? t(isGenesisNodeId(reads.superId) ? 'account_both_genesis' : 'account_both') : lines[0]?.words ?? null;
   const mark: AccountRow['mark'] = lines.length === 0 ? null : lines.some((l) => l.mark === 'live') ? 'live' : 'ring';
 
   const balanceNano = hasLight ? light.balanceNano : hasSuper ? sup.balanceNano : null;
   const balance = balanceNano === null ? null : `${formatQnc(balanceNano)} QNC`;
 
   // A device that runs the node by its name, or by its state where the name is not known (a node of an earlier version,
-  // an address only viewed); an unlinked one is no device.
+  // an address only viewed); an unlinked one is no device, one no answer could name is not known.
   let device: string | null = null;
   if (hasLight) {
     const state = nodeState(light);
-    device = state === 'no_device' ? t('account_no_device') : isLinkedState(state) ? (light.device ? deviceName(light.device) : null) ?? STATE_WORD[state] ?? null : null;
-  } else if (hasSuper) device = t('account_server', { state: (STATE_WORD[superState(sup)] ?? t('badge_offline')).toLowerCase() });
+    device = state === 'no_device' || state === 'device_unknown' ? stateWord(state, t)
+      : isLinkedState(state) ? (light.device ? deviceName(light.device, t) : null) ?? (STATE_WORD[state] ? t(STATE_WORD[state]) : null) : null;
+  } else if (hasSuper) device = t('account_server', { state: stateWord(superState(sup), t).toLocaleLowerCase(t.locale) });
 
   const newest = ok(reads.history)?.rows[0] ?? null;
   const history = newest ? t('account_epoch', { epoch: int(newest.epoch) }) : null;

@@ -1,6 +1,7 @@
 /**
- * History rows: a title in plain words over whom it was with (and its status after it while it is not final), and the
- * amount with its sign and tone, no icon and no badge; amounts in the one amount format, never with a suffix or an
+ * History rows: the token's icon (a swap's two), a title in plain words over whom it was with (and its status after it
+ * while it is not final), and the amount with its sign and tone at the title's height, no badge; amounts in the one
+ * amount format, never with a suffix or an
  * exponent; one row per transaction (a node registration the registry and a transaction feed both report is one row,
  * never a "Sent 0 QNC" beside "Node registered"); a header per day; and a screen-reader label naming what, the amount
  * and when.
@@ -9,13 +10,15 @@ import React from 'react';
 import renderer, { act } from 'react-test-renderer';
 import { StyleSheet, Text, View } from 'react-native';
 import {
-  BESIDE_CHARS, HistoryRow, TxDetail, compactAmount, compactDecimalText, dayLabel, describeTx, rowA11yLabel, txKind,
+  HistoryRow, TxDetail, compactAmount, compactDecimalText, dayLabel, describeTx, fitsBeside, rowA11yLabel, txKind,
 } from '../src/screens/HistoryTab';
 import { shortAddress } from '../src/utils/addressDisplay';
 import { FIGURE_LINE } from '../src/components/InfoRow';
-import { color } from '../src/theme';
+import TokenIcon from '../src/components/TokenIcons';
+import { color, size } from '../src/theme';
 import {
-  historyEntries, historySections, mergeHistory, splitExplorerItems, txNodeId, txTypeName, nodeNativeRow,
+  historyEntries, historySections, mergeHistory, splitExplorerItems, txNodeId, txTypeName, nodeNativeRow, nodeEventRow,
+  withNodeEvents,
 } from '../src/utils/txHistory';
 
 const { makeT } = require('../src/i18n');
@@ -139,7 +142,7 @@ describe('each kind of row: title, whom with, amount, sign and tone', () => {
   it('a row not final says its status after whom it was with, wrapping rather than cutting either', async () => {
     let tree;
     await act(async () => { tree = renderer.create(<HistoryRow tx={native({ status: 'pending' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree)).toEqual(['Sent', 'To: eeeeee…eeeeee', 'Pending', '−12.5', ' QNC']);
+    expect(texts(tree)).toEqual(['Sent', '−12.5', ' QNC', 'To: eeeeee…eeeeee', 'Pending']);
     // Whom with keeps one line; the status is its own run beside it, which wraps under it when both do not fit.
     const party = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).includes('To: eeeeee…eeeeee'));
     expect([party.props.numberOfLines, party.props.adjustsFontSizeToFit, party.props.minimumFontScale]).toEqual([1, true, 0.8]);
@@ -147,61 +150,93 @@ describe('each kind of row: title, whom with, amount, sign and tone', () => {
     expect(StyleSheet.flatten(line.props.style)).toMatchObject({ flexDirection: 'row', flexWrap: 'wrap' });
     expect(line.findAllByType(Text).map((n) => [].concat(n.props.children).join(''))).toEqual(['To: eeeeee…eeeeee', 'Pending']);
     await act(async () => { tree.update(<HistoryRow tx={native()} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree)).toEqual(['Sent', 'To: eeeeee…eeeeee', '−12.5', ' QNC']);
+    expect(texts(tree)).toEqual(['Sent', '−12.5', ' QNC', 'To: eeeeee…eeeeee']);
     // A row that names no one says its status alone.
     await act(async () => { tree.update(<HistoryRow tx={native({ status: 'pending', to: null, amount: 0, txType: 'ContractCall' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree)).toEqual(['Contract call', 'Pending']);
-    await act(async () => { tree.update(<HistoryRow tx={native({ status: 'dropped' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree)).toContain('Not found');
+    await act(async () => { tree.update(<HistoryRow tx={native({ status: 'expired' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    expect(texts(tree)).toContain('Expired');
     // Nothing moved: its status in Ember, its amount in Fog.
-    expect(flatStyle(tree.root.find((n) => n.type === Text && n.props.testID === 'history-badge-dropped')).color).toBe(color.ember);
+    expect(flatStyle(tree.root.find((n) => n.type === Text && n.props.testID === 'history-badge-expired')).color).toBe(color.ember);
     expect(flatStyle(tree.root.findAllByType(Text).find((n) => n.props.children === '−12.5')).color).toBe(color.fog);
     // A confirmed row says no status.
     await act(async () => { tree.update(<HistoryRow tx={native()} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree)).not.toContain('Confirmed');
   });
 
-  it('a number and symbol too long for one line stack the symbol under the number, as the extension does; a short pair shares it', async () => {
-    let tree;
-    await act(async () => { tree = renderer.create(<HistoryRow tx={token({ tokenSymbol: 'LONGSYMBOL', tokenAmountDisplay: '98,765.4321' })} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree).slice(-2)).toEqual(['+98,765.43', 'LONGSYMBOL']);
-    const number = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === '+98,765.43');
-    expect(StyleSheet.flatten(number.parent.props.style).flexDirection).not.toBe('row');
-    await act(async () => { tree.update(<HistoryRow tx={native()} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    expect(texts(tree).slice(-2)).toEqual(['−12.5', ' QNC']);
-    const inline = tree.root.findAllByType(Text).find((n) => [].concat(n.props.children).join('') === '−12.5');
-    expect(StyleSheet.flatten(inline.parent.props.style).flexDirection).toBe('row');
-  });
+  // The words on a row's line (history-row-top: what happened; history-row-bottom: whom with) and the amounts on it.
+  const lineTexts = (tree, id) => {
+    const line = tree.root.findAll((n) => n.props.testID === id && typeof n.type === 'string');
+    return line.length ? line[0].findAllByType(Text).map((n) => [].concat(n.props.children).join('')) : [];
+  };
 
-  it('a row wears its token\'s icon (a token with a contract its letter), no badge; a row that moves nothing wears none', async () => {
-    const icon = (tree) => tree.root.findAll((n) => typeof n.props.testID === 'string' && n.props.testID.startsWith('token-icon-')
-      && typeof n.type !== 'string').map((n) => n.props.testID);
-    for (const [tx, want] of [[native(), ['token-icon-QNC']], [token(), ['token-icon-letter']], [sol({ status: 'failed' }), ['token-icon-SOL']],
-      [nodeEvent(), []]]) {
-      let tree;
+  it('an amount sits at the title\'s height, the number shrinking to fit, a long symbol ending in an ellipsis on its line', async () => {
+    let tree;
+    // The owner's rows: Sent to self 235,717.82 QNC and Moved from node +942,871.28 QNC, and a million and more.
+    for (const [tx, number] of [
+      [native({ to: ME, type: 'self', amount: 235717.82 }), '235,717.82'],
+      [native({ from: 'system_rewards_pool', to: ME, type: 'receive', amount: 942871.28 }), '+942,871.28'],
+      [native({ from: OTHER, to: ME, type: 'receive', amount: 12345678901 }), '+12,345,678,901'],
+      [token({ tokenSymbol: 'LONGSYMBOL', tokenAmountDisplay: '9,876.5432' }), '+9,876.54'],
+    ]) {
       await act(async () => { tree = renderer.create(<HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={() => {}} />); });
-      expect([tx.hash, [...new Set(icon(tree))]]).toEqual([tx.hash, want]);
+      const top = lineTexts(tree, 'history-row-top');
+      expect([number, top.slice(1, 2)]).toEqual([number, [number]]);
+      const shown = tree.root.findAllByType(Text).find((n) => n.props.children === number);
+      expect(shown.props).toMatchObject(FIGURE_LINE);
+      const symbol = tree.root.findAllByType(Text).find((n) => /^ /.test([].concat(n.props.children).join('')));
+      expect([symbol.props.numberOfLines, symbol.props.ellipsizeMode]).toEqual([1, 'tail']);
+      // The amount's line reads left to right in every language: the number, then its symbol, side by side.
+      expect(StyleSheet.flatten(shown.parent.props.style)).toMatchObject({ flexDirection: 'row', direction: 'ltr' });
       await act(async () => { tree.unmount(); });
     }
   });
 
-  it('a number too long to sit beside the title takes the line under it, the whole width, shrinking to fit', async () => {
+  it('a row wears its token\'s icon, 40 dp (a token with a contract its letter), no badge; a row that moves nothing wears none', async () => {
+    const icon = (tree) => tree.root.findAll((n) => typeof n.props.testID === 'string' && n.props.testID.startsWith('token-icon-')
+      && typeof n.type !== 'string');
+    for (const [tx, want] of [[native(), ['token-icon-QNC']], [token(), ['token-icon-letter']], [sol({ status: 'failed' }), ['token-icon-SOL']],
+      [nodeEvent(), []]]) {
+      let tree;
+      await act(async () => { tree = renderer.create(<HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={() => {}} />); });
+      expect([tx.hash, [...new Set(icon(tree).map((n) => n.props.testID))]]).toEqual([tx.hash, want]);
+      expect(tree.root.findAllByType(TokenIcon).map((n) => n.props.size)).toEqual(want.map(() => size.histIcon));
+      // A row that moves nothing keeps the icon's room, so its title starts where every other row's does.
+      expect(tree.root.findAll((n) => typeof n.type === 'string' && StyleSheet.flatten(n.props.style || {}).width === size.histIcon)).toHaveLength(1);
+      await act(async () => { tree.unmount(); });
+    }
+  });
+
+  it('a swap: both tokens\' icons, the received in front, and each amount at its line\'s height, the received first', async () => {
+    const out = token({ tokenLogIndex: 0, type: 'send', from: ME, to: CONTRACT, tokenSymbol: 'GLD', tokenAmountDisplay: '10' });
+    const got = token({ tokenLogIndex: 1, tokenContract: 'd'.repeat(64), tokenSymbol: 'SLV', tokenAmountDisplay: '121,469.22846', from: CONTRACT });
+    const [swap] = historyEntries([out, got]);
+    let tree;
+    await act(async () => { tree = renderer.create(<HistoryRow tx={swap} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    const pair = tree.root.find((n) => n.props.testID === 'history-swap-icons' && typeof n.type === 'string');
+    const icons = pair.findAllByType(TokenIcon);
+    // Drawn back to front: the one paid (GLD), then the one received (SLV) over it.
+    expect(icons.map((n) => [n.props.symbol, n.props.size])).toEqual([['GLD', size.swapIcon], ['SLV', size.swapIcon]]);
+    expect(lineTexts(tree, 'history-row-top')).toEqual(['Swap', '+121,469.23', ' SLV']);
+    expect(lineTexts(tree, 'history-row-bottom')).toEqual(['−10', ' GLD']);
+  });
+
+  it('a number too long for its line even at its smallest takes, with the other, a line of its own under the row', async () => {
     let tree;
     const big = native({ from: OTHER, to: ME, type: 'receive', amount: 123456789012 });
+    expect(fitsBeside(describeTx(big).legs[0])).toBe(false);
+    expect(fitsBeside(describeTx(native({ from: OTHER, to: ME, type: 'receive', amount: 12345678901 })).legs[0])).toBe(true);
     await act(async () => { tree = renderer.create(<HistoryRow tx={big} t={t} hideAmounts={false} onOpen={() => {}} />); });
     const number = tree.root.findAllByType(Text).find((n) => n.props.children === '+123,456,789,012');
-    expect(number.props.children.length).toBeGreaterThan(BESIDE_CHARS);
     expect(number.props).toMatchObject(FIGURE_LINE);
     // The title's line holds the title alone; the amounts are the row's second child.
+    expect(lineTexts(tree, 'history-row-top')).toEqual(['Received']);
     const row = tree.root.find((n) => n.props.testID === 'history-row' && typeof n.type === 'string');
-    const [line, amounts] = row.children.filter((c) => typeof c === 'object');
-    expect(line.findAllByType(Text).map((n) => n.props.children)).not.toContain('+123,456,789,012');
+    const [, amounts] = row.children.filter((c) => typeof c === 'object');
     expect(amounts.findAllByType(Text).map((n) => n.props.children)).toContain('+123,456,789,012');
-    // A number that fits stays beside the title, one line at full size.
-    await act(async () => { tree.update(<HistoryRow tx={native({ amount: 98765.4321 })} t={t} hideAmounts={false} onOpen={() => {}} />); });
-    const short = tree.root.findAllByType(Text).find((n) => n.props.children === '−98,765.43');
-    expect(short.props.numberOfLines).toBe(1);
-    expect(short.props.adjustsFontSizeToFit).toBeUndefined();
+    // Hidden amounts always sit beside the title.
+    await act(async () => { tree.update(<HistoryRow tx={big} t={t} hideAmounts onOpen={() => {}} />); });
+    expect(lineTexts(tree, 'history-row-top')).toEqual(['Received', '••••']);
   });
 });
 
@@ -252,7 +287,7 @@ describe('one row per transaction', () => {
     expect(words.join('|')).not.toMatch(/Sent|QNC/);
     // Its detail: the node, the transaction's hash and its explorer page.
     const onExplorer = jest.fn();
-    await act(async () => { tree = renderer.create(<TxDetail tx={{ ...reg, nodeTypeTitle: 'Light node' }} t={t} onBack={() => {}} onCopy={() => {}} onExplorer={onExplorer} />); });
+    await act(async () => { tree = renderer.create(<TxDetail tx={{ ...reg, nodeTypeTitle: 'Light node' }} t={t} onBack={() => {}} onExplorer={onExplorer} />); });
     expect(texts(tree)).toEqual(expect.arrayContaining(['Node registered', 'Light node', 'light_9f3a2c1d0e7b', 'f'.repeat(64), '2851100']));
     // The status in a word, no badge.
     expect(tree.root.find((n) => n.type === Text && n.props.testID === 'tx-detail-badge-confirmed').props.children).toBe(t('hist_status_confirmed'));
@@ -268,6 +303,64 @@ describe('one row per transaction', () => {
     expect(entries[0]).toMatchObject({ nodeRegistration: true, status: 'confirmed', timestamp: AT });
   });
 
+  // "Node registered" never reads Unverified for good when the registry's events do not come (a refused or unanswered
+  // read): the node's status settles the archive's row of the registration.
+  it('the light node\'s status, with its registration height, settles the registration as the registry\'s event does', async () => {
+    const { native: [archived] } = splitExplorerItems([registrationItem], ME);
+    expect(historyEntries([archived])[0].status).toBe('unverified');
+    // Two genesis nodes report the light node on the chain, registered at the archive row's block.
+    const fromStatus = nodeEventRow({ nodeId: 'light_9f3a2c1d0e7b', nodeType: 'light', height: 2851100 }, ME);
+    expect(fromStatus).toEqual({ ...nodeEvent({ timestamp: 0 }), from: ME.toLowerCase() });
+    const [entry] = historyEntries(withNodeEvents([archived], [fromStatus]));
+    expect(entry).toMatchObject({ nodeRegistration: true, nodeId: 'light_9f3a2c1d0e7b', status: 'confirmed', timestamp: AT });
+    let tree;
+    await act(async () => { tree = renderer.create(<HistoryRow tx={entry} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    expect(texts(tree)).not.toContain(t('hist_status_unverified'));
+    // The registry's own event of the node is not doubled; another node's is added as it is.
+    const rows = [archived, nodeEvent()];
+    expect(withNodeEvents(rows, [fromStatus])).toBe(rows);
+    expect(withNodeEvents(rows, [{ ...fromStatus, hash: 'node:light_other', nodeId: 'light_other' }])).toHaveLength(3);
+    expect(withNodeEvents(rows, [])).toBe(rows);
+  });
+
+  it('a refused or failed read of the registry keeps its events: only a list of events is its answer', () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    const load = src.slice(src.indexOf('const readTxHistory = async'), src.indexOf('const loadOlderHistory = async'));
+    expect(load).toMatch(/const nodeEvents = nodeEventsData && Array\.isArray\(nodeEventsData\.events\) \? nodeEventsData\.events : null;/);
+    expect(load).toMatch(/nodeEventsOk: nodeEvents !== null/);
+    expect(load).toMatch(/nodeEventRow\(\s*\{ nodeId: ev\.node_id, nodeType: ev\.node_type, height: ev\.height, timestamp: ev\.timestamp \}, myAddress\)/);
+    // A rate limit's body is not a list: the events shown stay, so the registration they settle stays confirmed.
+    const { native: [archived] } = splitExplorerItems([registrationItem], ME);
+    const shown = mergeHistory([], [archived, nodeEvent()], { myAddress: ME, coveredFromMs: 0, nowMs: NOW, nodeEventsOk: true });
+    const after = mergeHistory(shown, [archived], { myAddress: ME, coveredFromMs: 0, nowMs: NOW, nodeEventsOk: false });
+    expect(historyEntries(after).map((e) => [e.nodeRegistration, e.status])).toEqual([[true, 'confirmed']]);
+    // The screen's own light status joins the list as a node event (WalletScreen lightRegistration).
+    expect(src).toMatch(/withNodeEvents\(withMoveStates\(txHistory, transit\.owner === wallet\?\.qnetAddress \? transit : null\)\.filter\(historyRowVisible\),\s+lightRegistration \? \[lightRegistration\] : \[\]\)/);
+    expect(src).toMatch(/nodeEventRow\(\{ nodeId: lightNodeStatus\.nodeId, nodeType: 'light', height: lightRegHeight \}, wallet\.qnetAddress\)/);
+  });
+
+  it('a hidden node name is masked in the row and its detail, in the same place; Copy still copies it whole', async () => {
+    const { native: archived } = splitExplorerItems([registrationItem], ME);
+    const [reg] = historyEntries([...archived, nodeEvent()]);
+    let tree;
+    await act(async () => { tree = renderer.create(<HistoryRow tx={reg} t={t} hideAmounts={false} hideNames onOpen={() => {}} />); });
+    expect(texts(tree)).toContain('Node ••••');
+    expect(texts(tree).join('|')).not.toMatch(/light_9f3a2c1d0e7b/);
+    expect(tree.root.find((n) => n.props.testID === 'history-row').props.accessibilityLabel).not.toMatch(/light_/);
+    const Clipboard = require('@react-native-clipboard/clipboard').default;
+    await act(async () => {
+      tree = renderer.create(<TxDetail tx={{ ...reg, nodeTypeTitle: 'Light node' }} t={t} hideNames onBack={() => {}} onExplorer={() => {}} />);
+    });
+    expect(texts(tree)).toContain('••••');
+    expect(texts(tree).join('|')).not.toMatch(/light_9f3a2c1d0e7b/);
+    await act(async () => { await tree.root.find((n) => n.props.testID === 'tx-detail-copy-node' && n.props.onPress).props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith('light_9f3a2c1d0e7b');
+    await act(async () => { tree.unmount(); });
+    // Shown again: the name, as before.
+    await act(async () => { tree = renderer.create(<HistoryRow tx={reg} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    expect(texts(tree)).toContain('Node light_9f3a2c1d0e7b');
+  });
+
   it('a node event alone stays a row; a registration of another node is not folded into it', () => {
     const other = { ...splitExplorerItems([{ ...registrationItem, block: 99 }], ME).native[0] };
     const entries = historyEntries([other, nodeEvent()]);
@@ -277,8 +370,8 @@ describe('one row per transaction', () => {
 
   it('a standalone node event\'s detail has no hash and no explorer page', async () => {
     let tree;
-    await act(async () => { tree = renderer.create(<TxDetail tx={nodeEvent()} t={t} onBack={() => {}} onCopy={() => {}} onExplorer={() => {}} />); });
-    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-explorer' || n.props.testID === 'tx-detail-copy')).toHaveLength(0);
+    await act(async () => { tree = renderer.create(<TxDetail tx={nodeEvent()} t={t} onBack={() => {}} onExplorer={() => {}} />); });
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-explorer' || n.props.testID === 'tx-detail-copy-hash')).toHaveLength(0);
     expect(texts(tree)).not.toContain('node:light_9f3a2c1d0e7b');
   });
 
@@ -316,6 +409,51 @@ describe('day headers', () => {
   });
 });
 
+// Blocks, not lines across the page. Each transaction is a card of its own under its day's header (the header outside
+// the cards, no rule under it); its detail is the amount over one section of its fields, the status
+// first, and the action under the section.
+describe('cards and the detail\'s section', () => {
+  const { card } = require('../src/theme');
+  const Section = require('../src/components/ui/Section').default;
+  const Action = require('../src/components/ui/Action').default;
+
+  it('a row is a card of its own; the day\'s header sits over the cards with no rule', async () => {
+    let tree;
+    await act(async () => { tree = renderer.create(<HistoryRow tx={native()} t={t} hideAmounts={false} onOpen={() => {}} />); });
+    const row = tree.root.find((n) => n.props.testID === 'history-row' && typeof n.type === 'string');
+    expect(flatStyle(row)).toMatchObject(card);
+    const { DayHeader } = require('../src/screens/HistoryTab');
+    await act(async () => { tree = renderer.create(<DayHeader item={{ day: 'today', at: NOW }} t={t} />); });
+    const header = flatStyle(tree.root.findByType(Text));
+    expect([header.borderBottomWidth, header.borderRadius, header.backgroundColor]).toEqual([undefined, undefined, undefined]);
+  });
+
+  it('the detail: the amount, then one section of rows with the status first in its tone, then its one action', async () => {
+    const tones = { confirmed: color.mint, pending: color.fog, failed: color.ember };
+    for (const [status, ink] of Object.entries(tones)) {
+      let tree;
+      await act(async () => {
+        tree = renderer.create(<TxDetail tx={native({ status })} t={t} onBack={() => {}} onExplorer={() => {}} />);
+      });
+      const sections = tree.root.findAllByType(Section);
+      expect(sections).toHaveLength(1);
+      const rows = sections[0].findAll((n) => n.type === Text);
+      expect([rows[0].props.children, rows[1].props.testID]).toEqual([t('tx_detail_status'), `tx-detail-badge-${status}`]);
+      expect(flatStyle(rows[1]).color).toBe(ink);
+      // The amount above the section; the explorer under it, the one solid action of the screen, for one the network
+      // ran; one still pending has none (its hash is copied by a tap on it).
+      expect(texts(tree).indexOf('−12.5 QNC')).toBeLessThan(texts(tree).indexOf(t('tx_detail_status')));
+      const action = tree.root.findAllByType(Action).find((n) => n.props.testID === 'tx-detail-explorer');
+      if (status === 'pending') {
+        expect(action).toBeUndefined();
+        continue;
+      }
+      expect(action.props.kind).toBeUndefined();
+      expect(sections[0].findAllByType(Action).filter((n) => n === action)).toHaveLength(0);
+    }
+  });
+});
+
 describe('the app mark', () => {
   it('every token wears its icon, all bundled: nothing is fetched to draw one, and a look-alike gets its letter', () => {
     const fs = require('fs');
@@ -331,9 +469,9 @@ describe('the app mark', () => {
     expect(knownIcon({ network: 'qnet', symbol: 'SOL' })).toBeNull();
     const screen = fs.readFileSync(path.join(__dirname, '..', 'src', 'screens', 'WalletScreen.js'), 'utf8');
     expect(screen).not.toMatch(/raw\.githubusercontent|source=\{\{\s*uri/);
-    // Assets (QNC, QNet tokens, SOL and 1DEV), the Send switch, Receive and the token manager.
-    expect(screen.match(/<TokenIcon /g).length).toBeGreaterThanOrEqual(6);
-    for (const f of ['HistoryTab.js', 'SolanaSend.js']) {
+    // Receive and the token manager; Assets, the token picker and a token's own screen draw theirs in TokenScreens.
+    expect(screen.match(/<TokenIcon /g).length).toBeGreaterThanOrEqual(2);
+    for (const f of ['HistoryTab.js', 'TokenScreens.js']) {
       expect(fs.readFileSync(path.join(__dirname, '..', 'src', 'screens', f), 'utf8')).toMatch(/<TokenIcon /);
     }
     // The one image of the open wallet is the app mark in its header, the bundled file.
@@ -397,9 +535,9 @@ describe('the detail screen names the network\'s own senders in words (M-2)', ()
     return out;
   };
   const claim = native({ from: 'system_rewards_pool', to: ME, type: 'receive', amount: 5, txType: 'RewardDistribution', fee: 0 });
-  const detail = async (tx, tt = t, onCopy = () => {}) => {
+  const detail = async (tx, tt = t) => {
     let tree;
-    await act(async () => { tree = renderer.create(<TxDetail tx={tx} t={tt} onBack={() => {}} onCopy={onCopy} onExplorer={() => {}} />); });
+    await act(async () => { tree = renderer.create(<TxDetail tx={tx} t={tt} onBack={() => {}} onExplorer={() => {}} />); });
     return tree;
   };
 
@@ -417,18 +555,22 @@ describe('the detail screen names the network\'s own senders in words (M-2)', ()
   });
 
   it('the sender is not copied and drawn in the plain face; an account still is copied', async () => {
-    const onCopy = jest.fn();
-    let tree = await detail(claim, t, onCopy);
+    const Clipboard = require('@react-native-clipboard/clipboard').default;
+    Clipboard.setString.mockClear();
+    let tree = await detail(claim, t);
     const value = tree.root.findAllByType(Text).find((n) => n.props.children === 'Node balance');
     expect(StyleSheet.flatten(value.props.style).fontFamily).toBe(StyleSheet.flatten(tree.root.findAllByType(Text).find((n) => n.props.children === 'From').props.style).fontFamily);
     const copiers = tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.props.accessibilityHint === t('common_tap_to_copy'));
-    for (const c of copiers) await act(async () => { c.props.onPress(); });
-    expect(onCopy.mock.calls.map((c) => c[1])).not.toContain('detail-from');
-    tree = await detail(native({ from: OTHER, to: ME, type: 'receive' }), t, onCopy);
-    const from = tree.root.findAll((n) => typeof n.props.onPress === 'function' && n.props.accessibilityHint === t('common_tap_to_copy'))
-      .find((n) => n.findAllByType(Text).some((x) => x.props.children === OTHER));
-    await act(async () => { from.props.onPress(); });
-    expect(onCopy).toHaveBeenLastCalledWith(OTHER, 'detail-from');
+    for (const c of copiers) await act(async () => { await c.props.onPress(); });
+    expect(Clipboard.setString.mock.calls.map((c) => c[0])).not.toContain('system_rewards_pool');
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-detail-copy-from')).toHaveLength(0);
+    await act(async () => { tree.unmount(); });
+    tree = await detail(native({ from: OTHER, to: ME, type: 'receive' }), t);
+    const from = tree.root.find((n) => n.props.testID === 'tx-detail-copy-from' && typeof n.props.onPress === 'function');
+    expect(from.findAllByType(Text).some((x) => x.props.children === OTHER)).toBe(true);
+    await act(async () => { await from.props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(OTHER);
+    await act(async () => { tree.unmount(); });
   });
 
   it('genesis is "Genesis" and any other system sender "Network"', async () => {
@@ -468,7 +610,7 @@ describe('a token whose symbol carries a direction override (M-5)', () => {
     let tree;
     await act(async () => { tree = renderer.create(<HistoryRow tx={tx} t={t} hideAmounts={false} onOpen={() => {}} />); });
     expect(texts(tree).filter((w) => FORMAT.test(w))).toEqual([]);
-    await act(async () => { tree = renderer.create(<TxDetail tx={tx} t={t} onBack={() => {}} onCopy={() => {}} onExplorer={() => {}} />); });
+    await act(async () => { tree = renderer.create(<TxDetail tx={tx} t={t} onBack={() => {}} onExplorer={() => {}} />); });
     expect(texts(tree)).toContain(t('tok_reserved_warning'));
     expect(texts(tree).filter((w) => FORMAT.test(w))).toEqual([]);
   });

@@ -1,68 +1,71 @@
 // The documentation is kept in the repository next to the code it describes; every row opens the current version of
 // one document there. A server component: the list never changes in the browser.
 
+import type { ReactNode } from 'react';
 import PageHead from '@/components/ui/PageHead';
+import { getI18n } from '@/i18n/server';
+import type { MessageKey } from '@/lib/texts';
 
 const DOCS = 'https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/docs';
 
-const SECTIONS: { title: string; items: { name: string; path: string; what: string }[] }[] = [
+const SECTIONS: { title: MessageKey; items: { key: MessageKey; what: MessageKey; path: string }[] }[] = [
   {
-    title: 'Architecture',
+    title: 'docs_sec_architecture',
     items: [
-      { name: 'Overview', path: 'architecture/overview.md', what: 'What QNet Blockchain is made of and how the pieces fit.' },
-      { name: 'Consensus', path: 'architecture/consensus.md', what: 'Microblocks, checkpoints, committees and quorum certificates.' },
-      { name: 'Cryptography', path: 'architecture/cryptography.md', what: 'ML-DSA-65 signatures, hashes and the address format.' },
-      { name: 'Networking', path: 'architecture/networking.md', what: 'Transport, gossip and the post-quantum handshake between nodes.' },
-      { name: 'State', path: 'architecture/state.md', what: 'Accounts, the state commitment and proofs against it.' },
+      { key: 'docs_architecture_overview', what: 'docs_architecture_overview_what', path: 'architecture/overview.md' },
+      { key: 'docs_architecture_consensus', what: 'docs_architecture_consensus_what', path: 'architecture/consensus.md' },
+      { key: 'docs_architecture_cryptography', what: 'docs_architecture_cryptography_what', path: 'architecture/cryptography.md' },
+      { key: 'docs_architecture_networking', what: 'docs_architecture_networking_what', path: 'architecture/networking.md' },
+      { key: 'docs_architecture_state', what: 'docs_architecture_state_what', path: 'architecture/state.md' },
     ],
   },
   {
-    title: 'Developers',
+    title: 'docs_sec_developers',
     items: [
-      { name: 'Overview', path: 'developers/overview.md', what: 'Where to start: what the testnet offers and the limits to design around.' },
-      { name: 'dApp integration', path: 'developers/dapp-integration.md', what: 'Connecting a web page or game to QNet Wallet, the app and the extension.' },
-      { name: 'Sign-in', path: 'developers/sign-in.md', what: 'Signing users in with their wallet, checked on your server.' },
-      { name: 'Transactions', path: 'developers/transactions.md', what: 'Transfers, token transfers, contract calls and deploys: signing, gas and status.' },
-      { name: 'Smart contracts', path: 'developers/smart-contracts.md', what: 'Writing, deploying and calling contracts, gas and events.' },
-      { name: 'SDK', path: 'developers/sdk.md', what: 'The developer kit for pages, servers and tools.' },
-      { name: 'CLI', path: 'developers/cli.md', what: 'The qnet command: keys, transfers, deploys and calls.' },
-      { name: 'RPC API', path: 'developers/rpc-api.md', what: 'Every endpoint a wallet, an explorer or a script can call.' },
-      { name: 'Security', path: 'developers/security.md', what: 'What to do so users and servers stay safe.' },
-      { name: '1DEV burn contract', path: 'developers/1dev-burn-contract.md', what: 'The Solana side of Phase 1 activation.' },
-      { name: 'QNet Link', path: 'protocols/qnet-link-v1.md', what: 'How aiqnet.io asks QNet Wallet to share its addresses, link its light node to a device, unlink it or move a node balance.' },
-      { name: 'Light node messages', path: 'protocols/light-node-messages.md', what: 'What the wallet, the node and the device sign for a light node, and the device check.' },
+      { key: 'docs_developers_overview', what: 'docs_developers_overview_what', path: 'developers/overview.md' },
+      { key: 'docs_developers_dapp_integration', what: 'docs_developers_dapp_integration_what', path: 'developers/dapp-integration.md' },
+      { key: 'docs_developers_sign_in', what: 'docs_developers_sign_in_what', path: 'developers/sign-in.md' },
+      { key: 'docs_developers_transactions', what: 'docs_developers_transactions_what', path: 'developers/transactions.md' },
+      { key: 'docs_developers_smart_contracts', what: 'docs_developers_smart_contracts_what', path: 'developers/smart-contracts.md' },
+      { key: 'docs_developers_sdk', what: 'docs_developers_sdk_what', path: 'developers/sdk.md' },
+      { key: 'docs_developers_cli', what: 'docs_developers_cli_what', path: 'developers/cli.md' },
+      { key: 'docs_developers_rpc_api', what: 'docs_developers_rpc_api_what', path: 'developers/rpc-api.md' },
+      { key: 'docs_developers_security', what: 'docs_developers_security_what', path: 'developers/security.md' },
+      { key: 'docs_developers_1dev_burn_contract', what: 'docs_developers_1dev_burn_contract_what', path: 'developers/1dev-burn-contract.md' },
+      { key: 'docs_protocols_qnet_link_v1', what: 'docs_protocols_qnet_link_v1_what', path: 'protocols/qnet-link-v1.md' },
+      { key: 'docs_protocols_light_node_messages', what: 'docs_protocols_light_node_messages_what', path: 'protocols/light-node-messages.md' },
     ],
   },
   {
-    title: 'Economics',
+    title: 'docs_sec_economics',
     items: [
-      { name: 'Overview', path: 'economics/overview.md', what: 'Emission, the halving schedule and how rewards are split.' },
-      { name: 'Node activation', path: 'economics/node-activation.md', what: 'What activation costs in each phase and why.' },
-      { name: '1DEV', path: 'economics/tokenomics-1dev.md', what: 'The Phase 1 token and its burn.' },
+      { key: 'docs_economics_overview', what: 'docs_economics_overview_what', path: 'economics/overview.md' },
+      { key: 'docs_economics_node_activation', what: 'docs_economics_node_activation_what', path: 'economics/node-activation.md' },
+      { key: 'docs_economics_tokenomics_1dev', what: 'docs_economics_tokenomics_1dev_what', path: 'economics/tokenomics-1dev.md' },
     ],
   },
   {
-    title: 'Operators',
+    title: 'docs_sec_operators',
     items: [
-      { name: 'Running a node', path: 'operators/running-a-node.md', what: 'From a server to a node on QNet Blockchain.' },
-      { name: 'Configuration', path: 'operators/configuration.md', what: 'Every setting a node reads.' },
-      { name: 'Maintenance', path: 'operators/maintenance.md', what: 'Monitoring, logs, upgrades, backups and recovery.' },
+      { key: 'docs_operators_running_a_node', what: 'docs_operators_running_a_node_what', path: 'operators/running-a-node.md' },
+      { key: 'docs_operators_configuration', what: 'docs_operators_configuration_what', path: 'operators/configuration.md' },
+      { key: 'docs_operators_maintenance', what: 'docs_operators_maintenance_what', path: 'operators/maintenance.md' },
     ],
   },
   {
-    title: 'Applications',
+    title: 'docs_sec_applications',
     items: [
-      { name: 'Mobile wallet', path: 'applications/mobile-wallet.md', what: 'The app for phones and tablets and the light node it runs.' },
-      { name: 'Browser wallet', path: 'applications/browser-wallet.md', what: 'The browser extension.' },
-      { name: 'Explorer', path: 'applications/explorer.md', what: 'This website: what it indexes and what it serves.' },
-      { name: 'Python CLI', path: 'applications/cli.md', what: 'The read-only command-line tool for node, wallet and network information.' },
+      { key: 'docs_applications_mobile_wallet', what: 'docs_applications_mobile_wallet_what', path: 'applications/mobile-wallet.md' },
+      { key: 'docs_applications_browser_wallet', what: 'docs_applications_browser_wallet_what', path: 'applications/browser-wallet.md' },
+      { key: 'docs_applications_explorer', what: 'docs_applications_explorer_what', path: 'applications/explorer.md' },
+      { key: 'docs_applications_cli', what: 'docs_applications_cli_what', path: 'applications/cli.md' },
     ],
   },
 ];
 
 const WHITEPAPER = 'https://github.com/AIQnetLab/QNet-Blockchain/blob/testnet/QNet_Whitepaper.md';
 
-function DocRow({ href, name, what }: { href: string; name: string; what: string }) {
+function DocRow({ href, name, what }: { href: string; name: ReactNode; what: ReactNode }) {
   return (
     <li>
       <a className="rowlink" href={href} target="_blank" rel="noopener noreferrer">
@@ -73,23 +76,24 @@ function DocRow({ href, name, what }: { href: string; name: string; what: string
   );
 }
 
-export default function DocsPage() {
+export default async function DocsPage() {
+  const { t, say } = await getI18n();
   return (
     <div className="pg">
-      <PageHead title="Documentation" lead="Kept in the repository next to the code it describes. Each row opens the current version on GitHub." />
+      <PageHead title={t('docs_title')} lead={t('docs_lead')} />
       <div className="wrap pg-body">
         {SECTIONS.map((s) => (
           <section key={s.title} className="doc-sec">
-            <h2>{s.title}</h2>
+            <h2>{say(s.title)}</h2>
             <ul className="rowlinks">
-              {s.items.map((d) => <DocRow key={d.path} href={`${DOCS}/${d.path}`} name={d.name} what={d.what} />)}
+              {s.items.map((d) => <DocRow key={d.path} href={`${DOCS}/${d.path}`} name={say(d.key)} what={say(d.what)} />)}
             </ul>
           </section>
         ))}
         <section className="doc-sec">
-          <h2>Whitepaper</h2>
+          <h2>{t('docs_whitepaper')}</h2>
           <ul className="rowlinks">
-            <DocRow href={WHITEPAPER} name="QNet_Whitepaper.md" what="The whitepaper, at the repository root." />
+            <DocRow href={WHITEPAPER} name="QNet_Whitepaper.md" what={t('docs_whitepaper_what')} />
           </ul>
         </section>
       </div>

@@ -1,4 +1,4 @@
-// My node in concept B (B-SPEC 5.18-5.20, 6.7): the sections from one list for the rail, the thumb bar and the header's
+// My node: the sections from one list for the rail, the thumb bar and the header's
 // account menu; the journey only while a step after Activate is open; the activation's four numbered steps; the last 12
 // epochs and what each epoch added; every entity a link; a layout whose size does not wait for its data.
 // Run: npm run test:wallet
@@ -12,7 +12,7 @@ import { BAR_EPOCHS, STRIP_EPOCHS, lastEpochs, perEpochBars, stripRest } from '.
 import { STAGES } from '../cabinet/flow.ts';
 import { TAB_HREF, navItems, showJourney } from '../cabinet/tabs.ts';
 import { at, clockAgo, clockAt } from '../format.ts';
-import { TEXTS } from '../texts.ts';
+import { EN, TEXTS } from './texts-helper.mjs';
 import { SRC, code, read } from './source.mjs';
 
 const ok = (value) => ({ phase: 'ok', value });
@@ -35,8 +35,8 @@ const history = (rows) => ok({ registeredEpoch: 1, archived: true, rows, more: f
 const reads = (over = {}) => ({ network: ok({ state: 'registered', nodeId: 'light_mobile_1', nodeType: 'light' }), light: ok(light()), superNode: ok(NO_SUPER), history: history([row(281, 'counted', 1.13)]), ...over });
 
 test('the sections: one list for the rail and the bar, its data from the account menu\'s own rows', () => {
-  const rows = accountRows(reads());
-  const items = navItems('node', false, 'overview', false, rows, null);
+  const rows = accountRows(reads(), EN);
+  const items = navItems('node', false, 'overview', false, rows, null, EN);
   assert.deepEqual(items.map((i) => [i.tab, i.href, i.label, i.datum, i.tone]), [
     ['overview', TAB_HREF.overview, 'Overview', '10,478.743462 QNC', 'signal'],
     ['device', TAB_HREF.device, 'Device', 'Pixel 8 · Android', null],
@@ -46,47 +46,47 @@ test('the sections: one list for the rail and the bar, its data from the account
   const menu = Object.fromEntries(rows.map((r) => [r.key, r.datum]));
   assert.deepEqual(items.map((i) => i.datum), [menu.balance, menu.device, menu.history]);
   // An epoch not counted is Ember in both.
-  const missed = navItems('node', false, 'history', false, accountRows(reads({ history: history([row(282, 'missed')]) })), null);
+  const missed = navItems('node', false, 'history', false, accountRows(reads({ history: history([row(282, 'missed')]) }), EN), null, EN);
   assert.equal(missed.find((i) => i.tab === 'history').tone, 'ember');
   // Under 1 QNC the balance is not Signal.
-  const low = navItems('node', false, 'overview', false, accountRows(reads({ light: ok(light({ balanceNano: NANO(0.5) })) })), null);
+  const low = navItems('node', false, 'overview', false, accountRows(reads({ light: ok(light({ balanceNano: NANO(0.5) })) }), EN), null, EN);
   assert.equal(low[0].tone, null);
   // Not read yet: a dash in place ("—"), never a guess.
-  assert.deepEqual(navItems(null, false, 'overview', false, accountRows({ network: LOADING, light: LOADING, superNode: LOADING, history: LOADING }), null).map((i) => i.datum), [null, null, null]);
+  assert.deepEqual(navItems(null, false, 'overview', false, accountRows({ network: LOADING, light: LOADING, superNode: LOADING, history: LOADING }, EN), null, EN).map((i) => i.datum), [null, null, null]);
 });
 
 test('a wallet without a node lists Overview and Activate (its step in Ember); Device and History join once a node exists', () => {
-  const rows = accountRows(reads({ network: ok({ state: 'none' }), light: ok(NO_LIGHT), history: LOADING }));
-  const items = navItems('none', false, 'activate', false, rows, 1);
+  const rows = accountRows(reads({ network: ok({ state: 'none' }), light: ok(NO_LIGHT), history: LOADING }), EN);
+  const items = navItems('none', false, 'activate', false, rows, 1, EN);
   assert.deepEqual(items.map((i) => [i.tab, i.datum, i.tone]), [['overview', 'No node yet', null], ['activate', 'Step 2 of 4', 'ember']]);
   // The menu's Activate row says the same step.
   assert.equal(rows.find((r) => r.key === 'activate').datum, items[1].datum);
   // A burn on its way or being recorded: still no node, Overview only (Activate while this browser's activation is open).
   for (const state of ['reserved', 'sending', 'burned', 'recording']) {
-    assert.deepEqual(navItems(state, false, 'overview', false, rows, 2).map((i) => i.tab), ['overview'], state);
-    assert.deepEqual(navItems(state, true, 'overview', false, rows, 2).map((i) => i.tab), ['overview', 'activate'], state);
+    assert.deepEqual(navItems(state, false, 'overview', false, rows, 2, EN).map((i) => i.tab), ['overview'], state);
+    assert.deepEqual(navItems(state, true, 'overview', false, rows, 2, EN).map((i) => i.tab), ['overview', 'activate'], state);
   }
   // A page opened directly stays listed, so the current section is always marked.
-  assert.deepEqual(navItems('none', false, 'device', false, rows, 1).map((i) => i.tab), ['overview', 'activate', 'device']);
+  assert.deepEqual(navItems('none', false, 'device', false, rows, 1, EN).map((i) => i.tab), ['overview', 'activate', 'device']);
   // An address only viewed is offered no Activate.
-  assert.deepEqual(navItems('none', false, 'overview', true, rows, 1).map((i) => i.tab), ['overview']);
+  assert.deepEqual(navItems('none', false, 'overview', true, rows, 1, EN).map((i) => i.tab), ['overview']);
 });
 
 test('a super node: the server\'s state stands where a device would; both nodes: each with its own line, light first', () => {
   const sup = reads({ network: ok({ state: 'registered', nodeId: 'super_node_1', nodeType: 'super' }), light: ok(NO_LIGHT), superNode: ok(superNode()) });
-  const items = navItems('node', false, 'device', false, accountRows(sup), null);
+  const items = navItems('node', false, 'device', false, accountRows(sup, EN), null, EN);
   assert.deepEqual(items.map((i) => i.datum), ['3 QNC', 'Server online', 'Epoch 281']);
-  assert.deepEqual(nodeLines(sup), [{ nodeType: 'super', words: 'Super node · Online', mark: 'live' }]);
+  assert.deepEqual(nodeLines(sup, EN), [{ nodeType: 'super', words: 'Super node · Online', mark: 'live' }]);
   const both = reads({ superNode: ok(superNode({ online: false, lastSeenAt: null, heartbeats: null })) });
-  const lines = nodeLines(both);
+  const lines = nodeLines(both, EN);
   assert.deepEqual(lines.map((l) => l.nodeType), ['light', 'super']);
   assert.equal(lines[0].words, 'Light node · Online');
-  assert.equal(accountRows(both)[0].datum, 'Light and super node');
-  assert.deepEqual(nodeLines(reads({ light: ok(NO_LIGHT) })), []);
+  assert.equal(accountRows(both, EN)[0].datum, 'Light and super node');
+  assert.deepEqual(nodeLines(reads({ light: ok(NO_LIGHT) }), EN), []);
 });
 
 test('the device\'s datum: its name, or its state where the name is not known; an unlinked device is no device', () => {
-  const device = (d, over = {}) => accountRows(reads({ light: ok(light({ device: { ...DEVICE, ...d }, ...over })) })).find((r) => r.key === 'device').datum;
+  const device = (d, over = {}) => accountRows(reads({ light: ok(light({ device: { ...DEVICE, ...d }, ...over })) }), EN).find((r) => r.key === 'device').datum;
   assert.equal(device({}), 'Pixel 8 · Android');
   // An address only viewed reads no platform or model (node-view.ts publicStatus): the state, never "No device".
   assert.equal(device({ platform: null, model: null }), 'Online');
@@ -95,11 +95,11 @@ test('the device\'s datum: its name, or its state where the name is not known; a
   // A device the network unlinked runs nothing, whatever it said it was.
   assert.equal(device({ state: 'unlinked' }), 'No device');
   // A node of an earlier version names no device: its binding decides.
-  assert.equal(accountRows(reads({ light: ok(light({ device: null })) })).find((r) => r.key === 'device').datum, 'Online');
-  assert.equal(accountRows(reads({ light: ok(light({ device: null, deviceBound: false })) })).find((r) => r.key === 'device').datum, 'No device');
+  assert.equal(accountRows(reads({ light: ok(light({ device: null })) }), EN).find((r) => r.key === 'device').datum, 'Online');
+  assert.equal(accountRows(reads({ light: ok(light({ device: null, deviceBound: false })) }), EN).find((r) => r.key === 'device').datum, 'No device');
 });
 
-// B-SPEC 5.18: one progress indicator at a time.
+// One progress indicator at a time.
 test('the journey shows only while a step after Activate is open: never on Activate, never once running', () => {
   const view = (over) => ({ state: 'node', missing: [], until: null, light: null, superNode: null, superConnected: false, superId: null, nodes: [], burn: null, here: false, extensionUpdate: false, lockedBy: null, unusable: false, networkDown: false, ...over });
   const linkNow = view({ nodes: ['light'], light: 'no_device' });
@@ -150,7 +150,7 @@ test('the last 12 epochs: oldest first, counted Paper, not counted Ember, the ne
   const strip = code('components/cabinet/EpochCharts.tsx');
   assert.match(strip, /\{Array\.from\(\{ length: STRIP_EPOCHS - cells\.length \}, \(_, i\) => <i key=\{`pad-\$\{i\}`\} className="cab-cell" aria-hidden="true" \/>\)\}/);
   // Each cell is a button that names its epoch and result; the line under the strip says it.
-  assert.match(strip, /aria-label=\{cellWords\(cell\)\}/);
+  assert.match(strip, /aria-label=\{cellWords\(cell, t\)\}/);
   assert.equal(TEXTS.strip_epoch, 'Epoch {epoch} · {result}');
 });
 
@@ -166,7 +166,7 @@ test('added per epoch: bars to the tallest, moved in Fog, a tick for not counted
 });
 
 test('every entity in My node is a link in the one look: node ids, blocks, transactions, Solana burns', () => {
-  // The node id: its wallet's address page (B-SPEC 5.7), in the rail's head, the details and the head of each node.
+  // The node id: its wallet's address page, in the rail's head, the details and the head of each node.
   assert.match(code('components/cabinet/CabinetNav.tsx'), /<EntityLink kind="node" value=\{id\} address=\{wallet\} \/>/);
   assert.match(code('components/cabinet/NodeDetails.tsx'), /<EntityLink kind="node" value=\{nodeId\} address=\{choice\?\.qnet \?\? null\} full \/>/);
   assert.match(code('components/cabinet/NodeHome.tsx'), /<EntityLink kind="node" value=\{nodeId\} address=\{choice\?\.qnet \?\? null\} \/>/);
@@ -176,12 +176,16 @@ test('every entity in My node is a link in the one look: node ids, blocks, trans
   // Each epoch's move to the wallet: its transaction page; an amount's unit: the QNC page.
   assert.match(code('components/cabinet/NodeHistory.tsx'), /<EntityLink kind="tx" value=\{row\.claimTx\} \/>/);
   assert.match(code('components/cabinet/NodeHistory.tsx'), /<Amount value=\{AMOUNT\.format\(row\.amountQnc\)\} \/>/);
-  // The wallet a node is for, wherever a sentence names it, and the address only viewed: its address page.
+  // The wallet an activation is for, wherever its page names it: the entity without a link, since before the node is
+  // registered its address page shows nothing of the activation (no payment, no node). The address only viewed: its page.
   const activate = code('components/cabinet/NodeActivate.tsx');
   for (const key of ['act_reserve_lead', 'act_reserve_done', 'act_link_named']) {
-    assert.match(activate, new RegExp(`rich\\('${key}', \\{ wallet: <EntityLink kind="address" value=\\{named\\} /> \\}\\)`), key);
+    assert.match(activate, new RegExp(`rich\\('${key}', \\{ wallet: <EntityLink kind="address" value=\\{named\\} link=\\{false\\} /> \\}\\)`), key);
   }
   assert.doesNotMatch(activate, /t\('act_(reserve_lead|reserve_done|link_named)', \{ wallet: shortAddress/);
+  const steps = code('components/cabinet/ActivateSteps.tsx');
+  for (const key of ['act_owner', 'act_answer_for']) assert.match(steps, new RegExp(`rich\\('${key}', \\{ [^}]*wallet: <EntityLink kind="address" value=\\{[a-z.]+\\} link=\\{false\\} /> \\}\\)`), key);
+  assert.doesNotMatch(activate + steps, /<EntityLink kind="address" value=\{(named|wallet|record\.answer\.qnet)\} \/>/);
   assert.match(code('components/cabinet/CabinetNav.tsx'), /rich\('view_line', \{ wallet: <EntityLink kind="address" value=\{wallet\} \/> \}\)/);
   // Burns on Solana leave the site (↗), never a bare hash.
   for (const file of ['NodeDetails', 'ActivateSteps', 'ExtensionActivate']) {
@@ -204,10 +208,10 @@ test('nothing jumps: the area keeps its room, the Overview its geometry while it
   const charts = code('components/cabinet/EpochCharts.tsx');
   assert.match(charts, /if \(!data && state\.phase !== 'loading'\) return null;/);
   assert.match(charts, /const cols = \{ '--n': data \? bars\.length : BAR_EPOCHS \} as CSSProperties;/);
-  assert.match(charts, /<figure className="cab-pe" aria-busy=\{data \? undefined : true\}>/);
+  assert.match(charts, /<figure className="cab-pe" dir="ltr" aria-busy=\{data \? undefined : true\}>/);
   // The rail's data keep their box: a datum that arrives moves nothing beside it.
   assert.match(sheet, /\.cab-nav-d \{\n {2}justify-self: end; min-width: 18ch;/);
-  assert.match(sheet, /\.cab-id \{ display: grid; gap: 14px; min-height: 50px;/);
+  assert.match(sheet, /\.cab-id \{ display: grid; grid-template-columns: minmax\(0, 1fr\); gap: 14px; min-height: 50px;/);
   // While the node is read, its readouts and its epochs' rows stand in place (dashes, empty rows at their height).
   const home = code('components/cabinet/NodeHome.tsx');
   assert.match(home, /<StatusGate state=\{state\} retry=\{retry\} loading=\{<Reading nodeId=\{nodeId\} \/>\}>/);
@@ -216,7 +220,7 @@ test('nothing jumps: the area keeps its room, the Overview its geometry while it
   assert.match(code('components/cabinet/NodeHistory.tsx'), /return view && nodeId \? <AllEpochs nodeId=\{nodeId\} first=\{view\} \/> : <Table rows=\{null\} loading=\{10\} \/>;/);
   // The epoch's reading follows the chain's head alone; the rest of the Overview does not re-render every block.
   assert.equal(home.match(/useChainHead\(\)/g)?.length, 1);
-  assert.match(home, /function ThisEpoch\(\{ value \}: \{ value: string \| null \}\) \{\s*const \{ height \} = useChainHead\(\);\s*return <EpochReadout height=\{height\} reading=\{\{ label: epochLabel, value \}\} \/>;/);
+  assert.match(home, /function ThisEpoch\(\{ value \}: \{ value: string \| null \}\) \{\s*const \{ rich \} = useI18n\(\);\s*const \{ height \} = useChainHead\(\);\s*const epochLabel = \(epoch: ReactNode\) => rich\('ro_epoch', \{ epoch \}\);\s*return <EpochReadout height=\{height\} reading=\{\{ label: epochLabel, value \}\} \/>;/);
   // A request's QR code has its box from the start; an expired one leaves the box in place.
   assert.match(code('components/cabinet/LinkWaiting.tsx'), /<svg className="cab-qr" width=\{size\} height=\{size\}/);
   assert.match(sheet, /\.cab-req-gone \{ width: 168px; height: 168px;/);
@@ -226,14 +230,14 @@ test('nothing jumps: the area keeps its room, the Overview its geometry while it
 
 test('times in one form: a time to come and a time gone by, the day added past twelve hours', () => {
   const now = Date.UTC(2026, 9, 19, 12, 0);
-  assert.match(clockAt(now + 3_600_000, now), /^\d\d:\d\d$/);
-  assert.equal(clockAt(now + 13 * 3_600_000, now), at(now + 13 * 3_600_000));
-  assert.match(clockAgo(now - 3_600_000, now), /^\d\d:\d\d$/);
-  assert.equal(clockAgo(now - 13 * 3_600_000, now), at(now - 13 * 3_600_000));
-  assert.match(at(now), /^[A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
-  // The cabinet has no date formatter of its own but the UTC day a device linked.
+  assert.match(clockAt(now + 3_600_000, now, EN), /^\d\d:\d\d$/);
+  assert.equal(clockAt(now + 13 * 3_600_000, now, EN), at(now + 13 * 3_600_000, EN));
+  assert.match(clockAgo(now - 3_600_000, now, EN), /^\d\d:\d\d$/);
+  assert.equal(clockAgo(now - 13 * 3_600_000, now, EN), at(now - 13 * 3_600_000, EN));
+  assert.match(at(now, EN), /^[A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
+  // The cabinet has no date formatter of its own: the UTC day a device linked is the formats module's too (dayUtc).
   for (const file of ['NodeStatus', 'NodeHistory', 'NextSteps']) {
     const formatters = code(`components/cabinet/${file}.tsx`).match(/new Intl\.DateTimeFormat\(/g)?.length ?? 0;
-    assert.equal(formatters, file === 'NodeStatus' ? 1 : 0, file);
+    assert.equal(formatters, 0, file);
   }
 });

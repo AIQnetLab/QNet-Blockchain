@@ -1,6 +1,6 @@
 /**
- * The app's own native security module (QNetSecurity; Kotlin on Android, Objective-C on iOS):
- * screen protection for secret screens, the recovery-phrase field's clipboard guard, the recovery phrase's Copy
+ * The app's own native security module (QNetSecurity; Kotlin on Android, Objective-C on iOS): the guard of screens
+ * that show a secret or move value, the recovery-phrase field's clipboard guard, the recovery phrase's Copy
  * with its timed clearing, the Android Keystore keys that seal the vault, the boot clock for the password lockout, a
  * local device-integrity check, the wipe of the in-app browser's data, and the restart of the app's JS that a new layout
  * direction takes. Nothing here talks to the network. Every call degrades to a harmless default when
@@ -17,40 +17,12 @@ export const nativeSecurityAvailable = () => !!N;
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const unb64 = (s) => new Uint8Array(Buffer.from(String(s), 'base64'));
 
-// ── Screen protection ──────────────────────────────────────────────────────────────────────────────
-// Android: FLAG_SECURE (no screenshots, recordings or recents thumbnail), overlay windows hidden (API 31+),
-// accessibility services that are not assistive tools see nothing (API 34+), obscured touches dropped and
-// keyboard learning off in the fields. iOS: the window is covered while the screen is captured. Counted, so
-// overlapping secret screens keep it on until the last one closes.
-let secureDepth = 0;
-
-function applySecure(on) {
-  if (!N || !N.setSecureScreen) return;
-  try { N.setSecureScreen(on); } catch (_) { /* never let protection break the screen it protects */ }
-}
-
-export function acquireSecureScreen() {
-  secureDepth += 1;
-  if (secureDepth === 1) applySecure(true);
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    secureDepth = Math.max(0, secureDepth - 1);
-    if (secureDepth === 0) applySecure(false);
-  };
-}
-
-/** Keeps the screen protected while `active` is true. */
-export function useSecureScreen(active) {
-  useEffect(() => (active ? acquireSecureScreen() : undefined), [active]);
-}
-
 // ── Protected interaction (Android) ────────────────────────────────────────────────────────────────
-// A screen whose taps move value or approve a request (the send form, a site's or aiqnet.io's confirmation):
-// the guard of a secret screen without FLAG_SECURE, so it can still be captured, but overlays are hidden,
-// touches through an obscuring window are dropped and, from API 34, an accessibility service that is not an
-// assistive tool neither sees the views nor acts on them (MPLAT-R2-01). Counted like the secure screen.
+// A screen that shows or takes a secret, or whose taps move value or approve a request (the send form, a site's or
+// aiqnet.io's confirmation): overlays are hidden, touches through an obscuring window are dropped, keyboard learning is
+// off in its fields and, from API 34, an accessibility service that is not an assistive tool neither sees the views nor
+// acts on them. Every screen can still be captured. Counted, so overlapping screens keep it on until the
+// last one closes.
 // None of this stops an accessibility service below API 34, or one that declares itself an assistive tool: what does
 // is that the fresh check it would have to pass is a system biometric prompt it cannot see or pass, or a password whose
 // text the app never gives to accessibility (every password field, on every screen and API level, MPLAT-R4-01), with
@@ -200,9 +172,8 @@ export async function clearBrowserData() {
 
 // ── Native texts ───────────────────────────────────────────────────────────────────────────────────
 /**
- * The words the native side shows by itself, in the app's language: the iOS cover shown while the screen is
- * recorded, the Android notice for a touch through another app's window and the default authentication reason. A build
- * without the method keeps English.
+ * The words the native side shows by itself, in the app's language: the Android notice for a touch through another
+ * app's window and the default authentication reason. A build without the method keeps English.
  */
 export function setNativeTexts(texts) {
   if (!N || !N.setTexts || !texts) return;

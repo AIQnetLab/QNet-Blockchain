@@ -20,7 +20,7 @@ export function loadFaucetSigner(): Signer | null {
 // The network is the release's (ACTIVATION_NETWORK, from BURN_CLUSTER): never a request's Host header, and never a
 // setting either. The site reads and burns only on that cluster, so a setting that said 'mainnet' on a devnet release
 // (or one left unset, once read as 'mainnet') told visitors to send real SOL to addresses nobody could ever move it
-// from (SITE-R3-01).
+// from.
 export function faucetEnvironment(): 'testnet' | 'mainnet' {
   return ACTIVATION_NETWORK;
 }

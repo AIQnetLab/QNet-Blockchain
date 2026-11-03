@@ -11,9 +11,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import jsSha3 from 'js-sha3';
 import { CABINET_LIMITS, CLIENT_BUDGETS, createGate } from '../../server/cabinet/limits.ts';
 import {
-  HISTORY_CACHE_MS, MISS_TIMEOUT_MS, NONE_CACHE_MS, RESERVE_CACHE_MS, STATUS_CACHE_MS, SUPER_CACHE_MS, createNodeProxy, historyPath, historyView, lightShardOwners,
-  mergeHistory, mergeStatus, missesPath, parseHistory, parsePending, parsePublicStatus, settlingPair, stillNeeded,
+  HISTORY_CACHE_MS, MISS_TIMEOUT_MS, NONE_CACHE_MS, RESERVE_CACHE_MS, STATUS_CACHE_MS, SUPER_CACHE_MS, createNodeProxy, deviceSource, historyPath, historyView,
+  lightShardOwners, mergeHistory, mergeStatus, missesPath, parseHistory, parsePending, parsePublicStatus, settlingPair, stillNeeded,
 } from '../../server/cabinet/node-proxy.ts';
+import { activationView, viewName, nextStep } from '../cabinet/wallet-activation.ts';
+import { accountRows, nodeLines } from '../account-menu.ts';
+import { EN } from './texts-helper.mjs';
+import { read } from './source.mjs';
 import { createKnownNodes } from '../../server/cabinet/known-nodes.ts';
 import {
   CLAIMS_SQL, REGISTRATION_CACHE_MS, REGISTRATION_RECHECK_MS, REGISTRATION_SQL, TIMES_SQL, claimsFrom, createEpochArchive, movedEpochs, timesFrom,
@@ -22,7 +26,7 @@ import {
 import { superNodeId } from '../qnet-link.ts';
 import { epochOfHeight, epochOfKey } from '../cabinet/epochs.ts';
 import { UPSTREAM_BUDGETS, createUpstreamBudget } from '../../server/cabinet/upstream.ts';
-import { HISTORY_PAGE_ROWS, joinPages, parseHistoryView, parseStatusView } from '../cabinet/node-view.ts';
+import { HISTORY_PAGE_ROWS, joinPages, nodeState, parseHistoryView, parseStatusView } from '../cabinet/node-view.ts';
 import { GENESIS_NODES } from '../genesis-nodes.ts';
 import { PRICE_NODES } from '../activation-price.ts';
 
@@ -79,11 +83,11 @@ function proxy(table, options = {}) {
 const get = (url = BASE, headers = {}) => new Request(url, { headers: { host: 'aiqnet.io', ...headers } });
 const json = async (res) => JSON.parse(await res.text());
 
-// Contract of 04.10, section 2: the public status names the linked device (its state, the platform it said when it
+// The public status names the linked device (its state, the platform it said when it
 // linked, the UTC day it linked, its last answer's epoch), null for a node not on the chain; the site reads it strictly,
 // takes a node of an earlier version (no field) as naming none, and passes the first settling answer's on. A field it
 // does not read is ignored, as in the status itself; the exact time of the last answer an earlier node still sends
-// (`last_answer_at`, `last_answer`) is never kept (H-1, 06.10).
+// (`last_answer_at`, `last_answer`) is never kept.
 test('the public status\'s device: read strictly, none from an earlier node, passed on from the first settling answer', async () => {
   const device = { platform: 'ios', linked_since: 1_790_000_000 - (1_790_000_000 % 86_400), last_answer_epoch: 155, state: 'online' };
   const none = { model: null, last_miss: null };
@@ -165,7 +169,7 @@ test('"no node" only when two nodes agree; one node or two that disagree is unre
   assert.deepEqual(await json(disagree), { error: 'unavailable' });
 });
 
-// SITE-R4-01: every status answer carries `authoritative`, false while the answering node is behind the network height
+// Every status answer carries `authoritative`, false while the answering node is behind the network height
 // it cached; its "not registered" and "not pending" then settle nothing, and the client asks another node
 // (docs/protocols/light-node-messages.md section 7). The proxy dropped the field and took the first two answers that
 // agreed, so two genesis nodes catching up after a restart answered "no node" for a wallet that had one: the page burned
@@ -182,7 +186,7 @@ const inOrder = { random: () => 0.999 };
 const ASKED = [...lightShardOwners(NODE), ...[0, 1, 2, 3, 4].filter((i) => !lightShardOwners(NODE).includes(i))];
 const nth = (n) => host(ASKED[n - 1] + 1);
 
-// F13 (05.10): an answer reaches the other two owners of the node's light shard by one relay, which an owner that was
+// An answer reaches the other two owners of the node's light shard by one relay, which an owner that was
 // down or restarting misses; then the first owner asked said "not answered" and Offline while the other two counted the
 // device. "Answered this epoch" is now true when any owner listing the node says so, and "needs reactivation" (the
 // device Offline) only when every one of them does; owners behind the network give way to the ones at its height.
@@ -243,6 +247,88 @@ test('answered and needs reactivation are the shard owners\' word: answered when
   body = await json(await down.p.status(get(), NODE));
   assert.deepEqual([body.answeredThisEpoch, body.device.state], [true, 'online']);
   assert.deepEqual(statusReads(down.calls), [nth(1), nth(2), nth(3)]);
+});
+
+// Only the three owners of a light shard keep its binding; another genesis names their device, or none when it could read
+// no owner (device null, device_bound false). So the device is taken from an owner that caught up, else from a genesis
+// that read the owners, else from a node from before the fields; with none of them its link is not known, a state of its
+// own, and the page offers no step to link one.
+test('the device: from a synced owner, else a genesis that read the owners; none of them is "not known", never "no device"', async () => {
+  const device = (state, last = 155) => ({ platform: 'android', linked_since: 1_789_948_800, last_answer_epoch: last, state });
+  const owner = (over = {}) => status({ binding_owner: true, binding_synced: true, device: device('online'), ...over });
+  const lost = (over = {}) => status({ binding_owner: false, binding_synced: false, device_bound: false, device: null, ...over });
+  const parsed = (s) => parsePublicStatus(s);
+  // The fields: absent from a node of an earlier release (null), booleans otherwise; anything else refuses the answer.
+  assert.deepEqual([parsed(status()).binding_owner, parsed(status()).binding_synced], [null, null]);
+  assert.deepEqual([parsed(owner()).binding_owner, parsed(owner({ binding_synced: false })).binding_synced], [true, false]);
+  for (const bad of [{ binding_owner: 'yes' }, { binding_synced: 1 }, { binding_owner: {} }]) assert.equal(parsed(status(bad)), null, JSON.stringify(bad));
+  // No owner reached: the two genesis nodes that answered could read none, so the device is not known.
+  let v = mergeStatus(parsed(lost()), parsed(lost()), null);
+  assert.deepEqual([v.registered, v.deviceBound, v.device], [true, null, null]);
+  assert.equal(nodeState(v), 'device_unknown');
+  assert.deepEqual(parseStatusView(v), v);
+  assert.equal(deviceSource([parsed(lost()), parsed(lost())]), null);
+  // An owner still catching up is passed over for one that caught up, whatever their order.
+  const behindOwner = parsed(owner({ binding_synced: false, device_bound: false, device: { ...device('unlinked', null), platform: null } }));
+  const synced = parsed(owner());
+  for (const [a, b] of [[behindOwner, synced], [synced, behindOwner]]) {
+    v = mergeStatus(a, b, null, [a, b], [a, b]);
+    assert.deepEqual([v.deviceBound, v.device.state, v.device.platform, nodeState(v)], [true, 'online', 'android', 'online']);
+  }
+  // With no owner that caught up: a genesis that read the owners names their device; without one, not known.
+  const relayed = parsed(lost({ device_bound: true, device: device('online', 150) }));
+  v = mergeStatus(behindOwner, relayed, null, [behindOwner, relayed], [behindOwner]);
+  assert.deepEqual([v.deviceBound, v.device.state, v.device.lastAnswerEpoch], [true, 'online', 150]);
+  v = mergeStatus(behindOwner, parsed(lost()), null, [behindOwner, parsed(lost())], [behindOwner]);
+  assert.deepEqual([v.deviceBound, v.device, nodeState(v)], [null, null, 'device_unknown']);
+  // Nodes from before the fields keep their own word, the first settling answer's.
+  v = mergeStatus(parsed(status({ device: device('online') })), parsed(status({ device: device('offline') })), null);
+  assert.deepEqual([v.deviceBound, v.device.state], [true, 'online']);
+  // A node not on the chain: no device, never "not known".
+  v = mergeStatus(parsed(unlisted({ binding_owner: false, binding_synced: false })), parsed(unlisted({ binding_owner: false, binding_synced: false })), null);
+  assert.deepEqual([v.registered, v.deviceBound, v.device, nodeState(v)], [false, false, null, 'none']);
+  // The page reads "not known" only for a registered node that names no device.
+  const unknown = mergeStatus(parsed(lost()), parsed(lost()), null);
+  assert.equal(parseStatusView({ ...unknown, device: { platform: null, model: null, linkedSince: null, lastAnswerEpoch: null, state: 'online', lastMiss: null } }), null);
+  assert.equal(parseStatusView({ ...unknown, registered: false, balanceNano: null }), null);
+  assert.equal(parseStatusView({ ...unknown, deviceBound: 'unknown' }), null);
+
+  // Through the route: the three owners are down, the two other genesis nodes could read none of them.
+  const down = proxy({ [nth(4)]: reads(lost()), [nth(5)]: reads(lost()) }, inOrder);
+  let body = await json(await down.p.status(get(), NODE));
+  assert.deepEqual([body.registered, body.deviceBound, body.device], [true, null, null]);
+  assert.deepEqual(parseStatusView(body), body);
+  assert.deepEqual(statusReads(down.calls), [nth(1), nth(2), nth(3), nth(4), nth(5)]);
+  // The two owners asked first are catching up: the third is asked once, and its word is taken.
+  const catching = owner({ binding_synced: false, device_bound: false, device: { ...device('unlinked', null), platform: null } });
+  const third = proxy({ [nth(1)]: reads(catching), [nth(2)]: reads(catching), [nth(3)]: reads(owner({ device: device('online', 160) })), [nth(4)]: reads(lost()) }, inOrder);
+  body = await json(await third.p.status(get(), NODE));
+  assert.deepEqual([body.deviceBound, body.device.state, body.device.lastAnswerEpoch], [true, 'online', 160]);
+  assert.deepEqual(statusReads(third.calls), [nth(1), nth(2), nth(3)]);
+  // A reservation's read asks no owner more: its answer says the link is not known.
+  const reserve = proxy({ [nth(1)]: reads(catching), [nth(2)]: reads(catching), [nth(3)]: reads(owner()) }, inOrder);
+  const view = await reserve.p.view(NODE, 'reserve');
+  assert.deepEqual([view.deviceBound, view.device], [null, null]);
+  assert.deepEqual(statusReads(reserve.calls), [nth(1), nth(2)]);
+
+  // Every page: the wallet has its node (nothing to activate), its device not known, and no step to link one.
+  const loaded = { phase: 'ok', value: unknown };
+  const av = activationView({
+    choice: { qnet: 'd9fa370374e24333242eon847d1d354dcd87fe873823e', source: 'extension' }, network: { phase: 'ok', value: { state: 'registered', nodeId: NODE, nodeType: 'light' } }, light: loaded,
+    superStatus: { phase: 'ok', value: null }, server: { phase: 'ok', value: { state: 'none' } }, scan: null, extension: { phase: 'na' }, kept: null, records: [],
+  });
+  assert.deepEqual([av.state, av.light, av.nodes, nextStep(av), viewName(av)], ['node', 'device_unknown', ['light'], null, 'light-device-unknown']);
+  const reads2 = { network: { phase: 'ok', value: { state: 'registered', nodeId: NODE, nodeType: 'light' } }, light: loaded, superNode: { phase: 'loading' }, history: { phase: 'loading' }, superId: null };
+  assert.deepEqual(nodeLines(reads2, EN).map((l) => [l.words, l.mark]), [['Light node · Not known', 'ring']]);
+  assert.equal(accountRows(reads2, EN).find((r) => r.key === 'device').datum, 'Not known');
+  assert.equal(EN('device_state_unknown'), 'The device that runs the node cannot be read right now. This page checks again by itself.');
+  assert.match(read('components/cabinet/NodeStatus.tsx'), /device_unknown: \{ tone: 'quiet', word: 'badge_unknown', text: 'device_state_unknown' \},/);
+  assert.match(read('components/cabinet/NodeStatus.tsx'), /return isLinkedState\(state\) \|\| state === 'device_unknown' \? BADGE\[state\] \?\? null : null;/);
+  assert.match(read('components/cabinet/NodeStatus.tsx'), /if \(state === 'device_unknown'\) return <StateLine badge=\{badge\} \/>;/);
+  assert.match(read('components/cabinet/NodeDevices.tsx'), /if \(s === 'device_unknown'\) return <DeviceRows status=\{status\} \/>;\n[^\n]*\n\s*if \(!isLinkedState\(s\)\) return <LinkPhone onLinked=\{reread\} \/>;/);
+  assert.match(read('components/cabinet/ExtensionActivate.tsx'), /: unknown \? <p>\{t\('device_state_unknown'\)\}<\/p> : <LinkPhone \/>\}/);
+  assert.match(read('components/cabinet/ActivateSteps.tsx'), /status\.deviceBound !== false \? <DeviceRows status=\{status\} \/> :/);
+  assert.match(read('components/cabinet/NodeHome.tsx'), /\{state === 'no_device' && <LinkPhone onLinked=\{reread\} \/>\}/);
 });
 
 test('a "no" from nodes behind the network settles nothing: the proxy asks on, and 503 when no two authoritative nodes say it', async () => {
@@ -516,7 +602,7 @@ test('the history without the archive: undated, nothing left out; one node when 
 // A miss in the public form a shard owner serves.
 const miss = (epoch, reason, delivered = null) => ({ epoch, reason, delivered });
 
-// Batch 18.10: each shard owner serves the node's misses of the 64 epochs up to its newest record (GET
+// Each shard owner serves the node's misses of the 64 epochs up to its newest record (GET
 // /api/v1/light-node/misses); a backup
 // owner records nothing while it stands down, so the site asks all three and merges them per epoch by the rule for
 // `last_miss` (last-miss.ts missesByEpoch). A node of an earlier release has no such route: the rows then come without a
@@ -664,7 +750,7 @@ test('the misses never hold the page: a slow owner adds none past MISS_TIMEOUT_M
   assert.equal(old.calls.filter((x) => x.path === missesPath(NODE)).length, 6);
 });
 
-// Owner, 11.10: every epoch, a page at a time. A page after the first starts at the epoch before its own, so a page read
+// Every epoch, a page at a time. A page after the first starts at the epoch before its own, so a page read
 // from a node one epoch behind, or kept from before an epoch settled, skips none; the page joins them.
 test('the history\'s pages: ?page=N reads 31 epochs from offset 30 N - 1, each kept as long as the first; anything else is 400 before a node is asked', async () => {
   assert.equal(HISTORY_PAGE_ROWS, 30);
@@ -964,13 +1050,15 @@ test('the routes are thin: every read goes through the proxy, which logs nothing
     assert.match(text, /export const dynamic = 'force-dynamic';/);
     assert.match(text, new RegExp(`return nodeProxy\\(\\)\\.${call};`));
   }
-  // The history's archive reads the explorer database with the read side's one pool.
-  assert.match(src('app/api/cabinet/node/[id]/history/route.ts'), /const archive = createEpochArchive\(\(text, params\) => query\(text, params\)\);/);
-  assert.doesNotMatch(src('server/cabinet/epoch-archive.ts'), /console\./);
-  for (const file of ['server/cabinet/node-proxy.ts', 'server/cabinet/limits.ts']) assert.doesNotMatch(src(file), /console\./, file);
+  // The history's archive reads the explorer database with the read side's one pool, and a move it keeps cut short from
+  // a genesis node on the cabinet's upstream budget.
+  assert.match(src('app/api/cabinet/node/[id]/history/route.ts'), /const archive = createEpochArchive\(\(text, params\) => query\(text, params\), Date\.now, movePayloads\(sharedUpstreamBudget\(\)\)\);/);
+  for (const file of ['server/cabinet/epoch-archive.ts', 'server/cabinet/move-payload.ts', 'server/cabinet/node-proxy.ts', 'server/cabinet/limits.ts']) {
+    assert.doesNotMatch(src(file), /console\./, file);
+  }
 });
 
-// SITE-R2-09: every cabinet read and write goes to the five genesis nodes, and the explorer server may be on their
+// Every cabinet read and write goes to the five genesis nodes, and the explorer server may be on their
 // whitelist, which skips their own per-address limits. However many clients ask, each genesis node now gets at most
 // UPSTREAM_BUDGETS reads (and submits) a second from the site; a call beyond it is not made and counts as that node not
 // answering. The kinds are kept apart, so reads cannot starve a registration.
@@ -1006,25 +1094,28 @@ test('each genesis node gets a bounded number of calls a second from the site, w
   // A reservation's check that the wallet has no node has a budget of its own (audit M6).
   assert.equal(budget('reserve', 'https://node1.aiqnet.io/x'), true);
   assert.equal(budget('readKnown', 'not a url'), false);
-  assert.deepEqual(UPSTREAM_BUDGETS, {
+  // The genesis nodes' kinds (the wallets' Solana relay's lanes beside them: solana-relay.test.mjs).
+  const { readKnown, readUnknown, reserve, submit } = UPSTREAM_BUDGETS;
+  assert.deepEqual({ readKnown, readUnknown, reserve, submit }, {
     readKnown: { max: 16, windowMs: 1_000 }, readUnknown: { max: 4, windowMs: 1_000 }, reserve: { max: 10, windowMs: 1_000 }, submit: { max: 2, windowMs: 1_000 },
   });
   assert.equal(UPSTREAM_BUDGETS.readKnown.max + UPSTREAM_BUDGETS.readUnknown.max, 20, 'a genesis node is asked no more than before');
   // The process's routes share one budget.
   const src = (name) => readFileSync(new URL(`../../server/cabinet/${name}`, import.meta.url), 'utf8');
-  // The eligible set's reads go on the same budget as the reads of an id seen registered.
-  assert.match(src('node-proxy.ts'), /const budget = sharedUpstreamBudget\(\);\s*const created = createNodeProxy\(\{ gate: cabinetGate\(\), budget, eligible: createEligibleSet\(\{ budget \}\) \}\);/);
+  // The eligible set's reads go on the same budget as the reads of an id seen registered, one set for the process.
+  assert.match(src('node-proxy.ts'), /const created = createNodeProxy\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\), eligible: sharedEligibleSet\(\) \}\);/);
+  assert.match(src('eligible-set.ts'), /const created = createEligibleSet\(\{ budget: sharedUpstreamBudget\(\) \}\);/);
   assert.match(src('eligible-set.ts'), /if \(!budget\('readKnown', url\)\) return null;/);
   assert.match(src('register.ts'), /createRegister\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\), verifyConsent, paymentRecord, \.\.\.own \}\)/);
   assert.match(src('wallet-node.ts'), /createWalletNode\(\{ gate: cabinetGate\(\), budget: sharedUpstreamBudget\(\) \}\)/);
   assert.match(src('wallet-node.ts'), /const url = `\$\{base\}\/api\/v1\/verify-activation`;\s*if \(!budget\(kind, url\)\) return null;/);
   assert.match(src('activation-api.ts'), /walletNode: \(wallet\) => sharedWalletNode\(\)\.check\(wallet, 'reserve'\)/);
-  // Owner, 11.10: no I'm back on the site, so no wake route and no wake budget.
+  // No I'm back on the site, so no wake route and no wake budget.
   assert.equal(existsSync(new URL('../../server/cabinet/wake.ts', import.meta.url)), false);
   assert.equal(existsSync(new URL('../../app/api/cabinet/wake/route.ts', import.meta.url)), false);
   assert.match(src('node-proxy.ts'), /async function read\(url: string, kind: UpstreamKind, timeoutMs: number = NODE_TIMEOUT_MS\): Promise<unknown> \{\s*if \(!budget\(kind, url\)\) return null;/);
 });
-// R4: a super node's status for My node: one node that lists it registered answers "yes" with its details; "no" needs
+// A super node's status for My node: one node that lists it registered answers "yes" with its details; "no" needs
 // two nodes; the balance from rewards/pending; a last-seen time from the nodes, else the archive's newest heartbeat;
 // a reputation below the floor bars it. The answer's shape is exact, and only a super node id is taken.
 test('the super node status: a yes from one node, a no from two, last seen, heartbeats, the bar and the balance', async () => {
@@ -1126,9 +1217,9 @@ test('the super node status: a yes from one node, a no from two, last seen, hear
   assert.deepEqual(asked, [[ID]]);
 });
 
-// C3.7: whether a wallet has a node of either type: verify-activation with the wallet in a header, never in the URL;
-// any "yes" settles it, a "no" needs a node at the network's height and the light node's settled "none".
-test('the wallet\'s node: verify-activation in a header, a yes from any node, a no only from an authoritative one', async () => {
+// Whether a wallet has a node of either type: verify-activation with the wallet in a header, never in the URL;
+// any "yes" settles it, a "no" needs two nodes at the network's height and the light node's settled "none".
+test('the wallet\'s node: verify-activation in a header, a yes from any node, a no only from two authoritative ones', async () => {
   const { createWalletNode, parseVerifyActivation } = await import('../../server/cabinet/wallet-node.ts');
   const WALLET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
   const light = (over = {}) => ({ registered: false, pending: false, deviceBound: false, answeredThisEpoch: false, needsReactivation: false, counted: { sinceRegistration: 0, counted: 0, lastCountedEpoch: null }, features: [], balanceNano: null, ...over });
@@ -1150,6 +1241,21 @@ test('the wallet\'s node: verify-activation in a header, a yes from any node, a 
   assert.deepEqual(await make({ verified: false, authoritative: true }, async () => light({ pending: true })).w.check(WALLET), { state: 'registered', nodeId: 'light_mobile_6526ab8fd00ff8ca', nodeType: 'light' });
   assert.equal(parseVerifyActivation({ verified: false, error: 'Missing wallet_address parameter' }), null);
   assert.deepEqual(parseVerifyActivation({ verified: true, node_id: 'genesis_node_001', node_type: 'super' }), { verified: true, nodeId: 'genesis_node_001', nodeType: 'super' });
+  // One node's "no" is no answer, wherever it stands in the order, while no other node at the network's height says so:
+  // the others unreachable, or behind the network. Two settle it; a "yes" after a "no" is the node.
+  const byNode = (answers) => createWalletNode({
+    fetchFn: network(Object.fromEntries([1, 2, 3, 4, 5].map((n) => [host(n), (path) => (path === '/api/v1/verify-activation' ? answers[n] : undefined)]))).fetchFn,
+    random: () => 0.5, lightView: async () => light(), scope: `wn${(scopes += 1)}`, devOrigins: false, clientKey: () => ({ ok: true, ip: '203.0.113.60' }),
+  });
+  const NO = { verified: false, authoritative: true };
+  const BEHIND = { verified: false, authoritative: false };
+  for (const n of [1, 2, 3, 4, 5]) {
+    assert.equal(await byNode({ [n]: NO }).check(WALLET), null, `node${n} alone says no`);
+    assert.equal(await byNode({ 1: BEHIND, 2: BEHIND, 3: BEHIND, 4: BEHIND, 5: BEHIND, [n]: NO }).check(WALLET), null, `node${n} says no, the others are behind`);
+  }
+  assert.equal((await byNode({ 4: NO }).route(get(`https://aiqnet.io/api/cabinet/wallet-node/${WALLET}`), WALLET)).status, 503);
+  assert.deepEqual(await byNode({ 3: NO, 5: NO }).check(WALLET), { state: 'none' });
+  assert.deepEqual(await byNode({ 1: NO, 2: { verified: true, node_id: 'genesis_node_002', node_type: 'super' } }).check(WALLET), { state: 'registered', nodeId: 'genesis_node_002', nodeType: 'super' });
   // The route: an EON address only, exact answers.
   const route = await no.w.route(get(`https://aiqnet.io/api/cabinet/wallet-node/${WALLET}`), WALLET);
   assert.deepEqual(await json(route), { state: 'none' });
@@ -1191,7 +1297,7 @@ test('the reservation\'s has-node check has its own upstream budget and cache', 
   assert.ok(seen.length > 0 && seen.every((k) => k === 'readKnown'), 'a page read does not take the reservation\'s cache or budget');
 });
 
-// SITE M-12: made-up light ids cost nothing and always miss the per-id cache. Each client's reads that go upstream count
+// Made-up light ids cost nothing and always miss the per-id cache. Each client's reads that go upstream count
 // against its own share across the node, super and wallet-node routes (a cached answer costs nothing), ids nobody saw
 // registered read on a small budget of their own, so registered owners keep theirs, and answers are kept about the
 // page's poll interval, "not registered" and "none" a little longer.

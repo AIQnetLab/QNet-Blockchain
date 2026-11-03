@@ -414,7 +414,8 @@ describe('MN-R1-07: no claim is signed that cannot be reported', () => {
     expect(wm._submitClaim).not.toHaveBeenCalled();
     // The QNet Link sheet answers it as empty, which the protocol can carry.
     const { nodeLinkActions } = require('../src/services/NodeLinkActions');
-    const a = nodeLinkActions({ walletManager: wm, credential: 'pw' });
+    const { move, claimBusy } = require('../test-support/moveRun').sheetMove(wm, { walletAddress: WALLET, credential: 'pw' });
+    const a = nodeLinkActions({ walletManager: wm, credential: 'pw', move, claimBusy });
     expect(await a.claim({ nodeId: NODE, qnet: WALLET, amountNano: 1_020_000_000 })).toEqual({ status: 'empty' });
   });
 

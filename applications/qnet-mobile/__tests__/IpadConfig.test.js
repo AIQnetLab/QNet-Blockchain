@@ -58,12 +58,12 @@ describe('the iOS project', () => {
     const scene = read('ios/QNetMobile/SceneDelegate.swift');
     // One start site, in the app delegate; the launch itself makes no window.
     expect(`${app}\n${scene}`.match(/startReactNative\(/g)).toHaveLength(1);
-    expect(app).toMatch(/func runReactNative\(in window: UIWindow, launchOptions: \[UIApplication\.LaunchOptionsKey: Any\]\?\) \{\s*window\.backgroundColor = AppDelegate\.launchColor\s*self\.window = window\s*reactNativeFactory\?\.startReactNative\(withModuleName: "QNetMobile", in: window, launchOptions: launchOptions\)/);
+    expect(app).toMatch(/func runReactNative\(in window: UIWindow\) \{\s*window\.backgroundColor = AppDelegate\.launchColor\s*self\.window = window\s*reactNativeFactory\?\.startReactNative\(withModuleName: "QNetMobile", in: window, launchOptions: nil\)/);
     expect(app).not.toMatch(/UIWindow\(frame:/);
-    expect(app).toMatch(/DispatchQueue\.main\.async \{\s*guard self\.window == nil, application\.connectedScenes\.isEmpty else \{ return \}\s*self\.runReactNative\(in: UIWindow\(\), launchOptions: nil\)/);
+    expect(app).toMatch(/DispatchQueue\.main\.async \{\s*guard self\.window == nil, application\.connectedScenes\.isEmpty else \{ return \}\s*self\.runReactNative\(in: UIWindow\(\)\)/);
     // A scene connecting while React Native runs takes its window instead of starting a second root.
     expect(scene).toMatch(/if let running = app\.window \{\s*(\/\/[^\n]*\n\s*)*running\.windowScene = windowScene/);
-    expect(scene).toMatch(/let created = UIWindow\(windowScene: windowScene\)\s*self\.window = created\s*app\.runReactNative\(in: created, launchOptions: SceneDelegate\.launchOptions\(connectionOptions\)\)/);
+    expect(scene).toMatch(/let created = UIWindow\(windowScene: windowScene\)\s*self\.window = created\s*app\.runReactNative\(in: created\)/);
   });
 
   it('has every iPad icon, each at its pixel size', () => {
@@ -96,9 +96,13 @@ describe('the screens', () => {
   const styles = require('../src/screens/WalletScreen.styles').default;
 
   it('every screen keeps one centred column of at most 640', () => {
-    for (const k of ['scrollContentContainer', 'formContent', 'centerContent', 'fieldColumn']) {
+    for (const k of ['scrollContentContainer', 'formContent', 'centerContent']) {
       expect([k, styles[k].maxWidth, styles[k].alignSelf, styles[k].width]).toEqual([k, 640, 'center', '100%']);
     }
+    // The screens that hold no data (first read, loading, welcome, lock): their column under the mark.
+    const { startStyles } = require('../src/components/ui/StartScreen');
+    const column = startStyles.column;
+    expect([column.maxWidth, column.alignSelf, column.width]).toEqual([640, 'center', '100%']);
     // Nothing reads the window width: the layout is flex only.
     for (const f of ['src/screens/WalletScreen.js', 'src/screens/NodeTab.js']) {
       expect([f, /useWindowDimensions|Dimensions\./.test(read(f))]).toEqual([f, false]);
@@ -111,6 +115,8 @@ describe('the screens', () => {
     expect(screen).not.toMatch(/edges=\{Platform\.OS/);
     // The system navigation bar too: nothing on a full screen sits under it (owner 20.10: "Forgot?" under Android's bar).
     expect(screen).toMatch(/const SCREEN_EDGES = \['top', 'left', 'right', 'bottom'\];/);
+    // The screens that hold no data draw edge to edge for the mark; their column keeps clear of the bars and the sides.
+    expect(read('src/components/ui/StartScreen.js')).toMatch(/<SafeAreaView edges=\{\['left', 'right', 'bottom'\]\} style=\{s\.frame\}>/);
   });
 
   it('every modal turns with the device', () => {

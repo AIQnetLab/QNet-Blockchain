@@ -1,7 +1,6 @@
-import type { Metadata } from 'next';
+import { recordMetadata } from '@/i18n/server';
 
-// One page per chain record: crawlable for its links, kept out of the index.
-export const metadata: Metadata = { robots: { index: false, follow: true } };
+export const generateMetadata = () => recordMetadata('col_block');
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   return children;

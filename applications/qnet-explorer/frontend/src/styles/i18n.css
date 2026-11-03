@@ -1,0 +1,64 @@
+/* i18n.css: the page in its language. Imported last. Values keep their own direction in every language; Arabic mirrors
+   the layout (the other sheets use logical sides, charts and the Latest blocks strip keep left to right in their
+   markup); each script takes its own faces (tokens.css --f-script) and the spacing it needs. */
+
+/* A count or a time reads as one run in the direction of its first letter: a number left to right, a phrase of the page's
+   language around one ("from 4,838,997 to 4,838,948", "5 s ago") in that language's. */
+.num { unicode-bidi: plaintext; }
+/* An address, a hash, an amount or a piece of code reads left to right as one run inside any sentence; a sentence about
+   amounts (a meter's "250 of 1,500") reads in the page's direction. */
+.ent, .amount, .amount-v, .mono, .ex-val, .addr, .cab-code, .cab-send-amt, code, kbd, samp {
+  direction: ltr; unicode-bidi: isolate;
+}
+/* An address field writes left to right; its hint, until something is typed, reads in the page's direction. */
+[dir='rtl'] .mono:placeholder-shown { direction: rtl; }
+pre { direction: ltr; text-align: left; unicode-bidi: isolate; }
+[translate='no'] { unicode-bidi: isolate; }
+
+/* Right to left: a progress line fills from the right, and a table that scrolls sideways fades and edges its sticky
+   column on the left. */
+[dir='rtl'] .ro-bar > i { transform-origin: right; }
+@media (max-width: 1180px) {
+  [dir='rtl'] .tbl-frame[data-over='true'] .tbl td:first-child { box-shadow: inset 1px 0 0 var(--rule-strong); }
+  [dir='rtl'] .tbl-frame[data-over='true'] .tbl th:first-child { box-shadow: inset 1px 0 0 var(--rule-strong), inset 0 -1px 0 var(--rule-strong); }
+  [dir='rtl'] .tbl-frame[data-over='true']::after { background: linear-gradient(to left, transparent, var(--ink)); }
+}
+/* A chart or the strip of latest blocks keeps left to right on an Arabic page; each label in it reads in the direction of
+   its first letter (a transaction count or an hour in Arabic words) and is still set from the left. */
+:where([dir='rtl'] [dir='ltr']) :where(span, li, p, dt, dd, figcaption):where(:not([dir], [dir='auto'] *)) { unicode-bidi: plaintext; text-align: left; }
+/* The guide's pictures of QNet Wallet's and the extension's screens mirror as those screens do in Arabic; each label is
+   turned back where it stands and reads in the direction of its first letter. */
+[dir='rtl'] .guide-art { direction: ltr; transform: scaleX(-1); }
+[dir='rtl'] .guide-art :is(text, image) { transform: scaleX(-1); transform-box: fill-box; transform-origin: center; }
+[dir='rtl'] .guide-art text { unicode-bidi: plaintext; }
+
+/* Each script's faces, before the stand-ins: Russian takes Roboto's Cyrillic after Archivo (Archivo has none); Chinese,
+   Japanese, Korean and Arabic the system's faces for their script, nothing downloaded. */
+:root:lang(ru) { --f-script: var(--font-cyrillic),; }
+:root:lang(zh-CN) { --f-script: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Noto Sans SC',; }
+:root:lang(ja) { --f-script: 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', Meiryo, 'Noto Sans CJK JP', 'Noto Sans JP',; }
+:root:lang(ko) { --f-script: 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans CJK KR', 'Noto Sans KR',; }
+:root:lang(ar) { --f-script: 'Geeza Pro', 'Segoe UI Arabic', 'Noto Naskh Arabic', 'Noto Sans Arabic', Tahoma,; }
+
+/* Letter spacing breaks Arabic's joined letters and loosens Chinese, Japanese and Korean, which have no capitals to
+   space: none in those scripts, over every rule that sets one (hence !important). */
+:root:is(:lang(ar), :lang(zh-CN), :lang(ja), :lang(ko)) * { letter-spacing: normal !important; }
+/* Without its -.03 em the values' face advances .6 em a character: a value set smaller by its length counts .63 em, the
+   room it keeps in the other languages. */
+:root:is(:lang(ar), :lang(zh-CN), :lang(ja), :lang(ko)) { --ro-ch: .63; }
+
+/* Headings set tight for Latin capitals need room for Arabic's marks above and below the line and for the full height
+   of Chinese, Japanese and Korean characters. */
+:root:is(:lang(ar), :lang(zh-CN), :lang(ja), :lang(ko)) :is(.h2, .page-title, .tbl-title, .cab-title, .cab-pay-h, .phase-t, .ftr-line, .deck) { line-height: 1.3; }
+:root:lang(ar) :is(.h3, .cab-h, .lead, .label) { line-height: 1.6; }
+:root:lang(ar) body { line-height: 1.75; }
+
+/* Korean breaks a line between words, never inside one (browsers break between any two syllables by default); a word
+   longer than its line still breaks. */
+:root:lang(ko) body { word-break: keep-all; overflow-wrap: break-word; }
+/* Chinese and Japanese headings keep a word whole on its line: Japanese by its phrases where the browser can tell them,
+   both between spaces and punctuation otherwise, and a run longer than its line still breaks. Japanese display type and
+   the header set kana at their proportional widths, as Japanese typesetting does. */
+:root:is(:lang(zh-CN), :lang(ja)) :is(h1, h2, h3, h4, dt, .lead, .deck, .ftr-line) { word-break: keep-all; overflow-wrap: anywhere; }
+:root:lang(ja) :is(h1, h2, h3, h4, dt, .lead, .deck, .ftr-line) { word-break: auto-phrase; }
+:root:lang(ja) :is(.hdr, h1, h2, h3, h4, .deck, .ftr-line) { font-feature-settings: 'palt'; }

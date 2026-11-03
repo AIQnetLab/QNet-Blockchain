@@ -8,11 +8,11 @@
 // site script around it. So does any other page rendered for the link host (the root layout passes `onLinkHost` from
 // the request's Host). The proxy (src/proxy.ts) already sends every path there but its exact files to aiqnet.io, and a
 // missing build asset is a plain 404; this holds even for a request that reaches the app past that rule, as
-// /icon-1.png and /_next/staticx did (SITE-R4-CSP-01).
+// /icon-1.png and /_next/staticx would.
 
 import { useEffect } from 'react';
-import { usePathname } from 'next/navigation';
 import { AppProvider } from '@/contexts/AppContext';
+import { usePath } from '@/i18n/client';
 import { LINK_PAGES } from '@/lib/hosts';
 import { installTarget } from '@/lib/install-target';
 import Header from './Header';
@@ -30,8 +30,9 @@ function DeviceClass() {
 
 // `React.ReactNode`, the type the root layout receives from Next.js, passed through unchanged.
 export default function SiteShell({ children, onLinkHost }: { children: React.ReactNode; onLinkHost: boolean }) {
-  const pathname = usePathname();
-  if (onLinkHost || LINK_PAGES.has(pathname)) {
+  // The path without its language: /ru/l is the link page too.
+  const path = usePath();
+  if (onLinkHost || LINK_PAGES.has(path)) {
     return (
       <div className="app-wrapper">
         <main className="qnet-container">{children}</main>

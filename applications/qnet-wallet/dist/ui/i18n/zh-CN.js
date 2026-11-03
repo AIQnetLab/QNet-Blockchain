@@ -173,7 +173,7 @@ export default Object.freeze({
   historyNotFound: '未找到',
   historyUnverified: '未验证',
   historyDroppedLead: 'QNet Blockchain 已不再保留此交易，交易未完成。没有花费任何资金；你的下一笔发送将取代它。',
-  historyUnverifiedLead: '区块浏览器列出了此交易，但 QNet Blockchain 节点没有：它可能早于节点保留的范围。',
+  historyUnverifiedLead: '区块浏览器列出了此交易，但 QNet Blockchain 节点没有。',
   historyTokenUnverifiedLead: '区块浏览器列出了此代币转账，但钱包尚未能在 QNet Blockchain 上证明它。',
   historyReplacedLead: '此钱包的另一笔交易占用了它的 nonce：这笔交易永远无法完成。',
   historyType: '类型',

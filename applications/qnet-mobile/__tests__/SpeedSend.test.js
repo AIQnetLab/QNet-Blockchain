@@ -49,6 +49,28 @@ beforeEach(async () => {
 });
 
 describe('a hedged read', () => {
+  // The second node's start goes with the request: a read or a submit that settled, answered or failed, leaves nothing
+  // running behind it.
+  it('a read or a submit that settled leaves no start of a second node behind', async () => {
+    const wm = new WalletManager();
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    try {
+      global.fetch = jest.fn(async () => reply(200, { nonce: 1 }));
+      await wm._hedged('/api/v1/account/x', { nodes: [A, B], hedgeMs: 10_000, timeoutMs: 3000 });
+      expect(jest.getTimerCount()).toBe(0);
+      await wm._hedged('/api/v1/transaction', { method: 'POST', body: { a: 1 }, nodes: [A, B], hedgeMs: 10_000, timeoutMs: 3000 });
+      expect(jest.getTimerCount()).toBe(0);
+      global.fetch = jest.fn(async () => { throw new TypeError('Network request failed'); });
+      await expect(wm._hedged('/api/v1/account/x', { nodes: [A, B], hedgeMs: 10_000, timeoutMs: 3000 })).rejects.toThrow();
+      await expect(wm._hedged('/api/v1/transaction', { method: 'POST', body: { a: 1 }, nodes: [A, B], hedgeMs: 10_000 }))
+        .rejects.toThrow();
+      expect(jest.getTimerCount()).toBe(0);
+      expect(global.fetch).toHaveBeenCalledTimes(4);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('[429, 200]: the 429 is that node\'s failure, and the next node is asked at once', async () => {
     global.fetch = jest.fn(async (url) => (url.startsWith(A) ? reply(429, { error: 'busy' }) : reply(200, { nonce: 4 })));
     const wm = new WalletManager();
@@ -86,16 +108,35 @@ describe('a hedged read', () => {
     await expect(wm._hedged('/p', { nodes: [A, B], hedgeMs: 10_000 })).resolves.toMatchObject({ ok: false, rateLimited: true });
   });
 
+  // On a mocked clock: the attempt ends exactly at its timeout, whatever load the test machine is under.
   it('a body that stalls times out, and the next node is asked', async () => {
     const stalled = { ok: true, status: 200, json: () => new Promise(() => {}), text: () => new Promise(() => {}) };
     global.fetch = jest.fn(async (url) => (url.startsWith(A) ? stalled : reply(200, { nonce: 9 })));
     const wm = new WalletManager();
-    let t0 = Date.now();
-    await expect(wm._hedged('/p', { nodes: [A], timeoutMs: 250 })).rejects.toThrow(/Timed out/);
-    expect(Date.now() - t0).toBeLessThan(2000);
-    t0 = Date.now();
-    await expect(wm._hedged('/p', { nodes: [A, B], timeoutMs: 250, hedgeMs: 10_000 })).resolves.toMatchObject({ ok: true, base: B });
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(240);
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    try {
+      const outcome = (p) => {
+        const o = { done: false, value: null, error: null };
+        p.then((v) => { o.value = v; }, (e) => { o.error = e; }).finally(() => { o.done = true; });
+        return o;
+      };
+      const alone = outcome(wm._hedged('/p', { nodes: [A], timeoutMs: 250 }));
+      await jest.advanceTimersByTimeAsync(249);
+      expect(alone.done).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(alone.done).toBe(true);
+      expect(alone.error && alone.error.message).toMatch(/Timed out/);
+
+      const handed = outcome(wm._hedged('/p', { nodes: [A, B], timeoutMs: 250, hedgeMs: 10_000 }));
+      await jest.advanceTimersByTimeAsync(249);
+      expect(handed.done).toBe(false);
+      expect(global.fetch.mock.calls.some(([url]) => url.startsWith(B))).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(handed.done).toBe(true);
+      expect(handed.value).toMatchObject({ ok: true, base: B });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('an unreadable body is no answer either', async () => {

@@ -1,0 +1,306 @@
+{
+  "about": "The Solana transactions QNet Wallet and the QNet extension build, each as its message (hex) and its wire bytes signed by the payer (base64), with the shape the site's relay must read them as: a SOL transfer, a 1DEV transfer (the recipient's associated account created first or not, a payment request's memo and references), and the extension's activation burn. `builders` names the wallets that build the case from `transfer` or `burn`.",
+  "generator": "docs/protocols/tools/solana-relay-vectors.mjs",
+  "specs": [
+    "docs/applications/explorer.md#wallets-solana-relay",
+    "docs/applications/mobile-wallet.md",
+    "docs/applications/browser-wallet.md"
+  ],
+  "constants": {
+    "relayPath": "/api/cabinet/solana",
+    "oneDevMint": "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ",
+    "oneDevDecimals": 6,
+    "recentBlockhash": "AseP4eGf1edqQvHMEjf3y1mWr9YCePtZ4tbK9soD3Q1Z"
+  },
+  "cases": [
+    {
+      "name": "sol",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "sol",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "1500000000",
+        "references": [],
+        "memo": null
+      },
+      "message": "01000103200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a136e8332feaf4971ef42ba8dbd0f93304382dad8de47b331211af3ae2906e1ce7000000000000000000000000000000000000000000000000000000000000000092b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac01020200010c02000000002f685900000000",
+      "transaction": "AdyzqkvrX/TB3PV+R6iaifOtLukNYiF6x2IC/fkNMfyF2QCaC25Nrn1APCc2nPTGHYHARqO0WEc5dYJcPP1lfg4BAAEDIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqE26DMv6vSXHvQrqNvQ+TMEOC2tjeR7MxIRrzrikG4c5wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkrJ9Kux6QSCgoE85bgwMVeovYSHVoMCSKHxhI2LiOKwBAgIAAQwCAAAAAC9oWQAAAAA=",
+      "signature": "5QvmmYnoLfMbE8ygmZtKaJqeX8sVPpTzZuRny319GHoxksMSVD6LuSUD5RaGDz5y643cLn3QcTnW41T5ugmnTu89",
+      "shape": {
+        "kind": "sol",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "sol to itself",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "sol",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "amount": "5000",
+        "references": [],
+        "memo": null
+      },
+      "message": "01000102200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a1000000000000000000000000000000000000000000000000000000000000000092b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac01010200000c020000008813000000000000",
+      "transaction": "AWbtC6Pdid3e4rpMLrAjIyuebnkCGmb0ctNPMDnlEIgfPiMfTOC+9o6efup77scfqWkubXJI/zkFUooHdz3IOA4BAAECIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAQECAAAMAgAAAIgTAAAAAAAA",
+      "signature": "34MWJ72g2zt7USjJsybS4S3bLoJP9UY2AeUzSrEKGDeDuxgjJTehZwZUoeUbAAb3ZhAeHx3h54vtEwBP16bN8gS1",
+      "shape": {
+        "kind": "sol",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "sol with a memo and four references",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "sol",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "1",
+        "references": [
+          "9R5tgpypewqiLEdbmA5QDDpvh2JtmJXDGm28nbsnaPCt",
+          "8rtQJ7NzwhLnWdLQq7NPHxwLwHk8E9tJcphQfdtsJJAd",
+          "4KdiAReyHUt6HAjXKNz8F5CK1XZU8Lp6V9nVtjrktvYi",
+          "CfyQENDd1hVrpqm89WT647ySMTXmkY4bEyyACZtePBcg"
+        ],
+        "memo": "Order 42 ✓"
+      },
+      "message": "01000608200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a136e8332feaf4971ef42ba8dbd0f93304382dad8de47b331211af3ae2906e1ce77d08f71be02705fbfaf01d243a2e04d1a69c33e37a55bdd715c16ddbdb967e0174c9635d90a0765d2ba8f7acf021b2dcc512f7271000b07784cf9e873ebb353a315905ebe3256aa1f0657d7f1b7a6f41f3f6885e541baf0b83abcc4b17bca6ebad6c6632ba953f39f1ca4a8686813f9a44d161abf2d39bdb3b6ac7b8714c599d054a535a992921064d24e87160da387c7c35b5ddbc92bb81e41fa8404105448d000000000000000000000000000000000000000000000000000000000000000092b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac0206000c4f7264657220343220e29c9307060001020304050c020000000100000000000000",
+      "transaction": "AVz5aBTLXhBzWq3LimyiP/pwIqppcUyt0PHacG8+GkMKnYdAQjI6V8d+O/Eg/GbtW5yU2H2iC64fnblJZWphvgwBAAYIIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqE26DMv6vSXHvQrqNvQ+TMEOC2tjeR7MxIRrzrikG4c530I9xvgJwX7+vAdJDouBNGmnDPjelW91xXBbdvbln4BdMljXZCgdl0rqPes8CGy3MUS9ycQALB3hM+ehz67NToxWQXr4yVqofBlfX8bem9B8/aIXlQbrwuDq8xLF7ym661sZjK6lT858cpKhoaBP5pE0WGr8tOb2ztqx7hxTFmdBUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAgYADE9yZGVyIDQyIOKckwcGAAECAwQFDAIAAAABAAAAAAAAAA==",
+      "signature": "2rpBWqgMUUtmBKbnCkNnCntiHarz4Zbukq81c2kX3QFfWbwhdumB8ckzBLR6AjRzZRgyvMF1SBsAT55AvJNnPsJB",
+      "shape": {
+        "kind": "sol",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "sol with the payer as a reference",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "sol",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "2000000",
+        "references": [
+          "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+        ],
+        "memo": null
+      },
+      "message": "01000103200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a136e8332feaf4971ef42ba8dbd0f93304382dad8de47b331211af3ae2906e1ce7000000000000000000000000000000000000000000000000000000000000000092b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac0102030001000c0200000080841e0000000000",
+      "transaction": "AVSoJtMVFluGbCgZczyL3UaoSpnGHNt6htKvrnTw1/16vWlwVkvJG9lOhmesWQC0cTrQZsGB8WyueSfm3ndAZgIBAAEDIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqE26DMv6vSXHvQrqNvQ+TMEOC2tjeR7MxIRrzrikG4c5wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkrJ9Kux6QSCgoE85bgwMVeovYSHVoMCSKHxhI2LiOKwBAgMAAQAMAgAAAICEHgAAAAAA",
+      "signature": "2hAn3gEqmwJycgyfq6pM8h2bHW9cHVx3n5PEVXeTQv62hjv8insdVoKvoowGYLdkxqJ6BQmPrHMqu1N9VVLTjwds",
+      "shape": {
+        "kind": "sol",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "1dev with the create",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "1dev",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "1500000",
+        "references": [],
+        "memo": null,
+        "createAccount": true,
+        "source": "J1QbMxsZLMJPFkTKgZ3FoXS4VpzYFcprsW5kmHbtNYUL",
+        "destination": "77xnLhHR96NbV7iMMNCvszAxvAHsiJaGsK4EzRfxAJzF"
+      },
+      "message": "01000508200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a15aeeadd2fb2c3d94835e666d77f12bda3a317756145d4a9a85515e8ecd21ab74fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af54536e8332feaf4971ef42ba8dbd0f93304382dad8de47b331211af3ae2906e1ce74aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d1000000000000000000000000000000000000000000000000000000000000000006ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a98c97258f4e2489f1bb3d1029148e0d830b5a1399daff1084048e7bd8dbe9f85992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac02070600010304050601010604020401000a0c60e316000000000006",
+      "transaction": "AWQ8rL2UvIwAvWib5Imyw7pXWHZPSrr2/f9/L+/i3Pg5tC4tDB0vk01qyCYYOeZau8YCXQ1NvktLRAoH5BHVaAkBAAUIIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqFa7q3S+yw9lINeZm138SvaOjF3VhRdSpqFUV6OzSGrdPyxWpLakpFwV0T7rUMVI7+jNKwSW+Fr3Z7G1zQEmvVFNugzL+r0lx70K6jb0PkzBDgtrY3kezMSEa864pBuHOdKpVbZ9TzlPUv0QZm7mQqUNPbqjz371JUl593YZTr00QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKmMlyWPTiSJ8bs9ECkUjg2DC1oTmdr/EIQEjnvY2+n4WZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAgcGAAEDBAUGAQEGBAIEAQAKDGDjFgAAAAAABg==",
+      "signature": "31EewY8r6jb11NtATq9KaYzc3PUjjFS8yW7abe5E8rr6sH7GpxZJQgWAzxVruFmhVs3Yi1h1mFYx8v42GM3qUbFW",
+      "shape": {
+        "kind": "token",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "1dev to an existing account",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "1dev",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "1",
+        "references": [],
+        "memo": null,
+        "createAccount": false,
+        "source": "J1QbMxsZLMJPFkTKgZ3FoXS4VpzYFcprsW5kmHbtNYUL",
+        "destination": "77xnLhHR96NbV7iMMNCvszAxvAHsiJaGsK4EzRfxAJzF"
+      },
+      "message": "01000205200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a1fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af5455aeeadd2fb2c3d94835e666d77f12bda3a317756145d4a9a85515e8ecd21ab744aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d106ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac010404010302000a0c010000000000000006",
+      "transaction": "AQr9HPAoQxk6zOlnk/8VtIaK4ZSS+493lML6EKVyhdMxW+w8t/9r7iDTFFIBrxsRNMmlUfAl8WsY+rc7WYTx5QABAAIFIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqH8sVqS2pKRcFdE+61DFSO/ozSsElvha92extc0BJr1RVrurdL7LD2Ug15mbXfxK9o6MXdWFF1KmoVRXo7NIat0SqVW2fU85T1L9EGZu5kKlDT26o89+9SVJefd2GU69NEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAQQEAQMCAAoMAQAAAAAAAAAG",
+      "signature": "Dk54WwkghUHxzNwow5TFvRtmeRSNNHS4KkczXXxuH3chZEiNhDSwT9Ya2r9EtWqq2ZC3jp7xgYZhUTt88ZyC5gb",
+      "shape": {
+        "kind": "token",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "1dev with the create, a memo and two references",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "1dev",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "250000000",
+        "references": [
+          "9R5tgpypewqiLEdbmA5QDDpvh2JtmJXDGm28nbsnaPCt",
+          "8rtQJ7NzwhLnWdLQq7NPHxwLwHk8E9tJcphQfdtsJJAd"
+        ],
+        "memo": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+        "createAccount": true,
+        "source": "J1QbMxsZLMJPFkTKgZ3FoXS4VpzYFcprsW5kmHbtNYUL",
+        "destination": "77xnLhHR96NbV7iMMNCvszAxvAHsiJaGsK4EzRfxAJzF"
+      },
+      "message": "0100080b200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a15aeeadd2fb2c3d94835e666d77f12bda3a317756145d4a9a85515e8ecd21ab74fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af54536e8332feaf4971ef42ba8dbd0f93304382dad8de47b331211af3ae2906e1ce74aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d1000000000000000000000000000000000000000000000000000000000000000006ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a97d08f71be02705fbfaf01d243a2e04d1a69c33e37a55bdd715c16ddbdb967e0174c9635d90a0765d2ba8f7acf021b2dcc512f7271000b07784cf9e873ebb353a8c97258f4e2489f1bb3d1029148e0d830b5a1399daff1084048e7bd8dbe9f859054a535a992921064d24e87160da387c7c35b5ddbc92bb81e41fa8404105448d92b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac03090600010304050601010a00c8016d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d06060204010007080a0c80b2e60e0000000006",
+      "transaction": "AfP4rRQcrPSQX01YPGsGK3OAh5y1iex0xwHo7+EeqHGj2PLprrrIoCNP1To3CK/YBzsRc3SkkyrhXHcvhUhMUQABAAgLIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqFa7q3S+yw9lINeZm138SvaOjF3VhRdSpqFUV6OzSGrdPyxWpLakpFwV0T7rUMVI7+jNKwSW+Fr3Z7G1zQEmvVFNugzL+r0lx70K6jb0PkzBDgtrY3kezMSEa864pBuHOdKpVbZ9TzlPUv0QZm7mQqUNPbqjz371JUl593YZTr00QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKl9CPcb4CcF+/rwHSQ6LgTRppwz43pVvdcVwW3b25Z+AXTJY12QoHZdK6j3rPAhstzFEvcnEACwd4TPnoc+uzU6jJclj04kifG7PRApFI4NgwtaE5na/xCEBI572Nvp+FkFSlNamSkhBk0k6HFg2jh8fDW13bySu4HkH6hAQQVEjZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAwkGAAEDBAUGAQEKAMgBbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW0GBgIEAQAHCAoMgLLmDgAAAAAG",
+      "signature": "5supNSKWrUo41X6f1AYFNW96dURY52sLSkV7QWkqwxPtWUuQnCBjRbtYLSryrMWHcNVaHDXV5Ca5qYj8JUdDozZD",
+      "shape": {
+        "kind": "token",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "1dev to itself",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "1dev",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "amount": "7",
+        "references": [],
+        "memo": null,
+        "createAccount": false,
+        "source": "J1QbMxsZLMJPFkTKgZ3FoXS4VpzYFcprsW5kmHbtNYUL",
+        "destination": "J1QbMxsZLMJPFkTKgZ3FoXS4VpzYFcprsW5kmHbtNYUL"
+      },
+      "message": "01000204200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a1fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af5454aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d106ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac010304010201000a0c070000000000000006",
+      "transaction": "AenrCRadHlVa7yaTLjhnWDUmbFKsow0hT3ihANqa0k0NAFsNwhANagY9VITm09cq1KnDfaRMJ/zaQjA8paphvw0BAAIEIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqH8sVqS2pKRcFdE+61DFSO/ozSsElvha92extc0BJr1RUqlVtn1POU9S/RBmbuZCpQ09uqPPfvUlSXn3dhlOvTRBt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKmSsn0q7HpBIKCgTzluDAxV6i9hIdWgwJIofGEjYuI4rAEDBAECAQAKDAcAAAAAAAAABg==",
+      "signature": "5gFfNs1aWM9Mu89jqbiAzRYGv3W5bsYy8eE91THTzM88JEtkEiWu3mUH7vK1MB24NEegnswW551gvSVYudDFMYvp",
+      "shape": {
+        "kind": "token",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "1dev with the payer as a reference",
+      "builders": [
+        "app",
+        "extension"
+      ],
+      "transfer": {
+        "asset": "1dev",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "3000000",
+        "references": [
+          "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+        ],
+        "memo": null,
+        "createAccount": false,
+        "source": "J1QbMxsZLMJPFkTKgZ3FoXS4VpzYFcprsW5kmHbtNYUL",
+        "destination": "77xnLhHR96NbV7iMMNCvszAxvAHsiJaGsK4EzRfxAJzF"
+      },
+      "message": "01000205200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a1fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af5455aeeadd2fb2c3d94835e666d77f12bda3a317756145d4a9a85515e8ecd21ab744aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d106ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac01040501030200000a0cc0c62d000000000006",
+      "transaction": "AckyUnsPBqMBGJ7uzomle3f16ZPvP0v9uXtoYRV8AzIXZHNtrXgfRADjUrH/uYKpu5f+U5wXfEeJYaCcM2LlWgMBAAIFIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqH8sVqS2pKRcFdE+61DFSO/ozSsElvha92extc0BJr1RVrurdL7LD2Ug15mbXfxK9o6MXdWFF1KmoVRXo7NIat0SqVW2fU85T1L9EGZu5kKlDT26o89+9SVJefd2GU69NEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAQQFAQMCAAAKDMDGLQAAAAAABg==",
+      "signature": "52JuV3yVUWM5WYppQgYwncJvXiR78P1YUWsXqbX3YKDNDPopSEmx2645XzyPiQGBxWPJYRqrhHmngWa4Yd7nXaot",
+      "shape": {
+        "kind": "token",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "1dev from another account of the payer",
+      "builders": [
+        "app"
+      ],
+      "transfer": {
+        "asset": "1dev",
+        "from": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "to": "4hLNinsN26LNCr6eALiPJUbP9n3acGYwQ3cwp4GPMS6a",
+        "amount": "9000000",
+        "references": [],
+        "memo": null,
+        "createAccount": false,
+        "source": "C89EkBsMqfV4s18tNTZ21jypCyBsz6CtAJsmMcJc1Uum",
+        "destination": "77xnLhHR96NbV7iMMNCvszAxvAHsiJaGsK4EzRfxAJzF"
+      },
+      "message": "01000205200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a1a544ef7876fd9a61cb3fcf409b63b321c42a18662526d0854a3e7e7020f3d0505aeeadd2fb2c3d94835e666d77f12bda3a317756145d4a9a85515e8ecd21ab744aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d106ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac010404010302000a0c405489000000000006",
+      "transaction": "AbvCVICJr7mUytMQMG1vpxH2AOA8OipzS/aCIi5oRc6goi1qHyVQheV1XEoTlYFOhzO5qxCU7ewYyKgQL5ACHQ4BAAIFIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqGlRO94dv2aYcs/z0CbY7MhxCoYZiUm0IVKPn5wIPPQUFrurdL7LD2Ug15mbXfxK9o6MXdWFF1KmoVRXo7NIat0SqVW2fU85T1L9EGZu5kKlDT26o89+9SVJefd2GU69NEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAQQEAQMCAAoMQFSJAAAAAAAG",
+      "signature": "4kj95KrEE4wc3eWr3y3SrEJxSyh9iPvN3it4GJUMibztjmJSyJWEYq8EVkGzXJcDKi9pBNEG5gB5fkE9kYkgwvRj",
+      "shape": {
+        "kind": "token",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG"
+      }
+    },
+    {
+      "name": "burn for a light node",
+      "builders": [
+        "extension"
+      ],
+      "burn": {
+        "owner": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "nodeType": "light",
+        "amountWhole": 1500
+      },
+      "message": "01000205200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a14aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d1fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af545054a535a992921064d24e87160da387c7c35b5ddbc92bb81e41fa8404105448d06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac0204030201000908002f68590000000003010014514e45545f4e4f44455f545950453a4c49474854",
+      "transaction": "AY99Dl+66BW0NjQ5h6MIJyE5e65bgRS+xdvA98LrUCiFeoj+/lFLRDu18dIoNIHXO2cPIXb+nQOYRMcKjzyeQw8BAAIFIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqFKpVbZ9TzlPUv0QZm7mQqUNPbqjz371JUl593YZTr00fyxWpLakpFwV0T7rUMVI7+jNKwSW+Fr3Z7G1zQEmvVFBUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0G3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAgQDAgEACQgAL2hZAAAAAAMBABRRTkVUX05PREVfVFlQRTpMSUdIVA==",
+      "signature": "3sPdGucUgpqukULhJgbCZqRycy8DgLNDTJtrTXiAuEK1UwQZjU9x6XC32zANuTN8CCVDxjmWVkQWdFRhYdAutR6v",
+      "shape": {
+        "kind": "burn",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "whole": 1500,
+        "nodeType": "light"
+      }
+    },
+    {
+      "name": "burn for a super node",
+      "builders": [
+        "extension"
+      ],
+      "burn": {
+        "owner": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "nodeType": "super",
+        "amountWhole": 1000000000
+      },
+      "message": "01000205200421702380edf11978d1292f094c81457881f8dec8de5c075389fe48dba2a14aa556d9f53ce53d4bf44199bb990a9434f6ea8f3dfbd49525e7ddd8653af4d1fcb15a92da9291705744fbad431523bfa334ac125be16bdd9ec6d734049af545054a535a992921064d24e87160da387c7c35b5ddbc92bb81e41fa8404105448d06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a992b27d2aec7a4120a0a04f396e0c0c55ea2f6121d5a0c092287c612362e238ac02040302010009080080c6a47e8d030003010014514e45545f4e4f44455f545950453a5355504552",
+      "transaction": "ARfk61MomkWq0Jz6CTmFSX1cLHwYkiRhNd4xJ+s7EtMdAICMtIUltCXcihH3n4QJcXrRTedNbrpv2PMCBZHG0goBAAIFIAQhcCOA7fEZeNEpLwlMgUV4gfjeyN5cB1OJ/kjboqFKpVbZ9TzlPUv0QZm7mQqUNPbqjz371JUl593YZTr00fyxWpLakpFwV0T7rUMVI7+jNKwSW+Fr3Z7G1zQEmvVFBUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0G3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqZKyfSrsekEgoKBPOW4MDFXqL2Eh1aDAkih8YSNi4jisAgQDAgEACQgAgMakfo0DAAMBABRRTkVUX05PREVfVFlQRTpTVVBFUg==",
+      "signature": "Ui4H2rbTmL6d9m2dZaVnCJVPwUj4y4ySauT6VGHJasoAYohoHdoNFkWRU9biW3FevdtSphtVt7y8NDksJUgkYnu",
+      "shape": {
+        "kind": "burn",
+        "payer": "39yha1Tj95oQ8Kx1QKqk1QydyptNn3C7QdNfpDvqTFzG",
+        "whole": 1000000000,
+        "nodeType": "super"
+      }
+    }
+  ]
+}

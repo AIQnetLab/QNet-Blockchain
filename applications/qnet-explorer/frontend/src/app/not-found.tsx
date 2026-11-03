@@ -5,15 +5,20 @@
 import Action from '@/components/ui/Action';
 import PageHead from '@/components/ui/PageHead';
 import ExplorerSearch from '@/components/explorer/ExplorerSearch';
+import { getI18n, pageMetadata } from '@/i18n/server';
 
-export default function NotFound() {
+// The tab names the page in its language, as every page's title does.
+export const generateMetadata = () => pageMetadata(['notfound_title'], 'notfound_lead');
+
+export default async function NotFound() {
+  const { t } = await getI18n();
   return (
     <div className="pg">
-      <PageHead title="This page does not exist" lead="The address may be mistyped, or the page has moved. Search the explorer for what you were looking for.">
+      <PageHead title={t('notfound_title')} lead={t('notfound_lead')}>
         <ExplorerSearch />
       </PageHead>
       <div className="wrap pg-body">
-        <Action href="/explorer">Open the explorer</Action>
+        <Action href="/explorer">{t('notfound_explorer')}</Action>
       </div>
     </div>
   );

@@ -203,7 +203,7 @@ describe('MB-R2-02: the Send form checks what the wallet may still spend, read n
     expect(fresh).not.toMatch(/tokenBalances/);
     expect(fresh).toMatch(/return r && r\.ok && \/\^\\d\+\$\/\.test\(String\(r\.balanceNano\)\) \? r : \{ error: \(r && r\.error\) \|\| 'unanswered' $/m);
     const send = between(ws, 'const handleSendTransaction = async () => {', 'setSendingTransaction(true);');
-    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: sendCheckError\(qncCheck\.error\) \}\);\s*return;/);
+    expect(send).toMatch(/if \(isQnetSend && qncCheck\.error\) \{\s*refuse\(sendCheckError\(qncCheck\.error\)\);\s*return;/);
     // A token send is checked against the token balance read again, and its QNC fee against what may still be spent.
     expect(send).toMatch(/walletManager\.checkedTokenBalance\(sendingToken\.contract, myQnetAddress, sendingToken\.decimals\)/);
     expect(send).not.toMatch(/amount > sendingToken\.balance/);

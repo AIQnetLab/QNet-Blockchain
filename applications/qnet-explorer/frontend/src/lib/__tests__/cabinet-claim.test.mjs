@@ -1,5 +1,5 @@
-// Moving a node balance from My node (owner, 12.10: through the site too, for a light and for a super node; unified plan
-// SITE-5; docs/protocols/qnet-link-v1.md sections 14.4 and 14.10): with the QNet extension, the one method naming the
+// Moving a node balance from My node, through the site too, for a light and for a super node
+// (docs/protocols/qnet-link-v1.md sections 14.4 and 14.10): with the QNet extension, the one method naming the
 // node (claimWithExtension in src/lib/qnet-link.ts), the result checked as the `claim` answer for the wallet the page
 // shows and that node, each provider failure by its code and what the page says of each; with QNet Wallet, the `claim`
 // request naming the wallet and the node (docs/protocols/node-claim.vectors.json); the Overview offering Move to wallet
@@ -12,6 +12,9 @@ import { COOLDOWN_MESSAGE } from '../qnet-provider.ts';
 import { LINK_ERRORS, claimWithExtension, lightNodeId, superNodeId, walletHash } from '../qnet-link.ts';
 import { claimErrorKey, claimReport, failureKey } from '../cabinet/extension-view.ts';
 import { CLAIM } from './link-helpers.mjs';
+import { code } from './source.mjs';
+import { TEXTS } from './texts-helper.mjs';
+import { CATALOGS } from '../../i18n/catalogs.ts';
 
 const NOW = 1_790_000_060;
 const [KAT, OTHER_WALLET] = CLAIM.wallets;
@@ -25,9 +28,6 @@ const result = (name) => {
   return rest;
 };
 
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n')
-  .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 
 function provider(answer) {
   const calls = [];
@@ -100,8 +100,9 @@ test('provider failures by code: declined, cooldown, not allowed, too old (updat
 });
 
 test('what the page says of each answer and failure, by the wallet that answered', () => {
-  assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...result('claim-super-ok') }, 'extension'), { key: 'claim_ok', amountNano: '48000000000' });
-  assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...result('claim-super-ok-partial') }, 'app'), { key: 'claim_ok_part', amountNano: '1000000000', epoch: '155' });
+  const { txHash } = result('claim-super-ok');
+  assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...result('claim-super-ok') }, 'extension'), { key: 'claim_ok', amountNano: '48000000000', txHash });
+  assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...result('claim-super-ok-partial') }, 'app'), { key: 'claim_ok_part', amountNano: '1000000000', epoch: '155', txHash });
   assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...result('claim-light-empty') }, 'app'), { key: 'claim_empty' });
   assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...result('claim-super-rejected') }, 'app'), { key: 'link_answer_rejected' });
   assert.deepEqual(claimReport({ v: 1, intent: 'claim', status: 'rejected' }, 'extension'), { key: 'ext_failure_rejected' });
@@ -113,6 +114,31 @@ test('what the page says of each answer and failure, by the wallet that answered
   assert.equal(failureKey('other_wallet', 'claim'), 'claim_failure_other_wallet');
   assert.equal(failureKey('timeout', 'claim'), 'claim_failure_timeout');
   assert.equal(failureKey('unsupported', 'claim'), 'ext_failure_unsupported');
+});
+
+// Each wallet moves the whole balance it shows under one confirmation, in one claim or several (protocol section 14.7):
+// the answer's amount is the total, its hash the last claim's, and `stoppedAtEpoch` names the rest only when the run
+// ended short. A wallet that sends one claim answers the same form.
+test('a run of several claims: one call, one answer with the total and the last claim\'s transaction', async () => {
+  const last = 'c'.repeat(64);
+  const whole = { ...result('claim-super-ok'), amountNano: '151250000000', txHash: last };
+  const short = { ...whole, amountNano: '96500000000', stoppedAtEpoch: '1124' };
+  for (const answer of [whole, short]) {
+    const p = provider(answer);
+    assert.deepEqual(await claimWithExtension(p, WALLET, SUPER, NOW), { ok: true, answer: { v: 1, intent: 'claim', ...answer } });
+    assert.equal(p.calls.length, 1);
+  }
+  assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...whole }, 'extension'), { key: 'claim_ok', amountNano: '151250000000', txHash: last });
+  assert.deepEqual(claimReport({ v: 1, intent: 'claim', ...short }, 'app'), { key: 'claim_ok_part', amountNano: '96500000000', epoch: '1124', txHash: last });
+  // The total keeps its digits and direction; the last transaction follows the report as a link to its page.
+  const claim = code('components/cabinet/NodeClaim.tsx');
+  assert.match(claim, /amount: report\.amountNano \? <span className="num" translate="no">\{formatQnc\(report\.amountNano\)\}<\/span> : '',/);
+  assert.match(claim, /if \(!report\.txHash\) return text;\s*return <>\{text\} \{rich\('claim_last_tx', \{ tx: <EntityLink kind="tx" value=\{report\.txHash\} \/> \}\)\}<\/>;/);
+  // The extension's call answers once its whole move ran: the waiting line stays true after the confirm, in every catalog.
+  assert.match(claim, /\{ext\.phase === 'waiting' && <Waiting>\{t\('claim_extension_waiting'\)\}<\/Waiting>\}/);
+  assert.doesNotMatch(claim, /wallet_extension_waiting/);
+  assert.match(TEXTS.claim_extension_waiting, /^Confirm in the extension window\. Once confirmed, it moves the balance and then answers here\./);
+  for (const [locale, catalog] of Object.entries(CATALOGS)) assert.ok(catalog.claim_extension_waiting?.length > 0, locale);
 });
 
 test('every error the extension may answer is one the site reads', () => {
@@ -136,7 +162,7 @@ test('the Overview offers Move to wallet for a light and a super node, naming th
     // The ways sit in the one node balance group, which says what moving means (Balance, beside them).
     assert.match(part, /<Balance nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\}>/);
   }
-  assert.match(home, /<p className="body">\{t\('balance_lead'\)\}<\/p>\s*\{children\}/);
+  assert.match(home, /<p className="body">\{say\('balance_lead'\)\}<\/p>\s*\{children\}/);
   assert.match(sup, /const movable = isClaimNodeId\(nodeId\) && canMove\(status\.balanceNano\);/);
   assert.doesNotMatch(home, /balance_move|super_move/);
   const claim = code('components/cabinet/NodeClaim.tsx');

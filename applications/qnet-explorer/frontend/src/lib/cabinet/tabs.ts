@@ -3,7 +3,7 @@
 
 import type { AccountRow } from '../account-menu.ts';
 import type { NodeType } from '../qnet-link.ts';
-import { t, type MessageKey } from '../texts.ts';
+import type { MessageKey, T } from '../texts.ts';
 import { wayOf, type ActivationView, type ViewState } from './wallet-activation.ts';
 
 // Overview (status and next step, the node balance, the node's details, the latest epochs), Activate (only while it
@@ -24,7 +24,7 @@ export const TAB_HREF: Record<Tab, string> = {
 // How it works: readable without a wallet, in the header's Docs menu and linked from the connect screen.
 export const GUIDE_HREF = '/docs/how-it-works';
 
-// The sections My node had before 29.09 and where each one is now: /node?tab=<name> goes there, and so do the old pages
+// The sections My node had in earlier releases and where each one is now: /node?tab=<name> goes there, and so do the old pages
 // (next.config.js redirects /node/devices, /node/claim, /node/code and /node/guide to the same places).
 export const MOVED_TABS: Readonly<Record<string, string>> = Object.freeze({
   devices: TAB_HREF.device,
@@ -84,7 +84,7 @@ export interface NavItem {
 // that there is no node), Device the device or the server, History the newest epoch, Activate its step while it is the
 // one to do now (`step`, journey().current).
 export function navItems(
-  state: ViewState | null, openActivation: boolean, current: Tab, viewOnly: boolean, rows: readonly Pick<AccountRow, 'key' | 'datum' | 'tone'>[], step: number | null,
+  state: ViewState | null, openActivation: boolean, current: Tab, viewOnly: boolean, rows: readonly Pick<AccountRow, 'key' | 'datum' | 'tone'>[], step: number | null, t: T,
 ): NavItem[] {
   const row = (key: AccountRow['key']) => rows.find((r) => r.key === key) ?? null;
   const noNode = state !== null && NO_NODE_STATES.has(state);
@@ -116,7 +116,7 @@ export function journeySteps(nodeType: NodeType | null): readonly JourneyStep[] 
 }
 
 // How many steps are done, and the one to do now; null while the wallet's state is not known, or when all are done. A
-// known burn marks Activate done (SITE-F10): its record on the network is the Overview's own card.
+// known burn marks Activate done: its record on the network is the Overview's own card.
 export function journey(connected: boolean, view: ActivationView | null): { done: number; current: number | null; nodeType: NodeType | null } {
   const nodeType = view ? wayOf(view) : null;
   const at = (done: number, current: number | null) => ({ done, current, nodeType });
@@ -139,7 +139,7 @@ export function journey(connected: boolean, view: ActivationView | null): { done
         if (view.light === 'online') return at(4, null);
         if (view.light === 'offline' || view.light === 'device_pending') return at(3, 3);
         if (view.light === 'no_device') return at(2, 2);
-        // Listed, its status not read yet: nothing past Activate is shown as done.
+        // Listed, its status or its device not read yet: nothing past Activate is shown as done, and no step is open.
         return at(2, null);
       }
       if (view.superNode === 'online') return at(4, null);

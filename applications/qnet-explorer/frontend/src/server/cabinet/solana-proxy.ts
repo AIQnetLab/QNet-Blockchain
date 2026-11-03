@@ -1,9 +1,10 @@
-// The activation page's Solana and price reads, and the one door it sends through (plan-site section 7): the page
+// The activation page's Solana and price reads, and the one door it sends through: the page
 // talks only to this origin, so each route takes one narrow shape and none relays anything else. The price comes
 // from two genesis nodes that agree (the page burns by it); `send` forwards only the cabinet's burn and refund,
 // signed by their payment address (src/lib/cabinet/burn-tx.ts), and a burn only under the wallet's reservation with the
-// payment key's v2 owner bind of that wallet, announced in the activation registry before it leaves (shared contracts
-// C3.3 and C4); every route meters the real client (limits.ts).
+// payment key's v2 owner bind of that wallet, announced in the activation registry before it leaves;
+// every route meters the real client (limits.ts). The wallets' Solana relay (solana-relay.ts) is built on this door's
+// blockhash, height and status caches and its account batch.
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import bs58 from 'bs58';
@@ -11,20 +12,22 @@ import { agreedQuote, sitePriceBody, type PriceQuote } from '../../lib/activatio
 import { READ_PASS_RE, classifyCabinetTx, oneDevAccountOf } from '../../lib/cabinet/burn-tx.ts';
 import { ONE_DEV_MINT } from '../../lib/one-dev.ts';
 import { isSolanaSignature } from '../../lib/qnet-link.ts';
-import { decodeKey, parseLegacyTransaction, signaturesValid, PACKET_DATA_SIZE } from '../../lib/solana-message.ts';
+import { decodeBase64, decodeKey, parseLegacyTransaction, signaturesValid, PACKET_DATA_SIZE } from '../../lib/solana-message.ts';
 import { readJsonPost } from '../request-guard.ts';
 import { latestBlockhash, sendTransaction, statusOf, type Rpc, type Status } from '../solana-rpc.ts';
-import { BATCH_WINDOW_MS, accountBatcher, sharedSolanaRpc } from '../solana-endpoint.ts';
+import { BATCH_WINDOW_MS, accountBatcher, sharedSolanaRpc, solanaRpcUrl } from '../solana-endpoint.ts';
 import { parseBurn } from './burn-parse.ts';
 import { memo } from './cache.ts';
 import { cabinetGate, cabinetJson, createGate, type Gate, type GateOptions } from './limits.ts';
+import { createRelay, type AnnouncedBurn } from './solana-relay.ts';
+import { sharedUpstreamBudget, type UpstreamBudget } from './upstream.ts';
 
 export { parseBurn, type ActivationBurn } from './burn-parse.ts';
 
 export const PRICE_CACHE_MS = 15_000;
 export const PAYMENT_CACHE_MS = 3_000;
 export const BLOCKHASH_CACHE_MS = 2_000;
-// A transaction's read is made of parts kept apart (SITE M-14): its status by signature and the block height (one for
+// A transaction's read is made of parts kept apart: its status by signature and the block height (one for
 // all) a couple of seconds each, and a finalized transaction's burn for good, since it never changes. The state that
 // depends on the page's `lvh` (pending or expired) is worked out from them here, so a new `lvh` costs no Solana read.
 export const TX_CACHE_MS = 2_000;
@@ -32,18 +35,18 @@ export const HEIGHT_CACHE_MS = 2_000;
 export const FINAL_TX_CACHE_MS = 86_400_000;
 // A page reads the state of its own burns and refunds with the read pass /send gave it for that signature. The pass is
 // an HMAC of the signature under the server's CABINET_READ_KEY, so it outlives a restart of the site, and the server
-// keeps no list of what it sent (SITE-R3-01). /send gives one only for a transaction the endpoint took or may have
+// keeps no list of what it sent. /send gives one only for a transaction the endpoint took or may have
 // taken (one it refused cost nothing), and for a refund only when its payer is a payment address a reservation of this
 // site named. Reads of any other signature, which anyone can make up by the thousand from many addresses, share a small
 // budget a second for the whole server, each client at most its own share of it (CABINET_LIMITS.txOther), so that
-// together they cannot use up the endpoint's rate for every visitor (SITE-R2-08); past it the route answers
+// together they cannot use up the endpoint's rate for every visitor; past it the route answers
 // `unavailable` without asking Solana. Reads with a pass that go to Solana share OWN_TX_READS a second, a larger budget
 // of their own, so pass holders cannot go past a fixed share of the endpoint's rate either.
 export const OTHER_TX_READS = { max: 2, windowMs: 1_000 } as const;
 export const OWN_TX_READS = { max: 10, windowMs: 1_000 } as const;
 const READ_PASS_CONTEXT = 'qnet.cabinet.read-pass.v1:';
 
-// The server's read pass key: CABINET_READ_KEY, 32 bytes or more in hex, set once in .env.local
+// The server's read pass key: CABINET_READ_KEY, 32 bytes or more in hex, set once in the site's settings file
 // (deployment/deploy-aiqnet.sh); without it, a key of this process only, and a restart ends the passes it gave.
 export function readPassKey(configured: string | undefined = process.env.CABINET_READ_KEY): Buffer {
   return typeof configured === 'string' && /^(?:[0-9a-fA-F]{2}){32,}$/.test(configured) ? Buffer.from(configured, 'hex') : randomBytes(32);
@@ -60,7 +63,6 @@ const OWNER_SIG_RE = /^[0-9a-f]{128}$/;
 export type PaymentAnnounce = (reservation: string, burner: string, burnAmount: number, burnTx: string, ownerSig: string) => Promise<string | null | 'invalid_proof' | 'unavailable'>;
 // Whether a reservation of this site named `payer` as its payment address (activation-api.ts knowsPaymentBurner).
 export type KnownPayer = (payer: string) => Promise<boolean>;
-const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 export interface PaymentView {
   // Lamports and raw 1DEV units, as decimal strings.
@@ -112,6 +114,11 @@ export interface SolanaProxyOptions extends GateOptions {
   announce?: PaymentAnnounce;
   // Without it no refund earns a read pass.
   knownPayer?: KnownPayer;
+  // The relay's lanes on the Solana endpoint (upstream.ts); the process's own without it.
+  budget?: UpstreamBudget;
+  // Without it no burn goes on through the relay.
+  announcedBurn?: AnnouncedBurn;
+  log?: (line: string) => void;
 }
 
 export interface SolanaProxy {
@@ -121,34 +128,48 @@ export interface SolanaProxy {
   // `announce`, `knownPayer`: the registry's, in place of the options' ones.
   send(request: Request, announce?: PaymentAnnounce, knownPayer?: KnownPayer): Promise<Response>;
   tx(request: Request, signature: string, lastValidBlockHeight: string | null, pass?: string | null): Promise<Response>;
-}
-
-function decodeBase64(text: string): Uint8Array | null {
-  if (text.length % 4 !== 0 || !B64_RE.test(text)) return null;
-  try {
-    const bytes = Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
-    return btoa(String.fromCharCode(...bytes)) === text ? bytes : null;
-  } catch {
-    return null;
-  }
+  // POST /api/cabinet/solana, the wallets' relay (solana-relay.ts); `announcedBurn`: the registry's.
+  relay(request: Request, announcedBurn?: AnnouncedBurn): Promise<Response>;
 }
 
 export function createSolanaProxy(options: SolanaProxyOptions = {}): SolanaProxy {
   const now = options.now ?? Date.now;
   const rpc = options.rpc ?? sharedSolanaRpc();
-  const accounts = accountBatcher(rpc, { windowMs: options.batchWindowMs ?? BATCH_WINDOW_MS });
+  const batchWindowMs = options.batchWindowMs ?? BATCH_WINDOW_MS;
+  const accounts = accountBatcher(rpc, { windowMs: batchWindowMs });
   const gate = options.gate ?? createGate(options);
   const quote = options.quote ?? (() => agreedQuote('light'));
   const priceCache = memo<PriceQuote | null>(PRICE_CACHE_MS, now, 1);
   const paymentCache = memo<PaymentView | null>(PAYMENT_CACHE_MS, now);
   const blockhashCache = memo<{ blockhash: string; lastValidBlockHeight: number } | null>(BLOCKHASH_CACHE_MS, now, 1);
   // The parts of a transaction's read (TX_CACHE_MS above): a status (a found one or none) by signature, the second look
-  // past the last valid block by signature, the block height, and a finalized transaction's view.
+  // past the last valid block by signature, the block height by commitment, and a finalized transaction's view.
   const statusCache = memo<{ status: Status } | null>(TX_CACHE_MS, now);
   const againCache = memo<{ status: Status } | null>(TX_CACHE_MS, now);
-  const heightCache = memo<number | null>(HEIGHT_CACHE_MS, now, 1);
+  const heightCache = memo<number | null>(HEIGHT_CACHE_MS, now, 2);
   const finalCache = memo<TxView | null>(FINAL_TX_CACHE_MS, now);
   const kept = <T>(v: T | null): boolean => v !== null;
+  // The latest blockhash and the block height: one for the activation page and every wallet of the relay. `onFail`
+  // hears why a read the endpoint did not answer failed (the relay logs it).
+  const ignore = (_err: unknown): void => undefined;
+  const latest = (onFail = ignore) => blockhashCache('latest', async () => {
+    try {
+      return await latestBlockhash(rpc);
+    } catch (err) {
+      onFail(err);
+      return null;
+    }
+  }, kept);
+  const readHeight = (commitment: 'confirmed' | 'finalized', onFail = ignore) => async (): Promise<number | null> => {
+    try {
+      const h = await rpc('getBlockHeight', [{ commitment }]);
+      if (typeof h !== 'number') throw new Error('rpc_malformed_height');
+      return h;
+    } catch (err) {
+      onFail(err);
+      return null;
+    }
+  };
   const readKey = options.readKey ?? readPassKey();
   const passOf = (signature: string): string =>
     createHmac('sha256', readKey).update(READ_PASS_CONTEXT).update(signature).digest().subarray(0, 16).toString('base64url');
@@ -187,14 +208,7 @@ export function createSolanaProxy(options: SolanaProxyOptions = {}): SolanaProxy
     let status = first.status;
     if (status === null) {
       if (lastValid === null) return { state: 'pending' };
-      const height = await heightCache('height', upstream(async () => {
-        try {
-          const h = await rpc('getBlockHeight', [{ commitment: 'confirmed' }]);
-          return typeof h === 'number' ? h : null;
-        } catch {
-          return null;
-        }
-      }), kept);
+      const height = await heightCache('confirmed', upstream(readHeight('confirmed')), kept);
       if (height === null) return null;
       if (height <= lastValid) return { state: 'pending' };
       // Past its last valid block: look once more, since it may have landed in that very block.
@@ -249,20 +263,14 @@ export function createSolanaProxy(options: SolanaProxyOptions = {}): SolanaProxy
     async blockhash(request) {
       const refused = gate(request, 'blockhash');
       if (refused) return refused;
-      const latest = await blockhashCache('latest', async () => {
-        try {
-          return await latestBlockhash(rpc);
-        } catch {
-          return null;
-        }
-      }, kept);
-      return latest ? cabinetJson(200, latest) : cabinetJson(503, { error: 'unavailable' });
+      const answer = await latest();
+      return answer ? cabinetJson(200, answer) : cabinetJson(503, { error: 'unavailable' });
     },
 
     // POST /api/cabinet/send: a burn or a refund of the cabinet, validly signed by its payment address; a burn exactly
     // {tx, reservation, ownerSig}, with the reservation it was made under and the payment key's v2 owner bind of the
     // reserved wallet, a refund exactly {tx}. A burn sent earns its read pass; a refund only from a payment address a
-    // reservation named (any funded key could send one, SITE M-14).
+    // reservation named (any funded key could send one).
     async send(request, announce = options.announce, knownPayer = options.knownPayer) {
       const read = await readJsonPost(request, SEND_BODY_MAX_BYTES);
       if (!read.ok) return cabinetJson(read.status, { error: read.error });
@@ -283,7 +291,7 @@ export function createSolanaProxy(options: SolanaProxyOptions = {}): SolanaProxy
       const limited = gate.keyed('send', shape.payer);
       if (limited) return limited;
       if (shape.kind === 'burn') {
-        // Announced as the reserved wallet's, with its owner bind, before it leaves, or it does not leave at all (C4).
+        // Announced as the reserved wallet's, with its owner bind, before it leaves, or it does not leave at all.
         const held = announce ? await announce(reservation as string, shape.payer, shape.whole, bs58.encode(parsed.signatures[0]), ownerSig as string) : null;
         if (held === 'unavailable') return cabinetJson(503, { error: 'unavailable' });
         if (held === 'invalid_proof') return cabinetJson(400, { error: 'invalid_proof' });
@@ -311,6 +319,14 @@ export function createSolanaProxy(options: SolanaProxyOptions = {}): SolanaProxy
       const view = await loadTx(signature, lastValid, allowed);
       return view ? cabinetJson(200, view) : cabinetJson(503, { error: 'unavailable' });
     },
+
+    // POST /api/cabinet/solana: the wallets' calls when their Solana endpoint gives them no answer, on this door's caches.
+    relay: createRelay({
+      rpc, gate, now, budget: options.budget ?? sharedUpstreamBudget(), endpoint: solanaRpcUrl(), devOrigins: options.devOrigins, batchWindowMs,
+      cacheMs: { account: PAYMENT_CACHE_MS, recent: TX_CACHE_MS, final: FINAL_TX_CACHE_MS },
+      blockhash: latest, height: (commitment, onFail) => heightCache(commitment, readHeight(commitment, onFail), kept), statuses: statusCache,
+      parsedConfirmed: accounts, announcedBurn: options.announcedBurn, log: options.log,
+    }),
   };
 }
 

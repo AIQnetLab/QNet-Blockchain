@@ -1,16 +1,12 @@
-// Where the node cabinet's payment key can be reached (plan-site sections 4.1 and 8): only the activation page loads
+// Where the node cabinet's payment key can be reached: only the activation page loads
 // the module that signs with it; the key is made non-extractable; it signs in one place, through three functions;
 // nothing serializes it; only the payment store opens its database; the cabinet writes no HTML and calls only this
 // origin. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-
-const SRC = new URL('../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, SRC), 'utf8');
-// Comments may name what the code must not do; only code is checked.
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+import { readdirSync, statSync } from 'node:fs';
+import { SRC, code, read } from './source.mjs';
 
 function sources(dir = SRC, out = []) {
   for (const name of readdirSync(dir)) {
@@ -37,7 +33,7 @@ test('only the activation page loads the payment key', () => {
   for (const file of ['components/cabinet/NodeDetails.tsx', 'hooks/usePaymentRecords.ts', 'components/cabinet/NextSteps.tsx', 'components/cabinet/CabinetFrame.tsx', 'lib/cabinet/consent-submit.ts']) {
     assert.doesNotMatch(code(file), /payment-key|cabinet\/activation'|\.\/activation\.ts'/, file);
   }
-  // Another browser finishes a payment address's registration with the wallet's consent alone (C4): no key module.
+  // Another browser finishes a payment address's registration with the wallet's consent alone: no key module.
   assert.deepEqual(importersOf('consent-submit').sort(), ['components/cabinet/NextSteps.tsx', 'lib/cabinet/activation.ts']);
   assert.match(code('hooks/usePaymentRecords.ts'), /import \{ listRecords \} from '@\/lib\/cabinet\/payment-store';/);
 });
@@ -61,7 +57,7 @@ test('the key is non-extractable, signs in one place through three functions, an
     assert.doesNotMatch(text, /console\./, file);
   }
   // The activation steps never name the key; the one place a record is given a key value is the receipt, which deletes it
-  // (flow.ts asReceipt, SITE-R3-03).
+  // (flow.ts asReceipt).
   assert.equal(code('lib/cabinet/activation.ts').match(/\bkey: [^,} ]+/g), null);
   assert.deepEqual(code('lib/cabinet/flow.ts').match(/\bkey: [^,} ]+/g), ['key: CryptoKey', 'key: null']);
 });

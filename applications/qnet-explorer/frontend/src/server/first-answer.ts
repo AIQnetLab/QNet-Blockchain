@@ -1,9 +1,10 @@
 import { headers } from 'next/headers';
 import { NextRequest } from 'next/server';
 import { within } from '@/lib/deadline';
+import { logWindow } from './log-window.ts';
 
-// A page's first answer from one of the site's own API routes, read in-process while the server renders the page (B-SPEC
-// 3.3): the page paints with exactly what its client would have read, so it has its final shape from the first paint.
+// A page's first answer from one of the site's own API routes, read in-process while the server renders the page:
+// the page paints with exactly what its client would have read, so it has its final shape from the first paint.
 // The visitor's request headers go with the read, so a route's per-visitor limits count it as the visitor's.
 
 export interface FirstAnswer {
@@ -13,11 +14,15 @@ export interface FirstAnswer {
 
 // A first answer never waits for a node: the route's request signal is aborted from the start, so a route that reads
 // nodes answers from the explorer's index alone and marks what it left out (`nodeUnread`); the page's client reads that
-// part. A route that has not answered within FIRST_ANSWER_MS is not waited for (its client reads it). An answer is kept
-// FIRST_ANSWER_KEEP_MS by its path, so repeated loads and tab switches within a block cost one read.
-export const FIRST_ANSWER_MS = 1_500;
+// part. A route that has not answered within FIRST_ANSWER_MS is not waited for: the page paints its fixed geometry and
+// its client reads it, so a slow index never holds the first paint. An answer is kept FIRST_ANSWER_KEEP_MS by its path,
+// so repeated loads and tab switches within a block cost one read.
+export const FIRST_ANSWER_MS = 400;
 export const FIRST_ANSWER_KEEP_MS = 1_000;
 const KEPT_MAX = 500;
+// A read past FIRST_ANSWER_MS is how a slow index is met, not a failure: one INFO line a minute at most says how many
+// came late since the one before.
+const lateLine = logWindow(60_000);
 
 type Route<P> = (request: NextRequest, context: { params: Promise<P> }) => Promise<Response>;
 
@@ -47,7 +52,8 @@ async function read<P extends Record<string, string>>(route: Route<P>, path: str
       return { status: res.status, body: await res.json() };
     })());
     if (!answer) {
-      console.warn(`[WARN][WEB] first_answer_late path=${path} wait_ms=${FIRST_ANSWER_MS}`);
+      const late = lateLine();
+      if (late !== null) console.log(`[INFO][WEB] first_answer_late path=${path} wait_ms=${FIRST_ANSWER_MS} count=${late}`);
       return null;
     }
     // Nothing found without the nodes is not "nothing there": the page's client asks them.

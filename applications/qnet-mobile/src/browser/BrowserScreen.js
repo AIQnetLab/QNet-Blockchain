@@ -27,9 +27,10 @@ import Clipboard from '@react-native-clipboard/clipboard';
 import { WebView } from 'react-native-webview';
 import Action from '../components/ui/Action';
 import Menu from '../components/ui/Menu';
+import Section from '../components/ui/Section';
 import { LinkRow } from '../components/InfoRow';
 import { providerScript, PAGE_OPENED_METHOD } from './providerScript';
-import { color, radius, size, space, themed } from '../theme';
+import { card, color, radius, size, space, themed } from '../theme';
 import { readBridgeMessage, responseScript, eventScript, PageSession, PAUSE_MEDIA_SCRIPT } from './bridge';
 import { createDappProvider, pageError, ProviderError, CODES, visibleLabel } from './dappProvider';
 import { createGrantStore } from './grants';
@@ -676,6 +677,16 @@ const BrowserScreen = forwardRef(function BrowserScreen({
     setOverview(true);
   };
 
+  // The start page over the tab in front: its page stays loaded under it (the browsing session goes on) but no longer
+  // plays.
+  const toStartPage = () => {
+    const id = tabsRef.current.active;
+    pauseMedia(id);
+    userNavigated(id);
+    update((st) => updateTab(st, id, { home: true }));
+    setInput('');
+  };
+
   useImperativeHandle(ref, () => ({
     // Android back: the tab overview, the menu or the typed address closes first, then the tab in front goes back in its
     // own history; false when there is nothing to go back to here.
@@ -684,6 +695,15 @@ const BrowserScreen = forwardRef(function BrowserScreen({
       if (menu) { setMenu(false); return true; }
       if (editing) { setEditing(false); return true; }
       return goBack();
+    },
+    // The Browser tab tapped while it is open: the start page with nothing over it. A sheet on screen is modal.
+    goHome: () => {
+      if (sheetOpen()) return;
+      setOverview(false);
+      setMenu(false);
+      setEditing(false);
+      Keyboard.dismiss();
+      toStartPage();
     },
     revoke: (origin) => engine.revoke(origin),
     // Every open request of the browser ends as rejected (4001): a QNet Link request came in, and nothing of the
@@ -749,20 +769,22 @@ const BrowserScreen = forwardRef(function BrowserScreen({
     );
   };
 
+  // The start page: the bookmark on a card of its own, the recent pages on one card under it (components/ui/Section).
   const startPage = () => (
     <ScrollView style={s.start} contentContainerStyle={s.startBody} keyboardShouldPersistTaps="handled">
-      <View style={s.bookmark}>
+      <Section style={s.bookmark}>
         <LinkRow title="aiqnet.io" note={t('browser_bookmark_explorer')} noteLines={2} onPress={() => open(BOOKMARK_URL)}
           testID="bookmark-aiqnet" />
-      </View>
-      <Text style={s.sectionTitle}>{t('browser_recent')}</Text>
-      {recent.length === 0 ? <Text style={s.empty}>{t('browser_recent_empty')}</Text> : recent.map((e) => {
-        const d = describeUrl(e.url);
-        return (
-          <LinkRow key={e.url} title={e.title || (d ? d.host : e.url)} titleLines={1} note={e.url} noteLines={1} ltrNote
-            onPress={() => open(e.url)} />
-        );
-      })}
+      </Section>
+      <Section title={t('browser_recent')}>
+        {recent.length === 0 ? <Text style={s.empty}>{t('browser_recent_empty')}</Text> : recent.map((e) => {
+          const d = describeUrl(e.url);
+          return (
+            <LinkRow key={e.url} title={e.title || (d ? d.host : e.url)} titleLines={1} note={e.url} noteLines={1} ltrNote
+              onPress={() => open(e.url)} />
+          );
+        })}
+      </Section>
       <View style={s.clearButton}>
         <Action kind="destructive" label={t('browser_clear')}
           onPress={() => confirmAction(t('browser_clear_title'), t('browser_clear_body'), clearData)} />
@@ -852,7 +874,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
     <View style={s.overview} accessibilityViewIsModal testID="browser-tab-overview">
       <View style={s.overviewHeader}>
         <Text style={s.overviewTitle} numberOfLines={1}>{t('browser_tabs_count', { count: tabs.length })}</Text>
-        <Action kind="act" label={t('common_done')} onPress={() => setOverview(false)} align="end" style={s.overviewDone} />
+        <Action kind="quiet" label={t('common_done')} onPress={() => setOverview(false)} />
       </View>
       <ScrollView style={s.start} contentContainerStyle={s.overviewBody}>
         {tabs.map((tab) => {
@@ -876,7 +898,6 @@ const BrowserScreen = forwardRef(function BrowserScreen({
                 onPress={() => closeTabById(tab.id)}
                 accessibilityLabel={t('browser_close_tab', { title })}
                 testID={`browser-tab-close-${tab.id}`}
-                align="end"
                 style={s.tabClose}
               />
             </View>
@@ -917,14 +938,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
       if (web) web.reload();
     } } : null,
     { label: t('browser_new_tab'), onPress: () => { setMenu(false); newTab(); } },
-    { label: t('browser_home'), onPress: () => {
-      // Its page stays loaded under the start page (the browsing session goes on) but no longer plays.
-      pauseMedia(active);
-      userNavigated(active);
-      setMenu(false);
-      update((st) => updateTab(st, active, { home: true }));
-      setInput('');
-    } },
+    { label: t('browser_home'), onPress: () => { setMenu(false); toStartPage(); } },
     // What cannot be undone, in Ember.
     { label: t('browser_clear'), warn: true, onPress: () => { setMenu(false); confirmAction(t('browser_clear_title'), t('browser_clear_body'), clearData); } },
     // The wallet's own items after a rule; a switch keeps the menu open, as in the header's.
@@ -971,9 +985,10 @@ const BrowserScreen = forwardRef(function BrowserScreen({
   return (
     <View style={s.pane}>
       <View style={s.chrome} {...underOverview} testID="browser-chrome">
-        {/* Back, the address, the tab count and More, the same at every width; Forward, Reload and Stop are in More. */}
+        {/* Back, the address on its rounded bar, the tab count and More, the same at every width; Forward, Reload and
+            Stop are in More. */}
         <View style={s.toolbar}>
-          <Action kind="act" label={t('browser_back')} onPress={goBack} disabled={!showPage || !nav.canGoBack} style={s.toolAct} />
+          <Action kind="quiet" label={t('browser_back')} onPress={goBack} disabled={!showPage || !nav.canGoBack} />
           <View style={s.addressBox}>{addressBar()}</View>
           <Pressable
             style={s.tool}
@@ -987,7 +1002,7 @@ const BrowserScreen = forwardRef(function BrowserScreen({
           </Pressable>
           {/* The share sheet of a tablet points at this (Share's anchor). */}
           <View ref={menuButtonRef} collapsable={false}>
-            <Action kind="act" label={t('common_more')} onPress={() => setMenu((m) => !m)} align="end" style={s.toolAct} />
+            <Action kind="quiet" label={t('common_more')} onPress={() => setMenu((m) => !m)} />
           </View>
         </View>
         {showPage && loading && progress < 1 ? (
@@ -1013,26 +1028,26 @@ const s = themed((type) => ({
   pane: { flex: 1, backgroundColor: color.ink },
   chrome: { flex: 1 },
   toolbar: {
-    flexDirection: 'row', alignItems: 'center', paddingHorizontal: space.s4, paddingVertical: 6, backgroundColor: color.ink,
-    borderBottomWidth: 1, borderBottomColor: color.rule,
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: space.s4, paddingVertical: space.s8,
+    backgroundColor: color.ink, borderBottomWidth: 1, borderBottomColor: color.rule,
   },
-  // The tab count and the two acts keep their targets through their reach (hitSlop), so the address keeps its room
-  // for a placeholder in every language on a 320 dp phone.
-  tool: { width: 40, height: 44, alignItems: 'center', justifyContent: 'center' },
-  toolAct: { paddingHorizontal: space.s4 },
-  addressBox: { flex: 1, minWidth: 0, marginHorizontal: space.s4 },
+  // The tab count keeps its target through its reach (hitSlop), Back and More are their words alone, so the address
+  // keeps its room for a placeholder in every language on a 320 dp phone.
+  tool: { width: 36, height: 44, alignItems: 'center', justifyContent: 'center' },
+  addressBox: { flex: 1, minWidth: 0, marginStart: space.s4 },
+  // The address bar: a pill on Surface, the page's host centred in it, the field to type an address in its place.
   addressInput: {
-    ...type('field', 14), height: 36, borderRadius: radius.box, backgroundColor: color.fillField, color: color.paper,
-    paddingHorizontal: 10, paddingVertical: 0, borderWidth: 1, borderColor: color.edge,
+    ...type('field', 14), height: 40, borderRadius: radius.pill, backgroundColor: color.surface, color: color.paper,
+    paddingHorizontal: space.s12, paddingVertical: 0, borderWidth: 1, borderColor: color.signalLine,
   },
   addressShown: {
-    height: 36, borderRadius: radius.box, backgroundColor: color.fillField, borderWidth: 1, borderColor: color.edge,
-    paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 6,
+    height: 40, borderRadius: radius.pill, backgroundColor: color.surface, borderWidth: 1, borderColor: color.ruleStrong,
+    paddingHorizontal: space.s12, flexDirection: 'row', alignItems: 'center', gap: 6,
   },
-  addressText: { ...type('field', 14), flex: 1, writingDirection: 'ltr' },
+  addressText: { ...type('field', 14), flex: 1, textAlign: 'center', writingDirection: 'ltr' },
   addressPrefix: { color: color.fog },
   addressDomain: { ...type('row', 14), color: color.paper },
-  // The tab count: a number in a small square (a datum, how many tabs are open).
+  // The tab count: a number in a small rounded box (a datum, how many tabs are open).
   tabCount: {
     minWidth: 22, height: 22, paddingHorizontal: 3, borderRadius: radius.box, borderWidth: 1, borderColor: color.edge,
     alignItems: 'center', justifyContent: 'center',
@@ -1057,13 +1072,10 @@ const s = themed((type) => ({
   loading: { position: 'absolute', top: 16, alignSelf: 'center' },
   start: { flex: 1, backgroundColor: color.ink },
   startBody: { padding: space.gut, paddingBottom: space.s32, width: '100%', maxWidth: size.column, alignSelf: 'center' },
-  // The start page's one bookmark, a row like the recent pages under it.
-  bookmark: { marginBottom: space.s24 },
-  sectionTitle: {
-    ...type('label'), color: color.fog, paddingBottom: space.s8, borderBottomWidth: 1, borderBottomColor: color.ruleStrong,
-  },
-  empty: { ...type('note'), color: color.fog, marginTop: space.s12, marginBottom: space.s16 },
-  clearButton: { marginTop: space.s24, alignSelf: 'flex-start' },
+  // The start page's one bookmark, on its card over the recent pages' card.
+  bookmark: { marginBottom: space.s16 },
+  empty: { ...type('note'), color: color.fog, paddingVertical: space.s12 },
+  clearButton: { marginTop: space.s12, alignSelf: 'flex-start' },
   errorView: {
     ...StyleSheet.absoluteFillObject, backgroundColor: color.ink, alignItems: 'flex-start', justifyContent: 'center',
     padding: space.s24,
@@ -1075,26 +1087,26 @@ const s = themed((type) => ({
   // The tab overview covers the whole browser pane; the pages stay loaded under it.
   overview: { ...StyleSheet.absoluteFillObject, backgroundColor: color.ink, zIndex: 40, elevation: 10 },
   overviewHeader: {
-    flexDirection: 'row', alignItems: 'center', minHeight: 48, paddingStart: space.gut, paddingEnd: space.s4,
+    flexDirection: 'row', alignItems: 'center', minHeight: 48, paddingStart: space.gut, paddingEnd: space.s12,
     backgroundColor: color.ink, borderBottomWidth: 1, borderBottomColor: color.rule,
   },
   overviewTitle: { ...type('h3'), flex: 1, minWidth: 0, color: color.paper },
-  overviewDone: { paddingHorizontal: space.s12 },
   overviewBody: { padding: space.gut, paddingBottom: space.s32, width: '100%', maxWidth: size.column, alignSelf: 'center' },
-  tabRow: {
-    flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: color.rule,
-    borderStartWidth: 2, borderStartColor: color.clear,
-  },
-  tabRowFront: { borderStartColor: color.signal },
+  // A tab of the overview, a card of its own; the one in front edged in Signal. Close stands at the card's top, its
+  // 44 dp target centred on the title's line (12 above it, its 21 dp line), inside the card.
+  tabRow: { ...card, flexDirection: 'row', alignItems: 'flex-start', marginBottom: space.s8, overflow: 'hidden' },
+  tabRowFront: { borderColor: color.signalLine },
   tabMain: {
-    flex: 1, minWidth: 0, minHeight: 56, paddingVertical: space.s8, paddingStart: space.s12, justifyContent: 'center',
-    alignItems: 'flex-start',
+    flex: 1, minWidth: 0, alignSelf: 'stretch', minHeight: size.rowMin, paddingVertical: space.s12, paddingStart: space.s16,
+    justifyContent: 'center', alignItems: 'flex-start',
   },
   tabTitle: { ...type('row', 15), color: color.paper },
   tabTitleFront: { color: color.paper },
   tabHost: { ...type('data', 12), color: color.fog, marginTop: 2, writingDirection: 'ltr' },
-  tabClose: { paddingHorizontal: space.s12 },
+  tabClose: { marginEnd: space.s4 },
   tabsNote: { ...type('note'), color: color.ember, marginTop: 2, marginBottom: space.s8 },
   overviewActions: { flexDirection: 'row', flexWrap: 'wrap', gap: space.s12, marginTop: 10 },
   overviewButton: { flexGrow: 1, flexBasis: 140 },
 }));
+
+export const browserStyles = s;

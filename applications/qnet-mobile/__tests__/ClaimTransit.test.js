@@ -207,6 +207,72 @@ describe('what the wallet\'s live figure tells of it (owner, 18.10)', () => {
   });
 });
 
+describe('a move in parts: one press moves the balance', () => {
+  const { movesOn, runNote } = ClaimTransit;
+  const { SIZE_STOPS } = require('../src/utils/claimRun');
+  const stopped = (reason) => result({ stoppedAtEpoch: 104, stoppedReason: reason });
+
+  it('goes on only past a bound of one request; an epoch the nodes cannot serve, or no stop, ends it', () => {
+    expect(SIZE_STOPS).toEqual(['batch_full', 'quote_byte_budget', 'rebuild_budget']);
+    for (const reason of SIZE_STOPS) expect([reason, movesOn(stopped(reason))]).toEqual([reason, true]);
+    for (const reason of ['root_not_here', 'not_ready', 'local_corruption', 'epoch_unservable', null]) {
+      expect([reason, movesOn(stopped(reason))]).toEqual([reason, false]);
+    }
+    expect(movesOn(result())).toBe(false);
+    expect(movesOn(null)).toBe(false);
+  });
+
+  it('says the next part follows, then the last part\'s state counting the parts before it, exact past 2^53', () => {
+    const big = '9007199254740993'; // 2^53 + 1 nanoQNC
+    const run = (over) => ({ parts: [{ txHash: 'a', amountNano: big }, { txHash: 'b', amountNano: '7' }], more: false, stop: null, ...over });
+    expect(runNote(run({ more: true }), { result: 'done' })).toEqual({ key: 'claim_parts_next' });
+    expect(runNote(run(), { result: 'moving' })).toEqual({ key: 'claim_credited_on_block' });
+    expect(runNote(run(), { result: 'done' })).toEqual({ key: 'claim_note_done' });
+    expect(runNote(run(), { result: 'partial', appliedNano: 3 })).toEqual({ key: 'claim_note_partial', appliedNano: '9007199254740996' });
+    // The last part expired: the parts before it are in the wallet, the rest on the node; alone, today's line.
+    expect(runNote(run(), { result: 'expired', appliedNano: 0 })).toEqual({ key: 'claim_note_partial', appliedNano: big });
+    expect(runNote({ parts: [{ txHash: 'a', amountNano: '5' }], more: false, stop: null }, { result: 'expired' }))
+      .toEqual({ key: 'claim_note_expired' });
+    // While the last part is in transit, its quote's stop is the rest, unless nothing was left to quote.
+    expect(runNote(run(), { result: 'moving' }, 104)).toEqual({ key: 'claim_stopped_at', epoch: 104 });
+    expect(runNote(run({ whole: true }), { result: 'moving' }, 104)).toEqual({ key: 'claim_credited_on_block' });
+  });
+
+  it('where the rest of a part taken in part begins: past the share its outcome names, by its epochs', () => {
+    const { restEpochOf } = ClaimTransit;
+    const parts = [[101, '1000000000'], [300, '0'], [301, '1000000000'], [612, '1000000000']];
+    expect([restEpochOf(parts, 0), restEpochOf(parts, 1000000000), restEpochOf(parts, 2000000000)]).toEqual([101, 301, 612]);
+    expect([restEpochOf(parts, 3000000000), restEpochOf(null, 5)]).toEqual([null, null]);
+  });
+
+  it('a next part not sent: what the parts put in the wallet, the refusal\'s code, or that an unanswered one may have gone', () => {
+    const parts = [{ txHash: 'a', amountNano: '3000000000' }, { txHash: 'b', amountNano: '2000000000' }];
+    expect(runNote({ parts, more: false, stop: { code: 'RATE_LIMITED' } }, { result: 'done' }))
+      .toEqual({ key: 'claim_note_partial', appliedNano: '5000000000', reason: 'RATE_LIMITED' });
+    expect(runNote({ parts, more: false, stop: { ended: true } }, { result: 'done' }))
+      .toEqual({ key: 'claim_note_partial', appliedNano: '5000000000', reason: null });
+    expect(runNote({ parts, more: false, stop: { unknown: true } }, { result: 'done' }))
+      .toEqual({ key: 'claim_parts_in_wallet', appliedNano: '5000000000', unknown: true });
+  });
+
+  // runNote is the one rule for every card's note, a move of one part's too: no card chooses between it and moveNote.
+  it('a move of one part (no run) says what moveNote says, so every card asks runNote alone', () => {
+    for (const [outcome, stop] of [
+      [null, null], [null, 104], [{ result: 'moving' }, 104], [{ result: 'done', appliedNano: 1 }, null],
+      [{ result: 'partial', appliedNano: 2.5e9 }, 104], [{ result: 'expired', appliedNano: 0 }, null],
+    ]) {
+      expect(runNote(null, outcome, stop)).toEqual(moveNote(outcome, stop));
+      expect(runNote(undefined, outcome, stop)).toEqual(moveNote(outcome, stop));
+    }
+    const fs = require('fs');
+    const path = require('path');
+    for (const file of ['src/screens/WalletScreen.js', 'src/screens/QNetLinkScreen.js']) {
+      const src = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+      expect([file, /\bmoveNote\(/.test(src), (src.match(/\brunNote\(/g) || []).length]).toEqual([file, false, 1]);
+    }
+  });
+});
+
 describe('a node balance answer counts only from a node not behind the wallet\'s certified watermark', () => {
   it('first unclaimed epoch past the floor, or nothing left to claim (the node\'s answer after a whole move)', () => {
     expect(balanceAnswerCounts(answer(4e9, 101), null)).toBe(true); // no floor known: every answer

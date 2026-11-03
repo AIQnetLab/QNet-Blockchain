@@ -1,6 +1,7 @@
-// Whether a visitor hid the explorer's Latest blocks strip (owner 20.10: the strip folds away and stays as the visitor
-// left it). One cookie, written only by Hide and deleted by Show, scoped to the explorer's pages; the server reads it so
-// the page paints the strip folded or open from the first byte, and nothing moves after load.
+// Whether a visitor hid the explorer's Latest blocks strip (it folds away and stays as the visitor
+// left it). One cookie, written only by Hide and deleted by Show, scoped to the explorer's pages in the page's language
+// (/explorer, /ru/explorer); the server reads it so the page paints the strip folded or open from the first byte, and
+// nothing moves after load.
 
 export const STRIP_COOKIE = 'qnet.blocks';
 const HIDDEN = 'hidden';
@@ -18,8 +19,8 @@ export function stripHiddenIn(cookies: string): boolean {
   return false;
 }
 
-// The Set-Cookie value Hide (hidden) and Show (not hidden) write; Show deletes the cookie.
-export function stripCookie(hidden: boolean, secure: boolean): string {
-  const value = `${STRIP_COOKIE}=${hidden ? HIDDEN : ''}; Path=/explorer; Max-Age=${hidden ? KEEP_S : 0}; SameSite=Lax`;
+// The Set-Cookie value Hide (hidden) and Show (not hidden) write on the explorer at `path`; Show deletes the cookie.
+export function stripCookie(hidden: boolean, secure: boolean, path: string): string {
+  const value = `${STRIP_COOKIE}=${hidden ? HIDDEN : ''}; Path=${path}; Max-Age=${hidden ? KEEP_S : 0}; SameSite=Lax`;
   return secure ? `${value}; Secure` : value;
 }

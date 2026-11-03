@@ -111,8 +111,11 @@ it('lists a token only when the user added it or chose to show it, and never one
 
 it('the Assets list, the proofs and the manager all use this rule', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
-  expect(src).toMatch(/qrcTokens\.filter\(\(tk\) => isTokenShown\(tk\.contract\)\)\.map/);
+  // The Assets list and the token picker draw the same assets (heldAssets).
+  expect(src).toMatch(/qrcTokens\.filter\(\(tk\) => tk\.contract && isTokenShown\(tk\.contract\)\)\.map/);
+  expect(src).toMatch(/\{heldAssets\(selectedNetwork\)\.filter\(/);
   expect(src).toMatch(/const toProve = list\.filter\(\(tk\) => tokenVisible\(/);
-  expect(src).toMatch(/t\('tok_contract_id', \{ id: contractShortId\(tk\.contract\) \}\)/);
+  const rows = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/TokenScreens.js'), 'utf8');
+  expect(rows).toMatch(/t\('tok_contract_id', \{ id: contractShortId\(asset\.contract\) \}\)/);
   expect(src).toMatch(/t\('tok_reserved_warning'\)/);
 });

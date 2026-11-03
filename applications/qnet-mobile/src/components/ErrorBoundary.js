@@ -11,8 +11,9 @@ import { tr } from '../i18n';
 import Action from './ui/Action';
 import { color, size, space, themed } from '../theme';
 
-// The caches "Clear cache" removes, by exact key (services/HistoryCache, services/NodePool, the Node tab's last reads).
-export const CACHE_KEYS = Object.freeze(['qnet_node_rewards', 'qnet_cached_server_status', 'qnet_tx_history', 'qnet_node_pool']);
+// The caches "Clear cache" removes, by exact key (services/HistoryCache, services/NodePool, the node rewards read). The
+// wallet's node record (WalletManager.WALLET_NODE_KEY) is not one: it shows the wallet's node at once on every open.
+export const CACHE_KEYS = Object.freeze(['qnet_node_rewards', 'qnet_tx_history', 'qnet_node_pool']);
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -123,8 +124,8 @@ class ErrorBoundary extends React.Component {
 
   handleClearCache = async () => {
     try {
-      // Only what the app reads again from the network by itself: the node balance and server status it last showed,
-      // the confirmed history rows and the read pool. The wallet, its node record and its settings stay.
+      // Only what the app reads again from the network by itself: the node rewards it last read, the confirmed history
+      // rows and the read pool. The wallet, its node record and its settings stay.
       const allKeys = await AsyncStorage.getAllKeys();
       const keysToDelete = allKeys.filter((key) => CACHE_KEYS.includes(key));
       if (keysToDelete.length > 0) await AsyncStorage.multiRemove(keysToDelete);

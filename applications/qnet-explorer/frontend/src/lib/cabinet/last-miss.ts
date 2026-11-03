@@ -1,4 +1,4 @@
-// Why a light node was not counted in an epoch, and what its owner can do (owner, 05.10): the public status's
+// Why a light node was not counted in an epoch, and what its owner can do: the public status's
 // `device.last_miss` (docs/protocols/light-node-messages.md section 7), the latest of the last few epochs the node was
 // not counted in, as a genesis owning its light shard saw it: the epoch, the reason, and whether the wake reached the
 // device. A reader takes, among the owners that answer, the miss of the highest epoch, at equal epochs the most
@@ -11,7 +11,7 @@
 // Every answer belongs to its own epoch: nothing here says one counts for another. Pure, shared by the site route
 // (src/server/cabinet/node-proxy.ts) and the page.
 
-import { number, t, type MessageKey } from '../texts.ts';
+import { number, type MessageKey, type T } from '../texts.ts';
 import type { DevicePlatform, NodeStatusView } from './node-view.ts';
 
 // Most specific first: no committed check of the node's shard (no node of it counted, whatever the device did), an
@@ -179,14 +179,14 @@ function deliveryLine(miss: LastMiss): MessageKey | null {
 
 // The miss's one line in two parts: what happened in that epoch (a text whose {epoch} names it, so a page can link
 // it), then whether the wake reached the device when known and what to do.
-export function missParts(miss: LastMiss, platform: DevicePlatform | null): { what: MessageKey; rest: string } {
+export function missParts(miss: LastMiss, platform: DevicePlatform | null, t: T): { what: MessageKey; rest: string } {
   const notice = missNotice(miss, platform);
   const delivery = deliveryLine(miss);
   return { what: notice.what, rest: [...(delivery === null ? [] : [t(delivery)]), t(notice.todo)].join(' ') };
 }
 
 // The miss's one line as words.
-export function missText(miss: LastMiss, platform: DevicePlatform | null): string {
-  const { what, rest } = missParts(miss, platform);
+export function missText(miss: LastMiss, platform: DevicePlatform | null, t: T): string {
+  const { what, rest } = missParts(miss, platform, t);
   return `${t(what, { epoch: number(miss.epoch) })} ${rest}`;
 }

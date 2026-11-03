@@ -682,6 +682,11 @@ describe('bundle surface', () => {
     'contractCallData', 'contractCallIntrinsicGas', 'contractCallPreimage', 'contractCallRequestJson', 'contractDeployData',
     'contractDeployIntrinsicGas', 'contractDeployPreimage', 'contractDeployRequestJson', 'deriveContractAddress',
     'signContractCall', 'signTokenTransfer', 'transferRequestJson', 'wasmCodeHash',
+    // the V2 form (a signed last height): its lifetimes, the form from a node's answer, the typed refusals and their one
+    // re-sign, the last height of a stored body and the height that ends it, and the one expiry every signer builds
+    // (test/tx-v2-vectors.test.mjs)
+    'EXPIRY_REFUSALS', 'MAX_TX_LIFETIME_BLOCKS', 'TX_V2_LIFETIME_BLOCKS', 'expiredAt', 'expiryAt', 'expiryRefusalOf',
+    'resignFormOf', 'txExpiryFromAccount', 'validUntilOf',
     // the token rules a token transfer's approval shows (compiled from the mobile utils/tokenSafety.js), and the text rule
     // of the approval window (message.js)
     'contractShortId', 'destroysTokens', 'tokenLabel', 'usesReservedName', 'isVisibleText',
@@ -689,8 +694,8 @@ describe('bundle surface', () => {
     // from the mobile utils/amountFormat.js and utils/sendAmount.js)
     'amountInput', 'amountText',
     // the light node messages (compiled from the mobile NodePreimages.js; test/light-node-vectors.test.mjs)
-    'claimPayloadPreimage', 'claimQuotePreimage', 'consentPreimage', 'lightNodeId', 'ownerBindPreimage', 'publicKeySha3',
-    'registrationProof',
+    'claimPayloadPreimage', 'claimPayloadPreimageV2', 'claimQuotePreimage', 'consentPreimage', 'lightNodeId',
+    'ownerBindPreimage', 'publicKeySha3', 'registrationProof',
     // the wallet's super node id, whose claim quote the builder above and the signer below also take (decision 47)
     'superNodeId',
     // and their signers: the node id and proof are the wallet's own, computed inside (node.js)
@@ -730,6 +735,10 @@ describe('bundle surface', () => {
     // (mobile QcLightClient.js; docs/protocols/galc-capsule-v2.md)
     'capsulePreimage', 'clearCapsule', 'exportCapsule', 'followStep', 'heldCapsuleIndex', 'importCapsule', 'refreshCapsule',
     'stepsToVerify', 'verifiedCheckpoint',
+    // the way the worker's Solana calls go, to the endpoint or through aiqnet.io's relay (mobile solanaRoute.js, decision 56)
+    'SOLANA_DIRECT_RETRY_MS', 'solanaAttemptAfter', 'solanaProbeDue', 'solanaRouteAfter', 'solanaRouteOf',
+    // the stops and the waits of a node balance's move in parts (mobile claimRun.js, decision 54)
+    'BEHIND_TRIES', 'BEHIND_WAIT_MS', 'SIZE_STOPS',
   ];
 
   it('exports exactly the documented API, as a deep-frozen default namespace', () => {
@@ -758,6 +767,16 @@ describe('bundle surface', () => {
     assert.equal(core.fees.TRANSFER_FEE_NANO, 150000);
     assert.equal(core.fees.feeNano(10, 10000), 150000);
     assert.equal(core.fees.NANO_PER_QNC, 1e9);
+  });
+
+  it('carries the app\'s rules of a move in parts and of the Solana attempts, and the worker keeps no copy of them', () => {
+    assert.deepEqual(core.SIZE_STOPS, ['batch_full', 'quote_byte_budget', 'rebuild_budget']);
+    assert.equal(Object.isFrozen(core.SIZE_STOPS), true);
+    assert.deepEqual([core.BEHIND_TRIES, core.BEHIND_WAIT_MS], [2, 3000]);
+    assert.deepEqual(core.solanaAttemptAfter('site', 'unusable', 5), { route: null, next: 'direct' });
+    assert.deepEqual(core.solanaAttemptAfter('direct', 'none', 5), { route: { v: 1, via: 'site', probeAt: 5 }, next: 'site' });
+    const nodes = readFileSync(path.join(HERE, '../dist/background/nodes.js'), 'utf8');
+    assert.doesNotMatch(nodes, /\b(?:const|let)\s+(?:SIZE_STOPS|BEHIND_TRIES|BEHIND_WAIT_MS)\b/);
   });
 
   it('exposes working primitives', async () => {

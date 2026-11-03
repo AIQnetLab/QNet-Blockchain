@@ -1,22 +1,19 @@
-// The site's texts (src/lib/texts.ts), English only: the node cabinet, the link page and the Support page. The
-// {placeholder} filling and English numbers, the words shared with the app and the extension in their English, no
-// word for earnings, the Support page's in-app part free of platforms and activation, every key a page uses, and no
-// language switch, locale choice or right-to-left handling anywhere; then the cabinet's button and card system at
-// phone and tablet widths, the wallet choice kept in the browser, the one reading of a node's state, and the
-// balance in English digits. Run: npm run test:wallet
+// The site's texts (src/i18n/locales/en.ts, the English catalog): the node cabinet, the link page and the Support page.
+// The {placeholder} filling and English numbers, the words shared with the app and the extension in their English, no
+// word for earnings, the Support page's in-app part free of platforms and activation, every key a page uses; then the
+// cabinet's button and card system at phone and tablet widths, the wallet choice kept in the browser, the one reading
+// of a node's state, and the balance in English digits. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { TEXTS, format, number, pageTitle, t, templateParts } from '../texts.ts';
+import { readFileSync, readdirSync } from 'node:fs';
+import { format, number, pageTitle, templateParts } from '../texts.ts';
+import { EN as t, TEXTS } from './texts-helper.mjs';
 import { WALLET_KEY, choiceView, clearChoice, isHeldWallet, loadChoice, ownSolanaOf, parseChoice, saveChoice } from '../cabinet/wallet-choice.ts';
 import { canMove, formatQnc, formatUnits, nodeState } from '../cabinet/node-view.ts';
+import { REPO, SRC, code, read } from './source.mjs';
 
 const WALLET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
-const SRC = new URL('../../', import.meta.url);
-const REPO = new URL('../../../../../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 // Typography that is not wording: curly or straight apostrophes, the extension's soft hyphens, case.
 const norm = (s) => s.replace(/­/g, '').replace(/[’']/g, "'").toLowerCase();
 const APP = (await import(new URL('applications/qnet-mobile/src/i18n/locales/en.js', REPO).href)).default;
@@ -25,13 +22,15 @@ const placeholders = (text) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1])
 const sources = (dir) => readdirSync(new URL(dir, SRC), { recursive: true })
   .map((n) => `${dir}${n.replace(/\\/g, '/')}`)
   .filter((n) => /\.(tsx?|css)$/.test(n) && !n.includes('__tests__') && !n.includes('__release__'));
-// The forms that name the system other than "QNet Blockchain" (owner, 12.10). An article stays only before the noun
+// The forms that name the system other than "QNet Blockchain". An article stays only before the noun
 // the name qualifies ("the QNet Blockchain protocol").
 const OTHER_NAMES = [
   /QNet('s)?\s+(test\s+)?network|QNet\s+chain\b|Quantum\s+(Blockchain|Network)|\bthe\s+QNet\s+Blockchain\b(?!\s+(protocol|testnet|Explorer|DAO|nodes?|transactions?|history)\b)/i,
   /QNet\s+blockchain/,
 ];
 const otherName = (text) => OTHER_NAMES.find((re) => re.test(text));
+// The privacy policy's and the terms' paragraphs: legal statements, held to their own tests (privacy-claims, legal-pages).
+const LEGAL = /^(privacy|terms|legal)_/;
 // "QNet" alone, where it would stand for the system: allowed only in the product and brand names.
 const BARE_QNET = /\bQNet\b(?![-_])(?!\s+(Wallet|Blockchain|Link)\b)/;
 
@@ -46,7 +45,7 @@ test('placeholders are filled by name, numbers are English, a sentence splits ar
   assert.equal(t('link_error_NOPE'), 'link_error_NOPE');
   assert.equal(number(1234567), '1,234,567');
   assert.equal(number(18446744073709551615n), '18,446,744,073,709,551,615');
-  assert.equal(pageTitle('activate_title', 'cabinet_title'), `${TEXTS.activate_title} - My node - QNet Blockchain`);
+  assert.equal(pageTitle(t, 'activate_title', 'cabinet_title'), `${TEXTS.activate_title} - My node - QNet Blockchain`);
   assert.deepEqual(templateParts('Install it (see {walletPage}), then {nodePage}.'), ['Install it (see ', { name: 'walletPage' }, '), then ', { name: 'nodePage' }, '.']);
   assert.deepEqual(templateParts('{a}'), [{ name: 'a' }]);
 });
@@ -57,8 +56,6 @@ test('every text is trimmed, with no stray braces or doubled spaces', () => {
     assert.ok(typeof text === 'string' && text.trim() === text && text.length > 0, key);
     assert.doesNotMatch(text.replace(/\{\w+\}/g, 'X'), /[{}]|undefined|\s{2}/, key);
   }
-  // Nothing is left of the language menu.
-  assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'lang_label'), false);
 });
 
 test('the words shared with QNet Wallet are the app\'s own English', () => {
@@ -66,7 +63,7 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   const same = (site, appText, key) => assert.equal(norm(site), norm(appText), key);
   same(TEXTS.no_node, APP.node_none, 'no_node');
   // The node on no device: the site's own sentence; QNet Wallet shows a light node only on the device it is linked to and
-  // has none for it (owner, 11.10).
+  // has none for it.
   assert.equal(APP.node_no_device, undefined, 'no_device');
   same(TEXTS.badge_online, APP.node_status_online, 'badge_online');
   same(TEXTS.badge_offline, APP.node_status_offline, 'badge_offline');
@@ -90,11 +87,11 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   same(TEXTS.device_answered, APP.node_answered, 'device_answered');
   same(TEXTS.device_yes, APP.node_answered_yes_untimed, 'device_yes');
   same(TEXTS.ro_not_answered, APP.node_answered_no, 'ro_not_answered');
-  // Owner, 11.10: no count over a window of recent epochs; History lists the epochs themselves
+  // No count over a window of recent epochs; History lists the epochs themselves
   // (cabinet-layout.test.mjs).
   for (const key of ['counted', 'super_epochs']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);
-  for (const [key, text] of Object.entries(TEXTS)) assert.doesNotMatch(text, /of the last|settled lately/i, key);
-  // Unified plan section 3.1: the English of the words the app and the cabinet share.
+  for (const [key, text] of Object.entries(TEXTS).filter(([k]) => !LEGAL.test(k))) assert.doesNotMatch(text, /of the last|settled lately/i, key);
+  // The English of the words the app and the cabinet share.
   assert.equal(TEXTS.no_node, 'This wallet has no node.');
   assert.equal(TEXTS.no_device, 'The node does not run on any device now.');
   assert.equal(TEXTS.badge_online, 'Online');
@@ -105,13 +102,13 @@ test('the words shared with QNet Wallet are the app\'s own English', () => {
   assert.equal(TEXTS.balance_min, 'The node balance can be moved to the wallet once it reaches 1 QNC.');
   assert.equal(TEXTS.action_link_device, 'Link a device');
   assert.equal(TEXTS.unreachable, 'QNet Blockchain could not be reached.');
-  // The system is named "QNet Blockchain" and in no other way (owner, 12.10), the ui_ labels quoted from the app and the
+  // The system is named "QNet Blockchain" and in no other way, the ui_ labels quoted from the app and the
   // extension included.
   for (const [key, text] of Object.entries(TEXTS)) {
     assert.equal(otherName(text), undefined, key);
     assert.doesNotMatch(text, BARE_QNET, key);
-    // A status line opens with QNet Blockchain, never with "The network".
-    assert.doesNotMatch(text, /(^|[.:!?] )The network\b/, key);
+    // A status line opens with QNet Blockchain, never with "The network" (the policies' own sentences aside).
+    if (!LEGAL.test(key)) assert.doesNotMatch(text, /(^|[.:!?] )The network\b/, key);
   }
   // The line under My node's title for a visitor without a wallet repeated the connect screen's guides: gone (AUDIT 4.6).
   assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'eligibility'), false);
@@ -129,7 +126,8 @@ test('every page, its metadata and the manifest name the system QNet Blockchain'
   assert.equal([...layout.matchAll(/title: 'QNet Blockchain',/g)].length, 3);
   assert.match(layout, /siteName: 'QNet Blockchain',/);
   // The explorer's title is its band's one h1 (components/ui/PageHead.tsx), on the page and while it loads.
-  for (const file of ['app/explorer/ExplorerClient.tsx', 'app/explorer/loading.tsx']) assert.match(code(file), /<PageHead\s+title="QNet Blockchain Explorer"/, file);
+  for (const file of ['app/explorer/ExplorerClient.tsx', 'app/explorer/loading.tsx']) assert.match(code(file), /<PageHead\s+title=\{say\('ex_title'\)\}/, file);
+  assert.equal(TEXTS.ex_title, 'QNet Blockchain Explorer');
   assert.match(code('components/ui/PageHead.tsx'), /<h1 className="page-title"[^>]*>\{title\}<\/h1>/);
   // The home headline and the header's wordmark: the name together, split into lines or weights only for the eye.
   assert.match(code('app/HomeClient.tsx'), /const NAME = 'QNet Blockchain';/);
@@ -146,8 +144,8 @@ test('every page, its metadata and the manifest name the system QNet Blockchain'
 
 test('the extension\'s buttons, tabs and fields are named as the extension names them', () => {
   const has = (text, part, what) => assert.ok(norm(text).includes(norm(part)), what);
-  for (const key of ['code_no_registration']) has(TEXTS[key], EXT.recordButton, key);
-  // The extension's own "Recover my code" (XC-09), named only where its Activate tab shows it: beside a check that could
+  has(TEXTS.next_record_other_wallet, EXT.recordButton, 'next_record_other_wallet');
+  // The extension's own "Recover my code", named only where its Activate tab shows it: beside a check that could
   // not finish. Elsewhere the code is simply in its Settings once known (popup.js codeSection; it finds a burn of the
   // wallet by itself), so those texts send there, not to a button, and never to the Activate tab, which shows no code.
   has(TEXTS.check_solana, `"${EXT.recoverButton}"`, 'check_solana');
@@ -162,14 +160,17 @@ test('the extension\'s buttons, tabs and fields are named as the extension names
   assert.equal(norm(TEXTS.act_code), norm(EXT.codeLabel), 'act_code');
 });
 
-// Owner, 13.10: the one exception is the node's "Total earned", the sum moved to the wallet plus the node balance
+// The one exception is the node's "Total earned", the sum moved to the wallet plus the node balance
 // (NodeHistory.tsx Earned); its reading's label says that phrase and no text says another word of the kind.
 test('no text speaks of earnings: the node balance is what it is', () => {
-  for (const [key, text] of Object.entries(TEXTS)) {
+  // The explorer's name of the chain's reward type, the home page's economic model, a document's description in the
+  // documentation index and the policies speak of the protocol, not of a node's balance.
+  const protocol = new Set(['tx_type_reward', 'home_eco_lead', 'home_pools_title', 'docs_economics_overview_what']);
+  for (const [key, text] of Object.entries(TEXTS).filter(([k]) => !protocol.has(k) && !LEGAL.test(k))) {
     const said = key === 'ro_total_earned' ? text.replace(/^Total earned$/, '') : text;
     assert.doesNotMatch(said, /reward|\bmining\b|\bearn|\bincome\b|\bprofit/i, key);
   }
-  assert.deepEqual(Object.keys(TEXTS).filter((k) => /\bearn/i.test(TEXTS[k])), ['ro_total_earned']);
+  assert.deepEqual(Object.keys(TEXTS).filter((k) => !LEGAL.test(k) && /\bearn/i.test(TEXTS[k])), ['ro_total_earned']);
 });
 
 // The page as the QNet app's view renders it: every `{full && …}` block (shown only outside that view) removed.
@@ -188,11 +189,11 @@ function inAppView(src) {
     out = out.slice(0, at) + out.slice(end + 1);
   }
 }
-const keysIn = (src) => [...src.matchAll(/\b(?:t|rich)\('([a-z0-9_]+)'/g)].map((m) => m[1]);
+const keysIn = (src) => [...src.matchAll(/\b(?:t|say|rich)\('([a-z0-9_]+)'/g)].map((m) => m[1]);
 
 test('the Support page in the app\'s view names no platform and points to no activation', () => {
   const page = code('app/support/page.tsx');
-  // Owner, 04.10: self-service only; the page renders no review request.
+  // Self-service only: the page renders no review request.
   assert.doesNotMatch(page, /SupportRequest/);
   const shown = new Set(keysIn(inAppView(page)));
   const hidden = keysIn(page).filter((k) => !shown.has(k));
@@ -203,7 +204,7 @@ test('the Support page in the app\'s view names no platform and points to no act
   }
   for (const key of keysIn(page)) assert.ok(key.startsWith('support_'), key);
   // No review step anywhere on the site: what the user does is move the node to another device.
-  for (const [key, text] of Object.entries(TEXTS).filter(([k]) => !/^support_(form|case)_/.test(k))) {
+  for (const [key, text] of Object.entries(TEXTS)) {
     assert.doesNotMatch(text, /a person reviews|ask for a review|appeal/i, key);
   }
   assert.match(TEXTS.support_device_lead, /run it on another phone or tablet: install QNet Wallet there from the app store, open this wallet with its recovery phrase and link the node to that device\./);
@@ -211,14 +212,14 @@ test('the Support page in the app\'s view names no platform and points to no act
 
 test('every key a page uses has its text, and they show text only through it', () => {
   const used = new Set();
-  const files = [...readdirSync(new URL('components/cabinet/', SRC)).map((n) => `components/cabinet/${n}`), 'app/support/page.tsx', 'components/SupportRequest.tsx', 'app/l/page.tsx', 'app/l/LinkButtons.tsx', 'app/send/page.tsx'];
+  const files = [...readdirSync(new URL('components/cabinet/', SRC)).map((n) => `components/cabinet/${n}`), 'app/support/page.tsx', 'app/l/page.tsx', 'app/l/LinkButtons.tsx', 'app/send/page.tsx'];
   for (const file of files) {
     const text = read(file);
-    for (const m of text.matchAll(/\b(?:t|rich)\('([a-z0-9_]+)'/g)) used.add(m[1]);
+    for (const m of text.matchAll(/\b(?:t|say|rich)\('([a-z0-9_]+)'/g)) used.add(m[1]);
     for (const m of text.matchAll(/(?:label|title): '([a-z0-9_]+)'/g)) used.add(m[1]);
     for (const m of text.matchAll(/title="([a-z0-9_]+)"/g)) used.add(m[1]);
     for (const m of text.matchAll(/return '([a-z0-9_]+)';/g)) used.add(m[1]);
-    for (const m of text.matchAll(/: '((?:history|support_case)_[a-z_]+)'/g)) used.add(m[1]);
+    for (const m of text.matchAll(/: '(history_[a-z_]+)'/g)) used.add(m[1]);
     // No English sentence written into a component: every text node is a {t(...)} or a formatted value.
     assert.doesNotMatch(text, />[A-Z][a-z]+ [a-z]+[^<{]*</, file);
     // Nor a message the site's wallet control writes (src/contexts/AppContext.tsx).
@@ -227,12 +228,12 @@ test('every key a page uses has its text, and they show text only through it', (
   // The pages' titles.
   for (const dir of ['app/node/', 'app/docs/how-it-works/', 'app/support/', 'app/l/', 'app/send/']) {
     for (const name of readdirSync(new URL(dir, SRC), { recursive: true }).filter((n) => /\.tsx$/.test(n))) {
-      for (const m of read(`${dir}${name.replace(/\\/g, '/')}`).matchAll(/pageTitle\(([^)]*)\)/g)) {
+      for (const m of read(`${dir}${name.replace(/\\/g, '/')}`).matchAll(/pageMetadata\(\[([^\]]*)\]/g)) {
         for (const k of m[1].matchAll(/'([a-z0-9_]+)'/g)) used.add(k[1]);
       }
     }
   }
-  assert.match(read('app/node/page.tsx'), /description: t\('cabinet_description'\)/);
+  assert.match(read('app/node/page.tsx'), /return pageMetadata\(\['cabinet_title'\], 'cabinet_description'\);/);
   for (const key of used) assert.ok(Object.prototype.hasOwnProperty.call(TEXTS, key), key);
   // The failure texts of a link request are looked up by code.
   for (const failure of ['busy', 'network', 'refused', 'expired', 'unreadable', 'insecure', 'rate_limited']) {
@@ -240,37 +241,6 @@ test('every key a page uses has its text, and they show text only through it', (
   }
 });
 
-test('English only: no language switch, no locale choice, no second table, no right-to-left handling', () => {
-  assert.equal(existsSync(new URL('i18n', SRC)), false);
-  assert.equal(existsSync(new URL('components/LanguageMenu.tsx', SRC)), false);
-  const cookies = [];
-  for (const file of sources('')) {
-    const text = code(file);
-    assert.doesNotMatch(text, /LanguageMenu|lang-menu|qnet_lang|useI18n|I18nProvider|requestLocale|messagesOf|accept-language/i, file);
-    assert.doesNotMatch(text, /\bdir=|\[dir=|unicode-bidi|<bdi\b|direction:\s*(ltr|rtl)/, file);
-    if (/document\.cookie/.test(text)) cookies.push(file);
-  }
-  // No language cookie: the site's one cookie is the explorer's folded strip (privacy-claims.test.mjs).
-  assert.deepEqual(cookies, ['components/explorer/LatestBlocks.tsx']);
-  // The pages that had a language: no select, no lang or dir of their own, the root's English only.
-  for (const file of ['components/cabinet/CabinetFrame.tsx', 'app/support/page.tsx', 'app/l/page.tsx', 'app/send/page.tsx', 'app/node/layout.tsx', 'app/support/layout.tsx']) {
-    const text = code(file);
-    assert.doesNotMatch(text, /<select|\blang=|locale/, file);
-  }
-  assert.match(read('app/layout.tsx'), /<html lang="en"/);
-  // The node layout reads no request header; it renders per request for the server's CABINET_PHONE_FLOWS.
-  const layout = code('app/node/layout.tsx');
-  assert.doesNotMatch(layout, /cookies\(\)|headers\(\)/);
-  assert.match(layout, /export const dynamic = 'force-dynamic';/);
-  // Every page title is static and English.
-  for (const page of ['app/node/page.tsx', 'app/node/activate/page.tsx', 'app/node/device/page.tsx', 'app/node/history/page.tsx', 'app/docs/how-it-works/page.tsx', 'app/support/layout.tsx', 'app/l/page.tsx', 'app/send/page.tsx']) {
-    assert.match(read(page), /export const metadata: Metadata = \{ title: pageTitle\(/, page);
-  }
-});
-
-// The rules of one selector block of the site's stylesheet, as written: the first block that starts a line with
-// exactly that selector (in `within`, a media query's text, or the whole sheet).
-const CSS = read('app/globals.css');
 const CABINET = read('styles/cabinet.css');
 // One media query of My node's sheet, whole.
 function cabinetMedia(query) {
@@ -283,24 +253,8 @@ function cabinetMedia(query) {
   }
   assert.fail(query);
 }
-const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-function block(selector, within = CSS) {
-  const m = new RegExp(`^[ \\t]*${escape(selector)} \\{`, 'm').exec(within);
-  assert.ok(m, selector);
-  return within.slice(m.index, within.indexOf('}', m.index));
-}
-function media(query) {
-  const at = CSS.lastIndexOf(`@media (${query}) {`);
-  assert.ok(at >= 0, query);
-  let depth = 0;
-  for (let i = CSS.indexOf('{', at); i < CSS.length; i++) {
-    if (CSS[i] === '{') depth++;
-    else if (CSS[i] === '}' && --depth === 0) return CSS.slice(at, i + 1);
-  }
-  assert.fail(query);
-}
 
-// B-SPEC 5.5: My node's actions are the site's own (components/ui/Action.tsx): solid for the one step to do now, text
+// My node's actions are the site's own (components/ui/Action.tsx): solid for the one step to do now, text
 // for the others, act inside a line of data; never an outlined box, never a dimmed one. Each is a finger-sized target.
 test('the cabinet\'s actions: the site\'s solid, text and act, finger-sized targets, a disabled solid filled grey', () => {
   for (const name of readdirSync(new URL('components/cabinet/', SRC)).filter((n) => n.endsWith('.tsx'))) {
@@ -309,9 +263,9 @@ test('the cabinet\'s actions: the site\'s solid, text and act, finger-sized targ
     for (const m of src.matchAll(/className="(btn[^"]*)"/g)) assert.match(m[1], /^btn btn-(solid|text)( btn-sm)?$/, `${name}: ${m[1]}`);
   }
   const base = read('styles/base.css');
-  assert.match(base, /\.btn-solid \{ background: var\(--signal\); color: var\(--ink\); padding: 17px 24px;/);
+  assert.match(base, /\.btn-solid \{ background: var\(--signal\); color: var\(--ink\); padding: 15\.45px 24px;/);
   assert.match(base, /\.btn-solid:disabled, \.btn-solid\[aria-disabled='true'\] \{ background: var\(--fill-disabled\); color: var\(--fog\); cursor: not-allowed; \}/);
-  assert.match(base, /\.btn-text \{\n {2}color: var\(--paper\); padding: 15px 0;/);
+  assert.match(base, /\.btn-text \{\n {2}color: var\(--paper\); padding: 13\.45px 0;/);
   // A disabled action is never dimmed by opacity.
   assert.doesNotMatch(base + CABINET, /:disabled[^{]*\{[^}]*opacity/);
   // The sections' rows, How it works's titles and the node types are 44 px or taller (the ways to connect are the solid
@@ -322,7 +276,7 @@ test('the cabinet\'s actions: the site\'s solid, text and act, finger-sized targ
   assert.match(base, /\.field \{[^}]*font-size: 16px;/);
 });
 
-// Owner 19.10 (B-SPEC, owner additions 7): phones and tablets genuinely convenient: the sections in a bar under the thumb
+// Phones and tablets genuinely convenient: the sections in a bar under the thumb
 // that never covers the page's end and steps aside for the menu and the account sheet, rows that stack, nothing wider
 // than the screen.
 test('phones and tablets: the sections under the thumb, rows that stack, buttons that take the row, nothing wider than the screen', () => {
@@ -386,9 +340,12 @@ test('one reading of a node\'s state: Online never from anything but a linked de
   assert.equal(nodeState({ ...base, needsReactivation: true }), 'offline');
   assert.equal(nodeState({ ...base, deviceBound: false }), 'no_device');
   assert.equal(nodeState({ ...base, deviceBound: false, needsReactivation: true }), 'no_device');
+  // No answer could say which device runs it: not known, never "no device" and never Online.
+  assert.equal(nodeState({ ...base, deviceBound: null, device: null }), 'device_unknown');
+  assert.equal(nodeState({ ...base, deviceBound: null, device: null, registered: false }), 'none');
   assert.equal(nodeState({ ...base, registered: false }), 'none');
   assert.equal(nodeState({ ...base, registered: false, pending: true }), 'pending');
-  // The public status's device, once the node names it, is the state (contract of 04.10).
+  // The public status's device, once the node names it, is the state.
   const device = (state) => ({ ...base, needsReactivation: true, device: { platform: 'ios', linkedSince: 1_790_000_000, lastAnswerEpoch: null, state } });
   assert.equal(nodeState(device('online')), 'online');
   assert.equal(nodeState(device('offline')), 'offline');
@@ -400,7 +357,7 @@ test('one reading of a node\'s state: Online never from anything but a linked de
   assert.equal(canMove('1000000000'), true);
 });
 
-// SITE-4: the check number is the one barrier against a forged QR answer, so its question says the page shows the
+// The check number is the one barrier against a forged QR answer, so its question says the page shows the
 // number and asks whether QNet Wallet shows the same: never a sentence that reads as QNet Wallet showing it.
 test('the check-number question names this page as the one that shows the number', () => {
   assert.match(TEXTS.act_check, /^This page shows the check number \{number\}\. Does QNet Wallet show the same number\?$/);

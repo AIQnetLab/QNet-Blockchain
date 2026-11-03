@@ -1,4 +1,4 @@
-// In-memory fixed-window rate limiters (one process: the site runs as a single pm2 process).
+// In-memory fixed-window rate limiters (the site runs as one process).
 //
 // A limiter holds at most `maxEntries` keys. When it is full, a new key evicts the key whose window was
 // started longest ago; a new key is never refused for lack of room. Refusing would let anyone with enough

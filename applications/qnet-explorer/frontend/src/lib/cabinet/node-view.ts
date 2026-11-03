@@ -1,15 +1,15 @@
 // What the cabinet shows about a node, from the site's node routes (src/server/cabinet/node-proxy.ts): the
 // answers' exact shapes, checked again in the page, and the one reading of them the app shares
-// (docs/protocols/light-node-messages.md section 7; unified plan R9: Online = a device is linked and the network
+// (docs/protocols/light-node-messages.md section 7: Online = a device is linked and the network
 // does not ask it to come back; Offline = it does; "answered this epoch" is its own row). The public status's
 // `device` names the linked device's state, its platform and model as the device said them when it linked (display
 // only), the UTC day it linked, the last epoch it answered in and its latest epoch not counted (last-miss.ts): epochs
 // only, never the time of an answer or a wake; a node of an earlier version sends none (null), or no model.
 
-import { t, type MessageKey } from '../texts.ts';
+import type { MessageKey, T } from '../texts.ts';
 import { isLastMiss, type LastMiss } from './last-miss.ts';
 
-// How long the site keeps a node's status (node-proxy.ts STATUS_CACHE_MS, about the page's poll interval, SITE M-12): a
+// How long the site keeps a node's status (node-proxy.ts STATUS_CACHE_MS, about the page's poll interval): a
 // page that wants to see a link, an unlink or a move it reported reads the status again once that is over.
 export const STATUS_KEPT_MS = 25_000;
 
@@ -39,7 +39,9 @@ export interface DeviceView {
 export interface NodeStatusView {
   registered: boolean;
   pending: boolean;
-  deviceBound: boolean;
+  // Whether a device runs the node; null for a registered node when no answer could say (the shard's owners were not
+  // reached or are catching up), which then names no device.
+  deviceBound: boolean | null;
   answeredThisEpoch: boolean;
   needsReactivation: boolean;
   counted: { sinceRegistration: number; counted: number; lastCountedEpoch: number | null };
@@ -47,7 +49,8 @@ export interface NodeStatusView {
   features: string[];
   // Decimal nano QNC, or null when it could not be read.
   balanceNano: string | null;
-  // The linked device as the first settling answer names it; null when the node does not name one.
+  // The linked device as the answer the site takes it from names it (node-proxy.ts deviceSource); null when none names
+  // one.
   device: DeviceView | null;
 }
 
@@ -76,11 +79,11 @@ export interface HistoryRow {
   miss: LastMiss | null;
 }
 
-// What the wallet's node earned, as of one moment (node-proxy.ts historyView): the QNC every move took to the wallet
-// (decimal nano, from the explorer archive's moves, which replay to the network's own watermark of moved epochs) and
-// the node balance the node that gave the page reported just before it.
+// What the wallet's node earned, as of one moment (node-proxy.ts historyView): the node balance the node that gave the
+// page reported just before it, and the QNC every move took to the wallet (decimal nano, from the explorer archive's
+// moves, which replay to the network's own watermark of moved epochs), null while the archive's moves do not reach it.
 export interface HistoryEarned {
-  movedNano: string;
+  movedNano: string | null;
   balanceNano: string;
 }
 
@@ -108,9 +111,10 @@ export const HISTORY_KEPT_MS = 30_000;
 // SHARD_CACHE_RETAIN_EPOCHS): 256, about six weeks.
 export const EPOCHS_KEPT = 256;
 
-// `device_pending`: a device linked less than an epoch ago that has not answered yet, while nothing counted the node in
-// this epoch or the two before.
-export type NodeState = 'none' | 'pending' | 'no_device' | 'device_pending' | 'online' | 'offline';
+// `device_pending`: the linked device has not answered yet, and it was linked, or the node registered, less than an epoch
+// ago (development/qnet-integration/src/rpc/light_status.rs device_view). `device_unknown`: registered, and no answer
+// could say whether a device runs it; never read as no device.
+export type NodeState = 'none' | 'pending' | 'no_device' | 'device_unknown' | 'device_pending' | 'online' | 'offline';
 
 export const MOVE_MIN_NANO = 1_000_000_000n;
 const FEATURE_RE = /^[a-z0-9_]{1,32}$/;
@@ -154,9 +158,11 @@ export function publicStatus(s: NodeStatusView): NodeStatusView {
 // GET /api/cabinet/node/:id, exactly.
 export function parseStatusView(body: unknown): NodeStatusView | null {
   if (!isObject(body) || !hasKeys(body, STATUS_KEYS)) return null;
-  for (const k of ['registered', 'pending', 'deviceBound', 'answeredThisEpoch', 'needsReactivation']) {
+  for (const k of ['registered', 'pending', 'answeredThisEpoch', 'needsReactivation']) {
     if (typeof body[k] !== 'boolean') return null;
   }
+  // A device link not known: only for a registered node, and it names no device.
+  if (typeof body.deviceBound !== 'boolean' && !(body.deviceBound === null && body.registered === true && body.device === null)) return null;
   const c = body.counted;
   if (!isObject(c) || !hasKeys(c, ['sinceRegistration', 'counted', 'lastCountedEpoch'])) return null;
   if (!isCount(c.sinceRegistration) || !isCount(c.counted) || c.counted > c.sinceRegistration) return null;
@@ -197,7 +203,7 @@ export interface SuperStatusView {
 }
 
 // `waiting`: registered, its server answers, and outside the network's admission (the node's `admission`, else outside
-// the eligible set): registered, not admitted to consensus yet (owner, 11.10).
+// the eligible set): registered, not admitted to consensus yet.
 export type SuperState = 'none' | 'online' | 'offline' | 'waiting';
 
 // The server is in step with the network within this many blocks (the node's own rule for a synced peer,
@@ -240,6 +246,12 @@ export function superState(s: SuperStatusView): SuperState {
   return outsideAdmission(s) === true && !s.banned ? 'waiting' : 'online';
 }
 
+// A super node's heartbeats this epoch as the page says them: never past the number needed, since the epoch counts the
+// node once it has them and more change nothing ("9 of 9", never "10 of 9").
+export function shownHeartbeats(h: { current: number; required: number }): { current: number; required: number } {
+  return { current: Math.min(h.current, h.required), required: h.required };
+}
+
 const TX_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
 function isHistoryRow(r: unknown): boolean {
@@ -254,7 +266,8 @@ function isHistoryRow(r: unknown): boolean {
 }
 
 const isNano = (v: unknown): v is string => typeof v === 'string' && NANO_RE.test(v);
-const isEarned = (v: unknown): boolean => v === null || (isObject(v) && hasKeys(v, ['movedNano', 'balanceNano']) && isNano(v.movedNano) && isNano(v.balanceNano));
+const isEarned = (v: unknown): boolean => v === null
+  || (isObject(v) && hasKeys(v, ['movedNano', 'balanceNano']) && (v.movedNano === null || isNano(v.movedNano)) && isNano(v.balanceNano));
 
 // The history route's page N, and its read for an address only viewed (`view`: publicHistory), whose address no
 // connected wallet's read shares.
@@ -279,11 +292,11 @@ export function parseHistoryView(body: unknown): HistoryView | null {
   return body as unknown as HistoryView;
 }
 
-// "Total earned" (owner, 13.10): the moves plus the node balance, both of the history's one moment, so a move between
-// two reads never counts twice or not at all. Shown while that balance is the one the page shows (`shown`, the status
-// read's); while they differ (a move, or an epoch settled, between the two reads) the history is read again
-// (`reading`), and once the page gave up on that (`gaveUp`) or without the history's answer it is unknown, with the
-// balance the page shows: never a total from two moments.
+// "Total earned": the moves plus the node balance, both of the history's one moment, so a move between two reads never
+// counts twice or not at all. Shown while that balance is the one the page shows (`shown`, the status read's); while
+// they differ (a move, or an epoch settled, between the two reads) the history is read again (`reading`), and once the
+// page gave up on that (`gaveUp`), without the history's answer or without its moves it is unknown, with the balance the
+// page shows, else the history's own: never a total from two moments, never a balance hidden that was read.
 export type EarnedView =
   | { kind: 'total'; totalNano: string; movedNano: string; balanceNano: string }
   | { kind: 'reading' }
@@ -293,6 +306,7 @@ export function earnedView(earned: HistoryEarned | null, shown: string | null, g
   if (earned === null) return { kind: 'unknown', balanceNano: shown };
   if (shown !== null && shown !== earned.balanceNano) return gaveUp ? { kind: 'unknown', balanceNano: shown } : { kind: 'reading' };
   const { movedNano, balanceNano } = earned;
+  if (movedNano === null) return { kind: 'unknown', balanceNano };
   return { kind: 'total', totalNano: (BigInt(movedNano) + BigInt(balanceNano)).toString(), movedNano, balanceNano };
 }
 
@@ -307,7 +321,7 @@ export function joinPages(pages: readonly HistoryView[]): HistoryRow[] {
 }
 
 // The node's state: the device's own state when the node names it, else read from the binding and the network's ask
-// to come back (a node of an earlier version).
+// to come back (a node of an earlier version); not known while no answer could say whether a device runs it.
 export function nodeState(s: NodeStatusView): NodeState {
   if (!s.registered) return s.pending ? 'pending' : 'none';
   const device = s.device ?? null;
@@ -316,6 +330,7 @@ export function nodeState(s: NodeStatusView): NodeState {
     if (device.state === 'other_device_pending') return 'device_pending';
     return device.state;
   }
+  if (s.deviceBound === null) return 'device_unknown';
   if (!s.deviceBound) return 'no_device';
   return s.needsReactivation ? 'offline' : 'online';
 }
@@ -333,7 +348,7 @@ const PLATFORM_SHORT: Record<DevicePlatform, MessageKey | null> = {
 
 // The linked device as the Device tab names it: its model, then its platform ("{model} · Android"); the model alone
 // when the platform is not known, the platform alone when the model is not; null while no device is linked.
-export function deviceName(d: Pick<DeviceView, 'platform' | 'model'>): string | null {
+export function deviceName(d: Pick<DeviceView, 'platform' | 'model'>, t: T): string | null {
   if (d.platform === null) return null;
   const short = PLATFORM_SHORT[d.platform];
   if (d.model === null) return t(PLATFORM_TEXT[d.platform]);

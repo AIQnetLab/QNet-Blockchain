@@ -1,10 +1,13 @@
-// How the explorer writes a transaction's sides and amounts, the same in every table and detail row (B-SPEC 5.7): an
+'use client';
+
+// How the explorer writes a transaction's sides and amounts, the same in every table and detail row: an
 // address is a link to its page (whole where its cell has room), a node id links to its address when that is known, a
 // system account is its name, a batch's side is "batch recipients"; an amount's number is text and its unit, with the
 // icon, is the link.
 
 import EntityLink, { Amount } from '@/components/ui/EntityLink';
 import { Dash } from '@/components/ui/Skeleton';
+import { useT } from '@/i18n/client';
 import { partyKind, type AmountParts } from '@/lib/explorer-view';
 import { qnc } from '@/lib/format';
 import { txPartyLabel } from '@/lib/tx-labels';
@@ -21,13 +24,14 @@ interface PartyProps {
 }
 
 export function Party({ value, full, address, whole = false, copyName }: PartyProps) {
+  const t = useT();
   switch (partyKind(value)) {
     case 'none':
       return <Dash />;
     case 'address':
       return <EntityLink kind="address" value={value as string} full={whole} copy={whole} copyName={copyName} />;
     case 'batch':
-      return <span className="ent">batch recipients</span>;
+      return <span className="ent">{t('party_batch')}</span>;
     case 'system': {
       const name = txPartyLabel(value as string, full);
       return <span className="ent" title={name}>{name}</span>;
@@ -49,9 +53,10 @@ export interface FromToProps {
   toWord?: string;
 }
 
-// The sender, "to" and the recipient on one line (owner 20.10); a record with no recipient (a heartbeat, a system
+// The sender, "to" and the recipient on one line; a record with no recipient (a heartbeat, a system
 // record) shows its sender alone. Each side shows as much of itself as the cell allows, never less than its short form.
 export function FromTo({ from, to, full, self, fromWord, toWord }: FromToProps) {
+  const t = useT();
   const side = (value: string | null | undefined) => (value && value === self
     ? <EntityLink kind="address" value={value} link={false} />
     : <Party value={value} full={full} />);
@@ -60,7 +65,7 @@ export function FromTo({ from, to, full, self, fromWord, toWord }: FromToProps) 
   return (
     <span className="ex-ft ent-fit">
       {noFrom && fromWord ? <span className="ex-ft-w">{fromWord}</span> : side(from)}
-      {!noTo && <span className="ex-ft-to">to</span>}
+      {!noTo && <span className="ex-ft-to">{t('party_to')}</span>}
       {!noTo && side(to)}
       {noTo && toWord && <span className="ex-ft-w">{toWord}</span>}
     </span>

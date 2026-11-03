@@ -1,7 +1,9 @@
-// The site's formats in one module: numbers with comma groups and a point whatever the visitor's locale (texts.ts
-// number, token-format.ts), ages, time left in words, exact times and the short forms of hashes, addresses and node ids.
+// The site's formats in one module: numbers with comma groups and a point in every language and whatever the visitor's
+// locale (texts.ts number, token-format.ts), ages, time left in words, exact times with the page language's month names,
+// and the short forms of hashes, addresses and node ids.
 
-import { number } from './texts.ts';
+import { dateLocale, type Locale } from './languages.ts';
+import { number, type T } from './texts.ts';
 import { shortAddress } from './qnet-provider.ts';
 import { formatQnc, formatTokenAmount } from './token-format.ts';
 
@@ -22,65 +24,86 @@ export const qnc = (nano: string | number | bigint | undefined): string => forma
 export const epochMs = (ts: number): number => (ts > 1e12 ? ts : ts * 1000);
 
 // now, 5s ago, 3m ago, 1h ago, 2d ago
-export function ago(ms: number): string {
+export function ago(ms: number, t: T): string {
   const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 1) return 'now';
-  if (s < 60) return `${s}s ago`;
+  if (s < 1) return t('ago_now');
+  if (s < 60) return t('ago_s', { n: s });
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) return t('ago_m', { n: m });
   const h = Math.floor(m / 60);
-  return h < 24 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
+  return h < 24 ? t('ago_h', { n: h }) : t('ago_d', { n: Math.floor(h / 24) });
 }
 
 // A span of blocks in words, one block a second: "about 38 min", "about 3 h 12 min".
-export function inWords(blocks: number): string {
+export function inWords(blocks: number, t: T): string {
   const minutes = Math.max(1, Math.round(blocks / 60));
-  if (minutes < 60) return `about ${minutes} min`;
+  if (minutes < 60) return t('about_min', { m: minutes });
   const rest = minutes % 60;
-  return `about ${Math.floor(minutes / 60)} h${rest ? ` ${rest} min` : ''}`;
+  return rest ? t('about_h_min', { h: Math.floor(minutes / 60), m: rest }) : t('about_h', { h: Math.floor(minutes / 60) });
 }
 
 // Ends in 2,295 blocks, about 38 min
-export function endsIn(blocks: number): string {
-  return `Ends in ${int(blocks)} ${blocks === 1 ? 'block' : 'blocks'}, ${inWords(blocks)}`;
+export function endsIn(blocks: number, t: T): string {
+  return t(blocks === 1 ? 'ends_in_one' : 'ends_in', { blocks: int(blocks), time: inWords(blocks, t) });
 }
 
-// Exact times in the visitor's time zone, English month names, 24 hours.
-const WHEN = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
-const DAY = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-const DATE = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
-const CLOCK = new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+// Exact times in the visitor's time zone, the page language's month names, Latin digits, 24 hours; one set of
+// formatters per language.
+interface Dates { when: Intl.DateTimeFormat; day: Intl.DateTimeFormat; dayUtc: Intl.DateTimeFormat; date: Intl.DateTimeFormat; clock: Intl.DateTimeFormat }
+const DATES = new Map<Locale, Dates>();
+
+function dates(locale: Locale): Dates {
+  let d = DATES.get(locale);
+  if (!d) {
+    const tag = dateLocale(locale);
+    d = {
+      when: new Intl.DateTimeFormat(tag, { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }),
+      day: new Intl.DateTimeFormat(tag, { month: 'short', day: 'numeric', year: 'numeric' }),
+      dayUtc: new Intl.DateTimeFormat(tag, { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }),
+      date: new Intl.DateTimeFormat(tag, { month: 'short', day: 'numeric' }),
+      clock: new Intl.DateTimeFormat(tag, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
+    };
+    DATES.set(locale, d);
+  }
+  return d;
+}
 
 // Oct 19, 2026, 04:07:12
-export const when = (ts: number): string => WHEN.format(ts);
+export const when = (ts: number, t: T): string => dates(t.locale).when.format(ts);
 
 // Oct 2, 2026
-export const day = (ts: number): string => DAY.format(ts);
+export const day = (ts: number, t: T): string => dates(t.locale).day.format(ts);
 
-// Oct 19, 00:07 – 04:07; across midnight Oct 18, 20:07 – Oct 19, 00:07
-export function span(from: number, to: number): string {
-  const start = `${DATE.format(from)}, ${CLOCK.format(from)}`;
-  return DAY.format(from) === DAY.format(to) ? `${start} – ${CLOCK.format(to)}` : `${start} – ${DATE.format(to)}, ${CLOCK.format(to)}`;
+// Oct 2, 2026 as a UTC day: the day a record names, the same for every visitor.
+export const dayUtc = (ts: number, t: T): string => dates(t.locale).dayUtc.format(ts);
+
+// Oct 19, 00:07 – 04:07; across midnight Oct 18, 20:07 – Oct 19, 00:07. Each time is held whole by no-break spaces, so a
+// narrow column breaks the line only after the dash.
+export function span(from: number, to: number, t: T): string {
+  const d = dates(t.locale);
+  const whole = (s: string) => s.replace(/ /g, ' ');
+  const start = whole(at(from, t));
+  return `${start} – ${whole(d.day.format(from) === d.day.format(to) ? d.clock.format(to) : at(to, t))}`;
 }
 
 // Oct 19, 04:07
-export const at = (ts: number): string => `${DATE.format(ts)}, ${CLOCK.format(ts)}`;
+export const at = (ts: number, t: T): string => t('date_time', { date: dates(t.locale).date.format(ts), time: dates(t.locale).clock.format(ts) });
 
 // A time to come back at: 14:05 within the next twelve hours, else Oct 20, 14:05.
-export function clockAt(ts: number, now: number): string {
-  return ts - now < 12 * 3_600_000 ? CLOCK.format(ts) : at(ts);
+export function clockAt(ts: number, now: number, t: T): string {
+  return ts - now < 12 * 3_600_000 ? dates(t.locale).clock.format(ts) : at(ts, t);
 }
 
 // A time gone by: 14:05 within the last twelve hours, else Oct 18, 14:05.
-export function clockAgo(ts: number, now: number): string {
-  return now - ts < 12 * 3_600_000 ? CLOCK.format(ts) : at(ts);
+export function clockAgo(ts: number, now: number, t: T): string {
+  return now - ts < 12 * 3_600_000 ? dates(t.locale).clock.format(ts) : at(ts, t);
 }
 
 export type ShortKind = 'hash' | 'address' | 'address-compact' | 'node' | 'solana';
 
 const NODE_WHOLE = 16;
 
-// The short forms (B-SPEC 5.7), with the one ellipsis character: a hash 8…6, an address 6…6 (4…4 in the phone header),
+// The short forms, with the one ellipsis character: a hash 8…6, an address 6…6 (4…4 in the phone header),
 // a node id whole up to 16 characters, else its prefix through the last "_", "…" and its last 8.
 export function short(kind: ShortKind, value: string): string {
   const cut = (head: number, tail: number) => (value.length > head + tail + 1 ? `${value.slice(0, head)}…${value.slice(-tail)}` : value);

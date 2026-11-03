@@ -51,7 +51,9 @@ over `urllib` instead of `requests`.
 Operations that need a key — sending QNC, claiming rewards — are authorised by ML-DSA-65 signatures
 from the wallet key: one over `q{chain_id}|claim_rewards:{node_id}:{wallet_address}` and one over
 `q{chain_id}|qnet_claim_v1:{wallet_address}:{claim_timestamp}:{sha3_256(claims_data)}` for the batch
-the node quotes. Perform them in the [mobile wallet](mobile-wallet.md).
+the node quotes, or, when the quote offers a last height, over
+`q{chain_id}|{network_id}|qnet_claim_v2:{wallet_address}:{valid_until}:{sha3_256(claims_data)}` with no
+timestamp. Perform them in the [mobile wallet](mobile-wallet.md).
 
 ## Running it
 

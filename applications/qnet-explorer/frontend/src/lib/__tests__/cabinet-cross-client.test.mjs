@@ -1,7 +1,6 @@
 // The QNet extension's activation (applications/qnet-wallet/dist/background/activation.js, the shipped module) against
 // this site's real activation routes (src/server/cabinet/activation-api.ts over the registry's rules, the burn check and
-// the search of burn-scan.ts), through one simulated Solana and QNet network (unified plan R1 and R6; shared contracts
-// C1, C3, C5 and C6). The extension's burn is held by the site's reservation, its proof is verified by the site's own
+// the search of burn-scan.ts), through one simulated Solana and QNet network. The extension's burn is held by the site's reservation, its proof is verified by the site's own
 // check, its burn becomes the wallet's record with the code the extension stored, and from then on no client gets a
 // second burn: the site's payment address, another install of the extension, a reset and restore. A reservation the
 // site's payment address holds, a site that cannot answer and a node the network knows refuse the extension's burn with
@@ -186,16 +185,16 @@ const light = (over = {}) => ({ nodeType: 'light', expectedPrice: 1500, ...over 
 // The wallet's own keys (the public recovery-phrase test vector the extension's test environment holds).
 const PAIR = core.deriveQnetKeypair(core.mnemonicToSeed('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'));
 // A reservation body of the site's payment address, with the wallet's signed reservation of its final fields (QNet
-// Wallet signs it before the address exists, shared contract C1).
+// Wallet signs it before the address exists) and the wallet's Solana address the site searches.
 function paymentReserve(over = {}) {
-  const body = { wallet: W, nodeType: 'light', way: 'payment', burner: PAYMENT, burnAmount: 1500, solana: null, ...over };
+  const body = { wallet: W, nodeType: 'light', way: 'payment', burner: PAYMENT, burnAmount: 1500, solana: OWNER, ...over };
   const time = Math.floor(Date.now() / 1000);
   const envelope = burnRecordEnvelope(reservationMessage(body.wallet, body.nodeType, body.way, body.burner, time));
   const sig = ml_dsa65.sign(envelope, PAIR.secretKey, { context: new TextEncoder().encode(OFFCHAIN_CONTEXT) });
   return { ...body, proof: { pk: encodeB64url(PAIR.publicKey), sig: encodeB64url(sig), time } };
 }
 
-test('C1: the extension\'s own burn record text and proof are what the site verifies', () => {
+test('the extension\'s own burn record text and proof are what the site verifies', () => {
   const fields = { wallet: W, nodeType: 'super', burner: OWNER, burnTx: core.KAT.activation.burnTx, burnAmount: 3000 };
   assert.equal(keysModule.burnRecordMessage(fields), burnRecordMessage(W, 'super', OWNER, fields.burnTx, 3000));
   assert.equal(RECORD_ORIGIN, 'https://aiqnet.io');
@@ -218,7 +217,7 @@ test('C1: the extension\'s own burn record text and proof are what the site veri
     ['another amount', { ...fields, burnAmount: 3001 }], ['another burner', { ...fields, burner: PAYMENT }]]) {
     assert.equal(verifyBurnRecordProof(facts, proof), false, what);
   }
-  // The reservation the extension signs with the same signer (A1): what the site's reserve route verifies.
+  // The reservation the extension signs with the same signer: what the site's reserve route verifies.
   const time = Math.floor(Date.now() / 1000);
   const held = { wallet: W, nodeType: 'super', way: 'extension', burner: OWNER };
   // The extension's own text of it (keys.signReservation signs keysModule.reservationMessage) is the site's.
@@ -230,7 +229,7 @@ test('C1: the extension\'s own burn record text and proof are what the site veri
   assert.throws(() => core.signOffchainMessage(RECORD_ORIGIN, reservationMessage(W, 'super', 'extension', OWNER, time), pair.secretKey, pair.publicKey));
 });
 
-test('R1, R6: the extension burns under the site\'s reservation; the site records it with the extension\'s code, and no client burns again', async () => {
+test('the extension burns under the site\'s reservation; the site records it with the extension\'s code, and no client burns again', async () => {
   installEnv();
   const a = await extension();
   const w = world();
@@ -253,7 +252,7 @@ test('R1, R6: the extension burns under the site\'s reservation; the site record
   // The site's payment address, and an extension burn for either node type, are refused by the site.
   assert.deepEqual((await w.answer(await w.api.reserve(w.page('reserve', paymentReserve())))).body.error, 'has_burn');
   for (const nodeType of ['light', 'super']) {
-    const got = await w.answer(await w.api.reserve(w.page('reserve', paymentReserve({ nodeType, way: 'extension', burner: OWNER, solana: OWNER }))));
+    const got = await w.answer(await w.api.reserve(w.page('reserve', paymentReserve({ nodeType, way: 'extension', burner: OWNER }))));
     assert.deepEqual([got.status, got.body.error], [409, 'has_burn'], nodeType);
   }
 
@@ -287,7 +286,7 @@ test('R1, R6: the extension burns under the site\'s reservation; the site record
   assert.equal(w.seen.sent.length, 1, 'one burn in all');
 });
 
-test('R6: the site\'s payment address holds the wallet: the extension refuses both node types and signs nothing', async () => {
+test('the site\'s payment address holds the wallet: the extension refuses both node types and signs nothing', async () => {
   const env = installEnv();
   const a = await extension();
   const w = world();
@@ -304,7 +303,7 @@ test('R6: the site\'s payment address holds the wallet: the extension refuses bo
   assert.equal((await w.read()).state, 'reserved');
 });
 
-test('R6: the extension and the site\'s payment address at once: exactly one of them holds the wallet', async () => {
+test('the extension and the site\'s payment address at once: exactly one of them holds the wallet', async () => {
   for (let round = 0; round < 3; round += 1) {
     installEnv();
     const a = await extension();
@@ -321,7 +320,7 @@ test('R6: the extension and the site\'s payment address at once: exactly one of 
   }
 });
 
-test('R6: a site or a database that cannot answer, or a node the network knows, refuses the extension\'s burn before anything is signed', async () => {
+test('a site or a database that cannot answer, or a node the network knows, refuses the extension\'s burn before anything is signed', async () => {
   for (const [what, set, code] of [
     ['aiqnet.io unreachable', (w) => { w.state.siteDown = true; }, 'RECORD_UNAVAILABLE'],
     ['its database down', (w) => { w.state.storeDown = true; }, 'RECORD_UNAVAILABLE'],
@@ -340,7 +339,7 @@ test('R6: a site or a database that cannot answer, or a node the network knows, 
   }
 });
 
-test('C1, C3.5: nobody plants a record with a proof made for another wallet or another burn', async () => {
+test('nobody plants a record with a proof made for another wallet or another burn', async () => {
   installEnv();
   const a = await extension();
   const w = world();
@@ -364,7 +363,7 @@ test('C1, C3.5: nobody plants a record with a proof made for another wallet or a
   assert.deepEqual([again.status, again.body.state, again.body.burnTx], [200, 'recorded', burnTx]);
 });
 
-test('C5: the extension\'s answer for a light node the site\'s payment address paid for passes the site\'s check, and the site records nothing for it', async () => {
+test('the extension\'s answer for a light node the site\'s payment address paid for passes the site\'s check, and the site records nothing for it', async () => {
   const burnTx = core.KAT.activation.burnTx;
   const code = core.walletActivationCode(W, burnTx, 1500);
   const activation = { code, nodeType: 'light', burnTx, burnAmount: 1500, solanaAddress: PAYMENT, cluster: SOLANA.CLUSTER, createdAt: 1_790_000_000_000 };

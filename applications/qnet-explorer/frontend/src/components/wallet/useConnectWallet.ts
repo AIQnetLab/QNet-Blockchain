@@ -1,6 +1,6 @@
 'use client';
 
-// The one Connect wallet, behind the header's control and My node's connect card (owner, 20.10). What it does on this
+// The one Connect wallet, behind the header's control and My node's connect card. What it does on this
 // device is connectWay (src/lib/qnet-provider.ts): a computer with the QNet extension asks it, and My node keeps the
 // wallet it shares as one connected with a tap; a phone or tablet asks QNet Wallet with the connect card's `connect`
 // request (src/lib/cabinet/connect-card.ts), whose button opens the app; a computer without the extension gets the

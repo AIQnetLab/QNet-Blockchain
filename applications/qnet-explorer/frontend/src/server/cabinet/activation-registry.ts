@@ -1,4 +1,4 @@
-// The activation registry (unified plan R1 and R6; shared contracts C3 and C4): one row per QNet wallet in the explorer
+// The activation registry: one row per QNet wallet in the explorer
 // database (migrations/005_cabinet_activations.sql), so that a wallet gets exactly one activation burn and one code, for
 // a light or a super node, chosen once, whichever browser, device or client starts it.
 //
@@ -14,7 +14,8 @@
 
 import { randomBytes } from 'node:crypto';
 import {
-  SETTLE_AFTER_MS, recordCode, verifyBurnRecordProof, type ActivationRecordView, type BurnFacts, type BurnWay, type RecordState, type ScanView,
+  DROP_SETTLE_MS, SETTLE_AFTER_MS, recordCode, verifyBurnRecordProof, type ActivationRecordView, type BurnFacts, type BurnWay, type RecordState,
+  type ScanView,
 } from '../../lib/cabinet/burn-record.ts';
 import { verifyOwnerBindV2 } from '../../lib/cabinet/registration.ts';
 import { MLDSA65_PUBLIC_KEY_BYTES, decodeB64url, type NodeType } from '../../lib/qnet-link.ts';
@@ -85,6 +86,8 @@ export interface ActivationStore {
   get(wallet: string): Promise<ActivationRow | null>;
   // The row that holds this reservation, or null.
   byReservation(reservation: string): Promise<ActivationRow | null>;
+  // The row that holds this burn, or null.
+  byBurnTx(burnTx: string): Promise<ActivationRow | null>;
   // One statement: a new reservation, or one in place of an expired reservation without a burn. Null when another client
   // holds the wallet.
   reserve(input: ReserveInput): Promise<{ reservation: string; expiresAt: number } | null>;
@@ -113,6 +116,8 @@ const COLUMNS = `wallet, state, node_type, way, burner, burn_amount::text AS bur
 export const SQL = {
   get: `SELECT ${COLUMNS} FROM cabinet_activations WHERE wallet = $1`,
   byReservation: `SELECT ${COLUMNS} FROM cabinet_activations WHERE reservation = $1`,
+  // Served by burn_tx's unique index (migration 005).
+  byBurnTx: `SELECT ${COLUMNS} FROM cabinet_activations WHERE burn_tx = $1`,
   reserve: `INSERT INTO cabinet_activations (wallet, state, node_type, way, burner, burn_amount, reservation, reserved_at, expires_at, proof)
  VALUES ($1, 'reserved', $2, $3, $4, $5, $6, now(), now() + interval '10 minutes', $7)
  ON CONFLICT (wallet) DO UPDATE SET state = 'reserved', node_type = EXCLUDED.node_type, way = EXCLUDED.way, burner = EXCLUDED.burner,
@@ -177,7 +182,7 @@ const errorCode = (err: unknown): string | null => {
   return typeof code === 'string' ? code : null;
 };
 
-// Every statement of C4 through `query` (lib/db.ts): a unique burn_tx taken by another row is BurnTaken, any other
+// Every statement of the registry through `query` (lib/db.ts): a unique burn_tx taken by another row is BurnTaken, any other
 // failure StoreUnavailable.
 export function createPgStore(query: SqlQuery): ActivationStore {
   const run = async (sql: string, params: unknown[]) => {
@@ -199,6 +204,10 @@ export function createPgStore(query: SqlQuery): ActivationStore {
     },
     async byReservation(reservation) {
       const { rows } = await run(SQL.byReservation, [reservation]);
+      return rows[0] ? rowFrom(rows[0]) : null;
+    },
+    async byBurnTx(burnTx) {
+      const { rows } = await run(SQL.byBurnTx, [burnTx]);
       return rows[0] ? rowFrom(rows[0]) : null;
     },
     async reserve(input) {
@@ -277,6 +286,13 @@ export function createMemoryStore({ now = Date.now, ttlMs = 600_000 }: { now?: (
         return cur && cur.reservation === reservation ? copy(cur) : null;
       });
     },
+    byBurnTx: (burnTx) => {
+      const wallet = [...rows.values()].find((r) => r.burnTx === burnTx)?.wallet;
+      return wallet === undefined ? Promise.resolve(null) : serial(wallet, () => {
+        const cur = rows.get(wallet);
+        return cur && cur.burnTx === burnTx ? copy(cur) : null;
+      });
+    },
     reserve: (input) => serial(input.wallet, () => {
       const t = now();
       const cur = rows.get(input.wallet);
@@ -330,10 +346,13 @@ export function createMemoryStore({ now = Date.now, ttlMs = 600_000 }: { now?: (
   };
 }
 
-// ---------------------------------------------------------------- the rules (C3.1-C3.5)
+// ---------------------------------------------------------------- the rules
 
 // A sweep at most this often per process, started by any activation route.
 export const SWEEP_EVERY_MS = 600_000;
+// The announced burns whose first read past SETTLE_AFTER_MS found them nowhere, kept at most this many (the oldest go
+// first; one that goes only waits DROP_SETTLE_MS again).
+export const MISSED_KEPT = 5_000;
 
 export type BurnChecker = (burnTx: string, expect: BurnExpectation) => Promise<BurnCheck | null>;
 
@@ -347,9 +366,9 @@ export interface RegistryOptions {
 
 export type Blocking = 'has_burn' | 'burn_pending' | 'reserved';
 
-export type ReserveOutcome =
-  | { ok: true; reservation: string; until: number }
-  | { ok: false; error: Blocking; row: ActivationRow | null };
+export type Reserved = { ok: true; reservation: string; until: number };
+
+export type ReserveOutcome = Reserved | { ok: false; error: Blocking; row: ActivationRow | null };
 
 export type AnnounceOutcome = { ok: true; until: number } | { ok: false; error: 'reservation' | 'invalid_proof' };
 
@@ -364,8 +383,11 @@ export interface ActivationRegistry {
   current(wallet: string): Promise<ActivationRow | null>;
   view(wallet: string, row: ActivationRow | null, scan?: ScanView | null): ActivationRecordView;
   blocking(row: ActivationRow | null): Blocking | null;
+  // The live reservation the row holds when `input` is the very signed reservation that made it (a retry whose answer
+  // was lost, a second tab of the same payment), else null.
+  heldBy(row: ActivationRow | null, input: Omit<ReserveInput, 'reservation'>): Reserved | null;
   // The atomic reservation with the wallet's signed reservation (the checks of the proof and outside the store, such as
-  // the network, are the caller's).
+  // the network, are the caller's); the same signed reservation again gets the reservation it made.
   reserve(input: Omit<ReserveInput, 'reservation'>): Promise<ReserveOutcome>;
   announceExtension(wallet: string, reservation: string, burnTx: string, proof: unknown): Promise<AnnounceOutcome>;
   // The payment address's burn under its reservation with the payment key's v2 owner bind (POST /api/cabinet/send).
@@ -378,6 +400,9 @@ export interface ActivationRegistry {
   // Whether a reservation of this site named `burner` as its payment address: only such an address's refund earns a read
   // pass (solana-proxy.ts send). Throws StoreUnavailable.
   knowsPaymentBurner(burner: string): Promise<boolean>;
+  // The extension's burn of this signature, announced or recorded (the wallets' relay forwards only such a burn,
+  // solana-relay.ts); null for any other. Throws StoreUnavailable.
+  announcedBurn(burnTx: string): Promise<ActivationRow | null>;
 }
 
 // A proven row's burn is the wallet's: a record, or a burn on its way (the extension's came with the wallet's proof, a
@@ -394,14 +419,32 @@ export function createActivationRegistry({ store, check, now = Date.now, newRese
 
   const live = (r: ActivationRow): boolean => r.state !== 'reserved' || (r.burnTx === null && (r.expiresAt ?? 0) > now());
 
-  // C3.1: a `sending` row against Solana. Landed, final and valid: recorded, whichever way (its proof came with the
-  // announce). Failed, not a valid burn, or not found SETTLE_AFTER_MS after the announce: the row goes. Anything else, and
-  // a Solana that cannot be read, leave it.
+  // Burn -> when a read SETTLE_AFTER_MS or more after its announce first found it nowhere, in this process's memory.
+  const missedAt = new Map<string, number>();
+
+  // A `sending` row against Solana. Landed, final and valid: recorded, whichever way (its proof came with the
+  // announce). Failed or not a valid burn: the row goes. Not found: it goes only when two reads DROP_SETTLE_MS apart, the
+  // first SETTLE_AFTER_MS after the announce or later, find it nowhere, so one lagging answer frees no wallet. Anything
+  // else, and a Solana that cannot be read, leave it.
   async function settle(row: ActivationRow): Promise<ActivationRow | null> {
     if (row.state !== 'sending' || row.burnTx === null) return row;
     const got = await check(row.burnTx, { burner: row.burner, nodeType: row.nodeType, amount: row.burnAmount });
-    if (got === null || got.kind === 'pending') return row;
-    if (got.kind === 'missing' && now() - (row.announcedAt ?? 0) < SETTLE_AFTER_MS) return row;
+    if (got === null) return row;
+    if (got.kind === 'pending') {
+      missedAt.delete(row.burnTx);
+      return row;
+    }
+    if (got.kind === 'missing') {
+      if (now() - (row.announcedAt ?? 0) < SETTLE_AFTER_MS) return row;
+      const first = missedAt.get(row.burnTx);
+      if (first === undefined) {
+        if (missedAt.size >= MISSED_KEPT) missedAt.delete(missedAt.keys().next().value as string);
+        missedAt.set(row.burnTx, now());
+        return row;
+      }
+      if (now() - first < DROP_SETTLE_MS) return row;
+    }
+    missedAt.delete(row.burnTx);
     let next: SettleNext | null = null;
     if (got.kind === 'final') next = { state: 'recorded', burnSlot: got.burn.slot, burnedAt: got.burn.blockTime };
     await store.settle(row.wallet, row.burnTx, next);
@@ -437,6 +480,15 @@ export function createActivationRegistry({ store, check, now = Date.now, newRese
     return row.state === 'reserved' ? 'reserved' : 'burn_pending';
   }
 
+  // The row keeps the signed reservation it was made with, so every process reads the same answer from the database.
+  function heldBy(row: ActivationRow | null, input: Omit<ReserveInput, 'reservation'>): Reserved | null {
+    if (!row || row.state !== 'reserved' || !live(row) || row.reservation === null || row.expiresAt === null) return null;
+    const p = row.proof;
+    const same = row.wallet === input.wallet && row.nodeType === input.nodeType && row.way === input.way && row.burner === input.burner
+      && row.burnAmount === input.burnAmount && p !== null && p.pk === input.proof.pk && p.sig === input.proof.sig && p.time === input.proof.time;
+    return same ? { ok: true, reservation: row.reservation, until: row.expiresAt } : null;
+  }
+
   // The row as `next` in place of `expected`, as long as `decide` allows it for the row as it stands; a step that came
   // first is read again, a few times.
   async function upsert(wallet: string, decide: (row: ActivationRow | null) => ActivationRow | 'same' | 'other'): Promise<RecordOutcome> {
@@ -467,14 +519,19 @@ export function createActivationRegistry({ store, check, now = Date.now, newRese
     current,
     view,
     blocking,
+    heldBy,
 
     async reserve(input) {
       const row = await current(input.wallet);
+      const held = heldBy(row, input);
+      if (held) return held;
       const blocked = blocking(row);
       if (blocked) return { ok: false, error: blocked, row };
       const got = await store.reserve({ ...input, reservation: newReservation() });
       if (got) return { ok: true, reservation: got.reservation, until: got.expiresAt };
-      return { ok: false, error: 'reserved', row: await store.get(input.wallet) };
+      // Taken meanwhile: by the same signed reservation sent twice at once, or by another request.
+      const taken = await store.get(input.wallet);
+      return heldBy(taken, input) ?? { ok: false, error: 'reserved', row: taken };
     },
 
     async announceExtension(wallet, reservation, burnTx, proof) {
@@ -495,7 +552,7 @@ export function createActivationRegistry({ store, check, now = Date.now, newRese
       return moved ? { ok: true, until: moved.announcedAt + SETTLE_AFTER_MS } : { ok: false, error: 'reservation' };
     },
 
-    // C4: the reservation's row, still a live payment reservation without a burn of this burner and amount, with the
+    // The reservation's row, still a live payment reservation without a burn of this burner and amount, with the
     // wallet's signed reservation; the payment key's v2 owner bind must verify for the wallet, the key of that signed
     // reservation and this burn. Then the burn is announced with both, in one statement that compares and sets.
     async announcePayment(reservation, burner, burnAmount, burnTx, ownerSig) {
@@ -513,7 +570,7 @@ export function createActivationRegistry({ store, check, now = Date.now, newRese
       return moved ? { ok: true, wallet: moved.wallet } : { ok: false, error: 'reservation' };
     },
 
-    // C3.5: the extension's proven burn. Allowed with no row, over a reservation without a burn and over its own burn on
+    // The extension's proven burn. Allowed with no row, over a reservation without a burn and over its own burn on
     // its way; over another proven burn only when it is the same burner's older burn (the extension's rule: the oldest
     // burn is the code).
     async recordExtension(facts, proof) {
@@ -545,5 +602,10 @@ export function createActivationRegistry({ store, check, now = Date.now, newRese
     },
 
     knowsPaymentBurner: (burner) => store.knowsPaymentBurner(burner),
+
+    async announcedBurn(burnTx) {
+      const row = await store.byBurnTx(burnTx);
+      return row && row.way === 'extension' && proven(row) ? row : null;
+    },
   };
 }

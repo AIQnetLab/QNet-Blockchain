@@ -7,6 +7,7 @@ import { signLegacyTransaction, toBaseUnits } from '@/server/solana-tx';
 import { faucetEnvironment, loadFaucetSigner } from '@/server/faucet-config';
 import { confirmSignature, latestBlockhash, sendTransaction } from '@/server/solana-rpc';
 import { sharedSolanaRpc } from '@/server/solana-endpoint';
+import { FAUCET_CLAIM_MS } from '@/lib/faucet-handover';
 import {
   ONE_DEV_DECIMALS,
   SOL_DECIMALS,
@@ -22,8 +23,8 @@ import {
 
 // The most one claim may ask for. The /testnet page asks 0.005 SOL, enough for a wallet to fund a payment address of
 // My node (its SOL and its 1DEV account's rent, with the fees); the faucet wallet's SOL is shared, so a claim never
-// takes more than 0.01 (SITE-R1-02). Test tokens only: on a release whose network is not testnet (faucetEnvironment,
-// from BURN_CLUSTER) the faucet sends nothing (SITE-R3-01).
+// takes more than 0.01. Test tokens only: on a release whose network is not testnet (faucetEnvironment, from
+// BURN_CLUSTER) the faucet sends nothing, so no claim can move a token of value.
 const FAUCET_AMOUNTS = { '1DEV': 1500, SOL: 0.01 } as const;
 const faucetAmounts = (environment: 'testnet' | 'mainnet'): typeof FAUCET_AMOUNTS | null => (environment === 'mainnet' ? null : FAUCET_AMOUNTS);
 // {walletAddress, amount, tokenType, pass} fits in a few hundred bytes.
@@ -46,7 +47,7 @@ function validateSolanaAddress(address: string): boolean {
 //                      deadline while its blockhash is valid): the reservation stays.
 // The transaction id is the faucet's signature, known before sending, so it is echoed even when
 // the send itself gets no answer.
-async function sendSolanaTransfer(kind: '1DEV' | 'SOL', address: string, amount: number): Promise<SendResult> {
+async function sendSolanaTransfer(kind: '1DEV' | 'SOL', address: string, amount: number, deadline: number): Promise<SendResult> {
   const signer = loadFaucetSigner();
   if (!signer) {
     return { success: false, error: 'Faucet configuration error - private key not found', releasable: true };
@@ -74,7 +75,7 @@ async function sendSolanaTransfer(kind: '1DEV' | 'SOL', address: string, amount:
     const sent = await sendTransaction(rpc, signed.wire);
     if (sent.state === 'refused') return { success: false, error: sent.error, releasable: true };
 
-    const conf = await confirmSignature(rpc, signed.signature, lastValidBlockHeight);
+    const conf = await confirmSignature(rpc, signed.signature, lastValidBlockHeight, { timeoutMs: deadline - Date.now() });
     if (conf.status === 'landed') return { success: true, txHash: signed.signature };
     return {
       success: false,
@@ -90,11 +91,11 @@ async function sendSolanaTransfer(kind: '1DEV' | 'SOL', address: string, amount:
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
-async function sendTokens(tokenType: string, amount: number, address: string): Promise<SendResult> {
+async function sendTokens(tokenType: string, amount: number, address: string, deadline: number): Promise<SendResult> {
   switch (tokenType) {
     case '1DEV':
     case 'SOL':
-      return sendSolanaTransfer(tokenType, address, amount);
+      return sendSolanaTransfer(tokenType, address, amount, deadline);
     default:
       // Unsupported type never sent anything ⇒ releasable.
       return { success: false, error: 'Unsupported token type', releasable: true };
@@ -105,6 +106,8 @@ async function sendTokens(tokenType: string, amount: number, address: string): P
 // POST /api/faucet/claim
 // ---------------------------------------------------------------------------
 export async function POST(request: NextRequest) {
+  // The page and nginx wait longer than this for the answer (src/lib/faucet-handover.ts).
+  const deadline = Date.now() + FAUCET_CLAIM_MS;
   try {
     // Before anything else: no Origin (a script, the SDK) or aiqnet.io's own, a JSON body, a size cap.
     // Another site's page can then send nothing here with its visitors' IP addresses.
@@ -159,11 +162,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Every claim (SITE-R1-02): the per-(address, token) cooldown, the per-IP and per-network windows (X-Real-IP from
-    // nginx, else the socket address) and the faucet's hourly budget per token, most of it kept for claims with a faucet
-    // pass, one of each token per wallet a day (SITE M-13). A pass that does not check out, or has ended, makes the claim
-    // an open one. The places are taken before the transfer is sent, keyed per token so the page's parallel 1DEV and SOL
-    // pair never refuses itself (src/server/faucet-guard.ts). A refusal says when to try again.
+    // Every claim: the per-(address, token) cooldown, the per-IP and per-network windows (X-Real-IP from nginx, else the
+    // socket address) and the faucet's hourly budget per token, most of it kept for claims with a faucet pass, one of
+    // each token per wallet a day, so scripted claims cannot shut it to people activating a node. A pass that does not
+    // check out, or has ended, makes the claim an open one. The places are taken before the transfer is sent, keyed per
+    // token so the page's parallel 1DEV and SOL pair never refuses itself (src/server/faucet-guard.ts). A refusal says
+    // when to try again.
     const wallet = checkFaucetPass(sharedFaucetPassKey(), pass, Date.now());
     const admission = legacyFaucetGuard().admit(walletAddress, tokenType, getRateLimitKey(request), wallet);
     if (!admission.ok) {
@@ -179,7 +183,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const result = await sendTokens(tokenType, amount, walletAddress);
+    const result = await sendTokens(tokenType, amount, walletAddress, deadline);
 
     if (result.success) {
       return NextResponse.json({

@@ -45,20 +45,48 @@ export function isValidQnetAddress(address) {
 }
 
 // The bytes each transaction kind signs (node/transactions.rs build_canonical_verify_message, pinned by
-// __tests__/TxSourcePin.test.js). Integers go in as decimal digits; TxBuilders.js builds and checks the fields.
+// __tests__/TxSourcePin.test.js and docs/protocols/tx-v2.vectors.json). Integers go in as decimal digits; TxBuilders.js
+// builds and checks the fields. With `expiry` = { networkId, validUntil } a kind signs its V2 form: the chain tag, this
+// chain instance's network id (hex of block 0's hash), "|", a `_v2` body that ends in the last height a block may carry it.
+
+const NETWORK_ID_RE = /^[0-9a-f]{64}$/;
+const HEIGHT_RE = /^[1-9][0-9]{0,15}$/;
+
+/**
+ * The V2 prefix and last height of `expiry` ({ networkId, validUntil: a safe positive integer or its digits }), checked:
+ * { prefix, validUntil } with validUntil as digits. Throws TypeError for anything else, so nothing malformed is signed.
+ */
+export function v2Expiry(expiry) {
+  const { networkId, validUntil } = expiry || {};
+  const height = typeof validUntil === 'number' && Number.isSafeInteger(validUntil) ? String(validUntil) : validUntil;
+  if (typeof networkId !== 'string' || !NETWORK_ID_RE.test(networkId)
+      || typeof height !== 'string' || !HEIGHT_RE.test(height) || Number(height) > Number.MAX_SAFE_INTEGER) {
+    throw new TypeError('WalletIdentity: invalid expiry');
+  }
+  return { prefix: `${QNET_CHAIN_TAG}${networkId}|`, validUntil: height };
+}
 
 /** The exact bytes a QNC transfer signs. `amountNano` is an integer nano-QNC (1 QNC = 1e9). */
-export function transferPreimage(from, to, amountNano, nonce, gasPrice, gasLimit) {
-  return `${QNET_CHAIN_TAG}transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
+export function transferPreimage(from, to, amountNano, nonce, gasPrice, gasLimit, expiry = null) {
+  const fields = `${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
+  if (!expiry) return `${QNET_CHAIN_TAG}transfer:${fields}`;
+  const v2 = v2Expiry(expiry);
+  return `${v2.prefix}transfer_v2:${fields}:${v2.validUntil}`;
 }
 
 /** The exact bytes a contract call signs: the calldata the node rebuilds is bound by its SHA3-256. */
-export function contractCallPreimage(from, callData, nonce, gasPrice, gasLimit) {
+export function contractCallPreimage(from, callData, nonce, gasPrice, gasLimit, expiry = null) {
   const dataHash = bytesToHex(sha3_256(utf8ToBytes(callData)));
-  return `${QNET_CHAIN_TAG}contract_call:${from}:${dataHash}:${nonce}:${gasPrice}:${gasLimit}`;
+  const fields = `${from}:${dataHash}:${nonce}:${gasPrice}:${gasLimit}`;
+  if (!expiry) return `${QNET_CHAIN_TAG}contract_call:${fields}`;
+  const v2 = v2Expiry(expiry);
+  return `${v2.prefix}contract_call_v2:${fields}:${v2.validUntil}`;
 }
 
 /** The exact bytes a contract deploy signs: `codeHash` is the code_hash its deploy payload carries. */
-export function contractDeployPreimage(from, codeHash, nonce, gasPrice, gasLimit) {
-  return `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${nonce}:${gasPrice}:${gasLimit}`;
+export function contractDeployPreimage(from, codeHash, nonce, gasPrice, gasLimit, expiry = null) {
+  const fields = `${from}:${codeHash}:${nonce}:${gasPrice}:${gasLimit}`;
+  if (!expiry) return `${QNET_CHAIN_TAG}contract_deploy:${fields}`;
+  const v2 = v2Expiry(expiry);
+  return `${v2.prefix}contract_deploy_v2:${fields}:${v2.validUntil}`;
 }

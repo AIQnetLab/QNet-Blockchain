@@ -1,10 +1,10 @@
-// The faucet pass (SITE M-13): the node cabinet asks for one for the QNet wallet it activates, with the wallet's signed
-// reservation of its payment address (shared contract C1, the record's hold), and the /testnet faucet keeps most of each
+// The faucet pass: the node cabinet asks for one for the QNet wallet it activates, with the wallet's signed reservation
+// of its payment address (the record's hold), and the /testnet faucet keeps most of each
 // hour's claims for claims that carry one (src/server/faucet-guard.ts): one claim of each token per wallet a day. A pass
 // is the wallet and the time it ends, with an HMAC of both under the server's FAUCET_PASS_KEY (32 bytes or more in hex,
-// set in .env.local; without it a key of this process, and a restart ends the passes it gave). The server keeps no list
-// of the passes it gave. A QNet wallet costs nothing, so a signed reservation is no scarce thing: what makes a pass
-// scarce is the few each client IP and each network block get an hour. POST /api/faucet/pass: exactly
+// set in the site's settings file; without it a key of this process, and a restart ends the passes it gave). The server
+// keeps no list of the passes it gave. A QNet wallet costs nothing, so a signed reservation is no scarce thing: what
+// makes a pass scarce is the few each client IP and each network block get an hour. POST /api/faucet/pass: exactly
 // {wallet, burner, proof}.
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';

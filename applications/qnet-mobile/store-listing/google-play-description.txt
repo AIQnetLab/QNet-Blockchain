@@ -6,7 +6,7 @@ The texts themselves live where the upload tooling reads them, one copy only:
   fastlane/metadata/android/en-US/title.txt              (30 chars max)
   fastlane/metadata/android/en-US/short_description.txt  (80 chars max)
   fastlane/metadata/android/en-US/full_description.txt   (4000 chars max)
-  fastlane/metadata/android/en-US/changelogs/<versionCode>.txt   ("What's new", 500 chars max; 20.txt for 1.3.0)
+  fastlane/metadata/android/en-US/changelogs/<versionCode>.txt   ("What's new", 500 chars max; one per build)
   fastlane/metadata/android/en-US/images/                (the icon only; no screenshots yet, see below)
 
 ====================
@@ -57,6 +57,6 @@ Store-listing translations (English only at launch; the app itself is in ten mor
 Phone screenshots of the six scenes in store-listing/app-store-listing.txt, and 7" and 10" tablet screenshots (four or
 more each), all from the current build (store-listing/README.md, "Before submission").
 Play Console still shows the four phone screenshots saved on 23.09 from 1.1.6 (17). Their tab bar has Activate, a tab
-1.3.0 does not have. Replace them with phone screenshots of the current build before the 21 release goes to review.
+the current build does not have. Replace them with phone screenshots of the build that goes to review.
 Replace, don't just delete: the phone slot needs at least two. An upload from an empty phoneScreenshots folder does not
-remove them. Each new folder carries build.txt = 21 (__tests__/StoreListing.test.js).
+remove them. Each new folder carries build.txt with that build's versionCode (__tests__/StoreListing.test.js).

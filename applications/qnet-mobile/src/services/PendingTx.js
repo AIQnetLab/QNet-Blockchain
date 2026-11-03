@@ -25,6 +25,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 import { DEPLOY_GAS_LIMIT, DEPLOY_GAS_PRICE, TRANSFER_FEE_NANO, feeNano } from '../config/fees';
+import { expiredAt, validUntilOf } from '../crypto/TxBuilders';
 
 export const PENDING_KEY = 'qnet_pending_txs';
 export const MAX_LIVE = 4;                   // unsettled transactions one wallet may have at once
@@ -351,7 +352,8 @@ export async function ownSpends(from) {
   for (const r of ledgerOf(all, from)) add(r.nonce, normalSpend(r));
   for (const e of Array.isArray(all[from]) ? all[from] : []) add(e && e.nonce, entrySpend(e));
   for (const r of Array.isArray(all[RECENT_PREFIX + from]) ? all[RECENT_PREFIX + from] : []) {
-    if (r && !out.has(r.nonce)) add(r.nonce, spendFromSummary(r));
+    // An expired one took nothing (expireByHeight).
+    if (r && !r.expired && !out.has(r.nonce)) add(r.nonce, spendFromSummary(r));
   }
   return out;
 }
@@ -420,6 +422,45 @@ export async function recentSettled(from, now = Date.now()) {
   const all = await readAll();
   const list = Array.isArray(all[RECENT_PREFIX + from]) ? all[RECENT_PREFIX + from] : [];
   return list.filter((r) => r && now - (r.settledAt || 0) < RECENT_MS).sort((a, b) => b.settledAt - a.settledAt);
+}
+
+/** The recent record of `from`'s transaction at `nonce` that expired (expireByHeight), or null. */
+export async function expiredRecord(from, nonce, now = Date.now()) {
+  return (await recentSettled(from, now)).find((r) => r.nonce === nonce && r.expired === true) || null;
+}
+
+/**
+ * Drops every kept V2 transaction of `from` no block can take any more (TxBuilders expiredAt): by a genesis node's
+ * answer `tip` ({ nonce, nextHeight }), its nonce is still free and the tip passed the last height it signed. Each is
+ * remembered as recent with `expired`, so the screens say it failed and took nothing, its spend record goes, and the next
+ * send may take its nonce; a stopped one goes from the stopped list too. Returns the entries dropped.
+ */
+export function expireByHeight(from, tip, now = Date.now()) {
+  return locked(async () => {
+    if (!tip || !Number.isSafeInteger(tip.nonce) || !Number.isSafeInteger(tip.nextHeight)) return [];
+    const all = await readAll(now);
+    const ends = (nonce, validUntil) => nonce > tip.nonce && expiredAt(validUntil, tip.nextHeight);
+    const list = all[from] || [];
+    const gone = list.filter((e) => ends(e.nonce, validUntilOf(e.body)));
+    const stoppedKey = STOPPED_PREFIX + from;
+    const stopped = Array.isArray(all[stoppedKey]) ? all[stoppedKey] : [];
+    const stoppedLeft = stopped.filter((s) => !(s && ends(s.nonce, s.validUntil)));
+    if (gone.length === 0 && stoppedLeft.length === stopped.length) return [];
+    all[from] = list.filter((e) => !gone.includes(e));
+    if (stoppedLeft.length !== stopped.length) all[stoppedKey] = stoppedLeft;
+    const key = RECENT_PREFIX + from;
+    const recent = (Array.isArray(all[key]) ? all[key] : []).filter((r) => r && now - (r.settledAt || 0) < RECENT_MS);
+    for (const e of gone) {
+      const v = pendingView(e, now);
+      recent.push({ nonce: v.nonce, kind: v.kind, to: v.to, amountNano: v.amountNano, method: v.method, settledAt: now, expired: true });
+    }
+    all[key] = recent.slice(-RECENT_MAX);
+    // It can take nothing any more: its spend record goes with it.
+    const spentKey = SPENT_PREFIX + from;
+    if (gone.length && Array.isArray(all[spentKey])) all[spentKey] = ledgerOf(all, from).filter((r) => !gone.some((e) => e.nonce === r.nonce));
+    await writeAll(all, now);
+    return gone;
+  });
 }
 
 /** Drops every entry the confirmed account nonce has reached (remembered as recent); returns what is left. */
@@ -510,7 +551,8 @@ export function stopFrom(from, nonce, { bodyHash = null, now = Date.now() } = {}
       .filter((s) => s && now < s.until && !gone.some((e) => e.nonce === s.nonce));
     for (const e of gone) {
       const until = mayLandUntil(e);
-      if (now < until) stopped.push({ nonce: e.nonce, bodyHash: e.bodyHash || null, until });
+      // A V2 one keeps the last height it signed: once a tip passes it, it can no longer land (expireByHeight).
+      if (now < until) stopped.push({ nonce: e.nonce, bodyHash: e.bodyHash || null, until, validUntil: validUntilOf(e.body) });
     }
     all[key] = stopped.slice(-RECENT_MAX);
     await writeAll(all);

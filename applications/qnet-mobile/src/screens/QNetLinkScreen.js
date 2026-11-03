@@ -15,10 +15,17 @@ import { Answer, Answers } from '../components/ui/Action';
 import { color, layer, size, space, themed } from '../theme';
 import { shortAddress } from '../utils/addressDisplay';
 import {
-  openSession, prepareOffer, readOffer, performIntent, deliverAnswer, markHandled, groupCheckNumber, LinkRefusal,
+  openSession, prepareOffer, readOffer, performIntent, deliverAnswer, markHandled, groupCheckNumber, LinkRefusal, LINK,
+  otherNodeHint,
 } from '../services/QNetLink';
+import { carryAnswer } from '../services/LinkAnswers';
+import { noteLink } from '../services/LinkInbox';
+import { useAnswersAway } from '../components/AnswerAway';
 import { useArmedConfirm } from '../utils/useArmedConfirm';
-import { moveNote } from '../services/ClaimTransit';
+import { useHoldForUser } from '../utils/userAction';
+import { runNote } from '../services/ClaimTransit';
+import { lastCountedPart, runMovedNano } from '../services/MoveRun';
+import { moveNoteText } from '../utils/moveText';
 import { reasonText } from '../utils/bindRefusal';
 import { day } from '../utils/timeText';
 import { qncText } from '../utils/amountFormat';
@@ -43,9 +50,9 @@ const byWallet = (o) => !!o && o.kind === 'unlink' && o.mode === 'wallet';
 
 // A wallet named on the sheet: its start and its end.
 
-// `afterOther`: this request arrived while another one was on screen and waited until that one was closed
-// (R4-MOBLINK-01); the screen says so before anything can be confirmed. `onShown` tells the owner the user has this
-// request in front of them; `onGone` that the screen is going (the owner closes any prompt it opened for it).
+// `afterOther`: this request arrived while another one was on screen and waited until that one was closed; the
+// screen says so before anything can be confirmed. `onGone` tells the owner the screen is going
+// (the owner closes any prompt it opened for it).
 // `onOutcome` hands the owner the outcome as soon as there is one, even after this screen went: a request the user
 // decided stays with the owner across a lock, and comes back `settled` with that `settledOutcome` (or, while it is
 // still being carried out, without one, until it arrives), so what the user must see is never lost with the screen
@@ -55,23 +62,34 @@ const byWallet = (o) => !!o && o.kind === 'unlink' && o.mode === 'wallet';
 // its outcome says as it happens.
 export default function QNetLinkScreen({
   link, wallet, t, authenticate, onClose, node = null,
-  onSettled = () => {}, onShown = () => {}, onGone = () => {}, afterOther = false,
+  onSettled = () => {}, onGone = () => {}, afterOther = false,
   onOutcome = () => {}, settled = false, settledOutcome = null,
   onPrivacy = () => {}, onOpenNode = null, onPlayDialog = null, moveOf = null,
 }) {
   // loading | refused | unavailable | confirm | working | done
   const [phase, setPhase] = useState(settled ? (settledOutcome ? 'done' : 'working') : 'loading');
   const [refusal, setRefusal] = useState(null);
+  // While loading: a try got no answer and the screen tries again, which it says.
+  const [slow, setSlow] = useState(false);
   const [offer, setOffer] = useState(null);
   const [answer, setAnswer] = useState(settled ? settledOutcome : null);
   // null while sending, then delivered | conflict | expired | failed; 'resumed' for an outcome shown again after a lock
   const [delivery, setDelivery] = useState(settled ? 'resumed' : null);
   // The check number, once the relay took an answer that asked for it (kept with the outcome across a lock).
   const [check, setCheck] = useState((settled && settledOutcome && settledOutcome.check) || null);
+  // A claim's run while it is carried out ({ parts, movedNano, more } after each part: services/MoveRun).
+  const [progress, setProgress] = useState(null);
   const session = useRef(null);
   const alive = useRef(true);
   const acting = useRef(settled);
   const resumed = useRef(settled);
+  // The request's reads have the network before the background verification (utils/userAction), and so has a decided
+  // answer until the site has it, on screen or not (carryAnswer); a sheet waiting for the user's decision holds nothing.
+  useHoldForUser(phase === 'loading');
+  // The answers on their way: this request's own (a sheet shown again after a lock says so), and another request's.
+  const away = useAnswersAway();
+  const ownAway = away.includes(link.id);
+  const otherAway = away.some((id) => id !== link.id);
 
   const set = (fn) => (value) => { if (alive.current) fn(value); };
 
@@ -81,19 +99,38 @@ export default function QNetLinkScreen({
     onSettled();
   };
 
-  // Shows the outcome and sends the answer; the delivery and the hand-over to the owner go on even if the screen
-  // closes meanwhile.
+  // Shows the outcome and sends the answer; the delivery, the registration a consent is for and the hand-over to the
+  // owner go on even if the screen closes meanwhile. `shown`: the outcome with what came since (the check number, the
+  // registration's stage), handed over whole each time. Resolves once the delivery ended.
   const send = (ans) => {
+    let shown = ans;
+    const update = (extra) => {
+      shown = { ...shown, ...extra };
+      onOutcome(shown);
+      set(setAnswer)(shown);
+    };
     onOutcome(ans);
     set(setAnswer)(ans);
     set(setDelivery)(null);
     set(setPhase)('done');
     const onCheck = (n) => {
-      onOutcome({ ...ans, check: n });
+      update({ check: n });
       set(setCheck)(n);
     };
-    deliverAnswer(link, session.current, ans, { onCheck })
-      .then(set(setDelivery), () => set(setDelivery)('failed'));
+    // How the delivery ended goes with the outcome too, so a sheet shown again after a lock says it as this one does.
+    const delivered = deliverAnswer(link, session.current, ans, { onCheck })
+      .catch(() => 'failed')
+      .then((d) => {
+        update({ delivery: d });
+        set(setDelivery)(d);
+      });
+    // The wallet sends the registration its consent is for itself, at once; the page only follows the chain.
+    if (link.intent === 'link' && ans.status === 'ok' && ans.consent && offer && node && typeof node.register === 'function') {
+      node.register({
+        qnet: ans.qnet, burnTx: offer.burnTx, consent: ans.consent, until: (Number(ans.consent.ts) + LINK.CONSENT_PAST_S) * 1000,
+      }, (stage) => update({ registration: stage }));
+    }
+    return delivered;
   };
 
   // A request shown again after a lock: its outcome, once the work that was under way when the wallet locked ends.
@@ -107,44 +144,52 @@ export default function QNetLinkScreen({
   useEffect(() => {
     alive.current = true;
     if (resumed.current) return () => { alive.current = false; };
-    // A slow network keeps the request loading (it can be closed); only the relay's or the network's answer refuses it.
+    // A slow network keeps the request loading (it can be closed), saying so after a try with no answer; only the
+    // relay's or the network's answer refuses it.
     const cancelled = () => !alive.current;
+    const onRetry = () => set(setSlow)(true);
     (async () => {
       try {
-        session.current = await openSession(link, { cancelled });
+        session.current = await openSession(link, { cancelled, onRetry });
       } catch (e) {
         set(setRefusal)(e instanceof LinkRefusal ? e.reason : 'network');
         set(setPhase)('refused');
         return;
       }
-      const o = await readOffer(() => prepareOffer(link, { wallet, session: session.current, node }), session.current, { cancelled });
+      set(setSlow)(false);
+      const o = await readOffer(() => prepareOffer(link, { wallet, session: session.current, node }), session.current,
+        { cancelled, onRetry });
       if (!alive.current) return;
       setOffer(o);
       if (o.kind === 'unavailable' && o.error === 'NO_WALLET') {
         // Nothing to confirm and nothing revealed: the site learns only that there is no wallet here.
         acting.current = true;
         await settle();
-        send({ status: 'error', error: 'NO_WALLET' });
+        carryAnswer(link.id, send({ status: 'error', error: 'NO_WALLET' }));
         return;
       }
       setPhase(o.kind === 'unavailable' ? 'unavailable' : 'confirm');
+      noteLink('request_shown', { intent: link.intent, offer: o.kind === 'unavailable' ? o.error : o.kind });
+      // The request is on screen; whether the wallet has a node of the other type is read meanwhile. A source that says
+      // so, before the user acts, turns the sheet into that refusal; aiqnet.io and the chain refuse it in any case.
+      const hint = await otherNodeHint(o, node).catch(() => null);
+      if (hint && alive.current && !acting.current) {
+        setOffer({ kind: 'unavailable', error: hint });
+        setPhase('unavailable');
+      }
     })();
     return () => { alive.current = false; };
   }, [link]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { armed, onTouchStart, onPressIn, pressCounts } = useArmedConfirm(phase === 'confirm', ARM_MS);
 
-  // A new link never takes this screen's place while it is up (the owner queues it: R4-MOBLINK-01).
-  useEffect(() => {
-    onShown();
-    return () => onGone();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => onGone(), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const reject = async () => {
     if (acting.current) return;
     acting.current = true;
     await settle();
-    send({ status: 'rejected' });
+    carryAnswer(link.id, send({ status: 'rejected' }));
   };
 
   // The only button of a request the wallet cannot offer: it answers with the reason, which is no rejection.
@@ -152,7 +197,7 @@ export default function QNetLinkScreen({
     if (acting.current) return;
     acting.current = true;
     await settle();
-    deliverAnswer(link, session.current, { status: 'error', error: offer.error }).catch(() => {});
+    carryAnswer(link.id, deliverAnswer(link, session.current, { status: 'error', error: offer.error }).catch(() => {}));
     onClose();
   };
 
@@ -171,15 +216,20 @@ export default function QNetLinkScreen({
       acting.current = false;
       return;
     }
-    await settle();
-    set(setPhase)('working');
-    let ans;
-    try {
-      ans = await performIntent(link, offer, { node });
-    } catch (_) {
-      ans = { status: 'error', error: 'INTERNAL' };
-    }
-    send(ans);
+    // Decided: made and delivered to the end even if the sheet gives way to the next link meanwhile.
+    const made = (async () => {
+      await settle();
+      set(setPhase)('working');
+      let ans;
+      try {
+        ans = await performIntent(link, offer, { node, session: session.current, onProgress: set(setProgress) });
+      } catch (_) {
+        ans = { status: 'error', error: 'INTERNAL' };
+      }
+      return { delivered: send(ans) };
+    })();
+    carryAnswer(link.id, made.then(({ delivered }) => delivered));
+    await made;
   };
 
   useEffect(() => {
@@ -311,6 +361,10 @@ export default function QNetLinkScreen({
     );
   };
 
+  // How the answer's delivery ended (delivered | conflict | expired | failed), null while it is on its way: this sheet's
+  // own, or for a sheet shown again after a lock the one its outcome kept (send).
+  const sent = delivery === 'resumed' ? (answer && answer.delivery) || null : delivery;
+
   const outcome = () => {
     const a = answer;
     if (a.status === 'rejected') return <Text style={s.text}>{t('link_result_rejected')}</Text>;
@@ -328,7 +382,11 @@ export default function QNetLinkScreen({
         </>
       );
     }
-    if (link.intent === 'connect') return <Text style={s.text}>{t('link_result_connect')}</Text>;
+    // The addresses are the answer itself: one that did not reach the site says that alone, never that they were sent.
+    if (link.intent === 'connect') {
+      const missed = sent === 'expired' || sent === 'failed' || sent === 'conflict';
+      return <Text style={s.text}>{t(missed ? 'link_result_connect_missed' : 'link_result_connect')}</Text>;
+    }
     if (link.intent === 'reserve') return <Text style={s.text}>{t('link_result_reserve')}</Text>;
     if (link.intent === 'unlink') {
       if (a.byWallet) return <Text style={s.text}>{t('link_result_unlinked_wallet')}</Text>;
@@ -337,13 +395,19 @@ export default function QNetLinkScreen({
     if (a.status === 'linked') return <Text style={s.text}>{t(a.already ? 'link_result_already_here' : 'link_result_linked')}</Text>;
     if (a.status === 'empty') return <Text style={s.text}>{t('link_result_claim_empty')}</Text>;
     if (link.intent === 'claim') {
-      const n = moveNote(moveOf && a.txHash ? moveOf(a.txHash) : null, a.stoppedAtEpoch);
+      // Said as the Node tab's card says it, from the claims' records each time it is drawn: what they put in the wallet
+      // (MoveRun; a move whose one claim expired says what it submitted), past one claim their count, then the last
+      // one's record counting those before it (runNote). The answer the site got stays as it was sent.
+      const run = a.run && a.run.parts.length > 0 ? a.run : { parts: [{ txHash: a.txHash, amountNano: a.amountNano }] };
+      const outcomeOf = (hash) => (moveOf && hash ? moveOf(hash) : null);
+      const n = runNote(a.run, outcomeOf(run.parts[run.parts.length - 1].txHash), a.stoppedAtEpoch);
+      const movedNano = lastCountedPart(run, outcomeOf) ? runMovedNano(run, outcomeOf).toString() : a.amountNano;
+      const parts = run.parts.length;
       return (
         <>
-          <Text style={s.text}>{t('link_result_claim', { amount: qncText(a.amountNano) })}</Text>
-          <Text style={s.hint}>
-            {t(n.key, n.appliedNano !== undefined ? { amount: qncText(n.appliedNano) } : { epoch: n.epoch })}
-          </Text>
+          <Text style={s.text}>{t('link_result_claim', { amount: qncText(movedNano) })}</Text>
+          {parts > 1 ? <InfoRow label={t('tx_detail_parts')} value={String(parts)} ltr fit testID="link-claim-parts" /> : null}
+          <Text style={s.hint}>{moveNoteText(t, n, (nano) => qncText(nano))}</Text>
         </>
       );
     }
@@ -359,15 +423,20 @@ export default function QNetLinkScreen({
         </>
       );
     }
-    return <Text style={s.text}>{t(a.here === false ? 'link_result_consent_only' : 'node_linking')}</Text>;
+    // The registration this wallet sent (RegistrationSubmit), in the Node tab's words: on its way into a block, or
+    // recorded, the node linked here and waiting for its first answer.
+    const linking = { admitted: 'node_linking_pool', registered: 'node_linked_waiting' }[a.registration] || 'node_linking';
+    return <Text style={s.text}>{t(a.here === false ? 'link_result_consent_only' : linking)}</Text>;
   };
 
   const deliveryText = () => {
-    if (!answer || answer.error === 'NO_WALLET' || delivery === 'resumed') return null;
-    if (delivery === null) return <Text style={s.hint}>{t('link_working_send')}</Text>;
-    if (delivery === 'delivered') return <Text style={s.hint}>{t('link_delivered')}</Text>;
-    if (delivery === 'conflict') return <Text style={s.warning}>{t('link_delivery_conflict')}</Text>;
-    return <Text style={s.hint}>{t(delivery === 'expired' ? 'link_delivery_expired' : 'link_delivery_failed')}</Text>;
+    if (!answer || answer.error === 'NO_WALLET') return null;
+    if (sent === null) return delivery !== 'resumed' || ownAway ? <Text style={s.hint}>{t('link_working_send')}</Text> : null;
+    if (sent === 'delivered') return <Text style={s.hint}>{t('link_delivered')}</Text>;
+    if (sent === 'conflict') return <Text style={s.warning}>{t('link_delivery_conflict')}</Text>;
+    // A connect's own line says its addresses did not reach the site (outcome).
+    if (link.intent === 'connect') return null;
+    return <Text style={s.hint}>{t(sent === 'expired' ? 'link_delivery_expired' : 'link_delivery_failed')}</Text>;
   };
 
   // The six digits the page compares, once the relay took the answer (qnet-link-v1 section 14.6). A no-break space joins
@@ -403,15 +472,21 @@ export default function QNetLinkScreen({
         <View style={s.card}>
           <Text style={s.origin}>{t('link_origin')}</Text>
           <Text style={s.title}>{title()}</Text>
+          {otherAway ? <Text style={s.away} testID="link-previous-away">{t('link_previous_sending')}</Text> : null}
 
           {phase === 'loading' || phase === 'working' ? (
             <View style={s.busy}>
               <ActivityIndicator color={color.signal} />
               <Text style={s.text}>
-                {phase === 'loading' ? t('link_loading') : t(byWallet(offer) ? WALLET_UNLINK.working : (WORKING[link.intent] || 'link_working_send'))}
+                {phase === 'loading' ? t(slow ? 'link_loading_slow' : 'link_loading')
+                  : t(byWallet(offer) ? WALLET_UNLINK.working : (WORKING[link.intent] || 'link_working_send'))}
               </Text>
             </View>
           ) : null}
+          {/* A claim in more than one part answers once its last part went: the app has to stay open until then (a
+              phone suspends an app in the background, and no task carries the run). */}
+          {phase === 'working' && link.intent === 'claim' && progress && progress.more
+            ? <Text style={s.hint} testID="link-claim-more">{t('link_claim_parts')}</Text> : null}
 
           {phase === 'refused' ? <Text style={s.text}>{refusalText()}</Text> : null}
           {phase === 'unavailable' ? (
@@ -466,6 +541,7 @@ const s = themed((type) => ({
   link: { color: color.signal, textDecorationLine: 'underline', textDecorationColor: color.signalLine },
   warning: { ...type('body'), color: color.ember, marginBottom: space.s8 },
   hint: { ...type('note'), color: color.fog, marginTop: space.s8 },
+  away: { ...type('note'), color: color.fog, marginBottom: space.s12 },
   block: { marginTop: space.s4, marginBottom: space.s8 },
   // The check number with its words (one text: the words and the number are one translated line).
   check: { ...type('h3'), color: color.paper, marginVertical: space.s8 },

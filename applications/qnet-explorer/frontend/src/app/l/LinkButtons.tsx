@@ -4,11 +4,11 @@
 // page's own URL is a valid link, the button that opens QNet Wallet. The URL is read once, as a whole, through
 // the strict parser, and goes nowhere but into that intent: URL in this page. Its texts come from the page.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { WALLET_PAGE, androidIntentUrl, parseLink } from '@/lib/qnet-link';
 import { isAndroid } from '@/lib/qnet-provider';
 
-export default function LinkButtons({ lead, button, note }: { lead: string; button: string; note: string }) {
+export default function LinkButtons({ lead, button, note }: { lead: ReactNode; button: ReactNode; note: ReactNode }) {
   const [link, setLink] = useState<string | null>(null);
 
   useEffect(() => {

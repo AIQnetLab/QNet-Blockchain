@@ -1,9 +1,12 @@
 import { GET as blocksRoute } from '@/app/api/blocks/route';
 import { blocksPath } from '@/lib/explorer-reads';
 import { blocksAnchor, heightOf } from '@/lib/explorer-view';
+import { pageMetadata } from '@/i18n/server';
 import { firstAnswer } from '@/server/first-answer';
 import { headHub } from '@/server/head-hub';
 import BlocksClient from './BlocksClient';
+
+export const generateMetadata = () => pageMetadata(['blocks_title', 'hdr_explorer'], 'blocks_lead');
 
 // The block history renders with its page's rows: the newest blocks, or with ?at=H the page that starts at height H,
 // placed in the pages counted from the head (src/lib/explorer-view.ts blocksAnchor).

@@ -1,5 +1,5 @@
 // One unfinished QNet Link session per slot of a cabinet page (the activation page has one per activation, so one
-// activation's request never takes another's place, SITE-R3-02), kept in this browser until the session ends
+// activation's request never takes another's place), kept in this browser until the session ends
 // (docs/protocols/qnet-link-v1.md section 14.6): a phone browser may discard the tab while QNet Wallet is in
 // front, and the page must still read the answer when the user returns. Only a session whose private key is a
 // non-extractable WebCrypto key is kept: the browser uses that key for this origin and never hands it out. The

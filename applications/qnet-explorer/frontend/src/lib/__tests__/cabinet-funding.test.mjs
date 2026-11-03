@@ -1,4 +1,4 @@
-// The payment address funded from the user's own wallet (owner, 29.09 and 19.10). The card says in one sentence what to
+// The payment address funded from the user's own wallet. The card says in one sentence what to
 // send, then offers two ways: "Send from your wallet", a button per transfer for what the address still lacks of it,
 // opening a wallet with it filled in (the QNet extension's qnet_sendSolanaTransfer once it takes it, on any device; else
 // on a phone the link the release constant PHONE_LINK names), each done from the address's
@@ -23,11 +23,9 @@ import { BURN_CLUSTER, TRANSFER_LINK_PREFIX, TRANSFER_LINK_RE, isTransferLink } 
 import { isSolanaTransfer } from '../qnet-provider.ts';
 import { qrMatrix } from '../qr.ts';
 import { decodeKey } from '../solana-message.ts';
-import { TEXTS } from '../texts.ts';
+import { SRC, allSheets, code, read } from './source.mjs';
+import { TEXTS } from './texts-helper.mjs';
 
-const SRC = new URL('../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 const PAYMENT = '9z1QsPH2k9xpYY9EQYh8EdPjhnt9CXnsxZZkYgT5Km96';
 const SOLANA = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
 const MOBILE = new URL('../../../../../qnet-mobile/', import.meta.url);
@@ -128,8 +126,8 @@ test('the payment card: who the node is for, one sentence, one QR code of the pl
   const steps = code('components/cabinet/ActivateSteps.tsx');
   const card = steps.slice(steps.indexOf('export function Funding('), steps.indexOf('export function Receipt('));
   // Who the node belongs to: the QNet wallet that confirmed it in QNet Wallet, never the payment address.
-  // The wallet named is a link to its address page.
-  assert.match(card, /\{wallet && <p className="cab-step-s">\{rich\('act_owner', \{ wallet: <EntityLink kind="address" value=\{wallet\} \/> \}\)\}<\/p>\}/);
+  // The wallet is named without a link: its address page shows nothing of the activation before the registration.
+  assert.match(card, /\{wallet && <p className="cab-step-s">\{rich\('act_owner', \{ wallet: <EntityLink kind="address" value=\{wallet\} link=\{false\} \/> \}\)\}<\/p>\}/);
   assert.equal(TEXTS.act_owner, 'The node is registered to your QNet Blockchain wallet {wallet}; this one-time address only burns the 1DEV.');
   assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, 'act_owner_later'), false);
   assert.match(code('components/cabinet/NodeActivate.tsx'), /<Funding record=\{record\} price=\{price\} balance=\{balance\} wallet=\{named\} walletSolana=\{choice\?\.solana \?\? null\} phone=\{device\?\.phone === true\} \/>/);
@@ -143,7 +141,7 @@ test('the payment card: who the node is for, one sentence, one QR code of the pl
   assert.equal(TEXTS.act_address_qr, 'QR code of the payment address');
   assert.ok(qrMatrix(PAYMENT).size > 0);
   assert.deepEqual([...card.matchAll(/<Copy [^>]*\/>/g)].map((m) => m[0]), ['<Copy value={record.pub} />']);
-  assert.match(card, /<span className="ent ent-full">\{record\.pub\}<\/span>\s*<Copy value=\{record\.pub\} \/>/);
+  assert.match(card, /<span className="ent ent-full" translate="no">\{record\.pub\}<\/span>\s*<Copy value=\{record\.pub\} \/>/);
   // No request QR code, no second code, no copied request, and no "payment request" in what the card says.
   assert.doesNotMatch(card, /oneDevRequest|solRequest|act_request|act_copy_request|act_sol_|small/);
   for (const key of ['act_request_qr', 'act_request_note', 'act_request_note_phone', 'act_copy_request', 'act_sol_line', 'act_sol_qr', 'act_address_note']) {
@@ -154,12 +152,13 @@ test('the payment card: who the node is for, one sentence, one QR code of the pl
   // The QR code has one size; the small one and the SOL's row are gone with their styles.
   assert.match(code('components/cabinet/LinkWaiting.tsx'), /export function QrCode\(\{ text, label, size = 168 \}: \{ text: string; label: string; size\?: number \}\)/);
   assert.match(code('components/cabinet/LinkWaiting.tsx'), /<svg className="cab-qr" width=\{size\} height=\{size\} viewBox=/);
-  assert.doesNotMatch(read('app/globals.css') + read('styles/cabinet.css'), /activate-qr-small|cabinet-sol-request/);
+  assert.doesNotMatch(allSheets(), /activate-qr-small|cabinet-sol-request/);
   // No funding by the site from the card; on testnet the faucet link, handing the wallet's Solana address over, and the
-  // faucet pass for the wallet when the site gave one (SITE M-13).
+  // faucet pass for the wallet when the site gave one.
   assert.doesNotMatch(card, /act_faucet|onFaucet|faucetBusy/);
-  assert.match(card, /<Link href="\/testnet#faucet" onClick=\{toFaucet\}>\{t\('act_no_tokens_link'\)\}<\/Link>/);
-  assert.match(card, /const toFaucet = \(\) => \{\s*if \(walletSolana\) handOver\(walletSolana\);\s*if \(pass\) handOverPass\(pass\);\s*\};/);
+  assert.match(card, /<Link href=\{FAUCET_HREF\} onClick=\{toFaucet\} aria-busy=\{passWait \|\| undefined\}>\{t\('act_no_tokens_link'\)\}<\/Link>/);
+  assert.match(steps, /const FAUCET_HREF = '\/testnet#faucet';/);
+  assert.match(card, /const toFaucet = \(event: MouseEvent<HTMLAnchorElement>\) => \{\s*if \(passWait\) \{\s*event\.preventDefault\(\);\s*return;\s*\}\s*if \(walletSolana\) handOver\(walletSolana\);/);
   assert.equal(TEXTS.act_no_tokens, 'No test tokens yet? {link}');
   assert.equal(TEXTS.act_no_tokens_link, 'Get them to your wallet');
   // What stays: what has arrived so far, per amount, a line filling as it comes (dashes before the first read); and
@@ -183,7 +182,7 @@ test('the two ways: the extension\'s buttons on any device once it takes the tra
   assert.equal(fundingButtons(false, true), 'extension');
   assert.equal(fundingButtons(true, true), 'extension');
   assert.equal(fundingButtons(false, false), null, 'a computer without the extension: by hand only');
-  // Owner 20.10: a phone always gets both buttons. A testnet phone opens QNet Wallet's Solana Send with the transfer
+  // A phone always gets both buttons. A testnet phone opens QNet Wallet's Solana Send with the transfer
   // link, never the solana: link, which another cluster's wallet app could take; a mainnet one gets the solana: link.
   assert.equal(ACTIVATION_NETWORK, 'testnet');
   assert.equal(PHONE_LINK, 'transfer');
@@ -214,8 +213,8 @@ test('the two ways: the extension\'s buttons on any device once it takes the tra
   assert.match(card, /const received = fundingReceived\(balance, price\);/);
   assert.match(card, /if \(!transfer\) \{\s*return <span key=\{token\} className="cab-send-st">\{t\('act_fund_done'\)\}<\/span>;/);
   assert.match(card, /const className = token === 'oneDev' \|\| received\.oneDev \|\| arriving\.oneDev !== undefined \? 'btn btn-solid btn-sm' : 'btn btn-text';/);
-  // One row per transfer: what it is, its full amount, and its state or its button.
-  assert.match(card, /<span className="cab-send-k">\{tokens\[token\]\}<\/span>\s*<span className="cab-send-amt">\{full\[token\]\} \{tokenName\(token\)\}<\/span>\s*\{fundButton\(token\)\}/);
+  // One row per transfer: what it is, its full amount with its token's icon, and its state or its button.
+  assert.match(card, /<span className="cab-send-k">\{tokenName\(token\)\}<\/span>\s*<span className="cab-send-amt" translate="no">\{amount\(token\)\}<\/span>\s*\{fundButton\(token\)\}/);
   assert.match(card, /\{row\('oneDev'\)\}\s*\{row\('sol'\)\}/);
   assert.equal(TEXTS.act_fund_send, 'Send {amount} {token}');
   assert.equal(TEXTS.act_fund_done, 'Received');
@@ -225,7 +224,7 @@ test('the two ways: the extension\'s buttons on any device once it takes the tra
   assert.match(card, /\{fromWallet \? \(\s*<ViewTabs\s+className="cab-modes"\s+items=\{\[\{ key: 'wallet', label: t\('act_fund_auto_title'\) \}, \{ key: 'manual', label: t\('act_fund_manual_title'\) \}\]\}/);
   assert.match(card, /\{mode === 'wallet' \? fromWallet : yourself\}\s*<\/ViewTabs>\s*\) : yourself\}/);
   assert.match(card, /const fromWallet = buttons && \(/);
-  assert.match(card, /\{t\(buttons === 'extension' \? 'act_fund_auto_extension' : PHONE_LINK === 'transfer' \? 'act_fund_auto_phone_transfer' : 'act_fund_auto_phone'\)\}/);
+  assert.match(card, /\{say\(buttons === 'extension' \? 'act_fund_auto_extension' : PHONE_LINK === 'transfer' \? 'act_fund_auto_phone_transfer' : 'act_fund_auto_phone'\)\}/);
   assert.match(card, /<figure className="cab-pay-qr">\s*<QrCode text=\{record\.pub\}/);
   assert.equal(TEXTS.act_fund_auto_title, 'Send from your wallet');
   assert.equal(TEXTS.act_fund_manual_title, 'Send it yourself');
@@ -241,7 +240,7 @@ test('the two ways: the extension\'s buttons on any device once it takes the tra
   for (const failure of ['short', 'timeout', 'failed', 'unverifiable']) assert.ok(TEXTS[`transfer_failure_${failure}`], failure);
 });
 
-// The testnet phone had no buttons (owner, 19.10: "make them buttons"): its link is QNet Wallet's transfer link, read by
+// The testnet phone gets buttons too: its link is QNet Wallet's transfer link, read by
 // the app's own parser into the transfer the button names, with the 1DEV mint of the release's cluster; what the app
 // refuses, the site's check refuses too.
 test('a testnet phone\'s link is QNet Wallet\'s transfer link: the app reads it as the same transfer, the mint of the release\'s cluster', () => {
@@ -358,7 +357,7 @@ test('the faucet sends a wallet enough test SOL to fund a payment address from i
   assert.match(read('app/api/faucet/claim/route.ts'), /const FAUCET_AMOUNTS = \{ '1DEV': 1500, SOL: 0\.01 \} as const;/);
 });
 
-// One faucet (owner, 29.09): the Testnet page's, which funds the user's own Solana address. The cabinet's route that
+// One faucet: the Testnet page's, which funds the user's own Solana address. The cabinet's route that
 // sent a payment address test tokens is gone with its module, its limits and its setting; nothing calls it.
 test('the route does not exist: no cabinet faucet, its limits, its setting or a caller of it', async () => {
   assert.equal(existsSync(new URL('app/api/cabinet/faucet', SRC)), false);
@@ -377,16 +376,15 @@ test('the route does not exist: no cabinet faucet, its limits, its setting or a 
   const { CABINET_LIMITS } = await import('../../server/cabinet/limits.ts');
   assert.deepEqual(Object.keys(CABINET_LIMITS).filter((k) => /faucet/i.test(k)), []);
   const REPO = new URL('../../../../../../', import.meta.url);
-  for (const path of ['applications/qnet-explorer/frontend/ecosystem.config.example.js', 'deployment/deploy-aiqnet.sh', 'deployment/deploy-to-1984.sh', 'docs/applications/explorer.md']) {
+  for (const path of ['deployment/deploy-aiqnet.sh', 'docs/applications/explorer.md']) {
     const text = readFileSync(new URL(path, REPO), 'utf8');
     assert.doesNotMatch(text, /CABINET_FAUCET|\/api\/cabinet\/faucet/, path);
   }
 });
 
-// SITE-R3-01: the cabinet chose its testnet or mainnet branch from FAUCET_ENV or NEXT_PUBLIC_NETWORK, and nothing set
-// was 'mainnet'. The deploy script and the ecosystem template set neither, so a devnet-only site told visitors to send
-// real SOL "from any wallet or exchange" to a payment address it reads only on devnet, and the /testnet faucet took its
-// mainnet amounts. The network is now the release's, from BURN_CLUSTER, whatever is set.
+// A branch chosen from FAUCET_ENV or NEXT_PUBLIC_NETWORK, which a deploy may leave unset, could tell visitors of a
+// devnet-only site to send real SOL to a payment address read only on devnet. The network is the release's, from
+// BURN_CLUSTER, whatever is set.
 test('the cabinet\'s network is the release\'s, from BURN_CLUSTER: testnet on devnet whatever the settings say', async () => {
   const { BURN_CLUSTER } = await import('../qnet-link.ts');
   const { ACTIVATION_NETWORK } = await import('../one-dev.ts');
@@ -412,7 +410,7 @@ test('the cabinet\'s network is the release\'s, from BURN_CLUSTER: testnet on de
   assert.doesNotMatch(code('server/faucet-config.ts'), /process\.env\.(FAUCET_ENV|NEXT_PUBLIC_NETWORK)/);
   assert.match(read('lib/one-dev.ts'), /export const ACTIVATION_NETWORK: 'testnet' \| 'mainnet' = BURN_CLUSTER === 'devnet' \? 'testnet' : 'mainnet';/);
   // A payment address is made for the release's network, never the page's choice. The user funds it from their own
-  // wallet (owner, 29.09); on testnet the page asks for test tokens on Solana devnet and links the Testnet page's
+  // wallet; on testnet the page asks for test tokens on Solana devnet and links the Testnet page's
   // faucet, and never says "any wallet or exchange".
   const { createPaymentKey } = await import('../cabinet/payment-key.ts');
   const records = new Map();
@@ -426,7 +424,7 @@ test('the cabinet\'s network is the release\'s, from BURN_CLUSTER: testnet on de
   const steps = code('components/cabinet/ActivateSteps.tsx');
   assert.match(steps, /<p className="cab-pay-h">\{t\(ACTIVATION_NETWORK === 'mainnet' \? 'act_mainnet_send' : 'act_testnet_send', \{ price: number\(price\), sol \}\)\}<\/p>/);
   assert.equal(steps.match(/act_mainnet_send/g).length, 1);
-  assert.match(steps, /\{ACTIVATION_NETWORK === 'testnet' && \(\s*<p>\s*\{rich\('act_no_tokens', \{/);
+  assert.match(steps, /\{ACTIVATION_NETWORK === 'testnet' && !\(received\.oneDev && received\.sol\) && \(\s*<p>\s*\{rich\('act_no_tokens', \{/);
   // The page asks the site for no funding.
   assert.doesNotMatch(steps + page + read('lib/cabinet/activation.ts'), /onFaucet|claimFaucet|readFaucet|\/api\/cabinet\/faucet/);
   assert.match(TEXTS.act_testnet_send, /^Send \{price\} test 1DEV and \{sol\} test SOL \(Solana devnet\) to this address\.$/);

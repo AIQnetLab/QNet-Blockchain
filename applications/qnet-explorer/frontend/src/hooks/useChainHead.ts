@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import type { HeadBlockFacts } from '@/lib/explorer-view';
+import { siteRequest } from '@/lib/site-request';
 
 // Live chain head for client components: one event stream per tab (shared by every subscriber),
 // paused while the tab is hidden, falling back to a 15 s poll of /api/head when streaming fails.
@@ -55,7 +56,7 @@ function parse(data: string): Partial<ChainHead> | null {
 
 async function pollOnce() {
   try {
-    const res = await fetch('/api/head', { cache: 'no-store' });
+    const res = await fetch('/api/head', siteRequest());
     const j = await res.json();
     if (j?.success && j.data) { const p = parse(JSON.stringify(j.data)); if (p) publish(p); }
   } catch { /* next poll */ }

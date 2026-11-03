@@ -1,8 +1,10 @@
 import type { Metadata } from 'next';
 import NodeHistory from '@/components/cabinet/NodeHistory';
-import { pageTitle } from '@/lib/texts';
+import { pageMetadata } from '@/i18n/server';
 
-export const metadata: Metadata = { title: pageTitle('history_title', 'cabinet_title'), robots: { index: false, follow: true } };
+export async function generateMetadata(): Promise<Metadata> {
+  return { ...(await pageMetadata(['history_title', 'cabinet_title'])), robots: { index: false, follow: true } };
+}
 
 export default function NodeHistoryPage() {
   return <NodeHistory />;

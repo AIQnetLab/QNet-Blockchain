@@ -36,7 +36,7 @@ describe('storing a different wallet clears what the previous one left', () => {
   it("wipes the old wallet's node and token data, keeps device settings and per-address history", async () => {
     await AsyncStorage.multiSet([
       ['qnet_address', A.qnet], ['qnet_wallet_address', A.sol],
-      ['qnet_last_activated_node', '{}'], ['qnet_custom_tokens', '[]'], ['qnet_node_link_pending', '{}'],
+      ['qnet_wallet_node', '{}'], ['qnet_custom_tokens', '[]'], ['qnet_node_link_pending', '{}'],
       ['qnet_rate_limit', '{"attempts":3}'], ['qnet_pending_txs', '[]'],
       ['qnet_language', 'ru'], ['qnet_tx_history', JSON.stringify([{ owner: A.qnet, rows: [] }])],
     ]);
@@ -44,7 +44,7 @@ describe('storing a different wallet clears what the previous one left', () => {
     await wm.storeWallet(walletOf(B, { mnemonic: TEST_MNEMONIC }), 'bravo-lantern-94');
 
     const keys = await AsyncStorage.getAllKeys();
-    for (const gone of ['qnet_last_activated_node', 'qnet_custom_tokens', 'qnet_node_link_pending', 'qnet_rate_limit',
+    for (const gone of ['qnet_wallet_node', 'qnet_custom_tokens', 'qnet_node_link_pending', 'qnet_rate_limit',
       'qnet_pending_txs']) {
       expect(keys).not.toContain(gone);
     }
@@ -81,10 +81,10 @@ describe('storing a different wallet clears what the previous one left', () => {
   });
 
   it("re-saving the same wallet keeps its data", async () => {
-    await AsyncStorage.multiSet([['qnet_address', B.qnet], ['qnet_wallet_address', B.sol], ['qnet_last_activated_node', '{"k":1}']]);
+    await AsyncStorage.multiSet([['qnet_address', B.qnet], ['qnet_wallet_address', B.sol], ['qnet_wallet_node', '{"k":1}']]);
     const wm = new WalletManager();
     await wm.storeWallet(walletOf(B, { mnemonic: TEST_MNEMONIC }), 'bravo-lantern-94');
-    expect(await AsyncStorage.getItem('qnet_last_activated_node')).toBe('{"k":1}');
+    expect(await AsyncStorage.getItem('qnet_wallet_node')).toBe('{"k":1}');
   });
 });
 
@@ -132,7 +132,7 @@ describe('the vault answers only to its own password', () => {
 });
 
 describe('older builds left a code in the node record and in key names', () => {
-  it('the launch cleanup keeps the node, drops the code and its burn, and every key named after a code', async () => {
+  it('the launch cleanup drops that node record with its code and burn, and every key named after a code', async () => {
     const wm = new WalletManager();
     const code = 'QNET-LFEFD9-706058-537636';
     await AsyncStorage.multiSet([
@@ -158,23 +158,33 @@ describe('older builds left a code in the node record and in key names', () => {
       expect(keys).not.toContain(gone);
     }
     expect(keys).toContain('qnet_identity_pk_light_mobile_1234567890abcdef');
-    expect(JSON.parse(await AsyncStorage.getItem('qnet_last_activated_node'))).toEqual({ nodeType: 'light', walletAddress: B.qnet });
-
-    // The node record is read back for its own wallet only, and never carries a code.
-    expect(await wm.loadNodeRecord([B.qnet, B.sol])).toEqual({ nodeType: 'light', walletAddress: B.qnet });
-    expect(await wm.loadNodeRecord([A.qnet, A.sol])).toBeNull();
+    // The older node record goes whole, its code and burn with it: the genesis nodes name the wallet's node again.
+    expect(keys).not.toContain('qnet_last_activated_node');
   });
 
-  it('a genesis record keeps its node, known by its id', async () => {
+  // One record of the wallet's node (WalletManager.saveWalletNode): read back for its own wallet only, a status kept only
+  // when it names that node registered, and gone once two genesis nodes say the wallet has none (forgetWalletNode).
+  it('the wallet\'s node record: its own wallet\'s only, never a status that says the node is not registered', async () => {
     const wm = new WalletManager();
     const G = '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d';
-    await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-      nodeType: 'super', code: 'QNET-BOOT-001-STRAP', pseudonym: 'genesis_node_001', isGenesis: true,
-      bootstrapId: '001', burnTxHash: 'genesis', walletAddress: G }));
-    await wm.cleanupActivationStorage();
-    expect(await wm.loadNodeRecord([G])).toEqual({ nodeType: 'super', walletAddress: G, pseudonym: 'genesis_node_001',
-      isGenesis: true, bootstrapId: '001' });
-    expect(await AsyncStorage.getItem('qnet_last_activated_node')).not.toContain('QNET-BOOT');
+    const good = { success: true, registered: true, nodeId: 'genesis_node_001', nodeType: 'super', isOnline: true, heartbeatCount: 4 };
+    await wm.saveWalletNode({ owner: G, nodeId: 'genesis_node_001', nodeType: 'super', status: good });
+    expect(await wm.loadWalletNode(G)).toMatchObject({ owner: G, nodeId: 'genesis_node_001', nodeType: 'super', status: good });
+    expect(await wm.loadWalletNode(B.qnet)).toBeNull();
+    // A status that says the node is not registered, names no node or another one is never kept: the good one stays.
+    for (const status of [{ ...good, registered: false }, { success: true, registered: false, nodeId: null }, { ...good, nodeId: 'super_x' },
+      { success: false, error: 'network' }]) {
+      await wm.saveWalletNode({ owner: G, nodeId: 'genesis_node_001', nodeType: 'super', status });
+      expect((await wm.loadWalletNode(G)).status).toEqual(good);
+    }
+    // Another node named: its record keeps no status of the one before.
+    await wm.saveWalletNode({ owner: G, nodeId: 'super_node_x', nodeType: 'super', status: { ...good, registered: false } });
+    expect(await wm.loadWalletNode(G)).toMatchObject({ nodeId: 'super_node_x', status: null });
+    expect(await AsyncStorage.getItem(WalletManager.WALLET_NODE_KEY)).not.toMatch(/"registered":false/);
+    await wm.forgetWalletNode(B.qnet); // another wallet's word drops nothing
+    expect(await wm.loadWalletNode(G)).not.toBeNull();
+    await wm.forgetWalletNode(G);
+    expect(await wm.loadWalletNode(G)).toBeNull();
   });
 });
 

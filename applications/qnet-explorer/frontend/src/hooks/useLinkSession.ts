@@ -6,7 +6,7 @@
 // browser until it ends (src/lib/link-store.ts), so the page reads the answer after the phone browser discarded
 // the tab while QNet Wallet was in front. A session belongs to the slot it was started for: when the page's slot
 // changes (the activation page follows another activation), the hook lets go of it, keeps it for its slot, and
-// follows the new slot's session instead (SITE-R3-02).
+// follows the new slot's session instead.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { POLL_INTERVAL_MS, type ConsentVerifier, type LinkAnswer, type LinkIntent, type LinkRequest, type ReservationVerifier } from '@/lib/qnet-link';
@@ -72,7 +72,7 @@ export function useLinkSession(options: LinkSessionOptions = {}) {
   }, []);
 
   // The session ended. `release`: the page gives the session up before its end (cancelled, or replaced by a new
-  // request), so the relay drops it at once instead of holding it against this address until its TTL (SITE-8).
+  // request), so the relay drops it at once instead of holding it against this address until its TTL.
   const stop = useCallback((release = false) => {
     const r = detach();
     if (!r) return;

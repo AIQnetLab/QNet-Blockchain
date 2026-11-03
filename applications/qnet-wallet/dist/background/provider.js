@@ -102,10 +102,11 @@ import * as vault from './vault.js';
  * @property {'ok'|'empty'|'error'} status
  * @property {string} [qnet] ok, empty
  * @property {string} [nodeId] ok, empty: the node the site named, this wallet's light or super node
- * @property {string} [amountNano] ok: decimal nano, at least CLAIM_MIN_NANO, or above zero for a part of the balance
- *   (stoppedAtEpoch set)
- * @property {string} [txHash] ok: 64 lowercase hex
- * @property {string|null} [stoppedAtEpoch] ok: the epoch the node's quote stopped at (a partial move), else null
+ * @property {string} [amountNano] ok: decimal nano, the total the move's parts took under the one approval
+ *   (nodes.claimForSite): at least CLAIM_MIN_NANO, or above zero when stoppedAtEpoch is set
+ * @property {string} [txHash] ok: 64 lowercase hex, the last part's
+ * @property {string|null} [stoppedAtEpoch] ok: null when the whole balance moved, at least CLAIM_MIN_NANO in all; else
+ *   the first epoch the last part did not take (a rest stays on the node, or the whole balance came to less than 1 QNC)
  * @property {string} [error] error: a CLAIM_ERRORS code
  *
  * @typedef {object} SiteUnlinkResult  qnet_unlinkNodeDevice result (CONTRACTS.md decision 38: the `unlink` answer of QNet
@@ -170,6 +171,9 @@ export const CLAIM_ERROR_CODES = Object.freeze([...CLAIM_ERRORS]);
 const claimError = (code) => errorResult(CLAIM_ERRORS, code);
 const CLAIM_VIEW_MODES = new Set(['claim', 'empty', 'unavailable']);
 const CLAIM_VIEW_REASONS = new Set(['WALLET_MISMATCH', 'NO_NODE', 'NETWORK', 'SIGNING_DISABLED']);
+// A confirmed move starts its next part only this long after the site's request came (nodes.claimForSite `until`): the
+// site waits five minutes for the answer from its call, the review included, so the answer reaches it inside that.
+const CLAIM_RUN_MS = 150000;
 // The node a site's move names (router.js CLAIM_NODE_ID_RE): a light or a super node id.
 const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 // The error codes a qnet_unlinkNodeDevice result may carry (decision 38); anything else is INTERNAL (UNSUPPORTED and
@@ -1575,8 +1579,8 @@ export function createProviderService(options = {}) {
   }
 
   // The dApp result of a claim outcome (nodes.claimForSite), checked once more: the node the site named, one of this
-  // wallet's own, a move with a transaction hash of at least CLAIM_MIN_NANO (a full batch) or above zero (a part of the
-  // balance, with the epoch its quote stopped at: EXT-R1-03), or an empty balance.
+  // wallet's own, a move with its last transaction's hash of at least CLAIM_MIN_NANO in all (the whole balance) or above
+  // zero (a rest stays, with the first epoch the last part did not take: EXT-R1-03), or an empty balance.
   function claimResult(outcome, current, nodeId) {
     if (claimNodeType(nodeId, current) === null) throw new WalletError('WALLET_MISMATCH');
     if (outcome?.status === 'empty' && outcome.qnet === current.qnetAddress && outcome.nodeId === nodeId) {
@@ -1596,7 +1600,7 @@ export function createProviderService(options = {}) {
 
   // approval.resolve of a claimNodeBalance approval. A window that could not offer the move (unavailable, or a balance
   // below the minimum) answers the dApp with that and counts no rejection; a reject is a reject; a confirm of the view
-  // the page drew runs nodes.claimForSite.
+  // the page drew runs nodes.claimForSite, its parts up to the balance it showed and within CLAIM_RUN_MS of the request.
   async function resolveClaim(approval, params) {
     const view = approval.view;
     if (view?.mode === 'unavailable' || view?.mode === 'empty') {
@@ -1610,9 +1614,15 @@ export function createProviderService(options = {}) {
     approval.busy = true;
     let current;
     let result;
+    // a whole balance below 1 QNC names the last part's stop too: the window says no rest then
+    let whole = false;
     try {
       current = await d.session.requireUnlocked();
-      result = claimResult(await d.nodes.claimForSite(approval.payload.nodeId), current, approval.payload.nodeId);
+      const outcome = await d.nodes.claimForSite(approval.payload.nodeId, {
+        shownNano: view.amountNano, until: approval.createdAt + CLAIM_RUN_MS,
+      });
+      result = claimResult(outcome, current, approval.payload.nodeId);
+      whole = outcome?.whole === true;
     } catch (error) {
       approval.busy = false;
       const code = knownCode(error?.code) ?? 'INTERNAL';
@@ -1630,7 +1640,7 @@ export function createProviderService(options = {}) {
     balanceChanged();
     return {
       resolved: true, status: result.status, error: null, amountNano: result.amountNano ?? null,
-      partial: typeof result.stoppedAtEpoch === 'string',
+      partial: typeof result.stoppedAtEpoch === 'string' && !whole,
     };
   }
 

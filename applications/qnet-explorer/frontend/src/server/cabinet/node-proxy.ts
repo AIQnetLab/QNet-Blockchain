@@ -16,6 +16,7 @@
 
 import { blake3 } from '@noble/hashes/blake3';
 import { readCappedBytes } from '../../lib/capped-body.ts';
+import { within } from '../../lib/deadline.ts';
 import { GENESIS_NODES } from '../../lib/genesis-nodes.ts';
 import { isLightNodeId, isSuperNodeId } from '../../lib/qnet-link.ts';
 import { isEonAddress } from '../../lib/qnet-provider.ts';
@@ -29,13 +30,13 @@ import {
 } from '../../lib/cabinet/node-view.ts';
 import type { ArchiveFacts, EpochArchive } from './epoch-archive.ts';
 import { memo } from './cache.ts';
-import { createEligibleSet, type EligibleSet } from './eligible-set.ts';
+import { sharedEligibleSet, type EligibleSet } from './eligible-set.ts';
 import { knownNodes, type KnownNodes } from './known-nodes.ts';
 import { cabinetGate, cabinetJson, createGate, type Gate, type GateOptions } from './limits.ts';
 import { sharedUpstreamBudget, unbudgeted, type UpstreamBudget, type UpstreamKind } from './upstream.ts';
 
 // A page reads a node's status every half minute (hooks/useNodeStatus.ts): an answer is kept about that long, and a
-// settled "not registered, not being recorded" (or a super node "not registered") a little longer (SITE M-12). A
+// settled "not registered, not being recorded" (or a super node "not registered") a little longer. A
 // reservation's read keeps its own answers a few seconds only.
 export const STATUS_CACHE_MS = STATUS_KEPT_MS;
 export const SUPER_CACHE_MS = 25_000;
@@ -51,15 +52,6 @@ export const MISS_TIMEOUT_MS = 1_500;
 const NODE_BODY_MAX_BYTES = 64 * 1024;
 export const ELIGIBLE_WAIT_MS = 3_000;
 
-// `p`'s value, or null once `ms` passed first.
-function within<T>(p: Promise<T>, ms: number): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), ms);
-  });
-  return Promise.race([p, late]).finally(() => clearTimeout(timer));
-}
-
 // The public status fields the cabinet reads; any other field of a node's answer is ignored.
 export interface PublicStatus {
   onchain_registered: boolean;
@@ -72,8 +64,13 @@ export interface PublicStatus {
   // False while the answering node is behind the network height it cached: its "not registered" and "not pending"
   // then settle nothing (section 7). A node from before the field is taken as authoritative.
   authoritative: boolean;
-  // The linked device (section 7): null for a node not on the chain, or a node from before the field.
+  // The linked device (section 7): null for a node not on the chain, a node from before the field, or a genesis that
+  // could read none of the shard's owners.
   device: PublicDevice | null;
+  // Whether the answering genesis owns the node's light shard (the owners alone keep its binding) and, for an owner,
+  // whether it caught up with its co-owners (section 7); null from a node from before the fields.
+  binding_owner: boolean | null;
+  binding_synced: boolean | null;
 }
 
 export interface PublicDevice {
@@ -136,6 +133,9 @@ export function parsePublicStatus(body: unknown): PublicStatus | null {
   if (typeof authoritative !== 'boolean') return null;
   const device = parsePublicDevice(body.device);
   if (device === undefined) return null;
+  const owner = body.binding_owner ?? null;
+  const synced = body.binding_synced ?? null;
+  if ((owner !== null && typeof owner !== 'boolean') || (synced !== null && typeof synced !== 'boolean')) return null;
   return {
     onchain_registered: body.onchain_registered as boolean,
     registration_pending: body.registration_pending as boolean,
@@ -146,6 +146,8 @@ export function parsePublicStatus(body: unknown): PublicStatus | null {
     features: body.features,
     authoritative,
     device: body.onchain_registered ? device : null,
+    binding_owner: owner as boolean | null,
+    binding_synced: synced as boolean | null,
   };
 }
 
@@ -326,16 +328,16 @@ export function historyView(
 
 export type PendingAt = NonNullable<ReturnType<typeof parsePendingAt>>;
 
-// The wallet's earnings at one moment, or null. The balance goes with the page's watermark only while no move landed
-// between the two reads (its first unpaid epoch is still above the watermark), and the archive's moves count only when
-// they replay to that same watermark (epoch-archive.ts movedTotal): an archive behind the move, or a node behind the
-// archive, gives no total rather than one from two moments.
+// The wallet's earnings at one moment, or null. The balance goes with the page only while no move landed between the
+// two reads (its first unpaid epoch is still above the page's watermark); the archive's moves count only when they
+// replay to that same watermark (epoch-archive.ts movedTotal), else the balance stands alone: an archive behind the
+// move, or a node behind the archive, gives no total rather than one from two moments.
 export function earnedOf(node: NodeHistory, facts: ArchiveFacts | null, balance: PendingAt | null): HistoryEarned | null {
+  if (balance === null) return null;
   const watermark = node.lastClaimed ?? null;
+  if (watermark !== null && balance.firstUnclaimed !== null && balance.firstUnclaimed <= watermark) return null;
   const moved = facts?.moved ?? null;
-  if (balance === null || watermark === null || moved === null || moved.watermark !== watermark) return null;
-  if (balance.firstUnclaimed !== null && balance.firstUnclaimed <= watermark) return null;
-  return { movedNano: moved.nano, balanceNano: balance.nano };
+  return { movedNano: watermark !== null && moved !== null && moved.watermark === watermark ? moved.nano : null, balanceNano: balance.nano };
 }
 
 // `?view=1` of the status and history routes, the read of an address only viewed (node-view.ts publicStatus,
@@ -388,14 +390,27 @@ export function stillNeeded(got: readonly PublicStatus[]): number {
   return Math.max(1, 2 - have);
 }
 
+// The answer whose word on the device the cabinet takes (section 7): an owner of the node's light shard that caught up
+// with its co-owners; else a genesis that read the owners for it (it names their device); else a node from before the
+// fields, on its own word. None when every answer that lists the node is an owner still catching up or a genesis that
+// could read no owner: the device's link is then not known, never "no device".
+export function deviceSource(answers: readonly PublicStatus[]): PublicStatus | null {
+  const listing = answers.filter((s) => s.onchain_registered);
+  return listing.find((s) => s.binding_owner === true && s.binding_synced !== false)
+    ?? listing.find((s) => s.binding_owner === false && s.device !== null)
+    ?? listing.find((s) => s.binding_owner === null)
+    ?? null;
+}
+
 // The answers `seen`, settled by the pair `a`, `b` (settlingPair), as the cabinet shows them: the details of the
-// first, the features both list, whether any answer saw a registration on its way (a node behind the network that saw
-// one is right about it), and the latest miss any answer names (last-miss.ts latestMiss). Whether the node answered this epoch and needs reactivation are the word of `owners`, the answers of
-// the genesis nodes owning its light shard that list it, those at the network's height when any is (a node behind
-// reads an older epoch), else the pair's: answered when any of them says so, needs reactivation only when all do. An
-// owner that missed the one relay of an answer (down or restarting when the device answered at another) is not the
-// network's word; the device's state and its last answer's epoch follow. Null for anything settlingPair would not have
-// settled.
+// first, the device by deviceSource (deviceBound null when no answer could say), the features both list, whether any
+// answer saw a registration on its way (a node behind the network that saw one is right about it), and the latest miss
+// any answer names (last-miss.ts latestMiss). Whether the node answered this epoch and needs reactivation are the word of
+// `owners`, the answers of the genesis nodes owning its light shard that list it, those at the network's height when any
+// is (a node behind reads an older epoch), else the pair's: answered when any of them says so, needs reactivation only
+// when all do. An owner that missed the one relay of an answer (down or restarting when the device answered at another)
+// is not the network's word; the device's state and its last answer's epoch follow. Null for anything settlingPair
+// would not have settled.
 export function mergeStatus(
   a: PublicStatus, b: PublicStatus, balanceNano: string | null, seen: readonly PublicStatus[] = [], owners: readonly PublicStatus[] = [],
 ): NodeStatusView | null {
@@ -406,10 +421,12 @@ export function mergeStatus(
   const voters = !a.onchain_registered ? [a] : current.length > 0 ? current : listing.length > 0 ? listing : [a, b];
   const answered = voters.some((s) => s.answered_this_epoch);
   const needsReactivation = !answered && voters.every((s) => s.needs_reactivation);
+  const answers = [a, b, ...seen];
+  const source = a.onchain_registered ? deviceSource(answers) : null;
   return {
     registered: a.onchain_registered,
-    pending: !a.onchain_registered && [a, b, ...seen].some((s) => s.registration_pending),
-    deviceBound: a.device_bound,
+    pending: !a.onchain_registered && answers.some((s) => s.registration_pending),
+    deviceBound: !a.onchain_registered ? a.device_bound : source ? source.device_bound : null,
     answeredThisEpoch: answered,
     needsReactivation,
     counted: {
@@ -419,12 +436,12 @@ export function mergeStatus(
     },
     features: a.features.filter((f) => b.features.includes(f)),
     balanceNano: a.onchain_registered ? balanceNano : null,
-    device: a.device ? deviceView(a.device, [a, b, ...seen], voters, needsReactivation === a.needs_reactivation ? null : needsReactivation) : null,
+    device: source?.device ? deviceView(source.device, answers, voters, needsReactivation === source.needs_reactivation ? null : needsReactivation) : null,
   };
 }
 
-// The device as the first answer names it, with its last answer's epoch as `voters` (mergeStatus) have it; its state
-// is the first answer's own unless `needsReactivation` (the voters' word, when it differs from the first answer's)
+// The device as its source answer (deviceSource) names it, with its last answer's epoch as `voters` (mergeStatus) have
+// it; its state is that answer's own unless `needsReactivation` (the voters' word, when it differs from that answer's)
 // turns it, by the node's own rule: a bound device is Online unless the node needs reactivation. The miss from every
 // answer.
 function deviceView(d: PublicDevice, answers: readonly PublicStatus[], voters: readonly PublicStatus[], needsReactivation: boolean | null): DeviceView {
@@ -535,9 +552,9 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
   // Status answers of distinct nodes in the status order, two first, then as many more as could still settle the
   // registration, until two settle it (settlingPair) or no node is left: then the network could not be read. A page's
   // read whose answers name a miss the Overview shows, or a wake with no answer that lacks the device's account
-  // (last-miss.ts asksOtherOwners), or whose owners call the device Offline, also asks the shard's owners not asked yet,
-  // once, so the most telling record any owner keeps is the one shown and an owner holding the device's answer is
-  // heard; a reservation's read does not. A page's read goes on the budget of its id (pageKind), and an id the network
+  // (last-miss.ts asksOtherOwners), or whose owners call the device Offline, or that could not say which device runs it,
+  // also asks the shard's owners not asked yet, once, so the most telling record any owner keeps is the one shown and an
+  // owner holding the device's answer is heard; a reservation's read does not. A page's read goes on the budget of its id (pageKind), and an id the network
   // lists as registered is noted as seen.
   async function loadStatus(nodeId: string, kind: 'read' | 'reserve' = 'read'): Promise<NodeStatusView | null> {
     const upstream: UpstreamKind = kind === 'reserve' ? 'reserve' : pageKind(nodeId);
@@ -576,7 +593,9 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
     const view = mergeStatus(pair[0], pair[1], balance, got, ofOwners(got));
     const unasked = bases.filter((base) => order.includes(base));
     const offline = view?.registered === true && view.needsReactivation;
-    if (view === null || kind !== 'read' || unasked.length === 0 || !(asksOtherOwners(view) || offline)) return view;
+    // No answer could say which device runs the node (the owners asked are catching up): an owner not asked yet may.
+    const unknown = view?.registered === true && view.deviceBound === null;
+    if (view === null || kind !== 'read' || unasked.length === 0 || !(asksOtherOwners(view) || offline || unknown)) return view;
     const owners = await Promise.all(unasked.map(async (base) => ({ base, value: parsePublicStatus(await read(statusUrl(base), upstream)) })));
     const listed: PublicStatus[] = [];
     for (const { base, value } of owners) {
@@ -664,7 +683,7 @@ export function createNodeProxy(options: NodeProxyOptions = {}): NodeProxy {
         }
         // The node's own admission settles it; else the eligible set, which waits ELIGIBLE_WAIT_MS at most: a slower read
         // goes on and serves the next status read, and this one says nothing of the admission.
-        const set = eligible && s.admission === null ? await within(eligible().catch(() => null), ELIGIBLE_WAIT_MS) : null;
+        const set = eligible && s.admission === null ? await within(ELIGIBLE_WAIT_MS, eligible().catch(() => null)) : null;
         return {
           registered: true, online: s.online, lastSeenAt, heartbeats: s.heartbeats,
           banned: s.reputation !== null && s.reputation < REPUTATION_FLOOR, balanceNano: balance, admission: s.admission,
@@ -736,8 +755,7 @@ export function nodeProxy(): NodeProxy {
   const holder = globalThis as unknown as Record<symbol, NodeProxy | undefined>;
   const existing = holder[GLOBAL_KEY];
   if (existing) return existing;
-  const budget = sharedUpstreamBudget();
-  const created = createNodeProxy({ gate: cabinetGate(), budget, eligible: createEligibleSet({ budget }) });
+  const created = createNodeProxy({ gate: cabinetGate(), budget: sharedUpstreamBudget(), eligible: sharedEligibleSet() });
   holder[GLOBAL_KEY] = created;
   return created;
 }

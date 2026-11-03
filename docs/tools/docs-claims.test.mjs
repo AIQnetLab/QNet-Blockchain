@@ -211,27 +211,35 @@ test('SITE-R2-12: the payment key\'s lifetime is stated as the cabinet keeps it'
   assert.match(explorer, /Before a burn the payment address's key lives at most 24 hours from the start\. After a burn it is kept only to send back what is left/);
 });
 
-// SD-R2-06, SD-R2-07: a refreshed push token goes to genesis nodes only; no environment variable names a node's address.
-test('SD-R2-06, SD-R2-07: push tokens reach genesis nodes only, and no document names an unread variable', () => {
+// SD-R2-06, SD-R2-07: a refreshed push token goes to the node's three shard owners only; no environment variable names
+// a node's address.
+test('SD-R2-06, SD-R2-07: push tokens reach the shard owners only, and no document names an unread variable', () => {
   const push = read('applications/qnet-mobile/src/services/PushService.js');
-  assert.match(push, /for \(const url of \[\.\.\.owners, \.\.\.GENESIS_NODES\.filter\(\(u\) => !owners\.includes\(u\)\)\]\)/);
+  assert.match(push, /for \(const url of lightShardOwnerUrls\(nodeId\)\) \{/);
+  assert.doesNotMatch(push, /GENESIS_NODES\.filter\(\(u\) => !owners\.includes\(u\)\)/);
   const mobile = flat('docs/applications/mobile-wallet.md');
   assert.doesNotMatch(mobile, /to a random node only if every owner fails/);
-  assert.match(mobile, /A refreshed FCM token is sent to the node's shard owners in rank order, then to the other genesis nodes; never to another node/);
+  assert.match(mobile, /A refreshed FCM token is sent to the node's three shard owners in rank order and to no other node \(`PushService\.js`\)/);
   assert.match(mobile, /A push names no address to answer at; the app answers the node's shard owners by name/);
   for (const file of OFFICIAL) assert.doesNotMatch(read(file), /QNET_PUBLIC_RPC_URL|where an earlier roll set it/, file);
 });
 
-// SD-R2-09: no store text of an earlier build is left in the Play metadata, and What's new says what this build does.
+// SD-R2-09: no store text of an earlier build is left in the Play metadata, the build has its What's new, and every
+// What's new that names the unlock describes it as it is. A build's What's new lists what that build changes, so it
+// names the unlock only when the build changes it.
 test('SD-R2-09: the Play changelogs name no update check and describe the unlock as it is', () => {
   const dir = 'fastlane/metadata/android/en-US/changelogs';
   const files = readdirSync(path.join(REPO, dir));
   assert.ok(!files.includes('18.txt'), 'changelog 18 describes an update check no build has');
-  for (const f of files) {
-    assert.doesNotMatch(read(path.join(dir, f)), /update|GitHub|download|every phone/i, f);
-  }
   const code = /versionCode (\d+)/.exec(read('applications/qnet-mobile/android/app/build.gradle'))[1];
-  assert.match(read(path.join(dir, `${code}.txt`)), /Unlock with the device's screen lock where it has one, otherwise with a password/);
+  assert.ok(files.includes(`${code}.txt`), `build ${code} has no What's new`);
+  for (const f of files) {
+    const text = read(path.join(dir, f));
+    assert.doesNotMatch(text, /update|GitHub|download|every phone/i, f);
+    for (const line of text.split('\n').filter((l) => /unlock/i.test(l))) {
+      assert.equal(line.trim(), "• Unlock with the device's screen lock where it has one, otherwise with a password", f);
+    }
+  }
 });
 
 // SD-R2-13: the protocol says what a licensed store install on Android also needs, and the refusal it gets without it.
@@ -300,21 +308,79 @@ test('DEV-R2-01: the rate-limit table is the node\'s ApiRateLimiter', () => {
   }
 });
 
-// The explorer doc's production host: the deploy and its update script each make CABINET_READ_KEY and FAUCET_PASS_KEY
-// once in .env.local, before the site starts, keep a value of exactly 64 lowercase hex digits and replace any other.
+// The text of /root/update-aiqnet.sh as deploy-aiqnet.sh writes it.
+const updateScriptOf = (script) => {
+  const start = script.indexOf("cat > /root/update-aiqnet.sh << 'EOF'\n");
+  return script.slice(start, script.indexOf('\nEOF\n', start));
+};
+
+// The explorer doc's production host: the update script, which every deploy runs too, makes CABINET_READ_KEY and
+// FAUCET_PASS_KEY once in the site's settings file, before the site starts, keeps a value of exactly 64 lowercase hex
+// digits and replaces any other.
 test('the deploy script makes both pass keys once and keeps them, as the explorer doc says', () => {
   const script = read('deployment/deploy-aiqnet.sh');
-  const provision = script.slice(script.indexOf('chmod 600 .env.local'), script.indexOf('sudo -u $APP_USER -H pm2 start ecosystem.config.js'));
-  const update = script.slice(script.indexOf("cat > /root/update-aiqnet.sh << 'EOF'"), script.indexOf('sudo -u $APP_USER -H pm2 restart aiqnet-explorer'));
+  const update = updateScriptOf(script);
   const made = (key, file) => `grep -Eq '^${key}=[0-9a-f]{64}\\$' ${file} || { sed -i '/^${key}=/d' ${file}; `
     + `echo ${key}=\\$(openssl rand -hex 32) >> ${file}; }`;
   for (const key of ['CABINET_READ_KEY', 'FAUCET_PASS_KEY']) {
-    assert.ok(provision.includes(made(key, '.env.local')), `${key}: provisioning`);
-    assert.ok(update.includes(made(key, '$APP_DIR/applications/qnet-explorer/frontend/.env.local')), `${key}: update script`);
+    assert.equal(script.split(made(key, '$SITE_ENV')).length, 2, `${key}: made in one place`);
+    const at = update.indexOf(made(key, '$SITE_ENV'));
+    assert.ok(at > -1 && at < update.indexOf('\nsystemctl restart qnet-explorer.service\n'), `${key}: by the update script, before the site restarts`);
   }
+  assert.ok(script.indexOf('\n    /root/update-aiqnet.sh\n') > script.indexOf(update), 'every deploy runs the update script');
+  assert.match(script, /^SITE_ENV="\/root\/qnet-explorer\.env"$/m);
   const doc = flat('docs/applications/explorer.md');
-  assert.match(doc, /The script and `\/root\/update-aiqnet\.sh` each write `CABINET_READ_KEY` and `FAUCET_PASS_KEY` there \(`openssl rand -hex 32`\) unless the file already holds one of exactly 64 lowercase hex digits, which they keep \(any other value of either is replaced\)/);
-  assert.match(doc, /\| `FAUCET_PASS_KEY` \| 32 bytes or more in hex \(`openssl rand -hex 32`, set once in `\.env\.local`; `deploy-aiqnet\.sh` makes it once and keeps it\)/);
+  assert.match(doc, /`\/root\/update-aiqnet\.sh`, which every deploy runs too, writes `CABINET_READ_KEY` and `FAUCET_PASS_KEY` there \(`openssl rand -hex 32`\) unless the file already holds one of exactly 64 lowercase hex digits, which it keeps \(any other value of either is replaced\)/);
+  assert.match(doc, /\| `FAUCET_PASS_KEY` \| 32 bytes or more in hex \(`openssl rand -hex 32`, set once in `\/root\/qnet-explorer\.env`; `deploy-aiqnet\.sh` makes it once and keeps it\)/);
+});
+
+// The explorer doc's production host: the indexer's own tree, fetched and rebuilt only when its inputs change, and its
+// migrations committed before the site starts, as the deploy script writes them.
+test('the explorer doc states how the indexer is built and when the site starts, as the deploy script does', () => {
+  const script = read('deployment/deploy-aiqnet.sh');
+  const doc = flat('docs/applications/explorer.md');
+  assert.match(script, /^INDEXER_BUILDER="qnet-indexer-build"$/m);
+  assert.match(script, /^INDEXER_DIR="\/opt\/qnet-indexer"$/m);
+  assert.match(doc, /a system user `qnet-indexer-build` \(no login shell\) that owns the indexer's tree in `\/opt\/qnet-indexer`/);
+  const inputs = `${/^INDEXER_INSTALL_INPUTS="([^"]+)"$/m.exec(script)[1]} ${/^INDEXER_INPUTS="\$INDEXER_INSTALL_INPUTS ([^"]+)"$/m.exec(script)[1]}`.split(' ');
+  assert.deepEqual(inputs.map((p) => p.replace(/^applications\/qnet-explorer\/(?:frontend\/)?/, '')),
+    ['package.json', 'package-lock.json', 'package.json', 'scripts/lockfile-check.mjs', 'tsconfig.indexer.json', 'src/indexer', 'migrations']);
+  assert.match(doc, /`package\.json` and `package-lock\.json` of `applications\/qnet-explorer\/`, and `package\.json`, `scripts\/lockfile-check\.mjs`, `tsconfig\.indexer\.json`, `src\/indexer\/` and `migrations\/` of its `frontend\/`/);
+  assert.match(script, /\nif \[ \\"\\\$\(sudo -u \$INDEXER_BUILDER -H cat \$INDEXER_BUILT 2>\/dev\/null\)\\" != \\"\\\$SITE_INPUTS\\" \]; then\n/);
+  assert.match(doc, /; an update that changes only the site fetches, installs and builds nothing of the indexer\./);
+  // The site's new release is built while the site runs on; then the indexer restarts (its migrations committed), and
+  // only then is the site switched to the new release and restarted; an indexer that does not start leaves it unswitched.
+  const update = updateScriptOf(script);
+  const order = ["    npm run build\n' _ $SITE_RELEASES/\\$RELEASE\n", 'if ! systemctl restart qnet-indexer.service; then\n',
+    'point $APP_USER $SITE_RELEASES \\$RELEASE ', 'systemctl restart qnet-explorer.service\n'].map((s) => update.indexOf(s));
+  assert.ok(order.every((at, i) => at > 0 && (i === 0 || at > order[i - 1])), order.join(' '));
+  assert.match(update, /if ! systemctl restart qnet-indexer\.service; then\n[\s\S]*?\n {4}exit 1\nfi\npoint \$APP_USER \$SITE_RELEASES /);
+  assert.match(doc, /The site's new release is the commit's `applications\/qnet-explorer` exported into a folder of its own, installed and built there as `aiqnet` while the site runs on from the release before; the update then restarts the indexer, which returns once its migrations are committed, and only then switches the site to the new release and restarts it; an indexer release that does not start gives way to the one before it, and the update ends with the site not switched\./);
+  assert.match(script, /\nExecStartPre=\/usr\/bin\/node \$INDEXER_FRONTEND\/dist-indexer\/main\.js --migrate-only\nTimeoutStartSec=infinity\n/);
+  assert.match(script, /\nBefore=qnet-explorer\.service\n/);
+  assert.match(doc, /its unit runs `main\.js --migrate-only` \(`ExecStartPre`\), which takes the writer lock, applies the pending migrations and exits\. The unit has no start timeout \(`TimeoutStartSec=infinity`\)/);
+});
+
+// The explorer doc's nginx: the faucet claim's own wait, between the route's longest answer and the page's wait, and the
+// certificate's paths put in the site file whenever the certificate exists, as the deploy script and the site have them.
+test('the explorer doc states the faucet claim\'s nginx wait and the certificate paths as the deploy script has them', () => {
+  const script = read('deployment/deploy-aiqnet.sh');
+  const handover = read('applications/qnet-explorer/frontend/src/lib/faucet-handover.ts');
+  const ms = (src, name) => Number(new RegExp(`export const ${name} = ([0-9_]+);`).exec(src)[1].replace(/_/g, ''));
+  const claimMs = ms(handover, 'FAUCET_CLAIM_MS');
+  assert.match(handover, /export const FAUCET_CLAIM_REQUEST_MS = FAUCET_CLAIM_MS \+ SITE_REQUEST_MS;/);
+  const requestMs = claimMs + ms(read('applications/qnet-explorer/frontend/src/lib/site-request.ts'), 'SITE_REQUEST_MS');
+  const wait = Number(/\n    location = \/api\/faucet\/claim \{\n[^}]*\n        proxy_read_timeout (\d+)s;\n    \}\n/.exec(script)[1]);
+  assert.deepEqual(script.match(/proxy_read_timeout \d+s;/g), ['proxy_read_timeout 3600s;', `proxy_read_timeout ${wait}s;`]);
+  const doc = flat('docs/applications/explorer.md');
+  const claim = `\`/api/faucet/claim\` waits ${wait} s for the app's answer, more than a claim takes at most (\`FAUCET_CLAIM_MS\`, ${claimMs / 1000} s) and less than the page waits (\`FAUCET_CLAIM_REQUEST_MS\`, ${requestMs / 1000} s), while every other location keeps nginx's 60 s`;
+  assert.ok(doc.includes(claim), claim);
+  // Step 3 when the certificate exists, and step 4 once certbot made it, put its paths in before nginx -t and the restart or reload.
+  assert.match(script, /^DOMAIN_NAME="aiqnet\.io"$/m);
+  assert.match(script, /^LE_LIVE="\/etc\/letsencrypt\/live\/\$DOMAIN_NAME"$/m);
+  assert.match(script, /\n    if \[ -f \$LE_LIVE\/fullchain\.pem \]; then\n        sed -i '\$CERT_PATHS' \/etc\/nginx\/sites-available\/\$DOMAIN_NAME\n    fi\n\n[^\n]*\n    \$NGINX_TEST\n\n[^\n]*\n    systemctl restart nginx\n/);
+  assert.match(script, /\n    certbot certonly --nginx [^\n]*\n    sed -i\.previous '\$CERT_PATHS' \/etc\/nginx\/sites-available\/\$DOMAIN_NAME\n    \$NGINX_TEST\n    systemctl reload nginx\n/);
+  assert.match(doc, /The site file is written with the self-signed certificate's paths and, whenever `\/etc\/letsencrypt\/live\/aiqnet\.io\/fullchain\.pem` exists, the script puts the certificate's paths in it before nginx restarts or reloads, so a deploy over a host that has the certificate never serves the self-signed one\./);
 });
 
 // DEV-R2-02: every fenced block in the official texts closes on a line of its own.
@@ -533,9 +599,9 @@ test('EXT-R2A-04: QNet Link 14.2 and 14.7 take a partial claim below 1 QNC, and 
   assert.doesNotMatch(p, /`amountNano` a decimal u64 of at least 1 QNC, `txHash`/);
   assert.doesNotMatch(p, /the last epoch of a claim that took part of the balance/);
   assert.match(p, /any amount above zero for a part the node's quote stopped short of the whole \(`stoppedAtEpoch` set, more epochs remain\)/);
-  assert.match(p, /`amountNano` \(decimal string\) is at least 1 QNC when `stoppedAtEpoch` is `null`, and above zero when it is set/);
+  assert.match(p, /The total is at least 1 QNC when `stoppedAtEpoch` is `null`, and above zero when it is set/);
   assert.match(p, /`amountNano` a decimal u64 of at least 1 QNC when `stoppedAtEpoch` is `null` and above zero otherwise/);
-  assert.match(p, /it is the first epoch the claim did not take/);
+  assert.match(p, /Otherwise it is the first epoch that claim did not take, as a decimal string/);
   const link = JSON.parse(read('docs/protocols/light-node.vectors.json')).link;
   const small = link.cases.filter((c) => c.intent === 'claim').map((c) => JSON.parse(c.plaintext))
     .filter((a) => a.status === 'ok' && a.stoppedAtEpoch !== null && BigInt(a.amountNano) < 1_000_000_000n);
@@ -565,17 +631,17 @@ test('SD-R2-02, SD-R3-03: the protocol quotes the app\'s consent, and the store 
   assert.match(store, new RegExp(`Google's Play Integrity API collects app activity information to tell ${verdict.source}`));
   assert.match(store, new RegExp(`\\| App activity → Installed apps \\| Collected \\*\\*only while a node is linked, on Android\\*\\*: Google Play's app-access-risk verdict, which says ${verdict.source}`));
   assert.doesNotMatch(store, /control the device are installed or running|capture the screen or control the device are running/);
-  assert.match(flat('applications/qnet-explorer/frontend/src/app/privacy/page.tsx'), verdict);
+  assert.match(flat('applications/qnet-explorer/frontend/src/i18n/locales/en.ts'), verdict);
 });
 
 // SD-R3-04: the reviewers' steps for the website's sheets name the wallet with a node (the cabinet's Device tab offers
-// nothing to link for a wallet without one) and the site's own labels, read from src/lib/texts.ts where the cabinet
+// nothing to link for a wallet without one) and the site's own labels, read from src/i18n/locales/en.ts where the cabinet
 // shows them (the tabs Overview · Device · History since 29.09), and the notes name all five sheets the app has
 // (connect, reserve, link, claim, unlink), with the activation's steps by the Activate page's own labels. The wallet
 // with a node has a device linked by then, so its Device tab reads "Move the node to another device" and offers
 // "Unlink this device" (owner, 30.09).
 test('SD-R3-04: the review steps for the website sheets use the wallet with a node and the cabinet\'s labels', () => {
-  const site = read('applications/qnet-explorer/frontend/src/lib/texts.ts');
+  const site = read('applications/qnet-explorer/frontend/src/i18n/locales/en.ts');
   const label = (key) => {
     const m = site.match(new RegExp(`^  ${key}: '((?:[^'\\\\]|\\\\.)*)',$`, 'm'));
     assert.ok(m, key);
@@ -592,19 +658,25 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   // tabs, the Device tab's button (only for a wallet with a node) and the Overview's move (of a light or a super node's
   // balance, owner 12.10).
   const cabinet = (file) => read(`applications/qnet-explorer/frontend/src/components/cabinet/${file}`);
-  assert.match(cabinet('WalletChoice.tsx'), /\{t\(device\.phone \? 'connect_app_here' : 'connect_app_qr'\)\}/);
-  assert.match(cabinet('LinkWaiting.tsx'), /<a className="btn btn-solid" href=\{href\} onClick=\{opened\}>\{t\('link_open_app'\)\}/);
+  // The connect card's one main action by device: on a phone it asks QNet Wallet (the way `app`), labelled
+  // `connect_app_here`; a computer offers QNet Wallet by QR code among the other ways.
+  assert.match(read('applications/qnet-explorer/frontend/src/lib/qnet-provider.ts'), /if \(device\.phone\) return \{ kind: 'app' \};/);
+  const choice = cabinet('WalletChoice.tsx');
+  assert.match(choice, /if \(way\.kind === 'app'\) return \['connect_app_here', 'connect_app_here_note'\];/);
+  assert.match(choice, /: <Action kind="solid" onClick=\{run\}>\{say\(label\)\}<\/Action>\}/);
+  assert.match(choice, /<Action onClick=\{showQr\}>\{say\('connect_app_qr'\)\}<\/Action>/);
+  assert.match(cabinet('LinkWaiting.tsx'), /<a className="btn btn-solid" href=\{href\} onClick=\{opened\}>\{say\('link_open_app'\)\}/);
   const tabs = read('applications/qnet-explorer/frontend/src/lib/cabinet/tabs.ts');
   assert.match(tabs, /const TAB_LABEL: Record<Tab, MessageKey> = \{[^}]*overview: 'nav_overview',[^}]*device: 'nav_device',/);
   // The same button reads "Move the node to another device" while a device is linked (owner, 30.09).
   assert.match(cabinet('LinkDevice.tsx'), /const title: MessageKey = move \? 'devices_move_title' : 'action_link_device';/);
   // The button reads `label`: the title, except the Overview's Offline action (relink).
   assert.match(cabinet('LinkDevice.tsx'), /const label: MessageKey = relink \? \(device && !device\.phone \? 'relink_button_qr' : 'relink_button'\) : title;/);
-  assert.match(cabinet('LinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\{t\(label\)\}<\/Action>/);
+  assert.match(cabinet('LinkDevice.tsx'), /onClick=\{ask\} disabled=\{!device\}>\{say\(label\)\}<\/Action>/);
   const devices = cabinet('NodeDevices.tsx');
   assert.match(devices, /if \(s === 'none' \|\| s === 'pending'\) return <NoNode pending=\{s === 'pending'\} \/>;/);
   assert.match(devices, /<LinkDevice onLinked=/);
-  assert.match(cabinet('NodeClaim.tsx'), /\{t\('claim_with_app'\)\}/);
+  assert.match(cabinet('NodeClaim.tsx'), /\{say\('claim_with_app'\)\}/);
   assert.match(cabinet('NodeHome.tsx'), /import \{ Move\b[^}]*\} from '\.\/NodeClaim';/);
   const app = read('applications/qnet-mobile/src/i18n/locales/en.js');
   const sheet = (key) => app.match(new RegExp(`${key}: (?:'((?:[^'\\\\]|\\\\.)*)'|"([^"]*)")`)).slice(1).find((x) => x !== undefined).replace(/\\'/g, "'");
@@ -625,7 +697,7 @@ test('SD-R3-04: the review steps for the website sheets use the wallet with a no
   assert.ok(demo.includes(`"${label('act_start')}" > "${open}" (sheet 2), send the amounts, "${label('act_burn')}", "${label('act_link_open')}" > "${open}" (sheet 3 with consent)`), demo);
   const activate = cabinet('NodeActivate.tsx');
   for (const key of ['act_start', 'act_burn']) assert.ok(activate.includes(`{t('${key}')}`), key);
-  assert.ok(activate.includes("{t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}"), 'act_link_open');
+  assert.ok(activate.includes("{say(device?.phone ? 'act_link_open' : 'act_link_show_qr')}"), 'act_link_open');
   assert.doesNotMatch(demo, /Wallet B: no node\. Link sheet|connect QNet Wallet|Ask QNet Wallet|Devices >/);
   const play = flat('applications/qnet-mobile/store-listing/README.md').match(/3\. \*Website request sheets\*: "(.*?)"/)[1];
   assert.match(play, /^With the wallet of set 1 \(the one with a node\)/);
@@ -1007,6 +1079,40 @@ test('the claim names the node: QNet Link, the extension, the site and the node 
   assert.match(flat('docs/applications/explorer.md'), /a `claim` request to QNet Wallet that names the wallet and the node/);
 });
 
+// One confirmation moves the whole balance shown, in one claim or several, and answers once with the section 14.7 keys;
+// the app sends a next claim only while CLAIM_ANSWER_MARGIN_S of the relay's session is left, the extension only within
+// CLAIM_RUN_MS of the page's call, and the documents state both bounds as the code has them.
+test('a claim answer is the total of its run, and each wallet ends its run in time, as the documents state it', () => {
+  const p = flat('docs/protocols/qnet-link-v1.md');
+  assert.match(p, /`amountNano` \(decimal string\) is what they moved: the sum of their amounts, except that a last claim the wallet saw taken only in part counts the part the network applied, and one it saw expire counts nothing/);
+  assert.match(p, /`txHash` \(64 lowercase hex\) is the hash of the last claim it counts/);
+  assert.match(p, /`stoppedAtEpoch` is `null` when they moved the whole balance and total at least 1 QNC/);
+  assert.match(p, /A claim after the first that fails ends the run short, and the answer is `ok` with the claims before it/);
+  assert.match(p, /An `ok` answer of either way is shown as the wallet's report: the total moved, what is left from `stoppedAtEpoch` on only when the answer names that epoch \(in words also true when nothing is left\), and the last claim's transaction \(`txHash`\) as a link/);
+  assert.match(flat('docs/applications/explorer.md'), /the total moved, that anything left stays in the node balance from the epoch the answer names, only when it names one \(`stoppedAtEpoch`, which a whole balance below 1 QNC names too\), and the last transaction as a link to its page/);
+  // A quote is a claim request the node counts against the address: a next one goes only to nodes that applied the part
+  // before, and any quote passes over a node that cannot serve, has that limit spent, or is busy, in both wallets.
+  const nodes = read('applications/qnet-wallet/dist/background/nodes.js');
+  const manager = read('applications/qnet-mobile/src/components/WalletManager.js');
+  for (const source of [nodes, manager]) assert.match(source, /code === 'rate_limited' \|\| \w+\.code === 'claim_busy' \|\| \/rate limit exceeded\|already in progress\/i/);
+  assert.match(nodes, /const among = after === null \? pickNodes\(QNET\.NODES\.length\) : await appliedFirst\(nodeId, after\);\n {2}if \(among\.length < 2\) return \{ behind: true \};/);
+  assert.match(manager, /const quoteNodes = after === null \? this\.getTrustedNodes\(GENESIS_NODES\.length\) : await this\._appliedFirst\(nodeId, after\);\n {6}if \(quoteNodes\.length < 2\) throw WalletManager\.claimBehind\(\);/);
+  assert.match(p, /A next claim is quoted only at genesis nodes whose node balance read shows the claim before applied/);
+  assert.match(flat('applications/qnet-wallet/CONTRACTS.md'), /only at pinned nodes whose `pending` read shows that part applied \(`appliedFirst`/);
+  assert.match(flat('docs/applications/mobile-wallet.md'), /only at genesis nodes whose node balance read shows it applied \(a first unclaimed epoch past it, or nothing left\), then at those that answered with none \(`WalletManager\._appliedFirst`/);
+  const link = read('applications/qnet-mobile/src/services/QNetLink.js');
+  const margin = Number(/^  CLAIM_ANSWER_MARGIN_S: (\d+),$/m.exec(link)?.[1]);
+  assert.ok(margin > 0 && margin < Number(/^  SESSION_TTL_S: (\d+),$/m.exec(link)?.[1]), 'the app\'s margin is inside the session');
+  assert.ok(p.includes(`only while at least ${margin} s of the session remain. A wait for a claim's block ends at that moment too`));
+  assert.ok(flat('docs/applications/mobile-wallet.md').includes(`\`LINK.CLAIM_ANSWER_MARGIN_S\` = ${margin} seconds`));
+  const runMs = Number(/^const CLAIM_RUN_MS = (\d+);$/m.exec(read('applications/qnet-wallet/dist/background/provider.js'))?.[1]);
+  const waitMin = Number(/^const CLAIM_TIMEOUT_MS = (\d+) \* 60_000;$/m.exec(read('applications/qnet-explorer/frontend/src/lib/qnet-link.ts'))?.[1]);
+  assert.ok(runMs > 0 && runMs % 1000 === 0 && runMs < waitMin * 60_000, 'the extension\'s run starts no part past the page\'s wait');
+  assert.ok(p.includes(`only within ${runMs / 1000} s of the page's call, when a wait for a claim's block ends too, so that its one answer comes inside the page's ${waitMin}-minute wait`));
+  assert.ok(flat('docs/applications/browser-wallet.md').includes(`A next part starts only within ${runMs / 1000} s of the site's request`));
+  assert.ok(flat('applications/qnet-wallet/CONTRACTS.md').includes(`\`until\` = the approval's \`createdAt\` + ${runMs / 1000} s`));
+});
+
 // Owner, 12.10: the documents name the system "QNet Blockchain" and in no other way, and quote the node's own texts.
 test('the documents name the system QNet Blockchain and quote the node texts that name it', () => {
   const files = [...markdownUnder('docs'), 'README.md', 'applications/qnet-mobile/store-listing/README.md',
@@ -1026,4 +1132,50 @@ test('the documents name the system QNet Blockchain and quote the node texts tha
   assert.ok(flat('docs/developers/rpc-api.md').includes(`error: "${walletHasNode}", node_id}`));
   assert.ok(read('development/qnet-integration/src/node/activation.rs').includes('"This wallet already has a {} node on QNet Blockchain ({}).'));
   assert.ok(flat('docs/operators/running-a-node.md').includes('("This wallet already has a light node on QNet Blockchain (...)", naming the other node)'));
+});
+
+// Both wallets show an archive row past the node's TX_INDEX_RETENTION_BLOCKS window, and a token row past its
+// MICROBLOCK_BODY_RETENTION_BLOCKS window, as in a block; a row inside the index but past the listing is looked up by its
+// hash, as many reads as each document says, and the documents state both windows with their values.
+test('both wallets judge an archive row by the node\'s windows and look up the rows past the listing, as the documents state it', () => {
+  // A constant's factors as its source writes them (`6 * 14_400`), and its value.
+  const factors = (file, pattern) => {
+    const m = pattern.exec(read(file));
+    assert.ok(m, file);
+    return m[1].split('*').map((f) => Number(f.trim().replace(/_/g, '')));
+  };
+  const product = (list) => list.reduce((a, b) => a * b, 1);
+  const constant = (file, pattern) => product(factors(file, pattern));
+  const grouped = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const blocks = constant('development/qnet-integration/src/storage/mod.rs', /^pub const TX_INDEX_RETENTION_BLOCKS: u64 = ([0-9_]+);$/m);
+  assert.ok(blocks > 0);
+  assert.equal(constant('applications/qnet-mobile/src/utils/txHistory.js', /^export const TX_INDEX_RETENTION_BLOCKS = ([0-9_]+);$/m), blocks, 'the app');
+  assert.equal(constant('applications/qnet-wallet/dist/background/qnet.js', /^const TX_INDEX_RETENTION_BLOCKS = ([0-9_]+);$/m), blocks, 'the extension');
+  const value = grouped(blocks);
+  assert.ok(flat('docs/architecture/state.md').includes(`\`TX_INDEX_RETENTION_BLOCKS\` = ${value} blocks`));
+  assert.ok(flat('docs/applications/mobile-wallet.md').includes(`\`TX_INDEX_RETENTION_BLOCKS\` = ${value} blocks (about 28 hours) of its transaction index`));
+  assert.ok(flat('docs/applications/browser-wallet.md').includes(`whose block is \`TX_INDEX_RETENTION_BLOCKS\` = ${value} or more below the head two pinned nodes report`));
+  assert.ok(flat('applications/qnet-wallet/CONTRACTS.md').includes(`\`TX_INDEX_RETENTION_BLOCKS\` (${value}) or more below the head two pinned nodes report`));
+  // The logs window: no token transfer, log or logs proof at or below the floor a node reports, which the node keeps at
+  // most MICROBLOCK_BODY_RETENTION_BLOCKS below its head.
+  const logsFactors = factors('development/qnet-integration/src/node/mod.rs', /^pub const MICROBLOCK_BODY_RETENTION_BLOCKS: u64 = ([0-9_]+(?: \* [0-9_]+)*);$/m);
+  const logs = product(logsFactors);
+  assert.ok(logs > 0);
+  assert.equal(constant('applications/qnet-mobile/src/utils/txHistory.js', /^export const MICROBLOCK_BODY_RETENTION_BLOCKS = ([0-9_]+);$/m), logs, 'the app');
+  assert.equal(constant('applications/qnet-wallet/dist/background/qnet.js', /^const MICROBLOCK_BODY_RETENTION_BLOCKS = ([0-9_]+);$/m), logs, 'the extension');
+  const logsValue = grouped(logs);
+  assert.ok(flat('docs/architecture/state.md').includes(`\`MICROBLOCK_BODY_RETENTION_BLOCKS\` = ${logsFactors.map(grouped).join(' × ')} = ${logsValue} blocks`));
+  assert.ok(flat('docs/applications/mobile-wallet.md').includes(`\`MICROBLOCK_BODY_RETENTION_BLOCKS\` = ${logsValue} blocks`));
+  assert.ok(flat('docs/applications/browser-wallet.md').includes(`\`MICROBLOCK_BODY_RETENTION_BLOCKS\` = ${logsValue} below the head two pinned nodes report`));
+  assert.ok(flat('applications/qnet-wallet/CONTRACTS.md').includes(`\`MICROBLOCK_BODY_RETENTION_BLOCKS\` (${logsValue}) below the head two pinned nodes report`));
+  // The lookups by hash: the most rows one History read asks about.
+  const appLookups = constant('applications/qnet-mobile/src/utils/txHistory.js', /^export const HISTORY_LOOKUP_ROWS = (\d+);$/m);
+  assert.ok(appLookups > 0 && flat('docs/applications/mobile-wallet.md').includes(`\`HISTORY_LOOKUP_ROWS\` = ${appLookups} rows a read`));
+  const extLookups = constant('applications/qnet-wallet/dist/background/qnet.js', /^const ROW_LOOKUPS = (\d+);$/m);
+  assert.ok(extLookups > 0 && flat('applications/qnet-wallet/CONTRACTS.md').includes(`at most \`ROW_LOOKUPS\` (${extLookups}) rows a read`));
+  assert.ok(flat('docs/applications/browser-wallet.md').includes(`at most ${extLookups} rows a read`));
+  // An Unverified row is never said to be older than what the nodes keep.
+  for (const file of ['docs/applications/browser-wallet.md', 'applications/qnet-wallet/CONTRACTS.md', 'applications/qnet-wallet/dist/ui/i18n/en.js']) {
+    assert.doesNotMatch(flat(file), /older than what they keep|older than their window/, file);
+  }
 });

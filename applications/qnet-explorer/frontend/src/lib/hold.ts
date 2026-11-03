@@ -1,10 +1,11 @@
-// When a live list holds its newest rows, so nothing moves under a pointer or a finger (B-SPEC 3.6), and how it says
+// When a live list holds its newest rows, so nothing moves under a pointer or a finger, and how it says
 // what waits. A mouse or pen over the list and focus inside it hold it while they last; a touch holds it from the press
 // until TOUCH_HOLD_MS after the last touch there, and after a touch a scroll while the list is on screen holds it the
 // same way, so a row does not move between aiming at it and tapping it; a list scrolled away from its newest end holds
 // until it is back there. Framework-free, so the rules are testable; components/ui/useHold.ts wires them to the page.
 
 import { int } from './format.ts';
+import type { T } from './texts.ts';
 
 export const TOUCH_HOLD_MS = 3_000;
 
@@ -52,7 +53,7 @@ export function heldBack<T>(shown: readonly T[] | null, latest: readonly T[] | n
 }
 
 // What the list's label says while it holds: what waits ("3 new", "12+ new"), or that it is paused.
-export function heldText(back: { count: number; more: boolean }, touch: boolean): string {
-  if (back.count > 0) return `${int(back.count)}${back.more ? '+' : ''} new`;
-  return touch ? 'Paused' : 'Paused while you point at it';
+export function heldText(back: { count: number; more: boolean }, touch: boolean, t: T): string {
+  if (back.count > 0) return t(back.more ? 'held_new_more' : 'held_new', { count: int(back.count) });
+  return t(touch ? 'held_paused' : 'held_paused_pointer');
 }

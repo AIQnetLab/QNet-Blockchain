@@ -3,7 +3,7 @@
 // (MS1-04), and the phrase is not shown or typed before the apps that can read the screen are named (MS1-06).
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { AppState, Text, TextInput } from 'react-native';
+import { AppState, Linking, Text, TextInput } from 'react-native';
 
 const mockQNET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const mockSOL = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
@@ -18,19 +18,12 @@ jest.mock('../src/services/DeviceSecurity', () => ({
 }));
 
 jest.mock('../src/components/WalletManager', () => {
-  class VaultCorruptError extends Error {}
-  const words = 'abandon ability able about above absent absorb abstract absurd abuse access accident'.split(' ');
-  class FakeWalletManager {
+  const { WORDS, fakeWalletManager, walletManagerModule, recipientAddress } = require('../test-support/walletMocks');
+  class FakeWalletManager extends fakeWalletManager({ qnet: mockQNET, sol: mockSOL, light: 'light_x', superNode: 'super_x' }) {
     constructor() {
+      super();
       mockState.instances.push(this);
-      return new Proxy(this, {
-        get: (target, prop) => {
-          if (prop in target || typeof prop === 'symbol' || prop === 'then') return target[prop];
-          return async () => null;
-        },
-      });
     }
-    async prepareInstall() {}
     async purgeLegacyBiometric() { return false; }
     async legacyBiometricNotice() { return false; }
     async vaultState() { return mockState.vault; }
@@ -39,63 +32,54 @@ jest.mock('../src/components/WalletManager', () => {
     async unlockWithBiometrics() { return mockState.lock ? { ok: true, token: 'session-token' } : null; }
     async isBiometricEnabled() { return !!mockState.bio; }
     async confirmWithBiometrics(reason, note) { mockState.bioCalls.push([reason, note]); return mockState.bioAnswer; }
-    async isBiometricSupported() { return false; }
-    async getPasswordLockStatus() { return { locked: false }; }
-    async unlockWithPassword() { return { ok: true, token: 'session-token' }; }
-    async checkPassword() { return { ok: true }; }
     async canStoreNewWallet() { return true; }
-    async loadWallet() { return { address: mockSOL, solanaAddress: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
-    async generateWallet() { mockState.generated += 1; return { mnemonic: words.join(' '), address: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
-    async revealMnemonic() { return { ok: true, mnemonic: words.join(' ') }; }
-    getBIP39WordList() { return [...words, 'zebra', 'zero', 'zone', 'zoo']; }
-    getTrustedNodes() { return []; }
-    trustedNodeUrl() { return 'https://node.invalid'; }
+    async generateWallet() { mockState.generated += 1; return { mnemonic: WORDS.join(' '), address: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
+    async revealMnemonic() { return { ok: true, mnemonic: WORDS.join(' ') }; }
     async getQNCBalanceWithProof() { return { ok: true, balance: 1, balanceNano: '1000000000', verified: true }; }
     // The send check's read (the live figure less this wallet's own unsettled spends): the same figure.
-    async qncForSend() { return { ok: true, balanceNano: '1000000000', nonce: '4', pending: [] }; }
+    // A test that holds the check (mockState.checkGate) finds it still running until it lets it go.
+    async qncForSend() {
+      if (mockState.checkGate) await mockState.checkGate;
+      return { ok: true, balanceNano: '1000000000', nonce: '4', pending: [] };
+    }
     async getTokenHoldings() { return []; }
+    // An added token's balance (mockState.token: its read, as the token list and a send's check take it), its units,
+    // its transfer's QNC, and the transfer itself, each sent counted.
+    async getTokenBalanceOf() { return mockState.token ? { ok: true, balanceBaseUnits: mockState.token.base, balance: mockState.token.balance } : null; }
+    async checkedTokenBalance() { return mockState.token ? { ok: true, balanceBase: mockState.token.base, pending: [], balance: mockState.token.balance } : null; }
+    toBaseUnits(v, d) { const [whole, frac = ''] = String(v).split('.'); return BigInt(whole + frac.padEnd(d, '0')).toString(); }
+    _formatBaseUnits(base, decimals) { return require('../src/browser/dappRequests').formatUnits(base, decimals); }
+    qrc20TransferFeeNano() { return 150000; }
+    async qrc20TransferQncNeedNano() { return { feeNano: 150000, depositNano: 0, needNano: 150000 }; }
+    async qrc20Transfer(...args) { mockState.tokenSends.push(args); return { tx_hash: 'f'.repeat(64), submitNonce: 5 }; }
     async pendingTransactions() { return mockState.pending; }
     // This wallet's kept transactions as Assets lists them (WalletManager.keptTransactions).
     async keptTransactions() { return mockState.kept; }
     // The wallet's figure at a genesis node's live tip: what the test says (none by default).
     async liveQncFigure() { return mockState.live; }
-    async previewSend() { return mockState.preview; }
-    async sendTransaction(...args) { mockState.sends.push(args); return { success: true, txHash: 'f'.repeat(64), ...mockState.sent }; }
-    generateQNetAddressFromSolana() { return mockQNET; }
-    generateLightNodePseudonym() { return 'light_x'; }
-    generateSuperNodePseudonym() { return 'super_x'; }
-    sessionOpen() { return true; }
+    // A test that holds the read of the unconfirmed transactions (previewGate) or the submit (sendGate) lets it go itself.
+    async previewSend() {
+      if (mockState.previewGate) await mockState.previewGate;
+      return mockState.preview;
+    }
+    async sendTransaction(...args) {
+      mockState.sends.push(args);
+      if (mockState.sendGate) await mockState.sendGate;
+      return { success: true, txHash: 'f'.repeat(64), ...mockState.sent };
+    }
+    // The chain's answer at a send's nonce: the test's, else nothing decided.
+    async resolveSubmitByNonce() { return mockState.nonceAnswer; }
     closeSession() { mockState.closed += 1; }
   }
-  FakeWalletManager.MIN_PASSWORD_LENGTH = 8;
-  FakeWalletManager.publicWallet = (w) => ({ ...w });
-  FakeWalletManager.canonicalAddress = (a) => a;
   FakeWalletManager.deviceAuthCredential = (reason) => Object.freeze({ reason });
   FakeWalletManager.isSessionToken = (x) => x === 'session-token';
-  // The real rule (MOBNET-R4-01): value goes only to a checksummed EON address; 64 hex is a contract or a hash.
-  FakeWalletManager.recipientAddress = (a) => {
-    if (!/^[0-9a-f]{19}eon[0-9a-f]{23}$/.test(String(a))) throw Object.assign(new Error('not an account'), { code: 'HEX_RECIPIENT' });
-    return a;
-  };
-  return { __esModule: true, default: FakeWalletManager, WalletManager: FakeWalletManager, VaultCorruptError };
+  FakeWalletManager.recipientAddress = recipientAddress;
+  return walletManagerModule(FakeWalletManager);
 });
 
-jest.mock('../src/services/PushService', () => ({
-  readUnconfirmedBinding: jest.fn(async () => null),
-  settleUnconfirmedBinding: jest.fn(async () => false),
-  BG_REFRESH_STATUS_KEY: 'qnet_bg_refresh_status',
-  checkNodeStatus: jest.fn(async () => null),
-  readdressIfOwed: jest.fn(async () => false),
+jest.mock('../src/services/PushService', () => require('../test-support/walletMocks').pushServiceModule({
   selfAttestIfNeeded: jest.fn(async () => true),
   checkServerNodeStatus: jest.fn(async () => ({ success: false })),
-  getAllNodesByWallet: jest.fn(async () => ({ success: true, nodes: [] })),
-  getWalletNodeEvents: jest.fn(async () => ({ success: true, nodes: [] })),
-  getNodeEpochs: jest.fn(async () => null),
-  getPendingRewards: jest.fn(async () => ({ success: true, pendingRewards: 0 })),
-  refreshFcmTokenOnServer: jest.fn(async () => ({})),
-  isTokenRefreshNeeded: jest.fn(async () => false),
-  teardownLightNode: jest.fn(async () => {}),
-  teardownLightNodeIfForeign: jest.fn(async () => {}),
 }));
 jest.mock('../src/services/HistoryCache', () => ({ loadCachedHistory: jest.fn(async () => []), saveCachedHistory: jest.fn(async () => {}) }));
 jest.mock('react-native-qrcode-svg', () => {
@@ -106,9 +90,9 @@ jest.mock('react-native-qrcode-svg', () => {
 const mockLinks = {};
 jest.mock('../src/services/QNetLink', () => ({
   parseLink: jest.fn((url) => mockLinks[url] || null),
-  takeInitialUrl: jest.fn(async () => null),
   openSession: jest.fn(), prepareOffer: jest.fn(), performIntent: jest.fn(), deliverAnswer: jest.fn(), markHandled: jest.fn(),
   readOffer: jest.requireActual('../src/services/QNetLink').readOffer,
+  otherNodeHint: jest.fn(async () => null),
   LinkRefusal: class LinkRefusal extends Error {},
 }));
 
@@ -116,8 +100,8 @@ const { makeT } = require('../src/i18n');
 const t = makeT('en');
 const AsyncStorage = require('@react-native-async-storage/async-storage');
 const WalletScreen = require('../src/screens/WalletScreen').default;
+const { flush, pressId, openQncSend, explorerAction, networkFree } = require('../test-support/screen');
 
-const flush = async (n = 4) => { for (let i = 0; i < n; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
 // What the screen shows: an action's other label, held at no height to keep its width (components/ui/Action), is not.
 const texts = (tree) => tree.root.findAllByType(Text).filter((n) => !n.props.accessibilityElementsHidden)
   .map((n) => [].concat(n.props.children).flat(Infinity).filter((c) => typeof c === 'string').join('')).join('\n');
@@ -130,6 +114,10 @@ function pressable(tree, text) {
 const press = async (tree, key) => { await act(async () => { await pressable(tree, t(key)).props.onPress(); }); await flush(); };
 // For a press whose handler waits on a dialog the test answers next.
 const tap = async (tree, key) => { await act(async () => { pressable(tree, t(key)).props.onPress(); }); await flush(); };
+const pressTab = async (tree, tab) => {
+  await act(async () => { tree.root.find((n) => n.props.testID === `tab-${tab}` && typeof n.props.onPress === 'function').props.onPress(); });
+  await flush(2);
+};
 const input = (tree, key) => tree.root.findAll((n) => n.type === TextInput && n.props.placeholder === t(key))[0];
 const type = async (tree, key, value) => { await act(async () => { input(tree, key).props.onChangeText(value); }); await flush(1); };
 
@@ -152,6 +140,7 @@ beforeEach(async () => {
   Object.assign(mockState, {
     vault: 'none', instances: [], closed: 0, generated: 0, pending: [], preview: null, sends: [],
     bio: false, bioCalls: [], bioAnswer: { ok: false, fallback: true }, lock: false, kept: [], live: null, sent: null,
+    checkGate: null, previewGate: null, sendGate: null, nonceAnswer: null, token: null, tokenSends: [],
   });
   mockClock.mono = 1_000_000;
   mockReaders.list = [];
@@ -486,18 +475,32 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
     await flush(4);
   }
 
-  async function sendForm(to = TO) {
+  // `open` opens the QNC Send form: Send's token picker on Assets, or the QNC token's own screen and its Send.
+  async function sendForm(to = TO, open = openQncSend, amount = '0.5') {
     mockState.vault = 'ok';
     const tree = await mount();
     await type(tree, 'enter_password', 'Otter-Canyon-58');
     await press(tree, 'unlock_wallet');
     await flush(6);
-    await press(tree, 'assets_send');
+    await open(tree);
     await type(tree, 'send_placeholder_eon', to);
-    await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText('0.5'); });
+    await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText(amount); });
     await flush(1);
     return tree;
   }
+  // A send the user confirmed, its submit held until the test lets it go (the returned function).
+  async function confirmedSend(tree) {
+    let release;
+    mockState.sendGate = new Promise((r) => { release = r; });
+    await tap(tree, 'send_button');
+    await flush(4);
+    await review(tree);
+    await confirmPassword(tree);
+    expect(mockState.sends).toHaveLength(1);
+    return async () => { await act(async () => { release(); }); await flush(6); };
+  }
+  const resultUp = (tree) => tree.root.findAll((n) => n.props.testID === 'tx-result-done').length > 0;
+  const sendBusy = (tree) => tree.root.findAll((n) => n.props.testID === 'send-busy').length > 0;
 
   it('names it, and signs nothing until the user chooses; Replace signs at its nonce', async () => {
     mockState.pending = [{ nonce: 5 }];
@@ -561,6 +564,372 @@ describe('a send while this wallet has an unconfirmed transaction (MOBNET-R1-01)
     await review(tree);
     await confirmPassword(tree);
     expect(mockState.sends).toHaveLength(1);
+  });
+
+  // The result card says the state at the top, keeps the details on one card and Done at its foot.
+  it('the result of a send: Pending at the top, the recipient, the fee reviewed and the hash on its card, Done at the foot', async () => {
+    const tree = await sendForm();
+    await tap(tree, 'send_button');
+    await flush(4);
+    await review(tree);
+    await confirmPassword(tree);
+    expect(mockState.sends).toHaveLength(1);
+    const status = tree.root.findAll((n) => n.type === Text && n.props.testID === 'tx-result-status-pending');
+    expect(status.map((n) => n.props.children)).toEqual([t('hist_status_pending')]);
+    const card = tree.root.find((n) => n.props.testID === 'tx-result-details' && typeof n.type === 'string');
+    const onCard = card.findAllByType(Text).map((n) => [].concat(n.props.children).join(''));
+    expect(onCard).toEqual(expect.arrayContaining([t('tx_to'), TO, t('tx_detail_fee'), '0.00015 QNC', t('tx_label'), 'f'.repeat(64)]));
+    const foot = tree.root.find((n) => n.props.testID === 'tx-result-actions' && typeof n.type === 'string');
+    expect(foot.findAll((n) => n.props.testID === 'tx-result-done' && typeof n.props.onPress === 'function').length).toBeGreaterThan(0);
+    expect(texts(tree)).not.toContain('Waiting for confirmation.');
+    await press(tree, 'common_done');
+    expect(tree.root.findAll((n) => n.props.testID === 'tx-result-actions')).toHaveLength(0);
+  });
+
+  // Done leads to the same place wherever the send began: Assets' token list, never back to a token's own screen.
+  it('Done on a send the network took opens Assets\' token list, for a send begun on a token\'s own screen too', async () => {
+    const fromToken = async (tree) => {
+      await pressId(tree, 'qnet-row-QNC');
+      expect(texts(tree)).toContain(t('tok_information'));
+      await pressId(tree, 'token-send');
+    };
+    for (const open of [fromToken, openQncSend]) {
+      const tree = await sendForm(TO, open);
+      await tap(tree, 'send_button');
+      await flush(4);
+      await review(tree);
+      await confirmPassword(tree);
+      expect(tree.root.findAll((n) => n.props.testID === 'tx-result-done').length).toBeGreaterThan(0);
+      await press(tree, 'common_done');
+      expect(texts(tree)).not.toContain(t('tok_information'));
+      expect(texts(tree)).not.toContain(t('send_title', { symbol: 'QNC' }));
+      expect(texts(tree)).toContain(t('assets_send'));
+      await act(async () => { mounted.pop().unmount(); });
+      mockState.sends = [];
+    }
+  });
+
+  // Send's picker on Assets offers QNC and every QNet token Assets shows; the form sends the one chosen there, a token
+  // through its own transfer in its own units, its fee in QNC.
+  it('a QNet token chosen in Send\'s picker is sent as that token: its contract, the recipient and the amount in its units', async () => {
+    const C = 'c'.repeat(64);
+    await AsyncStorage.setItem('qnet_custom_tokens', JSON.stringify([{ contract_address: C, symbol: 'TKN', name: 'Token', decimals: 2 }]));
+    mockState.token = { base: '1000', balance: '10' };
+    const pick = async (tree) => {
+      await pressId(tree, 'assets-send');
+      expect(['pick-QNC', `pick-${C.slice(0, 12)}`].map((id) => tree.root.findAll((n) => n.props.testID === id).length > 0)).toEqual([true, true]);
+      await pressId(tree, `pick-${C.slice(0, 12)}`);
+    };
+    const tree = await sendForm(TO, pick, '2.5');
+    expect(texts(tree)).toContain(t('send_title', { symbol: 'TKN' }));
+    await tap(tree, 'send_button');
+    await flush(4);
+    await review(tree);
+    await confirmPassword(tree);
+    expect(mockState.tokenSends).toEqual([[C, TO, '250', expect.anything(), { choice: null }]]);
+    expect(mockState.sends).toEqual([]);
+  });
+
+  // The review waits for the user, so it holds nothing (utils/userAction).
+  it('a send holds the background verification while it is checked and while it is sent, not while it is reviewed', async () => {
+    let checked;
+    let sent;
+    mockState.checkGate = new Promise((r) => { checked = r; });
+    mockState.sendGate = new Promise((r) => { sent = r; });
+    const tree = await sendForm();
+    expect(await networkFree()).toBe(true);
+    await tap(tree, 'send_button');
+    expect(await networkFree()).toBe(false);
+    await act(async () => { checked(); });
+    await flush(4);
+    expect([texts(tree).includes(t('send_review_title')), await networkFree()]).toEqual([true, true]);
+    await review(tree);
+    await confirmPassword(tree);
+    expect([mockState.sends.length, await networkFree()]).toEqual([1, false]);
+    await act(async () => { sent(); });
+    await flush(6);
+    expect([resultUp(tree), await networkFree()]).toEqual([true, true]);
+  });
+
+  it('the Assets tab leaves a Send form whose send is still being checked: no review comes up and nothing is signed', async () => {
+    let release;
+    mockState.checkGate = new Promise((r) => { release = r; });
+    const tree = await sendForm();
+    await tap(tree, 'send_button');
+    await pressTab(tree, 'assets');
+    expect(texts(tree)).not.toContain(t('send_title', { symbol: 'QNC' }));
+    await act(async () => { release(); });
+    await flush(6);
+    expect(texts(tree)).not.toContain(t('send_review_title'));
+    expect(mockState.sends).toEqual([]);
+    expect(texts(tree)).toContain(t('assets_send'));
+  });
+
+  it('a send whose form closed while it was checked asks nothing: no Unconfirmed transactions dialog over the token list', async () => {
+    mockState.pending = [{ nonce: 5 }];
+    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false };
+    // Closed while the balance was read, and while the unconfirmed transactions were read for the dialog.
+    for (const gate of ['checkGate', 'previewGate']) {
+      let release;
+      mockState[gate] = new Promise((r) => { release = r; });
+      const tree = await sendForm();
+      await tap(tree, 'send_button');
+      await pressTab(tree, 'assets');
+      await act(async () => { release(); });
+      await flush(6);
+      expect([gate, texts(tree).includes(t('pending_dialog_title'))]).toEqual([gate, false]);
+      expect(texts(tree)).toContain(t('assets_send'));
+      await act(async () => { mounted.pop().unmount(); });
+      mockState[gate] = null;
+    }
+  });
+
+  it('Back while a short send is checked, then another form: no refusal of the old send, and the new form is not busy', async () => {
+    let release;
+    mockState.checkGate = new Promise((r) => { release = r; });
+    const tree = await sendForm(TO, openQncSend, '5');
+    await tap(tree, 'send_button');
+    expect(sendBusy(tree)).toBe(true);
+    await press(tree, 'common_back');
+    await openQncSend(tree);
+    expect(texts(tree)).toContain(t('send_title', { symbol: 'QNC' }));
+    expect(sendBusy(tree)).toBe(false);
+    await act(async () => { release(); });
+    await flush(6);
+    expect(texts(tree)).not.toContain(t('send_cannot_title'));
+    expect(resultUp(tree)).toBe(false);
+    // The same short send on a form that stays open is refused, saying why.
+    await type(tree, 'send_placeholder_eon', TO);
+    await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText('5'); });
+    await tap(tree, 'send_button');
+    await flush(4);
+    expect(texts(tree)).toContain(t('send_cannot_title'));
+  });
+
+  it('a send the network refused after the user confirmed it is said, though its form closed meanwhile', async () => {
+    mockState.sent = { success: false, error: 'refused', code: 'NONCE_TAKEN' };
+    const tree = await sendForm();
+    const submit = await confirmedSend(tree);
+    await pressTab(tree, 'assets');
+    await submit();
+    expect(texts(tree)).toContain(t('tx_failed_title'));
+    expect(resultUp(tree)).toBe(true);
+  });
+
+  it('the Assets tab with a send\'s result up removes the card and opens the token list', async () => {
+    const tree = await sendForm();
+    const submit = await confirmedSend(tree);
+    await submit();
+    expect(resultUp(tree)).toBe(true);
+    await pressTab(tree, 'assets');
+    expect(resultUp(tree)).toBe(false);
+    expect(texts(tree)).not.toContain(t('send_title', { symbol: 'QNC' }));
+    expect(texts(tree)).toContain(t('assets_send'));
+  });
+
+  it('a result that arrived while the Browser tab was open: the Assets tab shows it first, a second press opens the token list', async () => {
+    const tree = await sendForm();
+    const submit = await confirmedSend(tree);
+    await pressTab(tree, 'browser');
+    await submit();
+    expect(resultUp(tree)).toBe(false);
+    await pressTab(tree, 'assets');
+    expect(resultUp(tree)).toBe(true);
+    await pressTab(tree, 'assets');
+    expect(resultUp(tree)).toBe(false);
+    expect(texts(tree)).toContain(t('assets_send'));
+  });
+
+  // Every tab, tapped, opens its first page: History, Node, Settings and Browser leave no result card up over it, and
+  // Browser does not hide one until the next tab.
+  it('every other tab tapped over a send\'s result opens its own first page; the card goes as its Done makes it go', async () => {
+    const lit = (tree) => tree.root.findAll((n) => /^tab-[a-z]+$/.test(n.props.testID || '') && typeof n.props.onPress === 'function'
+      && n.props.accessibilityState.selected).map((n) => n.props.testID);
+    for (const tab of ['history', 'node', 'settings', 'browser']) {
+      const tree = await sendForm();
+      const submit = await confirmedSend(tree);
+      await submit();
+      expect(resultUp(tree)).toBe(true);
+      await pressTab(tree, tab);
+      expect([tab, resultUp(tree), lit(tree)]).toEqual([tab, false, [`tab-${tab}`]]);
+      // Done's rule ran (a send the network took leaves Assets on its token list), and nothing comes back over Assets.
+      await pressTab(tree, 'assets');
+      expect([tab, resultUp(tree), texts(tree).includes(t('send_title', { symbol: 'QNC' })), texts(tree).includes(t('assets_send'))])
+        .toEqual([tab, false, false, true]);
+      await act(async () => { mounted.pop().unmount(); });
+      mockState.sends = [];
+    }
+  });
+
+  // The timers the screen starts from now on: the newest one of `ms` (its handle), and whether a handle was cleared.
+  const watchTimers = () => {
+    const set = jest.spyOn(global, 'setTimeout');
+    const clear = jest.spyOn(global, 'clearTimeout');
+    const newestAt = (ms) => set.mock.calls.map((c) => c[1]).lastIndexOf(ms);
+    return {
+      newest: (ms) => set.mock.results[newestAt(ms)].value,
+      cleared: (handle) => clear.mock.calls.some((c) => c[0] === handle),
+      // The newest of them run now, cleared first so it does not run again later.
+      fire: async (ms) => {
+        const at = newestAt(ms);
+        clearTimeout(set.mock.results[at].value);
+        await act(async () => { await set.mock.calls[at][0](); });
+        await flush(6);
+      },
+    };
+  };
+
+  // A send's settle by nonce (180 s, then every 30 s for half an hour) and its 2 s hash poll end with the screen, never
+  // with a change of tab: leaving Assets does not end the poll of a send still on its way.
+  it('a send\'s follow-up goes on whichever tab is open, and ends with the screen: its poll and its settle by nonce', async () => {
+    const timers = watchTimers();
+    const tree = await sendForm();
+    const submit = await confirmedSend(tree);
+    await submit();
+    const poll = timers.newest(2000);
+    const settle = timers.newest(180000);
+    await pressTab(tree, 'history');
+    expect([timers.cleared(poll), timers.cleared(settle)]).toEqual([false, false]);
+    await act(async () => { mounted.pop().unmount(); });
+    expect([timers.cleared(poll), timers.cleared(settle)]).toEqual([true, true]);
+  });
+
+  // The chain's answer at the send's nonce settles its card (its settle by nonce, due 3 minutes on, run now): a send no
+  // block took keeps its hash with no explorer page; one bound to nothing names the transaction that applied there.
+  async function settledBy(answer) {
+    const timers = watchTimers();
+    mockState.sent = { from: mockQNET, to: TO, nonce: 5, amountNano: 500_000_000 };
+    const tree = await sendForm();
+    const submit = await confirmedSend(tree);
+    await submit();
+    mockState.nonceAnswer = answer;
+    await timers.fire(180000);
+    return tree;
+  }
+
+  it('a send the chain says expired keeps its hash and offers no explorer', async () => {
+    const tree = await settledBy({ known: true, landed: false, expired: true });
+    expect(texts(tree)).toContain(t('tx_expired_title'));
+    expect([texts(tree).includes('f'.repeat(64)), !!explorerAction(tree)]).toEqual([true, false]);
+  });
+
+  it('a send another transaction of the wallet replaced keeps its hash and offers no explorer', async () => {
+    const tree = await settledBy({ known: true, landed: false, replaced: true });
+    expect(texts(tree)).toContain(t('tx_not_applied_title'));
+    expect([texts(tree).includes('f'.repeat(64)), !!explorerAction(tree)]).toEqual([true, false]);
+  });
+
+  it('a send bound to nothing at its nonce opens the transaction that applied there in the explorer', async () => {
+    const open = jest.spyOn(Linking, 'openURL').mockResolvedValue(true);
+    const applied = 'e'.repeat(64);
+    const tree = await settledBy({ known: true, landed: false, unbound: true, txHash: applied });
+    expect(texts(tree)).toContain(t('tx_unbound_title'));
+    expect(texts(tree).includes(applied)).toBe(true);
+    await act(async () => { explorerAction(tree).props.onPress(); });
+    expect(open).toHaveBeenCalledWith(require('../src/config/nodes').explorerTxUrl(applied));
+  });
+
+  it('a pull whose read ends first leaves no spinner timer behind, and a one-shot timer of the screen ends with it', async () => {
+    const timers = watchTimers();
+    const tree = await sendForm();
+    await press(tree, 'common_back');
+    const onRefresh = tree.root.findAll((n) => n.props.refreshControl && n.props.refreshControl.props
+      && typeof n.props.refreshControl.props.onRefresh === 'function')[0].props.refreshControl.props.onRefresh;
+    await act(async () => { await onRefresh(); });
+    expect(timers.cleared(timers.newest(3000))).toBe(true);
+    // The lock screen's "Incorrect password" goes after 3 s: a screen that went before then clears that timer too.
+    await act(async () => { tree.root.findAll((n) => n.props.testID === 'tab-settings' && typeof n.props.onPress === 'function')[0].props.onPress(); });
+    await flush(2);
+    await press(tree, 'lock_wallet');
+    await press(tree, 'unlock_wallet');
+    expect(texts(tree)).toContain(t('incorrect_password'));
+    const message = timers.newest(3000);
+    expect(timers.cleared(message)).toBe(false);
+    await act(async () => { mounted.pop().unmount(); });
+    expect(timers.cleared(message)).toBe(true);
+  });
+
+  it('the Browser tab keeps the page it shows when switched to, and goes to its start page when tapped while open', async () => {
+    const tree = await sendForm();
+    await pressTab(tree, 'browser');
+    const field = tree.root.findAll((n) => n.type === TextInput && n.props.accessibilityLabel === t('browser_address_label'))[0];
+    await act(async () => { field.props.onChangeText('dapp.example'); });
+    await act(async () => { field.props.onSubmitEditing(); });
+    const web = () => tree.root.findAll((n) => n.props.testID === 'webview' && typeof n.type === 'string');
+    await act(async () => { web()[0].props.onNavigationStateChange({ url: 'https://dapp.example/', title: 'Page', loading: false }); });
+    const onStart = () => tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet').length > 0;
+    expect(onStart()).toBe(false);
+    await pressTab(tree, 'history');
+    await pressTab(tree, 'browser');
+    expect(onStart()).toBe(false);
+    await pressTab(tree, 'browser');
+    // The start page, the page still loaded under it.
+    expect([onStart(), web().length]).toEqual([true, 1]);
+  });
+
+  it('a lock over the Unconfirmed transactions dialog ends that check: after the unlock the form\'s Send is free again', async () => {
+    mockState.pending = [{ nonce: 5 }];
+    mockState.preview = { confirmed: 4, nonce: null, live: [pendingView], replace: pendingView, canAppend: false };
+    const tree = await sendForm();
+    await tap(tree, 'send_button');
+    expect(texts(tree)).toContain(t('pending_dialog_title'));
+    await emit('background');
+    mockClock.mono += 4 * 3600_000;
+    now += 4 * 3600_000;
+    await emit('active');
+    await flush(6);
+    expect(texts(tree)).toContain(t('unlock_wallet'));
+    await type(tree, 'enter_password', 'Otter-Canyon-58');
+    await press(tree, 'unlock_wallet');
+    await flush(6);
+    expect(texts(tree)).toContain(t('send_title', { symbol: 'QNC' }));
+    expect(texts(tree)).not.toContain(t('pending_dialog_title'));
+    expect(sendBusy(tree)).toBe(false);
+    await tap(tree, 'send_button');
+    expect(texts(tree)).toContain(t('pending_dialog_title'));
+    expect(mockState.sends).toEqual([]);
+  });
+
+  // A transfer link waits for a send under way, whether or not its form is still open, and for its result on screen.
+  describe('a transfer link meanwhile', () => {
+    const SOL_LINK = 'https://link.aiqnet.io/send#to=9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin&amount=0.001';
+    const { fakeLinkInbox } = require('../test-support/linkInbox');
+    const solanaForm = (tree) => tree.root.findAll((n) => n.props.testID === 'solana-send').length > 0;
+    let inbox;
+    beforeEach(() => { inbox = fakeLinkInbox(); });
+    afterEach(() => { inbox.remove(); });
+
+    it('the Assets tab during the submit: the link waits for the result and its Done, then its form opens and stays', async () => {
+      const tree = await sendForm();
+      const submit = await confirmedSend(tree);
+      await pressTab(tree, 'assets');
+      await inbox.deliver(SOL_LINK);
+      expect(solanaForm(tree)).toBe(false);
+      expect(inbox.waiting()).toEqual([SOL_LINK]);
+      await submit();
+      expect(resultUp(tree)).toBe(true);
+      expect(inbox.waiting()).toEqual([SOL_LINK]);
+      await press(tree, 'common_done');
+      await flush(6);
+      expect(solanaForm(tree)).toBe(true);
+      expect(inbox.waiting()).toEqual([]);
+    });
+
+    it('Back during the submit, the link arriving once the result is up: the result stays until Done', async () => {
+      const tree = await sendForm();
+      const submit = await confirmedSend(tree);
+      await press(tree, 'common_back');
+      await submit();
+      expect(resultUp(tree)).toBe(true);
+      await inbox.deliver(SOL_LINK);
+      expect(resultUp(tree)).toBe(true);
+      expect(solanaForm(tree)).toBe(false);
+      expect(inbox.waiting()).toEqual([SOL_LINK]);
+      await press(tree, 'common_done');
+      await flush(6);
+      expect(solanaForm(tree)).toBe(true);
+      expect(inbox.waiting()).toEqual([]);
+    });
   });
 
   it('after a send, the held expected balance carries no proof label (MOBNET-R2-07; the screens show none)', async () => {
@@ -721,18 +1090,17 @@ describe('apps that can read the screen are named on the lock screen (MPLAT-R4-0
   });
 });
 
-// R4-MOBLINK-01: another app can start the wallet with a link of its own at any moment. Once the user has a request in
-// front of them, a different link never takes its place: it waits until that one is closed and then says it is another
-// request.
+// R4-MOBLINK-01: another app can start the wallet with a link of its own at any moment. While the user has a request to
+// decide in front of them, a different link never takes its place: it waits until that one is decided or closed, and
+// then says it is another request. A decided request gives way to it at once, its answer still on its way.
 describe('a QNet Link request on screen is never swapped for another one', () => {
-  const { Linking } = require('react-native');
+  const { fakeLinkInbox } = require('../test-support/linkInbox');
   const QNetLink = require('../src/services/QNetLink');
   const A = { id: 'a'.repeat(32), sitePub: 'b'.repeat(43), intent: 'connect' };
   const B = { id: 'c'.repeat(32), sitePub: 'd'.repeat(43), intent: 'connect' };
   const URL_A = 'https://link.aiqnet.io/l#a';
   const URL_B = 'https://link.aiqnet.io/l#b';
-  let urlListeners;
-  const deliver = async (url) => { await act(async () => { urlListeners.forEach((fn) => fn({ url })); }); await flush(6); };
+  let inbox;
   const opened = () => QNetLink.openSession.mock.calls.map((c) => c[0].id);
   // The link screen's Confirm: the button with a press-in handler (utils/useArmedConfirm), pressed as a finger does.
   const pressConfirm = async (tree) => {
@@ -742,12 +1110,9 @@ describe('a QNet Link request on screen is never swapped for another one', () =>
     await flush(4);
   };
 
+  afterEach(() => { inbox.remove(); });
   beforeEach(() => {
-    urlListeners = [];
-    jest.spyOn(Linking, 'addEventListener').mockImplementation((type, fn) => {
-      if (type === 'url') urlListeners.push(fn);
-      return { remove: () => {} };
-    });
+    inbox = fakeLinkInbox();
     Object.assign(mockLinks, { [URL_A]: A, [URL_B]: B });
     QNetLink.openSession.mockReset();
     QNetLink.openSession.mockImplementation(async () => ({ expiresAt: now + 600_000 }));
@@ -769,31 +1134,62 @@ describe('a QNet Link request on screen is never swapped for another one', () =>
     return tree;
   }
 
-  it('a link that arrives while one is on screen waits, and comes after it with a note', async () => {
+  it('a link that arrives while one waits for the user waits; once that one is decided it takes its place at once', async () => {
     const tree = await unlockedWallet();
-    await deliver(URL_A);
+    let deliveredA;
+    QNetLink.deliverAnswer.mockImplementationOnce(() => new Promise((resolve) => { deliveredA = resolve; }));
+    await inbox.deliver(URL_A);
     expect(opened()).toEqual([A.id]);
     expect(texts(tree)).toContain(t('link_title_connect'));
-    await deliver(URL_B);
+    await inbox.deliver(URL_B);
     expect(opened()).toEqual([A.id]);
     expect(texts(tree)).not.toContain(t('link_after_other'));
     await press(tree, 'link_reject');
-    await flush(4);
+    await flush(6);
     expect(QNetLink.deliverAnswer).toHaveBeenCalledWith(A, expect.anything(), { status: 'rejected' }, expect.anything());
-    await press(tree, 'link_close');
+    // No Close: B is on screen at once, saying another request arrived and that A's answer is still on its way.
+    expect(opened()).toEqual([A.id, B.id]);
+    expect(texts(tree)).not.toContain(t('link_result_rejected'));
+    expect(texts(tree)).toContain(t('link_after_other'));
+    expect(texts(tree)).toContain(t('link_previous_sending'));
+    await act(async () => { deliveredA('delivered'); });
+    await flush(2);
+    expect(texts(tree)).not.toContain(t('link_previous_sending'));
+    expect(texts(tree)).toContain(t('link_after_other'));
+  });
+
+  it('a decided request behind the lock screen gives way to a link that came meanwhile: the new one shows after the unlock', async () => {
+    const tree = await unlockedWallet();
+    await inbox.deliver(URL_A);
+    await press(tree, 'link_reject');
+    await flush(4);
+    expect(texts(tree)).toContain(t('link_result_rejected'));
+    await emit('background');
+    mockClock.mono += 12 * 3600_000;
+    now += 12 * 3600_000;
+    await emit('active');
+    await flush(6);
+    expect(texts(tree)).toContain(t('unlock_wallet'));
+    await inbox.deliver(URL_B);
+    expect(texts(tree)).toContain(t('link_waiting_unlock'));
+    await type(tree, 'enter_password', 'Otter-Canyon-58');
+    await press(tree, 'unlock_wallet');
     await flush(6);
     expect(opened()).toEqual([A.id, B.id]);
+    expect(texts(tree)).toContain(t('link_title_connect'));
     expect(texts(tree)).toContain(t('link_after_other'));
+    expect(texts(tree)).not.toContain(t('link_result_rejected'));
+    expect(inbox.waiting()).toEqual([URL_B]);
   });
 
   it('a link that arrives while the user authenticates the request on screen does not take its place', async () => {
     const tree = await unlockedWallet();
-    await deliver(URL_A);
+    await inbox.deliver(URL_A);
     await act(() => new Promise((r) => { setTimeout(r, 1100); })); // Confirm arms
     await pressConfirm(tree);
     expect(texts(tree)).toContain(t('fresh_title'));
     expect(texts(tree)).toContain(t('link_auth_connect'));
-    await deliver(URL_B);
+    await inbox.deliver(URL_B);
     expect(opened()).toEqual([A.id]);
     expect(texts(tree)).toContain(t('link_auth_connect')); // the prompt is still the one for A, over A
     await press(tree, 'cancel');
@@ -808,7 +1204,7 @@ describe('a QNet Link request on screen is never swapped for another one', () =>
   it('a link ends the password prompt a send left open; nothing is sent', async () => {
     const TO = '02dca74ef2eae3be97feon499504db891ae0c60e364a8';
     const tree = await unlockedWallet();
-    await press(tree, 'assets_send');
+    await openQncSend(tree);
     await type(tree, 'send_placeholder_eon', TO);
     await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText('0.5'); });
     await flush(1);
@@ -820,32 +1216,57 @@ describe('a QNet Link request on screen is never swapped for another one', () =>
     await act(async () => { confirm.props.onPressIn(); confirm.props.onPress(); });
     await flush(4);
     expect(texts(tree)).toContain(t('send_confirm_reason', { amount: '0.5 QNC' }));
-    await deliver(URL_A);
+    await inbox.deliver(URL_A);
     expect(texts(tree)).not.toContain(t('send_confirm_reason', { amount: '0.5 QNC' }));
     expect(texts(tree)).toContain(t('link_title_connect'));
     expect(input(tree, 'password')).toBeUndefined();
     expect(mockState.sends).toEqual([]);
   });
 
-  it('the same link twice is one request, and a request not seen yet (behind the lock screen) may be replaced', async () => {
+  it('requests behind the lock screen come in their order, the next saying another arrived; the same link twice is one', async () => {
     mockState.vault = 'ok';
     const tree = await mount();
-    await deliver(URL_A);
-    await deliver(URL_B);
+    // A's session cannot be read: its request is closed with no decision.
+    QNetLink.openSession.mockImplementationOnce(async () => { throw new Error('offline'); });
+    await inbox.deliver(URL_A);
+    await inbox.deliver(URL_B);
+    await inbox.deliver(URL_A);
     expect(texts(tree)).toContain(t('link_waiting_unlock'));
     await type(tree, 'enter_password', 'Otter-Canyon-58');
     await press(tree, 'unlock_wallet');
     await flush(6);
-    expect(opened()).toEqual([B.id]);
-    await deliver(URL_B);
-    expect(opened()).toEqual([B.id]);
-    expect(texts(tree)).not.toContain(t('link_after_other'));
+    expect(opened()).toEqual([A.id]);
+    expect(inbox.waiting()).toEqual([URL_A, URL_B]);
+    await press(tree, 'link_close');
+    await flush(6);
+    expect(opened()).toEqual([A.id, B.id]);
+    expect(texts(tree)).toContain(t('link_after_other'));
+    // The link of the request on screen again is that request.
+    await inbox.deliver(URL_B);
+    expect(opened()).toEqual([A.id, B.id]);
+    expect(inbox.waiting()).toEqual([URL_B]);
   });
 });
 
-describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
+// A secret is copied by its own Copy button under it (its label alone, Copied while the copy may be on the clipboard),
+// at creation and at export alike; a tap on the words or the key copies nothing.
+describe('a secret\'s copy (its Copy button only)', () => {
   const PHRASE = 'abandon ability able about above absent absorb abstract absurd abuse access accident';
   const lines = (tree) => texts(tree).split('\n');
+  const button = (tree, id) => tree.root.find((n) => n.props.testID === id && n.props.accessibilityRole === 'button'
+    && typeof n.props.onPress === 'function');
+  const tapPhrase = async (tree) => {
+    await act(async () => { await button(tree, 'seed-copy').props.onPress(); });
+    await flush();
+  };
+  // Nothing that can be pressed holds a word of the phrase (or the key): the secret is drawn apart from its button.
+  const pressableHolding = (tree, text) => tree.root.findAll((n) => typeof n.props.onPress === 'function'
+    && n.findAllByType(Text).some((x) => [].concat(x.props.children).flat(Infinity).join('') === text));
+  // The button says what it does in its label alone: no copy mark repeats it.
+  const expectCopyButton = (tree, id, labelKey) => {
+    expect(button(tree, id).findAllByType(Text).map((x) => [].concat(x.props.children).join(''))).toEqual([t(labelKey)]);
+    expect(button(tree, id).findAll((n) => typeof n.type === 'string' && /^copy-glyph/.test(n.props.testID || ''))).toHaveLength(0);
+  };
   // No native module here: the copy's JS timer is stopped, as Delete wallet would.
   afterEach(async () => { await require('../src/services/DeviceSecurity').clearSecretCopy(); });
   const pressExact = async (tree, text) => {
@@ -856,7 +1277,7 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     await flush();
   };
 
-  it('on a new wallet\'s phrase: the warning next to it, nothing copied until the tap, then the words and "Copied"', async () => {
+  it('on a new wallet\'s phrase: Copy phrase under the words, the warning next to it, nothing copied until its tap', async () => {
     const DS = require('../src/services/DeviceSecurity');
     const copy = jest.spyOn(DS, 'copySecret');
     const tree = await mount();
@@ -868,13 +1289,17 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     await press(tree, 'create_wallet');
     expect(texts(tree)).toContain(t('seed_save_title'));
     expect(texts(tree)).toContain(t('seed_copy_warning', { seconds: 60 }));
+    expectCopyButton(tree, 'seed-copy', 'secret_copy_phrase');
+    for (const word of PHRASE.split(' ')) expect([word, pressableHolding(tree, word).length]).toEqual([word, 0]);
     expect(copy).not.toHaveBeenCalled();
-    await pressExact(tree, t('common_copy'));
+    await tapPhrase(tree);
     expect(copy).toHaveBeenCalledWith(PHRASE);
+    expectCopyButton(tree, 'seed-copy', 'common_copied');
     expect(lines(tree)).toContain(t('common_copied'));
+    expect(lines(tree)).not.toContain(t('secret_copy_phrase'));
   });
 
-  it('on the phrase shown again from Settings: shown at once with the same button, no clipboard text (owner, 06.10)', async () => {
+  it('on the phrase shown again from Settings: shown at once, copied the same way, no clipboard text', async () => {
     const DS = require('../src/services/DeviceSecurity');
     const copy = jest.spyOn(DS, 'copySecret');
     mockState.vault = 'ok';
@@ -890,20 +1315,51 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     expect(texts(tree)).toContain(t('recovery_phrase_warning'));
     await type(tree, 'password', 'Otter-Canyon-58');
     await pressExact(tree, t('show'));
-    // After it: only the words, Copy and Done.
+    // After it: only the words, their Copy button and Done.
     expect(texts(tree)).not.toContain(t('recovery_phrase_warning'));
     for (const word of PHRASE.split(' ')) expect(lines(tree)).toContain(word);
+    for (const word of PHRASE.split(' ')) expect([word, pressableHolding(tree, word).length]).toEqual([word, 0]);
+    expectCopyButton(tree, 'seed-copy', 'secret_copy_phrase');
     expect(texts(tree)).not.toContain(t('seed_copy_warning', { seconds: 60 }));
     expect(copy).not.toHaveBeenCalled();
-    await pressExact(tree, t('common_copy'));
+    await tapPhrase(tree);
     expect(copy).toHaveBeenCalledWith(PHRASE);
-    expect(lines(tree)).toContain(t('common_copied'));
+    expectCopyButton(tree, 'seed-copy', 'common_copied');
     await pressExact(tree, t('common_done'));
     for (const word of PHRASE.split(' ')) expect(lines(tree)).not.toContain(word);
   });
 
-  it('"Copied" turns back to Copy when the copy may no longer be on the clipboard', async () => {
-    const { SECRET_CLIPBOARD_SECONDS } = require('../src/services/DeviceSecurity');
+  it('on a private key shown from Settings: Copy key under its box, the box copying nothing', async () => {
+    const KEY = '5c5c79cac60d06d566b9c23047ad28b5da96dab4367593563ef34539067b57f6';
+    const DS = require('../src/services/DeviceSecurity');
+    const copy = jest.spyOn(DS, 'copySecret');
+    mockState.vault = 'ok';
+    const tree = await mount();
+    await type(tree, 'enter_password', 'Otter-Canyon-58');
+    await press(tree, 'unlock_wallet');
+    await flush(6);
+    for (const wm of mockState.instances) wm.revealPrivateKeys = async () => ({ ok: true, qnet: { address: mockQNET, key: KEY } });
+    await act(async () => { tree.root.find((n) => n.props.testID === 'tab-settings' && typeof n.props.onPress === 'function').props.onPress(); });
+    await flush();
+    await press(tree, 'export_private_key');
+    await type(tree, 'password', 'Otter-Canyon-58');
+    await pressExact(tree, t('show'));
+    expect(lines(tree)).toContain(KEY);
+    expect(pressableHolding(tree, KEY)).toHaveLength(0);
+    expectCopyButton(tree, 'key-copy-qnet', 'secret_copy_key');
+    expect(copy).not.toHaveBeenCalled();
+    await act(async () => { await button(tree, 'key-copy-qnet').props.onPress(); });
+    await flush();
+    expect(copy).toHaveBeenCalledWith(KEY);
+    expectCopyButton(tree, 'key-copy-qnet', 'common_copied');
+    await pressExact(tree, t('common_done'));
+    expect(lines(tree)).not.toContain(KEY);
+  });
+
+  // Copied lasts COPIED_MS, as every copy of the app; the clipboard is still cleared after the minute seed_copy_warning
+  // names under the button.
+  it('Copied turns back to the button\'s label after as long as any copy of the app says it', async () => {
+    const { COPIED_MS } = require('../src/components/ui/Copyable');
     const tree = await mount();
     await press(tree, 'create_new_wallet');
     await type(tree, 'enter_password', '12345678');
@@ -912,15 +1368,14 @@ describe('the recovery phrase\'s Copy (an explicit tap only)', () => {
     await press(tree, 'accept');
     await press(tree, 'create_wallet');
     const timers = jest.spyOn(global, 'setTimeout');
-    await pressExact(tree, t('common_copy'));
-    expect(lines(tree)).toContain(t('common_copied'));
-    // The last timer of that length is the button's (the copy's own clear is set first).
-    const at = timers.mock.calls.map((c) => c[1]).lastIndexOf(SECRET_CLIPBOARD_SECONDS * 1000);
+    await tapPhrase(tree);
+    expectCopyButton(tree, 'seed-copy', 'common_copied');
+    // The last timer of that length is the label's.
+    const at = timers.mock.calls.map((c) => c[1]).lastIndexOf(COPIED_MS);
     expect(at).toBeGreaterThan(-1);
     clearTimeout(timers.mock.results[at].value);
     await act(async () => { timers.mock.calls[at][0](); });
-    expect(lines(tree)).not.toContain(t('common_copied'));
-    expect(lines(tree)).toContain(t('common_copy'));
+    expectCopyButton(tree, 'seed-copy', 'secret_copy_phrase');
   });
 });
 

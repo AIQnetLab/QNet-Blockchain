@@ -1,4 +1,4 @@
-// The title band of a page (B-SPEC 5.23): the field behind it, the page's one h1, an optional kicker, lead and actions
+// The title band of a page: the field behind it, the page's one h1, an optional kicker, lead and actions
 // or search field, and optional readouts under it. The field is weighted to the right, and no glyph sits behind any line
 // of the band's text (data-field-band: components/field/Field.tsx clears the cells under each line).
 
@@ -14,7 +14,7 @@ interface PageHeadProps {
   children?: ReactNode;
   // Readouts or anything else under the band's text.
   more?: ReactNode;
-  // B-SPEC 4.2: explorer 0.55, My node 0.32 (cabinet, at .7 opacity), every other page 0.3.
+  // Explorer 0.55, My node 0.32 (cabinet, at .7 opacity), every other page 0.3.
   strength?: number;
   kind?: FieldKind;
   opacity?: number;

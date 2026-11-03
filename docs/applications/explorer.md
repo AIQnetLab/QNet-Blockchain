@@ -11,51 +11,80 @@ deployment needs, and how to run it locally.
 | Path | Role |
 | --- | --- |
 | `frontend/src/app/` | Next.js App Router pages and HTTP API routes |
-| `frontend/src/components/` | UI components: the header (its links, the Docs menu and the wallet control), the footer, token icons, UI primitives |
+| `frontend/src/components/` | UI components: the header (its links, the Docs menu, the language switcher and the wallet control), the footer, token icons, UI primitives |
 | `frontend/lib/` | Web-tier server modules: read-only database access, security checks, rate limiting, monitoring |
-| `frontend/src/lib/` | Client and shared helpers: the node client, caching, token and QNC amount formatting, transaction mapping, the background's frame loop (`frame-loop.ts`), the wallet-extension provider client (`qnet-provider.ts`) |
+| `frontend/src/lib/` | Client and shared helpers: the node client, caching, token and QNC amount formatting, transaction mapping, the background's frame loop (`frame-loop.ts`), the wallet-extension provider client (`qnet-provider.ts`), the pages' requests to the site's own routes with their time limit (`site-request.ts`) |
 | `frontend/src/indexer/` | The indexer process: node client, chain follower, writer, migration runner |
 | `frontend/src/server/head-hub.ts` | The per-process head snapshot the web tier serves |
 | `frontend/src/server/light/` | The balance check: the light client that verifies macroblocks' committee certificates from the pin, its checkpoint store and the build-time walk (`store.ts`, `refresh.ts`, run by `scripts/light-pin.mjs`), the GALC v2 capsule as a faster walk root (`galc.ts`, the genesis keys in `genesis-keys.ts`), the state-tree proof checks, and the certified balance proof with the old-node fallback |
 | `frontend/src/server/link-relay.ts` | The per-process QNet Link relay store behind `/api/link/*` |
-| `frontend/src/server/cabinet/` | The node cabinet's server side: `node-proxy.ts` (a light node's status, balance and history, and a super node's status, from the genesis nodes), `wallet-node.ts` (whether a wallet has a node of either type), `solana-proxy.ts` (the activation's price, payment address, blockhash and transaction reads, and the one door its burn and refund go through), `burn-parse.ts` and `burn-scan.ts` (an activation burn read from Solana, and the search of a wallet's Solana address for one), `activation-registry.ts` and `activation-api.ts` (the activation registry: one record per wallet, below), `register.ts` (the registration submit), `registration-record.ts` (a registration's burn from the archive), `eligible-set.ts` (the network's eligible set, from the newest certified macroblock's proof) and `limits.ts` (the origin checks and per-client limits of every `/api/cabinet` route) |
+| `frontend/src/server/cabinet/` | The node cabinet's server side: `node-proxy.ts` (a light node's status, balance and history, and a super node's status, from the genesis nodes), `wallet-node.ts` (whether a wallet has a node of either type), `solana-proxy.ts` (the activation's price, payment address, blockhash and transaction reads, and the one door its burn and refund go through) and `solana-relay.ts` (the wallets' Solana relay, below, built on that door's caches and batches), `burn-parse.ts` and `burn-scan.ts` (an activation burn read from Solana, and the search of a wallet's Solana address for one), `activation-registry.ts` and `activation-api.ts` (the activation registry: one record per wallet, below), `register.ts` (the registration submit), `registration-record.ts` (a registration's burn from the archive), `eligible-set.ts` (the network's eligible set, from the newest certified macroblock's proof) and `limits.ts` (the origin checks and per-client limits of every `/api/cabinet` route) |
 | `frontend/src/server/phone-flows.ts` | `CABINET_PHONE_FLOWS`: whether the cabinet sends QNet Wallet its `link`, `claim`, `reserve` and `unlink` requests |
 | `frontend/src/server/wallet-apk.ts` | `WALLET_APK_URL`: the Android file `/wallet` offers, if any |
-| `frontend/src/lib/cabinet/`, `frontend/src/components/cabinet/`, `frontend/src/lib/texts.ts` | The node cabinet's shared logic (the wallet choice, the reading of a node's state, the wallet's activation from every source in `wallet-activation.ts`, the record proof in `burn-record.ts`, the tabs, the activation's stages and payment requests), its components, and the site's English texts |
+| `frontend/src/lib/cabinet/`, `frontend/src/components/cabinet/` | The node cabinet's shared logic (the wallet choice, the reading of a node's state, the wallet's activation from every source in `wallet-activation.ts`, the record proof in `burn-record.ts`, the tabs, the activation's stages and payment requests) and its components |
+| `frontend/src/i18n/`, `frontend/src/lib/texts.ts`, `frontend/src/lib/languages.ts`, `frontend/src/lib/locale-route.ts` | The site's languages: one catalog per language in `src/i18n/locales` (`en.ts` the source, every other with exactly its keys), the translator and the one number format (`texts.ts`), the language list, a page's address in each language and the language cookie (`languages.ts`), which language a request is served in (`locale-route.ts`), and the page's language on the server (`src/i18n/server.ts`) and in the browser (`src/i18n/client.tsx`, with the links and the router that stay in it), with the texts each part of the site hands the browser (`src/i18n/areas.ts`, `src/i18n/area.tsx`) |
 | `frontend/src/lib/faucet-handover.ts` | The connected wallet's Solana address and the faucet pass handed from the cabinet's payment card to the Testnet page's faucet, in the tab's session storage, each read once; the request for the pass |
 | `frontend/src/server/faucet-guard.ts`, `faucet-budget.ts`, `faucet-pass.ts` | The faucet's admission (per address, per wallet with a pass, per IP, per network block, and each hour's budget, most of it kept for claims with a pass) and the faucet pass |
 | `frontend/src/lib/qnet-link.ts`, `qnet-link-crypto.ts`, `link-client.ts`, `link-store.ts` | QNet Link on the page: the link, the request and the answer, the key exchange and the check number, the relay client, and the one unfinished session a cabinet page keeps in the browser |
 | `frontend/src/server/request-guard.ts` | The checks of the relay and the faucet: `Origin`, `Sec-Fetch-Site`, JSON media type, body cap |
-| `frontend/src/server/solana-tx.ts`, `solana-rpc.ts`, `faucet-tx.ts` | The faucet's Solana transactions, built, signed and confirmed without a Solana SDK |
+| `frontend/src/server/solana-tx.ts`, `solana-rpc.ts`, `faucet-tx.ts` | The faucet's Solana transactions, built, signed and confirmed without a Solana SDK; `solana-rpc.ts` is also the server's one JSON-RPC client, each answer read up to its method's cap and its integers past 2^53 kept exact |
+| `frontend/src/lib/wallet-solana-tx.ts` | The transactions QNet Wallet and the QNet extension build (a SOL transfer, a 1DEV transfer, the extension's activation burn), read back before the wallets' Solana relay sends one on |
 | `frontend/src/server/faucet-cooldown.ts` | The faucet's per-(address, token) and per-(wallet, token) cooldown in process memory, each entry dropped after its 24 hours |
 | `frontend/src/server/logo-proxy.ts` | Token logos fetched by the server and served from the site (`/api/token/[contract]/logo`) |
 | `frontend/migrations/` | Ordered schema migrations: `001_init.sql`, `002_batch_transfers.sql`, `003_indexer_v2.sql`, `004_address_history.sql`, `005_cabinet_activations.sql`, `006_cabinet_activations_reservation.sql`, `007_cabinet_activations_burner.sql` |
 | `frontend/scripts/` | Timestamp backfill, PostgreSQL install/backup/restore helpers, `run-migrations.ts` behind `npm run db:migrate`, which reads only `001_init.sql`, and `light-pin.mjs`, the balance check's build-time walk and pin refresh |
-| `frontend/ecosystem.config.example.js` | PM2 layout running the web tier and the indexer side by side, as the unprivileged app user |
-| `deployment/deploy-aiqnet.sh` | Provisioning of the aiqnet.io host: Node.js 22, the `aiqnet` user, pm2, nginx, TLS |
+| `deployment/deploy-aiqnet.sh` | Provisioning of the aiqnet.io host: Node.js 22, the `aiqnet` user, the web tier and the indexer as systemd services, each run from a release built in a folder of its own, nginx, TLS |
 
 The repository root of the explorer is a workspace whose `dev`, `build`, `start` and `lint` scripts
 delegate into `frontend/`.
 
 ## What it shows
 
-- `/explorer` — the title band with the search and six readouts, then Latest blocks beside All transactions. The search
+- `/explorer` — the title band with the search and six readouts, then the Latest blocks strip with All transactions
+  below it. The search
   (`src/components/explorer/ExplorerSearch.tsx`) takes a block height, a transaction or block hash, an address or a
   token; `/` focuses it on a computer, its matches come from `/api/search/suggest` 250 ms after typing stops, and a
-  match opens with a full navigation. The readouts (`NetworkReadouts.tsx`): the block height (a link to the block), the
+  match opens with a full navigation, in the page's language. A token's suggestion carries its symbol and name exactly
+  as the index has them (`tokenSuggestion` in `src/lib/explorer-view.ts`); where a token has none, the page writes its
+  own words for them in its language. The search's words in the empty field are the whole sentence on a computer and a short one
+  on a phone; where a language's words are longer than the field they take a second, balanced line inside it. The readouts (`NetworkReadouts.tsx`): the block height (a link to the block), the
   epoch with the blocks left, server nodes and light nodes of the last settled epoch as two readings
   (`/api/network/stats`, read at most once a minute), the QNC supply (a link to `/explorer/qnc`) and the last block's
-  age with the node that made it. Latest blocks: 12 rows (6 on a phone), each height a link to its block over its hash,
-  with the producer (a link to its address page when the index holds `producer_address`, else its id as text), its
-  transaction count and its age; the server renders them from the head snapshot's newest blocks and each new head from
-  the head stream takes the top row with its producer and count as the oldest leaves, a skipped height as a row of its
-  own; a row without its hash or producer (a skipped height, or a head whose event did not name its block) is filled in
-  place from `GET /api/blocks?latest=N`, read at most every 2 s while one is missing
-  (`src/components/explorer/useRecentBlocks.ts`). Beside All transactions from 1,281 px wide, above it below
-  that. The epoch readout leads to the epoch's first block (epoch N holds blocks N × 14,400 on). All transactions: 50 to a page, type filters several at
+  age with the node that made it. Latest blocks (`src/components/explorer/LatestBlocks.tsx`): one strip across the
+  page above All transactions, of the 14 newest blocks (`RECENT_BLOCKS` in `src/lib/explorer-view.ts`), each a card of
+  184 by 100 px (164 px wide under 720 px) with its lines stacked: the height (a link to its block), its age, the
+  producer (a link to its address page when the index holds `producer_address`, else its id as text) and its
+  transaction count, each cut with "…" at the card's edge, a line not known yet empty at its height. The newest block is
+  at the left in every language: a new one comes in there and the strip slides by a transform, so nothing around it
+  moves; older blocks are a sideways scroll inside the strip (a finger, the wheel, or a drag with the mouse), its bar a
+  3 px line in the rules' colour on a computer and none on a touch screen. A pointer, focus or a touch on it, or the strip
+  scrolled from its newest end, holds it, and its label says how many blocks wait. The server renders the cards from the
+  head snapshot's newest blocks and each new head from the head stream takes the first card with its producer and count
+  as the oldest leaves, a skipped height as a card of its own; a card without its block's hash or producer (a skipped
+  height, or a head whose event did not name its block) is filled in place from `GET /api/blocks?latest=N`, read at
+  most every 2 s while one is missing and 15 s after a read that filled nothing
+  (`src/components/explorer/useRecentBlocks.ts`). All blocks opens the block history (`/explorer/blocks`); Hide folds
+  the strip to its title line and Show opens it again, and the `qnet.blocks` cookie, written by Hide for a year on the
+  explorer's path in the page's language (`src/lib/strip-pref.ts`), keeps it folded: the server reads it, so the page
+  paints the strip as the visitor left it. Its head keeps the title, the Live mark and its two actions on one line where
+  they fit; otherwise the actions take a line of their own and no word is broken. The epoch readout leads to the
+  epoch's first block (epoch N holds blocks N × 14,400 on). Every list that shows a
+  transaction's kind (All transactions, a block's, an address's, the transaction page) names it one way
+  (`src/lib/tx-mapping.ts` `mapTxType`): Transfer, Token Transfer, Move to wallet (a node balance moved to its wallet from
+  `system_rewards_pool`), Reward (the emission into that pool), Heartbeat, Light Eligibility, Registration, Activation,
+  Contract Call, Deploy, Swap and System, each with a square mark and its name in a colour of its own
+  (`--kind-*` in `src/styles/tokens.css`): every one readable on Ink at a contrast of 6.5:1 or more, the kinds a page of
+  the feed shows together at least 15 apart on a perceptual colour scale (every other pair at least 11), none as close
+  to Signal, the colour of an action, and only the transfer a neutral (Paper). A token's page lists its movements by
+  method (transfer, mint, burn) from the token index, which names no transaction kind. All transactions: 50 to a page, type filters several at
   once with All to clear them, the block column's order, numbered pages up to 200 and older pages by cursor; the first
   page, newest first and unfiltered, is read again on a new head at most every 1.5 s. Nothing moves under the reader:
-  columns of fixed width and rows of fixed height (`src/components/ui/DataTable.tsx`), a live table keeps its row
+  columns of fixed width and rows of fixed height (`src/components/ui/DataTable.tsx`; every amount column as wide as its
+  list's longest amount with its sign and unit, `src/components/explorer/columns.tsx` `amountsWidth`, so a token's
+  amount to 18 decimals never runs into the next column, and a list whose rows refresh (All transactions, an address's
+  transactions and token transfers, QNC's and a token's transfers) keeps the widest it needed while the reader stays on
+  its page, order and filter, `useSteadyWidth`, so a long amount that leaves the rows never moves From / To; below 720 px a holder list gives each balance the row's second
+  line and sets it smaller by the list's longest amount where that line is narrower, `holderCols`), a live table keeps its row
   elements in place and gives them the new content, a new row lands tinted, and a live table's rows are held while the
   pointer or focus is inside it, and on a touch screen from a press on it until 3 s after the last touch there (after a
   touch, a scroll of the page while the table is on screen holds it the same way); while held its label says how many
@@ -65,7 +94,10 @@ delegate into `frontend/`.
   route loads as itself. The block, transaction, address, token, token directory and QNC pages render on the server
   with their routes' first answers (`src/server/first-answer.ts` reads a route in-process with the visitor's request
   headers, so the route's per-visitor limits count the read as theirs), so their notes, tables and groups are there from
-  the first paint and the client reads again only to follow the chain, a filter or a page; while one of them loads it
+  the first paint and the client reads again only to follow the chain, a filter or a page; a read that has not answered
+  within 400 ms (`FIRST_ANSWER_MS`) is not waited for: the page paints its fixed geometry and its client reads that
+  part, and the server writes one `[INFO][WEB] first_answer_late path=… wait_ms=400 count=N` line a minute at most, N
+  the reads that came late since the line before (`src/server/log-window.ts`). While one of them loads it
   shows itself with nothing in it, and reads nothing. An explorer page is at least a screen tall, so the footer starts
   below the first screen and nothing in view moves when a page takes the place of its loading state.
 - `/explorer/block/[hash]` — "Block N" with its type, the whole hash with Copy, its time and the blocks either side
@@ -77,22 +109,38 @@ delegate into `frontend/`.
   as the chain reaches it, at most every 3 s and 20 times.
 - `/explorer/tx/[hash]` — the transaction's short hash as the title with its type and status, the whole hash with Copy
   and its time; readouts for its status, block, amount and fee; From and To whole with Copy, nonce and signature; a
-  QRC-20 call's token transfer, a `BatchTransfers` envelope's recipients, or its data with addresses and blocks as
-  links. While the page loads, a row the list showed paints it from the tab's cache; a transaction not in a block the
+  QRC-20 call's token transfer (in base units grouped as every count is while the token's decimals are not read), a
+  `BatchTransfers` envelope's recipients, or its data with addresses and blocks as links. Each fact the indexer records in the data (`genesis_id`, `epoch`, `eligible_count`, `batch_id`,
+  `transfer_count`, `node_id`, `node_type`, `burn_tx`, `burn_wallet`, `burn_amount`; `src/lib/tx-labels.ts`
+  `txDataLabel`) is named in the page's language; any other field shows its own name as code, never translated. While
+  the page loads, a row the list showed paints it from the tab's cache; a transaction not in a block the
   explorer has read is asked for again as the chain moves.
-- `/explorer/address/[address]` — the short address as the title, the whole address spaced at its structure with Copy;
+- `/explorer/address/[address]` — the word Address as the title with the whole address under it, spaced at its
+  structure, and Copy under that (a system account: its name);
   readouts for its balance, transactions, first seen and last active; its other tokens, its newest 100 transactions
   with incoming batch-transfer credits (25 to a page, the first page live), and its token transfers; read again as the
   head moves, at most every 3 s. A system account shows its name and no balance.
 - `/explorer/tokens` and `/explorer/token/[contract]` — the token directory (a lookup by contract, a filter, 25 to a
   page, each token, deployer and deploy transaction a link) and a token's page: readouts for its supply, holders, issued
-  total and decimals, then Transfers, Holders and Contract as tabs; its transfers follow the head at most every 10 s.
+  total and decimals, then Transfers, Holders and Contract as tabs (Contract: the standard's methods, what each does on
+  one line, the column as wide as the longest of them in the page's language); its transfers follow the head at most
+  every 10 s.
 - `/explorer/qnc` — native QNC overview backed by the node rich list (top holders, total and
   circulating supply). QNC is the native coin, so this is a coin view, not a QRC-20 token page. It is read again as the
   head moves, at most every 10 s.
 - Every block, transaction, address, token and node with a known address in the explorer is written by one component,
   `src/components/ui/EntityLink.tsx` (its rules in `src/lib/entity.ts`), and links to its page; an amount's number is
-  text and its unit, with its icon, the link to QNC or the token. The explorer's tables are put together from one set of
+  text and its unit, with its icon, the link to QNC or the token (`Amount`, `AmountUnit`), and text where the reading
+  is itself the link (the QNC supply readouts) or no page of the site is its: the 1DEV and SOL of the activation's
+  payment step and of the faucet's confirmation show their own icons, unlinked. What it writes, an address set out in its parts
+  anywhere (`AddressParts`, the account menu's too), and the activation page's addresses, codes, amounts and live
+  readouts (the "received" lines, the request's countdown, the check number), carry `translate="no"`: a browser's page translation leaves those values and the text the page updates in them as they are,
+  and the words around them stay translatable. The same holds for the names QNet Blockchain, QNet Wallet and QNet Link
+  inside any sentence the site shows: each is an element of its own marked `translate="no"`, written by `say`, the
+  translator's form for a text the page shows, by `rich` for a sentence with elements, and by the request lines
+  (`Waiting`, `Answered`, `Failed`) for a message the page put together (`named` in `src/lib/rich.tsx`); an attribute
+  (a label, a title, a hint), which holds no element, takes `t`.
+  The explorer's tables are put together from one set of
   columns (`src/components/explorer/columns.tsx`) and write a transaction's sides one way (`cells.tsx`).
 - Amounts and counts read the same whatever the visitor's language or locale (42,578.81988 QNC): every formatter names
   English (`'en'` or `'en-US'`), never the browser's locale, so the whole part is grouped with commas and the decimals
@@ -106,32 +154,56 @@ delegate into `frontend/`.
   shows its amount exact. Up to 1,180 px wide a table keeps its columns in a frame that scrolls sideways when they need
   more room than it has (never narrower than their widths, a flexible column 176 px unless it names its own:
   `src/lib/geometry.ts`), its first column fixed, and the page itself never does; wider, every table fits its frame.
-  A list's From / To is two lines, the sender over "to" and the recipient. In a table's flexible column on a window
-  wider than 1,180 px an address, hash or node id shows whole where the cell has room for it and in its short form
-  otherwise, chosen by a container query on the cell (`styles/base.css`), with the whole value in its title. A readout's
-  value is never cut: a long one is set smaller by its length in characters (`--ro-len`). Links, buttons and rows carry
+  A header longer than its column, a long type name, an epoch's result and its times take a second line, never the
+  next column's room, and an age's column is as wide as the page's language writes its longest age (`ageWidth` in
+  `columns.tsx`).
+  A list's From / To is one line, the sender, "to" in Fog and the recipient (`cells.tsx` `FromTo`); a record without a
+  recipient (a heartbeat, a system record) shows its sender alone. Where the page sizes the room (a table's flexible
+  column, a side of From / To, a Latest blocks card) an address, hash or node id shows whole when it fits, else its head
+  as far as it fits, "…" and the tail of its short form, never narrower than the short form (`.ent-cut` in
+  `styles/base.css`; nothing is measured), with the whole value in its title. A readout's
+  value is never cut: a long one is set smaller by its length in characters (`--ro-len`), an amount's unit and its token
+  icon counted whole (`amountLength`), and My node's balance figure the same way; each character counts `--ro-ch` em
+  (0.6 against the face's 0.57 em advance, 0.63 on Arabic, Chinese, Japanese and Korean pages, which drop the face's
+  -0.03 em spacing), and the icon inside such a value stays 1.25 times its text at every size (elsewhere it is never
+  under 20 px). Links, buttons and rows carry
   no arrows; on a phone or a touch screen every small control has a 44 px tall target and a table row is the target of
-  its first entity. The site's two faces, Archivo and Martian Mono, are self-hosted through next/font (`src/app/fonts.ts`,
+  its first entity. Where a detail row's Copy wraps under its value (a longer language's word), the two lines keep
+  10 px apart, the reach of its target over the row, so the target never covers the value's link. The site's two faces, Archivo and Martian Mono, are self-hosted through next/font (`src/app/fonts.ts`,
   served from `/_next/static/media`); while they load, text is set in platform faces (Arial or Roboto, and Courier New or
   another monospace face of 0.6 em) sized for each width and weight the sheets use (`src/styles/fonts.css`), so nothing
   rewraps or moves when a face arrives. Monospace text takes one stack, Martian Mono then the platform's own
-  (`--font-mono` in `src/styles/tokens.css`). The design tokens are in `src/styles/tokens.css`, the base and the shared
-  primitives of `src/components/ui` in `src/styles/base.css`, and each rebuilt area has its own sheet
-  (`shell.css`, `home.css`, `explorer.css`, `cabinet.css`, `pages.css`), imported by the root layout after the rules of the
-  areas not yet rebuilt (`src/app/globals.css`, `src/app/mobile-fixes.css`).
+  (`--font-mono` in `src/styles/tokens.css`). Each script takes its own faces before those stand-ins (`--f-script`, set
+  per language in `src/styles/i18n.css`): Russian takes Roboto's Cyrillic, self-hosted the same way and not preloaded
+  (Archivo has no Cyrillic), so only a Russian page downloads it; Chinese, Japanese, Korean and Arabic take the system's
+  faces for their script, nothing downloaded, with no letter spacing and taller headings. The design tokens are in
+  `src/styles/tokens.css`, the base and the shared primitives of `src/components/ui` in `src/styles/base.css`, and each
+  rebuilt area has its own sheet (`shell.css`, `home.css`, `explorer.css`, `cabinet.css`, `pages.css`), imported by the
+  root layout, and last the page's language (`i18n.css`). Every class a sheet defines is one the site's code sets.
 - The field (`src/components/field/Field.tsx`, drawn by `src/lib/field/rain.ts`): hex rain inside a page's head zone (the
   home hero, the title band of `src/components/ui/PageHead.tsx`), never behind the whole page. It draws only while its
   zone is in view, the tab is shown and the system allows motion: 30 frames a second (24 on a phone, 15 in My node),
   waking the page once per frame it draws (a timer to just before the frame is due, then one frame request), the
-  device pixel ratio capped at 1.5 on the home hero and 1.25 elsewhere, from a glyph atlas drawn once; under reduced
-  motion it paints one still picture. When a frame's step stays over 7 ms for 30 frames it halves its density, then
-  drops to 20 frames a second, then stops on a still picture. Elements marked `data-field-clear` (the header's
+  device pixel ratio capped at 1.5 on the home hero and 1.25 elsewhere, from a glyph atlas drawn once. The glyphs change
+  as a stream falls, at the same pace at any frame rate: its head writes a new glyph into each cell it enters and changes
+  its glyph at least 12 times a second, and each trail cell still in sight takes a new glyph 0.65 times a second on
+  average (about once every 1.5 s, on its own random schedule), drawn at the brightness its cell shows (the trail is
+  drawn at 0.85 of the stream's brightness and keeps 0.925 of it every thirtieth of a second); under reduced motion it
+  paints one still picture. When a frame's step stays over 7 ms for 30 frames it halves its density, then
+  drops to 20 frames a second, then stops on a still picture. A stream the halving switches off keeps fading by the
+  same law until its head's glyph (1.4 times the stream's brightness, at most full) is under 0.02, and its column's
+  cells under 0.02 are then cleared, so no glyph stays frozen. Elements marked `data-field-clear` (the header's
   controls) clear the cells over them and `data-field-dim` dims them (text).
 - `/` — the home page: the headline the field decodes, the live blocks (the 14 newest, kept as Latest blocks keeps its
-  rows; each height a link to its block; held while the pointer or focus is on them), the readouts (light nodes and server nodes from `/api/network/stats`, the epoch and the
-  QNC supply from the head), Get QNet Wallet (`src/components/GetTheApp.tsx`, also on `/wallet`: on a computer a QR code of
+  rows; each a height, a link to its block, with its transaction count, under them the node that made it and its age,
+  whose box holds the language's longest; three of the hero's twelve columns, four from 861 to 1,099 px, so each line
+  fits in every language; held while the pointer or focus is on them), the readouts (light nodes and server nodes from `/api/network/stats`, the epoch and the
+  QNC supply from the head, and 13,000 transfers a second, measured end-to-end on a 5-node testnet, with 40,000 to
+  80,000 on validator hardware), Get QNet Wallet (`src/components/GetTheApp.tsx`, also on `/wallet`: on a computer a QR code of
   `/get` beside the three stores, on a phone or tablet its own store first and no extension, decided from the request's
-  user agent at first paint as `data-device` on `<html>`), the security model, the mobile-first statement with QNet
+  user agent at first paint as `data-device` on `<html>`), the security model (a datum of two phrases breaks only between
+  them, its lines balanced and no word of any script split: `.feat-k` in `src/styles/home.css`, each phrase short
+  enough for one line of a 360-pixel phone), the mobile-first statement with QNet
   Wallet's eleven languages in the app's order and names (`src/lib/languages.ts`), the economic model and the open
   source section.
 - `/wallet`, `/qnet-wallet-extension`, `/testnet`, `/dao`, `/docs`, `/docs/how-it-works`, `/privacy`, `/terms`,
@@ -158,16 +230,20 @@ delegate into `frontend/`.
   included. `/nodes` is a permanent redirect to `/explorer` and
   `/activate` one to `/node/activate` (`next.config.js`). A path with no page shows the site's 404 page
   (`src/app/not-found.tsx`): the explorer's search field (`src/components/explorer/ExplorerSearch.tsx`) in its title
-  band, and a link to the explorer.
+  band, and a link to the explorer; its tab's title names it in the page's language, as every page's does.
 - The header (`src/components/Header.tsx`): the wordmark "QNet Blockchain" leads home, then Explorer, My node (`/node`),
-  Wallet, Testnet (its own tab on a testnet release, where the faucet is) and a Docs menu (Documentation, How it works,
-  DAO, Support), and the account control (`src/components/wallet/connect-wallet-button.tsx`), one in the header row at
+  Wallet, Testnet (its own tab on a testnet release, where the faucet is), a Docs menu (Documentation, How it works,
+  DAO, Support) and the language switcher (below), and the account control (`src/components/wallet/connect-wallet-button.tsx`), one in the header row at
   every width. Without a wallet it reads Connect wallet; with the wallet My node remembers it shows the node's state and
   the short address and opens the account menu: the whole address spaced at its structure with Copy, how the wallet is
   connected, My node's sections with one datum each (My node, Node balance, Device and History, or My node and
   Activate without a node; `src/lib/account-menu.ts`, read when the menu is about to open) and Disconnect. It is a panel
   under the button on a computer and a sheet from the bottom edge on a window 860 px wide or narrower, where the links
-  and the Docs menu (its list in place) open as a full-screen menu. The footer (`src/components/Footer.tsx`) carries,
+  and the Docs menu (its list in place) open as a full-screen menu. From 861 to 1180 px the globe stands for the
+  language's name, below 1100 px the links close up and below 1024 px the account control reads its short words
+  (Connect), so the row fits in every language. On a phone the row closes up below 420 px and its words step down below
+  380 and 340 px, so the brand, Connect and the menu's longer word keep the gutters from 390 down to 320 px. The footer
+  (`src/components/Footer.tsx`) carries,
   on every page, the line "QNet Blockchain has you, Eon...", a small line with the copyright, Privacy and Terms (Support
   is in the Docs menu) and the head block's height linked to its block, and, outside the app's view, the repository, X
   and Telegram marks and the two official store badges served from `/public/badges`, the iOS badge opening
@@ -192,7 +268,7 @@ delegate into `frontend/`.
   request for a phone (computer), Get QNet Wallet and, when that browser has it, the extension (phone or tablet). View
   by address and How it works in short (each way opened by its title) sit apart, beside it from 1,101 px and under it
   below.
-  View by address is no connection (owner, 13.10): the typed address is kept for this tab alone, in session storage
+  View by address is no connection: the typed address is kept for this tab alone, in session storage
   (`qnet.cabinet.view`), apart from the remembered wallet (a typed address an earlier version remembered as the wallet
   is dropped). While it is shown the header still offers Connect wallet (which ends the view, so the connect card
   shows), no extension's wallet is taken up by itself, and the head of the sections says "Viewing <short address> — read
@@ -214,19 +290,27 @@ delegate into `frontend/`.
   stand in a rail beside the section on a computer and in a bar under the thumb on a phone or small tablet (860 px or
   narrower, hidden while the menu or the account sheet is open), each with one datum from the account menu's own rows
   (`navItems` in `src/lib/cabinet/tabs.ts`): the node balance, the device or the server, the newest epoch, the
-  activation's step. The way to a running node (Connect, Activate, then Link a device and Running for a light node, or
-  Run the server and Running for a super node) shows over the section only while a step after Activate is open
-  (`showJourney`). While the page reads, every part stands at its final size (readouts with dashes, tables with empty
+  activation's step. On the bar a section's name is set smaller by its longest word where the section is narrower than
+  that word (`--n-len`, four sections on a 320 px screen). The way to a running node (Connect, Activate, then Link a
+  device and Running for a light node, or Run the server and Running for a super node) shows over the section only while
+  a step after Activate is open (`showJourney`), four steps across, two rows of two under 380 px. While the page reads, every part stands at its final size (readouts with dashes, tables with empty
   rows), so nothing moves when the answers come. What the pages show follows the wallet, whichever way it was
   connected and in whichever browser or device (`src/lib/cabinet/wallet-activation.ts`), from every source: the
   network (`GET /api/cabinet/wallet-node/{wallet}`, the light node's status and the super node's status: "no node" and
-  "registered" only when the nodes settle it), the site's activation record of the wallet with its search of the
+  "registered" only when the nodes settle it; the super node's status is read by the id the network names for the
+  wallet, a genesis node's for a genesis wallet, never the row its bootstrap left at height 1 under the id derived from
+  the wallet, and by that derived id only once the network said the wallet has no node, as for a server seen before
+  its registration lands, and not at all while the network is read or does not answer: `followedSuperId`, which My
+  node and the header's account menu share), the site's activation record of the wallet with its search of the
   wallet's own Solana address (`GET /api/cabinet/activation/{wallet}`, below), the QNet Wallet extension that holds the wallet
   (`qnet_getActivation`, read without a window: its activation, its burn on the way or its search), and on top what
   this browser keeps: the activation the extension reported for the wallet (`qnet.cabinet.activations`, at most five
   wallets) and the activations made here with a payment address. Every page shows one state: checking; the extension
   locked (or this site not approved), with nothing offered until it answers; a check that did not answer, named, with
-  Try again and a read again every half minute; no node and nothing known (the only state that offers an activation,
+  Try again and a read again every half minute (for a wallet kept from before it shared its Solana address, whose
+  Solana history the extension that holds it has not searched, that the page has no Solana address to search it by,
+  with the way on: Disconnect, then connect the wallet again; a payment address's burn asks for no reservation without
+  it); no node and nothing known (the only state that offers an activation,
   of either node type, the super node through the QNet Wallet extension only); another browser's or device's reservation
   (until when); a burn on its way; a known burn, whose code comes first with its next step (the record on the network
   and then Link a device for a light node, which any browser where the wallet is connected, a phone included, finishes
@@ -240,7 +324,14 @@ delegate into `frontend/`.
   the step's start or the page's return (then the half-minute round alone); the watch stops once nothing is awaited.
   The cabinet's reads of a node stay modest: the node's status, a super node's status and the wallet's node on the
   network every 30 s while the page is shown and when it is shown again, one read shared by every part of the page;
-  and the watch above. The site serves
+  and the watch above. Each request the cabinet sends to the site (its reads, the relay's requests, the activation's
+  steps) ends after 20 s without its answer (`src/lib/site-request.ts` `SITE_REQUEST_MS`), a reservation after 60 s
+  (`RESERVE_REQUEST_MS`: before it holds the wallet the site asks the genesis nodes and the light node's status, and
+  searches the wallet's Solana address when the page names it; the same signed reservation sent again gets the
+  reservation it made) and a
+  registration after 50 s (`REGISTER_REQUEST_MS`: the site's 30 s wait for the node, `SUBMIT_TIMEOUT_MS`, and 20 s
+  more), so a connection that stopped answering ends as a request not answered, which the page retries or offers to try
+  again, instead of holding the page. The site serves
   every status read from its cache per node, kept about the page's poll interval (25 s; a settled "not registered" 30
   s), so a node's genesis nodes see at most one round of reads per node in that time, whatever the visitors do, and
   each genesis node at most 20 page reads a second, 4 of them for ids nobody was seen registered with; a page that
@@ -248,8 +339,8 @@ delegate into `frontend/`.
   without a device, "Link your phone"; a node that one node lists before two agree on its status shows as recorded
   with no device yet, never as an empty section.
   A bare `/node` opens Activate only for a connected wallet in the state "nothing known", else the Overview.
-  The cabinet never renders in the QNet Wallet app's view (below). Its texts are English (`src/lib/texts.ts`), and the words
-  it shares with the app and the extension are theirs.
+  The cabinet never renders in the QNet Wallet app's view (below). Its texts are in the page's language
+  (`src/i18n/locales`), and the words it shares with the app and the extension are theirs.
   - Overview (`/node?tab=overview`): without a node, the state above and its next step; with nothing known, both node
     types ("Activate a light node", "Activate a super node": `/node/activate?type=light` or `?type=super`), with the
     note that a super node is activated only in the QNet Wallet extension on a computer and runs on the user's own server.
@@ -280,7 +371,8 @@ delegate into `frontend/`.
     record of the burn it has; once
     recorded with no device, "Next: link your phone or tablet" first on the page, with Link a device in numbered
     steps); the readouts: the node's state with its sentence (Online, Offline, or a new device waiting for its first
-    answer; else no device), this epoch with whether the node answered it, the time left and the line of its blocks
+    answer; Not known, with no step to link a device, while no answer can say which device runs the node; else no
+    device), this epoch with whether the node answered it, the time left and the line of its blocks
     done, the node balance with Move to wallet down to its ways (while a way to move it is open here), and the last 12
     epochs as cells (each names its epoch and result on hover, focus or tap; at rest the line under them names the
     newest epoch not counted, else the newest one); for an Offline device, under the readouts, the latest epoch the
@@ -291,25 +383,38 @@ delegate into `frontend/`.
     wake of its own: a phone whose push address is gone cannot be woken, only linked
     again. Then, for every registered node (with a device linked or not), the node balance: each counted epoch adds to
     it, the network keeps it for the wallet, and from 1 QNC Move to wallet puts it in the wallet, whichever way the
-    wallet is connected here (owner, 12.10): through the extension of this computer for its own wallet
-    (`qnet_claimNodeBalance` with the node's id, confirmed in the extension's own window), and a `claim` request to QNet
+    wallet is connected here: through the extension of this computer for its own wallet
+    (`qnet_claimNodeBalance` with the node's id, confirmed in the extension's own window, the page saying meanwhile that
+    the extension moves the balance once confirmed and answers here), and a `claim` request to QNet
     Wallet that names the wallet and the node (beside the extension's, or alone), its button on a phone or tablet and its
-    QR code on a computer; the answer is the wallet's report and the balance is read again from the network. An address
-    only viewed is offered no move. Under the balance, for a light and a super node alike, connected or viewed (owner,
-    13.10): the readings Total earned (X QNC) and Moved to the wallet (Y QNC), each unit a link to the QNC page. Y is what
+    QR code on a computer. Either wallet moves the whole balance it shows under its one confirmation, in one transaction
+    or several; the answer is the wallet's report (`src/lib/cabinet/extension-view.ts` `claimReport`): the total moved,
+    that anything left stays in the node balance from the epoch the answer names, only when it names one
+    (`stoppedAtEpoch`, which a whole balance below 1 QNC names too),
+    and the last transaction as a link to its page. The balance is then read again from the network. An address
+    only viewed is offered no move. Under the balance, for a light and a super node alike, connected or viewed: the readings Total earned (X QNC) and Moved to the wallet (Y QNC), each unit a link to the QNC page. Y is what
     every move of the wallet took to it, from the explorer archive's moves (all of them, not the nodes' 256 epochs),
     replayed by the chain's own rule: each listed epoch above the wallet's watermark of moved epochs is credited once and
     raises it, so a move sent twice counts once. Z is the node balance. Both are of one moment: the history route's first
     page reads the node balance from the node that gives the page, just before it, and carries the total only when that
     balance's first unpaid epoch is still above the page's watermark (`last_claimed_epoch`: no move landed between the two
     reads) and the archive's moves replay to that same watermark (an archive behind the latest move, or a node behind
-    the archive, gives none). The line shows it while that balance is the one the page shows; when they differ (a move or
+    the archive, gives none). A move the archive keeps cut short (it keeps a transaction's data to 100,000 characters,
+    which a move of about two hundred epochs passes, as a super or a genesis node's often does) is read whole from a
+    genesis node's microblock at its height (`src/server/cabinet/move-payload.ts`, two nodes asked, on the cabinet's
+    upstream budget), taken only when that transaction's listed amounts add up to the move's own total, and kept for the
+    process's life (500 at most; none given is asked again after 2 minutes; at most 8 fetched a read, a payload already
+    kept costing none of them, so a wallet with more cut moves gets the rest on its next reads); the page's moved epochs
+    then name it too. The line shows it while that balance is the one the page shows; when they differ (a move or
     a new epoch between the reads) it reads the history again at once and twice more after the site's 30 s copy of it,
-    saying meanwhile that it reads the latest moves, then gives up. Without a total (no archive, a move whose payload the
-    archive cut short or cannot be read, more than 5,000 moves, a node without those fields) the readings show a dash
-    with "Could not be read.": never a wrong number. Then, where the newest 16 epochs added anything, what each added
+    saying meanwhile that it reads the latest moves, then gives up. Without a total (no archive, a cut move no node
+    gives, more than 5,000 moves, a node without those fields) the two readings show a dash with "Could not be read.",
+    and History still names the node balance it read: never a wrong number. Then, where the newest 16 epochs added anything, what each added
     as bars (moved ones in grey, a tick for an epoch not counted, an outline for one not checked, a marker at the newest
-    move), the newest six epochs with the way to every epoch, and last Node
+    move, its label in a row of its own over the bars at the marker's place, inside the chart's width, taking a second
+    line where the chart is narrower than it, so it meets no other label; the axis values in a column as wide as the
+    widest of them; on a phone every fourth epoch under the bars, counted back from the newest), the newest six epochs
+    with the way to every epoch, and last Node
     details: the activation code with Copy, the node type, the node
     id, the burn with its link and amount and the block the node was recorded at (a link to that block), from the
     archive's registration
@@ -332,18 +437,23 @@ delegate into `frontend/`.
     as not admitted), or, from a node that does not name it, when the network's eligible set (the newest certified
     macroblock's eligible producers, read from its proof and kept 5 minutes) does not list it; offline wins, since the network also drops an admitted node that stopped sending
     heartbeats from the set; when it was last seen (the nodes', else the archive's newest heartbeat while the archive keeps up:
-    none once it wrote nothing for 120 s), its heartbeats this epoch against the number needed and whether they keep
+    none once it wrote nothing for 120 s), its heartbeats this epoch against the number needed (never past it: more than
+    the needed count reads as that count reached, 9 of 9) and whether they keep
     pace for the epoch to count (`is_reward_eligible`), the network's height and, when the network reports it
     (`peer_block_height`, which no node sends yet), the server's own against it, whether the network bars it, its node
     balance with Move to wallet as a light node's (the request names the wallet's super node; a genesis node's balance is
     only shown), its details with the server's steps and the block it was recorded at,
-    and its newest epochs. Before its registration lands, the page says so, and that the network sees its server
+    and its newest epochs. One of the network's genesis nodes (`genesis_node_001` to `genesis_node_005`) is named a
+    genesis node wherever a super node would be (the section's title, the node type and id in its details, the Device
+    tab, the account menu's node line, `src/lib/cabinet/server-words.ts`), and its details say it was recorded in the
+    first block (block 0), with no activation code or burn. Before its registration lands, the page says so, and that the network sees its server
     when a node's peer view holds it (status `onboarding` with `is_online`). Neither node type shows a count
     of its epochs over a window of recent ones; History lists the epochs themselves.
     A wallet with both shows both.
   - Device (`/node/device`): for a light node, the linked device from the public status's `device` ([light node
     messages](../protocols/light-node-messages.md) section 7): its state (Online, Offline, or a new device waiting
-    for its first answer), its model and platform as the device said them when it linked ("Pixel 8 · Android"; the
+    for its first answer; while no answer can say which device runs the node, only that, with no step to link one),
+    its model and platform as the device said them when it linked ("Pixel 8 · Android"; the
     platform alone when no model is known: Android, iPhone or iPad, or an unknown device; display only), the UTC day it
     linked, whether it answered this epoch, and the epoch of its last answer, as one entry with those three readings;
     for a node of an earlier version, which names no device, the last counted epoch instead. An address only viewed shows the state and the epochs alone: no
@@ -382,7 +492,7 @@ delegate into `frontend/`.
     super node, that it runs on its server with no device to link, and the server's status, or that it is not on the
     network yet.
   - History (`/node/history`): Total earned and Moved to the wallet as on the Overview, with the history's own node
-    balance as a third reading, then one list of the node's epochs, newest first, from its registration's epoch on, 30
+    balance as a third reading, shown once read, also while the moves cannot be totalled, then one list of the node's epochs, newest first, from its registration's epoch on, 30
     at a time with "Show more" (its waiting line while it reads, the older rows added under the ones shown; a page that
     fails keeps the rows and offers Try again): each epoch's number, when it began and ended (in the viewer's own time
     zone), its result (counted; counted and moved to the wallet; not counted; the registration's own epoch; not checked
@@ -443,7 +553,8 @@ delegate into `frontend/`.
     request that expired deletes the record, whose address was never shown. The
     user sends the activation price in 1DEV and 0.001 SOL (the burn's fee and the address's rent-exempt minimum,
     rounded up) to it from their own wallet: the card says which QNet Blockchain wallet the node is registered to and, in
-    one sentence, both amounts. The two ways are tabs, "Send from your wallet" first; under both, what has arrived of
+    one sentence, both amounts. The activation page names that wallet as text, never as a link: before its node is
+    registered the wallet's address page shows nothing of the activation. The two ways are tabs, "Send from your wallet" first; under both, what has arrived of
     each amount with a line that fills. "Send from your wallet" has one row and button per transfer, the 1DEV first, each for what the
     address still lacks of that token (`fundingLeft` in `src/lib/cabinet/payment-request.ts`: with 1,000 of 1,500 1DEV
     there, "Send 500 1DEV"); on testnet the buttons name test 1DEV and test SOL. On any device where the connected QNet
@@ -466,19 +577,24 @@ delegate into `frontend/`.
     (`ONE_DEV_MINTS[BURN_CLUSTER]` in `src/lib/one-dev.ts`, the extension's literals). A button reads
     "Received" once the payment address's balance read holds the full amount, and the SOL button is the primary one
     once the 1DEV is in or on its way. "Send it yourself" shows one QR code of the plain address, the address with Copy
-    and the two amounts (on a phone the address and amounts before the code); where no button is offered only this way
-    shows, without the tabs. On testnet it links the
+    and the two amounts (on a phone or a tablet the address and amounts before the code, a tablet's code in the second
+    of its two columns; a test token's name longer than its line breaks between its words); where no button is offered only this way
+    shows, without the tabs. On testnet, while either amount is still missing on the address, it links the
     Testnet page's faucet ("Get them to your wallet"), handing over the connected wallet's Solana address without a
     URL (`src/lib/faucet-handover.ts`), with the faucet pass the site gives for the wallet's signed reservation (see
     Faucet). Then the page burns (only for the connected wallet that signed the reservation,
     while its state is still "nothing known" or this browser holds its reservation, else Burn gives way to that state;
     and only under its reservation, made with the wallet's signed reservation: the server checks the network, its
     record and the wallet's Solana address first, and the payment key signs only with at least two minutes of the
-    reservation left; a signed reservation the server finds too old asks QNet Wallet to confirm again, the address
+    reservation left, a reservation answered again with less being released and taken anew; a signed reservation the server finds too old asks QNet Wallet to confirm again, the address
     kept). Right after the burn is signed and before it is sent, the payment key signs the owner bind v2 of the
     wallet's light node, and the site takes the burn only with it: once final, the burn is the wallet's activation for
     good and its code shows at once. The page then has QNet Wallet confirm the node with a `link` request naming that
-    wallet and submits the wallet's consent, which the server completes from its record before a node gets it; from a
+    wallet and submits the wallet's consent, which the server completes from its record before a node gets it; QNet
+    Wallet sends the same consent itself as soon as it gives it ([mobile wallet](mobile-wallet.md)), and the route takes
+    both as one registration. The steps from that answer to a node's admission (a consent that needs no check number
+    checked, the wallet's nodes read, the submit and its retries; `activation.ts` `runsHidden`) also run while the
+    page's tab is hidden; the funding and burn checks and following the chain run only while it is shown. From a
     node of either type already on the network for the wallet nothing is submitted (one wallet, one node), and the
     network's refusal `wallet_has_node` is shown as such. Every stage is kept in the browser's record and taken up again
     after a reload, whichever way the wallet is connected then. Before a burn the payment address's key lives at most 24
@@ -489,7 +605,14 @@ delegate into `frontend/`.
     when the extension or a `connect` on the same device shared it (on mainnet the page otherwise asks for it; test
     tokens are not asked for), and the key is deleted; the page then offers a new payment address, or, for a wallet that
     has its node or an activation by then, says that it needs none (`act_closed_has_node`). On mainnet an unrecorded
-    address with nothing on it keeps its key until the user deletes it. A recorded activation keeps a receipt.
+    address with nothing on it keeps its key until the user deletes it. A recorded activation keeps a receipt. A
+    finished activation with nothing left to send back opens My node's Overview by itself (`NodeActivate.tsx`).
+  - A QNet Wallet request on a phone (`src/components/cabinet/LinkWaiting.tsx`, for the connect and every later
+    request): after the button that opens QNet Wallet, the request keeps waiting for the app's answer until it
+    expires, however long the hand-over to the app takes; after 6 s still on the page (`NOT_OPENED_MS`) a note says
+    what to do if QNet Wallet has not opened, as another app's built-in browser never hands the link on: open the page
+    in the device's own browser, or show the QR code for another device. The note is worded as a condition, never as
+    a failure, and goes when the page leaves the screen.
   - Pieces that expire are asked for again in one tap, the progress kept: a QNet Wallet request past its ten minutes
     ("Ask again", a new request with the same content), a consent QNet Wallet gave more than 24 hours before the
     record ("Ask QNet Wallet again", for the same burn, whose code and wallet stay), a Link a device QR code, and an
@@ -532,6 +655,74 @@ delegate into `frontend/`.
     extension's paths stay (the extension's move of a node balance and its unlink among them), and the payment address is not offered. Without the
     extension, Unlink then says the node leaves a device when another device takes it over or when the wallet is
     deleted in QNet Wallet on it.
+- Languages: the site speaks QNet Wallet's eleven languages, in the app's order and under the app's names
+  (`src/lib/languages.ts`): English, 中文, Русский, Español, 한국어, 日本語, Português, Français, Deutsch, العربية,
+  Italiano. A page's address carries its language: English has none (`/explorer`), every other language puts its code
+  first (`/ru/explorer`, `/zh-CN/node`). `/en/...` is English too, for a browser that keeps no cookie: served in place
+  while English is not kept; a page load of it once English is kept, and a crawler's, is a 307 to the address without
+  it. The proxy (`src/proxy.ts`,
+  `src/lib/locale-route.ts`) serves `/ru/explorer` as `/explorer` in Russian and hands the page its language and its
+  path in two request headers it always sets itself (`x-qnet-locale`, `x-qnet-path`), and a third when the address
+  names English (`x-qnet-named`), so an address a server page makes keeps `/en/` (`/en/node?tab=history` goes to
+  `/en/node/history`); a request's own copy of any of the three is dropped first. That rewrite stays inside the
+  server: the proxy gets the request at the address the server checks a rewrite against (`skipProxyUrlNormalize` in
+  `next.config.js`; without it Next.js shows a server bound to 127.0.0.1 as localhost and fetches the page from outside), and a
+  redirect it answers leaves as a relative `Location`. A browser's first page load
+  without the `qnet.lang` cookie takes the first language its `Accept-Language` names that the site speaks (any
+  Chinese is 中文, any Portuguese Português), keeps it in that cookie for a year (`Path=/`, `SameSite=Lax`, `Secure` in production) and, when it
+  is not English, answers 307 to the page in that language; the language switcher's choice replaces the cookie, and an
+  address without a language then opens in the kept one. An address with a language is served in it whatever the
+  cookie says. The cookie's value is compared as sent (`localeIn`): one that is not a language code of the site, a
+  malformed one included, counts as none and is replaced. Crawlers and link previews (by generic words of their user agents), the router's own requests and
+  prefetches are never redirected and set nothing: a page load is a GET whose `Sec-Fetch-Dest` is `document` or, from
+  a browser that sends no `Sec-Fetch-*`, whose `Accept` names HTML (`isPageLoad`; the router's own RSC and prefetch
+  headers are not read); the link pages `/l` and `/send` take the kept or the browser's
+  language without changing their address; files, `/get`, `/robots.txt`, `/sitemap.xml` and the app-association files
+  have no language. Every page response and language redirect the proxy answers carries `Vary: Accept-Language,
+  Cookie`, since an address without a language is served in the kept or the browser's one, so no shared cache hands one
+  visitor's language to another. Every page renders per request, so a language is rendered when it is asked for and nothing is
+  prerendered eleven times. A page's head names its address in every language (`hreflang`, `x-default` the English
+  one) and its own canonical address, `/sitemap.xml` lists each of its pages in every language with the same
+  alternates, and a page's `<html>` carries `lang` and, for Arabic, `dir="rtl"`. Every page but the home page sets its
+  own title in the page's language: `<page> - QNet Blockchain`, and `<page> - Explorer - QNet Blockchain` for the
+  explorer's pages below `/explorer` (`pageMetadata` and, for a block, a transaction, an address or a token,
+  `recordMetadata` in `src/i18n/server.ts`, which also keeps those record pages out of the index); the home page is
+  titled QNet Blockchain. The texts are one
+  catalog per language (`src/i18n/locales/<code>.ts`, each typed as the English catalog's keys, so a missing or extra
+  key fails the type check), and every text, label, title, hint and image's words a page shows comes from them, apart
+  from names, values and the home page's outlined word VERIFY. The server reads them all; the browser gets, with the
+  page's data, only the texts its page's client code looks up: the shell's (the header, the footer, the error page)
+  from the root layout, and its part of the site's from that part's layout or page (`src/i18n/areas.ts`,
+  `src/i18n/area.tsx`: the home page, the explorer, My node, How it works, the privacy policy, the terms, Support,
+  Testnet, the wallet page), kept while the visitor moves within that part. The privacy policy's and the terms' texts
+  reach only their own pages; server components take theirs on the server and send none. When the root layout itself
+  fails, the last-resort page (`src/app/global-error.tsx`) reads its language from the address and shows its three
+  texts from `src/i18n/last-resort.ts`, which carries them for every language, so its first frame is already in that
+  language and it loads nothing; the error page under the layout (`src/app/error.tsx`) shows the shell's texts, which
+  every page holds, with the same Reload. Names and units (QNet Blockchain, QNet Wallet,
+  QNC, 1DEV, SOL, Solana, the stores), addresses, hashes, heights, amounts, activation codes and commands read the same
+  in every language; a value set into a sentence is isolated, so an address or an amount keeps its left-to-right order
+  inside Arabic, and dates take the language's month names with Latin digits. Korean breaks a line between words,
+  never inside one; Chinese and Japanese headings keep a word whole on its line (Japanese by its phrases where the
+  browser can tell them), and Japanese headings and the header set kana at their proportional widths (`i18n.css`). Sizes
+  the site computes from a text's length (a readout's value, a section's datum in My node, the lines of a guide
+  picture's label; `src/lib/geometry.ts` `textLength`) count a Chinese, Japanese or Korean character as one em, and a
+  value set smaller by its length (a readout's, a section's datum) an Arabic letter as 0.72 em (`ARABIC_VALUE_EM`, what
+  a short word of wide letters takes in the script's faces); a
+  picture's label breaks as its script does and never inside QNet Blockchain, QNet Wallet or QNet Link. The language switcher
+  (`src/components/LanguageSwitcher.tsx`) is in the header's row on a wide screen (a globe and the page's language,
+  opening a menu of the eleven) and at the end of the phone's menu, two to a row: each entry, in its own language, is a
+  link to the same page and query at the address that names that language (`/en/...` for English), the current one
+  marked; a choice writes the cookie and loads that page whole. An English page reached at `/en/...` keeps its links
+  there, so a browser that refuses the cookie stays in English. Arabic mirrors the layout (the sheets use logical sides; a sideways table's fixed column and fade move to
+  the left), while the charts, the epoch strip and the Latest blocks strip keep time running left to right; a label
+  inside them, and a count or a time anywhere (`.num`), reads in the direction of its first letter, so a transaction
+  count or a range of heights keeps its order; an address, a hash, an amount or a code keeps its own left-to-right run,
+  while a sentence around amounts (a payment meter's "250 of 1,500", a token transfer's base units) reads in the page's
+  direction, and the word that marks a test token stands in the label beside the amount; an address field's hint reads right to left until something is typed, and
+  the guide's pictures of QNet Wallet's and the extension's screens mirror as those screens do (`i18n.css`). Hide on
+  the explorer's Latest blocks keeps the strip folded in that language (`qnet.blocks`, scoped to `/explorer` or
+  `/<code>/explorer`).
 - The site has one origin, `https://aiqnet.io` (`src/lib/hosts.ts`, `src/proxy.ts`): the relay's and
   the faucet's `Origin` check, the extension's activation origin and the app's relay base all name it. A
   production build answers any other `Host` (`www.aiqnet.io`, `explorer.aiqnet.io`, an unknown name) with a
@@ -577,7 +768,7 @@ delegate into `frontend/`.
   holds to that in the app's in-app browser (provider `channel` `mobile`, `src/lib/activate-view.ts`). A page
   the app opens in the system browser is an ordinary visit there; the `?from=app` its links carry changes
   nothing. In the in-app browser, and in the server's render and before the wallet is detected, the header
-  links only the explorer, Privacy, Terms and Support (no Docs menu), the logo leads to the explorer, and the
+  links only the explorer, Privacy, Terms and Support (no Docs menu) beside the language switcher, the logo leads to the explorer, and the
   footer links no place off the site (no repository, Telegram, X or store); Support hides the documentation,
   the repository's issues and the Telegram channel, so its only way off the site is the support address.
   `/`, `/docs`, `/dao`, `/testnet`, `/qnet-wallet-extension`, `/wallet`, `/activate` and the node cabinet
@@ -600,8 +791,8 @@ Three parts, each its own process:
    applies pending migrations and then follows the chain. It commits with `synchronous_commit = off`
    and at start re-derives the gaps from 5,000 heights below its stored prefix, so rows a crash lost
    are fetched again.
-3. **Database** — PostgreSQL. The web tier can connect as a read-only role that writes only
-   `cabinet_activations`, the node cabinet's activation registry (below); the indexer needs write access.
+3. **Database** — PostgreSQL. The web tier connects as the role `explorer_reader`, which reads every table and writes
+   only `cabinet_activations`, the node cabinet's activation registry (below); the indexer is the writer (`qnet_user`).
 
 Every block commit is one transaction. A commit that writes the head block, a delete that moves the
 head and a reset each send `NOTIFY explorer_head` inside their transaction.
@@ -616,7 +807,11 @@ sync state. The overview, home and address pages follow the head through `useCha
 on `/api/stream` per tab, closed while the tab is hidden, with a 15 s poll of `/api/head` when the
 stream fails. On a new head the overview refetches its default first page, the home page its node counts
 at most once a minute (its epoch, supply and live blocks come from the head itself) and the address page its data at
-most every 3 s. The footer joins the stream for its block height only while it is near the screen.
+most every 3 s. The footer joins the stream for its block height only while it is near the screen. Every read the
+explorer's pages send to the site (`/api/head`, `/api/network/stats`, the lists, records, search suggestions and the
+balance check) ends after 20 s without its answer (`src/lib/site-request.ts` `SITE_REQUEST_MS`), and a search typed
+further or a list page left ends it first, so a connection that stopped answering leaves what the page shows and the
+next poll, head or Try again reads again.
 
 The migration runner (`src/indexer/migrate.ts`) applies every `migrations/NNN_*.sql` file not yet
 recorded in `schema_migrations`, in name order, each file as one transaction. A database whose tables
@@ -751,10 +946,11 @@ own, so explorer traffic never crowds it out.
 | `GET /api/blocks?latest=N` | The newest blocks from the head snapshot (height, hash, time, producer, producer address, transaction count), `N` 1–14 (default 12), no query of its own; 120 requests a minute per client |
 | `GET /api/blocks/[hash]` | Block by hash |
 | `GET /api/tx/[hash]` | Transaction by hash, its `amount_raw` and `fee_raw` in nano QNC (digit strings); a `BatchTransfers` envelope carries its recipients |
-| `GET /api/tokens`, `GET /api/token/[contract]`, `GET /api/token/[contract]/holders` | Token list, token detail, holders |
+| `GET /api/tokens`, `GET /api/token/[contract]/holders` | Token list; a token's holders, replayed from the index's transactions of the contract (at most 20,000, `MAX_REPLAY_TX`, `truncated` past them), the `limit` largest (1 to 500, default 100) with `holder_count` and `circulating_raw`. A contract's replay is kept a minute (`HOLDERS_KEEP_MS`) and made once at a time, so every reader in that minute (the token page, QNet Wallet's token screen) shares it, whatever its `limit`; at most 256 contracts are kept, and a replay that failed (503) is not |
+| `GET /api/token/[contract]` | Token detail: the token's record from a node (`/api/v1/token/{contract}`) with its newest transfers from the index (`?tx=`, 1 to 500, default 50). 404 only for the node's own not-found (its 404, or its answer that the contract holds no token: `nodeTokenRead` in `src/lib/explorer-reads.ts`); 503 `{success: false, error: 'unavailable'}` with `Cache-Control: no-store` when no node answered or a node failed, so the token page says it could not read the token and offers Try again, and the server keeps no such answer for the page's first paint |
 | `GET /api/token/[contract]/logo` | The token's on-chain logo, fetched by the server (`src/server/logo-proxy.ts`) from the URL the nodes report for the contract: https on port 443 only, no host that resolves to a private, loopback, link-local, shared, documentation, multicast or reserved address (the connection goes to the address checked), no redirects, at most 256 KB in 5 s, a PNG, JPEG, WebP or GIF by its own bytes (never SVG), nothing of the visitor passed on. Kept in memory (6 h, a missing logo 10 min; at most 2,000 logos and 32 MB), at most 4 fetches at once; 404 when there is no usable logo, 503 while busy; 600 requests per minute per client |
 | `GET /api/qnc` | Native QNC rich list, proxied from the node's `/api/v1/richlist`; the genesis-funded load-test accounts come apart as `genesis_allocations` and the QNC page shows them on one line instead of among holders. `GET /api/address/[address]` sets `genesisAllocation` for such an account and the address page says so |
-| `GET /api/network/stats` | Head, totals and emission from the head snapshot, plus Super nodes (distinct `Heartbeat` senders in the last complete 14,400-block epoch) and Light nodes (the largest per-epoch sum of bitmap `eligible_count` over the last three complete epochs), cached 60 s |
+| `GET /api/network/stats` | Head, totals and emission from the head snapshot, plus Super nodes (distinct `Heartbeat` senders in the last complete 14,400-block epoch that the network admits: the eligible set of the newest certified macroblock, `src/server/node-counts.ts`, shared with the cabinet's super node status; `null` while that set cannot be read, never a count of every sender) and Light nodes (the largest per-epoch sum of bitmap `eligible_count` over the last three complete epochs), cached 60 s |
 | `GET /api/search`, `GET /api/search/suggest` | Search and type-ahead |
 | `POST /api/faucet/claim` | Testnet faucet dispatch (see Faucet) |
 | `POST /api/faucet/pass` | The faucet pass for the QNet Blockchain wallet the node cabinet activates (see Faucet) |
@@ -763,18 +959,19 @@ own, so explorer traffic never crowds it out.
 | `GET /api/sync/start` | The indexer's published state: head, prefix, node height, lag, subscription, heal backlog, and `healthy` when the lag is at most 600 blocks and the last commit is under 120 s old; `POST` answers 410 |
 | `GET /api/monitoring/health`, `GET /api/monitoring/alerts` | Health (database, indexer lag and freshness, monitoring) and alerting; health reports `degraded` when the last commit is over 120 s old or the lag exceeds 600 blocks |
 | `GET /api/activation/price?type=light\|super` | The activation price from the pinned nodes `https://node1..5.aiqnet.io` (`/api/v1/activation/price`): `{type, phase: 1, cost, currency: '1DEV'}` or `{type, phase: 2}`, 503 when no node gives a valid quote (no fallback numbers); cached 15 s. A node's answer is read as a stream and dropped past 8 KiB (a larger declared length is not read at all), 4 s per node |
-| `POST /api/link/sessions`, `GET /api/link/sessions/[id]`, `GET`/`POST /api/link/sessions/[id]/response` | The QNet Link relay (`src/server/link-relay.ts`, protocol sections 5 and 14.5): the intents `connect`, `link`, `claim`, `reserve` and `unlink` (an `activate` session is refused; a `claim` session names the wallet and its light or super node, and the earlier one, which named no node, is refused as an invalid body), a session of any of them but `connect` with its request and the request's hash, which the relay computes; sessions in process memory (at most 100,000, at most 60 per creating IP, of them at most 5,000 `link` sessions and 10 per creating IP, 600 s each), one encrypted answer per session, body caps per intent (a `link` answer up to 12,288 bytes, the others 4,096), per-IP limits with a limiter store of its own (120 creates per 10 min; 120, 60 and 600 per minute for the other routes, for many phones or computers behind one NAT address), foreign `Origin` refused, and any `Sec-Fetch-Site` but `same-origin` (a browser request another page made, a GET by `<img>` included) refused before a limit counts it, in the app and in nginx, whose relay location has a rate-limit zone of its own; nothing logged by the relay or by nginx (`access_log off` for `/api/link/`) |
-| `GET /api/cabinet/node/[id]`, `GET /api/cabinet/node/[id]/history` | The node cabinet's reads of a node (`src/server/cabinet/node-proxy.ts`), the status for a light node id only (`?view=1`, the read of an address only viewed: the same cached status with the device's `platform`, `model`, `linkedSince` and `lastMiss` null; any other `view` is 400), the history for a light or a super node id: the public status from two genesis nodes `https://node1..5.aiqnet.io`, asked in the order of the node's light shard (the genesis that wakes its device, then the shard's two other owners, then the other two genesis nodes, each group shuffled), which must agree whether the node is registered (503 otherwise), with the features both list, the node balance and the linked device (`device`: `{platform, model, linkedSince, lastAnswerEpoch, state, lastMiss}`, the first five from the first settling answer, or null; a node's malformed `device` refuses its answer, one without the field names none, and a field of it the site does not read is ignored). `answeredThisEpoch` and `needsReactivation` are the word of the shard's owners that list the node (those at the network's height when any is, a node behind reading an older epoch; with no owner's answer, the settling pair's): answered when any of them says so, needs reactivation only when every one of them does, since an answer reaches the other owners by one relay that an owner down or restarting misses; when that word differs from the first answer's own, the device's `state` follows it by the node's rule (Online unless the node needs reactivation; then an owner's Offline or new-device state), and `lastAnswerEpoch` is the latest those owners name. `lastMiss` (`{epoch, reason, delivered}`: whether the wake of that epoch reached the device by the device's own account, true, false, or null when not known) is the shard owners' `device.last_miss` ([light node messages](../protocols/light-node-messages.md) section 7) as a reader takes it: among the answers, the miss of the highest epoch, at equal epochs the most specific reason (`not_committed`: no committed check of the shard, so no node of it counted whatever the device did; `answered_late`, `not_delivered`, `answer_refused`, `woken_no_answer`, `no_push_address`; `not_sent`: a wake the network did not get out, below any record of an owner that reached the device; `not_woken_inactive`), at equal reasons the one that knows whether the wake reached the device (the owner that took the device's account of it); a reason the site does not know, or a record it cannot read, is passed over, and a node without the field gives null. The keyless status names no exact time, delay or app outcome; a node of an earlier version that still sends them (`last_answer_at`, `last_answer`, a miss's times, delay, refusal code and `app_outcome`) is read for whether the wake reached the device alone, and nothing else of it is kept, neither in the answer nor in the shared per-node cache. When the answers name a miss newer than the node's last counted epoch with no later answer (but a shard with no committed check, the same at every owner), or a wake with no answer whose record lacks the device's account (only the owner that took the device's next answer keeps it), or the owners asked call the device Offline, a page's read also asks the shard's owners not asked yet, once (a reservation's read does not); and the node's epochs, which are its wallet's, one by one from the wallet's first registration on, a page at a time (`?page=N`, a whole number 0 to 1,000, else 400; `?view=1` as for the status, the same cached page with every row's `miss` null; `{registeredEpoch, archived, rows, more, earned}`, `earned` the wallet's total earned on page 0 with the archive, `{movedNano, balanceNano}` or null: the node balance read from the node that gives the page just before it, the archive's moves (every `RewardDistribution` from `system_rewards_pool` to the wallet, at most 5,000, their payloads without the proofs) only when they replay to that node's `last_claimed_epoch` and the balance's `first_unclaimed_epoch` is above it; page 0 the newest 30 epochs a node reports, page N the 31 from offset 30 N − 1 (the (30 N)th epoch on), so a page read from a node one epoch behind, or kept from before an epoch settled, skips none and the page drops the repeat; one node, a second filling the ones the first could not serve; `more` while the node has older epochs, names a wallet (a made-up id names none) and the page did not reach the registration's epoch): counted and still in the node balance, moved to the wallet, not counted (also an epoch after the wallet's super node registered that paid the wallet nothing, though the light node's group was not checked), the registration's own epoch, not checked by the network, or not readable, each with when it began and ended and the transaction that moved it, from the explorer archive for the wallet the nodes name (`src/server/cabinet/epoch-archive.ts`: the wallet's registrations, read by the wallet oldest first, at most 4, those naming its light or super node, or the id asked for, by their fields, their `client_node_reg:<node id>:` memo or a genesis node's `node_registration:<node id>:` one, the lowest block the start and the super node's apart, kept a day once found with the super node's, 5 minutes without; the wallet's moves from the end of the page's oldest epoch on, at most 32, with each epoch's exact amount; the block times of the page's epoch boundaries); an epoch the nodes can no longer read shows as moved when the archive holds its move; without the archive the epochs come undated. A row's `miss` (`{epoch, reason, delivered}`, as `lastMiss`) is why a light node's epoch the nodes report as not counted was missed, else null (also for an epoch not counted only because the wallet's super node earned nothing in it while the light node's group was not checked, since no node of that group could be counted): for a light node's page that names a wallet (a made-up id names none) and holds an epoch the nodes report as not counted, the three owners of its light shard are asked once each, alongside the archive, for `GET /api/v1/light-node/misses?node_id=&limit=64` (each owner's misses of the node's 64 epochs up to its newest record, at most 64 entries, each read as `last_miss` is), each given 1.5 s (`MISS_TIMEOUT_MS`), and their entries are merged per epoch by the rule for `lastMiss` and kept for the node 30 s, one read for every page of it; an owner that does not answer in time, or of an earlier release without the route (404, 405), adds none (a read no owner answered is not kept), and the page is served without those reasons. Exact answer shapes, cached per node 25 s, about the page's poll interval (a settled "not registered, not being recorded" 30 s; history 30 s per page, an older page as well, since a move to the wallet changes it), one upstream round per node at a time, 4 s and 64 KiB per node answer; foreign `Origin` and any `Sec-Fetch-Site` but `same-origin` refused before a limit counts it, then 120 requests per minute per client with a limiter store of the cabinet's own, and apart from it 30 reads a minute per client that miss the cache and go to the genesis nodes, shared with the super node and wallet-node routes (`limits.ts` `CLIENT_BUDGETS.upstreamMiss`, 429 past it). Each genesis node is asked at most 16 of these reads a second for ids the site has seen the network list as registered (kept in process memory a day after it was last seen registered, with nothing of who read it, `src/server/cabinet/known-nodes.ts`) and 4 for any other id (`upstream.ts` `readKnown`, `readUnknown`), so made-up ids, which cost nothing, cannot starve the owners of registered nodes |
+| `POST /api/link/sessions`, `GET /api/link/sessions/[id]`, `GET`/`POST /api/link/sessions/[id]/response` | The QNet Link relay (`src/server/link-relay.ts`, protocol sections 5 and 14.5): the intents `connect`, `link`, `claim`, `reserve` and `unlink` (an `activate` session is refused; a `claim` session names the wallet and its light or super node, and the earlier one, which named no node, is refused as an invalid body), a session of any of them but `connect` with its request and the request's hash, which the relay computes; sessions in process memory (at most 100,000, at most 60 per creating IP, of them at most 5,000 `link` sessions and 10 per creating IP, 600 s each), one encrypted answer per session, body caps per intent (a `link` answer up to 12,288 bytes, the others 4,096), per-IP limits with a limiter store of its own (120 creates per 10 min; 120, 60 and 600 per minute for the other routes, for many phones or computers behind one NAT address), foreign `Origin` refused, and any `Sec-Fetch-Site` but `same-origin` (a browser request another page made, a GET by `<img>` included) refused before a limit counts it, in the app and in nginx; nothing logged by the relay or by nginx (`access_log off` for `/api/link/`) |
+| `GET /api/cabinet/node/[id]`, `GET /api/cabinet/node/[id]/history` | The node cabinet's reads of a node (`src/server/cabinet/node-proxy.ts`), the status for a light node id only (`?view=1`, the read of an address only viewed: the same cached status with the device's `platform`, `model`, `linkedSince` and `lastMiss` null; any other `view` is 400), the history for a light or a super node id: the public status from two genesis nodes `https://node1..5.aiqnet.io`, asked in the order of the node's light shard (the genesis that wakes its device, then the shard's two other owners, then the other two genesis nodes, each group shuffled), which must agree whether the node is registered (503 otherwise), with the features both list, the node balance and the linked device (`deviceBound`, and `device`: `{platform, model, linkedSince, lastAnswerEpoch, state, lastMiss}`, the first five from one answer that lists the node, `deviceSource`: an owner of its light shard that has caught up with its co-owners, `binding_owner` true and `binding_synced` not false; else a genesis that read the owners for it, `binding_owner` false with a `device`; else a node from before those two fields; with none of them, as when no owner is reached, `deviceBound` and `device` are null and the cabinet says that the device that runs the node cannot be read right now, never that no device runs it, and offers no step to link one; a node's malformed `device`, `binding_owner` or `binding_synced` refuses its answer, one without the `device` field names none, and a field of it the site does not read is ignored). `answeredThisEpoch` and `needsReactivation` are the word of the shard's owners that list the node (those at the network's height when any is, a node behind reading an older epoch; with no owner's answer, the settling pair's): answered when any of them says so, needs reactivation only when every one of them does, since an answer reaches the other owners by one relay that an owner down or restarting misses; when that word differs from the first answer's own, the device's `state` follows it by the node's rule (Online unless the node needs reactivation; then an owner's Offline or new-device state), and `lastAnswerEpoch` is the latest those owners name. `lastMiss` (`{epoch, reason, delivered}`: whether the wake of that epoch reached the device by the device's own account, true, false, or null when not known) is the shard owners' `device.last_miss` ([light node messages](../protocols/light-node-messages.md) section 7) as a reader takes it: among the answers, the miss of the highest epoch, at equal epochs the most specific reason (`not_committed`: no committed check of the shard, so no node of it counted whatever the device did; `answered_late`, `not_delivered`, `answer_refused`, `woken_no_answer`, `no_push_address`; `not_sent`: a wake the network did not get out, below any record of an owner that reached the device; `not_woken_inactive`), at equal reasons the one that knows whether the wake reached the device (the owner that took the device's account of it); a reason the site does not know, or a record it cannot read, is passed over, and a node without the field gives null. The keyless status names no exact time, delay or app outcome; a node of an earlier version that still sends them (`last_answer_at`, `last_answer`, a miss's times, delay, refusal code and `app_outcome`) is read for whether the wake reached the device alone, and nothing else of it is kept, neither in the answer nor in the shared per-node cache. When the answers name a miss newer than the node's last counted epoch with no later answer (but a shard with no committed check, the same at every owner), or a wake with no answer whose record lacks the device's account (only the owner that took the device's next answer keeps it), or the owners asked call the device Offline, or no answer could say which device runs the node, a page's read also asks the shard's owners not asked yet, once (a reservation's read does not); and the node's epochs, which are its wallet's, one by one from the wallet's first registration on, a page at a time (`?page=N`, a whole number 0 to 1,000, else 400; `?view=1` as for the status, the same cached page with every row's `miss` null; `{registeredEpoch, archived, rows, more, earned}`, `earned` the wallet's total earned on page 0 with the archive, `{movedNano, balanceNano}` or null: the node balance read from the node that gives the page just before it, the archive's moves (every `RewardDistribution` from `system_rewards_pool` to the wallet, at most 5,000, their payloads without the proofs) only when they replay to that node's `last_claimed_epoch` and the balance's `first_unclaimed_epoch` is above it; page 0 the newest 30 epochs a node reports, page N the 31 from offset 30 N − 1 (the (30 N)th epoch on), so a page read from a node one epoch behind, or kept from before an epoch settled, skips none and the page drops the repeat; one node, a second filling the ones the first could not serve; `more` while the node has older epochs, names a wallet (a made-up id names none) and the page did not reach the registration's epoch): counted and still in the node balance, moved to the wallet, not counted (also an epoch after the wallet's super node registered that paid the wallet nothing, though the light node's group was not checked), the registration's own epoch, not checked by the network, or not readable, each with when it began and ended and the transaction that moved it, from the explorer archive for the wallet the nodes name (`src/server/cabinet/epoch-archive.ts`: the wallet's registrations, read by the wallet oldest first, at most 4, those naming its light or super node, or the id asked for, by their fields, their `client_node_reg:<node id>:` memo or a genesis node's `node_registration:<node id>:` one, the lowest block the start and the super node's apart, kept a day once found with the super node's, 5 minutes without; the wallet's moves from the end of the page's oldest epoch on, at most 32, with each epoch's exact amount; the block times of the page's epoch boundaries); an epoch the nodes can no longer read shows as moved when the archive holds its move; without the archive the epochs come undated. A row's `miss` (`{epoch, reason, delivered}`, as `lastMiss`) is why a light node's epoch the nodes report as not counted was missed, else null (also for an epoch not counted only because the wallet's super node earned nothing in it while the light node's group was not checked, since no node of that group could be counted): for a light node's page that names a wallet (a made-up id names none) and holds an epoch the nodes report as not counted, the three owners of its light shard are asked once each, alongside the archive, for `GET /api/v1/light-node/misses?node_id=&limit=64` (each owner's misses of the node's 64 epochs up to its newest record, at most 64 entries, each read as `last_miss` is), each given 1.5 s (`MISS_TIMEOUT_MS`), and their entries are merged per epoch by the rule for `lastMiss` and kept for the node 30 s, one read for every page of it; an owner that does not answer in time, or of an earlier release without the route (404, 405), adds none (a read no owner answered is not kept), and the page is served without those reasons. Exact answer shapes, cached per node 25 s, about the page's poll interval (a settled "not registered, not being recorded" 30 s; history 30 s per page, an older page as well, since a move to the wallet changes it), one upstream round per node at a time, 4 s and 64 KiB per node answer; foreign `Origin` and any `Sec-Fetch-Site` but `same-origin` refused before a limit counts it, then 120 requests per minute per client with a limiter store of the cabinet's own, and apart from it 30 reads a minute per client that miss the cache and go to the genesis nodes, shared with the super node and wallet-node routes (`limits.ts` `CLIENT_BUDGETS.upstreamMiss`, 429 past it). Each genesis node is asked at most 16 of these reads a second for ids the site has seen the network list as registered (kept in process memory a day after it was last seen registered, with nothing of who read it, `src/server/cabinet/known-nodes.ts`) and 4 for any other id (`upstream.ts` `readKnown`, `readUnknown`), so made-up ids, which cost nothing, cannot starve the owners of registered nodes |
 | `GET /api/cabinet/super/[id]` | A super node's status (`node-proxy.ts` `superStatus`), for a super node id (`super_node_` and 16 hex, or a genesis node's): `{registered, online, lastSeenAt, heartbeats, banned, balanceNano, admission, admitted, onPace, networkHeight, serverHeight, connected}` from the genesis nodes' `/api/v1/node/status` (one node that lists it registered answers "yes", two that do not are needed for "no", and `connected` says one of those saw its server), the balance from `/api/v1/rewards/pending`, when the nodes know no last-seen time the archive's newest heartbeat of the node (none while the archive is 120 s behind), `admission`, the answering node's word on the node's admission (`admitted`, `waiting` or `not_required`; null from a node that does not send it), and, only when it is null, `admitted`, whether the newest certified macroblock's eligible set lists the node (`src/server/cabinet/eligible-set.ts`: `/api/v1/state/certified`, then that macroblock's `/api/v1/macroblock/{index}/proof` and its `eligible_raw`, from one genesis node, the next when one gives no usable answer, kept 5 minutes for every reader and then served at once while one read refreshes it, also while refreshes fail, up to 30 minutes old, read on the budget of known ids; null when no node gave a usable answer, when the proof is over 8 MB, or when the set is not read within 3 s, whose read then goes on and serves the next status read); cached 25 s ("not registered" 30 s), 120 per client per minute, its reads that go upstream on the client's and the genesis nodes' read budgets as the light status's |
-| `GET /api/cabinet/wallet-node/[wallet]` | Whether a wallet has a node of either type (`src/server/cabinet/wallet-node.ts`): the genesis nodes' `/api/v1/verify-activation` with the wallet in the `x-qnet-wallet` header, two first then one more at a time (any `verified: true` is a node; a "no" needs a node at the network's height), then the light node's settled status: `{"state":"registered","nodeId","nodeType"}`, `{"state":"none"}`, or 503; cached 25 s (`none` 30 s), 60 per client per minute, its reads that go upstream on the client's and the genesis nodes' read budgets as the light status's (the budget of known ids for a wallet whose node was seen registered). A reservation (below) asks the same with a 5 s cache and an upstream budget of its own (`src/server/cabinet/upstream.ts` `reserve`, 10 calls a second per genesis node beside the reads' 16 and 4), so no flood of anonymous reads makes it answer `network_unavailable` |
+| `GET /api/cabinet/wallet-node/[wallet]` | Whether a wallet has a node of either type (`src/server/cabinet/wallet-node.ts`): the genesis nodes' `/api/v1/verify-activation` with the wallet in the `x-qnet-wallet` header, two first then one more at a time (any `verified: true` is a node; "no node" needs two nodes at the network's height that say so, `NONE_ANSWERS`, so one node's "no" with no "yes" is no answer, 503 here and on every route that would let a burn follow), then the light node's settled status: `{"state":"registered","nodeId","nodeType"}`, `{"state":"none"}`, or 503; cached 25 s (`none` 30 s), 60 per client per minute, its reads that go upstream on the client's and the genesis nodes' read budgets as the light status's (the budget of known ids for a wallet whose node was seen registered). A reservation (below) asks the same with a 5 s cache and an upstream budget of its own (`src/server/cabinet/upstream.ts` `reserve`, 10 calls a second per genesis node beside the reads' 16 and 4), so no flood of anonymous reads makes it answer `network_unavailable` |
 | `GET /api/cabinet/price`, `GET /api/cabinet/payment/[address]`, `GET /api/cabinet/blockhash`, `GET /api/cabinet/tx/[sig]`, `POST /api/cabinet/send` | The activation's Solana side (`src/server/cabinet/solana-proxy.ts`): the light price two genesis nodes agree on (15 s), a payment address's SOL and 1DEV (3 s), the latest blockhash (2 s), a transaction's state and the light burn it holds (its status by signature 2 s, the block height, one for all, 2 s, and a finalized transaction's burn a day, since it never changes; the state that depends on the page's `lvh`, pending or expired, is worked out from them on the server, so a new `lvh` costs no Solana read). A page reads its own burn and refund with the read pass `send` gave for that signature; those reads that go to Solana share 10 a second for the whole server, and reads of any other signature 2 a second, each client at most 12 a minute of them; past either the route answers 503 without asking Solana; `send` forwards only the cabinet's burn or refund, validly signed by its payment address (`src/lib/cabinet/burn-tx.ts`), anything else 400: a burn only as exactly `{"tx","reservation","ownerSig"}`, announced under that reservation in the activation registry before it leaves (the reservation's payer and whole amount must be the burn's; 409 `{"error":"reservation"}` and nothing forwarded otherwise), with the payment key's owner bind v2 of the reserved wallet's light node, 128 hex, which must verify against the key of the wallet's signed reservation (400 `{"error":"invalid_proof"}` and nothing forwarded otherwise); a refund exactly `{"tx"}`. A burn sent earns its read pass; a refund only when its payer is a payment address a reservation of this site named (`007_cabinet_activations_burner.sql` indexes them), since any funded key can send one. Per client 60, 120, 60, 120 and 10 per minute; `send` also 5 per payment address per 10 min |
-| `POST /api/cabinet/register` | The registration of a light burn from any browser (`src/server/cabinet/register.ts`), in one of two bodies. A payment address's burn: exactly the wallet's consent (`from`, `node_id`, `node_type`, `wallet_address`, `registration_proof`, `timestamp`, `burn_tx_hash`, `burn_amount`, `dilithium_signature`, `dilithium_public_key`), checked as the node checks it; then the wallet's row in the activation registry: its own payment burn, recorded, of this burn and amount, whose signed reservation carries this very wallet key; the body completed with that burn's payment address (`burn_wallet`) and the owner bind v2 the row keeps (`owner_signature`), which is verified again. A burn made from the wallet's own Solana address: the consent with `burn_wallet` (that address) and `owner_signature`, its owner bind v1 at the consent's `timestamp` (128 hex, which QNet Wallet signed with the wallet's Solana key), in the node's field order, checked as the node checks it (400 `invalid_request` with the field otherwise); then the wallet's row when it has a burn (that very burn, of that burner, a light one of this amount, recorded), else the search of `burn_wallet` (the kept one of the activation reads, in the reservation's lane, a new one charged to the register client and to the node, each its share of the lane: its first burn must be this light burn of this amount; `scan_incomplete` is a retry); then the network's one-node rule (the wallet's own light node already listed answers `registered`, any other node `wallet_has_node`, a network that cannot answer a retry). Either is then sent to one genesis node, one submit in flight per node; 30 per client per 10 min and 6 per node. Nothing is relayed for a burn not final yet (`{"result":"retry","code":"not_final"}`), another burn (`other_burn`), no such burn of the wallet or burner (`no_record`), another amount or node type (`invalid_burn`) or a key, bind or burner that does not match (`owner_bind`); the node's `wallet_has_node` (one wallet, one node) comes back refused |
+| `POST /api/cabinet/register` | The registration of a light burn from any browser (`src/server/cabinet/register.ts`), in one of two bodies. A payment address's burn: exactly the wallet's consent (`from`, `node_id`, `node_type`, `wallet_address`, `registration_proof`, `timestamp`, `burn_tx_hash`, `burn_amount`, `dilithium_signature`, `dilithium_public_key`), checked as the node checks it; then the wallet's row in the activation registry: its own payment burn, recorded, of this burn and amount, whose signed reservation carries this very wallet key; the body completed with that burn's payment address (`burn_wallet`) and the owner bind v2 the row keeps (`owner_signature`), which is verified again. A burn made from the wallet's own Solana address: the consent with `burn_wallet` (that address) and `owner_signature`, its owner bind v1 at the consent's `timestamp` (128 hex, which QNet Wallet signed with the wallet's Solana key), in the node's field order, checked as the node checks it (400 `invalid_request` with the field otherwise); then the wallet's row when it has a burn (that very burn, of that burner, a light one of this amount, recorded), else the search of `burn_wallet` (the kept one of the activation reads, in the reservation's lane, a new one charged to the register client and to the node, each its share of the lane: its first burn must be this light burn of this amount; `scan_incomplete` is a retry); then the network's one-node rule (the wallet's own light node already listed answers `registered`, any other node `wallet_has_node`, a network that cannot answer a retry). Either is then sent to one genesis node, one submit in flight per node; 30 per client per 10 min and 6 per node. The same signed registration again (its fields in any key order: QNet Wallet and the activation page both send it, or a retry) gets the answer of the one in flight, or for 3 minutes after a node admitted it (`ADMIT_HOLD_MS`, the wait of the page and of QNet Wallet before either submits it again) that admission, and reaches no node and none of the node's limit; up to 10,000 are kept, in the process's memory. Nothing is relayed for a burn not final yet (`{"result":"retry","code":"not_final"}`), another burn (`other_burn`), no such burn of the wallet or burner (`no_record`), another amount or node type (`invalid_burn`) or a key, bind or burner that does not match (`owner_bind`); the node's `wallet_has_node` (one wallet, one node) comes back refused |
 | `GET /api/cabinet/registration/[wallet]` | The block, burn, burner and amount of a wallet's light node registration from the archive, or with `?type=super` of its super node's (the wallet sends both; the row names the node by its kept id), for Node details (30 s cache, 30 per client per minute): exactly `{"found","record":{"height","burnTx","burner","amount"},"burnBy"}` or `{"found":false}`. `burnBy` says whose burn it is, so the page shows one code: `payment` (a one-time payment address of the site: the wallet's code) or `own` (the wallet's own Solana address: the burner's code; always so for a super node). For a light node: the wallet's row in the activation registry that holds this burn names it (`payment` for a payment address's, `own` for the extension's); without one no payment key of the site made it (every payment address's burn is announced in the registry before it leaves), and it is `own` once Solana holds that burn final and valid with the archive's burner as its fee payer and burn authority. Kept 24 hours per registration once known, and `null` as long when Solana holds that burn failed, or final but not as that burner's own valid burn; the Solana checks share 30 a minute for the whole server; `null` while the registry or Solana cannot tell |
 | `GET /api/cabinet/activation/[wallet]`, `POST /api/cabinet/activation/reserve`, `…/announce`, `…/release`, `…/record` | The activation registry (below) |
+| `POST /api/cabinet/solana` | The wallets' Solana relay (below) |
 
 Every `/api/cabinet/` route writes nothing of its requests to a log, and nginx gives it a location of its own
-with `access_log off`, the same `Sec-Fetch-Site` refusal as the relay and a rate-limit zone of its own
-(`aiqnet_cabinet`).
+with `access_log off` and the route's own `Sec-Fetch-Site` refusal: the relay's, and on the activation routes and the
+wallets' Solana relay `none` let through ([production host](#production-host)).
 
 ### Activation registry
 
@@ -790,8 +987,8 @@ carries `Retry-After`.
 
 | Route | What it does |
 | --- | --- |
-| `GET /api/cabinet/activation/[wallet][?solana=S]` | The wallet's row: exactly `wallet`, `state` (`none`, `reserved`, `sending`, `recorded`), `nodeType`, `way`, `burner`, `burnTx`, `burnAmount`, `code` (only when recorded), `until` (a reservation's end, an announced burn's last moment to land) and `recordedAt`, and with `?solana=` while the state is `none` the search of that Solana address: its signatures in pages of 1,000, older pages with `before`, up to 4 pages; those with a `QNET_NODE_TYPE` memo read oldest first, at most 30, and only the ones S paid for count toward the 10 of its own (a memo transaction someone else sent it costs a read, never that cap); `{complete, unusable, burns}`, complete only when every page and every marked transaction was read (`unusable`: a 1DEV burn of S's own no code comes from; a transaction that burned no 1DEV is no burn, whatever its memo), kept 5 minutes per address. Each of two lanes, these anonymous reads and the signed requests (a reservation's search and an own-address registration's), which the reads cannot starve, has budgets of its own for the whole server: 120 first pages of signatures a minute, and 30 searches a minute that read further pages or the marked transactions, so an address with no activation memo (a throwaway one) takes nothing scarce. A new search is charged first to the clients the route names (the visitor's IP, IPv6 by its /64, and for a registration also the node), each at most 3 searches a minute in a lane and 1 of them past its first page, so many free QNet Blockchain wallets from a few addresses cannot drain a lane; a search that joins one in flight costs nothing, and both lanes share the kept results. A search that cannot finish offers no burn; the QNet Wallet extension's own search, which continues where it stopped ("Recover my code"), is the way on for such a wallet. A `sending` row is settled first: landed, final and valid, it is recorded, whichever way (its proof came with the announce); failed, or not found 10 minutes after the announce, the row goes |
-| `POST /api/cabinet/activation/reserve` | Exactly `{wallet, nodeType, way, burner, burnAmount, solana, proof}`, at most 12 KiB (the payment way is light only, the extension's burner is its own Solana address). `proof` is the wallet's signed reservation `{pk, sig, time}`: its ML-DSA-65 key (base64url) must give the wallet, and its signature (FIPS 204 context `QNET_OFFCHAIN_MSG_v1`, over the envelope the wallets build for `https://aiqnet.io`) must verify over `QNet node reservation v1` with these very fields and `time` (400 `invalid_proof`); `time` must be at most 10 minutes old for the extension, 24 hours and 10 minutes for a payment address (QNet Wallet signs it before the address exists), and at most 5 minutes ahead (400 `stale_proof`). Then the wallet's row, then the network (409 `has_node` for a node of either type, 503 `network_unavailable`), then for the payment way a search of the wallet's Solana address no older than 5 minutes: the signed reservation does not name that address, so the page's own recent finished search of it answers, and a new one is charged to the client as above (409 `burn_found` or `burn_unusable`, 503 `scan_incomplete`), then one statement that takes a free row or an expired reservation, keeping the proof: `{reservation, until}` for 10 minutes, or 409 `has_burn`, `burn_pending` or `reserved` with the row |
+| `GET /api/cabinet/activation/[wallet][?solana=S]` | The wallet's row: exactly `wallet`, `state` (`none`, `reserved`, `sending`, `recorded`), `nodeType`, `way`, `burner`, `burnTx`, `burnAmount`, `code` (only when recorded), `until` (a reservation's end, an announced burn's last moment to land) and `recordedAt`, and with `?solana=` while the state is `none` the search of that Solana address: its signatures in pages of 1,000, older pages with `before`, up to 4 pages; those with a `QNET_NODE_TYPE` memo read oldest first, at most 30, and only the ones S paid for count toward the 10 of its own (a memo transaction someone else sent it costs a read, never that cap); `{complete, unusable, burns}`, complete only when every page and every marked transaction was read (`unusable`: a 1DEV burn of S's own no code comes from; a transaction that burned no 1DEV is no burn, whatever its memo), kept 5 minutes per address. Each of two lanes, these anonymous reads and the signed requests (a reservation's search and an own-address registration's), which the reads cannot starve, has budgets of its own for the whole server: 120 first pages of signatures a minute, and 30 searches a minute that read further pages or the marked transactions, so an address with no activation memo (a throwaway one) takes nothing scarce. A new search is charged first to the clients the route names (the visitor's IP, IPv6 by its /64, and for a registration also the node), each at most 3 searches a minute in a lane and 1 of them past its first page, so many free QNet Blockchain wallets from a few addresses cannot drain a lane; a search that joins one in flight costs nothing, and both lanes share the kept results. A search that cannot finish offers no burn; the QNet Wallet extension's own search, which continues where it stopped ("Recover my code"), is the way on for such a wallet. A `sending` row is settled first: landed, final and valid, it is recorded, whichever way (its proof came with the announce); failed, or no valid burn, the row goes; not found, it goes only once two reads of it 3 minutes apart (`DROP_SETTLE_MS`), the first 10 minutes after the announce or later, find it nowhere, so one lagging Solana answer frees no wallet (the time of the first such read is kept in the process's memory, for at most 5,000 burns: a restart only waits again) |
+| `POST /api/cabinet/activation/reserve` | Exactly `{wallet, nodeType, way, burner, burnAmount, solana, proof}`, at most 12 KiB (the payment way is light only, the extension's burner is its own Solana address). `proof` is the wallet's signed reservation `{pk, sig, time}`: its ML-DSA-65 key (base64url) must give the wallet, and its signature (FIPS 204 context `QNET_OFFCHAIN_MSG_v1`, over the envelope the wallets build for `https://aiqnet.io`) must verify over `QNet node reservation v1` with these very fields and `time` (400 `invalid_proof`); `time` must be at most 10 minutes old for the extension, 24 hours and 10 minutes for a payment address (QNet Wallet signs it before the address exists), and at most 5 minutes ahead (400 `stale_proof`). A payment address's reservation names the wallet's own Solana address in `solana`, which may hold the wallet's burn already: without it, 400 `solana_required`, and the server logs `[INFO][CABINET] reserve_refused reason=no_solana`, a line that names nothing of the request. Then the wallet's row, then the network (409 `has_node` for a node of either type, 503 `network_unavailable` when it did not answer, one node's "no" among it), then for the payment way a search of the wallet's Solana address no older than 5 minutes: the signed reservation does not name that address, so the page's own recent finished search of it answers, and a new one is charged to the client as above (409 `burn_found` or `burn_unusable`, 503 `scan_incomplete`), then one statement that takes a free row or an expired reservation, keeping the proof: `{reservation, until}` for 10 minutes, or 409 `has_burn`, `burn_pending` or `reserved` with the row. The same signed reservation sent again (the same wallet, `nodeType`, `way`, `burner`, `burnAmount` and `proof`) while its reservation lives, also twice at once, gets that `{reservation, until}`, read from the row before the network is asked; any other request for a wallet with a live reservation gets 409 `reserved` |
 | `POST /api/cabinet/activation/announce` | The extension's burn under its reservation, with the proof made with the wallet's own keys (`src/lib/cabinet/burn-record.ts`: the wallet's ML-DSA-65 signature, FIPS 204 context `QNET_OFFCHAIN_MSG_v1`, and the burner's Ed25519 signature over one message naming the wallet, the node type, the burner, the burn and the amount): `sending`, or 409 `reservation`, 400 `invalid_proof` |
 | `POST /api/cabinet/activation/release` | A reservation without a burn given up (a burn is never released); always `{"ok":true}` |
 | `POST /api/cabinet/activation/record` | The extension's final burn with that proof: recorded once Solana holds it final and valid (409 `not_final`, 400 `invalid_burn`), over no row, a reservation without a burn, or the same burn on its way; over another proven burn (a payment address's included) only when it is the same burner's older burn; otherwise 409 `other_burn` |
@@ -804,6 +1001,79 @@ runs, since a burn is public and permanent. No IP address is stored. Deploy the 
 the table exists (or while the database cannot be reached) every activation route answers 503 `unavailable`, the
 pages name the check that did not answer, and nothing is burned. When the web tier connects as a read-only role of
 another name than `explorer_reader`, grant it `SELECT, INSERT, UPDATE, DELETE` on `cabinet_activations` by hand.
+
+### Wallets' Solana relay
+
+QNet Wallet and the QNet extension call their Solana endpoint directly. When it gives a device no answer at all (a
+network error or a timeout), the same JSON-RPC request goes to `POST /api/cabinet/solana` on the site the wallet
+already uses (`src/server/cabinet/solana-relay.ts`, built on the activation's Solana door, `solana-proxy.ts`), and the
+wallet keeps its calls there until a direct try answers again. Only signed transactions travel; no key reaches the
+site.
+
+- The request: one JSON-RPC 2.0 object per POST, exactly `jsonrpc` `"2.0"`, `id` (an integer 0 to 2^31 − 1, or a
+  string of at most 64 characters), `method` and a `params` array, as `application/json` of at most 4,096 bytes (415,
+  413 and 400 otherwise; a batch or any other envelope is error −32600). Its origin rule is the activation routes': no
+  `Origin` (the app), the extension's `chrome-extension://` origin with `Sec-Fetch-Site: none`, or the site's own; any
+  other is 403 `forbidden_origin` before a limit counts it.
+- The methods are exactly the wallets' 14, each with exactly the params they send; any other method is −32601 and any
+  other param −32602, and neither reaches Solana:
+  - `getBalance` and `getAccountInfo` (jsonParsed), confirmed or finalized: the account is read first as its first
+    166 bytes (`getMultipleAccounts`, base64, `dataSlice`), the reads of every client that arrive within 250 ms
+    (`BATCH_WINDOW_MS`) in one call of up to 100 accounts; one with more than 165 bytes of data is −32602
+    `account data too large`, any other is then read parsed (at confirmed in the activation page's own batch);
+    answered `{value}`, kept 3 s per address and commitment.
+  - `getTokenAccountsByOwner` (the 1DEV mint, jsonParsed, confirmed), kept 3 s per owner.
+  - `getTokenSupply` (1DEV, finalized) and `getSupply` (confirmed, without the list of non-circulating accounts): one
+    answer for every client, 60 s; `getMinimumBalanceForRentExemption` of 0 or 165 bytes, an hour.
+  - `getLatestBlockhash` (confirmed) and `getBlockHeight` (confirmed or finalized): the activation page's own, 2 s.
+    Of these shared answers, one the endpoint did not give is kept 2 s (`FAILED_SHARED_MS`), so it is asked for at
+    most that often, however many clients ask.
+  - `getSignatureStatuses` of one signature: the status `/api/cabinet/tx` reads too, 2 s, the history searched, the
+    reads of every client that arrive within 250 ms in one call of up to 256 signatures. A read with
+    `searchTransactionHistory` true (a wallet's look before it calls a send expired) is answered by a status found, or
+    by a read made for it: a "not found" kept from before it is read again.
+  - `getSignaturesForAddress` (limit 1 to 1,000, confirmed or finalized, `before` and `until` optional), 2 s;
+    `getTransaction` (jsonParsed, confirmed or finalized, version 0): a finalized one a day (at most 500 kept), a
+    confirmed one 2 s, one not found yet not kept. A listing, an owner's token accounts or a transaction is kept only
+    while its JSON is at most 16 KiB (`KEEP_MAX_CHARS`), so these caches hold at most 596 answers of that size; a larger
+    one is passed on and read again next time.
+  - `getFeeForMessage` of a message, `simulateTransaction` (base64, `sigVerify` true, `replaceRecentBlockhash` false,
+    confirmed) and `sendTransaction` (the app's options or the extension's) of a transaction: only one of the wallets'
+    shapes (`src/lib/wallet-solana-tx.ts`), paid for by its one signer, and validly signed for a simulation or a send.
+    A SOL transfer is an optional memo and a System Transfer, then up to 4 reference keys; a 1DEV transfer an
+    optional idempotent create of the recipient's 1DEV account, an optional memo and a TransferChecked of the 1DEV
+    mint at 6 decimals from an account of the payer, then up to 4 reference keys; the extension's activation burn a
+    Burn of whole 1DEV from the payer's 1DEV account and its signed `QNET_NODE_TYPE:LIGHT` or `QNET_NODE_TYPE:SUPER`
+    memo. A memo lists no account and holds 1 to 200 bytes of UTF-8, references are distinct (the payer's own address
+    may be one), and the message lists exactly the accounts its instructions name, with their roles. Anything else, the
+    cabinet's own burn and refund included, is −32602 `transaction not accepted` (`message not accepted` for a fee).
+    `docs/protocols/solana-relay.vectors.json` (its generator `docs/protocols/tools/solana-relay-vectors.mjs`) holds
+    these shapes as bytes: the app's and the extension's tests build each of their cases byte for byte, and the site's
+    test reads each as its shape and sends it on. The burn
+    goes on only when the activation registry holds it, by its signature, as the extension's announced or recorded
+    burn of this burner, amount and node type (−32602 `burn not announced`; 503 when the registry cannot answer). A
+    send answers its signature, the endpoint's refusal as its JSON-RPC error (code and message), and 503 when the
+    endpoint gave no answer, since it may still have gone on.
+- The answers: a forwarded method's result exactly as the endpoint gave it, integers past 2^53 digit for digit; JSON
+  with `Cache-Control: no-store`. The endpoint's answer is read up to its method's cap (`src/server/solana-rpc.ts`
+  `ANSWER_MAX_BYTES`: 2 MiB for `getSignaturesForAddress`, 256 KiB for `getTokenAccountsByOwner`;
+  `ANSWER_DEFAULT_MAX_BYTES`, 1 MiB, for any other); past it the route answers 503.
+- The limits: on the endpoint the server keeps to lanes of its own (`src/server/cabinet/upstream.ts`) per 10 s: 25
+  reads (a batch is one), 9 listings of more than 25 signatures (an extension's activation check lists four, so two
+  checks fit), and 5 simulations and sends; together 39 of the public endpoint's 100 calls per 10 s for one address,
+  and of one method at most 34 of its 40. They are sized for the public endpoint, whatever `SOLANA_RPC_URL` names.
+  Past a lane the route answers 503 without asking Solana and logs `[WARN][SOLANA] relay_lane_spent lane=read`,
+  `scan` or `send` once a window. Per client (the visitor's IP, IPv6 by its /64): 240 requests a minute, and of each
+  lane a share in the lane's own 10 s, the most under half of it (`limits.ts` `CLIENT_BUDGETS`): 12 reads, 4 long
+  listings, 2 simulations and sends, so that one client never takes a whole lane, even across the seam of two of its
+  own windows, while a wallet's largest step fits (the extension's history page reads two listings and ten
+  transactions; the app's 1DEV quote nine reads). Each call that reaches Solana costs its client one of its lane's
+  share (a key added to a batch, a read the cache does not hold, a simulation, a send; an account read parsed costs its
+  slice and its parsed read); a kept read and the shared answers cost nothing; a send is charged to the client that
+  posts it, never to its fee payer, since anyone can post a payer's landed transaction again. 429 with `Retry-After`
+  past a limit.
+- What the endpoint did not answer (a read, a send, the blockhash, a block height) is logged at most once a minute per
+  method (`relay_upstream_failed method=… reason=…`); no line names an address, a signature, a body or a client.
 
 ### Balance check
 
@@ -905,8 +1175,13 @@ SDK runs in the process that holds the key. A claim asks for one token: at most 
 `/testnet` page asks for 1,500 1DEV and 0.005 SOL as a pair, enough for a wallet to send the activation's 1DEV and
 SOL to a payment address of My node, whose card links the page and hands over the wallet's Solana address (read once
 from the tab's session storage, never from the URL). The line under the page's form shows a waiting line while the
-claims run, then what was sent with each Solana transaction linked to the Solana explorer, or why nothing was sent and
-when to try again. The faucet sends test tokens only: on a release whose network is
+claims run, then what was sent (each token that went through on a line of its own, its amount with its icon) with each
+Solana transaction linked to the Solana explorer, or why nothing was sent and when to try again. A claim answers once its transfer landed, and at most 132 s after the route took it
+(`FAUCET_CLAIM_MS` in `src/lib/faucet-handover.ts`): the blockhash and the send, each Solana call at most 8 s
+(`RPC_CALL_MS`), then a confirmation read every 2 s (`CONFIRM_POLL_MS`) until the transfer lands, fails or its
+blockhash expires; a transfer not settled by then is answered unconfirmed, with its signature, and keeps its
+reservation; the page waits 152 s for the pair (`FAUCET_CLAIM_REQUEST_MS`, a read more) and then says the faucet
+could not be reached. The faucet sends test tokens only: on a release whose network is
 not testnet (from `BURN_CLUSTER` in `src/lib/qnet-link.ts`, never a setting) the route answers 404. Every claim passes
 the same admission (`src/server/faucet-guard.ts`): one claim of each token per address a day, keyed on the
 `(address, token type)` pair so the page's pair never refuses itself; 5 claims of each token per client IP an hour and
@@ -920,7 +1195,11 @@ for by the node cabinet's payment card with the wallet's signed reservation it h
 way's window, 400 `invalid_proof` or `stale_proof` otherwise; 10 requests per client per 10 min; once the reservation
 verified, 3 passes an hour per client IP and 10 per network block, since a QNet Blockchain wallet costs nothing and these are what
 make a pass scarce; 429 with `retryAfterS` past either; 404 off testnet) and handed to the Testnet page with the
-address; it names the wallet and the second it
+address. The card asks only when its faucet link is followed, and the click waits at most 4 s for the pass
+(`PASS_WAIT_MS`), the link busy and taking no second click, then goes on with or without one, unless the visitor has
+left the page meanwhile; per signed reservation the page keeps, in its memory only, the pass
+until a minute before it ends, and asks nothing during a 429's `retryAfterS` (60 s when it names none) or ever again
+after a 400 or 404. A pass names the wallet and the second it
 ends, an hour later, with an HMAC of both under `FAUCET_PASS_KEY` (`src/server/faucet-pass.ts`, compared in constant
 time; the server keeps no list of passes). With a pass each wallet gets one claim of each token a day, whatever address
 it names; a pass that does not check out, or has ended, makes the claim an open one. A refusal carries `retryAfterS`
@@ -943,13 +1222,13 @@ Values are operator-supplied. Never commit them; never place them in a document.
 | `QNET_API_URL` | Single node URL, used when `QNET_API_URLS` is unset |
 | `QNET_API_URLS` | Comma-separated node URLs: the indexer reads and votes over them; the API routes ask them in turn |
 | `QNET_BOOTSTRAP_NODES` | Comma-separated node list used for validator discovery |
-| `SOLANA_RPC_URL` | The Solana devnet RPC endpoint of the site's server, for the node cabinet's reads, sends and burn searches and for the faucet: an https URL without user info (plain http only for a node on this machine). Unset, it is the public `https://api.devnet.solana.com`, which allows one address only a few requests a second (`src/server/solana-endpoint.ts`); the deploy scripts warn when it is missing |
+| `SOLANA_RPC_URL` | The Solana devnet RPC endpoint of the site's server, for the node cabinet's reads, sends and burn searches, the wallets' Solana relay and the faucet: an https URL without user info (plain http only for a node on this machine). Unset, it is the public `https://api.devnet.solana.com`, which allows one address only a few requests a second (`src/server/solana-endpoint.ts`); the update script, which every deploy runs too, warns when it is missing. The relay's lanes on it (`src/server/cabinet/upstream.ts`) are sized for the public endpoint; this setting does not change them |
 | `DAO_ENABLED` | `1` opens `POST /api/dao/vote`; any other value, or none, refuses every vote |
 | `QNET_API_KEY` | Sent as `X-API-Key` to the node to bypass its rate limits |
 | `FAUCET_PRIVATE_KEY` | Faucet signing key, read only at runtime |
 | `CABINET_READ_KEY` | 32 bytes or more in hex (`deploy-aiqnet.sh` makes it once and keeps it): the key of the read passes the cabinet's send route gives for a burn or refund, so they outlive a restart; unset, a key of the process |
-| `FAUCET_PASS_KEY` | 32 bytes or more in hex (`openssl rand -hex 32`, set once in `.env.local`; `deploy-aiqnet.sh` makes it once and keeps it): the key of the faucet passes `POST /api/faucet/pass` gives, so they outlive a restart; unset, a key of the process, and a restart ends the passes it gave (a claim then takes the open share) |
-| `CABINET_PHONE_FLOWS` | `1` lets the node cabinet send QNet Wallet its `link`, `claim`, `reserve` and `unlink` requests; any other value, or none, is off (the deploy scripts write `0`) |
+| `FAUCET_PASS_KEY` | 32 bytes or more in hex (`openssl rand -hex 32`, set once in `/root/qnet-explorer.env`; `deploy-aiqnet.sh` makes it once and keeps it): the key of the faucet passes `POST /api/faucet/pass` gives, so they outlive a restart; unset, a key of the process, and a restart ends the passes it gave (a claim then takes the open share) |
+| `CABINET_PHONE_FLOWS` | `1` lets the node cabinet send QNet Wallet its `link`, `claim`, `reserve` and `unlink` requests; any other value, or none, is off (the deploy script writes `0` into `/root/qnet-explorer.env` when the file has no value) |
 | `WALLET_APK_URL` | The https address of an `.apk` file: QNet Wallet's Android file, the same Play-signed build as Google Play, which `/wallet` then offers; unset offers none. The file is served from aiqnet.io, or is the asset of one fixed GitHub release, `https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>` (for example the tag `app-1.3.0-20`), whose tag does not match `wallet-<x.y.z>-<n>` and whose asset is not named `QNet-Wallet.apk`: that tag pattern and that asset name belong to the older Android build's move release, which the 1.1.7 site APK's update check takes ([mobile wallet](mobile-wallet.md)). A `.../releases/latest/...` address, which could resolve to that release, and a release file with that tag pattern or asset name are refused (`src/server/wallet-apk.ts`), and the page then offers no file |
 | `SECURITY_WEBHOOK_URL` | Destination for security and alert events |
 | `INDEXER_LOG_LEVEL` | Indexer log level: `err`, `warn` or `info` (the default) |
@@ -998,42 +1277,142 @@ npm start                 # next start -H 127.0.0.1: reachable only from this ho
 The site needs Node.js 22 or later (`engines` in `package.json`); Node.js 18 has had no security
 releases since 2025-04-30. It runs on Next.js 16, which gets security releases until 2027-10-21.
 `frontend/release-support.json` records the end of security support of both lines, and the dependency
-gate below fails once one has passed. `ecosystem.config.example.js` lays out the web tier and the indexer under
-PM2, the web tier connecting as a read-only role.
+gate below fails once one has passed.
 
 ### Production host
 
-`deployment/deploy-aiqnet.sh` provisions the host: Node.js 22 from NodeSource, a system user `aiqnet`
-(no login shell) that owns the checkout in `/var/www/qnet`, installs and builds as that user and runs
-pm2 as that user (`pm2 startup systemd -u aiqnet`), and nginx in front, with `/api/link/` and `/api/cabinet/`
-each in a location of its own that writes no access log. Only the `aiqnet.io` block proxies the site;
-`www.aiqnet.io` and `explorer.aiqnet.io` have a block that only redirects to it, and `link.aiqnet.io` its own;
-every location that proxies sets `X-Real-IP` to the connecting address, and every TLS block keeps `/api/link/`
-and `/api/cabinet/` out of the access log (`src/lib/__tests__/deploy-config.test.mjs`). Secrets (`FAUCET_PRIVATE_KEY`, `DATABASE_URL`, `QNET_API_KEY`) go
-into `frontend/.env.local`, mode 600, owned by `aiqnet`. The script and `/root/update-aiqnet.sh` each write
-`CABINET_READ_KEY` and `FAUCET_PASS_KEY` there (`openssl rand -hex 32`) unless the file already holds one of exactly
-64 lowercase hex digits, which they keep (any other value of either is replaced), so the read passes and the faucet
-passes the site gives outlive every restart.
-`/root/update-aiqnet.sh` refuses to build on a Node.js older than 22 and pulls, installs, builds and restarts as
-`aiqnet`.
+`deployment/deploy-aiqnet.sh` provisions the host over SSH on port 2222 (`SSH_PORT=<port>` when its sshd listens on
+another): every connection, every command the script prints and the host's firewall and fail2ban rules use that one
+port, and it copies no file to the host. It runs its steps 1 to 5 in order, or only those named on its command line
+(`deploy-aiqnet.sh 2 3`), and every run ends with the host's status report (below). `deploy-aiqnet.sh upgrade` upgrades
+the host's packages, and only that step upgrades any: needrestart lists the services an upgraded library touches and
+restarts none (`NEEDRESTART_MODE=l`), though a package's own install scripts may restart its service, every
+configuration file the host changed is kept, and its end says whether the host needs a reboot. Step 1 may run again on a
+running host: it changes nothing from a session that reached sshd on another port than `SSH_PORT`; it installs the
+packages it names that are missing and upgrades none that is installed (`apt-get install --no-upgrade`, needrestart
+listing only), among them `ssl-cert` (the self-signed pair the site file names until the certificate exists, made again
+when it is missing) and `bind9-dnsutils` (the `dig` of step 4); it installs Node.js from NodeSource only on a host
+without Node.js 22 or later; it lets in that port and nginx's through the firewall and removes the port-22 rule that
+earlier versions of the script added by the service's name (`ssh`), keeping any other rule of the host; it restarts
+fail2ban for its jail of that port; and it adds a line for the host's name to `/etc/hosts` only when no line names it.
 
-A host set up before this layout (pm2 as root) moves over in this order: install Node.js 22; create the
-user (`useradd --system --create-home --home-dir /home/aiqnet --shell /usr/sbin/nologin aiqnet`); give
-it the checkout (`chown -R aiqnet:aiqnet` on the repository directory, which must not sit under
-`/root`); `chown aiqnet:aiqnet .env.local && chmod 600 .env.local`; `pm2 delete` the root processes,
-`pm2 unstartup` for root, then `sudo -u aiqnet -H pm2 start ecosystem.config.js`, `sudo -u aiqnet -H pm2
-save` and `pm2 startup systemd -u aiqnet --hp /home/aiqnet`; point every nginx `proxy_pass` for the site
-at `http://127.0.0.1:3000` and add the `/api/link/` location from the script; `nginx -t && systemctl
-reload nginx`. Check that `ss -ltnp` shows the site on `127.0.0.1:3000` only.
+The host runs Node.js 22 from NodeSource. A system user `aiqnet` (no login shell) owns the checkout of the `testnet`
+branch in `/var/www/qnet` and the site's releases in `/var/www/qnet-releases`, and installs and builds the site as that
+user (`npm ci`, `npm run build`); a system user `qnet-indexer-build` (no login shell) that owns the indexer's tree in
+`/opt/qnet-indexer`, a sparse checkout of the indexer's inputs, and its releases in `/opt/qnet-indexer-releases`,
+installs and builds the indexer (`npm ci` with no install script and no optional package, `npm run build:indexer`).
+Each release is built in a folder of its own, from the commit's own files, named by the update's time and the site's
+commit (`20261101T120000Z-` and 12 hex digits), and no build writes into a release a service runs. Each releases folder
+has two links: `current`, the release its service runs, and `previous`, the one before it, kept for a rollback; after
+each switch every other release is removed. A link changes in one rename, and each unit names its release through
+`current`, which systemd resolves at every start
+(`WorkingDirectory=/var/www/qnet-releases/current/applications/qnet-explorer/frontend`, and
+`/opt/qnet-indexer-releases/current/applications/qnet-explorer/frontend` for the indexer), so a start meets one
+release or the other, never a build in progress.
+
+The web tier and the indexer are two systemd services that restart on any exit and write to the journal
+(`journalctl -u qnet-explorer`, `-u qnet-indexer`; the journal keeps at most 300 MB). `qnet-explorer` runs
+`next start -H 127.0.0.1` of its release with node itself as `aiqnet`, so only nginx on the host reaches it, on port
+3000; it may write only its release's `.next` and `/var/www/qnet/applications/qnet-explorer/frontend/data`, the balance
+check's checkpoints, untracked in the checkout, which every release's `data/` links to so that they outlive every
+release, and it sees no process of another user (`ProtectProc=invisible`). Its settings and secrets are in
+`/root/qnet-explorer.env` (mode 600, which systemd reads before it starts the service): the `DATABASE_URL` of the role
+`explorer_reader`, `QNET_API_URLS`, `QNET_API_KEY`, `FAUCET_PRIVATE_KEY` and `SOLANA_RPC_URL`; the script writes
+`CABINET_PHONE_FLOWS=0` and an empty `WALLET_APK_URL` there when the file has no value. Step 2 stops before anything is
+built or switched while this file or the indexer's (below) holds no `DATABASE_URL`, naming the file and the next run
+(`deploy-aiqnet.sh 2 3 4 5`). `/root/update-aiqnet.sh`, which
+every deploy runs too, writes `CABINET_READ_KEY` and `FAUCET_PASS_KEY` there (`openssl rand -hex 32`) unless the file
+already holds one of exactly 64 lowercase hex digits, which it keeps (any other value of either is replaced), so the
+read passes and the faucet passes the site gives outlive every restart. `qnet-indexer` runs `dist-indexer/main.js` of
+its release as a user systemd makes for each run (`DynamicUser=yes`), not as `aiqnet`, so no process of the site's user
+can read the writer's settings from its environment, and no install script or build of the site can change the code
+the writer runs; its settings are in `/root/qnet-indexer.env` (mode 600): the database writer's `DATABASE_URL`,
+`QNET_API_URLS` and `QNET_API_KEY`. The migrations it applies are its own release's, read from beside its code
+(`dist-indexer/../migrations`) whatever the directory it starts in. Before the indexer starts, its unit runs
+`main.js --migrate-only` (`ExecStartPre`), which takes the writer lock, applies the pending migrations and exits. The
+unit has no start timeout (`TimeoutStartSec=infinity`), so a long migration is never stopped midway, and
+`qnet-explorer` is ordered after it (`Before=qnet-explorer.service`): the site starts only once the migrations it reads
+are committed. Both units are `Type=exec`: a start job ends once the service's program runs, after every
+`ExecStartPre`. No unit holds a secret or a setting of the operator's in its own text, which every user of the host can
+read, and no file of the checkout holds one. Step 2 writes no unit: the update script, which holds both units' texts,
+puts each in place only once `current` names a built release of its service, right before that service's restart,
+and loads it there (`systemctl daemon-reload`, then `systemctl enable --no-reload`), so a host that runs either service
+another way (a unit of its own, the site from a checkout) runs it on, whatever stops the update before.
+
+`/root/update-aiqnet.sh` is the end of every deploy and every update, and one runs at a time (`flock` on
+`/run/update-aiqnet.lock`). It refuses to build on a Node.js older than 22, pulls the site as `aiqnet`, builds nothing
+while the checkout's `frontend/` holds a `.env*` file (which `next build` and `next start` would read), and compares
+what the site's commit holds of the indexer's inputs with what the running indexer release was built from:
+`package.json` and `package-lock.json` of `applications/qnet-explorer/`, and `package.json`,
+`scripts/lockfile-check.mjs`, `tsconfig.indexer.json`, `src/indexer/` and `migrations/` of its `frontend/` (one
+SHA-256 over `git ls-tree` of those paths at each commit, which each indexer release records in `.built-inputs` once
+it is built). Only when they differ does `qnet-indexer-build` fetch the branch's tip into its tree, shallow and with
+the contents of those paths only (`--filter=blob:none` and a sparse checkout), and the update stops before building
+anything when the fetched inputs are not the site commit's (the branch moved between the two fetches); an update that
+changes only the site fetches, installs and builds nothing of the indexer. Before it builds, it removes the releases an
+earlier update built without switching to them, and checks the disk of each releases folder it builds into: that disk
+must hold as much as the running releases the update replaces take (2048 MB for each with none running yet) and 1024
+MB more, which stay free for the database and the logs, or the update stops and builds nothing. The site's new release
+is the commit's `applications/qnet-explorer` exported into a folder of its own, installed and built there as `aiqnet`
+while the site runs on from the release before; the update then restarts the indexer, which returns once its
+migrations are committed, and only then switches the site to the new release and restarts it; an indexer release that
+does not start gives way to the one before it, and the update ends with the site not switched. The indexer's release,
+built after the site's and only when its inputs changed, holds those inputs exported from the commit; it installs its
+packages with no install script and no optional package or, when what the install reads (the package files, the
+lockfile and the lockfile check, recorded in `.installed-inputs`) is unchanged, links in the running release's
+packages, which nothing writes after their install, and the indexer is switched to it just before that restart. A
+build that fails switches nothing. Each service's unit goes in right after its switch: a unit that differs from the
+one in place replaces it, which is kept beside it as `<unit>.previous` until the next update finds the unit unchanged.
+The site counts as started only once it serves the home page of `aiqnet.io` on `127.0.0.1:3000`: asked 12 times, each
+ask waiting at most 4 s and followed by 5 s, so a port still closed is given 60 s (`SITE_START_S`). An indexer that does not start, or a site that does not answer, gives way to what
+ran before: its links back where the update found them (a first release leaves no link, so the next update builds it
+again) and the unit this update replaced back in place and loaded, then restarted; the update says what runs again
+and ends there, before any release is removed. `/root/update-aiqnet.sh rollback` puts the site's previous release back
+and restarts it, and `rollback-indexer` the indexer's; the release left becomes `previous`. `/root/status-aiqnet.sh`
+prints only what the host measures: CPU, memory and disk use, both services, the status code of `https://aiqnet.io`,
+the indexer's published state (`/api/sync/start`), the certificate's end date and whether its renewal timer is active;
+every run of the deploy script writes it anew and ends with its report, whatever steps it ran.
+
+nginx in front has one site file, `/etc/nginx/sites-available/aiqnet.io`. Only the `aiqnet.io` block proxies the
+site, to `http://127.0.0.1:3000`; `www.aiqnet.io` and `explorer.aiqnet.io` have a block that only redirects to the
+same path on it (the bare root of `explorer.aiqnet.io` to `/explorer`, over http as over https), and `link.aiqnet.io`
+its own. Every location
+that proxies sets `X-Real-IP` to the connecting address. Per client address `/api` takes 10 requests a second with a
+burst of 20 (zone `aiqnet_api`), and `/api/link/` and `/api/cabinet/` the same each in a zone of their own
+(`aiqnet_link`, `aiqnet_cabinet`), so explorer traffic never uses up the relay's or the cabinet's budget; nginx answers
+a request over it 503. Those rates are at or above the app's own per-address limits of the routes (the relay's 600
+polls a minute, the cabinet's busiest route, the wallets' Solana relay, 240 a minute), so a page in normal use meets the app's answers and their
+`Retry-After`: a page polls the relay every 2 s, so twenty pages behind one address poll 10 times a second.
+`/api/link/` and `/api/cabinet/` have a location of their own on every TLS block that writes no access log. On
+`aiqnet.io` a browser request that no page of the site made (`Sec-Fetch-Site` present and other than `same-origin`) is
+refused 403 there, before the limit counts it; `/api/cabinet/activation/` and the exact location
+`/api/cabinet/solana` (the wallets' Solana relay) also let `none` through, the QNet extension's requests, exactly as
+`src/server/request-guard.ts` does. `/api/stream` is proxied unbuffered and kept
+open up to an hour; `/api/faucet/claim` waits 142 s for the app's answer, more than a claim takes at most
+(`FAUCET_CLAIM_MS`, 132 s) and less than the page waits (`FAUCET_CLAIM_REQUEST_MS`, 152 s), while every other location
+keeps nginx's 60 s; `/api/head`, `/api/activity` and `/api/network/stats` are cached for one second, shared by every
+visitor (`X-Cache`). Every TLS block takes TLS 1.2 and 1.3 only. One Let's Encrypt certificate, named `aiqnet.io`,
+covers the four names: the deploy first checks on the host, with `dig`, that every IPv4 address of each of them is the
+server's and that none of them has an IPv6 address, since every block of the site file listens on IPv4 only and a
+challenge also goes to an IPv6 address, then `certbot certonly --nginx` proves them without editing the site file; the
+certbot package's timer renews it and the deploy hook reloads nginx. The site file is written with the self-signed
+certificate's paths and, whenever `/etc/letsencrypt/live/aiqnet.io/fullchain.pem` exists, the script puts the
+certificate's paths in it before nginx restarts or reloads, so a deploy over a host that has the certificate never
+serves the self-signed one. Each change of the site file is tested with `nginx -t` before nginx restarts or reloads: a
+file nginx refuses, or one whose names another enabled file of `sites-enabled/` or `conf.d/` also names in a
+`server_name` (nginx only warns of that, `conflicting server name`, and serves the name from the file it loads first),
+is taken back out (the one before comes back when there was one) and the step names the other file and stops, so no
+later restart or boot of nginx meets it (`src/lib/__tests__/deploy-config.test.mjs`).
 
 `scripts/security_hardening.sh` (repository root) adds http-level nginx options only (`server_tokens
-off` in `conf.d`). It writes no site: it refuses to run unless `/etc/nginx/sites-available/aiqnet.io` is
-the file of `deploy-aiqnet.sh`, with the relay's own location, its Fetch Metadata refusal and zone and the
-link host; `deploy-config.test.mjs` keeps every other script of the repository from writing a site of
-these hosts.
+off` in `conf.d`), and takes its file back out when `nginx -t` refuses it. It writes no site: it refuses to run unless
+`/etc/nginx/sites-available/aiqnet.io` is the file of `deploy-aiqnet.sh`, with the relay's own location, its Fetch
+Metadata refusal and zone and the link host; `deploy-config.test.mjs` keeps every other script of the repository from
+writing a site of these hosts.
 
-`npm run lint` runs `bunx biome lint --write && bunx tsc --noEmit`, so it needs bun in addition to
-Node.js, and `--write` makes Biome apply its fixes to the working tree.
+`npm run lint` is a read-only check: `biome lint src scripts lib && tsc --noEmit -p tsconfig.json`, both from the
+workspace's own devDependencies (no bun). `npm run lint:fix` applies Biome's fixes to `src`, `scripts` and `lib`, and
+`npm run format` formats them.
 
 Never place database credentials, API keys or node hostnames in the repository; all of them are
 environment inputs.
@@ -1045,13 +1424,14 @@ The workspace root (`applications/qnet-explorer/package.json`) declares no packa
 `npm ci` installs only the frontend's tree. The faucet uses no Solana SDK (see Faucet), so
 `@solana/web3.js`, `@solana/spl-token` and their tree (`bigint-buffer`, `jayson`, `rpc-websockets`,
 `uuid`, `stream-json`) are not installed at all. `npm audit` reports two advisories, with or without
-`--omit=dev`, both reached only through the build and lint tools: `braces` (GHSA-vfj7-8cjw-p6xm, no fixed version
-published), through `tailwindcss` and `eslint-config-next`, listed in `frontend/npm-audit-allowlist.json` with that
-reason until 2026-11-04; and `postcss-selector-parser` (GHSA-rj75-hqrm-r3gf), the two 6.1.4 copies `tailwindcss` 3
-pulls (its own and `postcss-nested`'s), which parse only this repository's selectors while the stylesheet is built:
-the fix is in 7.1.6 only, every `tailwindcss` 3 release requires `^6.1.2`, so it is listed until 2026-11-05. The
-`source-map-js` advisory (GHSA-68fv-2mgg-jv7q) is fixed: the `postcss` devDependency is `^8.5.29`, which requires
-`source-map-js` 1.2.2, and `next`'s own `postcss` resolves to that copy.
+`--omit=dev`, both reached only through the build and lint tools and listed in `frontend/npm-audit-allowlist.json`
+with their reasons until 2026-12-03: `glob` (GHSA-3g3m-2fjr-6pw4), which `tailwindcss`'s `sucrase` uses to list this
+repository's files while the stylesheet is built (every `glob` from 9.0.0 to 14.0.1 is affected, `sucrase` 3 requires
+`^10`); and `minimatch` (GHSA-g3hv-75wg-m249), which `eslint` and its plugins use on this repository's file names
+while they lint (the fix is 11.0.1 only). The `postcss-selector-parser` copies `tailwindcss` 3 pulls (its own and
+`postcss-nested`'s) are 6.1.5, which fixes GHSA-rj75-hqrm-r3gf, and the `source-map-js` advisory
+(GHSA-68fv-2mgg-jv7q) is fixed: the `postcss` devDependency is `^8.5.29`, which requires `source-map-js` 1.2.2, and
+`next`'s own `postcss` resolves to that copy.
 
 The check is `npm audit` in `applications/qnet-explorer` (the workspace root, where the lockfile is),
 with and without `--omit=dev`. `npm run audit:check` in `frontend/` runs both and fails on any advisory
@@ -1065,7 +1445,7 @@ pinned lines and that the root declares no packages.
 
 Every package the lockfile installs pins its tarball: a `registry.npmjs.org` URL and a sha512 `integrity`,
 so `npm ci` refuses any other bytes for it, whatever registry or proxy the host is configured with.
-`frontend/scripts/lockfile-check.mjs` fails on an entry without them; the deploy scripts run it before
+`frontend/scripts/lockfile-check.mjs` fails on an entry without them; the deploy script runs it before
 every `npm ci`, and `npm run test:wallet` runs it on the committed lockfile. A lockfile regenerated by npm
 keeps both fields.
 

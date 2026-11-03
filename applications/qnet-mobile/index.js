@@ -23,7 +23,14 @@ import { AppRegistry } from 'react-native';
 import messaging from '@react-native-firebase/messaging';
 import BackgroundFetch from 'react-native-background-fetch';
 import { handlePushMessage, onBackgroundFetch } from './src/services/PushService';
-import App from './App';
+import { watchWakes } from './src/services/NetworkWake';
+import { installClientAgent } from './src/utils/clientAgent';
+
+// Every request to aiqnet.io and the genesis nodes names the app's build, a background wake's too.
+installClientAgent();
+
+// A retry waiting on a back-off for aiqnet.io goes again when the app comes to the front or a network is back.
+watchWakes();
 
 // Background/killed FCM handler — MUST be at top level (not in useEffect).
 // When the app is killed by OS and a push arrives, Android starts a headless
@@ -42,4 +49,6 @@ BackgroundFetch.registerHeadlessTask(async ({ taskId, timeout }) => {
   await onBackgroundFetch(taskId);
 });
 
-AppRegistry.registerComponent('QNetMobile', () => App);
+// The app's screens load only when the system runs the app's view: a process started for a push or a fetch registers
+// its handlers above with none of them loaded (an import would load them first), and App draws nothing until opened.
+AppRegistry.registerComponent('QNetMobile', () => require('./App').default);

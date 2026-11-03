@@ -4,39 +4,55 @@
 // to send the activation's 1DEV and SOL to a payment address of My node, whose card links here ("Get them to your
 // wallet"). The card hands over the connected wallet's Solana address without a URL (src/lib/faucet-handover.ts):
 // the field is filled in once, and nothing is sent before the visitor presses the button. It also hands over the faucet
-// pass the site gave for the QNet wallet being activated, sent with the claims (SITE M-13). A refused claim names the
-// time to try again. Waiting and a failure take the line under the form (B-SPEC 5.22); a claim that went through shows a
+// pass the site gave for the QNet wallet being activated, sent with the claims. A refused claim names the
+// time to try again. Waiting and a failure take the line under the form; a claim that went through shows a
 // panel with a green check, the amounts, the address and the transactions until it is closed.
 
 import { useEffect, useState, type FormEvent } from 'react';
 import Action from '@/components/ui/Action';
-import EntityLink from '@/components/ui/EntityLink';
+import EntityLink, { Amount } from '@/components/ui/EntityLink';
 import TokenIcon from '@/components/TokenIcon';
 import PageHead from '@/components/ui/PageHead';
 import { Failed, Waiting } from '@/components/ui/RequestState';
 import Section from '@/components/ui/Section';
 import { clockAt } from '@/lib/format';
-import { retryAt, takeHandedOver, takeHandedPass } from '@/lib/faucet-handover';
-import { t } from '@/lib/texts';
+import { FAUCET_CLAIM_REQUEST_MS, retryAt, takeHandedOver, takeHandedPass } from '@/lib/faucet-handover';
+import { siteRequest } from '@/lib/site-request';
+import { number, type MessageKey, type T } from '@/lib/texts';
+import { useI18n } from '@/i18n/client';
 
-// Test SOL a claim asks for: the payment address's SOL and its 1DEV account's rent, with the wallet's network fees.
+// The test tokens a claim asks for: 1DEV, and SOL for the payment address's SOL and its 1DEV account's rent with the
+// wallet's network fees.
+const FAUCET_DEV = 1500;
 const FAUCET_SOL = 0.005;
 const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 // " Try again at 14:05." (the day too when it is not within the next twelve hours); empty when no time is known.
-function tryAgain(at: number | null, now: number): string {
+function tryAgain(at: number | null, now: number, t: T): string {
   if (at === null) return '';
-  return ` Try again at ${clockAt(at, now)}.`;
+  return ` ${t('faucet_try_at', { time: clockAt(at, now, t) })}`;
 }
 
+// A refused claim in the page's words, by the faucet's answer: a claim already made today (429 with the time it may go
+// again), the faucet busy or out of tokens this hour, an address of the wrong form (400), or a send that failed.
+function refusal(status: number, body: { nextClaimTime?: unknown } | null): MessageKey {
+  if (status === 429 && body?.nextClaimTime) return 'faucet_once_a_day';
+  if (status === 429 || status === 503) return 'faucet_busy';
+  if (status === 400) return 'act_refund_invalid';
+  return 'faucet_send_failed';
+}
+
+// A claim that went through: which of the two tokens were sent, where, and their transactions.
 interface Sent {
-  amounts: string;
+  dev: boolean;
+  sol: boolean;
   address: string;
   devTx: string;
   solTx: string;
 }
 
 export default function TestnetPage() {
+  const { t, say, rich } = useI18n();
   const [lastFaucetClaim, setLastFaucetClaim] = useState<number | null>(null);
   const [faucetAddress, setFaucetAddress] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -60,13 +76,13 @@ export default function TestnetPage() {
     e.preventDefault();
     if (isLoading) return;
     if (!faucetAddress.trim()) {
-      setErrorMessage('Enter a Solana address first.');
+      setErrorMessage(t('faucet_enter_address'));
       return;
     }
 
     const now = Date.now();
     if (lastFaucetClaim && (now - lastFaucetClaim) < COOLDOWN_MS) {
-      setErrorMessage('Tokens go to an address once every 24 hours.' + tryAgain(lastFaucetClaim + COOLDOWN_MS, now));
+      setErrorMessage(t('faucet_once_a_day') + tryAgain(lastFaucetClaim + COOLDOWN_MS, now, t));
       return;
     }
 
@@ -79,16 +95,16 @@ export default function TestnetPage() {
       const withPass = faucetPass ? { pass: faucetPass } : {};
 
       const [devResponse, solResponse] = await Promise.all([
-        fetch('/api/faucet/claim', {
+        fetch('/api/faucet/claim', siteRequest({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ walletAddress: address, amount: 1500, tokenType: '1DEV', ...withPass }),
-        }),
-        fetch('/api/faucet/claim', {
+          body: JSON.stringify({ walletAddress: address, amount: FAUCET_DEV, tokenType: '1DEV', ...withPass }),
+        }, FAUCET_CLAIM_REQUEST_MS)),
+        fetch('/api/faucet/claim', siteRequest({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ walletAddress: address, amount: FAUCET_SOL, tokenType: 'SOL', ...withPass }),
-        }),
+        }, FAUCET_CLAIM_REQUEST_MS)),
       ]);
 
       const [devData, solData] = await Promise.all([devResponse.json(), solResponse.json()]);
@@ -100,23 +116,25 @@ export default function TestnetPage() {
         setLastFaucetClaim(now);
         // Name only what was sent: one of the two claims can fail while the other goes through.
         setSent({
-          amounts: [devData.success && '1,500 1DEV', solData.success && `${FAUCET_SOL} SOL`].filter(Boolean).join(' + '),
+          dev: Boolean(devData.success),
+          sol: Boolean(solData.success),
           address,
           devTx: devData.txHash || '',
           solTx: solData.txHash || '',
         });
         setFaucetAddress('');
-        if (!devData.success) setErrorMessage('1DEV: ' + (devData.error || 'failed') + tryAgain(devRetry, answered));
-        if (!solData.success) setErrorMessage('SOL: ' + (solData.error || 'failed') + tryAgain(solRetry, answered));
+        if (!devData.success) setErrorMessage(t('faucet_token_refused', { token: '1DEV', reason: t(refusal(devResponse.status, devData)) }) + tryAgain(devRetry, answered, t));
+        if (!solData.success) setErrorMessage(t('faucet_token_refused', { token: 'SOL', reason: t(refusal(solResponse.status, solData)) }) + tryAgain(solRetry, answered, t));
       } else {
         // One reason once: both claims usually fail for the same one (an address of the wrong form).
-        const err = [...new Set([devData.error, solData.error].filter(Boolean))].join(' | ') || 'The faucet sent nothing. Try again.';
+        const reasons = [...new Set([refusal(devResponse.status, devData), refusal(solResponse.status, solData)])];
+        const err = reasons.map((key) => t(key)).join(' ');
         // Both refused: the time both may go again.
         const both = devRetry !== null && solRetry !== null ? Math.max(devRetry, solRetry) : devRetry ?? solRetry;
-        setErrorMessage(err + tryAgain(both, answered));
+        setErrorMessage(err + tryAgain(both, answered, t));
       }
     } catch {
-      setErrorMessage('The faucet could not be reached. Check your connection and try again.');
+      setErrorMessage(t('faucet_unreachable'));
     } finally {
       setIsLoading(false);
     }
@@ -124,73 +142,76 @@ export default function TestnetPage() {
 
   return (
     <div className="pg">
-      <PageHead title="QNet Blockchain testnet" lead="Test network for development and experimentation." />
+      <PageHead title={say('testnet_title')} lead={t('testnet_lead')} />
 
-      <Section id="faucet" title={t('ui_faucet_title')} lead={`Get 1,500 1DEV tokens + ${FAUCET_SOL} SOL to test node activation on QNet Blockchain testnet. They have no value.`} variant="tool">
+      <Section id="faucet" title={t('ui_faucet_title')} lead={say('faucet_lead', { dev: number(FAUCET_DEV), sol: FAUCET_SOL })} variant="tool">
         <form onSubmit={handleFaucetClaim}>
-          <label className="label form-label" htmlFor="faucet-address">Your Solana testnet address</label>
+          <label className="label form-label" htmlFor="faucet-address">{t('faucet_address_label')}</label>
           <div className="form-row">
             <input
               id="faucet-address"
               type="text"
               className="field"
-              placeholder="Solana address"
+              placeholder={t('act_refund_label')}
               value={faucetAddress}
               onChange={(e) => setFaucetAddress(e.target.value)}
               disabled={isLoading}
               autoComplete="off"
               spellCheck={false}
-              aria-invalid={errorMessage === 'Enter a Solana address first.' || undefined}
+              aria-invalid={errorMessage === t('faucet_enter_address') || undefined}
               aria-describedby="faucet-answer"
             />
             <button type="submit" className="btn btn-solid" disabled={isLoading} aria-busy={isLoading || undefined}>
               <span className="swap">
                 <span data-on={!isLoading}>{t('ui_faucet_button')}</span>
-                <span data-on={isLoading} aria-hidden={!isLoading}>Sending…</span>
+                <span data-on={isLoading} aria-hidden={!isLoading}>{t('faucet_sending_short')}</span>
               </span>
             </button>
           </div>
           {fromNode && (
-            <p className="note form-note">Your wallet&apos;s Solana address from My node is filled in. Check it, then press {t('ui_faucet_button')}.</p>
+            <p className="note form-note">{t('faucet_from_node', { button: t('ui_faucet_button') })}</p>
           )}
         </form>
 
         <div className="req" id="faucet-answer">
-          {isLoading && <Waiting>Sending the tokens on Solana devnet</Waiting>}
+          {isLoading && <Waiting>{t('faucet_sending')}</Waiting>}
           {sent && (
-            // Stays until closed or the next claim, so the confirmation is not missed (owner 20.10).
+            // Stays until closed or the next claim, so the confirmation is not missed.
             <section className="faucet-sent" role="status" aria-labelledby="faucet-sent">
               <div className="faucet-sent-head">
                 <svg className="faucet-sent-mark" viewBox="0 0 24 24" aria-hidden="true">
                   <circle cx="12" cy="12" r="11" />
                   <path d="M6.8 12.4l3.4 3.4 7-7.2" />
                 </svg>
-                <h3 className="faucet-sent-title" id="faucet-sent">Test tokens sent</h3>
-                <Action kind="quiet" onClick={() => setSent(null)}>Close</Action>
+                <h3 className="faucet-sent-title" id="faucet-sent">{t('faucet_sent_title')}</h3>
+                <Action kind="quiet" onClick={() => setSent(null)}>{t('hdr_close')}</Action>
               </div>
               <dl className="kv">
                 <div>
-                  <dt>Sent</dt>
-                  <dd>{sent.amounts}</dd>
+                  <dt>{t('faucet_sent')}</dt>
+                  <dd className="faucet-amts">
+                    {sent.dev && <Amount value={number(FAUCET_DEV)} solana="1DEV" />}
+                    {sent.sol && <Amount value={number(FAUCET_SOL)} solana="SOL" />}
+                  </dd>
                 </div>
                 <div>
-                  <dt>To</dt>
-                  <dd className="mono">{sent.address}</dd>
+                  <dt>{t('tx_to')}</dt>
+                  <dd className="mono" translate="no">{sent.address}</dd>
                 </div>
                 {sent.devTx && (
                   <div>
-                    <dt className="ent-unit"><TokenIcon solana="1DEV" size="text" />1DEV transaction</dt>
+                    <dt className="ent-unit"><TokenIcon solana="1DEV" size="text" />{rich('faucet_tx', { token: <span translate="no">1DEV</span> })}</dt>
                     <dd><EntityLink kind="solana-tx" value={sent.devTx} /></dd>
                   </div>
                 )}
                 {sent.solTx && (
                   <div>
-                    <dt className="ent-unit"><TokenIcon solana="SOL" size="text" />SOL transaction</dt>
+                    <dt className="ent-unit"><TokenIcon solana="SOL" size="text" />{rich('faucet_tx', { token: <span translate="no">SOL</span> })}</dt>
                     <dd><EntityLink kind="solana-tx" value={sent.solTx} /></dd>
                   </div>
                 )}
               </dl>
-              {fromNode && <Action href="/node/activate">Back to your activation on My node</Action>}
+              {fromNode && <Action href="/node/activate">{t('faucet_back')}</Action>}
             </section>
           )}
           {errorMessage && <Failed>{errorMessage}</Failed>}

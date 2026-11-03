@@ -1,6 +1,6 @@
 'use client';
 
-// The field inside a head zone (B-SPEC 4.2): one canvas, absolutely placed in its zone (never fixed to the viewport,
+// The field inside a head zone: one canvas, absolutely placed in its zone (never fixed to the viewport,
 // never behind a table, a form or reading text). It runs through FieldLoop (src/lib/field/rain.ts): frames only while
 // the zone is in view, the tab is shown and motion is allowed, at the page's frame and pixel-ratio caps; one still frame
 // under reduced motion. Elements marked data-field-clear (controls, the search field) or data-field-dim="0.1" (text)
@@ -20,7 +20,7 @@ export interface FieldApi {
 }
 
 interface FieldProps {
-  // Share of columns with a stream (B-SPEC 4.2: home 0.75, explorer 0.55, My node 0.32, other pages 0.3).
+  // Share of columns with a stream (home 0.75, explorer 0.55, My node 0.32, other pages 0.3).
   strength: number;
   kind?: FieldKind;
   // The canvas's opacity (My node .7).

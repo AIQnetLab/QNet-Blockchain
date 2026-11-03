@@ -1,4 +1,4 @@
-// Where a wallet's activation stands (src/lib/cabinet/wallet-activation.ts, shared contract C9), as every page of My
+// Where a wallet's activation stands (src/lib/cabinet/wallet-activation.ts), as every page of My
 // node shows it: the table of every state from the network, the site's record with its search of the wallet's Solana
 // address, the QNet extension (qnet_getActivation) and this browser; a burn is offered only in `none`, never while any
 // source is loading, locked or unreachable; positive evidence wins; the sections and the progress follow the state
@@ -8,11 +8,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { VIEW_STATES, activationView, c9Name, knownBurn, parseWalletNode, wayOf } from '../cabinet/wallet-activation.ts';
+import { VIEW_STATES, activationView, followedSuperId, viewName, knownBurn, parseWalletNode, wayOf } from '../cabinet/wallet-activation.ts';
 import { journey, journeySteps, landingTab, visibleTabs } from '../cabinet/tabs.ts';
 import { activationCode, lightNodeId, superNodeId, validateGetActivation } from '../qnet-link.ts';
 import { parseSuperStatus, superState } from '../cabinet/node-view.ts';
 import { recordCode } from '../cabinet/burn-record.ts';
+import { accountRows, nodeLines } from '../account-menu.ts';
+import { EN } from './texts-helper.mjs';
+import { code } from './source.mjs';
 
 const V = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
 const W = V.wallets[0].address;
@@ -73,6 +76,13 @@ test('a burn is refused while any one source cannot answer: the view names it', 
   assert.deepEqual(unknown({ extension: { phase: 'failed', failure: 'timeout' } }).missing, ['extension']);
   assert.deepEqual(unknown({ extension: ext({ status: 'unknown', qnet: W, solana: SOL, reason: 'HISTORY_TOO_LONG' }) }).missing, ['extension']);
   assert.deepEqual(unknown({ choice: { qnet: W, source: 'app', solana: SOL }, extension: { phase: 'na' }, scan: { complete: false, unusable: false, burns: [] } }).missing, ['solana']);
+  // A choice kept from before the wallet shared its Solana address: that history cannot be searched, so nothing is
+  // offered; the extension that holds the wallet searches it itself.
+  const kept = unknown({ choice: { qnet: W, source: 'app' }, extension: { phase: 'na' }, scan: null });
+  assert.deepEqual([kept.state, kept.missing], ['unknown', ['solana_address']]);
+  // A viewed address is offered no activation, so its history needs no search: with every source none it reads none.
+  assert.equal(stateOf({ choice: { qnet: W, source: 'entered' }, extension: { phase: 'na' }, scan: null }), 'none');
+  assert.equal(stateOf({ choice: { qnet: W, source: 'extension' } }), 'none');
   for (const over of [{ network: DOWN }, { server: DOWN }, { extension: { phase: 'failed', failure: 'failed' } }]) assert.equal(stateOf(over), 'unknown');
   // An extension too old for qnet_getActivation (4200): its source is not known, and the page asks for an update.
   const old = unknown({ extension: { phase: 'failed', failure: 'unsupported' } });
@@ -100,15 +110,15 @@ test('positive evidence wins over unknown: node > recording > burned > sending >
   assert.equal(stateOf({ server: ok(record({ state: 'reserved', nodeType: 'light', way: 'payment', burnAmount: 1500, until: 5 })) }), 'reserved');
   assert.equal(stateOf({ server: ok(record({ state: 'sending', nodeType: 'super', way: 'extension', burner: SOL, burnTx: TX, burnAmount: 1500, until: 9 })) }), 'sending');
   assert.equal(stateOf({ extension: ext({ status: 'pending', qnet: W, solana: SOL, nodeType: 'light', burnTx: TX, burnAmount: 1500 }) }), 'sending');
-  // A2: a payment address's final burn is the wallet's record like the extension's, whatever the network says.
+  // A payment address's final burn is the wallet's record like the extension's, whatever the network says.
   const paid = record({ state: 'recorded', nodeType: 'light', way: 'payment', burner: SOL, burnTx: TX, burnAmount: 1500, code: recordCode('payment', 'light', W, SOL, TX, 1500), recordedAt: 1 });
   assert.equal(stateOf({ server: ok(paid), network: DOWN }), 'burned');
   assert.deepEqual([activationView(base({ server: ok(paid) })).burn.source, activationView(base({ server: ok(paid) })).burn.way], ['record', 'payment']);
   assert.deepEqual(VIEW_STATES, ['loading', 'locked', 'unknown', 'none', 'reserved', 'sending', 'burned', 'recording', 'node']);
 });
 
-test('every C9 state, by name', () => {
-  const name = (over) => c9Name(activationView(base(over)));
+test('every state, by name', () => {
+  const name = (over) => viewName(activationView(base(over)));
   const recorded = (nodeType, way = 'extension') => record({
     state: 'recorded', nodeType, way, burner: SOL, burnTx: TX, burnAmount: 1500, code: recordCode(way, nodeType, W, SOL, TX, 1500), recordedAt: 1,
   });
@@ -169,7 +179,7 @@ test('this browser\'s own final payment burn is the wallet\'s burn while the ser
   ]) {
     const v = activationView(base({ records: [held], ...over }));
     assert.equal(v.state, 'burned', name);
-    assert.equal(c9Name(v), 'burned-light', name);
+    assert.equal(viewName(v), 'burned-light', name);
     assert.deepEqual({ source: v.burn.source, way: v.burn.way, burnTx: v.burn.burnTx, code: v.burn.code }, { source: 'browser', way: 'payment', burnTx: TX, code: activationCode('light', W, TX, 1500) }, name);
   }
   // Every stage from the burn to the registration's outcome holds it, with the code of the wallet it was reserved for.
@@ -213,7 +223,7 @@ test('sections and progress follow the state: Activate only in none; a known bur
   assert.equal(wayOf(v({ light: ok(light({ pending: true })) })), 'light');
 });
 
-test('the extension\'s read-only answer is checked exactly (C5), its code against its burn', () => {
+test('the extension\'s read-only answer is checked exactly, its code against its burn', () => {
   const codeOwn = activationCode('light', SOL, TX, 1500);
   const good = [
     { status: 'no_wallet' }, { status: 'locked' }, { status: 'not_connected' },
@@ -246,7 +256,7 @@ test('the network\'s and the super node\'s answers are read exactly', () => {
   assert.deepEqual(parseSuperStatus(online), online);
   assert.equal(superState(online), 'online');
   assert.equal(superState(superS({ registered: true })), 'offline');
-  // Owner, 11.10: registered, its server answering and outside the network's eligible set is not admitted to consensus
+  // Registered, its server answering and outside the network's eligible set is not admitted to consensus
   // yet, not Offline. Offline wins: the network drops a silent admitted node from the set too, so a stopped server
   // never reads as waiting; a barred node (also out of the set) reads Online with its own row. An unread set says
   // nothing.
@@ -263,10 +273,10 @@ test('the network\'s and the super node\'s answers are read exactly', () => {
   assert.equal(superState(superS({ registered: true, admission: 'waiting' })), 'offline');
   assert.equal(superState({ ...online, admission: 'waiting', banned: true }), 'online');
   const av = (over) => activationView(base(over));
-  assert.equal(c9Name(av({ superStatus: ok({ ...online, admitted: false }) })), 'super-waiting');
-  assert.equal(c9Name(av({ superStatus: ok(superS({ registered: true, admitted: false })) })), 'super-offline');
+  assert.equal(viewName(av({ superStatus: ok({ ...online, admitted: false }) })), 'super-waiting');
+  assert.equal(viewName(av({ superStatus: ok(superS({ registered: true, admitted: false })) })), 'super-offline');
   assert.deepEqual(journey(true, av({ superStatus: ok({ ...online, admitted: false }) })), { done: 3, current: 3, nodeType: 'super' });
-  assert.equal(c9Name(av({ superStatus: ok({ ...online, admitted: null, admission: 'waiting' }) })), 'super-waiting');
+  assert.equal(viewName(av({ superStatus: ok({ ...online, admitted: null, admission: 'waiting' }) })), 'super-waiting');
   // Not registered yet: the network may see its server, and says nothing else of it.
   const seen = superS({ connected: true });
   assert.deepEqual(parseSuperStatus(seen), seen);
@@ -278,4 +288,43 @@ test('the network\'s and the super node\'s answers are read exactly', () => {
   ]) {
     assert.equal(parseSuperStatus(bad), null, JSON.stringify(bad));
   }
+});
+
+// A wallet's super node is the one the network names: a genesis wallet's is its genesis node, never the row its
+// bootstrap left at height 1 under the id derived from the wallet. That id is read only once the network said the wallet
+// has no node (a server seen before its registration lands), and none while the network is read or did not answer.
+test('the super node My node and the account menu follow is the network\'s; the derived id only after "no node"', () => {
+  const named = (nodeId, nodeType = 'super') => ok({ state: 'registered', nodeId, nodeType });
+  assert.equal(followedSuperId(W, named('genesis_node_003')), 'genesis_node_003');
+  assert.equal(followedSuperId(W, named(superNodeId(W))), superNodeId(W));
+  assert.equal(followedSuperId(W, LOADING), null);
+  assert.equal(followedSuperId(W, named(lightNodeId(W), 'light')), null);
+  assert.equal(followedSuperId(W, ok({ state: 'none' })), superNodeId(W));
+  assert.equal(followedSuperId(W, DOWN), null);
+  assert.equal(followedSuperId(null, ok({ state: 'none' })), null);
+  // The network did not answer: no super node, even with the height-1 row's status in hand.
+  const down = activationView(base({ network: DOWN, superStatus: ok(superS({ registered: true, heartbeats: { current: 0, required: 9 }, balanceNano: '5000000000', admission: 'waiting' })) }));
+  assert.deepEqual([down.superNode, down.superId], [null, null]);
+  // The height-1 row under the derived id, as a read of it would answer.
+  const row = superS({ registered: true, heartbeats: { current: 0, required: 9 }, balanceNano: '5000000000', admission: 'waiting' });
+  // My node while the network is read: no super node, whatever a status in hand says.
+  const reading = activationView(base({ network: LOADING, superStatus: ok(row) }));
+  assert.deepEqual([reading.superNode, reading.superId, reading.nodes], [null, null, []]);
+  // The network names the genesis node: My node follows it.
+  const live = superS({ registered: true, online: true, heartbeats: { current: 9, required: 9 }, balanceNano: '1000000000', admission: 'admitted' });
+  const genesis = activationView(base({ network: named('genesis_node_003'), superStatus: ok(live) }));
+  assert.deepEqual([genesis.superId, genesis.superNode, genesis.nodes], ['genesis_node_003', 'online', ['super']]);
+  // The account menu, its super read made by the id the helper gives (useSuperStatus reads nothing for none).
+  const menu = (network, status) => {
+    const superId = followedSuperId(W, network);
+    return { network, light: ok(light()), superNode: superId === null ? LOADING : status(superId), history: LOADING, superId };
+  };
+  assert.deepEqual(nodeLines(menu(LOADING, () => ok(row)), EN), []);
+  assert.equal(accountRows(menu(LOADING, () => ok(row)), EN)[0].datum, null, 'not known while the network is read');
+  assert.equal(nodeLines(menu(named('genesis_node_003'), (id) => ok(id === 'genesis_node_003' ? live : row)), EN)[0].words, 'Genesis node · Online');
+  // The three places that read a wallet's super node take its id from the helper alone.
+  assert.match(code('components/cabinet/CabinetProvider.tsx'), /const superId = followedSuperId\(wallet, network\.state\);\n\s*const superRead = useSuperStatus\(superId\);/);
+  assert.match(code('hooks/useAccountReads.ts'), /const superId = followedSuperId\(wallet, network\.state\);\n\s*const superRead = useSuperStatus\(superId\);/);
+  assert.match(code('lib/cabinet/wallet-activation.ts'), /const followed = followedSuperId\(wallet, network\);\n\s*const superRead = followed !== null && superStatus\.phase === 'ok' \? superStatus\.value : null;/);
+  for (const file of ['components/cabinet/CabinetProvider.tsx', 'hooks/useAccountReads.ts']) assert.doesNotMatch(code(file), /superNodeId\(/, file);
 });

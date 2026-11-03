@@ -1,9 +1,9 @@
 import { StyleSheet } from 'react-native';
-import { color, radius, sheet, size, space, themed } from '../theme';
+import { card, color, radius, sheet, size, space, systemFace, themed } from '../theme';
 
 // One centred column of at most 640 on every screen, so a tablet or a wide window shows the phone layout, not lines
 // stretched across the screen. Flex only: nothing reads the window width. Its content is start-aligned and vertically
-// centred (fieldColumn sets it at the foot).
+// centred.
 const COLUMN = {
   width: '100%',
   maxWidth: size.column,
@@ -27,13 +27,6 @@ const styles = themed((type) => ({
   centerContent: {
     flex: 1,
     ...COLUMN,
-  },
-  // The welcome and lock screens' column: the mark, the name and the actions at its foot, under the live field of the
-  // top half. The lock screen's scrolls when a very large system font makes it taller than the screen.
-  fieldColumn: {
-    flexGrow: 1,
-    ...COLUMN,
-    justifyContent: 'flex-end',
   },
   formContent: {
     flexGrow: 1,
@@ -70,17 +63,27 @@ const styles = themed((type) => ({
     color: color.paper,
     marginBottom: space.s12,
   },
-  // The app's name on the screens that hold no data (welcome, lock, loading), at the start edge in either direction.
-  display: {
-    ...type('display'),
-    color: color.paper,
-    marginBottom: space.s12,
-    alignSelf: 'flex-start',
-  },
   subtitle: {
     ...type('body'),
     color: color.text,
     marginBottom: space.s32,
+  },
+  // The app's name on the welcome screen in the system face, bold, at 28, in every script; in Signal, centred under the
+  // mark. Its line is the title role's at 28, so a 568 dp screen holds it.
+  welcomeTitle: {
+    ...systemFace('title'),
+    fontSize: 28,
+    lineHeight: type('title', 28).lineHeight,
+    includeFontPadding: false,
+    color: color.signal,
+    textAlign: 'center',
+    marginBottom: space.s8,
+  },
+  // The line under the app's mark on the screens that hold no data, centred under it as the mark is; the column's gap
+  // keeps the actions at the foot, so a 568 dp screen holds the welcome screen whole.
+  markLine: {
+    textAlign: 'center',
+    marginBottom: space.s16,
   },
   // A quiet line of a form (a storage problem's reassurance, the phrase's clipboard rule).
   formNote: {
@@ -189,10 +192,10 @@ const styles = themed((type) => ({
     overflow: 'hidden',
     marginBottom: space.s16,
   },
+  // A group of Settings (WalletScreen SettingGroup): its kicker over its rows, a strong rule under it.
   settingGroup: {
     marginBottom: space.s32,
   },
-  // A group's kicker over its rows, a strong rule under it.
   settingGroupTitle: {
     ...type('label'),
     color: color.fog,
@@ -284,19 +287,19 @@ const styles = themed((type) => ({
     color: color.ember,
     marginBottom: space.s16,
   },
-  // An address in one rounded element a tap copies: the address (one line on Assets, whole on Receive), the copy glyph.
+  // A new wallet's phrase: its Copy button between the words and the warnings.
+  seedCopy: {
+    marginBottom: space.s16,
+  },
+  // An address in one rounded element a tap copies: the address (one line on Assets, whole on Receive) and the copy
+  // glyph on its line (components/ui/Copyable), centred in the element's height.
   addressPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    columnGap: space.s12,
+    ...card,
+    justifyContent: 'center',
     minHeight: size.rowMin,
     paddingVertical: space.s12,
     paddingHorizontal: space.s16,
     marginBottom: space.s16,
-    borderRadius: radius.tile,
-    borderWidth: 1,
-    borderColor: color.ruleStrong,
-    backgroundColor: color.surface,
   },
   addressPillDone: {
     borderColor: color.signalLine,
@@ -305,13 +308,6 @@ const styles = themed((type) => ({
     ...type('address', 14),
     color: color.paper,
     writingDirection: 'ltr',
-    flex: 1,
-  },
-  addressPillCopied: {
-    color: color.signal,
-  },
-  subjectAddress: {
-    flex: 1,
   },
   subjectLine: {
     ...type('address'),
@@ -371,14 +367,6 @@ const styles = themed((type) => ({
   tokenList: {
     marginBottom: space.s24,
   },
-  // A list's kicker (the transactions not settled yet), a strong rule under it.
-  listKicker: {
-    ...type('label'),
-    color: color.fog,
-    paddingBottom: space.s8,
-    borderBottomWidth: 1,
-    borderBottomColor: color.ruleStrong,
-  },
   keptLine: {
     ...type('data'),
     color: color.paper,
@@ -430,7 +418,7 @@ const styles = themed((type) => ({
     color: color.ember,
   },
   // A balance beside its token in up to two fifths of the row, shrinking to fit; one that would not fit there even at
-  // half its size goes under the token, whole (screens/WalletScreen TokenBalance).
+  // half its size goes under the token, whole (screens/TokenScreens AssetRow).
   tokenBalance: {
     alignItems: 'flex-end',
     flexShrink: 0,
@@ -449,22 +437,57 @@ const styles = themed((type) => ({
   // A token on Assets, a rounded tile of its own: its icon and name, and its balance on the same line (tokenBalance), or
   // under them (tokenItemWrap).
   tokenItemClickable: {
+    ...card,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: space.s12,
     paddingHorizontal: space.s16,
     marginBottom: space.s8,
-    borderRadius: radius.tile,
-    borderWidth: 1,
-    borderColor: color.rule,
-    backgroundColor: color.surface,
   },
   tokenIcon: {
     marginEnd: space.s12,
   },
   tokenItemWrap: {
     flexWrap: 'wrap',
+  },
+  // A token's own screen (screens/TokenScreens): its icon beside its name and symbol under Back, the warning about a
+  // token the wallet does not know, its balance, and the head of its transfers with Show all at its end.
+  tokenHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    columnGap: space.s12,
+  },
+  tokenHeadText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  tokenHeadSymbol: {
+    ...type('data'),
+    color: color.fog,
+    marginTop: space.s4,
+  },
+  tokenWarning: {
+    ...type('body'),
+    color: color.ember,
+    paddingVertical: space.s12,
+  },
+  tokenBalanceRow: {
+    paddingVertical: space.s12,
+  },
+  tokenBalanceFigure: {
+    ...type('amount', 18),
+    color: color.paper,
+    writingDirection: 'ltr',
+  },
+  tokenActivityHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    columnGap: space.s12,
+  },
+  tokenActivityTitle: {
+    flexShrink: 1,
   },
   mgrSearch: {
     marginBottom: space.s8,
@@ -560,19 +583,37 @@ const styles = themed((type) => ({
   subScreen: {
     paddingTop: space.s4,
   },
-  // Transaction result: start-aligned over the tab.
-  txResultContainer: {
-    alignItems: 'stretch',
-    paddingVertical: space.s24,
-  },
   txResultOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: color.ink,
   },
+  // Transaction result (components/TxResultCard): what happened, the details' card under it, start-aligned in the
+  // column; the actions at the foot, out of the scroll.
+  txResultScreen: {
+    flex: 1,
+  },
+  txResultScroll: {
+    flex: 1,
+  },
+  txResultBody: {
+    width: '100%',
+    maxWidth: size.column,
+    alignSelf: 'center',
+    paddingHorizontal: space.gut,
+    paddingTop: space.s24,
+    paddingBottom: space.s16,
+  },
+  txResultHead: {
+    alignItems: 'stretch',
+    marginBottom: space.s24,
+  },
+  txResultStatus: {
+    alignSelf: 'flex-start',
+    marginBottom: space.s12,
+  },
   txResultTitle: {
     ...type('title'),
     color: color.paper,
-    marginBottom: space.s16,
   },
   txResultTitleFailed: {
     color: color.ember,
@@ -580,22 +621,33 @@ const styles = themed((type) => ({
   txResultAmount: {
     ...type('figure'),
     color: color.paper,
-    marginBottom: space.s16,
+    marginTop: space.s16,
     alignSelf: 'flex-start',
-  },
-  // The recipient's field (components/InfoRow) across the column.
-  txResultTo: {
-    alignSelf: 'stretch',
-    marginBottom: space.s8,
-  },
-  txHashContainer: {
-    alignSelf: 'stretch',
-    marginBottom: space.s16,
   },
   txResultNote: {
     ...type('body'),
     color: color.text,
-    marginBottom: space.s16,
+    marginTop: space.s12,
+  },
+  txResultError: {
+    ...type('body'),
+    color: color.ember,
+    marginTop: space.s12,
+  },
+  // The foot: a hairline over it, so what scrolls ends there and does not run under the actions.
+  txResultFoot: {
+    borderTopWidth: 1,
+    borderTopColor: color.rule,
+    backgroundColor: color.ink,
+  },
+  txResultActions: {
+    width: '100%',
+    maxWidth: size.column,
+    alignSelf: 'center',
+    rowGap: space.s12,
+    paddingHorizontal: space.gut,
+    paddingTop: space.s16,
+    paddingBottom: space.s16,
   },
   histEmptyBox: {
     paddingVertical: 40,
@@ -615,25 +667,20 @@ const styles = themed((type) => ({
     color: color.fog,
     marginBottom: space.s12,
   },
-  // History (screens/HistoryTab): a header per day, then one row per transaction, the amount never cut.
+  // History (screens/HistoryTab): a header per day over its cards, one card per transaction, the amount never cut.
   histDay: {
     ...type('label'),
     color: color.fog,
-    marginTop: space.s24,
-    marginBottom: 0,
-    paddingBottom: space.s8,
-    borderBottomWidth: 1,
-    borderBottomColor: color.ruleStrong,
+    marginTop: space.s16,
+    marginBottom: space.s8,
   },
   histRow: {
+    ...card,
     justifyContent: 'center',
-    minHeight: 60,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: color.rule,
-  },
-  histRowPressed: {
-    backgroundColor: color.fillPress,
+    minHeight: 64,
+    paddingVertical: space.s12,
+    paddingHorizontal: space.s12,
+    marginBottom: space.s8,
   },
   histLine: {
     flexDirection: 'row',
@@ -641,7 +688,24 @@ const styles = themed((type) => ({
   },
   // The token's icon at a row's start; a row with no amount keeps its room, so the titles stay aligned.
   histIcon: {
+    width: size.histIcon,
+    height: size.histIcon,
     marginEnd: space.s12,
+  },
+  // A swap's two tokens in the icon's room: the one paid at the upper start, the one received in front at the lower end,
+  // ringed in the card's colour where they overlap.
+  histSwapBack: {
+    position: 'absolute',
+    top: 0,
+    start: 0,
+  },
+  histSwapFront: {
+    position: 'absolute',
+    bottom: 0,
+    end: 0,
+    borderRadius: size.swapIcon / 2 + 2,
+    borderWidth: 2,
+    borderColor: color.surface,
   },
   // The detail screen's amount: the token's icon, then the figure and its symbol on one line.
   txDetailLeg: {
@@ -655,26 +719,37 @@ const styles = themed((type) => ({
     marginTop: 0,
     alignSelf: 'center',
   },
-  histIconBlank: {
-    width: 30,
-    marginEnd: space.s12,
-  },
-  histMiddle: {
+  // A row's two lines beside its icon: what happened with the amount at its end, then whom with (a swap's second amount
+  // at its end).
+  histText: {
     flex: 1,
     minWidth: 0,
-    marginEnd: space.s8,
+  },
+  histTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    columnGap: space.s8,
+  },
+  histBottom: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    columnGap: space.s8,
+    marginTop: 2,
   },
   histTitle: {
     ...type('row', 15),
     color: color.paper,
+    flex: 1,
+    minWidth: 0,
   },
   histSub: {
     ...type('data', 12),
     color: color.fog,
-    marginTop: 2,
   },
   // The line under the title: whom with, then the status of a row not final, which wraps under it when both do not fit.
   histSubLine: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     flexWrap: 'wrap',
     alignItems: 'baseline',
@@ -683,20 +758,16 @@ const styles = themed((type) => ({
   histParty: {
     flexShrink: 1,
   },
-  // The amounts take at most 45% of the row, so what happened and whom with keep the rest: a compact number (at most 11
-  // characters) and a short symbol fit there whole at 320 dp, and a long symbol gives way first.
-  histRight: {
-    flexShrink: 1,
-    maxWidth: '45%',
-    alignItems: 'flex-end',
+  // An amount beside its line's words takes at most 60% of the row's text (HistoryTab AMOUNT_SHARE), so what happened
+  // keeps the rest; within it the symbol keeps its room and the number shrinks to fit.
+  histBeside: {
+    flexShrink: 0,
+    maxWidth: '60%',
   },
-  // Amounts too long to sit beside the title: on a line of their own under it, the whole width, at its end.
+  // Amounts too long to sit beside the title: on a line of their own under the row, the whole width, at its end.
   histWide: {
     alignItems: 'flex-end',
     marginTop: space.s4,
-  },
-  histAmountWide: {
-    flexShrink: 1,
   },
   // An amount reads left to right in every language: the sign, the number, the symbol.
   histAmountLine: {
@@ -706,32 +777,20 @@ const styles = themed((type) => ({
     maxWidth: '100%',
     direction: 'ltr',
   },
-  // A single amount with a long symbol: the number, and the symbol under it at the line's end.
-  histAmountStack: {
-    alignItems: 'flex-end',
-    maxWidth: '100%',
-  },
   histAmountLineNext: {
     marginTop: 2,
   },
-  // The number keeps its full width; only the symbol after it gives way.
   histAmount: {
     ...type('amount'),
-    flexShrink: 0,
+    flexShrink: 1,
     writingDirection: 'ltr',
   },
-  // A symbol longer than about six characters ends in an ellipsis (its detail screen and the row's label say it whole).
+  // A symbol longer than about six characters ends in an ellipsis (its detail screen and the row's label say it whole);
+  // HistoryTab SYMBOL_ROOM.
   histSymbol: {
     ...type('data'),
-    flexShrink: 1,
+    flexShrink: 0,
     maxWidth: 64,
-  },
-  // Under its number, a symbol is no wider than the longest number (about ten characters) so it never widens the column.
-  histSymbolStacked: {
-    ...type('data'),
-    maxWidth: 80,
-    marginTop: 1,
-    writingDirection: 'ltr',
   },
   // A row's status while it is not final, after whom it was with on the line under its title.
   histStatus: {
@@ -740,11 +799,12 @@ const styles = themed((type) => ({
   histStatus_pending: { color: color.fog },
   histStatus_moving: { color: color.fog },
   histStatus_failed: { color: color.ember },
-  histStatus_dropped: { color: color.ember },
+  histStatus_expired: { color: color.ember },
   histStatus_unverified: { color: color.fog },
   histStatus_included: { color: color.fog },
-  // The detail screen of one transaction: its fields' rows.
+  // The detail screen of one transaction: the section of its fields' rows under the amount, its action under it.
   txDetailCard: {
+    marginTop: space.s16,
     marginBottom: space.s16,
   },
   txDetailAmount: {
@@ -753,42 +813,25 @@ const styles = themed((type) => ({
     writingDirection: 'ltr',
     alignSelf: 'flex-start',
   },
-  txDetailBadge: {
-    marginTop: space.s8,
-    marginBottom: space.s16,
-  },
   txDetailWarning: {
     ...type('note', 12),
     color: color.ember,
-    marginTop: space.s8,
-  },
-  txErrorMessage: {
-    ...type('body'),
-    color: color.ember,
-    marginBottom: space.s24,
+    paddingVertical: space.s12,
   },
   nodeMonitoringTitle: {
     ...type('h3'),
     color: color.paper,
   },
+  // A sentence of the Node tab: what a state means, alone in its section or over the rows.
   nodeExplainer: {
     ...type('body'),
     color: color.text,
-    marginBottom: space.s8,
+    paddingVertical: space.s12,
   },
-  // A tile of the Node tab (the node, its balance, its status), the same rounded element as a token on Assets.
-  nodeGroup: {
-    padding: space.s16,
-    marginBottom: space.s12,
-    borderRadius: radius.tile,
-    borderWidth: 1,
-    borderColor: color.rule,
-    backgroundColor: color.surface,
-  },
-  // The node tile's head: the status chip before the type on one row, the whole name under them.
+  // The node's identity section: the status chip before the type on one row, the whole name under them.
   nodeHead: {
     rowGap: space.s8,
-    marginBottom: space.s12,
+    paddingVertical: space.s16,
   },
   nodeHeadRow: {
     flexDirection: 'row',
@@ -806,7 +849,7 @@ const styles = themed((type) => ({
     alignSelf: 'flex-start',
     paddingVertical: space.s4,
     paddingHorizontal: space.s12,
-    borderRadius: radius.tile,
+    borderRadius: radius.pill,
     borderWidth: 1,
   },
   nodeChipLive: {
@@ -840,7 +883,7 @@ const styles = themed((type) => ({
     position: 'absolute',
     width: 12,
     height: 12,
-    borderRadius: radius.tile,
+    borderRadius: radius.pill,
     marginStart: -6,
     borderWidth: 2,
     borderColor: color.surface,
@@ -851,26 +894,32 @@ const styles = themed((type) => ({
   epochMarkNo: {
     backgroundColor: color.fog,
   },
-  // The one action for what needs care (the background restriction), under the rows of its tile.
+  // The one action for what needs care (the background restriction, Use this device), between the status rows.
   nodeCare: {
-    marginTop: space.s12,
+    marginVertical: space.s12,
   },
-  // The Node tab's title, pinned over its scroll so the tiles pass under it and it is never cut.
+  // What the node's state asks for or waits for, under the status rows it follows.
+  nodeNote: {
+    ...type('note'),
+    color: color.text,
+    paddingBottom: space.s12,
+  },
+  // Move to wallet: the status section's last element, under the node balance's row.
+  nodeMove: {
+    marginTop: space.s4,
+    marginBottom: space.s16,
+  },
+  // The Node tab's title, pinned over its scroll so the sections pass under it and it is never cut: its ink band starts
+  // at the scroll view's edge (nodeScroll pads no top), so no section shows above it; at rest it sits as every tab's
+  // title does.
   stickyHead: {
     backgroundColor: color.ink,
+    paddingTop: space.gut,
   },
-  // The node balance: the one big figure of the tab, in Signal while it can move now.
-  nodeFigure: {
-    ...type('figure'),
-    color: color.paper,
-    writingDirection: 'ltr',
-    marginBottom: space.s16,
-    alignSelf: 'flex-start',
+  nodeScroll: {
+    paddingTop: 0,
   },
-  nodeFigureLive: {
-    color: color.signal,
-  },
-  // A light node under its wallet's server node: its tiles after a wider gap.
+  // A light node under its wallet's server node: its sections after a wider gap.
   nodeSecond: {
     paddingTop: space.s12,
   },
@@ -878,25 +927,7 @@ const styles = themed((type) => ({
   statusNeeds: {
     color: color.ember,
   },
-  // The Node tab's status tile: the epoch bar and its label and value rows (components/InfoRow).
-  rewardsCard: {
-    padding: space.s16,
-    marginBottom: space.s12,
-    borderRadius: radius.tile,
-    borderWidth: 1,
-    borderColor: color.rule,
-    backgroundColor: color.surface,
-  },
-  // A group's kicker, a strong rule under it.
-  rewardsTitle: {
-    ...type('label'),
-    color: color.fog,
-    paddingBottom: space.s8,
-    marginBottom: space.s8,
-    borderBottomWidth: 1,
-    borderBottomColor: color.ruleStrong,
-  },
-  // A quiet line in a Node tab group (a refusal's reason, the licence, a ban's reason).
+  // A quiet line in a Node tab section (a refusal's reason, the licence, a ban's reason).
   rewardHint: {
     ...type('note'),
     color: color.fog,
@@ -941,21 +972,31 @@ const styles = themed((type) => ({
     alignSelf: 'flex-start',
     marginTop: space.s12,
   },
-  // The app's mark above its name on the screens that hold no data, and the lock screen's "forgot" act under the unlock.
-  lockLogo: {
-    width: 64,
-    height: 64,
-    alignSelf: 'flex-start',
-    marginBottom: space.s8,
-  },
+  // The lock screen's "forgot" act under the unlock.
   lockForgot: {
-    marginTop: space.s16,
+    marginTop: space.s8,
   },
   // A waiting request or the screen-reading apps, above the unlock.
   lockNote: {
     ...type('note'),
     color: color.ember,
     marginBottom: space.s16,
+  },
+  // An answer to aiqnet.io still on its way (components/AnswerAway): above what the lock and welcome screens offer, and
+  // under the header's row, in its column, on every tab.
+  awayNote: {
+    ...type('note'),
+    color: color.fog,
+    marginBottom: space.s16,
+  },
+  headerAway: {
+    ...type('note'),
+    color: color.fog,
+    width: '100%',
+    maxWidth: size.column,
+    alignSelf: 'center',
+    paddingHorizontal: space.gut,
+    paddingBottom: space.s8,
   },
   lockField: {
     marginTop: space.s16,

@@ -157,10 +157,12 @@ async function withQnetKeypair(fn) {
 
 /**
  * Signs a QNC transfer with the wallet's ML-DSA-65 key over the node preimage (core.signTransfer builds
- * it from these typed fields and self-verifies). Re-checks the session first.
- * @param {{from: string, to: string, amountNano: string, nonce: string, gasPrice: string, gasLimit: string}} fields
+ * it from these typed fields and self-verifies; with validUntil, the V2 form). Re-checks the session first.
+ * @param {{from: string, to: string, amountNano: string, nonce: string, gasPrice: string, gasLimit: string,
+ *   validUntil?: string|null}} fields
  * @returns {Promise<{preimage: string, signature: Uint8Array, publicKey: Uint8Array}>}
- * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_ADDRESS, KEY_ADDRESS_MISMATCH, SIGNATURE_SELF_CHECK_FAILED
+ * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_ADDRESS, INVALID_EXPIRY, KEY_ADDRESS_MISMATCH,
+ *   SIGNATURE_SELF_CHECK_FAILED
  */
 export async function signQnetTransfer(fields) {
   const tx = {
@@ -170,6 +172,7 @@ export async function signQnetTransfer(fields) {
     nonce: fields?.nonce,
     gasPrice: fields?.gasPrice,
     gasLimit: fields?.gasLimit,
+    validUntil: fields?.validUntil ?? null,
   };
   return withQnetKeypair((pair) => {
     const { preimage, signature } = core.signTransfer(tx, pair.secretKey, pair.publicKey);
@@ -180,14 +183,18 @@ export async function signQnetTransfer(fields) {
 /**
  * Signs a built-in token transfer (a contract call of "transfer" with [to, amount]): core.signTokenTransfer builds the
  * calldata, gas and preimage from these typed fields and self-verifies. Re-checks the session first.
- * @param {{from: string, token: string, to: string, amount: string, nonce: string}} fields amount in token base units
+ * @param {{from: string, token: string, to: string, amount: string, nonce: string, validUntil?: string|null}} fields
+ *   amount in token base units; validUntil: the V2 form
  * @returns {Promise<{tx: object, preimage: string, signature: Uint8Array, publicKey: Uint8Array}>} tx: the shared
  *   builder's transaction (core.buildTokenTransfer)
- * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_ADDRESS, INVALID_AMOUNT, KEY_ADDRESS_MISMATCH,
- *   SIGNATURE_SELF_CHECK_FAILED
+ * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_ADDRESS, INVALID_AMOUNT, INVALID_EXPIRY,
+ *   KEY_ADDRESS_MISMATCH, SIGNATURE_SELF_CHECK_FAILED
  */
 export async function signQnetTokenTransfer(fields) {
-  const tx = { from: fields?.from, token: fields?.token, to: fields?.to, amount: fields?.amount, nonce: fields?.nonce };
+  const tx = {
+    from: fields?.from, token: fields?.token, to: fields?.to, amount: fields?.amount, nonce: fields?.nonce,
+    validUntil: fields?.validUntil ?? null,
+  };
   return withQnetKeypair((pair) => {
     const signed = core.signTokenTransfer(tx, pair.secretKey, pair.publicKey);
     return { tx: signed.tx, preimage: signed.preimage, signature: signed.signature, publicKey: pair.publicKey };
@@ -197,15 +204,16 @@ export async function signQnetTokenTransfer(fields) {
 /**
  * Signs a call of a WASM contract: core.signContractCall builds the calldata, gas and preimage from these typed fields
  * (args lowercase hex, '' for none; gasLimit null for the default fuel) and self-verifies. Re-checks the session first.
- * @param {{from: string, contract: string, method: string, args: string, nonce: string, gasLimit: string|null}} fields
+ * @param {{from: string, contract: string, method: string, args: string, nonce: string, gasLimit: string|null,
+ *   validUntil?: string|null}} fields validUntil: the V2 form
  * @returns {Promise<{tx: object, preimage: string, signature: Uint8Array, publicKey: Uint8Array}>}
  * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_ADDRESS, INVALID_METHOD, INVALID_ARGS,
- *   INVALID_GAS_LIMIT, KEY_ADDRESS_MISMATCH, SIGNATURE_SELF_CHECK_FAILED
+ *   INVALID_GAS_LIMIT, INVALID_EXPIRY, KEY_ADDRESS_MISMATCH, SIGNATURE_SELF_CHECK_FAILED
  */
 export async function signQnetContractCall(fields) {
   const tx = {
     from: fields?.from, contract: fields?.contract, method: fields?.method, args: fields?.args, nonce: fields?.nonce,
-    gasLimit: fields?.gasLimit ?? null,
+    gasLimit: fields?.gasLimit ?? null, validUntil: fields?.validUntil ?? null,
   };
   return withQnetKeypair((pair) => {
     const signed = core.signContractCall(tx, pair.secretKey, pair.publicKey);
@@ -419,14 +427,17 @@ export async function signNodeClaim(fields) {
 
 /**
  * Step 2: ML-DSA-65 over q1337|qnet_claim_v1:{wallet}:{timestamp}:{sha3(claimsData)}, built by the core from the
- * payload a node quoted and its timestamp. Re-checks the session first.
- * @param {{wallet: string, timestamp: number, claimsData: string}} fields
+ * payload a node quoted and its timestamp; with validUntil, the V2 form over that last height instead (core
+ * signClaimPayload). Re-checks the session first.
+ * @param {{wallet: string, timestamp: number, claimsData: string, validUntil?: number|null}} fields
  * @returns {Promise<{signature: Uint8Array, publicKey: Uint8Array}>}
- * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_NODE_MESSAGE, KEY_ADDRESS_MISMATCH,
+ * @throws {WalletError} LOCKED, SIGNING_DISABLED; CoreError INVALID_NODE_MESSAGE, INVALID_EXPIRY, KEY_ADDRESS_MISMATCH,
  *   SIGNATURE_SELF_CHECK_FAILED
  */
 export async function signClaimPayload(fields) {
-  const message = { wallet: fields?.wallet, ts: fields?.timestamp, claimsData: fields?.claimsData };
+  const message = {
+    wallet: fields?.wallet, ts: fields?.timestamp, claimsData: fields?.claimsData, validUntil: fields?.validUntil ?? null,
+  };
   return withQnetKeypair((pair) => ({
     signature: core.signClaimPayload(message, pair.secretKey, pair.publicKey).signature, publicKey: pair.publicKey,
   }));

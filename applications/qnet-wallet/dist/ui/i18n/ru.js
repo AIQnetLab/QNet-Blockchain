@@ -173,7 +173,7 @@ export default Object.freeze({
   historyNotFound: 'Не найдена',
   historyUnverified: 'Не проверена',
   historyDroppedLead: 'QNet Blockchain больше не хранит эту транзакцию, и она не прошла. Ничего не списано; ваша следующая отправка займёт её место.',
-  historyUnverifiedLead: 'Эксплорер показывает эту транзакцию, а ноды QNet Blockchain — нет: возможно, она старше того, что они хранят.',
+  historyUnverifiedLead: 'Эксплорер показывает эту транзакцию, а ноды QNet Blockchain — нет.',
   historyTokenUnverifiedLead: 'Эксплорер показывает этот перевод токена, но кошелёк пока не смог подтвердить его в QNet Blockchain.',
   historyReplacedLead: 'Другая транзакция этого кошелька заняла её nonce: эта уже никогда не пройдёт.',
   historyType: 'Тип',

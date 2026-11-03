@@ -1,4 +1,4 @@
-// A super node in the cabinet (owner, 11.10): the server's steps as the node and its image take them today (the
+// A super node in the cabinet: the server's steps as the node and its image take them (the
 // public image, no build on the server; the provider's firewall; the phrase in a root-only file typed with no shell
 // history; the server's public IPv4, which the node writes on the network at registration; absolute paths; the check,
 // the failures it names, a new release and the timeline), and its status: registered, online and outside the network's
@@ -8,14 +8,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { TEXTS } from '../texts.ts';
+import { EN, TEXTS, shows } from './texts-helper.mjs';
+import { code, repo } from './source.mjs';
 import { SERVER_SYNC_BLOCKS } from '../cabinet/node-view.ts';
 import { ELIGIBLE_CACHE_MS, ELIGIBLE_RETRY_MS, ELIGIBLE_STALE_MS, certifiedIndex, createEligibleSet, eligibleOf } from '../../server/cabinet/eligible-set.ts';
-
-const SRC = new URL('../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 
 // A bincode Vec<EligibleProducer{node_id: String, reputation: u32}>, as a macroblock proof's `eligible_raw` carries it.
 function eligibleRaw(ids) {
@@ -68,7 +64,7 @@ test('the server steps: the public image, the provider\'s firewall, the phrase t
   // The API on IPv4 only, as the operator guide and the install script publish it (an IPv6 client would reach it through
   // the container runtime's proxy, which hides its address).
   assert.match(steps, /'  -p 0\.0\.0\.0:8001:8001 -p 9876:9876 -p 9877:9877 -p 10876:10876\/udp \\\\'/);
-  assert.match(readFileSync(new URL('../../../../../../scripts/install-super-node.sh', import.meta.url), 'utf8'), /^ {2}-p 0\.0\.0\.0:8001:8001$/m);
+  assert.match(repo('scripts/install-super-node.sh'), /^ {2}-p 0\.0\.0\.0:8001:8001$/m);
   assert.match(steps, /`  -v \$\{NODE_DIR\}\/data:\/app\/data \$\{NODE_IMAGE\}`/);
   for (const v of ['QNET_ACTIVATION_CODE="${code}"', 'QNET_BURN_TX_HASH="${burnTx}"', 'QNET_BURN_AMOUNT="${burnAmount}"']) assert.ok(steps.includes(v), v);
   // One settings list: no second block that repeats the environment.
@@ -78,13 +74,13 @@ test('the server steps: the public image, the provider\'s firewall, the phrase t
   assert.match(steps, /'curl -s http:\/\/localhost:8001\/healthz',\s*'curl -s http:\/\/localhost:8001\/api\/v1\/sync\/status',/);
   // The filter also names the untagged lines of a burn the network does not find and of a refused start.
   assert.match(steps, /`docker logs \$\{NODE_CONTAINER\} 2>&1 \| grep -E '\\\\\[ACTIVATION\\\\\]\|\\\\\[REG\\\\\]\|activation_code_save_failed\|blockchain_node_failed\|start_failed'`/);
-  const nodeMain = readFileSync(new URL('../../../../../../development/qnet-integration/src/bin/qnet-node.rs', import.meta.url), 'utf8');
+  const nodeMain = repo('development/qnet-integration/src/bin/qnet-node.rs');
   for (const line of ['[WARN][NODE] activation_code_save_failed err=', '[ERROR][NODE] blockchain_node_failed err=', '[ERROR][NODE] start_failed err=']) assert.ok(nodeMain.includes(line), line);
   assert.doesNotMatch(steps, /node\/health/);
   // A new release: pull it, stop and remove the container, then the address and start steps again.
   assert.match(steps, /const update = `docker pull \$\{NODE_IMAGE\}\\ndocker stop -t 60 \$\{NODE_CONTAINER\} && docker rm \$\{NODE_CONTAINER\}`;/);
   for (const key of ['super_step_server', 'super_step_firewall', 'super_step_seed', 'super_step_dedicated', 'super_step_ip', 'super_step_start', 'super_step_check', 'super_step_errors', 'super_step_update', 'super_step_joined']) {
-    assert.ok(steps.includes(`t('${key}')`), key);
+    assert.ok(shows(steps, `'${key}'`), key);
   }
   assert.ok(!('super_step_build' in TEXTS));
   // The texts say what the node does: the memory it checks at start, the firewall it cannot see, the address it
@@ -102,7 +98,6 @@ test('the server steps: the public image, the provider\'s firewall, the phrase t
   assert.match(TEXTS.super_step_joined, /at least 9 of its 10 heartbeats, one about every 24 minutes/);
   assert.doesNotMatch(TEXTS.super_step_joined, /joins the network/);
   // The log lines and limits named are the node's own.
-  const repo = (path) => readFileSync(new URL(`../../../../../../${path}`, import.meta.url), 'utf8');
   const activation = repo('development/qnet-integration/src/node/activation.rs');
   for (const line of ['code_verified', 'burn_verified_onchain', 'burn_not_found_on_solana', 'mnemonic_mismatch', 'missing_burn_env_vars', 'convergence_done id={} registration=onchain']) {
     assert.ok(activation.includes(line), line);
@@ -185,17 +180,17 @@ test('the status rows: not admitted to consensus yet instead of Offline, the pac
   assert.match(rows, /export function superBadge\(status: SuperStatusView\): Badge \{\s*const state = superState\(status\);\s*if \(state === 'waiting'\) return \{ tone: 'quiet', word: 'badge_waiting', text: 'super_waiting' \};/);
   assert.match(sup, /const state = superState\(status\);/);
   // The note says why: the node's own admission (its epochs add nothing until it is admitted), else the eligible set.
-  assert.match(sup, /\{state === 'waiting' && <p className="note">\{t\(status\.admission === 'waiting' \? 'super_waiting_note' : 'super_waiting_set_note'\)\}<\/p>\}/);
+  assert.match(sup, /\{state === 'waiting' && <p className="note">\{say\(status\.admission === 'waiting' \? 'super_waiting_note' : 'super_waiting_set_note'\)\}<\/p>\}/);
   assert.match(sup, /\{status\.onPace !== null && <Fact label=\{t\('super_pace_label'\)\}>\{t\(status\.onPace \? 'super_on_pace' : 'super_behind'\)\}<\/Fact>\}/);
   // Each height is a link to its block.
   assert.match(sup, /behind <= SERVER_SYNC_BLOCKS \? rich\('super_height_synced', \{ height \}\)/);
   assert.match(sup, /return network === null \? null : <Fact label=\{t\('super_height_label'\)\}>\{rich\('super_height_network', \{ height: <EntityLink kind="block" value=\{network\} \/> \}\)\}<\/Fact>;/);
   // A last-seen time older than half a day names its day (format.ts clockAgo, the site's one clock).
-  assert.match(sup, /\{status\.lastSeenAt === null \? t\('super_not_known'\) : clockAgo\(status\.lastSeenAt, Date\.now\(\)\)\}/);
+  assert.match(sup, /\{status\.lastSeenAt === null \? t\('super_not_known'\) : clockAgo\(status\.lastSeenAt, Date\.now\(\), t\)\}/);
   const { clockAgo } = await import('../format.ts');
   const now = Date.UTC(2026, 9, 19, 12, 0);
-  assert.match(clockAgo(now - 3_600_000, now), /^\d\d:\d\d$/);
-  assert.match(clockAgo(now - 13 * 3_600_000, now), /^[A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
+  assert.match(clockAgo(now - 3_600_000, now, EN), /^\d\d:\d\d$/);
+  assert.match(clockAgo(now - 13 * 3_600_000, now, EN), /^[A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
   assert.equal(SERVER_SYNC_BLOCKS, 5);
   assert.equal(TEXTS.super_waiting, 'Registered, not admitted to consensus yet');
   assert.match(TEXTS.super_waiting_note, /has not admitted it to consensus yet: until it does, its epochs add nothing to the node balance and show as not admitted\./);
@@ -203,13 +198,85 @@ test('the status rows: not admitted to consensus yet instead of Offline, the pac
   for (const key of ['super_waiting_note', 'super_waiting_set_note']) assert.match(TEXTS[key], /Its node balance stays this wallet's to move\.$/);
   // Not registered yet: said so on the Overview and the Device tab, and that the network sees the server when it does;
   // the burned super node's steps say it too.
-  assert.match(code('components/cabinet/NodeHome.tsx'), /\{status\.registered \? <SuperFacts status=\{status\} \/> : <p>\{t\(status\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\}/);
-  assert.match(code('components/cabinet/NodeDevices.tsx'), /\(state\.value\.registered \? <SuperRows status=\{state\.value\} \/> : <p>\{t\(state\.value\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\)/);
-  assert.match(code('components/cabinet/NextSteps.tsx'), /\{view\.superConnected && <Answered>\{t\('super_connected'\)\}<\/Answered>\}/);
+  assert.match(code('components/cabinet/NodeHome.tsx'), /\{status\.registered \? <SuperFacts status=\{status\} \/> : <p>\{say\(status\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\}/);
+  assert.match(code('components/cabinet/NodeDevices.tsx'), /\(state\.value\.registered \? <SuperRows status=\{state\.value\} \/> : <p>\{say\(state\.value\.connected \? 'super_connected' : 'super_not_yet'\)\}<\/p>\)/);
+  assert.match(code('components/cabinet/NextSteps.tsx'), /\{view\.superConnected && <Answered>\{say\('super_connected'\)\}<\/Answered>\}/);
   // The node balance stays on the Overview for every registered super node, waiting or not, with Move to wallet for the
-  // wallet's own super node (owner, 12.10).
+  // wallet's own super node.
   const home = code('components/cabinet/NodeHome.tsx');
   const overview = home.slice(home.indexOf('function SuperOverview('), home.indexOf('function Overview('));
   assert.match(overview, /<Balance nodeId=\{nodeId\} balanceNano=\{status\.balanceNano\}>/);
   assert.match(overview, /<Move\s+qnet=\{choice\.qnet\}\s+nodeId=\{nodeId\}/);
+});
+
+// More heartbeats than the epoch needs change nothing: the page says the needed count is reached ("9 of 9"), never
+// "10 of 9", on the Overview's reading and in the server's facts alike.
+test('heartbeats past the number needed read as that number reached', async () => {
+  const { shownHeartbeats } = await import('../cabinet/node-view.ts');
+  assert.deepEqual(shownHeartbeats({ current: 10, required: 9 }), { current: 9, required: 9 });
+  assert.deepEqual(shownHeartbeats({ current: 9, required: 9 }), { current: 9, required: 9 });
+  assert.deepEqual(shownHeartbeats({ current: 6, required: 9 }), { current: 6, required: 9 });
+  assert.deepEqual(shownHeartbeats({ current: 0, required: 9 }), { current: 0, required: 9 });
+  assert.equal(EN('ro_heartbeats', shownHeartbeats({ current: 10, required: 9 })), '9 of 9');
+  const home = code('components/cabinet/NodeHome.tsx');
+  assert.match(home, /const beats = status\.heartbeats === null \? null : shownHeartbeats\(status\.heartbeats\);/);
+  assert.match(home, /<ThisEpoch value=\{beats === null \? null : t\('ro_heartbeats', \{ current: number\(beats\.current\), required: number\(beats\.required\) \}\)\} \/>/);
+  const rows = code('components/cabinet/NodeStatus.tsx');
+  assert.match(rows, /const beats = status\.heartbeats === null \? null : shownHeartbeats\(status\.heartbeats\);/);
+  assert.match(rows, /t\('super_heartbeats_of', \{ current: number\(beats\.current\), required: number\(beats\.required\) \}\)/);
+  assert.doesNotMatch(rows + home, /status\.heartbeats\.current/);
+});
+
+// One of the network's genesis nodes is named a genesis node wherever My node names a super node: the Overview's and the
+// Device tab's titles, the node type and id in its details (with no code, burn or record to look for: the first block
+// recorded it), the account menu and the rail's node line, in every language.
+test('a genesis node is named a genesis node wherever a super node is named, in every language', async () => {
+  const { serverWord } = await import('../cabinet/server-words.ts');
+  const { isGenesisNodeId, isSuperNodeId } = await import('../qnet-link.ts');
+  const { accountRows, nodeLines } = await import('../account-menu.ts');
+  const { CATALOGS } = await import('../../i18n/catalogs.ts');
+  const { LOCALES } = await import('../languages.ts');
+  const { translator } = await import('../texts.ts');
+  for (const id of ['genesis_node_001', 'genesis_node_005']) {
+    assert.ok(isGenesisNodeId(id) && isSuperNodeId(id), id);
+    assert.equal(EN(serverWord(id, 'title')), 'Genesis node');
+    assert.equal(EN(serverWord(id, 'type')), 'Genesis node');
+    assert.equal(EN(serverWord(id, 'id')), 'Genesis node ID');
+  }
+  for (const id of ['super_node_c78c3017a4f93464', 'genesis_node_006', 'genesis_node_00', null]) {
+    assert.equal(isGenesisNodeId(id), false, String(id));
+    assert.equal(EN(serverWord(id, 'title')), 'Super node', String(id));
+  }
+  // The account menu's node line and its row, by the super node's id.
+  const ok = (value) => ({ phase: 'ok', value });
+  const superNode = ok({ registered: true, online: true, lastSeenAt: 1, heartbeats: { current: 9, required: 9 }, banned: false, balanceNano: '0', admission: 'admitted', admitted: null, onPace: true, networkHeight: 1, serverHeight: null, connected: false });
+  const reads = (superId) => ({ network: ok({ state: 'registered', nodeId: superId, nodeType: 'super' }), light: ok({ registered: false }), superNode, history: { phase: 'loading' }, superId });
+  assert.equal(nodeLines(reads('genesis_node_001'), EN)[0].words, 'Genesis node · Online');
+  assert.equal(nodeLines(reads('super_node_c78c3017a4f93464'), EN)[0].words, 'Super node · Online');
+  assert.equal(accountRows(reads('genesis_node_001'), EN)[0].datum, 'Genesis node · Online');
+  // The words in each language, apart from the super node's.
+  for (const locale of LOCALES) {
+    const t = translator(locale, CATALOGS[locale]);
+    for (const word of ['title', 'type', 'id', 'device', 'checking']) {
+      assert.notEqual(t(serverWord('genesis_node_001', word)), t(serverWord('super_node_c78c3017a4f93464', word)), `${locale} ${word}`);
+    }
+    assert.notEqual(t('account_genesis', { state: 'x' }), t('account_super', { state: 'x' }), locale);
+    assert.notEqual(t('account_both_genesis'), t('account_both'), locale);
+    assert.equal(t('genesis_title'), t('tx_data_genesis_id'), `${locale}: the explorer's own name of a genesis node`);
+  }
+  // Every place the cabinet names a server node takes its word by the node's id.
+  const home = code('components/cabinet/NodeHome.tsx');
+  assert.match(home, /<Group title=\{say\(serverWord\(nodeId, 'title'\)\)\}>/);
+  assert.match(home, /\{both && <NodeHead title=\{t\(serverWord\(superId, 'title'\)\)\} nodeId=\{superId\} \/>\}/);
+  assert.match(home, /isGenesisNodeId\(nodeId\) \? 0 : known\.facts\?\.height \?\? null/);
+  const devices = code('components/cabinet/NodeDevices.tsx');
+  for (const word of ['title', 'device', 'checking']) assert.ok(shows(devices, `serverWord(nodeId, '${word}')`), word);
+  for (const file of ['components/cabinet/NodeHome.tsx', 'components/cabinet/NodeDevices.tsx', 'components/cabinet/NodeDetails.tsx']) {
+    assert.doesNotMatch(code(file), /'super_title'|'super_id'|'super_device'|'super_status_checking'|: 'ext_type_super'/, file);
+  }
+  // The header's account menu, on every page, with its own words by the same rule.
+  const menu = code('lib/account-menu.ts');
+  assert.match(menu, /t\(isGenesisNodeId\(reads\.superId\) \? 'account_genesis' : 'account_super', \{ state: stateWord\(state, t\) \}\)/);
+  assert.match(menu, /t\(isGenesisNodeId\(reads\.superId\) \? 'account_both_genesis' : 'account_both'\)/);
+  assert.match(code('hooks/useAccountReads.ts'), /history: history\.state, superId \};/);
 });

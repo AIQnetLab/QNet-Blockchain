@@ -1,5 +1,4 @@
-// Where a wallet's activation stands, from every source the page has (unified plan R1, R4 and R6; shared contracts C0 and
-// C9): the QNet network (the wallet's node of either type, its light node's status, its super node's status), the
+// Where a wallet's activation stands, from every source the page has: the QNet network (the wallet's node of either type, its light node's status, its super node's status), the
 // server's activation record with its search of the wallet's own Solana address, the QNet extension that holds the
 // wallet (qnet_getActivation, never a window), the answer the extension gave in this browser before, and this browser's
 // payment addresses. Pure: every page of My node shows the one state this gives, and none offers a burn unless it is
@@ -25,6 +24,15 @@ export type WalletNodeView = { state: 'registered'; nodeId: string; nodeType: No
 
 const WALLET_NODE_KEYS = ['state', 'nodeId', 'nodeType'];
 const NODE_ID_RE = /^[a-z0-9_]{1,128}$/;
+
+// The id the wallet's super node is read by: the one the network names (a genesis node's for a genesis wallet). The id
+// derived from the wallet only once the network said the wallet has no node, as for a server seen before its
+// registration lands; none while the network is read, when it did not answer, or when it names a light node.
+export function followedSuperId(wallet: string | null, network: Read<WalletNodeView>): string | null {
+  if (wallet === null || network.phase !== 'ok') return null;
+  if (network.value.state === 'none') return superNodeId(wallet);
+  return network.value.nodeType === 'super' ? network.value.nodeId : null;
+}
 
 // GET /api/cabinet/wallet-node/:wallet, exactly.
 export function parseWalletNode(body: unknown): WalletNodeView | null {
@@ -59,14 +67,15 @@ export interface ActivationInputs {
   records: PaymentRecord[] | null;
 }
 
-// C9, as the pages show them.
+// Where a wallet's activation stands, as every page of My node shows it.
 export const VIEW_STATES = ['loading', 'locked', 'unknown', 'none', 'reserved', 'sending', 'burned', 'recording', 'node'] as const;
 export type ViewState = (typeof VIEW_STATES)[number];
 
-// The checks `unknown` names: the QNet network, the server's record, the extension, the wallet's Solana history.
-export type Check = 'network' | 'server' | 'extension' | 'solana';
+// The checks `unknown` names: the QNet network, the server's record, the extension, the wallet's Solana history, and
+// that history when the page does not have the wallet's Solana address to search it by (a choice kept from before).
+export type Check = 'network' | 'server' | 'extension' | 'solana' | 'solana_address';
 
-// A burn the page knows is the wallet's, and where it knows it from (the code priority of D1 after the network's own
+// A burn the page knows is the wallet's, and where it knows it from (the code priority after the network's own
 // registration, which Node details read from the archive: the server's record, the extension's answer, the server's
 // search, the extension's answer kept in this browser, this browser's payment address).
 export interface KnownBurn {
@@ -86,8 +95,9 @@ export interface ActivationView {
   missing: Check[];
   // reserved, sending: until when (ms), when known.
   until: number | null;
-  // The wallet's light node on the network: pending (being recorded), no_device, device_pending (a device linked that has
-  // not answered yet), online, offline; null without one.
+  // The wallet's light node on the network: pending (being recorded), no_device, device_unknown (no answer could say
+  // whether a device runs it), device_pending (a device linked that has not answered yet), online, offline; null without
+  // one.
   light: NodeState | null;
   // Its super node: online, offline, or registered, not admitted to consensus yet; `registered` while the
   // network lists it and its status is not read yet.
@@ -117,7 +127,8 @@ const BLANK: Omit<ActivationView, 'state'> = {
   lockedBy: null, unusable: false, networkDown: false,
 };
 
-const isRegistered = (s: NodeState) => s === 'no_device' || isLinkedState(s);
+// A light node on the network, with or without a device, or with its device not known.
+const isRegistered = (s: NodeState) => s === 'no_device' || s === 'device_unknown' || isLinkedState(s);
 
 // This browser's payment record whose burn, or whose live reservation, is for `wallet` (a record from before the
 // reservations names it by its request).
@@ -134,14 +145,13 @@ const HELD_BURN_STAGES: ReadonlySet<PaymentRecord['stage']> = new Set([
 ]);
 
 // This browser's own final payment burn for the wallet, not registered yet: the wallet's burn even while the server's
-// record cannot be read or never had it (a burn from before the record), so this browser never offers a second one
-// (R1, R6).
+// record cannot be read or never had it (a burn from before the record), so this browser never offers a second one.
 function heldBurn(record: PaymentRecord | null): KnownBurn | null {
   if (!record?.burn || !HELD_BURN_STAGES.has(record.stage)) return null;
   return { nodeType: 'light', burnTx: record.burn.tx, burnAmount: record.burn.amount, code: receiptCode(record), way: 'payment', burner: record.pub, source: 'browser' };
 }
 
-// The burn the sources know, by the priority of D1 (the archive's registration aside).
+// The burn the sources know, by the code priority (the archive's registration aside).
 export function knownBurn(inputs: ActivationInputs): { burn: KnownBurn | null; unusable: boolean } {
   const { choice, server, extension, scan, kept, records } = inputs;
   const wallet = choice?.qnet ?? null;
@@ -198,9 +208,11 @@ export function activationView(inputs: ActivationInputs): ActivationView {
   const listed = network.phase === 'ok' && network.value.state === 'registered' ? network.value : null;
   const lightNode = lightState === 'none' && listed?.nodeType === 'light' ? 'no_device'
     : lightState !== null && lightState !== 'none' ? lightState : null;
-  const superRead = superStatus.phase === 'ok' ? superStatus.value : null;
+  // The super node's status is the followed id's (followedSuperId); none is shown while the network is read.
+  const followed = followedSuperId(wallet, network);
+  const superRead = followed !== null && superStatus.phase === 'ok' ? superStatus.value : null;
   let superNode: ActivationView['superNode'] = superRead?.registered ? (superState(superRead) as SuperState) : null;
-  let superId: string | null = superRead?.registered ? superNodeId(wallet) : null;
+  let superId: string | null = superRead?.registered ? followed : null;
   if (listed?.nodeType === 'super') {
     superId = listed.nodeId;
     if (superNode === null) superNode = 'registered';
@@ -249,8 +261,12 @@ export function activationView(inputs: ActivationInputs): ActivationView {
     else if (v.qnet !== wallet || v.status === 'searching') loading = true;
     else if (v.status === 'none') extensionNone = true;
   }
-  if (choice.solana && !extensionNone) {
-    if (scan === null) loading = true;
+  // The wallet's own Solana history may hold its burn: the extension that holds the wallet searched it, or the server
+  // searches it by the address the wallet shared; without that address nothing is offered. A viewed address is offered
+  // no activation, so it needs no search.
+  if (!extensionNone && choice.source !== 'entered') {
+    if (!choice.solana) missing.push('solana_address');
+    else if (scan === null) loading = true;
     else if (!scan.complete) missing.push('solana');
   }
   if (loading) return { ...base, state: 'loading', extensionUpdate };
@@ -259,8 +275,8 @@ export function activationView(inputs: ActivationInputs): ActivationView {
   return { ...base, state: 'none' };
 }
 
-// The C9 name of a view, as the tests and the documents name it: burned-light, recorded light running, and so on.
-export function c9Name(view: ActivationView): string {
+// A view's name for the tests: burned-light, light-running, light-not-linked+super-online, and so on.
+export function viewName(view: ActivationView): string {
   switch (view.state) {
     case 'burned':
       return view.burn ? `burned-${view.burn.nodeType}` : 'burned';
@@ -268,6 +284,7 @@ export function c9Name(view: ActivationView): string {
       const names: string[] = [];
       if (view.light === 'online') names.push('light-running');
       else if (view.light === 'no_device') names.push('light-not-linked');
+      else if (view.light === 'device_unknown') names.push('light-device-unknown');
       else if (view.light === 'device_pending') names.push('light-linking');
       else if (view.light === 'offline') names.push('light-offline');
       if (view.superNode === 'online' || view.superNode === 'offline' || view.superNode === 'waiting') names.push(`super-${view.superNode}`);
@@ -294,12 +311,12 @@ export function lightSectionState(status: NodeStatusView, view: ActivationView):
   return state === 'none' && view.state === 'node' && view.light === 'no_device' ? 'no_device' : state;
 }
 
-// The step the wallet is on, which every page leads with (owner, 30.09: the page moves on by itself and shows the
+// The step the wallet is on, which every page leads with (the page moves on by itself and shows the
 // steps): `record`, a light node's known burn or registration waiting for the network; `link`, a light node the network
 // lists with no device on it; `answer`, a device just linked that has not answered yet; `offline`, a linked device the
 // network asks to come back (the phone answers once QNet Wallet is open on it, or runs the node again); `running`;
 // `server`, a super node from its burn until the network counts its server online. Null before a burn, or while the
-// node's status is not read.
+// node's status, or which device runs it, is not read.
 export type NextStep = 'record' | 'link' | 'answer' | 'offline' | 'running' | 'server';
 
 export function nextStep(view: ActivationView): NextStep | null {

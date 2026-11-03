@@ -1,6 +1,6 @@
 'use client';
 
-// Latest blocks (B-SPEC 6.2, owner 20.10): one strip across the top of the explorer, above All transactions. Each block
+// Latest blocks: one strip across the top of the explorer, above All transactions. Each block
 // is a card of fixed size, its lines stacked: the height (a link to the block), its age, the node that made it (a link
 // to its address when the index knows it) and its transactions. A new block comes in at the left and the strip slides
 // right (a transform, so nothing around it moves); older blocks are a sideways scroll inside the strip (a finger, the
@@ -12,6 +12,7 @@ import { useRef, useState, useSyncExternalStore, type MouseEvent, type PointerEv
 import EntityLink from '@/components/ui/EntityLink';
 import { HoldLabel } from '@/components/ui/Status';
 import Action from '@/components/ui/Action';
+import { useI18n } from '@/i18n/client';
 import { RECENT_BLOCKS, txCountText, type RecentBlock } from '@/lib/explorer-view';
 import { int } from '@/lib/format';
 import { stripCookie, stripHiddenIn } from '@/lib/strip-pref';
@@ -33,6 +34,7 @@ const hiddenNow = () => stripHiddenIn(document.cookie);
 
 // `hidden`: the visitor's choice as the server read it (the loading state has none and reads the cookie in the browser).
 export default function LatestBlocks({ seed, hidden }: { seed: readonly RecentBlock[]; hidden?: boolean }) {
+  const { t, href } = useI18n();
   const view = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLOListElement>(null);
   const { shown, hold, near, landed } = useLiveBlocks(seed, RECENT_BLOCKS, view, list);
@@ -40,7 +42,7 @@ export default function LatestBlocks({ seed, hidden }: { seed: readonly RecentBl
   const [atEnd, setAtEnd] = useState(false);
   const drag = useRef<{ x: number; left: number; moved: boolean } | null>(null);
   const toggle = () => {
-    document.cookie = stripCookie(open, window.location.protocol === 'https:');
+    document.cookie = stripCookie(open, window.location.protocol === 'https:', href('/explorer'));
     for (const on of watchers) on();
   };
   const onScroll = () => {
@@ -76,22 +78,26 @@ export default function LatestBlocks({ seed, hidden }: { seed: readonly RecentBl
   };
 
   return (
-    <section className="ex-chain" aria-label="Latest blocks" data-open={open}>
+    <section className="ex-chain" aria-label={t('ex_latest_blocks')} data-open={open}>
       <div className="ex-chain-head">
-        <h2 className="label ex-chain-title">Latest blocks</h2>
+        <h2 className="label ex-chain-title">{t('ex_latest_blocks')}</h2>
         <span className="label tbl-live"><HoldLabel hold={hold} /></span>
-        <Action kind="act" href="/explorer/blocks" className="ex-chain-all">All blocks</Action>
-        <button type="button" className="act quiet" aria-expanded={open} aria-controls="ex-chain-cells" onClick={toggle}>
-          <span className="swap">
-            <span data-on={open}>Hide</span>
-            <span data-on={!open}>Show</span>
-          </span>
-        </button>
+        <span className="ex-chain-acts">
+          <Action kind="act" href="/explorer/blocks" className="ex-chain-all">{t('ex_all_blocks')}</Action>
+          <button type="button" className="act quiet" aria-expanded={open} aria-controls="ex-chain-cells" onClick={toggle}>
+            <span className="swap">
+              <span data-on={open}>{t('ex_hide')}</span>
+              <span data-on={!open}>{t('ex_show')}</span>
+            </span>
+          </button>
+        </span>
       </div>
       <div className="ex-chain-body" id="ex-chain-cells">
         <div
           ref={view}
           className="ex-chain-view"
+          // Newest at the left in every language: the slide, the drag and the scroll position read left to right.
+          dir="ltr"
           data-end={atEnd || undefined}
           onScroll={onScroll}
           {...hold.handlers}
@@ -114,7 +120,7 @@ export default function LatestBlocks({ seed, hidden }: { seed: readonly RecentBl
                     </span>
                     <span>{b.timestamp ? <Ago ts={b.timestamp} on={near && open} /> : null}</span>
                     <span className="ent-fit">{b.producer ? <EntityLink kind="node" value={b.producer} address={b.producerAddress} /> : null}</span>
-                    <span>{b.txCount !== null ? txCountText(b.txCount) : null}</span>
+                    <span>{b.txCount !== null ? txCountText(b.txCount, t) : null}</span>
                   </div>
                 </li>
               );

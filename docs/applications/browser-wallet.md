@@ -28,7 +28,7 @@ QNet Wallet's Node tab moves it too. Its windows speak the mobile wallet's eleve
 | `dist/background/platform.js` | The chrome.* helpers `session.js` and `clipboard.js` share: the API read at call time, every call as a promise, one-shot alarms |
 | `dist/background/keys.js` | Per-operation key derivation and signing, the password-gated private key export |
 | `dist/background/qnet.js` | QNet Blockchain node requests, the balance and nonce at a node's live tip and their certified check, QNC transfers, the wallet's built-in tokens and their transfers (the popup's and a site's), contract calls, history, the chain the wallet follows, the requests to aiqnet.io's record of burns |
-| `dist/background/solana.js` | Solana RPC, SOL and 1DEV transfers, the Solana history, the burn transaction and the burn matcher |
+| `dist/background/solana.js` | Solana RPC (the build's endpoint, or aiqnet.io's relay while the endpoint gives no answer), SOL and 1DEV transfers, the Solana history, the burn transaction and the burn matcher |
 | `dist/background/activation.js` | Activation price, the burn, the activation code, Recover, and aiqnet.io's record of the wallet's burn (its reservation, the proof, the sync) |
 | `dist/background/nodes.js` | The wallet's nodes on QNet Blockchain: the light node's registration after the burn, the move of the balance of the light or super node aiqnet.io names, and the unlink of the light node's device |
 | `dist/background/provider.js` | Site grants, the approval queue, provider methods and events |
@@ -69,11 +69,13 @@ npm run check:overflow   # every screen in every language in headless Chrome (ne
   PBKDF2, BLAKE3), `hash-wasm` (Argon2id, as WebAssembly), `@noble/curves` (Ed25519), `@scure/bip39`
   and `@scure/base`, all at exact versions from the bundle's lockfile. It also compiles
   the mobile app's `WalletIdentity`, `TxBuilders`, `NodePreimages`, `PasswordStrength`,
-  `QcLightClient`, `SmtFold`, `fees`, `genesisConsensus`, `tokenSafety` (with the `OffchainMessage` and `solanaFormat`
-  modules it imports), `boundedFetch`, `strictJson`, `amountFormat`, `sendAmount` and `textEdit` modules straight from
+  `QcLightClient` (with the `userHold` and `pause` modules it imports), `SmtFold`, `fees`, `genesisConsensus`, `tokenSafety` (with the
+  `OffchainMessage` and `solanaFormat` modules it imports), `boundedFetch`, `strictJson`, `amountFormat`, `sendAmount`, `textEdit`,
+  `solanaRoute` and `claimRun` modules straight from
   `applications/qnet-mobile/src`, so both apps share one derivation, one set of
-  transaction builders, one set of light node messages, one password policy, one fee table and one way of writing and
-  reading amounts; the packages those modules import (`js-sha3`, `buffer`) come from the same lockfile, and their
+  transaction builders, one set of light node messages, one password policy, one fee table, one way of writing and
+  reading amounts, one rule of the way Solana calls go and one set of rules for a move in parts; the packages those
+  modules import (`js-sha3`, `buffer`) come from the same lockfile, and their
   `DilithiumCrypto` import is replaced by a shim over `@noble/post-quantum`. The build refuses any other mobile module and any output that contains a cleartext URL,
   `eval`, `new Function`, an HTML sink or a console call. The test suite rebuilds the bundle and
   requires it to be byte-identical to the shipped file.
@@ -103,9 +105,11 @@ the dApp approvals to lock and delete. Static checks cover every shipped file: n
   document after the popup closed (see Vault and session); the browser shows `clipboardWrite` as a permission to change
   copied data when the extension is installed, and asks for it again when an installed one updates to it.
 - `host_permissions`: `https://node1.aiqnet.io/*` … `https://node5.aiqnet.io/*`,
-  `https://aiqnet.io/*` (the explorer archive, aiqnet.io's record of wallet burns, and the tabs of aiqnet.io an event
-  reaches when their port is closed) and the Solana RPC of the release channel (`https://api.devnet.solana.com/*`
-  in the testnet build).
+  `https://aiqnet.io/*` (the explorer archive, aiqnet.io's record of wallet burns, its relay of the wallet's Solana
+  calls, and the tabs of aiqnet.io an event reaches when their port is closed) and the Solana RPC of the release channel
+  (`https://api.devnet.solana.com/*` in the testnet build). Every request to aiqnet.io, the relay's included, carries the
+  header `x-qnet-client` with `QNetWallet-Extension/` and the manifest version (`QNetWallet-Extension/3.1.7` in this
+  build), so a request there is tied to its build; node requests and the Solana RPC's carry none.
 - Content security policy for extension pages: `default-src 'self'; script-src 'self'
   'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:`, `connect-src` limited to the origins
   above, and `object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`.
@@ -229,7 +233,8 @@ lifetime, and the next worker start runs it again.
 - **Delete** needs the word `DELETE` typed and the password; Enter in the password field deletes as the button does,
   and a wrong password empties only the password field, so the typed `DELETE` stays. It locks the wallet, deletes the
   vault database, clears `chrome.storage.local` (all but the chosen interface language, which holds no wallet data, and
-  a wallet of the earlier version that still opens) and `chrome.storage.session`, and empties the clipboard of a copied
+  a wallet of the earlier version that still opens; a Solana call still running may write the Solana route again) and
+  `chrome.storage.session`, and empties the clipboard of a copied
   secret still due to be cleared. Only once the vault record is gone are the open pages told: they reload, and every
   site the wallet's grants named, or that is connected now, is disconnected, also when the service worker restarted
   since it last read the grants. A delete whose database could not be deleted tells nothing: the wallet stays,
@@ -254,7 +259,9 @@ data, each with an HMAC under a key derived from the vault key; and the genesis 
 verified again in full before it is used. A new record that the Forgot-password restore of versions 3.0.0 and 3.1.0 staged next to the old one, and left
 when that version's service worker stopped in the middle, is deleted at the next start of the service worker or at
 unlock. `chrome.storage.local` holds
-the site grants (each carrying a MAC, see below) and the chosen language (a display preference only); a wallet of the
+the site grants (each carrying a MAC, see below), the chosen language (a display preference only) and the Solana route
+(whether the Solana calls go to the endpoint or through aiqnet.io's relay, and when the endpoint was last tried; see
+Solana below), which decides no security; a wallet of the
 earlier version stays there (and its second copy in its own IndexedDB database), untouched, until it is moved or
 removed; Delete wallet and a reset keep it while it opens, and remove what the earlier version left that opens nothing.
 `chrome.storage.session`, which the browser keeps in memory only, holds the unlocked session, the
@@ -364,12 +371,21 @@ Errors carry a fixed code and message, never the thrown text.
   root as a balance is) is read in the background only, one read at a time per address, and never holds a review; once
   it proves a contract, every later review and send to that address is refused at once. The signature is ML-DSA-65 over
   the node's preimage `q1337|transfer:{from}:{to}:{amountNano}:{nonce}:{gasPrice}:{gasLimit}`,
-  checked against the public key before anything is sent. The body goes to `/api/v1/transaction`
-  with the fields in the mobile wallet's order and the public key included. The sent screen (of a token transfer too)
+  checked against the public key before anything is sent. When a pinned node's account answer (read beside the live
+  balance, waited for at most 2 seconds) says the network takes the V2 form (`tx_v2`), the transfer signs its last height
+  instead: `q1337|{network id}|transfer_v2:{from}:{to}:{amountNano}:{nonce}:{gasPrice}:{gasLimit}:{validUntil}`, the
+  network id being the build's `NETWORK_ID` (the hash of block 0) and `validUntil` that answer's `next_height` + 600
+  (the node takes at most 1,800 above the block); a token transfer or contract call signs `contract_call_v2` the same way.
+  A typed refusal of the form or the height (`tx_v2_before_gate`, `tx_expiry_required`, `tx_expired`,
+  `tx_expiry_beyond_horizon`) is answered by one re-sign at the same nonce, in the refused one's place: the V1 form before
+  the gate, else the V2 form with a fresh `next_height`; a second refusal is the answer. The body goes to
+  `/api/v1/transaction` with the fields in the mobile wallet's order, the public key included and, for the V2 form,
+  `valid_until`. The sent screen (of a token transfer too)
   says Sent, with the nonce and "Waiting for QNet Blockchain to put it in a block…", and asks where the transaction
   stands by the nonce at least two nodes report live: every 2 seconds for the first 10 seconds, every 5 seconds to the
   first minute, then every 10 seconds, five minutes in all. It turns Confirmed once two pinned nodes list the transaction
-  at its nonce, or says that another transaction took the nonce; Done opens History, which lists it at once.
+  at its nonce, says that another transaction took the nonce, or says Expired once a V2 transaction is dropped by its
+  height (below); Done opens History, which lists it at once.
 - **Tokens.** Assets lists, after QNC, the built-in QRC-20 tokens the wallet holds: the contracts two nodes list for it
   (`/api/v1/account/{address}/tokens`, both lists together, kept a minute), each read again: what it is, as two nodes say
   alike (`/api/v1/token/{contract}`: a QRC-20 token with at most 18 decimals, else left out), and the wallet's balance in it
@@ -406,8 +422,8 @@ Errors carry a fixed code and message, never the thrown text.
   yet", until a figure past the call is read. It is signed, kept and
   resent like a site's.
 - **Identity of a transfer.** A transfer is `(from, nonce)`: at most one transaction of an address applies
-  at a nonce. Its hash is not its identity: the node that receives a transfer stamps its own copy with the
-  time and hashes that, and the wallet sends to a second node when the first is slow, so another copy with
+  at a nonce. Its hash is not its identity: the node that receives a V1 transfer stamps its own copy with the
+  time and hashes that (a V2 one carries no time and has one hash on every node), and the wallet sends to a second node when the first is slow, so another copy with
   another hash may be the one that lands.
 - **Pending transfers.** The exact body is stored in the vault before the first submission; up to 16
   can be pending at once, one place kept free for a replace. The next nonce accounts for them, and their
@@ -431,12 +447,18 @@ Errors carry a fixed code and message, never the thrown text.
   transaction replaced it; without such a row (or when a node lists two
   transactions at that nonce) its outcome stays unknown until a later check decides it, and leaves the list a day
   after it was seen so.
-- **Dropped transfers.** A transfer the wallet no longer sends (stale, or refused by the only node sent it) whose nonce
-  the chain's nonce last read shows still free, past the node's mempool lifetime after it last went out (30 minutes plus a 5-minute
-  margin, the mobile wallet's rule), is held by no node: it did not go through and never will by itself. History shows it
-  as Not found, the next transfer takes its nonce by default (so it does not hold every later send behind it) and its
-  amount is no longer kept back, and it leaves the list a day after it was dropped. A pending row so resolves within
-  about an hour and a half of its last send.
+- **Dropped transfers.** A V2 transaction (one that signed a last height) is dropped by height alone: once the tip two
+  pinned nodes report with this wallet's account (one below the lowest `next_height` of the answers that give the agreed
+  nonce, read only when at least two of those answers name one, so no single node moves it; the highest such tip read) is
+  past its `valid_until`, its nonce still free there, no block can take it: it did not go through, History shows it as Not
+  found ("Nothing was spent") and the sent screen says Expired. A V1 transfer has no last height, and its signed body stays
+  valid until its nonce is used, so no clock drops it: the sent screen keeps waiting and History shows it as Pending, never
+  as failed or not found, and only the chain decides it, by putting it in a block or by another transaction taking its
+  nonce. Once the wallet no longer sends it (stale, or refused by the only node sent it) and its nonce is still free past
+  the node's mempool lifetime after it last went out (30 minutes plus a 5-minute margin, the mobile wallet's rule), no
+  node holds it, and the wallet releases it as it releases a dropped one: it is never sent again, the next transfer takes
+  its nonce by default (so it does not hold every later send behind it, and only one of the two can go through) and its
+  amount is no longer kept back, and it leaves the list a day and 35 minutes after it last went out.
 - **History.** Pages of `https://aiqnet.io/api/address/{address}/history` and this wallet's transfers not decided yet or
   taken by the chain and not in the archive yet,
   newest first under the header of their day (Today, Yesterday, then the date in the UI language, with its year when it
@@ -448,9 +470,10 @@ Errors carry a fixed code and message, never the thrown text.
   row's own fields (its transaction, log index, contract and transfer event) must be the leaf the node proves, fold to
   its block's root and that to the window's logs root, and that root must be the one the committee certified for the
   macroblock closing the window; the event is written only when the transfer applied. One read starts at most 8 such
-  checks, each only when its macroblock is at most 4 walk steps away, waits for none of them and shows their verdicts
-  from the next read on; a row whose proof is another row's or folds to another root stays unverified for good, whatever
-  the nodes list. Each row is one
+  checks, each only for a row of a block above the logs floor (below), whose logs a pinned node still keeps, and only
+  when its macroblock is at most 4 walk steps away, waits for none of them and shows their verdicts from the next read
+  on; a row whose proof is another row's or folds to another root stays unverified, whatever the nodes list or its
+  block, while the service worker keeps that verdict (in memory, for the newest 256 rows checked). Each row is one
   transaction: a token transfer this wallet sent, which the archive lists twice under one hash (its contract call and
   the token's own row), is one row, the token row, with the network fee the call paid in its detail, also when the two
   fall on different pages; a call that wrote no token event keeps its own row. Rows are laid out and worded as the mobile
@@ -470,13 +493,29 @@ Errors carry a fixed code and message, never the thrown text.
   is one "Node registered" row, never a transfer of 0 QNC, confirmed when two pinned nodes list a registration with its
   hash. A row's detail says its state: Confirmed when two pinned nodes list it alike (a token row: its call, when this
   wallet sent it, or its logs proof verifies), Failed when another transaction took its nonce, Not found for a dropped
-  transfer, Unverified for an archive row no two pinned nodes list (older than what they keep, or not on the chain they
-  serve; a received token row not proven yet; a token row its proof contradicts),
-  and Pending for every state that may still apply (unconfirmed, no longer
-  resent, refused by a node, outcome unknown); the row itself says it after who it was with only while it is not
-  confirmed. Each row's
-  accessible name says what happened, the amount, who with, the state and when. Every pinned node's history is asked at
-  once, and the read ends when all answered or 700 ms after the second answer, so a silent node does not hold the list.
+  transfer, Unverified for an archive row no two pinned nodes list in the newest 100 rows of the wallet's history they
+  give or report at its block when asked by its hash, of a block they still keep (not on the chain they serve, a row not
+  asked for yet; a received token row not proven yet; a token row its proof contradicts), and Pending for every state
+  that may still apply (unconfirmed, no longer resent, refused by a node, outcome unknown); the row itself says it after
+  who it was with only while it is not confirmed. A row older than the newest 100 rows they list is Confirmed when two
+  pinned nodes asked for it by its hash (`/api/v1/transaction/{hash}`, never a page of their history, which skips rows)
+  report it at its block with its hash, both parties and amount (a contract call, deploy or registration, a token row's
+  call among them: its hash, when this wallet sent it): at most 8 rows a read, newest first, each once per service
+  worker once both answered, History waiting for them at most 1.5 s and showing the rest from the next read on (a batch
+  row only by the listing: a lookup names the batch, not this wallet's part of it). Confirmed at once are an archive
+  row, a token row too, whose block is `TX_INDEX_RETENTION_BLOCKS` = 100,000 or more below the head two pinned nodes
+  report (the highest the service worker read since it started; a pinned node keeps at least the newest 100,000 blocks
+  of its transaction index and lists, looks up or proves nothing below them, so the archive's row is the chain's only
+  record of it), and a token row whose block is at or below the logs floor: the highest `oldest_available` a pinned
+  node's token-transfer answer gave since the service worker started
+  (`/api/v1/account/{address}/token-transfers?limit=1`), never above `MICROBLOCK_BODY_RETENTION_BLOCKS` = 86,400 below
+  the head two pinned nodes report, which stands in while no node gave one (a pinned node keeps the logs of its newest
+  86,400 blocks at least, and no token transfer, log or logs proof at or below the floor it reports); one its proof
+  contradicted stays Unverified. Each row's accessible name says what happened, the amount, who with, the state and
+  when. Every pinned node's history is asked at once, and the read ends when all answered or 700 ms after the second
+  answer, so a silent node does not hold the list;
+  the head two pinned nodes report is read beside it (`/api/v1/height`, the chain check's read, taken as it is for a
+  minute), and so is the logs floor (one pinned node's token-transfer answer, at most once a minute).
   The list has no text on where it comes from. Two nodes listing a row says it is in a block, not that it applied: only
   the balance shows what arrived. History lists the network the switch shows, QNet Blockchain here and Solana on the Solana side, as the balances are apart. The amount takes at most half the row and its number is never scaled or cut:
   its symbol (shortened past ten characters, whole in the accessible name and the detail) goes under it when both do not
@@ -518,8 +557,8 @@ Errors carry a fixed code and message, never the thrown text.
   nodes report, kept in steps of 10 macroblocks). A head 10 or more macroblocks below it means the nodes serve another
   chain (a restarted test network: the live network never goes back, and a lagging node is a few blocks behind): the
   wallet drops what it kept of the old chain (the light client's anchors, its pending transactions and what they can take,
-  which no chain the nodes serve can decide, the genesis capsule, the nonces and the live figure it saw, and the
-  cached QNet Blockchain balance, tokens and history) and follows the new head; so it does with a cache kept under
+  which no chain the nodes serve can decide, the genesis capsule, the nonces, the live figure and the head History judged
+  by that it saw, and the cached QNet Blockchain balance, tokens and history) and follows the new head; so it does with a cache kept under
   another build's chain identity (a fingerprint of its network identity, the hash of block 0, and its pinned genesis
   identities). A cache kept by a build before the network identity was part of it, under the same genesis identities,
   is this chain's: its head stands and the identity is written again (anchors kept in the earlier format, without their
@@ -547,6 +586,25 @@ Errors carry a fixed code and message, never the thrown text.
 
 The Solana side shows the SOL and 1DEV balances of the wallet's address at `finalized` commitment, with Send and
 Receive. The mint's decimals are read on chain with `getTokenSupply` (1DEV must report 6).
+
+- **The way the calls go.** Every Solana call goes to the build's RPC endpoint, 15 seconds at most per attempt, three
+  attempts with 0.5 and then 1 second between them after a 429, a 5xx, an unreadable answer or an error the endpoint
+  calls temporary. When an attempt gets no answer at all (the connection fails, or the 15 seconds pass), the same request
+  goes at once to aiqnet.io's relay, `https://aiqnet.io/api/cabinet/solana` (the
+  [wallets' Solana relay](explorer.md#wallets-solana-relay)), which passes the wallet's own calls on to Solana and refuses
+  any other: the same body, timeout, answer limit (8 MiB) and request options, with `x-qnet-client`. From then on every
+  call goes there first, after a browser restart too: the service worker keeps the route in `chrome.storage.local`
+  (`qnet_solana_route_v1`). When the relay gives no usable answer (none at all, an error status such as 404 or 503, or
+  a body that is no JSON-RPC answer), the same request goes at once to the endpoint: a JSON-RPC answer from it brings
+  the calls back to the endpoint, and anything else keeps them on the relay. Beside a call on that route it
+  tries the endpoint again with one `getBlockHeight` once 300 seconds have passed since the last try, and the call does
+  not wait for it; when the endpoint answers it with a block height, or answers a call that went out before the switch,
+  the calls go to the endpoint again. These are the app's rules, compiled from its `utils/solanaRoute.js`. No key
+  leaves the service worker, only signed transactions: a send whose answer was lost on one way goes again the other
+  way, the same signed bytes, and the relay passes the activation burn on only once aiqnet.io's record holds the wallet's
+  announce of that burn, which the wallet sends before the burn (see Activate). The relay takes exactly the sends and
+  burns the extension builds: `docs/protocols/solana-relay.vectors.json` holds them, and
+  `test/chains-activation-solana.test.mjs` builds each of the extension's cases byte for byte.
 
 - **History.** The wallet's own Solana transactions, newest first, at `confirmed`, in pages of 10 with Load more: the
   signatures listed for its address and for its 1DEV account, merged by slot, each transaction read once
@@ -696,8 +754,9 @@ a phone or tablet (decision 36).
      with another memo (a Full node, `QNET_NODE_TYPE:FULL`), or one from another of the wallet's 1DEV
      token accounts (below); then it asks aiqnet.io's record (a record of this wallet refuses, and so does a
      reservation or a burn on its way there, of either way, or no answer), then
-     `/api/v1/verify-activation` whether the wallet's QNet Blockchain address already runs a node, and the nodes whether they list
-     its light node;
+     `/api/v1/verify-activation` whether the wallet's QNet Blockchain address already runs a node (two nodes at the
+     network's height must say it does not: one node's word is no proof, and nothing is burned on it), and the nodes
+     whether they list its light node;
   3. fetches the price again as above and requires it to equal the price the user confirmed, and checks the 1DEV
      balance;
   4. asks aiqnet.io's reservation for the wallet with the request its wallet key signs then (refused while another
@@ -912,12 +971,36 @@ chain lists the node is read from two pinned nodes: a light node's public status
 mobile wallet does (claims strictly ascending above the wallet's watermark, amounts summing to the total, a timestamp,
 the batch held to a second pinned node's quote of the same request, the first epoch equal to what two other nodes
 report, no other message to sign than the one it builds), signs the
-payload over `q1337|qnet_claim_v1:{wallet}:{ts}:{sha3(claims_data)}` and sends it back to the node that quoted it. The
-answer is `{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}` (at least 1 QNC for the whole balance; any
-amount above zero for a part the node's quote stopped short of, with `stoppedAtEpoch` the first epoch it did not take),
-`{status: 'empty', qnet, nodeId}` (below 1 QNC) or `{status: 'error', error}` with `NO_WALLET`, `WALLET_MISMATCH`,
-`NO_NODE`, `NETWORK`, `CLAIM_REFUSED`, `CLAIM_BUSY` or `INTERNAL`; a reject is 4001. The network credits the move once
-a block includes it. The popup itself has no move of a node balance; History shows a move as "From: node balance".
+payload over `q1337|qnet_claim_v1:{wallet}:{ts}:{sha3(claims_data)}`, or, when the quote offers a last height
+(`valid_until`), over `q1337|{network id}|qnet_claim_v2:{wallet}:{valid_until}:{sha3(claims_data)}` with no timestamp
+(the quote's `sign_message_v2`, when sent, must be that same text), and sends it back to the node that quoted it; a typed
+refusal of the form or the height is answered by one re-sign, as a transfer's. A node that cannot serve an epoch, that
+this address spent its claim budget at (a node limits claim requests per address, quotes included) or that is busy with
+another request for the node hands the quote to the next pinned node. One confirm moves the whole balance the
+window showed, in parts as the mobile wallet's Node tab moves it, under the one quote signature: a node caps one quote
+(512 epochs, 128 KiB of proofs, its leaf rebuilds), and a part whose quote stopped at such a bound (`batch_full`,
+`quote_byte_budget`, `rebuild_budget`) is followed by the next once the wallet's live figure (a pinned node's live tip)
+shows its claim watermark at the part's last epoch, read 2 s after the submit and then each wait half as long again, at
+most 10 s apart. The next part is quoted from that epoch, and only at nodes whose node balance read shows it applied (a
+first unclaimed epoch past it, or nothing left), then at those that answered with none: a node still quoting from before
+it, reporting a first unclaimed epoch at or below it, or not answering, is passed over, and while fewer than two nodes have applied it no claim request goes out and the part is asked for
+again 3 s later, twice. A
+next part starts only within 150 s of the site's request, so the answer reaches the site inside its own five-minute
+wait. The run ends at a batch that holds the rest, at a quote that finds nothing more, at any other stop (an epoch the
+nodes cannot serve now stays for a later move), once the parts reach the balance shown, at a part the live figure does
+not show through in whole by then, at a lock, and at a next part that fails, refused or unanswered (only the first
+part's failure is the site's answer). One move per wallet runs at a time: another one meanwhile, from another tab, is
+`CLAIM_BUSY` and signs nothing. The answer is `{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}`:
+the sum of the parts as submitted, except that a last part the live figure showed taken in part counts the epochs up to
+the watermark it read and one it showed expired counts nothing (a first part it showed expired is `CLAIM_REFUSED`),
+the last counted part's hash, and `stoppedAtEpoch` null
+when the whole balance moved (at least 1 QNC in all), else the first epoch that part did not take (any total above
+zero); `{status: 'empty', qnet, nodeId}`
+(below 1 QNC) or
+`{status: 'error', error}` with `NO_WALLET`, `WALLET_MISMATCH`, `NO_NODE`, `NETWORK`, `CLAIM_REFUSED`, `CLAIM_BUSY` or
+`INTERNAL`; a reject is 4001. The window says the total, and that a rest can be moved again only when one stays; the
+network credits each part once a block includes it. The
+popup itself has no move of a node balance; History shows each part as "From: node balance".
 
 ### Send from your wallet for aiqnet.io
 
@@ -977,7 +1060,7 @@ learns the page's origin from the browser, never from a message.
 | `qnet_disconnect` | none | `true`; removes the origin's grant |
 | `qnet_signMessage` | `{message}` | `{signature, publicKey, address}` after an approval that shows the exact text |
 | `qnet_sendTransaction` | `{to, amount}` or `{type: 'transfer', to, amount}` (amount in QNC as a decimal string); `{type: 'tokenTransfer', token, to, amount}` (amount in the token's decimals); `{type: 'contractCall', contract, method, args, gasLimit?}` (args lowercase or uppercase hex of whole bytes, at most 4096 bytes, '' for none) | `{status: 'submitted'\|'unknown', from, to, amount, nonce, txHash}`; a token transfer `{status, from, token, to, amount, nonce, txHash}`; a call `{status, from, contract, method, nonce, txHash}`, each after an approval (see Transactions below). `nonce` is a decimal string, `txHash` the hash one node gave its copy or `null` (then `status` is `unknown`); `submitted` never says a call succeeded |
-| `qnet_getTransactionStatus` | `{from, nonce}` | `{status: 'pending'\|'in_block'\|'unknown', blockHeight, txHash}` for the connected, unlocked account only (else 4100), no window. `pending`: the nonce at least two pinned nodes report live is below it and the wallet still sends a transaction there; `in_block`: at least two pinned nodes list the same transaction of `from` at that nonce, with its hash and, when two nodes report it alike, its block height (both null otherwise); `unknown` otherwise, and for a read that failed. In a block never means applied: the node keeps no outcome. An answer is given again for 3 seconds without a read, and an origin starts at most 20 reads a minute (the mobile in-app browser's shape and limits) |
+| `qnet_getTransactionStatus` | `{from, nonce}` | `{status: 'pending'\|'in_block'\|'unknown', blockHeight, txHash}` for the connected, unlocked account only (else 4100), no window. `pending`: the nonce at least two pinned nodes report live is below it and the wallet keeps a transaction there it sent that may still apply, a V1 one however long ago (not one a node refused, nor a dropped one, see Dropped transfers); `in_block`: at least two pinned nodes list the same transaction of `from` at that nonce, with its hash and, when two nodes report it alike, its block height (both null otherwise); `unknown` otherwise, and for a read that failed. In a block never means applied: the node keeps no outcome. An answer is given again for 3 seconds without a read, and an origin starts at most 20 reads a minute (the mobile in-app browser's shape and limits) |
 | `qnet_activateNode` | `{nodeType: 'light'\|'super'}` | `https://aiqnet.io` only. `{status: 'ok'\|'exists', qnet, solana, nodeType, burnTx, burnAmount, code}`, `{status: 'pending', qnet, solana, nodeType, burnTx, burnAmount}` or `{status: 'error', error}` after an approval (no password: its armed confirm); `exists` may add `supersededBurnTx`; a Light activation is then recorded on QNet Blockchain (see Activate from aiqnet.io) |
 | `qnet_getActivation` | none | `https://aiqnet.io` only, no window. `{status: 'exists', qnet, solana, nodeType, burnTx, burnAmount, code, paidOnSite}`, `{status: 'pending', qnet, solana, nodeType, burnTx, burnAmount}`, `{status: 'searching'\|'none'\|'unusable', qnet, solana}`, `{status: 'unknown', qnet, solana, reason}`, `{status: 'no_wallet'\|'locked'\|'not_connected'}` (see The wallet's activation for aiqnet.io) |
 | `qnet_claimNodeBalance` | `{nodeId}` | `https://aiqnet.io` only; the wallet's light or super node. `{status: 'ok', qnet, nodeId, amountNano, txHash, stoppedAtEpoch}`, `{status: 'empty', qnet, nodeId}` or `{status: 'error', error}` after an approval (see Move to wallet from aiqnet.io) |
@@ -1018,7 +1101,8 @@ since.
   signed with an empty context, so a message signature can never verify as a transaction. A verifier
   rebuilds the same bytes with the same context.
 - **Transactions.** The wallet sets the fee, gas and nonce itself and builds every byte with the shared
-  builders (`TxBuilders`, compiled into `lib/qnet-core.js`). A transfer names `to` and `amount`. A token
+  builders (`TxBuilders`, compiled into `lib/qnet-core.js`), in the form a pinned node's account answer names, with the
+  one re-sign after a typed refusal of the form or the height (see Transfer above). A transfer names `to` and `amount`. A token
   transfer names a built-in token contract: its name, symbol and decimals come from two pinned nodes that agree, and the
   balances at a node's live tip (see Tokens above); the amount is converted to base
   units exactly, and a recipient that holds none of the token costs the refundable 0.01 QNC storage
@@ -1094,6 +1178,12 @@ lock glyph in the header's text colour, at the header's button size, named "Lock
 and for screen readers.
 
 ## Store release notes
+
+3.1.7: History shows a transaction of a block older than the nodes still index as in a block, and finds older rows past
+the nodes' listing by their hash. Move to wallet moves the whole node balance with one approval, in parts when needed. A
+sent transaction fails only by the chain, never by a clock. SOL and 1DEV keep working where Solana's own address gives
+no answer: the calls go through aiqnet.io and back to the direct way as soon as it answers. A node activation sends no
+1DEV while the network has not confirmed that the wallet has no node.
 
 3.1.6: a copied recovery phrase, private key or activation code leaves the clipboard on time also after the popup
 closes, which takes the new permission to modify data you copy and paste. The popup opens where it was, with a Send

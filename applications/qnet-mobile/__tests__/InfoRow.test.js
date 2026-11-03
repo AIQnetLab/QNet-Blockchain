@@ -60,8 +60,11 @@ describe('a row: the label and its value on one line', () => {
   it('one type per role: the label in Fog, the value in Paper or its tone, a figure and a total in the mono face', () => {
     const label = flat(textsOf(draw(<InfoRow label="Node" value="Online" tone="ok" />))[0].props.style);
     expect(label).toMatchObject({ color: color.fog, fontSize: 14, fontFamily: FACES.regular });
-    // Signal only for what can be acted on or moved now; Ember for what needs the user.
-    expect(TONES).toEqual({ default: color.paper, accent: color.signal, ok: color.paper, warn: color.ember, bad: color.ember });
+    // Signal only for what can be acted on or moved now; Mint for what is settled or fine (the Background row when
+    // unrestricted, a confirmed transaction); Fog for what is on its way; Ember for what needs the user.
+    expect(TONES).toEqual({
+      default: color.paper, accent: color.signal, ok: color.mint, quiet: color.fog, warn: color.ember, bad: color.ember,
+    });
     for (const tone of Object.keys(TONES)) {
       const value = flat(textsOf(draw(<InfoRow label="Node" value="x" tone={tone} />))[1].props.style);
       expect([tone, value.color, value.fontSize, value.fontFamily]).toEqual([tone, TONES[tone], 15, FACES.regular]);
@@ -144,24 +147,51 @@ describe('a field: the label over its value', () => {
     expect(flat(value.props.style).fontFamily).toMatch(/mono|courier/i);
   });
 
-  it('a hash shortened in its middle (not selectable, which would undo that), copied whole on a tap; Copy answers Copied', () => {
-    const onCopy = jest.fn();
+  // Copied as the address on Assets is, the copy mark at the field's end, no Copy word: the mark on the value's line,
+  // never level with the label, and Copied in the value's place, as the Assets address says it.
+  it('a hash shortened in its middle (not selectable, which would undo that), copied whole on a tap; the mark answers', async () => {
+    const Clipboard = require('@react-native-clipboard/clipboard').default;
+    const Copyable = require('../src/components/ui/Copyable').default;
     const hash = 'f'.repeat(64);
-    const tree = draw(<InfoField t={t} label="Transaction" value={hash} mono middle onCopy={onCopy} copyTestID="copy" />);
+    const tree = draw(<InfoField t={t} label="Transaction" value={hash} mono middle copy={hash} copyTestID="copy" />);
     const value = textsOf(tree).find((n) => n.props.children === hash);
     expect(value.props).toMatchObject({ numberOfLines: 1, ellipsizeMode: 'middle', selectable: false });
+    expect(tree.root.findAllByType(Copyable)).toHaveLength(1);
     const field = tree.root.find((n) => n.props.testID === 'copy' && typeof n.props.onPress === 'function');
     expect(field.props).toMatchObject({ accessibilityRole: 'button', accessibilityHint: t('common_tap_to_copy') });
-    act(() => { field.props.onPress(); });
-    expect(onCopy).toHaveBeenCalledTimes(1);
-    // The label line carries the Copy act at its end; the label itself stays the label.
-    const copyAct = tree.root.find((n) => n.props.kind === 'act');
-    expect([copyAct.props.label, copyAct.props.labels]).toEqual([t('common_copy'), [t('common_copy'), t('common_copied')]]);
-    act(() => { copyAct.props.onPress(); });
-    expect(onCopy).toHaveBeenCalledTimes(2);
-    const copied = draw(<InfoField t={t} label="Transaction" value={hash} mono middle onCopy={onCopy} copied />);
-    expect(textsOf(copied)[0].props.children).toBe('Transaction');
-    expect(copied.root.find((n) => n.props.kind === 'act').props).toMatchObject({ label: t('common_copied'), done: true });
+    await act(async () => { await field.props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(hash);
+    expect(tree.root.findAll((n) => n.props.testID === 'copy-glyph-done' && typeof n.type === 'string').length).toBeGreaterThan(0);
+    // The label stays the label and the value keeps its room; Copied stands over the value, and no act is added.
+    expect(textsOf(tree).map((n) => n.props.children)).toEqual(['Transaction', hash, t('common_copied')]);
+    expect(tree.root.findAll((n) => n.props.kind === 'act')).toHaveLength(0);
+    // The label above the line the mark shares with the value alone; the room between them is the label's, so the mark
+    // is centred on the value's own line.
+    const { copyableStyles } = require('../src/components/ui/Copyable');
+    const line = tree.root.find((n) => typeof n.type === 'string' && n.props.style === copyableStyles.line);
+    const lineTexts = line.findAll((n) => n.type === Text).map((n) => n.props.children);
+    expect(lineTexts).toEqual([hash, t('common_copied')]);
+    expect(line.findAll((n) => n.props.testID === 'copy-glyph-done' && typeof n.type === 'string').length).toBeGreaterThan(0);
+    const label = textsOf(tree).find((n) => n.props.children === 'Transaction');
+    expect(flat(label.props.style).marginBottom).toBe(4);
+    expect(flat(value.props.style).marginTop).toBeUndefined();
+    // A field without `copy` copies nothing and draws no mark.
+    const plain = draw(<InfoField t={t} label="Transaction" value={hash} mono middle />);
+    expect(plain.root.findAllByType(Copyable)).toHaveLength(0);
+    expect(plain.root.findAll((n) => /^copy-glyph/.test(n.props.testID || ''))).toHaveLength(0);
+    act(() => { tree.unmount(); plain.unmount(); });
+  });
+
+  // Beside the copy mark a 64-character contract does not fit a narrow phone even at half its size: there it is shortened
+  // in its middle, never at its end, and the tap copies it whole.
+  it('a value a tap copies shrinks to half its size, then is shortened in its middle; not selectable', () => {
+    const hex = 'c'.repeat(64);
+    const tree = draw(<InfoField t={t} label="Address" value={hex} mono fit copy={hex} />);
+    expect(textsOf(tree).find((n) => n.props.children === hex).props).toMatchObject({
+      numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: FIT_MIN_SCALE, maxFontSizeMultiplier: ROW_FONT_CAP,
+      ellipsizeMode: 'middle', selectable: false,
+    });
+    act(() => { tree.unmount(); });
   });
 
   it('a text read whole wraps; its label stays one line', () => {
@@ -229,14 +259,15 @@ describe('right to left, and the one source of rows', () => {
 
   it('the screens build their rows from it; the hand-built rows and their styles are gone', () => {
     const uses = {
-      'src/screens/NodeTab.js': /import \{ FIGURE_LINE, InfoRow \} from '\.\.\/components\/InfoRow';/,
-      'src/screens/HistoryTab.js': /import \{ FIGURE_LINE, InfoField, InfoRow, ROW_FONT_CAP \} from '\.\.\/components\/InfoRow';/,
+      'src/screens/NodeTab.js': /import \{ InfoRow \} from '\.\.\/components\/InfoRow';/,
+      'src/screens/HistoryTab.js': /import \{ FIGURE_LINE, InfoField, InfoRow, ROW_FONT_CAP, figureFitsIn \} from '\.\.\/components\/InfoRow';/,
       'src/screens/QNetLinkScreen.js': /import \{ InfoField, InfoRow \} from '\.\.\/components\/InfoRow';/,
       'src/browser/DappSheet.js': /import \{ InfoField, InfoRow \} from '\.\.\/components\/InfoRow';/,
       'src/components/SendReview.js': /import \{ InfoField, InfoRow \} from '\.\/InfoRow';/,
       'src/screens/SolanaSend.js': /import \{ InfoRow \} from '\.\.\/components\/InfoRow';/,
-      'src/screens/WalletScreen.js': /import \{ FIGURE_LINE, InfoRow, LinkRow, SettingRow, figureFitsIn \} from '\.\.\/components\/InfoRow';/,
-      'src/components/TxResultCard.js': /import \{ InfoField \} from '\.\/InfoRow';/,
+      'src/screens/WalletScreen.js': /import \{ InfoRow, LinkRow, SettingRow \} from '\.\.\/components\/InfoRow';/,
+      'src/screens/TokenScreens.js': /import \{ FIGURE_LINE, InfoField, InfoRow, figureFitsIn \} from '\.\.\/components\/InfoRow';/,
+      'src/components/TxResultCard.js': /import \{ InfoField, InfoRow \} from '\.\/InfoRow';/,
     };
     for (const [file, re] of Object.entries(uses)) expect([file, re.test(read(file))]).toEqual([file, true]);
     expect(read('src/screens/NodeTab.js')).not.toMatch(/const Row =|rewardItem|rewardLabel|rewardValue|nodeMonitoringLabel|nodeMonitoringValue/);

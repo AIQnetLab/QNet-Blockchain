@@ -173,7 +173,7 @@ export default Object.freeze({
   historyNotFound: '見つかりません',
   historyUnverified: '未検証',
   historyDroppedLead: 'QNet Blockchain はこの取引をもう保持しておらず、取引は成立しませんでした。何も支払われていません。次の送信がその代わりになります。',
-  historyUnverifiedLead: 'エクスプローラーにはこの取引が表示されますが、QNet Blockchain のノードには表示されません。ノードが保持する期間より古い可能性があります。',
+  historyUnverifiedLead: 'エクスプローラーにはこの取引が表示されますが、QNet Blockchain のノードには表示されません。',
   historyTokenUnverifiedLead: 'エクスプローラーにはこのトークン送金が表示されますが、ウォレットはまだ QNet Blockchain 上で証明できていません。',
   historyReplacedLead: 'このウォレットの別の取引がその nonce を使いました。この取引が成立することはありません。',
   historyType: '種類',

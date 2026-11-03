@@ -5,10 +5,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { LINK_PAGES } from '../hosts.ts';
+import { SRC, code as sourceCode } from './source.mjs';
 
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8')
-  .replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\{\s*\}/g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+// The code without the empty braces a comment in JSX leaves.
+const code = (path) => sourceCode(path).replace(/\{\s*\}/g, '');
 
 function files(dir) {
   const out = [];
@@ -20,10 +20,9 @@ function files(dir) {
   return out;
 }
 
-// SITE-R3-CSP-03: link.aiqnet.io serves only the link page (protocol section 4), and the extension does not
-// run there. Inside the site's shell the page ran provider discovery, ended in 'missing', offered the store
-// ("QNet Wallet is not installed") to a visitor who has the extension, and showed the site's navigation, with
-// every site script running beside the request in the URL. It now renders alone, on every host.
+// link.aiqnet.io serves only the link page (protocol section 4), and the extension does not run there. Inside the
+// site's shell the page would run provider discovery, offer the store to a visitor who has the extension and run
+// every site script beside the request in the URL, so it renders alone, on every host.
 test('the link page renders without the wallet context, the wallet control, the navigation or the footer', () => {
   // The transfer link's page (/send) renders the same way.
   assert.deepEqual([...LINK_PAGES], ['/l', '/send']);
@@ -34,8 +33,10 @@ test('the link page renders without the wallet context, the wallet control, the 
   assert.doesNotMatch(layout, /AppProvider|<Header|<Footer|<MatrixRain|ConnectWalletButton/);
 
   const shell = code('components/SiteShell.tsx');
-  assert.match(shell, /const pathname = usePathname\(\);/);
-  const at = shell.indexOf('if (onLinkHost || LINK_PAGES.has(pathname)) {');
+  // The path without its language (src/i18n/client.tsx usePath): /ru/l renders alone as well.
+  assert.match(shell, /const path = usePath\(\);/);
+  assert.doesNotMatch(shell, /usePathname/);
+  const at = shell.indexOf('if (onLinkHost || LINK_PAGES.has(path)) {');
   assert.ok(at > 0, 'the link page branch');
   const linkBranch = shell.slice(at, shell.indexOf('\n  }\n', at));
   assert.match(linkBranch, /return \(\s*<div className="app-wrapper">\s*<main className="qnet-container">\{children\}<\/main>\s*<\/div>\s*\);/);
@@ -60,7 +61,7 @@ test('the link page renders without the wallet context, the wallet control, the 
   }
 });
 
-// SITE-R4-CSP-01: /icon-1.png (any number passed the host rule) and /_next/staticx (nginx handed it to the
+// /icon-1.png (any number passed the host rule) and /_next/staticx (nginx handed it to the
 // app as Host 127.0.0.1:3000, a "local run") rendered the site's 404 page with the whole shell on
 // link.aiqnet.io: provider discovery ending in "not installed", Connect wallet, the navigation. The link
 // host now serves only its exact files and every other path there goes to the site (hosts.test.mjs), nginx
@@ -73,16 +74,16 @@ test('the link host renders nothing inside the site\'s shell, its 404 page inclu
   assert.match(layout, /import \{ LINK_HOST, requestHost \} from '@\/lib\/hosts';/);
   const shell = code('components/SiteShell.tsx');
   assert.match(shell, /export default function SiteShell\(\{ children, onLinkHost \}: \{ children: React\.ReactNode; onLinkHost: boolean \}\)/);
-  // The bare branch is the first statement after the pathname: nothing of the shell renders before it.
-  assert.match(shell, /const pathname = usePathname\(\);\s*if \(onLinkHost \|\| LINK_PAGES\.has\(pathname\)\) \{\s*return \(\s*<div className="app-wrapper">\s*<main className="qnet-container">\{children\}<\/main>\s*<\/div>\s*\);\s*\}/);
+  // The bare branch is the first statement after the path: nothing of the shell renders before it.
+  assert.match(shell, /const path = usePath\(\);\s*if \(onLinkHost \|\| LINK_PAGES\.has\(path\)\) \{\s*return \(\s*<div className="app-wrapper">\s*<main className="qnet-container">\{children\}<\/main>\s*<\/div>\s*\);\s*\}/);
   // A not-found page of the site's own, if one is added, brings no part of the shell with it.
   for (const file of ['app/not-found.tsx', 'app/global-error.tsx', 'app/error.tsx']) {
     if (existsSync(new URL(file, SRC))) assert.doesNotMatch(code(file), /AppProvider|<Header|<Footer|ConnectWalletButton|useWallet/, file);
   }
 });
 
-// SITE-R3-CSP-04: /api/verify-build answered "verified" and "This build corresponds to the code on GitHub"
-// without checking anything, and hashed the source tree on every request; /test was a debug page.
+// A build-provenance route that answers "verified" without checking anything, or a debug page, has no place in the
+// site.
 test('no debug page and no unchecked build-provenance route', () => {
   assert.equal(existsSync(new URL('app/test', SRC)), false);
   assert.equal(existsSync(new URL('app/api/verify-build', SRC)), false);
@@ -96,8 +97,7 @@ test('no debug page and no unchecked build-provenance route', () => {
   for (const text of deploy) assert.doesNotMatch(text, /verify-build/);
 });
 
-// SITE-15: a stray empty file named like the mobile app's WalletManager sat among the site's components. No source
-// file of the site is empty, and that one is gone.
+// No source file of the site is empty, and none is a stray copy of the mobile app's files.
 test('no empty source file, and no stray copy of the mobile app\'s files', () => {
   assert.equal(existsSync(new URL('components/WalletManager.js', SRC)), false);
   for (const url of files(SRC)) assert.ok(statSync(url).size > 0, url.pathname.split('/src/')[1]);

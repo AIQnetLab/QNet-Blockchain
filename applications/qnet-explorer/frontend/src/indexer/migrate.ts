@@ -8,6 +8,12 @@ import { log } from './log';
 // are recorded without being re-run.
 const BASELINE = ['001_init.sql', '002_batch_transfers.sql'];
 
+// The migrations of the build this code belongs to (dist-indexer/../migrations), whatever the working directory: the
+// code and the schema it applies always come from one release.
+export function migrationsDir(): string {
+  return path.join(__dirname, '..', 'migrations');
+}
+
 export async function runMigrations(pool: Pool, dir: string): Promise<void> {
   await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);

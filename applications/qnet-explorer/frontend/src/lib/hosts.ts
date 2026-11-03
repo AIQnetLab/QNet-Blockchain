@@ -26,7 +26,7 @@ export const SITE_ICONS: readonly string[] = [
 
 // What the link host serves itself, by exact path: the two link pages, the app-association files, and the
 // manifest and icons their head names. Any other path there, also one that would only be the 404
-// page, goes to the site (SITE-R4-CSP-01). Build assets (/_next/static/) never reach the proxy (src/proxy.ts).
+// page, goes to the site. Build assets (/_next/static/) never reach the proxy (src/proxy.ts).
 const LINK_HOST_PATHS: ReadonlySet<string> = new Set([
   ...LINK_PAGES,
   '/.well-known/assetlinks.json',

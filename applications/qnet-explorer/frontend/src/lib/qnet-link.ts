@@ -4,7 +4,7 @@
 // hash, the relay bodies and the app's answer (a `reserve` answer's signature through a verifier the page supplies,
 // burn-record.ts verifyReserveAnswer); and the extension's qnet_activateNode, qnet_claimNodeBalance and
 // qnet_unlinkNodeDevice (sections 10 and 14.10). A `claim` request and qnet_claimNodeBalance name the node whose balance
-// moves, the wallet's light or super node (owner, 12.10). Pure
+// moves, the wallet's light or super node. Pure
 // and framework-free, shared by the cabinet, the relay routes and the tests; the key exchange and decryption are
 // in qnet-link-crypto.ts.
 // Checked against docs/protocols/light-node.vectors.json (revision 2), node-claim.vectors.json (the `claim` request that
@@ -42,7 +42,10 @@ const B64URL_RE = /^[A-Za-z0-9_-]+$/;
 const CODE_RE = /^QNET-[LS][0-9A-F]{5}-[0-9A-F]{6}-[0-9A-F]{6}$/;
 const WALLET_HASH_RE = /^[0-9a-f]{16}$/;
 const NODE_ID_RE = /^light_mobile_[0-9a-f]{16}$/;
-const SUPER_ID_RE = /^(?:super_node_[0-9a-f]{16}|genesis_node_00[1-5])$/;
+// The network's genesis nodes, which run from its first block.
+const GENESIS_ID = 'genesis_node_00[1-5]';
+const GENESIS_ID_RE = new RegExp(`^${GENESIS_ID}$`);
+const SUPER_ID_RE = new RegExp(`^(?:super_node_[0-9a-f]{16}|${GENESIS_ID})$`);
 // The node a `claim` request names: a wallet's light or super node id; a genesis node's is none.
 const CLAIM_NODE_ID_RE = /^(?:light_mobile|super_node)_[0-9a-f]{16}$/;
 const TX_HASH_RE = /^[0-9a-f]{64}$/;
@@ -67,7 +70,8 @@ export const CONSENT_FUTURE_S = 300;
 // A `reserve` answer's time: the page takes it from 15 minutes before its clock to 5 minutes after (section 14.4).
 export const RESERVE_ANSWER_PAST_S = 900;
 export const RESERVE_ANSWER_FUTURE_S = 300;
-// The smallest full claim: 1 QNC (a capped claim, which stops at an epoch, may move less; validateAnswer).
+// The smallest claim of the whole balance, and the smallest total of a `claim` answer without `stoppedAtEpoch`: 1 QNC
+// (a claim or a run that stopped at an epoch may move less; validateAnswer).
 export const CLAIM_MIN_NANO = 1_000_000_000n;
 export const BURN_AMOUNT_MAX = 1_000_000_000;
 // The cluster the live network verifies burns on: a constant of this release, never a choice.
@@ -182,6 +186,8 @@ export interface LinkAnswer {
   consent?: Consent;
   bound?: boolean;
   seq?: string;
+  // A `claim` answer: the total its request's claims moved, the last claim's hash, and null once they moved the whole
+  // balance (at least 1 QNC), else the first epoch the last claim did not take.
   amountNano?: string;
   txHash?: string;
   stoppedAtEpoch?: string | null;
@@ -258,6 +264,7 @@ export const isWalletHash = (value: unknown): value is string => typeof value ==
 export const isLightNodeId = (value: unknown): value is string => typeof value === 'string' && NODE_ID_RE.test(value);
 // A super node's id: the one a wallet's super node gets (superNodeId), or a genesis node's.
 export const isSuperNodeId = (value: unknown): value is string => typeof value === 'string' && SUPER_ID_RE.test(value);
+export const isGenesisNodeId = (value: unknown): value is string => typeof value === 'string' && GENESIS_ID_RE.test(value);
 // The form of the node a `claim` request names: a light node id or a wallet's super node id.
 export const isClaimNodeId = (value: unknown): value is string => typeof value === 'string' && CLAIM_NODE_ID_RE.test(value);
 
@@ -577,9 +584,8 @@ export function validateAnswer(plaintext: string, ctx: AnswerContext): AnswerChe
   if (status === 'linked' && !isU64String(r.seq)) return fail('seq');
   if (intent === 'unlink' && typeof r.unbound !== 'boolean') return fail('unbound');
   if (intent === 'claim' && status === 'ok') {
-    // At least 1 QNC, or any amount above zero when the node's quote stopped at an epoch (`stoppedAtEpoch` set: more
-    // epochs remain), so a balance spread over many small epochs can always be moved in several claims (owner
-    // decision, 27.09, EXT-R1-03 option (a)).
+    // The total of the request's claims, one or several, with no ceiling of one claim: at least 1 QNC when
+    // `stoppedAtEpoch` is null, any amount above zero when it names the first epoch the last claim did not take.
     if (!isU64String(r.amountNano)) return fail('amountNano');
     const amount = BigInt(r.amountNano);
     if (amount === 0n || (amount < CLAIM_MIN_NANO && r.stoppedAtEpoch === null)) return fail('amountNano');
@@ -672,7 +678,7 @@ export function validateActivation(plaintext: string, nodeType: NodeType): Activ
   if (has(r, 'code')) {
     if (typeof r.code !== 'string' || !CODE_RE.test(r.code)) return fail('code');
     const of = (address: string) => activationCode(r.nodeType as NodeType, address, r.burnTx as string, r.burnAmount as number);
-    // A light node's activation from a payment key of aiqnet.io carries the wallet's QNet address (owner rule, 26.09).
+    // A light node paid from a payment key of aiqnet.io takes its code from the wallet's QNet address.
     const wallet = r.nodeType === 'light' && of(r.qnet as string) === r.code;
     if (of(r.solana as string) !== r.code && !wallet) return fail('code');
   }
@@ -713,7 +719,7 @@ export async function activateWithExtension(provider: QNetProvider, nodeType: No
 
 // ---------------------------------------------------------------- extension: qnet_getActivation (read-only)
 
-// What the extension holds of its own wallet's activation, read without a window (shared contract C5): no wallet, locked,
+// What the extension holds of its own wallet's activation, read without a window: no wallet, locked,
 // this site not connected, a search or an activation still running, a search that could not finish, a burn no code comes
 // from, none (the search finished with nothing), a burn on its way, or the activation with its code. `paidOnSite`: the
 // light burn of a payment address of aiqnet.io, whose code names the QNet wallet.
@@ -743,7 +749,7 @@ const GET_ACTIVATION_TIMEOUT_MS = 5_000;
 
 const isBurnAmountValue = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 1 && v <= BURN_AMOUNT_MAX;
 
-// Exactly one of the shapes of C5, each value of its form, and in `exists` the code its burn gives: from the burner's
+// Exactly one of the shapes of a qnet_getActivation answer, each value of its form, and in `exists` the code its burn gives: from the burner's
 // Solana address, or with `paidOnSite` a light code from the QNet address.
 export function validateGetActivation(value: unknown): GetActivation | null {
   let r: unknown;
@@ -785,16 +791,17 @@ export async function getExtensionActivation(provider: QNetProvider): Promise<Ex
 
 // ---------------------------------------------------------------- extension: qnet_claimNodeBalance (section 14.10)
 
-// The user reads the amount in the approval window.
+// The user reads the amount in the approval window, and the extension's claims of the balance end inside this wait
+// (section 14.10).
 const CLAIM_TIMEOUT_MS = 5 * 60_000;
 
 // `other_wallet`: a checked answer for another wallet than the one the page shows.
 export type ClaimFailure = ExtensionFailure | 'other_wallet';
 export type ExtensionClaim = { ok: true; answer: LinkAnswer } | { ok: false; failure: ClaimFailure };
 
-// The extension moves the node balance of the node the page names, its own wallet's light or super node (`nodeId`); its
-// result is the `claim` answer of section 14.7 without v and intent, checked like the app's for the wallet the page shows
-// and that node.
+// The extension moves the node balance of the node the page names, its own wallet's light or super node (`nodeId`), in
+// one or more claims under its one approval; its result is the `claim` answer of section 14.7 without v and intent,
+// checked like the app's for the wallet the page shows and that node.
 export async function claimWithExtension(provider: QNetProvider, wallet: string, nodeId: string, nowS: number): Promise<ExtensionClaim> {
   let result: unknown;
   try {

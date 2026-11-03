@@ -4,7 +4,7 @@
 import * as core from '../lib/qnet-core.js';
 import { U64_MAX, formatUnits, parseUnits } from './amount.js';
 import {
-  DECIMALS, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, LIMITS, QNET, RECORD_PATH, STORAGE_KEYS, TIMINGS,
+  DECIMALS, FOLLOW_ALARM, FOLLOW_ALARM_MINUTES, LIMITS, QNET, RECORD_PATH, SITE_HEADERS, STORAGE_KEYS, TIMINGS,
 } from './config.js';
 import { WalletError } from './errors.js';
 import * as keys from './keys.js';
@@ -62,12 +62,16 @@ import * as vault from './vault.js';
  * @property {string} feeNano '0' for incoming
  * @property {number} timestamp ms epoch
  * @property {'included'|'unverified'|'pending'|'stale'|'replaced'|'dropped'|'unknown'|'refused'} status included: an
- *   archive row two pinned nodes list alike (a token row this wallet sent: its call), a token row its logs proof
- *   verifies, or a transaction of this wallet they list at its nonce, so it is in a block, which does not say it applied
- *   (a block carries transfers skipped at apply too: R5-EXTQ-01); unverified: an archive row they do not (older than
- *   their window, or not theirs: R4-EXTQ-04), or a token row its logs proof contradicts; stale: no longer resent, may
- *   still apply; replaced: another transaction of this wallet used its
- *   nonce, so it can never apply; unknown: its nonce was used and no two pinned nodes agree yet on what applied
+ *   archive row two pinned nodes list alike or report at its block when looked up by its hash (a token row this wallet
+ *   sent: its call), a token row its logs proof verifies, an archive row of a block TX_INDEX_RETENTION_BLOCKS or more
+ *   below the head they report (no node keeps its transaction), a token row of a block whose logs no pinned node keeps
+ *   (at or below the logs floor), or a transaction of this wallet they list at its nonce, so it is in a block, which does
+ *   not say it applied (a block carries transfers skipped at apply too: R5-EXTQ-01); unverified: an archive row of a newer
+ *   block they neither list nor report at its block (not theirs: R4-EXTQ-04), or a token row its logs proof
+ *   contradicts; stale: no longer resent, may still apply until its nonce is used, however long ago it was sent;
+ *   replaced: another transaction of this wallet used its nonce, so it can never apply; dropped: a V2 one whose last
+ *   height the tip passed with its nonce free (isDropped), so no block can take it; unknown: its nonce was used and no
+ *   two pinned nodes agree yet on what applied
  *   there (R3-EXTQ-04: check History); refused: the only node sent it refused it, and it may still apply (a node's
  *   word is not the chain's: R5-EXTQ-02), so it stays listed and reserved and the next transfer takes its nonce
  * @property {string|null} nonce the nonce of a transfer of this wallet the vault keeps, else null
@@ -141,9 +145,8 @@ const RESEND_ACCEPTED_MS = 10 * 60 * 1000;
 const PENDING_TRANSFER_TTL_MS = 60 * 60 * 1000;
 // How long a node keeps a transaction it admitted (its mempool lifetime, 1800 s from its own admission), and a margin
 // for a peer that took it by gossip later and for clocks (the mobile app's NODE_MEMPOOL_TTL_MS and LANDING_MARGIN_MS):
-// a transaction no longer sent, past this after it last went out with its nonce still free, is held by no node, so it
-// did not go through and never will by itself: History shows it as not found (dropped), the next send takes its nonce,
-// and it leaves the list a day later (owner, 06.10: a pending row resolves in a bounded time).
+// past this after it last went out, a V1 transaction no longer sent is held by no node, so the wallet releases it
+// (isReleased); its signed body stays valid until its nonce is used, so only the chain decides its fate.
 const NODE_MEMPOOL_TTL_MS = 30 * 60 * 1000;
 const LANDING_MARGIN_MS = 5 * 60 * 1000;
 // A transfer another transaction replaced stays listed this long after that was seen, then it is dropped.
@@ -155,6 +158,12 @@ const SENT_HISTORY_PAGE = 100;
 // The newest rows of a node's history an archive row is checked against (the node's page limit).
 const HISTORY_CHECK_PAGE = 100;
 const HISTORY_DEFAULT_LIMIT = 20;
+// A genesis node keeps at least the newest TX_INDEX_RETENTION_BLOCKS blocks of its transaction index (the node's constant
+// of that name): below them no node lists, looks up or proves a transaction, and the archive's row is its only record.
+const TX_INDEX_RETENTION_BLOCKS = 100_000;
+// A pinned node keeps the logs of its newest MICROBLOCK_BODY_RETENTION_BLOCKS blocks at least (the node's constant of that
+// name), and with them its token transfers and their proofs; none at or below the floor it reports.
+const MICROBLOCK_BODY_RETENTION_BLOCKS = 86_400;
 
 const PATH_RE = /^\/api\/v1\/[A-Za-z0-9_\-./?=&%]*$/;
 const HEADER_NAME_RE = /^x-qnet-[a-z0-9-]{1,32}$/;
@@ -424,7 +433,7 @@ async function explorerRequest(path) {
   if (typeof path !== 'string' || !path.startsWith('/api/address/') || path.length > 1024) throw new WalletError('INTERNAL');
   let reply;
   try {
-    reply = await fetchText(QNET.EXPLORER_API + path, requestInit('GET'), TIMINGS.NODE_TIMEOUT_MS, new AbortController());
+    reply = await fetchText(QNET.EXPLORER_API + path, requestInit('GET', undefined, SITE_HEADERS), TIMINGS.NODE_TIMEOUT_MS, new AbortController());
   } catch {
     throw new WalletError('NETWORK');
   }
@@ -450,7 +459,7 @@ export async function siteRequest(method, path, body) {
     || !SITE_PATH_RE.test(path)) {
     throw new WalletError('INTERNAL');
   }
-  const init = requestInit(method, method === 'POST' ? (body ?? {}) : undefined);
+  const init = requestInit(method, method === 'POST' ? (body ?? {}) : undefined, SITE_HEADERS);
   let reply;
   try {
     reply = await fetchText(QNET.EXPLORER_API + path, init, TIMINGS.RECORD_TIMEOUT_MS, new AbortController());
@@ -477,7 +486,8 @@ function parseOrNull(text) {
 // ---------------------------------------------------------------- account reads
 
 // /api/v1/account/{a} answer, or null: two pinned nodes alike give the chain's nonce now (agreeingAccount), which only
-// splits this wallet's own transactions into taken and still pending; no balance is ever taken from it.
+// splits this wallet's own transactions into taken and still pending; no balance is ever taken from it. The same answer
+// says whether the network takes the V2 form (txV2) and the height of that node's next block (nextHeight, or null).
 function accountAnswer(reply, address) {
   if (!reply || reply.status !== 200) return null;
   const body = parseOrNull(reply.text);
@@ -485,7 +495,8 @@ function accountAnswer(reply, address) {
   const balanceNano = u64Of(body.balance);
   const nonce = u64Of(body.nonce);
   if (balanceNano === null || nonce === null) return null;
-  return { balanceNano, nonce, pkBound: body.has_dilithium_pk === true };
+  const nextHeight = safeIntOf(body.next_height);
+  return { balanceNano, nonce, pkBound: body.has_dilithium_pk === true, txV2: body.tx_v2 === true, nextHeight: nextHeight > 0 ? nextHeight : null };
 }
 
 async function withinBudget(promise, ms) {
@@ -945,12 +956,12 @@ function legacyAccountFields(body, address) {
   return fields;
 }
 
-// The account in a body at a node's live root, when its proof folds to that root: {balanceNano, nonce, blockHeight}; else
-// null (an absent account has no such proof).
+// The account in a body at a node's live root, when its proof folds to that root: {balanceNano, nonce, blockHeight,
+// lastClaimedEpoch} (the wallet's claim watermark, u64 decimal); else null (an absent account has no such proof).
 function liveRootAccount(body, address) {
   const fields = legacyAccountFields(body, address);
   if (fields === null || !core.verifyAccountProof(fields, body.merkle_proof, body.state_root)) return null;
-  return { balanceNano: fields.balance, nonce: fields.nonce, blockHeight: body.block_height };
+  return { balanceNano: fields.balance, nonce: fields.nonce, blockHeight: body.block_height, lastClaimedEpoch: fields.lastClaimedEpoch };
 }
 
 /**
@@ -1066,8 +1077,8 @@ const isAbsentBody = (body, address) => body.address === address && body.error =
  * The account proof route without `mb` (proofAnswers' live pass): the first figure whose proof folds under its node's root
  * and whose nonce is at least `floor` (nonceFloorOf), else the highest any node gave. With no such figure, no nonce above 0
  * known taken (a new wallet) and at least two pinned nodes giving the body a node answers for no such account (which it
- * also gives for an error reading it), its 0 at once: {balanceNano: '0', nonce: '0', blockHeight: null}; the certified
- * absence proof is the committee's word on it.
+ * also gives for an error reading it), its 0 at once: {balanceNano: '0', nonce: '0', blockHeight: null, lastClaimedEpoch:
+ * null}; the certified absence proof is the committee's word on it.
  * @param {string} address
  * @param {bigint|null} [floor]
  * @returns {Promise<{figure: object|null, answered: boolean}>}
@@ -1082,18 +1093,19 @@ async function liveAccountRead(address, floor = null) {
   // a nonce the chain took means the account exists: that body then is an error, never its 0
   const unused = floor === null || floor === 0n;
   if (got.figure !== null || !unused || absent < MIN_NODE_AGREEMENT) return got;
-  return { ...got, figure: { balanceNano: '0', nonce: '0', blockHeight: null } };
+  return { ...got, figure: { balanceNano: '0', nonce: '0', blockHeight: null, lastClaimedEpoch: null } };
 }
 
 /**
  * The account of `address` at a pinned node's live tip (GET /api/v1/account/{a}/balance/proof without `mb`: that node's
  * live state and a proof of the account under its root), as the owner's rule wants it (18.10): balance, incoming funds
  * and the send checks act at once on a node's answer, the committee check runs in the background, and the network refuses
- * what is invalid. {balanceNano, nonce, blockHeight} once the proof folds to the root that node served; an account two
- * pinned nodes hold none of is 0 with blockHeight null (liveAccountRead); else null (no node answered, or none with such a
- * proof). Never verified.
+ * what is invalid. {balanceNano, nonce, blockHeight, lastClaimedEpoch} once the proof folds to the root that node served
+ * (lastClaimedEpoch: the account's claim watermark, which a move of a node balance follows: nodes.claimForSite); an
+ * account two pinned nodes hold none of is 0 with blockHeight and lastClaimedEpoch null (liveAccountRead); else null (no
+ * node answered, or none with such a proof). Never verified.
  * @param {string} address EON
- * @returns {Promise<{balanceNano: string, nonce: string, blockHeight: number|null}|null>}
+ * @returns {Promise<{balanceNano: string, nonce: string, blockHeight: number|null, lastClaimedEpoch: string|null}|null>}
  * @throws {WalletError} INVALID_ADDRESS
  */
 export async function liveAccountFigure(address) {
@@ -1146,8 +1158,8 @@ let headHint = null;
 // The macroblock covering the height at least two pinned nodes have reached (the second highest of their
 // answers), cached for a minute; null when fewer than two answer. Every pinned node is asked at once, and the read ends
 // when all answered or HEDGE_MS after the second answer, so a silent node does not hold it for its whole timeout; reads
-// that overlap share one. It tells only whether the pinned nodes serve another chain (followChain), never whether a
-// proof is recent (certifiedHeadNow).
+// that overlap share one. It tells whether the pinned nodes serve another chain (followChain) and how far an archive
+// row's block is below their head (historyHeadIndex), never whether a proof is recent (certifiedHeadNow).
 let headRead = null;
 function networkHeadIndex() {
   if (headHint !== null && Date.now() - headHint.at < HEAD_CACHE_MS) return Promise.resolve(headHint.index);
@@ -1270,7 +1282,9 @@ function agreedAccount(answers) {
 }
 
 // The highest account nonce at least two pinned nodes report (agreeingAccount's answers, by the nonce alone, as the app's
-// agreed nonce), and whether two report the key bound: {nonce, pkBound}, or null without one. No balance is taken.
+// agreed nonce), and whether two report the key bound: {nonce, pkBound}, or null without one. The lowest next height the
+// answers of that nonce name is noted with it (noteTip) once two of them name one, so no single node moves the tip. No
+// balance is taken.
 async function agreedAccountOf(address) {
   let answers;
   try {
@@ -1284,7 +1298,60 @@ async function agreedAccountOf(address) {
   const agreed = [...counts].filter(([, count]) => count >= MIN_NODE_AGREEMENT).map(([nonce]) => BigInt(nonce));
   if (agreed.length === 0) return null;
   const nonce = agreed.reduce((top, n) => (n > top ? n : top));
+  const heights = given.filter((a) => BigInt(a.nonce) === nonce && a.nextHeight !== null).map((a) => a.nextHeight);
+  if (heights.length >= MIN_NODE_AGREEMENT) noteTip(address, nonce, Math.min(...heights));
   return { nonce: nonce.toString(), pkBound: given.filter((a) => a.pkBound).length >= MIN_NODE_AGREEMENT };
+}
+
+// The tip of this wallet's own account the pinned nodes last showed with its nonce there ({address, nonce, nextHeight}),
+// the highest seen: a V2 transaction above that nonce whose last height that tip passed can no longer go into a block
+// (isDropped). null until one was read.
+let tipSeen = null;
+function noteTip(address, nonce, nextHeight) {
+  if (tipSeen?.address !== address || nextHeight > tipSeen.nextHeight) tipSeen = { address, nonce: BigInt(nonce), nextHeight };
+}
+
+/**
+ * The last height a transaction of `address` signs now (the V2 form): next_height + core.TX_V2_LIFETIME_BLOCKS from a
+ * pinned node's account answer when it says the network takes that form, else null (the V1 form, also when no node
+ * answered). `force` (the one re-sign after a typed refusal): the V2 form whenever the answer names a next height.
+ * @param {string} address
+ * @param {boolean} [force]
+ * @returns {Promise<string|null>} u64 decimal
+ */
+async function validUntilNow(address, force = false) {
+  let answer = null;
+  try {
+    answer = accountAnswer(await nodeRequest(`/api/v1/account/${address}`), address);
+  } catch {
+    answer = null;
+  }
+  if (answer === null) return null;
+  const expiry = core.txExpiryFromAccount({ tx_v2: answer.txV2, next_height: answer.nextHeight }, core.genesisConsensus.NETWORK_ID, force);
+  return expiry === null ? null : expiry.validUntil;
+}
+
+// The form a send signs, read beside its live base and waited for at most FORM_READ_MS: a node slow to name it never holds
+// the send, which then signs the V1 form (a typed refusal of that asks for the one re-sign: withOneResign).
+const FORM_READ_MS = 2000;
+const formForSend = (address) => withinBudget(validUntilNow(address), FORM_READ_MS).then((v) => (v === false ? null : v));
+
+/**
+ * The one re-sign a typed refusal `code` of the form or the last height (core.EXPIRY_REFUSALS) asks for, for a send and a
+ * claim of `address` alike: {validUntil: null} signs the V1 form (tx_v2_before_gate), {validUntil} the V2 form with a
+ * pinned node's fresh next_height + core.TX_V2_LIFETIME_BLOCKS; null is no re-sign (any other code, or no node naming a
+ * next height).
+ * @param {string} address
+ * @param {string|null} code
+ * @returns {Promise<{validUntil: string|null}|null>}
+ */
+export async function resignUntil(address, code) {
+  const form = core.resignFormOf(code);
+  if (form === null) return null;
+  const validUntil = form === 'v1' ? null : await validUntilNow(address, true);
+  if (form === 'v2' && validUntil === null) return null;
+  log.warn('re-signed after a typed refusal', form);
+  return { validUntil };
 }
 
 /**
@@ -1465,8 +1532,8 @@ const certifiedBalance = (address) => joinedRead(certifiedBalanceReads, address,
 /**
  * Handler of `qnet.balance` for the session's QNet address. The live figure (ownLiveRead) is shown at once, with what is
  * left to spend by the send rule (liveSend: its balance less what this wallet's own transactions took since and may still
- * take; a dropped one the next send takes the place of is not reserved). The certified read (readAccount with `display`)
- * runs beside it (liveOverCertified).
+ * take; a released one the next send takes the place of, isReleased, is not reserved). The certified read (readAccount
+ * with `display`) runs beside it (liveOverCertified).
  * @returns {Promise<QnetBalance>}
  * @throws {WalletError} LOCKED, NETWORK, BALANCE_UNCONFIRMED (neither read gave a figure)
  */
@@ -1486,8 +1553,8 @@ export async function getBalance() {
   if (live !== null) {
     const now = Date.now();
     const { confirmed, outstanding, spendable } = liveSend(state, live, (await own).floor);
-    const target = defaultReplaceNonce(outstanding, confirmed, now);
-    const freed = target !== null && outstanding.some((p) => p.nonce === target && isDropped(p, confirmed, now)) ? target : null;
+    const target = defaultReplaceNonce(outstanding, confirmed, now, qnetAddress);
+    const freed = target !== null && outstanding.some((p) => p.nonce === target && isReleased(p, confirmed, now, qnetAddress)) ? target : null;
     spendableNano = spendable(freed).toString();
   }
   if (!certifiedShown) {
@@ -1510,19 +1577,41 @@ const isStale = (p, now) => now - p.createdAt > PENDING_TRANSFER_TTL_MS;
 // Until when a kept transaction may still be in some node's mempool (the mobile app's mayLandUntil): the node's lifetime
 // after it last went out, plus the margin.
 const mayLandUntil = (p) => Math.max(p.createdAt, p.lastSubmitAt) + NODE_MEMPOOL_TTL_MS + LANDING_MARGIN_MS;
+// A kept transaction above the chain's nonce `confirmed` that the wallet sends or a node refused: one that can be dropped
+// or released (a superseded one goes with its replacement).
+const openAbove = (p, confirmed) => BigInt(p.nonce) > confirmed && (p.outcome === 'refused' || p.outcome === 'pending');
 
 /**
- * Whether a kept transaction is dropped: one the wallet no longer sends (stale, or refused by the only node sent it), its
- * nonce still free on the chain (`confirmed`), and no node can hold it any more (mayLandUntil passed). It did not go
- * through and never will by itself: History shows it as not found, and the next send takes its nonce by default.
+ * Whether a kept transaction is dropped, its nonce still free on the chain (`confirmed`): a V2 one (a body that signed a
+ * last height) whose last height the tip of `address` the pinned nodes showed (tipSeen), its nonce free there, passed
+ * (core.expiredAt), whether the wallet still sent it or a node refused it. No block can take it, so it did not go through:
+ * History and the sent screen say so. A V1 one has no last height and is never dropped: its nonce used decides it.
  * @param {object} p a vault PendingTransfer
  * @param {bigint} confirmed the account nonce the chain reached (liveSend's, or chainNonceNow's)
- * @param {number} now
+ * @param {string} address the session's QNet address, the account `p` is of
  * @returns {boolean}
  */
-function isDropped(p, confirmed, now) {
-  return (p.outcome === 'refused' || (p.outcome === 'pending' && isStale(p, now)))
-    && BigInt(p.nonce) > confirmed && now >= mayLandUntil(p);
+function isDropped(p, confirmed, address) {
+  const validUntil = core.validUntilOf(p.body);
+  return validUntil !== null && openAbove(p, confirmed) && tipSeen?.address === address && BigInt(p.nonce) > tipSeen.nonce
+    && core.expiredAt(validUntil, tipSeen.nextHeight);
+}
+
+/**
+ * Whether the wallet releases a kept transaction: the next send takes its nonce by default (so its amount is no longer
+ * kept back), it is never sent again and its record leaves the vault REPLACED_KEEP_MS after mayLandUntil. A V2 one once
+ * dropped (isDropped); a V1 one once the wallet no longer sends it (stale, or refused by the only node sent it) and no
+ * node can hold it (mayLandUntil passed). That is the wallet's act, no verdict: a V1 body stays valid until its nonce is
+ * used, so History keeps it stale or refused (pendingStatus) and no status answer calls it dropped.
+ * @param {object} p a vault PendingTransfer
+ * @param {bigint} confirmed the account nonce the chain reached
+ * @param {number} now
+ * @param {string} address the session's QNet address, the account `p` is of
+ * @returns {boolean}
+ */
+function isReleased(p, confirmed, now, address) {
+  if (core.validUntilOf(p.body) !== null) return isDropped(p, confirmed, address);
+  return openAbove(p, confirmed) && (p.outcome === 'refused' || isStale(p, now)) && now >= mayLandUntil(p);
 }
 
 // The highest nonce of the wallet's own account this worker read certified (readAccount) or two pinned nodes reported
@@ -1537,18 +1626,19 @@ const seenNonceOf = (address) => (chainNonceSeen?.address === address ? chainNon
 
 /**
  * The nonce a new transaction takes by default instead of the next one (R5-EXTQ-02, as mobile planNonce): that of the
- * oldest transaction a node refused or that is dropped (isDropped), which no transaction still being sent took since; so
- * the one it takes the place of, should it apply after all, and the new one are never both paid, and a dropped one does
- * not hold every later send behind its nonce. null when there is none.
+ * oldest transaction a node refused or that the wallet released (isReleased), which no transaction still being sent took
+ * since; so the one it takes the place of, should it apply after all, and the new one are never both paid, and a released
+ * one does not hold every later send behind its nonce. null when there is none.
  * @param {object[]} outstanding the kept transactions that may still apply above the live nonce
  * @param {bigint} confirmed
  * @param {number} now
+ * @param {string} address the session's QNet address
  * @returns {string|null}
  */
-function defaultReplaceNonce(outstanding, confirmed, now) {
-  const dropped = (p) => isDropped(p, confirmed, now);
-  const taken = new Set(outstanding.filter((p) => p.outcome === 'pending' && !dropped(p)).map((p) => p.nonce));
-  const candidates = outstanding.filter((p) => (p.outcome === 'refused' || dropped(p)) && !taken.has(p.nonce))
+function defaultReplaceNonce(outstanding, confirmed, now, address) {
+  const released = (p) => isReleased(p, confirmed, now, address);
+  const taken = new Set(outstanding.filter((p) => p.outcome === 'pending' && !released(p)).map((p) => p.nonce));
+  const candidates = outstanding.filter((p) => (p.outcome === 'refused' || released(p)) && !taken.has(p.nonce))
     .sort((a, b) => (BigInt(a.nonce) < BigInt(b.nonce) ? -1 : 1));
   return candidates.length > 0 ? candidates[0].nonce : null;
 }
@@ -1562,8 +1652,9 @@ let chainChecked = 0;
 /**
  * Forgets what the wallet kept of a chain the pinned nodes no longer serve (followChain): the verified anchors and the
  * genesis capsule, its pending transactions and their spend records (signed on the old chain; none of them can be decided
- * on this one), the nonces and the live figure it saw, the cached balances, token list and history, the recipient kinds
- * and token row verdicts, and the head it saw, which becomes `head`.
+ * on this one), the nonces, the tip, the live figure and History's head and logs floor it saw, the cached balances, token
+ * list and history, the recipient kinds, token row verdicts and History's lookups, and the head it saw, which becomes
+ * `head`.
  * @param {number} head
  * @returns {Promise<void>}
  */
@@ -1577,11 +1668,16 @@ async function forgetChain(head) {
   await vault.updateState((state) => ({ ...state, pendingTransfers: [], spends: [] }))
     .catch((error) => log.warn('pending transactions of the old chain not dropped', error?.code ?? error?.name));
   chainNonceSeen = null;
+  tipSeen = null;
   liveShown = null;
+  historyHead = null;
+  historyFloor = null;
+  floorReadAt = 0;
   recipientKinds.clear();
   recipientReads.clear();
   recipientPages.clear();
   rowVerdicts.clear();
+  rowLookups.clear();
   tokenList = null;
   contractCache.clear();
   await session.forgetViews(['qnetBalance', 'qnetTokens', 'qnetHistory']);
@@ -1713,9 +1809,9 @@ function liveBase(got) {
 // The chain view a transaction is built on: the live base of this wallet's own account (ownLiveRead) and this wallet's own
 // transactions against it (liveSend): those up to the nonce the chain reached counted in, those above it reserved (stale
 // ones too: they may still apply); the nonce after all of them; and what is left to spend. replaceNonce: the new transfer
-// takes that outstanding transfer's nonce, so at most one of the two can ever apply, and its amount is no longer reserved
-// (R2-EXTQ-03). Without one, a transfer a node refused, or one dropped, is replaced by default (R5-EXTQ-02, as mobile
-// planNonce): the new one takes the nonce of the oldest such one no sent transfer took since, so that one, should it apply
+// takes that outstanding transfer's nonce, so at most one of the two can ever apply, and its amount is no longer reserved.
+// Without one, a transfer a node refused, or one released (isReleased), is replaced by default, as the app's planNonce
+// does: the new one takes the nonce of the oldest such one no sent transfer took since, so that one, should it apply
 // after all, and the new one are never both paid.
 async function transferSnapshot(address, replaceNonce = null) {
   const state = await vault.readState();
@@ -1727,8 +1823,8 @@ async function transferSnapshot(address, replaceNonce = null) {
   if (replaceNonce !== null && !outstanding.some((p) => replaceable(p) && p.nonce === replaceNonce)) {
     throw new WalletError('NONCE_CHANGED');
   }
-  // a refused or dropped one is replaced by default (defaultReplaceNonce)
-  if (replaceNonce === null) replaceNonce = defaultReplaceNonce(outstanding, confirmed, Date.now());
+  // a refused or released one is replaced by default (defaultReplaceNonce)
+  if (replaceNonce === null) replaceNonce = defaultReplaceNonce(outstanding, confirmed, Date.now(), address);
   let nextNonce = confirmed + 1n;
   for (const p of outstanding) {
     if (BigInt(p.nonce) >= nextNonce) nextNonce = BigInt(p.nonce) + 1n;
@@ -1804,7 +1900,8 @@ const HASH_ONLY_KINDS = new Set(['token', 'deploy', 'node_registration']);
 const NO_RECIPIENT_KINDS = new Set(['deploy', 'node_registration']);
 
 // One explorer row as a HistoryItem, or null (rows this wallet is no party to, a token row of another standard, bad
-// fields). The archive is the site's host, not a node: a row is 'unverified' until two pinned nodes list it (R4-EXTQ-04).
+// fields). The archive is the site's host, not a node: a row is 'unverified' until two pinned nodes list it (R4-EXTQ-04),
+// or until their index no longer reaches its block (historyOf).
 // A built-in token's transfer (source 'token') moves no QNC: its amount is in the token's units (amountBase, u128) and
 // `token` names the token as the archive does. A node registration (this wallet registering its node) has no `to`:
 // its row keeps `to: ''`, so History shows one "Node registered" row for it and never a transfer of 0 QNC.
@@ -1848,9 +1945,19 @@ const HASH_LISTED_TYPES = /^(?:contract_?call|contract_?deploy|node_?registratio
 const identityOf = (item) => (HASH_ONLY_KINDS.has(item.kind) ? hashIdentity(item.hash)
   : rowIdentity(item.hash, item.from, item.to, item.amountNano));
 
-// The rows of this wallet's newest history one pinned node lists (sent and received, HISTORY_CHECK_PAGE of them),
-// as rowIdentity keys and the hashes of its contract calls, deploys and registrations (hashIdentity; a registration has
-// no `to`); null when that node's history could not be read.
+// The identities one row a node gives makes (a history row, or a lookup's transaction, whose type is in the node's debug
+// form: its leading word counts): its rowIdentity, and the hash of a contract call, deploy or registration (hashIdentity;
+// a registration has no `to`); none for a malformed row.
+function nodeRowIdentities(row) {
+  if (!isObject(row) || typeof row.hash !== 'string' || typeof row.from !== 'string') return [];
+  const out = HASH_LISTED_TYPES.test(/^[A-Za-z_]*/.exec(String(row.type ?? row.tx_type ?? ''))[0]) ? [hashIdentity(row.hash)] : [];
+  const amountNano = typeof row.to === 'string' ? u64Of(row.amount) : null;
+  if (amountNano !== null) out.push(rowIdentity(row.hash, row.from, row.to, amountNano));
+  return out;
+}
+
+// The rows of this wallet's newest history one pinned node lists (sent and received, HISTORY_CHECK_PAGE of them), as
+// their identities (nodeRowIdentities); null when that node's history could not be read.
 async function nodeHistoryRows(node, address) {
   let body = null;
   try {
@@ -1862,21 +1969,15 @@ async function nodeHistoryRows(node, address) {
   }
   if (!isObject(body) || !Array.isArray(body.transactions)) return null;
   const rows = new Set();
-  for (const row of body.transactions) {
-    if (!isObject(row) || typeof row.hash !== 'string' || typeof row.from !== 'string') continue;
-    if (HASH_LISTED_TYPES.test(String(row.type ?? row.tx_type ?? ''))) rows.add(hashIdentity(row.hash));
-    if (typeof row.to !== 'string') continue;
-    const amountNano = u64Of(row.amount);
-    if (amountNano !== null) rows.add(rowIdentity(row.hash, row.from, row.to, amountNano));
-  }
+  for (const row of body.transactions) for (const identity of nodeRowIdentities(row)) rows.add(identity);
   return rows;
 }
 
 // The archive rows at least two pinned nodes list alike (R4-EXTQ-04, the rule of every other state read): the ones
-// History shows as in a block, with the token rows a logs proof verifies. Rows older than a node's window stay
-// unverified. Being listed proves inclusion, never that the transfer applied: a node lists every transfer a block
-// carries, one skipped at apply (a balance too low, a nonce already used) too, and its history says nothing of the
-// outcome (R5-EXTQ-01).
+// History shows as in a block, with the rows they report at their block when looked up by hash, the token rows a logs
+// proof verifies and the rows of a block past what they keep (historyOf). Being listed proves inclusion, never that the
+// transfer applied: a node lists every transfer a block carries, one skipped at apply (a balance too low, a nonce already
+// used) too, and its history says nothing of the outcome (R5-EXTQ-01).
 // Every pinned node is asked at once, and the read ends when all answered or HEDGE_MS after the second answer, so a silent
 // node does not hold History for its whole timeout (a later read counts it again).
 async function nodeConfirmedRows(address) {
@@ -1962,13 +2063,15 @@ async function tokenRowVerdict(transfer, block) {
 }
 
 // The logs-proof verdict of each token row of `entries` ({row, item}) known now, by item: 'verified', 'rejected' or
-// 'pending'. The rows due a check (tokenRowVerdict) start one in the background.
-function tokenRowVerdicts(entries) {
+// 'pending'. The rows due a check (tokenRowVerdict) start one in the background, only those `provable(item)` holds: no
+// node proves a row of a block whose logs it no longer keeps.
+function tokenRowVerdicts(entries, provable = () => true) {
   const now = Date.now();
   const keyed = entries.map((entry) => ({ ...entry, transfer: tokenTransferOf(entry.row) }))
     .filter(({ transfer }) => transfer !== null)
     .map((entry) => ({ ...entry, key: `${entry.transfer.tx_hash}:${entry.transfer.log_index}` }));
-  const due = keyed.filter(({ key }) => {
+  const due = keyed.filter(({ key, item }) => {
+    if (!provable(item)) return false;
     const known = rowVerdicts.get(key);
     return known === undefined || (known.verdict === 'pending' && !known.running && now - known.at >= ROW_PROOF_RETRY_MS);
   }).slice(0, ROW_PROOF_CHECKS);
@@ -1986,16 +2089,52 @@ function tokenRowVerdicts(entries) {
   return new Map(keyed.map(({ key, item }) => [item, rowVerdicts.get(key)?.verdict ?? 'pending']));
 }
 
-// A superseded transfer (its replacement is being submitted) may still apply: it reads as pending or stale. A dropped one
-// (isDropped, against the chain's nonce last read) reads as dropped; one the chain took, as included (two pinned nodes
-// list it at its nonce) until the archive lists its row.
+// Archive rows inside the pinned nodes' index that their listing does not reach (past the newest HISTORY_CHECK_PAGE rows)
+// are looked up by hash (lookupAgreement, never a page of their history: it skips rows): at most ROW_LOOKUPS a read,
+// newest first, each once per worker once two nodes answered; History waits for them at most ROW_LOOKUP_WAIT_MS, and a
+// later read shows the rest. Kept by row identity: the block two nodes report alike, else null.
+const ROW_LOOKUPS = 8;
+const ROW_LOOKUP_WAIT_MS = 1500;
+const rowLookups = new Map(); // identityOf(item) -> {height}
+
+function lookupRows(address, items) {
+  const due = new Map();
+  for (const item of items) {
+    const key = identityOf(item);
+    if (due.size < ROW_LOOKUPS && !rowLookups.has(key) && !due.has(key)) due.set(key, item);
+  }
+  const runs = [...due].map(([key, item]) => {
+    const entry = { height: null };
+    rowLookups.set(key, entry);
+    return lookupAgreement(item.hash, item, address).catch(() => ({ height: null, answered: 0 })).then(({ height, answered }) => {
+      // fewer than two answered: a later read asks again
+      if (answered < MIN_NODE_AGREEMENT) {
+        if (rowLookups.get(key) === entry) rowLookups.delete(key);
+      } else {
+        entry.height = height;
+      }
+    });
+  });
+  while (rowLookups.size > ROW_VERDICTS_MAX) rowLookups.delete(rowLookups.keys().next().value);
+  return background(Promise.all(runs));
+}
+
+// Whether two pinned nodes report `item`'s transaction, with its identity, at its block (lookupRows).
+const lookedUp = (item) => {
+  const height = rowLookups.get(identityOf(item))?.height;
+  return Number.isSafeInteger(height) && (item.block === null || height === item.block);
+};
+
+// A superseded transfer (its replacement is being submitted) may still apply: pending or stale. A V2 one past its last
+// height (isDropped, by the chain's nonce last read) is dropped, a V1 one never: released, still stale or refused until
+// its nonce is used. One the chain took is included (two pinned nodes list it at its nonce) until the archive lists it.
 function pendingStatus(p, address, now) {
   if (p.outcome === 'confirmed') return 'included';
   if (p.outcome === 'replaced') return 'replaced';
   // its nonce was used, and no two nodes agree yet on what applied there (R3-EXTQ-04)
   if (p.outcome === 'passed') return 'unknown';
   const confirmed = seenNonceOf(address);
-  if (confirmed !== null && isDropped(p, confirmed, now)) return 'dropped';
+  if (confirmed !== null && isDropped(p, confirmed, address)) return 'dropped';
   // one node refused it; it may still apply until its nonce is used (R5-EXTQ-02)
   if (p.outcome === 'refused') return 'refused';
   return isStale(p, now) ? 'stale' : 'pending';
@@ -2064,12 +2203,39 @@ function archiveClaims(items, records) {
   return claims;
 }
 
-// A page of the explorer archive merged with the vault's pending transfers; with `confirm` (this wallet's own History),
-// each archive row two pinned nodes list alike reads 'included' (in a block, applied or not: R5-EXTQ-01), every other one
-// stays 'unverified' (R4-EXTQ-04). A token row reads included by its logs proof, or, when this wallet sent it, by two
-// nodes listing its call; a proof that contradicts it leaves it unverified. A transaction the chain took is listed from
-// the vault until the page lists its row (archiveClaims); that row then reads included, and the record leaves the vault
-// once the row does by the page's own reads: one row for it at every moment.
+// The macroblock History judges an archive row's block by: the highest head two pinned nodes reported in this worker
+// (networkHeadIndex), so a read that no two answer, or a node behind, never takes a row out of a block again.
+let historyHead = null;
+async function historyHeadIndex() {
+  const head = await networkHeadIndex();
+  if (head !== null && (historyHead === null || head > historyHead)) historyHead = head;
+  return historyHead;
+}
+
+// The logs floor History judges a token row's block by: the highest a pinned node reported in this worker (the
+// `oldest_available` of GET /api/v1/account/{a}/token-transfers, at or below which it keeps no token transfer, log or
+// logs proof), read at most once a minute (HEAD_CACHE_MS), reads that overlap sharing one; null while none was reported.
+let historyFloor = null;
+let floorRead = null;
+let floorReadAt = 0;
+function historyLogsFloor(address) {
+  if (Date.now() - floorReadAt < HEAD_CACHE_MS) return Promise.resolve(historyFloor);
+  floorRead ??= nodeRequest(`/api/v1/account/${encodeURIComponent(address)}/token-transfers?limit=1`).then((reply) => {
+    const body = reply.status === 200 ? parseOrNull(reply.text) : null;
+    if (!isObject(body) || body.address !== address || !Array.isArray(body.transfers)) return historyFloor;
+    const floor = safeIntOf(body.oldest_available);
+    if (floor !== null && (historyFloor === null || floor > historyFloor)) historyFloor = floor;
+    floorReadAt = Date.now();
+    return historyFloor;
+  }, () => historyFloor).finally(() => {
+    floorRead = null;
+  });
+  return floorRead;
+}
+
+// A page of the explorer archive merged with the vault's pending transfers. With `confirm` (this wallet's own History) a
+// row is 'included' only on what pinned nodes show of it, or when no node keeps what would show it (CONTRACTS.md 2.5); a
+// transaction the chain took is listed from the vault until the page lists its row (archiveClaims).
 async function historyOf(qnetAddress, params, confirm) {
   const limit = Number.isSafeInteger(params.limit)
     ? Math.min(Math.max(params.limit, 1), LIMITS.HISTORY_PAGE_MAX)
@@ -2083,27 +2249,44 @@ async function historyOf(qnetAddress, params, confirm) {
   }
 
   const query = `limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
-  const [text, state, confirmed] = await Promise.all([
+  const [text, state, confirmed, head, reported] = await Promise.all([
     explorerRequest(`/api/address/${encodeURIComponent(qnetAddress)}/history?${query}`),
     Promise.resolve(confirm && resubmitted !== null ? withinBudget(resubmitted, RESUBMIT_WAIT_MS) : null).then(() => vault.readState()),
     confirm ? nodeConfirmedRows(qnetAddress).catch(() => new Set()) : null,
+    confirm ? historyHeadIndex().catch(() => null) : null,
+    confirm ? historyLogsFloor(qnetAddress).catch(() => null) : null,
   ]);
   const body = parseOrNull(text);
   if (!isObject(body) || body.success !== true || !Array.isArray(body.items)) throw new WalletError('NETWORK');
   const mapped = body.items.map((row) => ({ row, item: historyItem(row, qnetAddress) })).filter(({ item }) => item !== null);
-  const verdicts = confirm ? tokenRowVerdicts(mapped.filter(({ item }) => item.kind === 'token')) : new Map();
+  // a block past what the pinned nodes keep: their transaction index, and for a token row its logs (the floor a node
+  // reported, never above MICROBLOCK_BODY_RETENTION_BLOCKS below their head)
+  const tip = head === null ? null : head * MACROBLOCK_INTERVAL;
+  const logsFloor = tip === null ? null : Math.min(reported ?? Infinity, tip - MICROBLOCK_BODY_RETENTION_BLOCKS);
+  const beyond = (item) => tip !== null && item.block !== null && (item.block + TX_INDEX_RETENTION_BLOCKS <= tip
+    || (item.kind === 'token' && item.block <= logsFloor));
+  const verdicts = confirm ? tokenRowVerdicts(mapped.filter(({ item }) => item.kind === 'token'), (item) => !beyond(item)) : new Map();
+  const agreed = (item) => confirmed.has(identityOf(item)) || lookedUp(item);
   const listed = (item) => {
     if (confirmed === null) return false;
-    if (item.kind !== 'token') return confirmed.has(identityOf(item));
+    if (item.kind !== 'token') return agreed(item);
     const verdict = verdicts.get(item);
     // a node lists a contract call only under its caller: two listing it speak for a token row this wallet sent
-    return verdict === 'verified' || (verdict !== 'rejected' && item.direction !== 'in' && confirmed.has(identityOf(item)));
+    return verdict === 'verified' || (verdict !== 'rejected' && item.direction !== 'in' && agreed(item));
   };
+  // the rows inside those windows the listing does not reach; a batch row names this wallet's part, a lookup the batch
+  if (confirm) {
+    const unlisted = mapped.filter(({ row, item }) => row.source !== 'batch' && !listed(item) && !beyond(item)
+      && (item.kind !== 'token' || (item.direction !== 'in' && verdicts.get(item) !== 'rejected'))).map(({ item }) => item);
+    if (unlisted.length > 0) await withinBudget(lookupRows(qnetAddress, unlisted), ROW_LOOKUP_WAIT_MS);
+  }
+  // a row of a block past what the pinned nodes keep, unless its logs proof contradicted it
+  const aged = (item) => beyond(item) && verdicts.get(item) !== 'rejected';
   // the light node's registration this wallet submitted names its node (the archive's row names none)
   const own = state.registration;
   const named = (item) => (item.kind === 'node_registration' && typeof own?.txHash === 'string' && own.txHash === item.hash
     ? { ...item, nodeId: own.nodeId } : item);
-  const shown = mapped.map(({ item }) => named(listed(item) ? { ...item, status: 'included' } : item));
+  const shown = mapped.map(({ item }) => named(listed(item) || aged(item) ? { ...item, status: 'included' } : item));
   const next = typeof body.next_cursor === 'string' && CURSOR_RE.test(body.next_cursor) ? body.next_cursor : null;
   const claims = confirm ? archiveClaims(shown, state.pendingTransfers) : new Map();
   const claimed = new Set(claims.values());
@@ -2126,8 +2309,11 @@ async function historyOf(qnetAddress, params, confirm) {
  * Handler of `qnet.history`: explorer archive page (EXPLORER_API /api/address/{a}/history) merged with
  * the vault's pending transfers. The archive is the site's host, not a node, so its rows are not taken as
  * applied on its word: a row two pinned nodes list alike in their newest history (hash, both parties, amount; a token
- * row this wallet sent, its call's hash) or a token row its logs proof verifies in the background is 'included', any
- * other is 'unverified' (R4-EXTQ-04). Neither says the transfer applied: a block carries, and
+ * row this wallet sent, its call's hash), or report alike at its block when looked up by its hash (a row past the
+ * rows they list), a token row its logs proof verifies in the background, a row of a block TX_INDEX_RETENTION_BLOCKS
+ * or more below the head two pinned nodes report (their index no longer reaches it), or a token row of a block at or
+ * below the logs floor (no node keeps its logs) is 'included', any other is 'unverified' (R4-EXTQ-04). Neither says the
+ * transfer applied: a block carries, and
  * every node lists, a transfer it skipped at apply too, and no node's history gives the outcome, so only the
  * balance, which the wallet verifies, shows what applied (R5-EXTQ-01). A transaction of this wallet the chain took is
  * listed from the vault ('included') until the page lists its row (historyOf). Also starts resubmitPending in the
@@ -2310,24 +2496,27 @@ function serialized(fn) {
 /**
  * The exact JSON text POSTed to /api/v1/transaction, as the shared builder writes it (core.transferRequestJson, the
  * mobile sendQNC field order): u64 fields are bare JSON integers written from their decimal strings; the public key is
- * always carried, which the node accepts whether or not it already holds the key.
+ * always carried, which the node accepts whether or not it already holds the key. A V2 transfer names its last height
+ * (valid_until).
  * @param {{from: string, to: string, amountNano: string, nonce: string, gasPrice: string, gasLimit: string,
- *   signature: Uint8Array, publicKey: Uint8Array}} signed
+ *   validUntil?: string|null, signature: Uint8Array, publicKey: Uint8Array}} signed
  * @returns {string}
  */
 export function transferBody(signed) {
-  const { from, to, amountNano, nonce, gasPrice, gasLimit } = signed;
+  const { from, to, amountNano, nonce, gasPrice, gasLimit, validUntil = null } = signed;
   for (const v of [amountNano, nonce, gasPrice, gasLimit]) if (u64Of(v) === null) throw new WalletError('INTERNAL');
+  if (validUntil !== null && u64Of(validUntil) === null) throw new WalletError('INTERNAL');
   if (!core.isValidQnetAddress(from) || !core.isValidQnetAddress(to)) throw new WalletError('INTERNAL');
   const signature = core.bytesToHex(signed.signature);
   const publicKey = core.bytesToHex(signed.publicKey);
   if (!HEX_RE.test(signature) || !HEX_RE.test(publicKey)) throw new WalletError('INTERNAL');
-  return core.transferRequestJson({ from, to, amountNano, nonce, gasPrice, gasLimit }, signature, publicKey);
+  return core.transferRequestJson({ from, to, amountNano, nonce, gasPrice, gasLimit, validUntil }, signature, publicKey);
 }
 
 // POSTs a stored body to its route (a transfer's by default). null when no node answered. A refusal is `definitive`
 // only when no other node was sent the body: with a hedged second node in flight, the transaction may have entered its
 // mempool. Even a definitive refusal is one node's word: the caller keeps the transaction as 'refused' (R5-EXTQ-02).
+// `refusal`: the node's typed refusal of the form or the last height (core.expiryRefusalOf), or null.
 async function submit(body, path = core.TX_ROUTES.transfer.path) {
   let reply;
   try {
@@ -2340,7 +2529,8 @@ async function submit(body, path = core.TX_ROUTES.transfer.path) {
   const hash = isObject(answer) ? answer.tx_hash : undefined;
   const txHash = typeof hash === 'string' && TX_HASH_RE.test(hash) ? hash : null;
   const accepted = isObject(answer) && (answer.success === true || txHash !== null) && answer.success !== false;
-  return { accepted, txHash, definitive: reply.attempts === 1 };
+  const refusal = accepted || !isObject(answer) ? null : core.expiryRefusalOf(answer);
+  return { accepted, txHash, definitive: reply.attempts === 1, refusal };
 }
 
 /**
@@ -2376,25 +2566,46 @@ export async function sendTransfer(transfer) {
   return serialized(async () => {
     const { qnetAddress: from } = await session.requireUnlocked();
     if (expectedFeeNano !== transferFeeNano()) throw new WalletError('FEE_CHANGED');
-    const snapshot = await baseWithRecipient(transferSnapshot(from, replaceNonce), assertPayableRecipient(to, from));
-    const preview = previewOf(from, to, amountNano, snapshot);
+    const [snapshot, validUntil] = await Promise.all([
+      baseWithRecipient(transferSnapshot(from, replaceNonce), assertPayableRecipient(to, from)), formForSend(from),
+    ]);
     checkNonce(snapshot, expectedNonce, oneInFlight);
     checkRoom(snapshot);
-    if (BigInt(preview.totalNano) > snapshot.spendable) throw new WalletError('INSUFFICIENT_FUNDS');
 
     const gasPrice = String(core.fees.GAS_PRICE);
     const gasLimit = String(core.fees.TRANSFER_GAS_LIMIT);
-    const fields = { from, to, amountNano, nonce: preview.nonce, gasPrice, gasLimit };
-    const { preimage, signature, publicKey } = await keys.signQnetTransfer(fields);
-    const expected = core.transferPreimage(from, to, amountNano, fields.nonce, fields.gasPrice, fields.gasLimit);
-    if (preimage !== expected || !core.verifyTransferSignature(fields, signature, publicKey)) {
-      throw new WalletError('SIGNATURE_SELF_CHECK_FAILED');
-    }
-    const body = transferBody({ ...fields, signature, publicKey });
-    const record = pendingRecord({ nonce: fields.nonce, to, amountNano, feeNano: preview.feeNano, body });
-    // a recipient the user signed for becomes a known one (recipientCheck)
-    return storeAndSubmit(from, snapshot, record, (state) => (to === from ? state : vault.withRecipient(state, to)));
+    return withOneResign(from, snapshot, validUntil, async (snap, signedUntil) => {
+      const preview = previewOf(from, to, amountNano, snap);
+      if (BigInt(preview.totalNano) > snap.spendable) throw new WalletError('INSUFFICIENT_FUNDS');
+      const fields = { from, to, amountNano, nonce: preview.nonce, gasPrice, gasLimit, validUntil: signedUntil };
+      const { preimage, signature, publicKey } = await keys.signQnetTransfer(fields);
+      const expected = core.transferPreimage(from, to, amountNano, fields.nonce, gasPrice, gasLimit, core.expiryAt(signedUntil));
+      if (preimage !== expected || !core.verifyTransferSignature(fields, signature, publicKey)) {
+        throw new WalletError('SIGNATURE_SELF_CHECK_FAILED');
+      }
+      const body = transferBody({ ...fields, signature, publicKey });
+      const record = pendingRecord({ nonce: fields.nonce, to, amountNano, feeNano: preview.feeNano, body });
+      // a recipient the user signed for becomes a known one (recipientCheck)
+      return storeAndSubmit(from, snap, record, (state) => (to === from ? state : vault.withRecipient(state, to)));
+    });
   });
+}
+
+/**
+ * Signs and submits at `snapshot`'s nonce (`sign(snapshot, validUntil)`, which checks what it spends), in the form the
+ * pinned nodes named (validUntilNow). A typed refusal of the form or the last height (storeAndSubmit's NODE_REJECTED with
+ * its refusal) is answered by one re-sign that takes the refused transaction's place at its nonce, never more
+ * (resignUntil).
+ * @returns {Promise<{txHash: string|null, status: 'submitted'|'unknown', nonce: string, from: string}>}
+ */
+async function withOneResign(from, snapshot, validUntil, sign) {
+  try {
+    return await sign(snapshot, validUntil);
+  } catch (error) {
+    const again = error instanceof WalletError && error.code === 'NODE_REJECTED' ? await resignUntil(from, error.refusal ?? null) : null;
+    if (again === null) throw error;
+    return sign(await transferSnapshot(from, snapshot.nextNonce), again.validUntil);
+  }
 }
 
 // The nonce the reviewed transaction was shown with, and for a dApp request (oneInFlight) the committed nonce + 1: the
@@ -2456,7 +2667,9 @@ async function storeAndSubmit(from, snapshot, record, withRecord) {
   const isSuperseded = (p) => p.outcome === 'superseded' && superseded.includes(p.body);
 
   const outcome = await submit(body, routeOf(record));
-  if (outcome !== null && !outcome.accepted && outcome.definitive) {
+  // A typed refusal of the form or the last height is the network's rule for these bytes, so it counts as definitive too:
+  // the sender answers it with one re-sign (withOneResign).
+  if (outcome !== null && !outcome.accepted && (outcome.definitive || outcome.refusal !== null)) {
     // the only node sent it refused it: one node's word, and it may have passed the body on, so the transaction
     // stays listed and reserved as refused (R5-EXTQ-02); what it was to replace is sent again
     await vault.updateState((state) => ({
@@ -2466,7 +2679,7 @@ async function storeAndSubmit(from, snapshot, record, withRecord) {
         return isSuperseded(p) ? { ...p, outcome: 'pending' } : p;
       }),
     }));
-    throw new WalletError('NODE_REJECTED');
+    throw new WalletError('NODE_REJECTED', outcome.refusal === null ? {} : { refusal: outcome.refusal });
   }
   // taken, or a node may hold it: the replaced transactions are no longer resent (whichever of them lands first
   // applies, the others never can: R2-EXTQ-03), and their records go, refused ones included
@@ -2978,13 +3191,14 @@ function assertCall(request) {
 }
 
 // The shared builder's transaction for a request of `from` at `nonce` (core.buildTokenTransfer / buildContractCall):
-// calldata, gas limit, maximum fee and preimage all come from there.
-function buildCall(request, from, nonce) {
+// calldata, gas limit, maximum fee and preimage all come from there; `validUntil` signs the V2 form.
+function buildCall(request, from, nonce, validUntil = null) {
+  const expiry = core.expiryAt(validUntil);
   if (request.kind === 'tokenTransfer') {
-    return core.buildTokenTransfer({ from, token: request.token, to: request.to, amount: request.amountBase, nonce });
+    return core.buildTokenTransfer({ from, token: request.token, to: request.to, amount: request.amountBase, nonce, expiry });
   }
   return core.buildContractCall({
-    from, contract: request.contract, method: request.method, args: request.args, nonce, gasLimit: request.gasLimit,
+    from, contract: request.contract, method: request.method, args: request.args, nonce, gasLimit: request.gasLimit, expiry,
   });
 }
 
@@ -3085,7 +3299,9 @@ export async function sendCall(call) {
   assertCall(request);
   return serialized(async () => {
     const { qnetAddress: from } = await session.requireUnlocked();
-    const snapshot = await baseWithRecipient(transferSnapshot(from), recipientOfCall(request, from));
+    const [snapshot, validUntil] = await Promise.all([
+      baseWithRecipient(transferSnapshot(from), recipientOfCall(request, from)), formForSend(from),
+    ]);
     const tx = buildCall(request, from, snapshot.nextNonce);
     if (tx.maxFeeNano !== expectedFeeNano) throw new WalletError('FEE_CHANGED');
     checkNonce(snapshot, expectedNonce, oneInFlight);
@@ -3095,37 +3311,57 @@ export async function sendCall(call) {
     if (depositNano !== expectedDepositNano) throw new WalletError('FEE_CHANGED');
     if (token !== null && token.tokenBalance === null) throw new WalletError(token.tokenProblem ?? 'BALANCE_UNCONFIRMED');
     if (token !== null && BigInt(token.tokenBalance) < BigInt(tx.amount)) throw new WalletError('INSUFFICIENT_FUNDS');
-    if (BigInt(tx.maxFeeNano) + BigInt(depositNano) > snapshot.spendable) throw new WalletError('INSUFFICIENT_FUNDS');
 
-    const signed = request.kind === 'tokenTransfer'
-      ? await keys.signQnetTokenTransfer({ from, token: tx.contract, to: tx.to, amount: tx.amount, nonce: tx.nonce })
-      : await keys.signQnetContractCall({
-        from, contract: tx.contract, method: tx.method, args: tx.args, nonce: tx.nonce, gasLimit: tx.gasLimit,
+    return withOneResign(from, snapshot, validUntil, async (snap, signedUntil) => {
+      if (BigInt(tx.maxFeeNano) + BigInt(depositNano) > snap.spendable) throw new WalletError('INSUFFICIENT_FUNDS');
+      const built = buildCall(request, from, snap.nextNonce, signedUntil);
+      const signed = request.kind === 'tokenTransfer'
+        ? await keys.signQnetTokenTransfer({
+          from, token: built.contract, to: built.to, amount: built.amount, nonce: built.nonce, validUntil: signedUntil,
+        })
+        : await keys.signQnetContractCall({
+          from, contract: built.contract, method: built.method, args: built.args, nonce: built.nonce, gasLimit: built.gasLimit,
+          validUntil: signedUntil,
+        });
+      if (!(await signedAsBuilt(signed, built, from))) throw new WalletError('SIGNATURE_SELF_CHECK_FAILED');
+      const body = core.contractCallRequestJson(built, core.bytesToHex(signed.signature), core.bytesToHex(signed.publicKey));
+      const record = pendingRecord({
+        nonce: built.nonce, to: built.contract, amountNano: depositNano, feeNano: built.maxFeeNano, body,
+        call: { method: built.method, recipient: token === null ? null : built.to, amount: token === null ? null : built.amount },
       });
-    if (!(await signedAsBuilt(signed, tx, from))) throw new WalletError('SIGNATURE_SELF_CHECK_FAILED');
-    const body = core.contractCallRequestJson(tx, core.bytesToHex(signed.signature), core.bytesToHex(signed.publicKey));
-    const record = pendingRecord({
-      nonce: tx.nonce, to: tx.contract, amountNano: depositNano, feeNano: tx.maxFeeNano, body,
-      call: { method: tx.method, recipient: token === null ? null : tx.to, amount: token === null ? null : tx.amount },
+      // a token recipient the user signed for becomes a known one (recipientCheck)
+      return storeAndSubmit(from, snap, record, (state) => (token === null || built.to === from ? state : vault.withRecipient(state, built.to)));
     });
-    // a token recipient the user signed for becomes a known one (recipientCheck)
-    return storeAndSubmit(from, snapshot, record, (state) => (token === null || tx.to === from ? state : vault.withRecipient(state, tx.to)));
   });
 }
 
-// The height two pinned nodes report alike for a stored transaction (GET /api/v1/transaction/{hash}), or null.
-async function agreedBlockHeight(hash) {
+// Two pinned nodes' lookup of a stored transaction (GET /api/v1/transaction/{hash}): {height: the block both report alike,
+// else null; answered: how many of them said found or not found}. With `item`, an archive row of `address`, a node's
+// height counts only for a transaction of the row's identity (nodeRowIdentities), by its hash alone only when `address`
+// sent it: a lookup, unlike a listing, is not read under the wallet's address.
+async function lookupAgreement(hash, item = null, address = null) {
+  let answered = 0;
   const heights = await Promise.all(shuffled(QNET.NODES).slice(0, MIN_NODE_AGREEMENT).map(async (node) => {
     try {
       const reply = await nodeRequest(`/api/v1/transaction/${hash}`, { nodes: [node] });
       const body = reply.status === 200 ? parseOrNull(reply.text) : null;
+      if (isObject(body) && (body.status === 'found' || body.status === 'not_found')) answered += 1;
       const tx = isObject(body) && body.status === 'found' && isObject(body.transaction) ? body.transaction : null;
-      return tx !== null && tx.hash === hash && tx.status === 'confirmed' ? safeIntOf(tx.block_height) : null;
+      if (tx === null || tx.hash !== hash || tx.status !== 'confirmed') return null;
+      const identity = item === null ? null : identityOf(item);
+      const sent = typeof tx.from === 'string' && lower(tx.from) === lower(address);
+      if (identity !== null && (!nodeRowIdentities(tx).includes(identity) || (identity === hashIdentity(hash) && !sent))) return null;
+      return safeIntOf(tx.block_height);
     } catch {
       return null;
     }
   }));
-  return heights[0] !== null && heights.every((height) => height === heights[0]) ? heights[0] : null;
+  return { height: heights[0] !== null && heights.every((height) => height === heights[0]) ? heights[0] : null, answered };
+}
+
+// The height two pinned nodes report alike for a stored transaction, or null (lookupAgreement).
+async function agreedBlockHeight(hash) {
+  return (await lookupAgreement(hash)).height;
 }
 
 /**
@@ -3150,7 +3386,8 @@ async function liveNonceState(from, nonce, state) {
 /**
  * qnet_getTransactionStatus for the session's own account: what the chain shows at (from, nonce), a transaction's
  * identity, by the pinned nodes' live word (liveNonceState). 'pending': the account nonce two pinned nodes report is
- * below it and this wallet still sends a transaction there (pending or superseded; a refused one it no longer sends);
+ * below it and this wallet keeps a transaction there it sent that may still apply (pending, stale or superseded; a V1 one
+ * however long ago, never one a node refused or a V2 one past its last height, isDropped);
  * 'in_block': the nonce is used and at least two pinned nodes list the same one transaction of `from` at it, with the hash
  * they list and the block height two nodes report alike, when they do; 'unknown' in every other case: an account no two
  * nodes agree on, a nonce this wallet sent nothing at, a history the nodes do not serve (older than their newest 100
@@ -3171,7 +3408,10 @@ export async function transactionStatus(query) {
   const at = await liveNonceState(from, nonce, state).catch(() => null);
   if (at === null) return answer('unknown');
   if (!at.passed) {
-    const sent = state.pendingTransfers.some((p) => p.nonce === nonce && (p.outcome === 'pending' || p.outcome === 'superseded'));
+    // no clock ends 'pending': a V1 one stays so however long ago it was sent, and only a V2 one past its last height
+    // (isDropped) is not; 'unknown' claims no failure, which only sentStatus's 'dropped' does, by height alone
+    const sent = state.pendingTransfers.some((p) => p.nonce === nonce && (p.outcome === 'pending' || p.outcome === 'superseded')
+      && !isDropped(p, BigInt(nonce) - 1n, from));
     return answer(sent ? 'pending' : 'unknown');
   }
   if (at.row === null) return answer('unknown');
@@ -3180,13 +3420,14 @@ export async function transactionStatus(query) {
 
 /**
  * Handler of `qnet.sentStatus` (the popup's sent screen of a QNC or token transfer): where this wallet's transaction at
- * `nonce` stands by the pinned nodes' live word (liveNonceState). 'pending' while the nonce is free; 'in_block' once two
- * pinned nodes list at it the transaction this wallet kept there (rowIsTransfer; with no record left at the nonce,
- * resubmitPending already found it so); 'replaced' when they list another one; 'unknown' while no two of them agree. Once
- * decided, the pending list is decided from the same reads (resubmitPending), so History lists the transaction as
- * confirmed until the archive lists its row.
+ * `nonce` stands by the pinned nodes' live word (liveNonceState). 'pending' while the nonce is free; 'dropped' once every
+ * transaction kept there is a V2 one whose last height the pinned nodes' tip passed (isDropped: it failed and took
+ * nothing); 'in_block' once two pinned nodes list at it the transaction this wallet kept there (rowIsTransfer; with no
+ * record left at the nonce, resubmitPending already found it so); 'replaced' when they list another one; 'unknown' while
+ * no two of them agree. Once decided, the pending list is decided from the same reads (resubmitPending), so History lists
+ * the transaction as confirmed until the archive lists its row.
  * @param {{nonce: string}} params
- * @returns {Promise<{status: 'pending'|'in_block'|'replaced'|'unknown'}>}
+ * @returns {Promise<{status: 'pending'|'dropped'|'in_block'|'replaced'|'unknown'}>}
  * @throws {WalletError} LOCKED, INVALID_PARAMS
  */
 export async function sentStatus(params) {
@@ -3196,7 +3437,11 @@ export async function sentStatus(params) {
   const state = await vault.readState();
   const at = await liveNonceState(qnetAddress, nonce, state).catch(() => null);
   if (at === null || (at.passed && at.row === null)) return { status: 'unknown' };
-  if (!at.passed) return { status: 'pending' };
+  if (!at.passed) {
+    const kept = state.pendingTransfers.filter((p) => p.nonce === nonce);
+    const dropped = kept.length > 0 && kept.every((p) => isDropped(p, BigInt(nonce) - 1n, qnetAddress));
+    return { status: dropped ? 'dropped' : 'pending' };
+  }
   const kept = state.pendingTransfers.filter((p) => p.nonce === nonce);
   const status = kept.length === 0 || kept.some((p) => rowIsTransfer(at.row, p)) ? 'in_block' : 'replaced';
   background(resubmitWith(at.view).catch((error) => log.debug('resubmit', error?.code ?? error?.name)));
@@ -3373,19 +3618,21 @@ async function resubmitWith(view) {
     }
     // a body a node accepted goes out again only every RESEND_ACCEPTED_MS: each POST may add another copy with
     // another hash (R5-EXTQ-03); a refused one never goes out again by itself (R5-EXTQ-02)
+    // a released one never goes out again (isReleased): a V2 one past its last height no block can take
     const due = open.filter((p) => p.outcome === 'pending' && !passed.includes(p) && !isStale(p, now)
+      && !(chainNonce !== null && isReleased(p, chainNonce, now, qnetAddress))
       && now - p.lastSubmitAt >= (p.txHash !== null ? RESEND_ACCEPTED_MS : RESUBMIT_INTERVAL_MS));
     const results = new Map();
     for (const p of due) {
       const outcome = await submit(p.body, routeOf(p)).catch(() => null);
       results.set(p.body, outcome?.txHash ?? null);
     }
-    // a confirmed, replaced or passed transfer's lastSubmitAt is when it was seen so; a dropped one (no node can hold it,
-    // its nonce still free) leaves the list REPLACED_KEEP_MS after it was dropped (owner, 06.10: a pending row resolves)
+    // a confirmed, replaced or passed transfer's lastSubmitAt is when it was seen so; a released one (isReleased, its nonce
+    // still free) leaves the list REPLACED_KEEP_MS after mayLandUntil
     const expired = (p) => verdicts.get(p.body) !== 'confirmed' && verdicts.get(p.body) !== 'replaced'
       && ((p.outcome === 'confirmed' && now - p.lastSubmitAt > CONFIRMED_KEEP_MS)
         || ((p.outcome === 'replaced' || p.outcome === 'passed') && now - p.lastSubmitAt > REPLACED_KEEP_MS)
-        || (chainNonce !== null && isDropped(p, chainNonce, now) && now - mayLandUntil(p) > REPLACED_KEEP_MS));
+        || (chainNonce !== null && isReleased(p, chainNonce, now, qnetAddress) && now - mayLandUntil(p) > REPLACED_KEEP_MS));
     const unsettled = chainNonce !== null && (state.spends ?? []).some((r) => r.settledAt === null && BigInt(r.nonce) <= chainNonce);
     if (verdicts.size > 0 || results.size > 0 || unsettled || state.pendingTransfers.some(expired)) {
       await vault.updateState((current) => withSpends({

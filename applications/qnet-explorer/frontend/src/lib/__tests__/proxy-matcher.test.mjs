@@ -50,14 +50,15 @@ test('every node cabinet page reaches the proxy and gets the cabinet\'s stricter
   assert.match(src, /const CABINET_EXTRA = \["worker-src 'none'", "frame-src 'none'", "manifest-src 'self'"\];/);
   assert.match(src, /function isCabinetPath\(pathname: string\): boolean \{\s*return pathname === '\/node' \|\| pathname\.startsWith\('\/node\/'\);\s*\}/);
   assert.match(src, /\.\.\.\(cabinet \? \[\.\.\.CABINET_EXTRA, \.\.\.\(DEV \? \[\] : \['upgrade-insecure-requests'\]\)\] : \[\]\),/);
-  assert.match(src, /const csp = policy\(newNonce\(\), isCabinetPath\(pathname\)\);/);
+  // By the page's path without its language: /ru/node is the cabinet too.
+  assert.match(src, /const path = route\.kind === 'page' \? route\.path : pathname;\n\s*const csp = policy\(newNonce\(\), isCabinetPath\(path\)\);/);
   // The old activation page is a permanent (308) redirect to the cabinet's (next.config.js).
   const redirects = await nextConfig.redirects();
   assert.deepEqual(redirects.find((r) => r.source === '/activate'), { source: '/activate', destination: '/node/activate', permanent: true });
 });
 
 test('on the link host every path but the build assets reaches it, and all but the link page go to the site', () => {
-  // SITE-R4-CSP-01: /icon-1.png and /_next/staticx rendered the site's 404 page there, shell and all.
+  // /icon-1.png and /_next/staticx would render the site's 404 page there, shell and all.
   for (const path of ['/', '/activate', '/wallet', '/faucet', '/_next/image', '/explorer', '/api/link/sessions', '/api/activation/price',
     '/icon-1.png', '/icon-999.png', '/_next/staticx', '/_next/staticfoo', '/_next/static']) {
     for (const headers of PREFETCH) {
@@ -72,7 +73,7 @@ test('on the link host every path but the build assets reaches it, and all but t
   }
 });
 
-// SITE-R3-02: the relay and the faucet answer only on aiqnet.io. On www., explorer. or any other host an API
+// The relay and the faucet answer only on aiqnet.io. On www., explorer. or any other host an API
 // request reaches the proxy, which sends it to aiqnet.io, so no nginx block of another name can hand the
 // relay a client's own X-Real-IP or log its session ids.
 test('on every other host API routes and pages reach it, and all go to the site', () => {
@@ -110,7 +111,7 @@ test('the config has no header condition that lets a request skip the policy', (
   assert.doesNotMatch(literal[1], /_next\/image/);
 });
 
-// SITE-R5-CSP-01: Next.js 16 names the file proxy and runs it on Node.js; the deprecated middleware.ts is gone,
+// Next.js 16 names the file proxy and runs it on Node.js; the deprecated middleware.ts is gone,
 // so the CSP and the host routing have one entry.
 test('the proxy is src/proxy.ts alone, exporting proxy', () => {
   assert.equal(existsSync(new URL('../../middleware.ts', import.meta.url)), false);

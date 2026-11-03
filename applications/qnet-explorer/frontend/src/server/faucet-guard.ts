@@ -1,10 +1,10 @@
 // The admission of a claim on the /testnet faucet (src/app/api/faucet/claim/route.ts), the same on every network: one
 // claim of each token per address a day, windows of each token per client IP and per network block (an IPv4 /24, an
 // IPv6 /48), and an hourly budget per token for everyone. The budget caps what this faucet can move out of the faucet
-// wallet in an hour, so it never crowds the shared Solana client's send lane (SITE-R1-02). Most of it is kept for claims
+// wallet in an hour, so it never crowds the shared Solana client's send lane. Most of it is kept for claims
 // that carry a faucet pass (src/server/faucet-pass.ts: the node cabinet asks for one with the QNet wallet's signed
 // reservation, a few a client and a network block an hour), each wallet one claim of each token a day, so that a few
-// addresses scripting claims at the start of an hour cannot shut the faucet to the people activating a node (SITE M-13).
+// addresses scripting claims at the start of an hour cannot shut the faucet to the people activating a node.
 // The places kept for passes are kept pro rata through the hour: those that claims with a pass have not taken by their
 // share of the hour so far open to any claim, so the hour is not left unused while no one activates, and a claim with a
 // pass later in the hour still finds its part. A claim with a pass may take any free place. A claim's places are taken

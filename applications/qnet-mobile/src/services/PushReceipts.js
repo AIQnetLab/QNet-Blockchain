@@ -4,13 +4,18 @@
  * took it (this device's clock) and what the app did with that epoch's pushes. An answer carries the record of the
  * epochs before its own (`push_receipts`): every push of them that reached this device, so a push missing from it never
  * reached it. A genesis reads it as display data for the node's last miss, never for counting; one of an earlier
- * release ignores it. One small record for the binding, gone with it (PushService.teardownLightNode).
+ * release ignores it. One small record for the binding, gone with it (PushService.teardownLightNode). Beside it an
+ * answer carries, once, why the app's last process ended where Android records it (noteLastExit), for the node's logs.
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { heldBecause } from './AnswerGate';
 import { APP_OUTCOMES } from './LightNode';
+import { lastExit } from './TaskState';
 
 export const PUSH_RECEIPTS_KEY = 'qnet_push_receipts';
+// Why the app's last process ended (TaskState.lastExit): { seenAt, pending: { reason, api, at } | null }, `seenAt` the
+// time of the newest record taken, so none is reported twice.
+export const LAST_EXIT_KEY = 'qnet_last_exit';
 
 // What the app did with an epoch's pushes is one of APP_OUTCOMES; the last word is kept, and 'answered' is never replaced.
 export { APP_OUTCOMES };
@@ -137,4 +142,44 @@ export async function reportFor(nodeId, epoch) {
   return { since, pushes };
 }
 
-export default { noteReceived, noteOutcome, noteHeld, noteAnswered, noteEpochSeen, reportFor };
+// The exit record kept: { seenAt, pending }; nothing seen when it cannot be read.
+async function readExit() {
+  try {
+    const r = JSON.parse((await AsyncStorage.getItem(LAST_EXIT_KEY)) || 'null');
+    if (!r || !natural(r.seenAt)) return { seenAt: 0, pending: null };
+    const p = r.pending;
+    const ok = !!p && typeof p.reason === 'string' && /^[a-z_]{1,20}$/.test(p.reason) && natural(p.api) && natural(p.at);
+    return { seenAt: r.seenAt, pending: ok ? p : null };
+  } catch (_) {
+    return { seenAt: 0, pending: null };
+  }
+}
+
+/**
+ * The exit record the next answer carries, { reason, api, at } or null: Android's newest record of a process of the app
+ * that ended after the last one taken (TaskState.lastExit) replaces one still unreported. Read with every answer, so a
+ * process started in the background reports the one before it too.
+ */
+export async function noteLastExit() {
+  const kept = await readExit();
+  let exit = null;
+  try { exit = await lastExit(kept.seenAt); } catch (_) { exit = null; }
+  if (!exit || exit.at <= kept.seenAt) return kept.pending;
+  try {
+    await AsyncStorage.setItem(LAST_EXIT_KEY, JSON.stringify({ seenAt: exit.at, pending: exit }));
+  } catch (_) { /* the next answer reads it again */ }
+  return exit;
+}
+
+/** An answer that carried the exit record of time `at` was taken: it is not reported again. */
+export async function exitReported(at) {
+  const kept = await readExit();
+  if (!kept.pending || kept.pending.at !== at) return;
+  try {
+    await AsyncStorage.setItem(LAST_EXIT_KEY, JSON.stringify({ seenAt: kept.seenAt, pending: null }));
+  } catch (_) { /* reported again with the next answer */ }
+}
+
+export default {
+  noteReceived, noteOutcome, noteHeld, noteAnswered, noteEpochSeen, reportFor, noteLastExit, exitReported,
+};

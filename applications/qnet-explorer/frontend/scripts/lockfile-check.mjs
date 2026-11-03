@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// The lockfile gate of the explorer workspace (SITE-R4-DEP-01): every package that the workspace lockfile
+// The lockfile gate of the explorer workspace: every package that the workspace lockfile
 // installs pins its tarball, a registry.npmjs.org URL and a sha512 integrity, so `npm ci` refuses any other
-// bytes for it, whatever registry or proxy the host is configured with. The deploy scripts run it before
+// bytes for it, whatever registry or proxy the host is configured with. The deploy script runs it before
 // every `npm ci`; src/lib/__tests__/dependency-audit.test.mjs runs the same function.
 //
 // An entry without `integrity` is installed by version alone and checked only against the configured

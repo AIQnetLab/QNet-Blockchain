@@ -1,7 +1,10 @@
-// The final geometry while a value loads (B-SPEC 3.13): a box of the content's size with a faint line, no shimmer and
+'use client';
+
+// The final geometry while a value loads: a box of the content's size with a faint line, no shimmer and
 // no spinner, so nothing moves when the content arrives. Hidden from screen readers; the page says what it waits for.
 
 import type { CSSProperties } from 'react';
+import { useT } from '@/i18n/client';
 
 interface SkeletonProps {
   // The content's width and line height, as CSS lengths ("12ch", "100%").
@@ -21,5 +24,6 @@ export default function Skeleton({ width = '10ch', lines = 1, block = false }: S
 
 // An empty value: "—" in Fog, where a value will stand.
 export function Dash() {
-  return <span className="dash" aria-label="Not known">—</span>;
+  const t = useT();
+  return <span className="dash" aria-label={t('not_known')}>—</span>;
 }

@@ -14,8 +14,10 @@
  *
  * InfoField: the label over its value, for what is too long to share a line. `mono`: an id, an address or a hash, left
  * to right in the mono face; `fit`: one line that shrinks to half its size; `middle`: one line shortened in its middle
- * (a 64-character hash, copied whole); otherwise the value wraps. `onCopy`: a tap copies it, and the Copy act at the end
- * of the label line answers Copied. With children in place of a value: the label over a box of the caller's.
+ * (a 64-character hash, copied whole); otherwise the value wraps. `copy`: the text a tap on the field copies, as every
+ * copy is made (components/ui/Copyable: the copy mark at the end of the value's line, Copied in the value's place for a
+ * moment); a `fit` value that does not fit beside the mark even at half its size is shortened in its middle. With
+ * children in place of a value: the label over a box of the caller's.
  *
  * SettingRow: a setting's title and what it is set to, on one line, the whole row a target that opens a picker or does
  * the row's one thing; the value in Signal at the end, a line about the setting under the title. `host`: the title is a
@@ -24,11 +26,14 @@
  * LinkRow: a full-width row that does one thing (Manage tokens, Change password, a recent page, a picker's option): its
  * title, a note under it, a value or an act at its end. A chosen option has a Signal bar at its start.
  *
- * A value stays selectable (a long press copies a block number or an amount), except a hash shortened in its middle.
+ * A value stays selectable (a long press copies a block number or an amount), except a hash shortened in its middle and
+ * a value a tap copies whole.
+ * Inside a section (components/ui/Section) every row runs to the card's edges, its hairline across the whole card.
  */
-import React from 'react';
+import React, { useContext } from 'react';
 import { Pressable, Text, View } from 'react-native';
-import Action from './ui/Action';
+import Copyable from './ui/Copyable';
+import { SectionContext, sectionStyles } from './ui/Section';
 import { tr } from '../i18n';
 import { MONO_ADVANCE, color, size, space, themed } from '../theme';
 
@@ -47,10 +52,12 @@ export const FIT_ROOM = 240;
 // Beside a figure the label gives way at this rate of the figure's, so it reaches its smallest just as the figure does.
 const LABEL_YIELD = (1 - LABEL_MIN_SCALE) / (1 - FIT_MIN_SCALE);
 
+// ok: settled or fine (Mint); quiet: on its way (Fog).
 export const TONES = Object.freeze({
   default: color.paper,
   accent: color.signal,
-  ok: color.paper,
+  ok: color.mint,
+  quiet: color.fog,
   warn: color.ember,
   bad: color.ember,
 });
@@ -104,6 +111,7 @@ export function figureFitsIn(value, room, px = VALUE_SIZE) {
 export const FIGURE_LINE = Object.freeze(line(FIT_MIN_SCALE));
 
 export function InfoRow({ label, value, tone = 'default', ltr = false, fit = false, total = false, divider = true, testID }) {
+  const inSection = useContext(SectionContext);
   const parts = (Array.isArray(value) ? value : [value]).map(shown);
   if (fit && !parts.every((p) => figureFits(label, p))) {
     return <InfoField label={label} value={parts.join(' ')} tone={tone} ltr={ltr} figure divider={divider} testID={testID} />;
@@ -115,7 +123,7 @@ export function InfoRow({ label, value, tone = 'default', ltr = false, fit = fal
     </Text>
   ));
   return (
-    <View style={[s.row, parts.length > 1 && s.rowTop, !divider && s.first]} accessible>
+    <View style={[s.row, parts.length > 1 && s.rowTop, !divider && s.first, inSection && sectionStyles.bleed]} accessible>
       <Text style={[s.label, fit && s.labelBesideFigure, total && s.totalLabel]} {...line(LABEL_MIN_SCALE)}>{label}</Text>
       {values.length > 1 ? <View style={s.values}>{values}</View> : values[0]}
     </View>
@@ -123,57 +131,39 @@ export function InfoRow({ label, value, tone = 'default', ltr = false, fit = fal
 }
 
 export function InfoField({
-  label, value, mono = false, fit = false, middle = false, tone = null, ltr = false, onCopy = null, copied = false,
+  label, value, mono = false, fit = false, middle = false, tone = null, ltr = false, copy = null,
   figure = false, divider = true, t = tr, testID, copyTestID, children = null,
 }) {
-  // A shortened hash is not selectable: the system would show it whole only by dropping the shortening.
-  const lines = fit ? line(FIT_MIN_SCALE) : (middle ? { numberOfLines: 1, ellipsizeMode: 'middle', maxFontSizeMultiplier: ROW_FONT_CAP } : null);
+  const inSection = useContext(SectionContext);
   const boxed = children !== null && children !== undefined;
-  const labelText = <Text style={[s.label, s.fieldLabel]} {...line(LABEL_MIN_SCALE)}>{label}</Text>;
-  const body = (
-    <>
-      {onCopy ? (
-        <View style={s.labelLine}>
-          {labelText}
-          <Action
-            kind="act"
-            label={copied ? t('common_copied') : t('common_copy')}
-            labels={[t('common_copy'), t('common_copied')]}
-            done={copied}
-            onPress={onCopy}
-            align="end"
-            style={s.copy}
-          />
-        </View>
-      ) : labelText}
-      {boxed ? children : (
-        <Text
-          style={[s.fieldValue, figure && s.figure, tone && { color: TONES[tone] }, (mono || ltr || figure) && s.ltr, mono && s.mono]}
-          selectable={!middle}
-          {...lines}
-          testID={testID}
-        >
-          {shown(value)}
-        </Text>
-      )}
-    </>
-  );
-  const style = [s.field, !divider && s.first];
-  // One element for a screen reader, unless the box is one of its own (a scrolled input stays reachable).
-  return onCopy ? (
-    <Pressable
-      style={({ pressed }) => [style, pressed && s.pressed]}
-      onPress={onCopy}
-      accessibilityRole="button"
-      accessibilityHint={t('common_tap_to_copy')}
-      testID={copyTestID}
+  const copies = copy !== null && copy !== undefined;
+  // A value beside the copy mark that does not fit even at half its size (a 64-character contract on a narrow phone) is
+  // shortened in its middle, never at its end, where a look-alike differs.
+  let lines = null;
+  if (fit) lines = copies ? { ...line(FIT_MIN_SCALE), ellipsizeMode: 'middle' } : line(FIT_MIN_SCALE);
+  else if (middle) lines = { numberOfLines: 1, ellipsizeMode: 'middle', maxFontSizeMultiplier: ROW_FONT_CAP };
+  const head = <Text style={[s.label, s.fieldLabel, !boxed && s.fieldLabelOverValue]} {...line(LABEL_MIN_SCALE)}>{label}</Text>;
+  // Not selectable when shortened (the system would show it whole only by dropping the shortening) or copied whole by a tap.
+  const body = boxed ? children : (
+    <Text
+      style={[s.fieldValue, figure && s.figure, tone && { color: TONES[tone] }, (mono || ltr || figure) && s.ltr, mono && s.mono]}
+      selectable={!middle && !copies}
+      {...lines}
+      testID={testID}
     >
-      {body}
-    </Pressable>
-  ) : <View style={style} accessible={!boxed}>{body}</View>;
+      {shown(value)}
+    </Text>
+  );
+  const style = [s.field, !divider && s.first, inSection && sectionStyles.bleed];
+  // One element for a screen reader, unless the box is one of its own (a scrolled input stays reachable). A copied value
+  // keeps its label above the line the copy mark shares with it.
+  return copies ? (
+    <Copyable text={copy} label={head} style={style} scale={false} t={t} testID={copyTestID}>{body}</Copyable>
+  ) : <View style={style} accessible={!boxed}>{head}{body}</View>;
 }
 
 export function SettingRow({ title, subtitle, value, onPress, host = false, subtitleLines, ltrSubtitle = false, accessibilityLabel, testID }) {
+  const inSection = useContext(SectionContext);
   const titleLines = host ? { numberOfLines: 1, ellipsizeMode: 'middle', maxFontSizeMultiplier: ROW_FONT_CAP } : line(LABEL_MIN_SCALE);
   const hasValue = value !== undefined && value !== null;
   const content = (
@@ -189,10 +179,10 @@ export function SettingRow({ title, subtitle, value, onPress, host = false, subt
       ) : null}
     </>
   );
-  if (!hasValue || !onPress) return <View style={s.setting}>{content}</View>;
+  if (!hasValue || !onPress) return <View style={[s.setting, inSection && sectionStyles.bleed]}>{content}</View>;
   return (
     <Pressable
-      style={({ pressed }) => [s.setting, pressed && s.pressed]}
+      style={({ pressed }) => [s.setting, inSection && sectionStyles.bleed, pressed && s.pressed]}
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel}
@@ -210,6 +200,7 @@ export function LinkRow({
   const titleProps = middle ? { numberOfLines: 1, ellipsizeMode: 'middle', maxFontSizeMultiplier: ROW_FONT_CAP } : { numberOfLines: titleLines };
   // A choice row keeps room for the Signal bar at its start, chosen or not, so its title never moves.
   const choice = accessibilityRole === 'radio';
+  const inSection = useContext(SectionContext);
   const content = (
     <>
       {selected ? <View style={s.chosen} /> : null}
@@ -221,10 +212,10 @@ export function LinkRow({
       {end}
     </>
   );
-  if (!onPress && !onLongPress) return <View style={[s.link, choice && s.choice]} testID={testID}>{content}</View>;
+  if (!onPress && !onLongPress) return <View style={[s.link, inSection && sectionStyles.bleed, choice && s.choice]} testID={testID}>{content}</View>;
   return (
     <Pressable
-      style={({ pressed }) => [s.link, choice && s.choice, pressed && s.pressed]}
+      style={({ pressed }) => [s.link, inSection && sectionStyles.bleed, choice && s.choice, pressed && s.pressed]}
       onPress={onPress}
       onLongPress={onLongPress}
       accessibilityRole={accessibilityRole}
@@ -298,20 +289,13 @@ const s = themed((type) => ({
   fieldLabel: {
     flexShrink: 1,
   },
-  // The label and the Copy act share the line while both fit; otherwise the act takes the next line, at its end.
-  labelLine: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
-    columnGap: GAP,
-  },
-  copy: {
-    minHeight: 0,
-    marginStart: 'auto',
+  // The room between a label and its value is the label's, so the value's line is the text alone and a copy mark
+  // centred on it is centred on the value.
+  fieldLabelOverValue: {
+    marginBottom: space.s4,
   },
   fieldValue: {
     ...type('body', VALUE_SIZE),
-    marginTop: space.s4,
     color: TONES.default,
     alignSelf: 'flex-start',
   },

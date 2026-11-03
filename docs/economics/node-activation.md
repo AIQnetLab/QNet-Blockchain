@@ -160,10 +160,12 @@ through the site's activation record (`applications/qnet-explorer/frontend/src/s
 one row per QNet Blockchain wallet in the explorer database; [block explorer](../applications/explorer.md#activation-registry)):
 
 - **Before a burn, every source.** A client offers or builds a burn only when every source it has answered "none":
-  the network (a node of either type for the wallet, `/api/v1/verify-activation` and the Light node's status), the
-  site's record of the wallet, the extension when the wallet is the extension's, and the search of the wallet's own
-  Solana address for an activation burn (the extension's kept search, or the site's). A source that is loading,
-  locked or unreachable means no burn, and the client says which check did not answer.
+  the network (a node of either type for the wallet, `/api/v1/verify-activation` and the Light node's status; "none"
+  only when two genesis nodes at the network's height say so, never on one node's word), the site's record of the
+  wallet, the extension when the wallet is the extension's, and the search of the wallet's own Solana address for an
+  activation burn (the extension's kept search, or the site's, which a payment address's reservation needs: without
+  the wallet's Solana address the site holds nothing). A source that is loading, locked or unreachable means no burn,
+  and the client says which check did not answer.
 - **A reservation per wallet, signed by the wallet.** The payment key and the extension sign a burn only under the
   wallet's reservation, and only the wallet itself can make one: the reservation carries the wallet's ML-DSA-65
   signature (FIPS 204 context `QNET_OFFCHAIN_MSG_v1`, inside the envelope the wallets build for aiqnet.io) over
@@ -175,10 +177,14 @@ one row per QNet Blockchain wallet in the explorer database; [block explorer](..
   hold a wallet nor make a burn in its name. One statement in the database takes it (`INSERT … ON CONFLICT (wallet)
   DO UPDATE … WHERE` the row is an expired reservation without a burn), so two browsers or devices racing for one
   wallet cannot both hold it. It lasts 10 minutes, and a client signs only while at least 2 minutes of it are left.
+  The same signed reservation sent again while it lives (a retry whose answer was lost, a second tab of the same
+  payment) gets the reservation it made, read from the row that keeps it; the cabinet gives back one answered with less
+  than 2 minutes left and holds the wallet anew.
   The burn is announced under it before it is sent: the extension's with a proof made with the wallet's own keys, a
   payment key's with its owner bind v2 of the reserved wallet's light node, which the site verifies against the key of
   the wallet's signed reservation. An announced burn that Solana still does not know 10 minutes later can no longer
-  land and frees the wallet.
+  land and frees the wallet. The site takes that from two of its reads at least 3 minutes apart that both find the
+  burn nowhere, so one lagging Solana answer frees no wallet.
 - **A verified, permanent record.** A burn becomes the wallet's record only once Solana holds it final and valid (the
   fee payer is the burner and signed; exactly one burn of the 1DEV mint by that burner of exactly the amount; exactly
   one `QNET_NODE_TYPE:LIGHT` or `QNET_NODE_TYPE:SUPER` memo of the node type) and with a proof that it is the
@@ -421,7 +427,8 @@ any node type other than `light` and requires `from == wallet_address`:
 - by the node cabinet after its payment key's burn, with the wallet's consent that QNet Wallet signed on its
   link sheet ([QNet Link](../protocols/qnet-link-v1.md) section 14) and the owner bind v2 the payment key signed
   when it burned, which the site keeps with the wallet's record and adds to the consent, from any browser where
-  the wallet is connected;
+  the wallet is connected; QNet Wallet sends the same consent to the site's register route itself as soon as it gives
+  it, and the route takes the two as one registration;
 - or by the browser extension after its own burn, with both signed by the extension.
 
 The messages are in [light node messages](../protocols/light-node-messages.md) section 4. The submit endpoint

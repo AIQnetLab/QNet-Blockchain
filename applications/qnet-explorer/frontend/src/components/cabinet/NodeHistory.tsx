@@ -1,7 +1,7 @@
 'use client';
 
-// /node/history: the node's epochs one by one, newest first, from the wallet's first registration on (owner, 29.09 and
-// 11.10): when each began and ended, counted or not (a super node outside the network's admission: not admitted, never
+// /node/history: the node's epochs one by one, newest first, from the wallet's first registration on:
+// when each began and ended, counted or not (a super node outside the network's admission: not admitted, never
 // not counted), the node balance it added and the transaction that moved it to the wallet
 // (src/server/cabinet/node-proxy.ts history, with the explorer's archive), a page at a time with Show more. Under
 // each epoch not counted, why, as the light node's shard owners keep it, in the Device tab's words (last-miss.ts
@@ -10,7 +10,7 @@
 // on. The Overview shows the newest rows of the same table (Epochs). Above them, here and with the Overview's node
 // balance, the total earned (Earned).
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Action from '@/components/ui/Action';
 import DataTable, { type Column } from '@/components/ui/DataTable';
 import EntityLink, { Amount, EpochNumber } from '@/components/ui/EntityLink';
@@ -18,7 +18,7 @@ import { Readout, Readouts } from '@/components/ui/Readouts';
 import { Failed, Waiting } from '@/components/ui/RequestState';
 import { Dash } from '@/components/ui/Skeleton';
 import { Status, type Tone } from '@/components/ui/Status';
-import { t, type MessageKey } from '@/lib/texts';
+import { type MessageKey, type T } from '@/lib/texts';
 import { TAB_HREF } from '@/lib/cabinet/tabs';
 import { at, span as timeSpan } from '@/lib/format';
 import { useEpochList, useNodeHistory, type EpochList } from '@/hooks/useNodeStatus';
@@ -30,6 +30,7 @@ import { useCabinet } from './CabinetProvider';
 import { NoNode } from './NextSteps';
 import { MissText } from './NodeStatus';
 import { Group, Notes } from './parts';
+import { useI18n } from '@/i18n/client';
 
 const RESULT_TEXT: Record<HistoryResult, MessageKey> = {
   counted: 'history_counted',
@@ -52,22 +53,22 @@ const RESULT_TONE: Record<HistoryResult, Tone> = {
   unknown: 'quiet',
 };
 
-export const resultText = (result: HistoryResult): string => t(RESULT_TEXT[result]);
+export const resultText = (result: HistoryResult, t: T): string => t(RESULT_TEXT[result]);
 
 const AMOUNT = new Intl.NumberFormat('en', { maximumFractionDigits: 9 });
 
 // When an epoch began and ended, in the viewer's own time zone, the end's day only when it is another than the start's.
-function span({ startedAt: start, endedAt: end }: HistoryRow): string {
-  if (start !== null && end !== null) return timeSpan(start, end);
-  return start === null && end === null ? '—' : t('history_span', { start: start === null ? '—' : at(start), end: end === null ? '—' : at(end) });
+function span({ startedAt: start, endedAt: end }: HistoryRow, t: T): string {
+  if (start !== null && end !== null) return timeSpan(start, end, t);
+  return start === null && end === null ? '—' : t('history_span', { start: start === null ? '—' : at(start, t), end: end === null ? '—' : at(end, t) });
 }
 
 // The epoch and its result first, so a phone (360 to 430 px) shows both without scrolling sideways; when, what it added
 // and the move after them.
-const COLUMNS: Column<HistoryRow>[] = [
+const columns = (t: T): Column<HistoryRow>[] => [
   { key: 'epoch', header: t('history_col_epoch'), width: 76, cell: (row) => <EpochNumber epoch={row.epoch} /> },
-  { key: 'result', header: t('history_col_result'), width: 248, cell: (row) => <Status tone={RESULT_TONE[row.result]}>{resultText(row.result)}</Status> },
-  { key: 'time', header: t('history_col_time'), min: 248, cell: (row) => span(row) },
+  { key: 'result', header: t('history_col_result'), width: 248, cell: (row) => <Status tone={RESULT_TONE[row.result]}>{resultText(row.result, t)}</Status> },
+  { key: 'time', header: t('history_col_time'), min: 248, cell: (row) => span(row, t) },
   { key: 'amount', header: t('history_col_amount'), width: 200, align: 'right', cell: (row) => (row.amountQnc === null ? <Dash /> : <Amount value={AMOUNT.format(row.amountQnc)} />) },
   { key: 'tx', header: t('history_col_tx'), width: 132, align: 'right', cell: (row) => (row.claimTx ? <EntityLink kind="tx" value={row.claimTx} /> : <Dash />) },
 ];
@@ -75,12 +76,14 @@ const COLUMNS: Column<HistoryRow>[] = [
 // The epochs as one table: fixed columns and rows; `reasons` (History): under each epoch not counted whose miss an owner
 // keeps, why, as one line across the row. The Overview names the latest miss beside the device's state instead.
 function Table({ rows, reasons = false, loading = 6 }: { rows: HistoryRow[] | null; reasons?: boolean; loading?: number }) {
+  const { t } = useI18n();
   const { devicePlatform } = useCabinet();
+  const cols = useMemo(() => columns(t), [t]);
   return (
     <DataTable
       className="cab-epochs"
       caption={t('history_epochs')}
-      columns={COLUMNS}
+      columns={cols}
       rows={rows}
       rowKey={(row) => String(row.epoch)}
       loadingRows={loading}
@@ -93,15 +96,17 @@ function Table({ rows, reasons = false, loading = 6 }: { rows: HistoryRow[] | nu
 // Show more while older epochs follow: the waiting line while it reads, and after a read that failed the error with Try
 // again. Older rows are added under the ones shown.
 function More({ list }: { list: EpochList }) {
+  const { t, say } = useI18n();
   if (!list.more) return null;
   if (list.phase === 'reading') return <div className="cab-more"><Waiting>{t('history_more_loading')}</Waiting></div>;
-  if (list.phase === 'failed') return <div className="cab-more"><Failed action={{ label: t('try_again'), onClick: list.showMore }}>{t('history_more_failed')}</Failed></div>;
+  if (list.phase === 'failed') return <div className="cab-more"><Failed action={{ label: t('try_again'), onClick: list.showMore }}>{say('history_more_failed')}</Failed></div>;
   return <div className="cab-more"><button type="button" className="btn btn-text" onClick={list.showMore}>{t('history_more')}</button></div>;
 }
 
 // Every epoch, a page at a time, with the notes its rows call for: an unreadable epoch the nodes no longer keep (as old
 // as EPOCHS_KEPT behind the newest listed) is told apart from one they did not give now.
 function AllEpochs({ nodeId, first }: { nodeId: string; first: HistoryView }) {
+  const { t, say } = useI18n();
   const { viewOnly } = useCabinet();
   const list = useEpochList(nodeId, first, viewOnly);
   const has = (result: HistoryResult) => list.rows.some((r) => r.result === result);
@@ -112,11 +117,11 @@ function AllEpochs({ nodeId, first }: { nodeId: string; first: HistoryView }) {
       <Table rows={list.rows} reasons />
       <More list={list} />
       <Notes>
-        <p className="note">{t('history_settled_note')}</p>
-        {has('unchecked') && <p className="note">{t('history_unchecked_note')}</p>}
-        {has('not_admitted') && <p className="note">{t('history_not_admitted_note')}</p>}
-        {unknown.some((r) => newest - r.epoch < EPOCHS_KEPT) && <p className="note">{t('history_unknown_note')}</p>}
-        {unknown.some((r) => newest - r.epoch >= EPOCHS_KEPT) && <p className="note">{t('history_retention_note')}</p>}
+        <p className="note">{say('history_settled_note')}</p>
+        {has('unchecked') && <p className="note">{say('history_unchecked_note')}</p>}
+        {has('not_admitted') && <p className="note">{say('history_not_admitted_note')}</p>}
+        {unknown.some((r) => newest - r.epoch < EPOCHS_KEPT) && <p className="note">{say('history_unknown_note')}</p>}
+        {unknown.some((r) => newest - r.epoch >= EPOCHS_KEPT) && <p className="note">{say('history_retention_note')}</p>}
         {first.registeredEpoch === null && <p className="note">{t('history_no_start')}</p>}
         {!first.archived && <p className="note">{t('history_no_archive')}</p>}
       </Notes>
@@ -127,9 +132,10 @@ function AllEpochs({ nodeId, first }: { nodeId: string; first: HistoryView }) {
 // The node's epochs as the network reports them: every one (History) or the newest six (the Overview, with the way to
 // every epoch). While they are read, the table stands with empty rows at its final height.
 export function Epochs({ nodeId, show }: { nodeId: string | null; show: 'all' | 'recent' }) {
+  const { t, say } = useI18n();
   const { viewOnly } = useCabinet();
   const { state, retry } = useNodeHistory(nodeId, viewOnly);
-  if (state.phase === 'unavailable') return <Failed action={{ label: t('try_again'), onClick: retry }}>{t('history_unavailable')}</Failed>;
+  if (state.phase === 'unavailable') return <Failed action={{ label: t('try_again'), onClick: retry }}>{say('history_unavailable')}</Failed>;
   const view = state.phase === 'ok' ? state.value : null;
   if (show === 'recent') return <Table rows={view ? view.rows.slice(0, 6) : null} />;
   return view && nodeId ? <AllEpochs nodeId={nodeId} first={view} /> : <Table rows={null} loading={10} />;
@@ -137,6 +143,7 @@ export function Epochs({ nodeId, show }: { nodeId: string | null; show: 'all' | 
 
 // The Overview's newest epochs, with the way to every epoch; empty rows while `nodeId` is not known.
 export function RecentEpochs({ nodeId }: { nodeId: string | null }) {
+  const { t } = useI18n();
   return (
     <Group title={t('history_recent')} meta={<Action href={TAB_HREF.history}>{t('history_see_all')}</Action>}>
       <Epochs nodeId={nodeId} show="recent" />
@@ -153,6 +160,7 @@ export const EARNED_RETRIES = 3;
 // names the history's own balance as a third reading). Public chain data, the same for a connected wallet and an address
 // only viewed. Dashes while the history is read the first time.
 export function Earned({ nodeId, balanceNano }: { nodeId: string; balanceNano: string | null }) {
+  const { t } = useI18n();
   const { viewOnly } = useCabinet();
   const { state, refresh } = useNodeHistory(nodeId, viewOnly);
   const [tries, setTries] = useState(0);
@@ -174,11 +182,13 @@ export function Earned({ nodeId, balanceNano }: { nodeId: string; balanceNano: s
   const total = shown?.kind === 'total' ? shown : null;
   const sub = shown?.kind === 'reading' ? t('earned_reading') : shown?.kind === 'unknown' ? t('earned_unknown') : undefined;
   const qnc = (nano: string | null | undefined) => (nano == null ? null : formatQnc(nano));
+  // History's own balance shows once read, also while the moves cannot be totalled.
+  const balance = shown?.kind === 'total' || shown?.kind === 'unknown' ? shown.balanceNano : null;
   return (
     <Readouts cols={balanceNano === null ? 3 : 2} size="tool">
       <Readout label={t('ro_total_earned')} value={qnc(total?.totalNano)} amount={{}} sub={sub} wide />
       <Readout label={t('ro_moved')} value={qnc(total?.movedNano)} amount={{}} wide />
-      {balanceNano === null && <Readout label={t('balance_title')} value={qnc(total?.balanceNano)} amount={{}} wide />}
+      {balanceNano === null && <Readout label={t('balance_title')} value={qnc(balance)} amount={{}} wide />}
     </Readouts>
   );
 }

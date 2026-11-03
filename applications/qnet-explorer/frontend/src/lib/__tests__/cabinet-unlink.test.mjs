@@ -1,4 +1,4 @@
-// Unlinking the light node's device with the QNet extension (contract of 04.10, section 1.9; docs/protocols/qnet-link-v1.md
+// Unlinking the light node's device with the QNet extension (docs/protocols/qnet-link-v1.md
 // section 14.10; unlinkWithExtension in src/lib/qnet-link.ts): the one method, no parameters, the result checked as the
 // `unlink` answer for the wallet the page shows, and what the page says of each answer and failure. Moving a node
 // balance is cabinet-claim.test.mjs. Run: npm run test:wallet

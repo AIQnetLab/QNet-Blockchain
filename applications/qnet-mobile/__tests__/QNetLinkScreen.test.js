@@ -63,7 +63,7 @@ describe('a connect request', () => {
       ADDRESSES.qnet, ADDRESSES.solana]) {
       expect(shown).toContain(s);
     }
-    expect(QNetLink.openSession).toHaveBeenCalledWith(CONNECT, { cancelled: expect.any(Function) });
+    expect(QNetLink.openSession).toHaveBeenCalledWith(CONNECT, { cancelled: expect.any(Function), onRetry: expect.any(Function) });
     expect(QNetLink.prepareOffer).toHaveBeenCalledWith(CONNECT, { wallet: props.wallet, session: expect.any(Object), node: null });
     expect(QNetLink.deliverAnswer).not.toHaveBeenCalled();
     await act(async () => { tree.unmount(); });
@@ -104,13 +104,57 @@ describe('a connect request', () => {
     await act(async () => { await press(button(tree, 'Confirm')); });
     await act(async () => { const b = button(tree, 'Confirm'); if (b) await press(b); }); // a second tap shares nothing more
     expect(QNetLink.performIntent).toHaveBeenCalledTimes(1);
-    expect(QNetLink.performIntent.mock.calls[0]).toEqual([CONNECT, OFFER, { node: null }]);
+    expect(QNetLink.performIntent.mock.calls[0]).toEqual([CONNECT, OFFER, { node: null, session: expect.any(Object), onProgress: expect.any(Function) }]);
     expect(QNetLink.deliverAnswer).toHaveBeenCalledWith(CONNECT, expect.any(Object), OK, expect.any(Object));
     const shown = texts(tree);
     expect(shown).toContain(t('link_result_connect'));
     expect(shown).toContain(t('link_delivered'));
     expect(buttons(tree).map((b) => b.label)).toEqual(['Close']);
     await act(async () => { tree.unmount(); });
+  });
+
+  // An answer that expired or failed on its way never shows "The addresses were sent to the website that showed the
+  // link." above the line that says it did not arrive: one line, never two saying opposite things.
+  it('a connect whose answer did not reach the site says that in one line, never that the addresses were sent', async () => {
+    for (const [ended, warning] of [['expired', null], ['failed', null], ['conflict', 'link_delivery_conflict']]) {
+      QNetLink.deliverAnswer.mockResolvedValueOnce(ended);
+      const onOutcome = jest.fn();
+      const tree = await mount(CONNECT, { onOutcome });
+      await wait(ARMED);
+      await act(async () => { await press(button(tree, 'Confirm')); });
+      await wait(0);
+      const shown = texts(tree);
+      expect([ended, shown.includes(t('link_result_connect_missed')), shown.includes(t('link_result_connect'))]).toEqual([ended, true, false]);
+      for (const key of ['link_delivery_expired', 'link_delivery_failed']) expect([ended, key, shown.includes(t(key))]).toEqual([ended, key, false]);
+      if (warning) expect(shown).toContain(t(warning));
+      // Shown again after a lock it says the same: how the delivery ended went with the outcome.
+      const kept = onOutcome.mock.calls[onOutcome.mock.calls.length - 1][0];
+      expect(kept.delivery).toBe(ended);
+      await act(async () => { tree.unmount(); });
+      const again = await mount(CONNECT, { settled: true, settledOutcome: kept });
+      expect([ended, texts(again).includes(t('link_result_connect_missed')), texts(again).includes(t('link_result_connect'))])
+        .toEqual([ended, true, false]);
+      await act(async () => { again.unmount(); });
+    }
+  });
+
+  // Through the native inbox, which writes it in every build (LinkInboxTest.kt noteLine), never the JS logger.
+  it('says in the log the request it shows, by intent and what it offers, never the session or an address', async () => {
+    const { NativeModules } = require('react-native');
+    const note = jest.fn();
+    NativeModules.QNetLinkInbox = { note };
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    try {
+      const tree = await mount(CONNECT);
+      expect(note.mock.calls).toEqual([['request_shown', { intent: 'connect', offer: 'connect' }]]);
+      expect(JSON.stringify(note.mock.calls)).not.toContain(CONNECT.id);
+      expect(JSON.stringify(note.mock.calls)).not.toContain(ADDRESSES.qnet);
+      expect(info.mock.calls.join('\n')).not.toContain('[LINK]');
+      await act(async () => { tree.unmount(); });
+    } finally {
+      delete NativeModules.QNetLinkInbox;
+      info.mockRestore();
+    }
   });
 
   it('a request that has expired by the time of Confirm performs nothing', async () => {
@@ -205,16 +249,94 @@ describe('a slow network', () => {
     expect(cancelled()).toBe(true);
   });
 
-  it('an offer the network has not answered yet is read again, still loading, and the request comes up', async () => {
+  it('an offer the network has not answered yet is read again, still loading and saying so, and the request comes up', async () => {
     QNetLink.prepareOffer.mockReset();
     QNetLink.prepareOffer.mockResolvedValueOnce({ kind: 'unavailable', error: 'NETWORK' }).mockResolvedValue(OFFER);
     const tree = await mount(CONNECT);
-    expect(texts(tree)).toContain(t('link_loading'));
+    expect(texts(tree)).toContain(t('link_loading_slow'));
+    expect(texts(tree)).not.toContain(t('link_loading'));
     expect(texts(tree)).not.toContain(t('link_unavailable_title'));
     await wait(1100);
     expect(QNetLink.prepareOffer).toHaveBeenCalledTimes(2);
     expect(texts(tree)).toContain(ADDRESSES.qnet);
     expect(texts(tree)).not.toContain(t('link_unavailable_title'));
+    await act(async () => { tree.unmount(); });
+  });
+
+  // While the request loads, a try with no answer makes the line say that the network has not answered and the screen
+  // tries again; an answer brings the plain line back.
+  it('says the network has not answered after a try with none, and goes back to the plain line on an answer', async () => {
+    let open;
+    QNetLink.openSession.mockImplementation((link, { onRetry }) => {
+      onRetry();
+      return new Promise((r) => { open = r; });
+    });
+    let offer;
+    QNetLink.prepareOffer.mockImplementation(() => new Promise((r) => { offer = r; }));
+    const tree = await mount(CONNECT);
+    expect(texts(tree)).toContain(t('link_loading_slow'));
+    expect(buttons(tree).map((b) => b.label)).toEqual(['Close']);
+    await act(async () => { open({ expiresAt: Date.now() + 500000 }); });
+    await wait(0);
+    expect(texts(tree)).toContain(t('link_loading'));
+    expect(texts(tree)).not.toContain(t('link_loading_slow'));
+    await act(async () => { offer(OFFER); });
+    await wait(0);
+    expect(texts(tree)).toContain(ADDRESSES.qnet);
+    expect(texts(tree)).not.toContain(t('link_loading_slow'));
+    await act(async () => { tree.unmount(); });
+    // Its own words in every language.
+    const translations = require('../src/i18n/translations').default;
+    for (const [lang, table] of Object.entries(translations)) {
+      expect([lang, typeof table.link_loading_slow === 'string' && table.link_loading_slow !== table.link_loading]).toEqual([lang, true]);
+    }
+  });
+});
+
+// One wallet, one node type: the sheet shows the request at once, and whether the wallet has a node of the other type is
+// read meanwhile (QNetLink.otherNodeHint); the site and the chain refuse such a node in any case.
+describe('the other node type, read after the request shows', () => {
+  const RESERVE = { id: 'e'.repeat(32), sitePub: 'd'.repeat(43), intent: 'reserve', reqHash: 'f'.repeat(64) };
+  const RESERVE_OFFER = { kind: 'reserve', qnet: ADDRESSES.qnet, nodeId: 'light_mobile_0123456789abcdef', burner: ADDRESSES.solana };
+  const silentNode = () => {
+    const node = { answer: null };
+    node.otherNode = jest.fn(() => new Promise((r) => { node.answer = r; }));
+    node.record = jest.fn(async () => null);
+    return node;
+  };
+
+  it('the request shows while the genesis nodes say nothing; their word that the wallet has a super node refuses it', async () => {
+    QNetLink.prepareOffer.mockResolvedValue(RESERVE_OFFER);
+    const node = silentNode();
+    const tree = await mount(RESERVE, { node });
+    expect(texts(tree)).toContain(t('link_reserve_body'));
+    expect(button(tree, 'Confirm')).toBeDefined();
+    expect(node.otherNode).toHaveBeenCalledWith(ADDRESSES.qnet);
+    await act(async () => { node.answer(true); });
+    await wait(0);
+    expect(texts(tree)).toContain(t('link_err_NODE_OTHER'));
+    expect(button(tree, 'Confirm')).toBeUndefined();
+    await act(async () => { await button(tree, 'Close').props.onPress(); });
+    expect(QNetLink.deliverAnswer).toHaveBeenCalledWith(RESERVE, expect.any(Object), { status: 'error', error: 'NODE_OTHER' });
+    expect(QNetLink.performIntent).not.toHaveBeenCalled();
+    await act(async () => { tree.unmount(); });
+  });
+
+  it('no word from them, or a word after the user decided, changes nothing', async () => {
+    QNetLink.prepareOffer.mockResolvedValue(RESERVE_OFFER);
+    const quiet = silentNode();
+    let tree = await mount(RESERVE, { node: quiet });
+    await act(async () => { quiet.answer(null); });
+    await wait(0);
+    expect(button(tree, 'Confirm')).toBeDefined();
+    await act(async () => { tree.unmount(); });
+    const late = silentNode();
+    tree = await mount(RESERVE, { node: late });
+    await act(async () => { await button(tree, 'Reject').props.onPress(); });
+    await act(async () => { late.answer(true); });
+    await wait(0);
+    expect(texts(tree)).toContain(t('link_result_rejected'));
+    expect(texts(tree)).not.toContain(t('link_err_NODE_OTHER'));
     await act(async () => { tree.unmount(); });
   });
 });
@@ -245,14 +367,11 @@ describe('refusals', () => {
   });
 });
 
-// R4-MOBLINK-01: the owner learns when the user has the request in front of them (from then on no other link takes its
-// place) and when the screen goes (it closes any prompt it opened); a request that waited says so before Confirm.
-describe('the screen tells its owner when it is up and when it goes', () => {
-  it('onShown on mount, onGone on unmount, and the note for a request that arrived meanwhile', async () => {
-    const onShown = jest.fn();
+// The owner learns when the screen goes (it closes any prompt it opened); a request that waited says so before Confirm.
+describe('the screen tells its owner when it goes', () => {
+  it('onGone on unmount, and the note for a request that arrived meanwhile', async () => {
     const onGone = jest.fn();
-    const tree = await mount(CONNECT, { onShown, onGone, afterOther: true });
-    expect(onShown).toHaveBeenCalledTimes(1);
+    const tree = await mount(CONNECT, { onGone, afterOther: true });
     expect(onGone).not.toHaveBeenCalled();
     expect(texts(tree)).toContain(t('link_after_other'));
     await act(async () => { tree.unmount(); });
@@ -299,7 +418,7 @@ describe('what a request can do is reached from this screen only', () => {
     expect(files.filter((f) => /performIntent\(/.test(f.text)).map((f) => f.name).sort())
       .toEqual(['screens/QNetLinkScreen.js', 'services/QNetLink.js']);
     const wallet = files.find((f) => f.name === 'screens/WalletScreen.js').text;
-    expect(wallet).toMatch(/import \{ parseLink, takeInitialUrl \} from '\.\.\/services\/QNetLink';/);
+    expect(wallet).toMatch(/import \{ parseLink \} from '\.\.\/services\/QNetLink';/);
   });
 });
 
@@ -344,6 +463,71 @@ describe('the outcome outlives a lock', () => {
   });
 });
 
+// A decided request may give way to the next link before its answer arrives: the answer is carried to its end with no
+// screen (services/LinkAnswers), and the app says it is on its way wherever the user is.
+describe('an answer on its way', () => {
+  const { answersAway, carryAnswer } = require('../src/services/LinkAnswers');
+
+  it('is made and delivered after its sheet went, and is on its way until the delivery ends, as its sheet says again', async () => {
+    let finish;
+    let delivered;
+    QNetLink.performIntent.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    QNetLink.deliverAnswer.mockImplementationOnce(() => new Promise((resolve) => { delivered = resolve; }));
+    const tree = await mount(CONNECT, { onOutcome: jest.fn() });
+    await wait(ARMED);
+    await act(async () => { press(button(tree, 'Confirm')); });
+    await wait(0);
+    expect(answersAway()).toEqual([CONNECT.id]);
+    await act(async () => { tree.unmount(); }); // the next link took its place
+    await act(async () => { finish(OK); });
+    await wait(0);
+    expect(QNetLink.deliverAnswer).toHaveBeenCalledWith(CONNECT, expect.any(Object), OK, expect.any(Object));
+    expect(answersAway()).toEqual([CONNECT.id]);
+    // Shown again (after a lock) while it is still being sent: it says so.
+    const back = await mount(CONNECT, { settled: true, settledOutcome: OK });
+    expect(texts(back)).toContain(t('link_working_send'));
+    await act(async () => { delivered('delivered'); });
+    await wait(0);
+    expect(answersAway()).toEqual([]);
+    expect(texts(back)).not.toContain(t('link_working_send'));
+    await act(async () => { back.unmount(); });
+  });
+
+  it('a rejection, the answer of a phone with no wallet and the reason a request cannot be offered are carried too', async () => {
+    const seen = [];
+    let delivered = [];
+    QNetLink.deliverAnswer.mockImplementation(() => new Promise((resolve) => { delivered.push(resolve); }));
+    const tree = await mount(CONNECT);
+    await act(async () => { await button(tree, 'Reject').props.onPress(); });
+    seen.push(answersAway());
+    QNetLink.prepareOffer.mockResolvedValueOnce({ kind: 'unavailable', error: 'NO_WALLET' });
+    const none = await mount({ ...CONNECT, id: 'e'.repeat(32) }, { wallet: null });
+    seen.push(answersAway());
+    QNetLink.prepareOffer.mockResolvedValueOnce({ kind: 'unavailable', error: 'WALLET_MISMATCH' });
+    const other = await mount({ ...CONNECT, id: 'f'.repeat(32) });
+    await act(async () => { await button(other, 'Close').props.onPress(); });
+    seen.push(answersAway());
+    expect(seen).toEqual([[CONNECT.id], [CONNECT.id, 'e'.repeat(32)], [CONNECT.id, 'e'.repeat(32), 'f'.repeat(32)]]);
+    await act(async () => { delivered.forEach((resolve) => resolve('failed')); });
+    await wait(0);
+    expect(answersAway()).toEqual([]);
+    delivered = [];
+    QNetLink.deliverAnswer.mockImplementation(async () => 'delivered');
+    for (const tr of [tree, none, other]) await act(async () => { tr.unmount(); });
+  });
+
+  it('another request\'s answer on its way is said on this sheet until it arrives', async () => {
+    let delivered;
+    carryAnswer('e'.repeat(32), new Promise((resolve) => { delivered = resolve; }));
+    const tree = await mount(CONNECT);
+    expect(texts(tree)).toContain(t('link_previous_sending'));
+    await act(async () => { delivered(); });
+    await wait(0);
+    expect(texts(tree)).not.toContain(t('link_previous_sending'));
+    await act(async () => { tree.unmount(); });
+  });
+});
+
 // Revision 2: the link sheet discloses the device check before Confirm and names what happens; the claim sheet names the
 // node whose balance moves (the wallet's light or super node) and shows the amount the app read itself; the check number
 // appears only once the relay took the answer.
@@ -352,6 +536,8 @@ describe('the link and claim sheets', () => {
   const CLAIM_L = { id: 'a'.repeat(32), sitePub: 'd'.repeat(43), intent: 'claim', reqHash: 'b'.repeat(43) };
   const NODE_ID = 'light_mobile_6526ab8fd00ff8ca';
   const SUPER_ID = 'super_node_f3e187d8752f4514';
+  // A move's three parts, by their hashes.
+  const H = ['a1', 'b2', 'c3'].map((x) => x.repeat(32));
   const CAPABLE = { capable: true, platform: 'ios', flags: 'mac=0,vision=0,idiom=phone', report: null };
   const consentOffer = (over = {}) => ({
     kind: 'link', mode: 'consent', nodeId: NODE_ID, qnet: ADDRESSES.qnet, burnTx: 'b', device: CAPABLE, features: [], switchFrom: null, ...over,
@@ -403,6 +589,57 @@ describe('the link and claim sheets', () => {
     await act(async () => { tree.unmount(); });
   });
 
+  // The wallet sends the registration its consent is for itself, at once (services/RegistrationSubmit); the page only
+  // follows the chain. The done screen says how far it got, in the Node tab's words.
+  it('Confirm on a consent sends its registration from the wallet at once; the done screen follows it into a block', async () => {
+    const CONSENT = { ts: '1793031451', pk: 'cGs', sig: 'c2ln' };
+    const OK_LINK = { status: 'ok', qnet: ADDRESSES.qnet, nodeId: NODE_ID, consent: CONSENT, bound: true, here: true };
+    QNetLink.prepareOffer.mockResolvedValue(consentOffer());
+    QNetLink.performIntent.mockResolvedValue(OK_LINK);
+    let stage = null;
+    const node = { register: jest.fn((job, onStage) => { stage = onStage; return new Promise(() => {}); }) };
+    const onOutcome = jest.fn();
+    const tree = await mount(LINK_L, { node, onOutcome });
+    expect(node.register).not.toHaveBeenCalled();
+    await wait(ARMED);
+    await act(async () => { await press(button(tree, 'Confirm')); });
+    expect(node.register).toHaveBeenCalledTimes(1);
+    expect(node.register).toHaveBeenCalledWith({
+      qnet: ADDRESSES.qnet, burnTx: 'b', consent: CONSENT, until: (1793031451 + 86400) * 1000,
+    }, expect.any(Function));
+    expect(texts(tree)).toContain(t('node_linking'));
+    await act(async () => { stage('admitted'); });
+    expect(texts(tree)).toContain(t('node_linking_pool'));
+    expect(onOutcome).toHaveBeenLastCalledWith({ ...OK_LINK, delivery: 'delivered', registration: 'admitted' });
+    await act(async () => { stage('registered'); });
+    expect(texts(tree)).toContain(t('node_linked_waiting'));
+    // What the user saw stays with the outcome across a lock.
+    const back = await mount(LINK_L, { settled: true, settledOutcome: onOutcome.mock.calls.at(-1)[0], node });
+    expect(texts(back)).toContain(t('node_linked_waiting'));
+    expect(node.register).toHaveBeenCalledTimes(1);
+    await act(async () => { tree.unmount(); back.unmount(); });
+  });
+
+  it('a binding for a node on the chain, a rejection or a refusal sends no registration', async () => {
+    const node = { register: jest.fn() };
+    QNetLink.prepareOffer.mockResolvedValue({ ...consentOffer(), mode: 'device' });
+    QNetLink.performIntent.mockResolvedValue({ status: 'linked', qnet: ADDRESSES.qnet, nodeId: NODE_ID, seq: '1790086400' });
+    const tree = await mount(LINK_L, { node });
+    await wait(ARMED);
+    await act(async () => { await press(button(tree, 'Confirm')); });
+    await act(async () => { tree.unmount(); });
+    QNetLink.prepareOffer.mockResolvedValue(consentOffer());
+    const rejected = await mount(LINK_L, { node });
+    await act(async () => { await button(rejected, 'Reject').props.onPress(); });
+    await act(async () => { rejected.unmount(); });
+    QNetLink.performIntent.mockResolvedValue({ status: 'error', error: 'INTERNAL' });
+    const failed = await mount(LINK_L, { node });
+    await wait(ARMED);
+    await act(async () => { await press(button(failed, 'Confirm')); });
+    await act(async () => { failed.unmount(); });
+    expect(node.register).not.toHaveBeenCalled();
+  });
+
   it('the check number appears after the relay took the answer, in two groups of three', async () => {
     QNetLink.prepareOffer.mockResolvedValue({ ...consentOffer(), mode: 'device' });
     QNetLink.performIntent.mockResolvedValue({ status: 'linked', qnet: ADDRESSES.qnet, nodeId: NODE_ID, seq: '1790086400' });
@@ -433,9 +670,11 @@ describe('the link and claim sheets', () => {
     await act(async () => { await press(button(tree, 'Confirm')); });
     await act(async () => { tree.unmount(); }); // the wallet locked before the relay took the answer
     await act(async () => { accept(); });
-    expect(onOutcome).toHaveBeenLastCalledWith({ ...LINKED, check: '798820' });
+    expect(onOutcome).toHaveBeenLastCalledWith({ ...LINKED, check: '798820', delivery: 'delivered' });
     const back = await mount(LINK_L, { settled: true, settledOutcome: onOutcome.mock.calls.at(-1)[0] });
     expect(texts(back)).toContain(t('link_check_number', { number: '798\u00a0820' }));
+    // And how the delivery ended, as the sheet before the lock would have said it.
+    expect(texts(back)).toContain(t('link_delivered'));
     await act(async () => { back.unmount(); });
   });
 
@@ -570,7 +809,127 @@ describe('the link and claim sheets', () => {
     outcome = { result: 'partial', appliedNano: 12.5e9 };
     await act(async () => { tree.update(<QNetLinkScreen {...props} moveOf={() => ({ ...outcome })} />); });
     expect(texts(tree)).toContain(t('claim_note_partial', { amount: '12.5 QNC' }));
+    expect(texts(tree)).toContain(t('link_result_claim', { amount: '12.5 QNC' }));
     await act(async () => { tree.unmount(); });
+  });
+
+  // The sheet moves the whole balance shown with one Confirm, in as many parts as the Node tab would, and
+  // answers once at the end. While a next part is to go the sheet says to keep the app open; the done screen says the
+  // total, how many transactions it took, and what became of them as the Node tab's card says it.
+  it('a move in parts: keep the app open while the next part is to go; then the total, the count and the run\'s note', async () => {
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, nodeType: 'light', qnet: ADDRESSES.qnet, amountNano: 9e9 });
+    let finish;
+    let heard;
+    QNetLink.performIntent.mockImplementation((link, offer, { onProgress }) => {
+      heard = onProgress;
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    const tree = await mount(CLAIM_L);
+    await wait(ARMED);
+    // Not awaited: Confirm's work runs until the run answers.
+    await act(async () => { press(button(tree, 'Confirm')); });
+    await wait(0);
+    expect(texts(tree)).toContain(t('link_working_claim'));
+    expect(texts(tree)).not.toContain(t('link_claim_parts'));
+    await act(async () => { heard({ parts: [{ txHash: H[0], amountNano: '3000000000' }], movedNano: 3000000000n, more: true }); });
+    expect(texts(tree)).toContain(t('link_claim_parts'));
+    const parts = H.map((txHash) => ({ txHash, amountNano: '3000000000', lastEpoch: 1, stoppedAtEpoch: 2 }));
+    const done = (stop) => ({
+      status: 'ok', qnet: ADDRESSES.qnet, nodeId: NODE_ID, amountNano: '9000000000', txHash: H[2], stoppedAtEpoch: '1125',
+      run: { parts, more: false, stop },
+    });
+    await act(async () => { finish(done({ ended: true })); });
+    await wait(0);
+    const shown = texts(tree);
+    expect(shown).toContain(t('link_result_claim', { amount: '9 QNC' }));
+    expect(tree.root.findAll((n) => n.props.testID === 'link-claim-parts' && n.props.value === '3')).not.toHaveLength(0);
+    // Ended by a lock (or the request's time): what the parts put in the wallet, the rest on the node.
+    expect(shown).toContain(t('claim_note_partial', { amount: '9 QNC' }));
+    expect(shown).not.toContain(t('link_claim_parts'));
+    await act(async () => { tree.unmount(); });
+    // Ended by a refusal of the next part: the same, with why.
+    QNetLink.performIntent.mockResolvedValue(done({ code: 'RATE_LIMITED' }));
+    const refused = await mount(CLAIM_L);
+    await wait(ARMED);
+    await act(async () => { await press(button(refused, 'Confirm')); });
+    expect(texts(refused)).toContain(`${t('claim_note_partial', { amount: '9 QNC' })} ${t('err_RATE_LIMITED')}`);
+    await act(async () => { refused.unmount(); });
+    // One claim, as an older run answers: no count.
+    QNetLink.performIntent.mockResolvedValue({ ...done(null), amountNano: '3000000000', txHash: H[0], run: { parts: parts.slice(0, 1), more: false, stop: null } });
+    const one = await mount(CLAIM_L);
+    await wait(ARMED);
+    await act(async () => { await press(button(one, 'Confirm')); });
+    expect(one.root.findAll((n) => n.props.testID === 'link-claim-parts')).toHaveLength(0);
+    expect(texts(one)).toContain(t('claim_stopped_at'));
+    await act(async () => { one.unmount(); });
+    // The last claim expired: the answer is the claims before it, and the note is the last claim's record, not the one
+    // the answer names.
+    const records = { [H[0]]: { result: 'done', appliedNano: 3e9 }, [H[1]]: { result: 'done', appliedNano: 3e9 }, [H[2]]: { result: 'expired', appliedNano: 0 } };
+    QNetLink.performIntent.mockResolvedValue({ ...done(null), amountNano: '6000000000', txHash: H[1] });
+    const expired = await mount(CLAIM_L, { moveOf: (hash) => records[hash] });
+    await wait(ARMED);
+    await act(async () => { await press(button(expired, 'Confirm')); });
+    expect(texts(expired)).toContain(t('link_result_claim', { amount: '6 QNC' }));
+    expect(texts(expired)).toContain(t('claim_note_partial', { amount: '6 QNC' }));
+    expect(texts(expired)).not.toContain(t('claim_note_done'));
+    await act(async () => { expired.unmount(); });
+    // Nothing was left to quote after a capped claim (a whole balance below 1 QNC names its stop): no rest is said.
+    QNetLink.performIntent.mockResolvedValue({ ...done(null), amountNano: '400000000', txHash: H[0], stoppedAtEpoch: '2', run: { parts: [{ ...parts[0], amountNano: '400000000' }], more: false, stop: null, whole: true } });
+    const whole = await mount(CLAIM_L, { moveOf: () => ({ result: 'moving' }) });
+    await wait(ARMED);
+    await act(async () => { await press(button(whole, 'Confirm')); });
+    expect(texts(whole)).toContain(t('claim_credited_on_block'));
+    expect(texts(whole)).not.toContain(t('claim_stopped_at'));
+    await act(async () => { whole.unmount(); });
+  });
+
+  // A last part the run does not wait for is said by its record as that comes: the headline counts what the claims put
+  // in the wallet, as the note and the Node tab's card do.
+  it('the headline follows the claims\' records with the note, as the Node tab\'s card; the site keeps the answer it got', async () => {
+    // The first two parts stopped at a quote's size; the third was the rest of the balance, in transit when the run ended.
+    const parts = H.map((txHash, i) => ({ txHash, amountNano: '3000000000', lastEpoch: i + 1, stoppedAtEpoch: i < 2 ? i + 2 : null }));
+    const sent = () => ({
+      status: 'ok', qnet: ADDRESSES.qnet, nodeId: NODE_ID, amountNano: '9000000000', txHash: H[2], stoppedAtEpoch: null,
+      run: { parts: parts.map((p) => ({ ...p })), more: false, stop: null, whole: true },
+    });
+    QNetLink.prepareOffer.mockResolvedValue({ kind: 'claim', nodeId: NODE_ID, nodeType: 'light', qnet: ADDRESSES.qnet, amountNano: 9e9 });
+    for (const [record, moved] of [[{ result: 'expired', appliedNano: 0 }, '6 QNC'], [{ result: 'partial', appliedNano: 1.5e9 }, '7.5 QNC']]) {
+      QNetLink.performIntent.mockResolvedValue(sent());
+      QNetLink.deliverAnswer.mockClear();
+      const records = { [H[0]]: { result: 'done', appliedNano: 3e9 }, [H[1]]: { result: 'done', appliedNano: 3e9 }, [H[2]]: { result: 'moving' } };
+      const moveOf = (hash) => records[hash];
+      const onOutcome = jest.fn();
+      const tree = await mount(CLAIM_L, { moveOf, onOutcome });
+      await wait(ARMED);
+      await act(async () => { await press(button(tree, 'Confirm')); });
+      expect(texts(tree)).toContain(t('link_result_claim', { amount: '9 QNC' }));
+      expect(texts(tree)).toContain(t('claim_credited_on_block'));
+      records[H[2]] = record;
+      await act(async () => { tree.update(<QNetLinkScreen {...props} />); });
+      const shown = texts(tree);
+      expect([record.result, shown.includes(t('link_result_claim', { amount: moved })), shown.includes(t('claim_note_partial', { amount: moved }))])
+        .toEqual([record.result, true, true]);
+      expect(shown).not.toContain(t('link_result_claim', { amount: '9 QNC' }));
+      // The site and the owner have the answer of the run's end; a sheet shown again after a lock reads the records.
+      expect(QNetLink.deliverAnswer.mock.calls).toEqual([[CLAIM_L, expect.any(Object), sent(), expect.any(Object)]]);
+      const kept = onOutcome.mock.calls.at(-1)[0];
+      expect(kept).toEqual({ ...sent(), delivery: 'delivered' });
+      await act(async () => { tree.unmount(); });
+      const back = await mount(CLAIM_L, { settled: true, settledOutcome: kept, moveOf });
+      expect(texts(back)).toContain(t('link_result_claim', { amount: moved }));
+      await act(async () => { back.unmount(); });
+    }
+    // A move whose one claim no block took says what it submitted, as the card does, and that it all stays on the node.
+    const single = { [H[2]]: { result: 'moving' } };
+    QNetLink.performIntent.mockResolvedValue({ ...sent(), amountNano: '3000000000', run: { parts: parts.slice(2), more: false, stop: null, whole: true } });
+    const one = await mount(CLAIM_L, { moveOf: (hash) => single[hash] });
+    await wait(ARMED);
+    await act(async () => { await press(button(one, 'Confirm')); });
+    single[H[2]] = { result: 'expired', appliedNano: 0 };
+    await act(async () => { one.update(<QNetLinkScreen {...props} />); });
+    expect(texts(one)).toContain(t('link_result_claim', { amount: '3 QNC' }));
+    expect(texts(one)).toContain(t('claim_note_expired'));
+    await act(async () => { one.unmount(); });
   });
 
   it('below 1 QNC there is nothing to move, and the answer after Confirm says so', async () => {
@@ -624,7 +983,7 @@ describe('the reserve sheet', () => {
     expect(props.authenticate).toHaveBeenCalledWith(t('link_auth_reserve'));
     expect(QNetLink.performIntent).not.toHaveBeenCalled();
     await act(async () => { await press(button(tree, 'Confirm')); });
-    expect(QNetLink.performIntent.mock.calls).toEqual([[RESERVE_L, OFFER_R, { node }]]);
+    expect(QNetLink.performIntent.mock.calls).toEqual([[RESERVE_L, OFFER_R, { node, session: expect.any(Object), onProgress: expect.any(Function) }]]);
     expect(QNetLink.deliverAnswer).toHaveBeenCalledWith(RESERVE_L, expect.any(Object), SIGNED, expect.any(Object));
     const shown = texts(tree);
     expect(shown).toContain(t('link_result_reserve'));

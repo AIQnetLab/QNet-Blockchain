@@ -3,7 +3,7 @@
  * Component styles read these tokens only. Signal marks what can be acted on or is live; Ember a change or what needs
  * the user. Words are set in Archivo, numbers, addresses and labels in Martian Mono, both bundled (assets/native/fonts).
  */
-import { StyleSheet } from 'react-native';
+import { Platform, StyleSheet } from 'react-native';
 
 export const color = Object.freeze({
   ink: '#05080A',
@@ -43,12 +43,18 @@ export function tint(hex, alpha) {
 
 export const space = Object.freeze({ gut: 16, gutWide: 24, s4: 4, s8: 8, s12: 12, s16: 16, s24: 24, s32: 32, s48: 48 });
 export const size = Object.freeze({
-  header: 52, tab: 52, row: 52, rowMin: 44, button: 48, field: 48, column: 640, sheet: 560, bar: 600, request: 520,
-  dot: 7,
+  header: 52, tab: 56, row: 52, rowMin: 44, button: 48, field: 48, column: 640, sheet: 560, bar: 600, request: 520,
+  dot: 7, histIcon: 40, swapIcon: 28,
 });
-// box: fields and buttons; tile: a token, an address or a node panel, each a rounded element of its own.
-export const radius = Object.freeze({ box: 2, dot: 3.5, tile: 14 });
-export const motion = Object.freeze({ toggle: 150, sheet: 240, pulse: 2000, curve: [0.2, 0.7, 0.2, 1] });
+// box: a field or a box of text; pill: a button, a chip, a switch, the browser's address (a radius past half the height
+// draws a pill); tile: a card (components/ui/Section, a History row, a token, the address); sheet: a sheet's top corners;
+// dot: a dot, a bar, a checkbox.
+export const radius = Object.freeze({ box: 12, pill: 24, tile: 16, sheet: 20, dot: 3.5 });
+export const motion = Object.freeze({ press: 120, toggle: 150, sheet: 240, pulse: 2000, curve: [0.2, 0.7, 0.2, 1] });
+// The one rounded surface every card is drawn on.
+export const card = Object.freeze({
+  borderRadius: radius.tile, borderWidth: 1, borderColor: color.rule, backgroundColor: color.surface,
+});
 // The overlays at the wallet screen's root, drawn (Android elevation) in the order they are touched (zIndex): a scan
 // under a site's or a link's request, under the prompts and alerts, under the header menu.
 export const layer = Object.freeze({
@@ -71,7 +77,7 @@ export const sheet = Object.freeze({
   overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'flex-end', alignItems: 'center' },
   panel: {
     width: '100%', maxWidth: size.sheet, maxHeight: '86%', backgroundColor: color.surface, borderTopWidth: 1,
-    borderTopColor: color.ruleStrong, ...shadow,
+    borderTopColor: color.ruleStrong, borderTopStartRadius: radius.sheet, borderTopEndRadius: radius.sheet, ...shadow,
   },
 });
 
@@ -88,6 +94,15 @@ export const FACES = Object.freeze({
 export const MONO_ADVANCE = Object.freeze({ data: 0.62, label: 0.65, figure: 0.6 });
 // The system face's weight standing in for a sans face in a script Archivo does not cover.
 const SYSTEM_WEIGHT = Object.freeze({ regular: '400', semibold: '600', title: '700', label: '400' });
+// The platform's sans face by name, for a run inside a text set in another face, which it would inherit (ui/amp).
+const SYSTEM_FAMILY = Platform.OS === 'ios' ? 'System' : 'sans-serif';
+/**
+ * The system face at a sans face's weight in every script: the welcome screen's name keeps the face it had before.
+ * `named`: the face is named too, for a run inside a text set in Archivo.
+ */
+export const systemFace = (face, named = false) => (named
+  ? { fontFamily: SYSTEM_FAMILY, fontWeight: SYSTEM_WEIGHT[face] }
+  : { fontWeight: SYSTEM_WEIGHT[face] });
 
 // role: [face, size, line height, tracking, uppercase]
 const ROLES = Object.freeze({

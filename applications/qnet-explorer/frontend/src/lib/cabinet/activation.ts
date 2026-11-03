@@ -1,4 +1,4 @@
-// The steps of an activation on aiqnet.io/node/activate (unified plan flows A and B; shared contracts C1 and C4): each
+// The steps of an activation on aiqnet.io/node/activate: each
 // reads what it needs from the site's own routes, moves the payment record one stage (src/lib/cabinet/flow.ts) in one
 // storage step, and returns it. The page calls them from its timers and buttons; the tests call them with fakes. Nothing
 // here shows text; nothing is signed but through payment-key.ts.
@@ -31,11 +31,12 @@ import { parseArchivedRecord, type ArchivedRecord } from './code-check.ts';
 import { parseStatusView, type NodeStatusView } from './node-view.ts';
 import { signBurn, signOwnerBindV2, signRefund, type SignedTx } from './payment-key.ts';
 import { browserArea, listRecords, pruneReceipts, removeRecord, requestPersistence, updateRecord, type PaymentArea } from './payment-store.ts';
-import { OWNER_BIND_V2_FEATURE, type ConsentBody, type SubmitOutcome } from './registration.ts';
+import { ADMIT_HOLD_MS, OWNER_BIND_V2_FEATURE, type ConsentBody, type SubmitOutcome } from './registration.ts';
 import { consentBodyOf, postConsent } from './consent-submit.ts';
 import { parseWalletNode, type WalletNodeView } from './wallet-activation.ts';
 import { fundingReceived } from './payment-request.ts';
-import { SIGN_MARGIN_MS, isReservationId } from './burn-record.ts';
+import { DROP_SETTLE_MS, SIGN_MARGIN_MS, isReservationId } from './burn-record.ts';
+import { SITE_REQUEST_MS, siteRequest } from '../site-request.ts';
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -53,7 +54,7 @@ export function browserDeps(): ActivationDeps {
 }
 
 // From the burn on, the payment key holds what is left on its address until it goes back: the browser is asked again to
-// keep the site's storage (SITE-R1-06), never waited for.
+// keep the site's storage, never waited for.
 function keepStorage(deps: ActivationDeps): void {
   const { persist } = deps;
   if (persist) void Promise.resolve().then(persist).catch(() => false);
@@ -61,22 +62,20 @@ function keepStorage(deps: ActivationDeps): void {
 
 // The burn waits for finality this long before the page says the outcome is not known yet.
 export const BURN_WAIT_MS = 90_000;
-// A dropped burn is forgotten only when a read this long after it was dropped still finds it nowhere past its last
-// valid block: by then no lagging Solana backend still misses a burn that landed (SITE-R3-02).
-export const DROP_SETTLE_MS = 3 * 60_000;
-// After an admission the page waits this long for the chain before it submits again.
-export const ADMIT_HOLD_MS = 180_000;
 // A node the network lists after this page's submit was admitted is taken as registered with this burn when the
-// explorer's archive still shows no registration this long after the admission (SITE-10).
+// explorer's archive still shows no registration this long after the admission.
 export const ARCHIVE_WAIT_MS = 10 * 60_000;
+// The page waits this long for a reservation: before it holds the wallet the site asks the genesis nodes, two and then
+// one at a time, and the light node's status (wallet-node.ts) and searches the wallet's Solana address the page names;
+// the same signed reservation sent again after an answer given up on gets the reservation it made.
+export const RESERVE_REQUEST_MS = 60_000;
 
-const REQUEST: RequestInit = { cache: 'no-store', credentials: 'omit', redirect: 'error' };
 const U64_RE = /^(?:0|[1-9][0-9]{0,19})$/;
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 async function getJson(deps: ActivationDeps, url: string): Promise<{ status: number; body: unknown } | null> {
   try {
-    const res = await deps.fetchFn(url, REQUEST);
+    const res = await deps.fetchFn(url, siteRequest());
     let body: unknown = null;
     try {
       body = await res.json();
@@ -89,9 +88,9 @@ async function getJson(deps: ActivationDeps, url: string): Promise<{ status: num
   }
 }
 
-async function postJson(deps: ActivationDeps, url: string, value: unknown): Promise<{ status: number; body: unknown } | null> {
+async function postJson(deps: ActivationDeps, url: string, value: unknown, ms: number = SITE_REQUEST_MS): Promise<{ status: number; body: unknown } | null> {
   try {
-    const res = await deps.fetchFn(url, { ...REQUEST, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+    const res = await deps.fetchFn(url, siteRequest({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) }, ms));
     let body: unknown = null;
     try {
       body = await res.json();
@@ -152,7 +151,7 @@ export async function readNodeStatus(nodeId: string, deps: ActivationDeps): Prom
   return got?.status === 200 ? parseStatusView(got.body) : null;
 }
 
-// Whether a wallet has a light node already, or one being recorded (SITE-R2-10). Null while the nodes cannot be read.
+// Whether a wallet has a light node already, or one being recorded. Null while the nodes cannot be read.
 export async function walletHasNode(qnet: string, deps: ActivationDeps): Promise<boolean | null> {
   const status = await readNodeStatus(lightNodeId(qnet), deps);
   return status === null ? null : status.registered || status.pending;
@@ -205,10 +204,10 @@ export function fundedFor(balance: PaymentBalance, price: number): boolean {
   return fundingReceived(balance, price).oneDev && balance.sol >= BURN_SOL_LAMPORTS;
 }
 
-// The burns the page dropped as never landed, looked at again (SITE-11): one that is final after all, and this
+// The burns the page dropped as never landed, looked at again: one that is final after all, and this
 // address's light burn, is taken back (burnFinal). One is forgotten only once proven: it failed, it holds no burn of this
 // address, or a read DROP_SETTLE_MS after it was dropped still finds it nowhere past its last valid block. Any other is
-// kept, and while one is kept no new burn is signed (burn, SITE-R3-02).
+// kept, and while one is kept no new burn is signed (burn).
 export async function recheckDropped(record: PaymentRecord, deps: ActivationDeps): Promise<PaymentRecord> {
   const dropped = record.dropped ?? [];
   if (dropped.length === 0 || TRANSITIONS[record.stage].burnFound === undefined) return record;
@@ -229,7 +228,7 @@ export async function recheckDropped(record: PaymentRecord, deps: ActivationDeps
 }
 
 // funding <-> funded, from the address's balance. Dropped burns are looked at again first, at every read while one is
-// kept: one may have landed even when the address still holds as much 1DEV as it would have burned (SITE-R3-02).
+// kept: one may have landed even when the address still holds as much 1DEV as it would have burned.
 export async function checkFunding(record: PaymentRecord, price: number, deps: ActivationDeps): Promise<{ record: PaymentRecord; balance: PaymentBalance | null }> {
   const balance = await readPayment(record.pub, deps);
   if (!balance) return { record, balance };
@@ -244,16 +243,17 @@ export async function checkFunding(record: PaymentRecord, price: number, deps: A
 }
 
 // `found`: a burn the page had dropped landed after all, and the record follows it now (burnFinal). `checking`: a
-// dropped burn is not proven never landed yet, so nothing is signed (SITE-R3-02). The wallet's reservation (shared
-// contract C3.2): `no_wallet`, the chosen wallet is not the one this activation is for; `reconfirm`, the wallet's signed
+// dropped burn is not proven never landed yet, so nothing is signed. The wallet's reservation:
+// `no_wallet`, the chosen wallet is not the one this activation is for; `reconfirm`, the wallet's signed
 // reservation is missing or too old for the server, and QNet Wallet is asked again (the address stays); `has_node`, the
 // wallet has a node; `has_burn`, it has its burn already (a record, or one found on its Solana address); `reserved`,
 // another browser or device holds it, or its burn is on its way; `check_unavailable`, a check did not answer;
-// `reservation`, the reservation ended before the burn left (nothing was forwarded); `not_open`, the network does not
-// take the payment key's owner bind yet (paymentOpen), so nothing is reserved or signed.
+// `no_solana`, the page does not have the wallet's own Solana address, which the server searches before it holds the
+// wallet; `reservation`, the reservation ended before the burn left (nothing was forwarded); `not_open`, the network
+// does not take the payment key's owner bind yet (paymentOpen), so nothing is reserved or signed.
 export type BurnResult = {
   outcome: 'sent' | 'unknown' | 'refused' | 'busy' | 'unavailable' | 'price_unavailable' | 'price_changed' | 'has_node' | 'found' | 'checking'
-    | 'no_wallet' | 'reconfirm' | 'has_burn' | 'reserved' | 'check_unavailable' | 'reservation' | 'not_open';
+    | 'no_wallet' | 'reconfirm' | 'has_burn' | 'reserved' | 'check_unavailable' | 'no_solana' | 'reservation' | 'not_open';
   record: PaymentRecord;
   // With `price_changed`: what the network asks now, for the page to show before the user burns.
   quote?: PriceQuote;
@@ -271,25 +271,26 @@ async function keepPass(record: PaymentRecord, which: 'burn' | 'refund', pass: s
   return kept ?? record;
 }
 
-// ---------------------------------------------------------------- the wallet's reservation (shared contract C3.2)
+// ---------------------------------------------------------------- the wallet's reservation
 
 export type ReserveAnswer =
   | { ok: true; reservation: string; until: number }
-  | { ok: false; outcome: 'has_node' | 'has_burn' | 'reserved' | 'check_unavailable' | 'reconfirm' };
+  | { ok: false; outcome: 'has_node' | 'has_burn' | 'reserved' | 'check_unavailable' | 'reconfirm' | 'no_solana' };
 
 // POST /api/cabinet/activation/reserve for a payment address's light burn of `amount` for `wallet`, with the wallet's own
-// Solana address when the page knows it (the server searches it for a burn first) and the wallet's signed reservation
-// (C1): the server holds the wallet only with it. A proof too old for the server asks QNet Wallet again (`reconfirm`).
-// Anything but a reservation offers no burn.
-export async function reserveWallet(wallet: string, burner: string, amount: number, solana: string | null, proof: Omit<HoldFacts, 'wallet'>, deps: ActivationDeps): Promise<ReserveAnswer> {
+// Solana address (the server searches it for a burn first and holds nothing without it) and the wallet's signed
+// reservation: the server holds the wallet only with it. A proof too old for the server asks QNet Wallet again
+// (`reconfirm`). Anything but a reservation offers no burn.
+export async function reserveWallet(wallet: string, burner: string, amount: number, solana: string, proof: Omit<HoldFacts, 'wallet'>, deps: ActivationDeps): Promise<ReserveAnswer> {
   const got = await postJson(deps, '/api/cabinet/activation/reserve', {
     wallet, nodeType: 'light', way: 'payment', burner, burnAmount: amount, solana, proof: { pk: proof.pk, sig: proof.sig, time: proof.time },
-  });
+  }, RESERVE_REQUEST_MS);
   const b = got?.body;
   if (got?.status === 200 && isObject(b) && isReservationId(b.reservation) && typeof b.until === 'number' && Number.isSafeInteger(b.until)) {
     return { ok: true, reservation: b.reservation, until: b.until };
   }
   if (got?.status === 400 && isObject(b) && b.error === 'stale_proof') return { ok: false, outcome: 'reconfirm' };
+  if (got?.status === 400 && isObject(b) && b.error === 'solana_required') return { ok: false, outcome: 'no_solana' };
   const error = got?.status === 409 && isObject(b) ? b.error : null;
   if (error === 'has_node') return { ok: false, outcome: 'has_node' };
   if (error === 'has_burn' || error === 'burn_found' || error === 'burn_unusable') return { ok: false, outcome: 'has_burn' };
@@ -297,7 +298,7 @@ export async function reserveWallet(wallet: string, burner: string, amount: numb
   return { ok: false, outcome: 'check_unavailable' };
 }
 
-// ---------------------------------------------------------------- the wallet's confirmation (shared contract C1)
+// ---------------------------------------------------------------- the wallet's confirmation
 
 // The `reserve` request for the record (section 14): its wallet by hash, and its payment address as the burner.
 export function reserveRequest(record: Pick<PaymentRecord, 'pub' | 'wallet'>): { walletHash: string; burner: string } | null {
@@ -361,20 +362,21 @@ function usableReservation(record: PaymentRecord, wallet: string, amount: number
 // recorded as sent before it is sent (its id is its signature), then sent through the site with the reservation and the
 // bind: the site announces it as the wallet's before it leaves, and once final it is the wallet's activation for good.
 // Another tab that took the step first leaves this one `busy`, with nothing sent. `wallet`: the connected wallet, which
-// must be the one that signed the reservation; `solana`: the wallet's own Solana address, when the page knows it.
+// must be the one that signed the reservation; `solana`: the wallet's own Solana address, without which no reservation
+// is asked for (`no_solana`).
 export async function burn(record: PaymentRecord, price: number, deps: ActivationDeps, wallet: string | null = null, solana: string | null = null): Promise<BurnResult> {
   // A dropped burn may have landed all the same (a lagging read, a refusal a layer in front of the endpoint forwarded
-  // anyway): a second burn beside it would burn the price twice, and the first one could never be registered (SITE-R3-02).
+  // anyway): a second burn beside it would burn the price twice, and the first one could never be registered.
   const checked = await recheckDropped(record, deps);
   if (checked.stage !== record.stage) return { outcome: 'found', record: checked };
   if ((checked.dropped ?? []).length > 0) return { outcome: 'checking', record: checked };
   record = checked;
   // The page may have stood open for hours, and the phase-1 price steps down as supply is burned: a burn of the amount
-  // read earlier would lose the difference, or fall short of the price (SITE-R2-05).
+  // read earlier would lose the difference, or fall short of the price.
   const quote = await readPrice(deps);
   if (!quote) return { outcome: 'price_unavailable', record };
   if (quote.phase !== 1 || quote.cost !== price) return { outcome: 'price_changed', record, quote };
-  // One wallet, one burn (R6): the burn is for the wallet that signed its reservation, held by a reservation, and only
+  // One wallet, one burn: the burn is for the wallet that signed its reservation, held by a reservation, and only
   // while that wallet is the connected one.
   const hold = record.hold;
   if (!hold) return { outcome: 'reconfirm', record };
@@ -385,12 +387,20 @@ export async function burn(record: PaymentRecord, price: number, deps: Activatio
   if (open === null) return { outcome: 'check_unavailable', record };
   if (!open) return { outcome: 'not_open', record };
   if (!usableReservation(record, target, price, deps.now())) {
+    if (solana === null) return { outcome: 'no_solana', record };
     // A reservation for another wallet or amount, or too close to its end, goes first: the server holds one per wallet.
     if (record.reservation) {
       await releaseReservation(record.reservation, deps);
       record = (await patch(record, { reservation: undefined }, deps)) ?? record;
     }
-    const held = await reserveWallet(target, record.pub, price, solana, hold, deps);
+    const facts = (h: { reservation: string; until: number }): ReservationFacts => ({ id: h.reservation, wallet: target, until: h.until, amount: price });
+    let held = await reserveWallet(target, record.pub, price, solana, hold, deps);
+    // The same signed reservation sent again gets the reservation it made (activation-api.ts): one too close to its end
+    // to sign under goes back, and the wallet is held afresh.
+    if (held.ok && held.until - deps.now() < SIGN_MARGIN_MS) {
+      await releaseReservation(facts(held), deps);
+      held = await reserveWallet(target, record.pub, price, solana, hold, deps);
+    }
     if (!held.ok) {
       // Another tab of this browser took the reservation for this record, and keeps it in the record a moment later:
       // that tab burns.
@@ -403,9 +413,12 @@ export async function burn(record: PaymentRecord, price: number, deps: Activatio
       }
       return { outcome: held.outcome, record };
     }
-    const kept = await patch(record, { reservation: { id: held.reservation, wallet: target, until: held.until, amount: price } }, deps);
+    const kept = await patch(record, { reservation: facts(held) }, deps);
     if (!kept) {
-      await releaseReservation({ id: held.reservation, wallet: target, until: held.until, amount: price }, deps);
+      // Another tab moved the record on, maybe under this very reservation (both tabs sent the same signed one): that
+      // one stays for its burn.
+      const stored = (await listRecords(deps.area)).find((r) => r.pub === record.pub);
+      if (stored?.reservation?.id !== held.reservation) await releaseReservation(facts(held), deps);
       return { outcome: 'busy', record };
     }
     record = kept;
@@ -438,7 +451,7 @@ export async function burn(record: PaymentRecord, price: number, deps: Activatio
   if (state === 'refused' || answer?.status === 400) {
     // The site's own check (400) forwarded nothing. A JSON-RPC error means the endpoint did not take it, but a layer in
     // front of it may have forwarded it all the same: that burn is kept aside, like one that expired unseen, and looked
-    // at again until it is proven never landed (SITE-R2-04, SITE-R3-02).
+    // at again until it is proven never landed.
     const dropped = state === 'refused' ? { dropped: withDropped(sent, sent.burn, deps.now()) } : {};
     return { outcome: 'refused', record: (await move(sent, 'burnExpired', deps, { burn: null, ...dropped })) ?? sent };
   }
@@ -464,7 +477,7 @@ export async function settleBurn(record: PaymentRecord, deps: ActivationDeps): P
     event = 'burnExpired';
     extra = { burn: null, dropped: withDropped(record, record.burn, deps.now()) };
   } else if (record.stage === 'burnSent' && deps.now() - record.updatedAt > BURN_WAIT_MS) {
-    // Not final yet, or not readable now (the site may be out of its Solana budget, SITE-R3-01): past 90 s the page says
+    // Not final yet, or not readable now (the site may be out of its Solana budget): past 90 s the page says
     // the outcome is not known yet, and keeps reading.
     event = 'burnTimeout';
   }
@@ -494,8 +507,7 @@ export function isRecordRequest(record: PaymentRecord, request: LinkRequest | nu
 
 // QNet Wallet's answer to the record's request, as the link session read and verified it against `request`, the
 // request that session carried. An answer to another request (another activation's, from a session another tab kept)
-// is never taken: it consents to another burn. The record's own request is then gone, and the page opens a new one
-// (SITE-R3-02).
+// is never taken: it consents to another burn. The record's own request is then gone, and the page opens a new one.
 export async function takeAnswer(record: PaymentRecord, answer: LinkAnswer, checkNumber: number, request: LinkRequest | null, deps: ActivationDeps): Promise<PaymentRecord> {
   if (record.stage !== 'linkOpen') return record;
   if (!isRecordRequest(record, request)) return closeLink(record, deps);
@@ -524,7 +536,7 @@ async function nodesBefore(record: PaymentRecord, qnet: string, nodeId: string, 
 // old for the nodes, confirmed without asking, or waiting for the user's check. Unchanged while the nodes cannot be read.
 export async function reviewConsent(record: PaymentRecord, deps: ActivationDeps): Promise<PaymentRecord> {
   if (record.stage !== 'consentVerified' || !record.answer) return record;
-  // Not the wallet the request named by its full address (SITE-R1-04): nothing is submitted.
+  // Not the wallet the request named by its full address: nothing is submitted.
   if (!record.link || !answerIsNamed(record.link, record.answer.qnet)) return (await move(record, 'mismatch', deps)) ?? record;
   const nodes = await nodesBefore(record, record.answer.qnet, record.answer.nodeId, deps);
   if (!nodes) return record;
@@ -562,7 +574,7 @@ async function postRegistration(record: PaymentRecord, submit: SubmitFacts, deps
   return postConsent(body, deps);
 }
 
-// The network lists the wallet's light node (SITE-10): registered with this burn (onChain), or with another one
+// The network lists the wallet's light node: registered with this burn (onChain), or with another one
 // (otherBurn), as the explorer's archive of the chain shows. While the archive shows no registration yet the record
 // waits; a registration is taken as this burn's once ARCHIVE_WAIT_MS passed since this page's submit was admitted, or,
 // before a submit, since the consent was read (one wallet, one burn: its reservation kept any other burn out).
@@ -610,6 +622,15 @@ export async function register(record: PaymentRecord, deps: ActivationDeps): Pro
   return applyOutcome(submitted, await postRegistration(submitted, submit, deps), deps);
 }
 
+// The steps the page takes while its tab is hidden, since the user is in QNet Wallet when its answer arrives: a consent
+// that needs no check number checked, the wallet's nodes read and the registration submitted, again until a node admits
+// it. Every other step waits on Solana, the chain or the user and runs only while the page is shown.
+export function runsHidden(record: Pick<PaymentRecord, 'stage' | 'submit' | 'link' | 'answer'>): boolean {
+  if (record.stage === 'consentVerified') return beneficiaryConfirmed(record);
+  if (record.stage === 'beneficiaryConfirmed') return true;
+  return record.stage === 'submitted' && record.submit !== null && record.submit.admittedAt === null;
+}
+
 // The wait between two submits of a registration that the nodes asked to retry.
 export function retryDelayMs(attempts: number): number {
   return Math.min(10_000 * 2 ** Math.max(0, attempts - 1), 120_000);
@@ -646,7 +667,7 @@ export function leftoverPlan(balance: PaymentBalance, destAccountExists: boolean
 const mayForgo = (record: PaymentRecord, dest: string | null): boolean => dest === null && record.network === 'testnet';
 
 // An unrecorded mainnet activation with nothing on its address keeps its key until the user deletes it (`done`): a
-// transfer from an exchange may still be on its way to it, and once the key is gone nobody could move it (SITE-1).
+// transfer from an exchange may still be on its way to it, and once the key is gone nobody could move it.
 const keepsEmptyKey = (record: PaymentRecord): boolean => record.stage === 'closing' && record.network === 'mainnet';
 
 // onChain -> leftovers when something is left to send back to the wallet (`dest`, or on mainnet the address the user
@@ -663,7 +684,7 @@ export async function finish(record: PaymentRecord, dest: string | null, deps: A
 
 // The key's lifetime is over and nothing was burned: the activation ends from where it stands (flow.ts isExpired); one
 // still waiting for QNet Wallet's confirmation is deleted. A dropped burn that landed after all is taken back instead,
-// and while one is not proven never landed the key stays (SITE-R3-02).
+// and while one is not proven never landed the key stays.
 export async function expire(record: PaymentRecord, deps: ActivationDeps): Promise<PaymentRecord | null> {
   if (!isExpired(record, deps.now())) return record;
   if (record.stage === 'walletConfirm') return dropUnconfirmed(record, deps);
@@ -715,8 +736,7 @@ export async function done(record: PaymentRecord, deps: ActivationDeps): Promise
 }
 
 // `empty`: nothing is on the address, and the key stays until the user deletes it (keepsEmptyKey). `short`: 1DEV or
-// the token account are left but the address lacks the SOL to send them back; `need` is what it lacks, in lamports
-// (SITE-R2-02).
+// the token account are left but the address lacks the SOL to send them back; `need` is what it lacks, in lamports.
 export type RefundResult = {
   outcome: 'sent' | 'unknown' | 'refused' | 'unavailable' | 'nothing' | 'empty' | 'final' | 'short';
   record: PaymentRecord | null;

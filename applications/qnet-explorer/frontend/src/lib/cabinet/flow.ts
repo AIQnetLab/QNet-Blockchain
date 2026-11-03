@@ -1,13 +1,13 @@
 // The activation of a light node on aiqnet.io/node/activate, as one record per payment address kept in this
 // browser (src/lib/cabinet/payment-store.ts): its stage, the wallet's signed reservation, the burn, the QNet Link request
 // that carries the burn to QNet Wallet, the wallet's answer and the submit. Pure: the page moves a record only through
-// `advance` (unified plan R16 and flows A and B; shared contracts C1 and C4). The record is for one wallet from the start:
+// `advance`. The record is for one wallet from the start:
 // QNet Wallet confirms it first (`walletConfirm`, its signed reservation, the `hold`), and only then is the payment address
-// shown. The burn is made only under that wallet's reservation in the server's activation registry (C3.2; unified plan
-// R6: one wallet, one burn), and the payment key binds it to that wallet's light node before it is sent, so the burn is
+// shown. The burn is made only under that wallet's reservation in the server's activation registry (one
+// wallet, one burn), and the payment key binds it to that wallet's light node before it is sent, so the burn is
 // the wallet's activation for good: the registration can then be finished in any browser where the wallet is connected.
-// Before a burn the key lives at most 24 hours: then what arrived goes back to the wallet and the key is deleted (owner
-// rule, 26.09). After a burn the key is kept only to send back what is left: once the node is recorded, or at once when
+// Before a burn the key lives at most 24 hours: then what arrived goes back to the wallet and the key is deleted.
+// After a burn the key is kept only to send back what is left: once the node is recorded, or at once when
 // the user asks (`returnLeftovers`).
 
 import { activationCode, walletHash, type Consent, type LinkDeviceRequest } from '../qnet-link.ts';
@@ -41,7 +41,7 @@ const GIVE_BACK = { returnLeftovers: 'closing' } as const;
 // was never shown, so nothing can have been sent to it (activation.ts dropUnconfirmed).
 export const TRANSITIONS: Record<Stage, Partial<Record<FlowEvent, Stage>>> = {
   walletConfirm: { walletConfirmed: 'funding' },
-  // A burn the page had dropped as never landed turns out final (a lagging Solana read, SITE-11): it is taken back.
+  // A burn the page had dropped as never landed turns out final (a lagging Solana read): it is taken back.
   funding: { funded: 'funded', burnFound: 'burnFinal', ...CANCEL },
   funded: { underfunded: 'funding', burnSigned: 'burnSent', burnFound: 'burnFinal', ...CANCEL },
   // Sent: final, failed on chain, never landed before its blockhash expired, or not known after 90 s.
@@ -57,7 +57,7 @@ export const TRANSITIONS: Record<Stage, Partial<Record<FlowEvent, Stage>>> = {
   // The wallet has a node of either type already: one wallet, one node, so this burn registers none.
   nodeExists: { ...GIVE_BACK },
   beneficiaryConfirmed: { submitted: 'submitted', nodeExists: 'nodeExists', consentStale: 'consentStale', onChain: 'onChain', otherBurn: 'otherBurn' },
-  // The network lists the node: recorded with this burn (onChain), or with another one (otherBurn, SITE-10).
+  // The network lists the node: recorded with this burn (onChain), or with another one (otherBurn).
   submitted: { submitted: 'submitted', refused: 'refused', consentStale: 'consentStale', onChain: 'onChain', otherBurn: 'otherBurn' },
   refused: { resubmit: 'submitted', ...GIVE_BACK },
   // The wallet's node was registered with another burn: this burn registers none, and only what is left goes back.
@@ -146,7 +146,7 @@ export interface ReservationFacts {
   amount: number;
 }
 
-// What a finished activation keeps (SITE-R3-03): the wallet the burn registered and its node. The rest of the record
+// What a finished activation keeps: the wallet the burn registered and its node. The rest of the record
 // goes with the key.
 export interface ReceiptFacts {
   qnet: string;
@@ -169,7 +169,7 @@ export interface PaymentRecord {
   submit: SubmitFacts | null;
   refund: RefundFacts | null;
   // Burns the page took for never landed (their blockhash expired unseen, or the endpoint refused them), looked at again
-  // until each is proven never landed or taken back (SITE-11); no new burn is signed while one is kept (SITE-R3-02).
+  // until each is proven never landed or taken back; no new burn is signed while one is kept.
   // Absent in a record from before.
   dropped?: DroppedBurn[];
   // Only in a receipt (stage `done`); a receipt from before keeps `submit` instead.
@@ -232,7 +232,7 @@ export function refundDestination(record: Pick<PaymentRecord, 'pub' | 'submit' |
   return dest;
 }
 
-// The `link` request for the record's burn (section 14.4 and R16): the wallet the burn is for by its hash, and the
+// The `link` request for the record's burn (section 14.4): the wallet the burn is for by its hash, and the
 // check number only for a QR code when the page neither holds that wallet nor has its signed reservation. A request that
 // names a wallet takes an answer from that wallet only (answerIsNamed), and only its key can sign one.
 export function linkFacts(record: PaymentRecord, qr: boolean, choice: WalletChoice | null): LinkFacts {
@@ -250,7 +250,7 @@ export function linkFacts(record: PaymentRecord, qr: boolean, choice: WalletChoi
 }
 
 // A request that named a wallet takes an answer from that wallet only, by its full address and not only by the
-// 64-bit hash the request carried (SITE-R1-04). A request that named none takes any wallet's.
+// 64-bit hash the request carried. A request that named none takes any wallet's.
 export function answerIsNamed(link: LinkFacts, answerQnet: string): boolean {
   return link.request.walletHash === null || (typeof link.named === 'string' && link.named === answerQnet);
 }
@@ -274,7 +274,7 @@ export function consentFresh(ts: number, nowS: number, consent24h: boolean): boo
 }
 
 // The activation code of the record's burn, a receipt the network does not need. It encodes the wallet the burn is
-// for, never the payment address (owner rule, 26.09): the wallet that signed the reservation, so it shows as soon as the
+// for, never the payment address: the wallet that signed the reservation, so it shows as soon as the
 // burn is final. A burn whose wallet's node came from another burn has none.
 export function receiptCode(record: Pick<PaymentRecord, 'burn' | 'submit'> & Partial<Pick<PaymentRecord, 'hold' | 'reservation'>> & { stage?: Stage; receipt?: ReceiptFacts }): string | null {
   const wallet = record.receipt?.qnet ?? record.submit?.qnet ?? record.hold?.wallet ?? record.reservation?.wallet ?? null;
@@ -290,7 +290,7 @@ export function receiptOf(record: Pick<PaymentRecord, 'stage' | 'submit' | 'rece
 }
 
 // The record as the receipt it leaves once the node is recorded (onChain, leftovers -> done): the payment address, the
-// burn, its amount, and the wallet and node it registered, as the privacy policy says (SITE-R3-03). The signed
+// burn, its amount, and the wallet and node it registered, as the privacy policy says. The signed
 // reservation, the link request, the wallet's answer with its public key and consent, the refund, the dropped burns and
 // the key go.
 export function asReceipt(record: PaymentRecord, now: number): PaymentRecord | null {

@@ -264,7 +264,7 @@ describe('MOBNET-R2-03: the recipients this wallet signed transfers to', () => {
     const src = require('fs').readFileSync(require('path').join(__dirname, '../src/components/WalletManager.js'), 'utf8');
     const body = src.slice(src.indexOf('async _signAndSubmit('), src.indexOf('async _sendPending('));
     expect(body.indexOf('this._rememberRecipient(')).toBeGreaterThan(body.indexOf('await putSigned(entry);'));
-    expect(body.indexOf('this._rememberRecipient(')).toBeLessThan(body.indexOf('await this._sendPending(entry)'));
+    expect(body.indexOf('this._rememberRecipient(')).toBeLessThan(body.indexOf('this._sendPending(entry)'));
   });
 });
 

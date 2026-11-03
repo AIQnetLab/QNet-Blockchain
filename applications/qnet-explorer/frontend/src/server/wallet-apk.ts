@@ -1,4 +1,4 @@
-// WALLET_APK_URL: where the wallet page offers QNet Wallet's Android file (owner decision 26.09: one Android package,
+// WALLET_APK_URL: where the wallet page offers QNet Wallet's Android file (one Android package,
 // io.aiqnet.wallet; the file the site offers is the same Play-signed build as Google Play, and the app does not
 // update itself, so the site offers the newest file). Unset, or not an https address of an .apk file, means the site
 // offers no file yet. Read per request, so setting it needs a restart, not a build.

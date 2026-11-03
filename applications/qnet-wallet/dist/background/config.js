@@ -6,7 +6,7 @@
 /** true only in dist-dev/, where scripts/build-dev.mjs rewrites this line; gates the logger. */
 export const DEV_BUILD = false;
 
-export const WALLET_VERSION = '3.1.6';
+export const WALLET_VERSION = '3.1.7';
 export const RELEASE_CHANNEL = 'testnet';
 
 export const QNET = Object.freeze({
@@ -23,6 +23,10 @@ export const QNET = Object.freeze({
   // Page links (opened with chrome.tabs.create, never fetched): EXPLORER_API + path + encodeURIComponent(hash).
   EXPLORER_TX_PATH: '/explorer/tx/',
 });
+
+// Every request to aiqnet.io names this build, so the site can tell which version sent it; a fetch cannot set the
+// browser's User-Agent.
+export const SITE_HEADERS = Object.freeze({ 'x-qnet-client': `QNetWallet-Extension/${WALLET_VERSION}` });
 
 const ONE_DEV_MINTS = Object.freeze({
   devnet: '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ',
@@ -44,6 +48,8 @@ export const SOLANA = Object.freeze({
   EXPLORER_CLUSTER_QUERY: SOLANA_CLUSTER === 'mainnet' ? '' : `?cluster=${SOLANA_CLUSTER}`,
   // The largest serialized transaction a Solana node accepts.
   TRANSACTION_MAX_BYTES: 1232,
+  // aiqnet.io's relay of the wallet's own calls, under QNET.EXPLORER_API, for when RPC_URLS gives no answer (decision 56).
+  RELAY_PATH: '/api/cabinet/solana',
 });
 
 // What a payment request may have a Solana send carry (the app's grammar, utils/solanaRequest.js): at most
@@ -141,6 +147,9 @@ export const STORAGE_KEYS = Object.freeze({
   // alone (R22). Grants carry a MAC keyed by the vault record's sitesKey; settings hold the language only.
   SITES: 'qnet_sites_v3',
   SETTINGS: 'qnet_settings_v3',
+  // whether the Solana calls go to the endpoint or through aiqnet.io's relay, and when the endpoint was last tried
+  // (solana.js); a writer can only send the calls the other way, and both carry the wallet's own calls only
+  SOLANA_ROUTE: 'qnet_solana_route_v1',
   // chrome.storage.session (TRUSTED_CONTEXTS)
   SESSION: 'qnet_session_v3',
   BACKOFF: 'qnet_backoff_v3',

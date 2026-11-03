@@ -14,11 +14,12 @@ register('./helpers/chains-activation-loader.mjs', import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => JSON.parse(readFileSync(path.join(HERE, 'fixtures', name), 'utf8'));
 const core = await import('../dist/lib/qnet-core.js');
-const { QNET, SOLANA } = await import('../dist/background/config.js');
+const { QNET, SITE_HEADERS, SOLANA } = await import('../dist/background/config.js');
 const { WalletError } = await import('../dist/background/errors.js');
 const { setViewBroadcaster } = await import('../dist/background/events.js');
 const {
-  WALLET, installEnv, installFetch, emptyState, solanaRoute, routes, fakeSignature, flush,
+  WALLET, RELAY_URL, installEnv, installFetch, emptyState, solanaRoute, relayRoute, solanaCallOf, unreachableEndpoint, routes,
+  fakeSignature, flush,
 } = await import('./helpers/chains-activation-env.mjs');
 const activation = await import('../dist/background/activation.js');
 const { createCabinet, proofValid, reservationProofValid } = await import('./helpers/cabinet-server.mjs');
@@ -95,7 +96,8 @@ const priceBody = (type, { phase = 1, cost = 1500, currency = phase === 1 ? '1DE
 
 /**
  * A simulated network around the KAT wallet. Options change one fact each; `seen` records what the code
- * did (simulations, sends, requests per endpoint).
+ * did (simulations, sends, requests per endpoint). Solana answers on the endpoint and through aiqnet.io's relay alike
+ * (decision 56), unless `endpointDown`: then the endpoint gives no answer at all.
  */
 function world(options = {}) {
   const {
@@ -103,7 +105,7 @@ function world(options = {}) {
     statuses = () => 'finalized', simulateErr = null, sendError = null, listing = null, blockHeight = 0,
     otherAccounts = {}, otherHistories = {}, signedHistory = {}, signedListing = null, registered = () => null,
     lightStatus = () => ({}),
-    cabinet = null,
+    cabinet = null, endpointDown = false,
   } = options;
   const seen = {
     simulated: [], sent: [], priceCalls: 0, verifyCalls: [], statusCalls: 0, listings: 0, heightCalls: 0, accountQueries: [], otherListings: 0,
@@ -245,11 +247,13 @@ function world(options = {}) {
   const site = cabinet ?? createCabinet({
     landed: (burnTx) => (seen.sent.some((sent) => sent.signature === burnTx) || Object.hasOwn(txs, burnTx) ? 'final' : 'unknown'),
   });
-  const requests = installFetch(routes(node, (request) => site.route(request), solanaRoute(methods)));
+  const solanaRoutes = [...(endpointDown ? [unreachableEndpoint] : []), solanaRoute(methods), relayRoute(methods)];
+  const requests = installFetch(routes(node, (request) => site.route(request), ...solanaRoutes));
   return { seen, requests, methods, cabinet: site };
 }
 
-const solanaCalls = (requests) => requests.filter((r) => SOLANA.RPC_URLS.includes(r.url)).map((r) => JSON.parse(r.body).method);
+// The Solana methods asked, on the endpoint or through the relay, in order.
+const solanaCalls = (requests) => requests.map(solanaCallOf).filter((method) => method !== null);
 
 describe('chains-activation activation: code helpers', () => {
   // aiqnet.io's answer about a wallet (decision 35), with the states decision 36 left: a payment address's burn is on its
@@ -1007,6 +1011,25 @@ describe('chains-activation activation: the network vouches for no node before a
     }
   });
 
+  it('one authoritative "no" with no other answer is no proof: NETWORK, nothing reserved, signed or burned; two let the burn go on', async () => {
+    const [vouching, second] = QNET.NODES;
+    const no = { verified: false, authoritative: true };
+    const env = installEnv();
+    const { seen, cabinet } = world({ verify: (node) => (node === vouching ? no : null) });
+    await rejectsWith(activation.burn(light()), 'NETWORK');
+    assert.equal(seen.verifyCalls.length, QNET.NODES.length, 'every pinned node is asked before it gives up');
+    await rejectsWith(activation.activateForSite({ nodeType: 'light', expectedPrice: 1500 }), 'NETWORK');
+    assert.deepEqual([(await activation.siteView('light')).reason], ['NETWORK']);
+    assert.equal(seen.sent.length + seen.simulated.length + cabinet.of('reserve').length, 0);
+    assert.equal(env.calls.signSolanaMessage, 0, 'nothing was signed');
+    assert.equal(env.state().pendingBurn, null);
+    // a second one, wherever it comes in the order the nodes are asked
+    installEnv();
+    const both = world({ verify: (node) => (node === vouching || node === second ? no : null) });
+    assert.equal((await activation.burn(light())).status, 'finalized');
+    assert.equal(both.seen.sent.length, 1);
+  });
+
   it('the light node listed, or its registration pending, on any node refuses with NODE_EXISTS; Recover then reads it', async () => {
     const cases = [
       ['listed on every node', () => ({ onchain_registered: true })],
@@ -1447,9 +1470,11 @@ describe('chains-activation activation: aiqnet.io\'s record and reservation (dec
   };
   // What each request asked: a route of aiqnet.io's record, or a Solana method.
   const labelOf = (request) => {
+    const method = solanaCallOf(request);
+    if (method !== null) return method;
     const url = new URL(request.url);
     if (url.origin === QNET.EXPLORER_API) return request.method === 'GET' ? 'get' : url.pathname.split('/').pop();
-    return SOLANA.RPC_URLS.includes(request.url) ? JSON.parse(request.body).method : url.pathname;
+    return url.pathname;
   };
 
   it('refuses a burn while aiqnet.io holds a record, a reservation, a burn on its way or a payment burn: nothing reserved, signed or sent', async () => {
@@ -1690,6 +1715,22 @@ describe('chains-activation activation: aiqnet.io\'s record and reservation (dec
       await rejectsWith(a.burn(light()), 'RECORD_UNAVAILABLE');
       assert.equal(env.calls.signSolanaMessage, 0, JSON.stringify(body));
     }
+  });
+
+  // The endpoint gives this browser no answer (decision 56): the burn goes through aiqnet.io's relay, which forwards a burn
+  // only once aiqnet.io's record holds its announce, so the announce still comes first.
+  it('with the Solana endpoint unreachable, the burn is announced on aiqnet.io, then sent through its relay', async () => {
+    installEnv();
+    const a = await fresh();
+    const { seen, cabinet, requests } = world({ endpointDown: true });
+    assert.equal((await a.burn(light())).status, 'finalized');
+    const sends = requests.filter((r) => solanaCallOf(r) === 'sendTransaction');
+    assert.deepEqual(sends.map((r) => r.url), [RELAY_URL], 'sent once, through the relay');
+    assert.equal(JSON.parse(sends[0].body).params[0], seen.sent[0].b64, 'the signed transaction itself');
+    assert.equal(sends[0].headers['x-qnet-client'], SITE_HEADERS['x-qnet-client']);
+    const order = requests.map(labelOf);
+    assert.ok(order.indexOf('announce') < order.indexOf('sendTransaction'), order.join());
+    assert.equal(cabinet.of('announce')[0].body.burnTx, seen.sent[0].signature);
   });
 
   it('the announce carries the burn record\'s proof: an independent verifier accepts both signatures over the contract\'s bytes', async (t) => {

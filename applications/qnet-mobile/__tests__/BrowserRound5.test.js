@@ -9,7 +9,8 @@ const fs = require('fs');
 const path = require('path');
 const { sha3_256 } = require('js-sha3');
 const AsyncStorage = require('@react-native-async-storage/async-storage');
-const { createDappProvider, CODES, previewShort, spendableNano } = require('../src/browser/dappProvider');
+const { CODES, previewShort, spendableNano } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 const { WalletManager } = require('../src/components/WalletManager');
 const { pendingView } = require('../src/services/PendingTx');
 const T = require('../src/crypto/TxBuilders');
@@ -55,7 +56,7 @@ function setup(over = {}) {
     onChange: (v) => views.push(v),
     ...over,
   };
-  const p = createDappProvider(deps);
+  const p = testProvider(deps);
   const ctx = { origin: SITE, binding: { origin: SITE, doc: 'd', id: 'x', nav: 1 } };
   return { p, deps, ctx, views, shown: () => views[views.length - 1] };
 }

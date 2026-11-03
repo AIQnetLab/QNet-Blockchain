@@ -5,25 +5,24 @@
 // activation (the documentation; src/lib/activate-view.ts). There it links no place off this site either,
 // only the support address: the repository (its issues are one tap from its front page, which describes
 // activation and its cost, and its Releases hold the APK) and the
-// Telegram channel (where the site says Android builds are shared) are shown only outside it (R4-XPD-06).
+// Telegram channel (where the site says Android builds are shared) are shown only outside it.
 // The app is the same on every phone and tablet, so the app's view names no platform: the settings of each
-// system are listed only outside it, as is the move from the older Android app installed from a file (owner
-// decision 26.09: one Android package). A node that does not run on a device is the user's to move: another phone or
-// tablet takes it over (owner, 04.10: self-service only, no review step). Its texts are the support_ keys
-// (src/lib/texts.ts). Contact stands beside the answers on a wide screen and after them on a narrow one, so the rows
+// system are listed only outside it, as is the move from the older Android app installed from a file (one
+// Android package). A node that does not run on a device is the user's to move: another phone or
+// tablet takes it over (self-service only, no review step). Its texts are the support_ keys
+// (src/i18n/locales/en.ts). Contact stands beside the answers on a wide screen and after them on a narrow one, so the rows
 // it shows once the wallet is detected move nothing above them.
 
-import Link from 'next/link';
 import PageHead from '@/components/ui/PageHead';
 import { useActivationContent } from '@/contexts/AppContext';
-import { rich } from '@/lib/rich';
-import { t } from '@/lib/texts';
+import { Link, useI18n } from '@/i18n/client';
 
 export default function SupportPage() {
+  const { t, say, rich } = useI18n();
   const full = useActivationContent();
   return (
     <div className="pg">
-      <PageHead title={t('support_title')} lead={t('support_subtitle')} />
+      <PageHead title={t('support_title')} lead={say('support_subtitle')} />
       <div className="wrap pg-body doc-grid">
         <div className="doc-main">
 
@@ -37,7 +36,7 @@ export default function SupportPage() {
           <section className="doc-sec" id="pending">
             <h2>{t('support_pending_title')}</h2>
             <div className="prose">
-              <p>{t('support_pending_lead')}</p>
+              <p>{say('support_pending_lead')}</p>
               <ul>
                 <li>{t('support_pending_app')}</li>
                 <li>{t('support_pending_extension')}</li>
@@ -49,15 +48,15 @@ export default function SupportPage() {
           <section className="doc-sec" id="epochs">
             <h2>{t('support_epochs_title')}</h2>
             <div className="prose">
-              <p>{t('support_epochs_lead')}</p>
+              <p>{say('support_epochs_lead')}</p>
               <ul>
                 <li>{t('support_epochs_closed')}</li>
-                <li>{t('support_epochs_battery')}</li>
+                <li>{say('support_epochs_battery')}</li>
                 <li>{t('support_epochs_offline')}</li>
-                {full && <li>{t('support_epochs_apple')}</li>}
-                {full && <li>{t('support_epochs_android')}</li>}
+                {full && <li>{say('support_epochs_apple')}</li>}
+                {full && <li>{say('support_epochs_android')}</li>}
               </ul>
-              <p>{t('support_epochs_sleep')}</p>
+              <p>{say('support_epochs_sleep')}</p>
             </div>
           </section>
 
@@ -70,7 +69,7 @@ export default function SupportPage() {
 
           {full && (
             <section className="doc-sec" id="new-app">
-              <h2>{t('support_move_title')}</h2>
+              <h2>{say('support_move_title')}</h2>
               <div className="prose">
                 <p>{rich('support_move', { walletPage: <Link href="/wallet">{t('support_move_wallet_link')}</Link> })}</p>
               </div>
@@ -103,12 +102,12 @@ export default function SupportPage() {
             <h2>{t('support_contact_title')}</h2>
             <div className="prose">
               {/* Above the rows that appear once the wallet check ends, so it never moves when they do. */}
-              <p>{t('support_never_share')}</p>
+              <p>{say('support_never_share')}</p>
               <ul>
-                <li>{rich('support_contact_email', { address: <a href="mailto:support@aiqnet.io">support@aiqnet.io</a> })}</li>
+                <li>{rich('support_contact_email', { address: <a href="mailto:support@aiqnet.io" translate="no">support@aiqnet.io</a> })}</li>
                 {full && <li>{rich('support_contact_bugs', { link: <a href="https://github.com/AIQnetLab/QNet-Blockchain/issues" target="_blank" rel="noopener noreferrer">{t('support_contact_bugs_link')}</a> })}</li>}
-                {full && <li>{rich('support_contact_community', { link: <a href="https://t.me/AiQnetLab" target="_blank" rel="noopener noreferrer">Telegram</a> })}</li>}
-                {full && <li>{rich('support_contact_docs', { link: <Link href="/docs">aiqnet.io/docs</Link> })}</li>}
+                {full && <li>{rich('support_contact_community', { link: <a href="https://t.me/AiQnetLab" target="_blank" rel="noopener noreferrer" translate="no">Telegram</a> })}</li>}
+                {full && <li>{rich('support_contact_docs', { link: <Link href="/docs" translate="no">aiqnet.io/docs</Link> })}</li>}
               </ul>
             </div>
           </section>

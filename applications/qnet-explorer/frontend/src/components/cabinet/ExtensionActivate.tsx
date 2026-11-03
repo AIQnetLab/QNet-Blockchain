@@ -1,14 +1,14 @@
 'use client';
 
-// /node/activate with the QNet extension on a computer (unified plan flow C, docs/protocols/qnet-link-v1.md sections
+// /node/activate with the QNet extension on a computer (docs/protocols/qnet-link-v1.md sections
 // 10 and 14.10). The extension shows the price, holds the wallet's reservation in the site's activation registry, burns
 // from its own Solana address and, for a light node, records the node on the QNet network in the same approval; the page
 // checks the answer (validateActivation) and reads "Registered" from two genesis nodes itself. The node type and the
 // button are offered only while every source of the wallet says it has nothing (the state `none`,
-// src/lib/cabinet/wallet-activation.ts; R1, R6): neither choosing another type nor Try again brings the button back
+// src/lib/cabinet/wallet-activation.ts): neither choosing another type nor Try again brings the button back
 // while the wallet has an activation, a burn on its way or a state not known. After any answer every source is read
 // again. A light node's next step follows (NextSteps.tsx): the record on the network, then Link a device. A super node
-// gets its server steps (R3). The extension answers through the browser, so its answer is its own report.
+// gets its server steps. The extension answers through the browser, so its answer is its own report.
 
 import { useCallback, useEffect, useState } from 'react';
 import { useWallet } from '@/contexts/AppContext';
@@ -17,8 +17,9 @@ import Copy from '@/components/ui/Copy';
 import EntityLink from '@/components/ui/EntityLink';
 import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import { useNodeStatus } from '@/hooks/useNodeStatus';
-import { number, t } from '@/lib/texts';
+import { number } from '@/lib/texts';
 import { parseSitePrice, type PriceQuote } from '@/lib/activation-price';
+import { siteRequest } from '@/lib/site-request';
 import {
   errorKey,
   extensionMayHaveBurned,
@@ -32,6 +33,7 @@ import { SITE_ORIGIN, lightNodeId, superNodeId, type ActivationAnswer, type Acti
 import { useCabinet } from './CabinetProvider';
 import { LinkPhone, Recording, SuperNext } from './NextSteps';
 import { Fact, Facts, Group } from './parts';
+import { useI18n } from '@/i18n/client';
 
 const NODE_TYPES: NodeType[] = ['light', 'super'];
 const LOCAL_ORIGIN_RE = /^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d{1,5})?$/;
@@ -48,7 +50,7 @@ type ExtState =
 
 async function fetchPrice(type: NodeType): Promise<Price> {
   try {
-    const res = await fetch(`/api/activation/price?type=${type}`, { cache: 'no-store', credentials: 'omit', redirect: 'error' });
+    const res = await fetch(`/api/activation/price?type=${type}`, siteRequest());
     if (res.status !== 200) return { state: 'unavailable' };
     const quote = parseSitePrice(await res.json(), type);
     return quote ? { state: 'ok', quote } : { state: 'unavailable' };
@@ -63,6 +65,7 @@ export function requestedType(search: string): NodeType {
 }
 
 function PriceLabel({ price }: { price: Price }) {
+  const { t } = useI18n();
   if (price.state === 'loading') return <>{t('ext_price_loading')}</>;
   if (price.state === 'unavailable') return <>{t('ext_price_unavailable')}</>;
   if (price.quote.phase === 2) return <>{t('ext_price_phase2')}</>;
@@ -73,6 +76,7 @@ function PriceLabel({ price }: { price: Price }) {
 // for the cabinet's wallet (wallet-activation.ts); until then its record on the network, then, by itself, Link your
 // phone. `since`: when the page got the answer.
 function LightNext({ qnet, since, burnFinal }: { qnet: string; since: number; burnFinal: boolean }) {
+  const { t, say } = useI18n();
   const { ready, choice, choose, viewOnly, view } = useCabinet();
   const { state } = useNodeStatus(lightNodeId(qnet), viewOnly);
   // The extension's wallet becomes the cabinet's wallet when none was chosen.
@@ -87,13 +91,15 @@ function LightNext({ qnet, since, burnFinal }: { qnet: string; since: number; bu
   const offline = state.phase === 'ok' && nodeState(state.value) === 'offline';
   // A device just linked that has not answered yet.
   const waiting = state.phase === 'ok' && nodeState(state.value) === 'device_pending';
+  // Which device runs it cannot be read now: no step to link one.
+  const unknown = state.phase === 'ok' && nodeState(state.value) === 'device_unknown';
   return (
     <div className="cab-sub">
       <h4 className="label">{t('ext_next')}</h4>
       {registered ? (
         <>
-          <Answered>{t('ext_light_registered')}</Answered>
-          {linked ? <p>{t(offline ? 'next_offline' : waiting ? 'next_device_pending' : 'next_running')}</p> : <LinkPhone />}
+          <Answered>{say('ext_light_registered')}</Answered>
+          {linked ? <p>{say(offline ? 'next_offline' : waiting ? 'next_device_pending' : 'next_running')}</p> : unknown ? <p>{t('device_state_unknown')}</p> : <LinkPhone />}
         </>
       ) : (
         <Recording qnet={qnet} since={since} burnFinal={burnFinal} pending={pending} />
@@ -106,7 +112,8 @@ function LightNext({ qnet, since, burnFinal }: { qnet: string; since: number; bu
 }
 
 function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; requested: NodeType; at: number }) {
-  const title = t(headingKey(answer));
+  const { t, say } = useI18n();
+  const title = say(headingKey(answer));
   if (answer.status === 'rejected') {
     return (
       <div className="cab-answer" role="status">
@@ -119,7 +126,7 @@ function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; reque
     return (
       <div className="cab-answer" data-tone="needs" role="alert">
         <h4 className="h3">{title}</h4>
-        <p className="rq-failed">{t(errorKey(answer.error as ActivationErrorCode))}</p>
+        <p className="rq-failed">{say(errorKey(answer.error as ActivationErrorCode))}</p>
       </div>
     );
   }
@@ -129,15 +136,15 @@ function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; reque
   return (
     <div className="cab-answer" role="status">
       <h4 className="h3">{title}</h4>
-      <p>{t(leadKey(answer), { amount: number(burnAmount) })}</p>
+      <p>{say(leadKey(answer), { amount: number(burnAmount) })}</p>
       {answer.status === 'exists' && answer.nodeType !== requested && (
         <p>{t('ext_other_type', { got: t(typeKey), chosen: t(requested === 'super' ? 'ext_type_super' : 'ext_type_light') })}</p>
       )}
       <Facts>
-        <Fact label={t('ext_field_type')}>{t(typeKey)}</Fact>
+        <Fact label={t('ext_field_type')}>{say(typeKey)}</Fact>
         {answer.code && (
           <Fact label={t('ext_field_code')}>
-            <span className="ent-copy"><span className="ent cab-code">{answer.code}</span><Copy value={answer.code} /></span>
+            <span className="ent-copy"><span className="ent cab-code" translate="no">{answer.code}</span><Copy value={answer.code} /></span>
           </Fact>
         )}
         <Fact label={t('ext_field_burn')}>
@@ -149,11 +156,11 @@ function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; reque
             <EntityLink kind="solana-tx" value={answer.supersededBurnTx} />
           </Fact>
         )}
-        <Fact label={t('ext_field_qnet')}>
+        <Fact label={say('ext_field_qnet')}>
           {answer.qnet && <EntityLink kind="address" value={answer.qnet} full />}
         </Fact>
         <Fact label={t('ext_field_solana')}>
-          <span className="ent ent-full">{answer.solana}</span>
+          <span className="ent ent-full" translate="no">{answer.solana}</span>
         </Fact>
       </Facts>
       <p className="note">{t(answer.code ? 'ext_footer_code' : 'ext_footer')}</p>
@@ -170,6 +177,7 @@ function AnswerView({ answer, requested, at }: { answer: ActivationAnswer; reque
 // so the node type and the burn button may show. `onAnswered`: the extension answered (the page then shows the answer,
 // not the state card).
 export default function ExtensionActivate({ offer, onAnswered }: { offer: boolean; onAnswered?: () => void }) {
+  const { t, say, href } = useI18n();
   const { activateNode } = useWallet();
   const { keepActivation, refreshActivation } = useCabinet();
   const [canonical, setCanonical] = useState<boolean | null>(null);
@@ -222,7 +230,7 @@ export default function ExtensionActivate({ offer, onAnswered }: { offer: boolea
     return offer ? (
       <div className="cab-next">
         <p>
-          {t('ext_other_origin')} <a href={`${SITE_ORIGIN}/node/activate`}>aiqnet.io/node/activate</a>
+          {say('ext_other_origin')} <a href={`${SITE_ORIGIN}${href('/node/activate')}`} translate="no">aiqnet.io/node/activate</a>
         </p>
       </div>
     ) : null;
@@ -238,10 +246,10 @@ export default function ExtensionActivate({ offer, onAnswered }: { offer: boolea
   const again = offer && (ext.phase === 'failed' || (ext.phase === 'done' && (ext.answer.status === 'rejected' || ext.answer.status === 'error')));
 
   return (
-    <Group level={3} title={t('ext_title')}>
+    <Group level={3} title={say('ext_title')}>
       {offer && (
         <>
-          <p>{t('ext_lead')}</p>
+          <p>{say('ext_lead')}</p>
           <div className="cab-types" role="radiogroup" aria-label={t('ext_type_label')}>
             {NODE_TYPES.map((type) => (
               <button
@@ -254,14 +262,14 @@ export default function ExtensionActivate({ offer, onAnswered }: { offer: boolea
                 disabled={busy}
               >
                 <span className="cab-type-n">{t(type === 'light' ? 'ext_type_light' : 'ext_type_super')}</span>
-                <span className="cab-type-d">{t(type === 'light' ? 'ext_type_light_where' : 'ext_type_super_where')}</span>
+                <span className="cab-type-d">{say(type === 'light' ? 'ext_type_light_where' : 'ext_type_super_where')}</span>
                 <span className="cab-type-p"><PriceLabel price={prices[type]} /></span>
               </button>
             ))}
           </div>
           {priceMissing && (
             <p className="note">
-              {t('ext_price_missing')}{' '}
+              {say('ext_price_missing')}{' '}
               <Action kind="act" onClick={() => void loadPrices()}>{t('try_again')}</Action>
             </p>
           )}
@@ -273,7 +281,7 @@ export default function ExtensionActivate({ offer, onAnswered }: { offer: boolea
         </>
       )}
       {phase2 && offer ? (
-        <p>{t('ext_phase2')}</p>
+        <p>{say('ext_phase2')}</p>
       ) : (
         <>
           {ext.phase === 'idle' && offer && (
@@ -286,7 +294,7 @@ export default function ExtensionActivate({ offer, onAnswered }: { offer: boolea
           {ext.phase === 'done' && <AnswerView answer={ext.answer} requested={ext.nodeType} at={ext.at} />}
           {/* A declined request or an error ends this ask; the extension is asked again only while the wallet still has
               nothing anywhere (every source read again first). */}
-          {ext.phase === 'failed' && <Failed action={again ? { label: t('try_again'), onClick: () => setExt({ phase: 'idle' }) } : null}>{t(failureKey(ext.failure, 'activate'))}</Failed>}
+          {ext.phase === 'failed' && <Failed action={again ? { label: t('try_again'), onClick: () => setExt({ phase: 'idle' }) } : null}>{say(failureKey(ext.failure, 'activate'))}</Failed>}
           {again && ext.phase === 'done' && <div className="cab-next-act"><Action kind="text" onClick={() => setExt({ phase: 'idle' })}>{t('try_again')}</Action></div>}
         </>
       )}

@@ -5,16 +5,17 @@
 // only the QNet extension on a computer activates (the burn in the extension, its code and the server steps on the page,
 // the server with the node software, then My node follows it, QNet Wallet with the same wallet shows it on every phone
 // and tablet, and My node moves its balance with the extension's window).
-// QNet Wallet's own Node tab moves a balance of either node type too (owner, 12.10).
+// QNet Wallet's own Node tab moves a balance of either node type too.
 // A picture is described here as parts of a screen; src/components/cabinet/GuideArt.tsx draws it. Every label a
-// picture shows is a key of src/lib/texts.ts, and every one is the label of the screen it draws: the app's and the
+// picture shows is a key of src/i18n/locales/en.ts, and every one is the label of the screen it draws: the app's and the
 // extension's labels there are their own words, and this site's are the ones its pages show (cabinet-guide.test.mjs).
 // Which steps exist follows the release's network and the site's phone flows.
 
 import type { MessageKey } from '../texts.ts';
 import { TAB_HREF } from './tabs.ts';
 
-export type Label = MessageKey | { key: MessageKey; vars: Record<string, string> } | { raw: string };
+// A value filled into a label is a number or a name as written, or a label of its own (a time in the app's words).
+export type Label = MessageKey | { key: MessageKey; vars: Record<string, string | { key: MessageKey; vars: Record<string, string> }> } | { raw: string };
 
 export interface ButtonPart {
   kind: 'button';
@@ -35,6 +36,8 @@ export interface ChoiceItem {
 }
 
 export type Part =
+  // QNet Wallet's welcome head as the app draws it: its mark, its name, then the line under them, all centred.
+  | { kind: 'mark'; name: Label; label: Label }
   | { kind: 'title'; label: Label }
   | { kind: 'small'; label: Label }
   | { kind: 'lines'; count: number }
@@ -123,22 +126,23 @@ const APP_NODE_TAB: Scene = {
 };
 
 // QNet Wallet's Node tab with a super node of the wallet (NodeTab.js ServerNodeCard), the same on every phone and
-// tablet that holds the wallet: its id, then its rows in the card's order (type, status, last seen), the node balance and
-// its move.
+// tablet that holds the wallet: its identity (its status, its type, its id), then its status rows (last seen), the node
+// balance and its move.
 const APP_SUPER_CARD: Scene = {
   frame: 'phone', screen: 'app', parts: [
     { kind: 'title', label: 'ui_app_node_tab' },
+    { kind: 'status', label: 'ui_app_active' },
+    { kind: 'small', label: 'ui_app_super_node' },
     { kind: 'small', label: SUPER_ID },
-    { kind: 'row', label: 'ui_app_node_type', value: 'ui_app_super_node' },
-    { kind: 'row', label: 'ui_app_status_node', value: 'ui_app_active' },
-    { kind: 'row', label: 'ui_app_last_seen', value: { key: 'ui_app_ago', vars: { time: '1 min' } } },
+    { kind: 'row', label: 'ui_app_last_seen', value: { key: 'ui_app_ago', vars: { time: { key: 'ui_app_time_min', vars: { n: '1' } } } } },
     { kind: 'row', label: 'ui_app_node_balance', value: APP_BALANCE },
     appButton('action_move'),
   ],
 };
 
 // Creating a wallet in QNet Wallet: the same four screens on every phone and tablet. A phone with a screen lock locks
-// the wallet with it and shows no password fields.
+// the wallet with it and shows no password fields. The welcome screen is the app's mark, its name and the line under
+// it, then the two buttons (WalletScreen.js).
 const APP_WALLET: GuideStep[] = [
   {
     id: 'install',
@@ -146,9 +150,7 @@ const APP_WALLET: GuideStep[] = [
     link: { href: '/wallet', label: 'guide_link_wallet' },
     scene: {
       frame: 'phone', screen: 'app', parts: [
-        { kind: 'title', label: 'ui_app_name' },
-        { kind: 'small', label: 'ui_app_welcome' },
-        { kind: 'lines', count: 2 },
+        { kind: 'mark', name: 'ui_app_name', label: 'ui_app_welcome' },
         appButton('ui_app_create_new', true),
         appButton('ui_app_import', false, 'secondary'),
       ],
@@ -173,7 +175,7 @@ const APP_WALLET: GuideStep[] = [
       frame: 'phone', screen: 'app', parts: [
         { kind: 'title', label: 'ui_app_seed_title' },
         { kind: 'words' },
-        appButton('copy', false, 'secondary'),
+        appButton('ui_app_copy_phrase', false, 'secondary'),
         appButton('ui_app_wrote', true),
       ],
     },
@@ -547,7 +549,7 @@ export function computerGuide({ network, phoneFlows }: GuideOptions): GuideStep[
         frame: 'browser', url: 'aiqnet.io/node', parts: [
           nodeTabs,
           { kind: 'small', label: BALANCE },
-          { kind: 'status', label: 'wallet_extension_waiting' },
+          { kind: 'status', label: 'claim_extension_waiting' },
         ],
         popup: [
           { kind: 'title', label: 'ui_ext_claim_title' },
@@ -559,14 +561,14 @@ export function computerGuide({ network, phoneFlows }: GuideOptions): GuideStep[
   ];
 }
 
-// A super node (R3, R5): only the QNet extension on a computer activates it. The extension makes or imports the wallet
+// A super node: only the QNet extension on a computer activates it. The extension makes or imports the wallet
 // and burns (the one-time payment address burns for light nodes only, and a phone activates none), the page shows the
 // code and every server step right after the burn and the Overview later in any browser where the wallet is connected,
 // the server runs the QNet node software with the same wallet, the operator checks that it runs and catches up, the
 // node registers itself, the Overview follows it, QNet Wallet with the same wallet shows it on every phone and tablet
 // with no device to link (the wallet derives the super node's id from its own address, WalletManager
 // generateSuperNodePseudonym), and My node moves its balance with the extension's window (or QNet Wallet's Node tab on
-// any phone with the wallet, owner 12.10).
+// any phone with the wallet).
 export function superGuide({ network }: GuideOptions): GuideStep[] {
   const SUPER_CODE = { raw: 'QNET-S2C4A1-806358-771140' };
   return [
@@ -664,7 +666,7 @@ export function superGuide({ network }: GuideOptions): GuideStep[] {
         frame: 'browser', url: 'aiqnet.io/node', parts: [
           nodeTabs,
           { kind: 'small', label: BALANCE },
-          { kind: 'status', label: 'wallet_extension_waiting' },
+          { kind: 'status', label: 'claim_extension_waiting' },
         ],
         popup: [
           { kind: 'title', label: 'ui_ext_claim_title' },
@@ -693,9 +695,11 @@ export function partLabels(parts: Part[]): Label[] {
       if (part.label) all.push(part.label);
       if (part.value) all.push(part.value);
     } else if (part.kind === 'row') all.push(part.label, part.value);
+    else if (part.kind === 'mark') all.push(part.name, part.label);
     else if ('label' in part) all.push(part.label);
   }
-  return all;
+  // A label filled into another is shown too.
+  return all.flatMap((label): Label[] => [label, ...(typeof label === 'string' || 'raw' in label ? [] : Object.values(label.vars).filter((v) => typeof v !== 'string'))]);
 }
 
 // Every label a scene shows, for the tests.

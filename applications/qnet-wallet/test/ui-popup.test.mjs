@@ -657,8 +657,9 @@ describe('popup: send', () => {
     assert.equal(page.$('[data-action="confirm-send"]'), null);
   });
 
-  it('QNet: the sent screen asks where its transaction stands and turns Confirmed once it is in a block (owner, 18.10)', async () => {
-    for (const [final, title, lead] of [['in_block', 'Confirmed', null], ['replaced', 'Sent', /took its nonce: this one can never go through/]]) {
+  it('QNet: the sent screen asks where its transaction stands and turns Confirmed once it is in a block, Expired once dropped', async () => {
+    for (const [final, title, lead] of [['in_block', 'Confirmed', null], ['replaced', 'Sent', /took its nonce: this one can never go through/],
+      ['dropped', 'Expired', /no longer holds this transaction and it did not go through/]]) {
       mock.timers.enable({ apis: ['setTimeout'] });
       const answers = ['pending', 'unknown', final];
       await openWallet({
@@ -1384,7 +1385,7 @@ describe('popup: receive and history', () => {
   // Owner, 28.09: History shows plain badges. The worker's states are unchanged (R2-EXTQ-02, R3-EXTQ-04,
   // R4-EXTQ-04, R5-EXTQ-01, R5-EXTQ-02); only their names on screen are: two pinned nodes list it (included) →
   // Confirmed; another transaction took its nonce (replaced) → Failed; what may still apply (pending, stale, unknown,
-  // refused) → Pending. Owner, 06.10: a row resolves: one no node can hold any more (dropped) → Not found, and an explorer
+  // refused) → Pending. A V2 one past its last height with its nonce free (dropped) → Not found, and an explorer
   // row no two pinned nodes list (unverified) → Unverified, never Pending forever. Owner, 06.10: a row says its state only
   // while it is not confirmed (after who it was with), a row where nothing moved carries the failed mark, and the detail
   // keeps the badge of every state, Confirmed too.
@@ -2171,7 +2172,7 @@ describe('popup: settings', () => {
     await page.click('[data-action="revoke"]');
     assert.deepEqual(page.callsOf('sites.revoke').map((entry) => entry.params), [{ origin: 'https://aiqnet.io' }]);
     assert.equal(page.$$('[data-action="revoke"]').length, 1);
-    assert.match(page.text(), /Version3\.1\.6/);
+    assert.match(page.text(), /Version3\.1\.7/);
   });
 
   it('checks a new password locally, then changes it with the current one', async () => {

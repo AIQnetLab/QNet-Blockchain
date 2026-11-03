@@ -7,6 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { TEXTS } from './texts-helper.mjs';
 import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import {
   ATTACKER, CAPSULE_OPTIONS, GALC_V, IDS, NODES, TEST_GENESIS_KEYS, accountLeaf, addressKey, buildTree, capsuleAt, capsuleText, coBucket, core,
@@ -28,8 +29,7 @@ import {
   capsuleSigned, capsuleSigners,
 } from '../../server/light/galc.ts';
 import { GENESIS_CONSENSUS_PKS } from '../../server/light/genesis-keys.ts';
-
-const SRC = new URL('../../', import.meta.url);
+import { SRC } from './source.mjs';
 
 // ------------------------------------------------------------------------------------------------ the checkpoint
 
@@ -733,12 +733,14 @@ test('the route, the page and explorer.md describe the committee check, and noth
   assert.match(route, /verificationMethod: 'committee-certificate',/);
   const page = readFileSync(new URL('app/explorer/address/[address]/AddressClient.tsx', SRC), 'utf8');
   assert.doesNotMatch(page, /Multi-Node Consensus|Nodes Agreed|Multi-node consensus|Cryptographically Verified/);
-  assert.match(page, /Verified by the committee certificate/);
+  assert.match(page, /t\('proof_verified'\)/);
+  assert.equal(TEXTS.proof_verified, 'Verified by the committee certificate');
   assert.match(page, /if \(data\.success && data\.verified === true && typeof data\.stateRoot === 'string' && typeof data\.balanceNano === 'string' && \/\^\\d\+\$\/\.test\(data\.balanceNano\)\) \{/);
   // The answer's `balance` stays the canonical decimal; the page groups the exact nano QNC as English writes it (qnc of
   // src/lib/format.ts, the site's one QNC formatter).
   assert.match(route, /balance: qncText\(r\.balanceNano\),\s*balanceNano: r\.balanceNano,/);
-  assert.match(page, /<Row label="Proven balance">\{qnc\(result\.balanceNano\)\} QNC\{result\.exists \? '' : ' \(no account yet\)'\}<\/Row>/);
+  assert.match(page, /<Row label=\{t\('proof_balance'\)\}>\{t\(result\.exists \? 'proof_amount' : 'proof_amount_new', \{ amount: qnc\(result\.balanceNano\) \}\)\}<\/Row>/);
+  assert.equal(TEXTS.proof_amount_new, '{amount} QNC (no account yet)');
   // A second request for an address under check shares that check; the page's block stays hidden, and the doc says so.
   assert.match(route, /let running = inflight\.get\(address\);\s*if \(!running\) \{\s*running = sharedBalanceProver\(\)\.provenBalance\(address\)\.then\(/);
   assert.match(route, /\}\)\.finally\(\(\) => inflight\.delete\(address\)\);\s*inflight\.set\(address, running\);/);

@@ -4,6 +4,7 @@
 // shown, so a table's ages refresh in place and the table itself never renders again for them.
 
 import { useSyncExternalStore } from 'react';
+import { useT } from '@/i18n/client';
 import { ageText } from '@/lib/explorer-view';
 
 const listeners = new Set<() => void>();
@@ -39,7 +40,8 @@ export function useClock(on = true): void {
 }
 
 export default function Ago({ ts, on = true }: { ts: number | string | null | undefined; on?: boolean }) {
+  const t = useT();
   useClock(on);
   // The server's age and the browser's differ by the time in between; the browser's replaces it at once.
-  return <span className="num" suppressHydrationWarning>{ageText(ts, Date.now())}</span>;
+  return <span className="num" suppressHydrationWarning>{ageText(ts, Date.now(), t)}</span>;
 }

@@ -19,6 +19,7 @@ const {
 } = await import('./helpers/chains-activation-env.mjs');
 const nodes = await import('../dist/background/nodes.js');
 const activation = await import('../dist/background/activation.js');
+const { certifiedNet } = await import('./helpers/certified-net.mjs');
 
 const W = WALLET.qnetAddress;
 const N = core.lightNodeId(W);
@@ -79,10 +80,12 @@ function answered(answer) {
 /**
  * The pinned nodes. status(nodeId, node) → onchain_registered (true/false), an answer object or an Error; server(nodeId,
  * node) the same for a super node's status; submit(body, node) → {status?, body} or an Error for no answer; claim(body,
- * node) and pending(nodeId, node) for the node balance.
+ * node) and pending(nodeId, node) for the node balance; `fallback`: a route for every other request (the wallet's live
+ * figure of a move in parts).
  */
 function network({
   status = () => false, server = () => false, submit = () => ({ body: { success: true, tx_hash: 'ab'.repeat(32) } }), claim, pending,
+  account = null, fallback = null,
 } = {}) {
   const seen = { status: [], server: [], submits: [], claims: [], pending: [] };
   const requests = installFetch(async (request) => {
@@ -115,7 +118,9 @@ function network({
       seen.pending.push(url.origin);
       return answered(await pending(url.pathname.split('/').pop(), url.origin));
     }
-    return undefined;
+    // the wallet's account (`account`: its answer, or none): the next height a re-signed claim names
+    if (account !== null && url.pathname.startsWith('/api/v1/account/')) return answered(await account(url.pathname.split('/').pop()));
+    return fallback === null ? undefined : fallback(request);
   });
   return { seen, requests };
 }
@@ -673,25 +678,34 @@ describe('nodes: activation.js queues the registration with the activation', () 
 
 // ---------------------------------------------------------------- the node balance
 
-const quoteOf = ({ epochs = [5, 6], amounts = [1_500_000_000, 1_000_000_000], watermark = 4, ts = 1_790_000_000, amountNano, signMessage, stopped = null } = {}) => {
+// `validUntil`: a quote that offers the V2 form (its sign_message_v2 the wallet's own message, or `signMessageV2`).
+const quoteOf = ({
+  epochs = [5, 6], amounts = [1_500_000_000, 1_000_000_000], watermark = 4, ts = 1_790_000_000, amountNano, signMessage, stopped = null,
+  validUntil = null, signMessageV2,
+} = {}) => {
   const claimsData = JSON.stringify({ claims: epochs.map((epoch, i) => ({ epoch, amount: amounts[i], proof: [['ab'.repeat(32), 0]] })) });
   return {
     success: false, needs_signature: true, claims_data: claimsData,
     sign_message: signMessage ?? core.claimPayloadPreimage(W, ts, claimsData), claim_timestamp: ts, epochs_claimed: epochs.length,
     amount_nano: amountNano ?? String(amounts.reduce((a, b) => a + b, 0)), last_claimed_epoch: watermark,
-    stopped_at_epoch: stopped, stopped_reason: stopped === null ? null : 'batch_full',
+    stopped_at_epoch: stopped, stopped_reason: stopped === null ? null : 'batch_full', valid_until: validUntil,
+    sign_message_v2: validUntil === null ? null
+      : signMessageV2 ?? core.claimPayloadPreimageV2(W, claimsData, { networkId: core.genesisConsensus.NETWORK_ID, validUntil }),
   };
 };
 
-function claimNetwork({ quote = quoteOf(), head = 5, balance = 2_500_000_000, listed = true, submitted, step1 } = {}) {
+// `submitted`: the step-2 answer, or a function of the request giving it; `account`: the wallet's account answer.
+function claimNetwork({ quote = quoteOf(), head = 5, balance = 2_500_000_000, listed = true, submitted, step1, account = null } = {}) {
   return network({
     status: () => listed,
     server: () => listed,
     pending: (id) => ({ body: { node_id: id, pending_rewards_nano: balance, first_unclaimed_epoch: head } }),
     claim: (body) => {
       if (body.claims_data === undefined) return { body: step1 ?? quote };
-      return { body: submitted ?? { success: true, tx_hash: 'cd'.repeat(32), amount_qnc: 2.5 } };
+      const answer = typeof submitted === 'function' ? submitted(body) : submitted;
+      return { body: answer ?? { success: true, tx_hash: 'cd'.repeat(32), amount_qnc: 2.5 } };
     },
+    account,
   });
 }
 
@@ -718,7 +732,7 @@ describe('nodes: the node balance', () => {
     const net = claimNetwork({ quote: quoteOf({ stopped: 7 }) });
     const outcome = await nodes.claimForSite(N);
     assert.deepEqual(outcome, {
-      status: 'ok', qnet: W, nodeId: N, amountNano: '2500000000', txHash: 'cd'.repeat(32), stoppedAtEpoch: '7',
+      status: 'ok', qnet: W, nodeId: N, amountNano: '2500000000', txHash: 'cd'.repeat(32), stoppedAtEpoch: '7', whole: false,
     });
     const [first, corroborating, second] = net.seen.claims;
     assert.equal(second.node, first.node, 'the payload goes back to the node that quoted it');
@@ -734,6 +748,53 @@ describe('nodes: the node balance', () => {
     assert.equal(await core.verifyConsensusSignature(core.claimPayloadPreimage(W, quote.claim_timestamp, quote.claims_data),
       second.body.claims_signature, second.body.dilithium_public_key), true);
     assert.ok(net.seen.pending.every((node) => node !== first.node), 'the head from other nodes than the quoting one');
+  });
+
+  // The V2 form (a signed last height): the quote's valid_until is signed over the message the wallet builds, the node's
+  // sign_message_v2 only ever compared; a typed refusal of the form or the height is answered by one re-sign.
+  const v2Message = (quote, validUntil) => core.claimPayloadPreimageV2(W, quote.claims_data,
+    { networkId: core.genesisConsensus.NETWORK_ID, validUntil });
+  const refusedWith = (code) => ({ success: false, error: `${code}: the node's words` });
+
+  it('a quote with valid_until: the V2 message signed and posted with its last height, no timestamp', async () => {
+    installEnv();
+    const quote = quoteOf({ validUntil: 1600 });
+    const net = claimNetwork({ quote });
+    assert.equal((await nodes.claimForSite(N)).status, 'ok');
+    const second = net.seen.claims.at(-1).body;
+    assert.equal(second.valid_until, 1600);
+    assert.equal(Object.hasOwn(second, 'claim_timestamp'), false);
+    assert.equal(await core.verifyConsensusSignature(v2Message(quote, 1600), second.claims_signature, second.dilithium_public_key), true);
+  });
+
+  it('another sign_message_v2, or a malformed last height, refuses before anything is signed', async () => {
+    for (const quote of [quoteOf({ validUntil: 1600, signMessageV2: 'q1337|transfer:x' }), { ...quoteOf(), valid_until: '0' },
+      { ...quoteOf(), valid_until: 'soon' }]) {
+      const env = installEnv();
+      claimNetwork({ quote });
+      await rejectsWith(nodes.claimForSite(N), 'CLAIM_REFUSED');
+      assert.equal(env.calls.signClaimPayload, 0);
+    }
+  });
+
+  it('a typed refusal: one re-sign, V1 before the gate, V2 with a fresh height otherwise; a second refusal is the answer', async () => {
+    let env = installEnv();
+    const quote = quoteOf({ validUntil: 1600 });
+    let net = claimNetwork({ quote, submitted: (body) => (body.valid_until !== undefined ? refusedWith('tx_v2_before_gate') : undefined) });
+    assert.equal((await nodes.claimForSite(N)).status, 'ok');
+    const [v2, v1] = net.seen.claims.slice(-2).map((c) => c.body);
+    assert.equal(v2.valid_until, 1600);
+    assert.equal(v1.claim_timestamp, quote.claim_timestamp);
+    assert.equal(await core.verifyConsensusSignature(core.claimPayloadPreimage(W, quote.claim_timestamp, quote.claims_data),
+      v1.claims_signature, v1.dilithium_public_key), true);
+    assert.equal(env.calls.signClaimPayload, 2);
+
+    env = installEnv();
+    const account = () => ({ body: { address: W, balance: '0', nonce: '0', has_dilithium_pk: true, tx_v2: true, next_height: 3000 } });
+    net = claimNetwork({ quote, account, submitted: () => refusedWith('tx_expired') });
+    await rejectsWith(nodes.claimForSite(N), 'CLAIM_REFUSED');
+    assert.deepEqual(net.seen.claims.filter((c) => c.body.claims_data !== undefined).map((c) => c.body.valid_until), [1600, 3600]);
+    assert.equal(env.calls.signClaimPayload, 2);
   });
 
   const refusals = [
@@ -791,7 +852,7 @@ describe('nodes: the node balance', () => {
     const small = { epochs: [5, 6, 7], amounts: [10_000_000, 10_000_000, 10_000_000], stopped: 8 };
     const net = claimNetwork({ quote: quoteOf(small), balance: 3_000_000_000 });
     assert.deepEqual(await nodes.claimForSite(N), {
-      status: 'ok', qnet: W, nodeId: N, amountNano: '30000000', txHash: 'cd'.repeat(32), stoppedAtEpoch: '8',
+      status: 'ok', qnet: W, nodeId: N, amountNano: '30000000', txHash: 'cd'.repeat(32), stoppedAtEpoch: '8', whole: false,
     });
     assert.equal(env.calls.signClaimPayload, 1);
     const second = net.seen.claims.find((c) => c.body.claims_data !== undefined);
@@ -895,7 +956,7 @@ describe('nodes: the node balance', () => {
       const early = quoteOf({ epochs: [5, 6], amounts: [E, E], stopped: 7, ts: 1_790_000_111 });
       const { net, quoting } = twoQuotes({ firstQuote: honestPart(), otherQuote: () => ({ body: early }) });
       assert.deepEqual(await nodes.claimForSite(N), {
-        status: 'ok', qnet: W, nodeId: N, amountNano: String(2 * E), txHash: 'cd'.repeat(32), stoppedAtEpoch: '7',
+        status: 'ok', qnet: W, nodeId: N, amountNano: String(2 * E), txHash: 'cd'.repeat(32), stoppedAtEpoch: '7', whole: false,
       });
       const [submitted] = step2(net);
       assert.equal(submitted.node, step1(net)[1].node, 'the payload goes to the node whose quote is signed');
@@ -995,6 +1056,269 @@ describe('nodes: the node balance', () => {
   });
 });
 
+// Move to wallet moves the whole balance the approval showed. Under the one approval and its one quote
+// signature, a part whose quote stopped at a bound of one request is followed by the next once the wallet's live figure
+// shows it through, quoted from its last epoch, until the balance shown moved or `until` passed; the site learns the
+// total, the last part's hash, and the first epoch the last part did not take unless the whole balance moved.
+describe('nodes: the move in parts under one approval', () => {
+  const E = 500_000_000;
+  // The clock and every timer are the test's: a part's watermark is read seconds after its submit.
+  beforeEach(() => {
+    const now = Date.now();
+    mock.timers.reset();
+    mock.timers.enable({ apis: ['Date', 'setTimeout'], now });
+  });
+  // `promise` run to its end, the clock moved on whenever nothing else is left to run.
+  async function driven(promise) {
+    let done = false;
+    promise.then(() => { done = true; }, () => { done = true; });
+    for (let i = 0; i < 4000 && !done; i += 1) {
+      await flush(10);
+      if (!done) mock.timers.tick(250);
+    }
+    return promise;
+  }
+  const hashOf = (n) => n.toString(16).padStart(2, '0').repeat(32);
+
+  /**
+   * The node balance: epochs 5 to `last` of `amount` each, quoted at most `cap` at a time from the watermark the nodes
+   * applied, a full quote stopping at the next epoch for `reason`. A submit is applied at once: the wallet's live figure
+   * (a certified-net live tip) shows its last epoch as the watermark unless `shows` is false, and the nodes quote from it
+   * `lagMs` later (before that, from the watermark before it). `stale`: the nodes that apply no part. `step1(n)`: the
+   * step-1 answer in place of every quote after the nth part, or null; `step1For(node)` that node's, or null.
+   * `onSubmit(n)`: called at the nth part's submit. `appliedThrough(epochs)`: the watermark a part's submit leaves (default
+   * its last epoch); `validUntil`: the last height every quote offers (the V2 form); `tipHeight`: the live figure's block.
+   * `silent`: the nodes that answer no node balance read and no claim after the first part.
+   */
+  function partsNetwork({
+    last = 14, cap = 4, amount = E, reason = 'batch_full', lagMs = 0, stale = [], shows = true, step1 = null, step1For = null,
+    onSubmit = null, appliedThrough = (epochs) => epochs.at(-1), validUntil = null, tipHeight = null, silent = [],
+  } = {}) {
+    const quiet = (node) => silent.includes(node) && marks.length > 1;
+    const live = certifiedNet({ accounts: { [W]: { balance: '0', nonce: '0', last_claimed_epoch: '4' } } });
+    const marks = [{ watermark: 4, at: 0 }];
+    const watermarkAt = (node) => (stale.includes(node) ? 4 : marks.filter((m) => m.at + lagMs <= Date.now()).at(-1).watermark);
+    const quoteAt = (w) => {
+      const epochs = [];
+      for (let e = w + 1; e <= last && epochs.length < cap; e += 1) epochs.push(e);
+      if (epochs.length === 0) return { success: false, error: 'No claimable rewards' };
+      const stopped = epochs.length === cap ? epochs.at(-1) + 1 : null;
+      return {
+        ...quoteOf({ epochs, amounts: epochs.map(() => amount), watermark: w, stopped, validUntil }),
+        stopped_reason: stopped === null ? null : reason,
+      };
+    };
+    const submitted = [];
+    const net = network({
+      status: () => true,
+      pending: (id, node) => {
+        if (quiet(node)) return new TypeError('offline');
+        const w = watermarkAt(node);
+        return { body: { node_id: id, pending_rewards_nano: Math.max(0, last - w) * amount, first_unclaimed_epoch: w + 1 } };
+      },
+      claim: (body, node) => {
+        if (quiet(node)) return new TypeError('offline');
+        if (body.claims_data === undefined) return { body: step1For?.(node) ?? step1?.(submitted.length) ?? quoteAt(watermarkAt(node)) };
+        const epochs = JSON.parse(body.claims_data).claims.map((c) => c.epoch);
+        submitted.push(epochs);
+        const watermark = appliedThrough(epochs);
+        marks.push({ watermark, at: Date.now() });
+        if (shows) live.setTip({ [W]: { balance: '0', nonce: '0', last_claimed_epoch: String(watermark) } }, {}, tipHeight);
+        onSubmit?.(submitted.length);
+        return { body: { success: true, tx_hash: hashOf(submitted.length) } };
+      },
+      fallback: live.route,
+    });
+    return { ...net, submitted };
+  }
+  const isQuote = (r) => r.url.endsWith('/api/v1/rewards/claim') && JSON.parse(r.body).claims_data === undefined;
+  const isSubmit = (r) => r.url.endsWith('/api/v1/rewards/claim') && JSON.parse(r.body).claims_data !== undefined;
+  const isLiveRead = (r) => r.url.endsWith(`/api/v1/account/${W}/balance/proof`);
+  const isPendingRead = (r) => r.url.includes('/api/v1/rewards/pending/');
+
+  it('moves the whole balance in parts under one quote signature, each quoted once the live figure shows the one before', async () => {
+    const env = installEnv();
+    const net = partsNetwork({ stale: [QNET.NODES[0]] });
+    const outcome = await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 }));
+    assert.deepEqual(outcome, { status: 'ok', qnet: W, nodeId: N, amountNano: String(10 * E), txHash: hashOf(3), stoppedAtEpoch: null, whole: true });
+    assert.deepEqual(net.submitted, [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14]]);
+    assert.equal(env.calls.signNodeClaim, 1, 'one quote signature for every part');
+    assert.equal(env.calls.signClaimPayload, 3);
+    // a part is quoted only after a live read showed the part before through
+    const submits = net.requests.map((r, i) => (isSubmit(r) ? i : -1)).filter((i) => i >= 0);
+    for (const at of submits.slice(0, -1)) {
+      const nextQuote = net.requests.findIndex((r, i) => i > at && isQuote(r));
+      assert.ok(net.requests.slice(at, nextQuote).some(isLiveRead), 'the live figure is read before the next quote');
+    }
+    // the node that applied no part never quotes a later one: its quote is passed over, its head does not count
+    assert.ok(net.seen.claims.filter((c) => c.body.claims_data !== undefined).slice(1).every((c) => c.node !== QNET.NODES[0]));
+  });
+
+  it('no next part once the parts reach the balance the approval showed, and the run ends at a stop no next quote goes past', async () => {
+    installEnv();
+    let net = partsNetwork();
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(6 * E), until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: String(8 * E), txHash: hashOf(2), stoppedAtEpoch: '13', whole: false,
+    });
+    assert.deepEqual(net.submitted, [[5, 6, 7, 8], [9, 10, 11, 12]]);
+    // an epoch the nodes cannot serve now stays for a later move
+    installEnv();
+    net = partsNetwork({ reason: 'epoch_unservable' });
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: String(4 * E), txHash: hashOf(1), stoppedAtEpoch: '9', whole: false,
+    });
+    assert.equal(net.submitted.length, 1);
+    // without `until` (no site's wait to keep inside), one part
+    installEnv();
+    net = partsNetwork();
+    assert.equal((await driven(nodes.claimForSite(N))).stoppedAtEpoch, '9');
+    assert.equal(net.submitted.length, 1);
+  });
+
+  it('a lock, a refusal of the next part and the end of the time each answer what moved, with the last part\'s stop', async () => {
+    const part1 = { status: 'ok', qnet: W, nodeId: N, amountNano: String(4 * E), txHash: hashOf(1), stoppedAtEpoch: '9', whole: false };
+    const env = installEnv();
+    let net = partsNetwork({ onSubmit: () => { env.locked = true; } });
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), part1);
+    assert.equal(net.submitted.length, 1, 'a part due while the wallet is locked is not sent');
+    const refused = installEnv();
+    net = partsNetwork({ step1: (n) => (n >= 1 ? { success: false, error: 'Rate limit exceeded' } : null) });
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), part1);
+    assert.equal(refused.calls.signClaimPayload, 1);
+    // the time for the next part was over before it: no live read, no second part
+    installEnv();
+    net = partsNetwork();
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() })), part1);
+    assert.equal(net.requests.filter(isLiveRead).length, 0);
+    // the time ends while the live figure does not show the part yet: it stays on its way, the next part is not sent
+    installEnv();
+    net = partsNetwork({ shows: false });
+    const started = Date.now();
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: started + 20_000 })), part1);
+    assert.ok(net.requests.filter(isLiveRead).length >= 3);
+    assert.ok(Date.now() - started >= 20_000 && Date.now() - started < 30_000);
+    assert.equal(net.submitted.length, 1);
+  });
+
+  it('a whole balance below 1 QNC in all answers the last part\'s stop, never null', async () => {
+    installEnv();
+    // the first part is capped at its bound, and the next quote finds nothing left (the epochs past it hold none)
+    let net = partsNetwork({ last: 6, cap: 2, amount: 100_000_000 });
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: '300000000', until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: '200000000', txHash: hashOf(1), stoppedAtEpoch: '7', whole: true,
+    });
+    assert.equal(net.submitted.length, 1);
+    assert.ok(net.requests.slice(net.requests.findIndex(isSubmit)).some(isQuote), 'the next part was quoted');
+    // the same with 1 QNC in all: the whole balance moved
+    installEnv();
+    net = partsNetwork({ last: 6, cap: 2 });
+    assert.equal((await driven(nodes.claimForSite(N, { shownNano: String(3 * E), until: Date.now() + 150_000 }))).stoppedAtEpoch, null);
+    assert.equal(net.submitted.length, 1);
+  });
+
+  it('no node applied the last part yet: asked again 3 s apart, twice, then the run ends; nodes that catch up take the next part', async () => {
+    installEnv();
+    let net = partsNetwork({ lagMs: 4_000 });
+    const whole = await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 }));
+    assert.deepEqual([whole.amountNano, whole.stoppedAtEpoch], [String(10 * E), null]);
+    assert.equal(net.submitted.length, 3);
+    installEnv();
+    net = partsNetwork({ lagMs: 60_000 });
+    const started = Date.now();
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: String(4 * E), txHash: hashOf(1), stoppedAtEpoch: '9', whole: false,
+    });
+    assert.equal(net.submitted.length, 1);
+    const firstSubmit = net.requests.findIndex(isSubmit);
+    // three rounds in which every node's pending head shows the part not applied: no claim request at all (each is one
+    // of the address's claim budget at the node), only those reads
+    assert.equal(net.requests.slice(firstSubmit + 1).filter(isQuote).length, 0);
+    assert.ok(net.requests.slice(firstSubmit).filter(isPendingRead).length >= 3 * QNET.NODES.length);
+    assert.ok(Date.now() - started >= 2_000 + 2 * 3_000);
+  });
+
+  it('a next part is quoted only at nodes whose pending head shows the part before applied', async () => {
+    installEnv();
+    // two nodes never apply a part: their heads stay at the first part's first epoch
+    const stale = QNET.NODES.slice(0, 2);
+    const net = partsNetwork({ stale });
+    const outcome = await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 }));
+    assert.deepEqual([outcome.amountNano, outcome.stoppedAtEpoch], [String(10 * E), null]);
+    const firstSubmit = net.requests.findIndex(isSubmit);
+    const later = net.seen.claims.slice(net.seen.claims.findIndex((c) => c.body.claims_data !== undefined) + 1);
+    assert.ok(later.length > 0 && later.every((c) => !stale.includes(c.node)), 'no claim request of a later part at a node behind');
+    assert.ok(firstSubmit >= 0);
+  });
+
+  it('one node that applied the part and the others behind or silent: it waits for a second, asking no claim of them', async () => {
+    installEnv();
+    const stale = QNET.NODES.slice(0, 2);
+    const silent = QNET.NODES.slice(2, 4);
+    const net = partsNetwork({ stale, silent });
+    const started = Date.now();
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: String(4 * E), txHash: hashOf(1), stoppedAtEpoch: '9', whole: false,
+    });
+    const later = net.seen.claims.slice(net.seen.claims.findIndex((c) => c.body.claims_data !== undefined) + 1);
+    assert.deepEqual(later, [], 'no claim request while fewer than two nodes show the part applied');
+    assert.ok(Date.now() - started >= 2_000 + 2 * 3_000, 'asked again twice, 3 s apart');
+  });
+
+  it('a node that spent this address\'s claim budget, or is busy with another request, hands the quote over', async () => {
+    const limited = { success: false, code: 'rate_limited', error: 'Rate limit exceeded', retry_after_seconds: 1800 };
+    const busy = { success: false, code: 'claim_busy', error: 'Claim already in progress for this node. Please wait and retry.' };
+    for (const refusal of [limited, busy]) {
+      installEnv();
+      const spent = QNET.NODES[0];
+      const net = partsNetwork({ step1For: (node) => (node === spent ? refusal : null) });
+      const outcome = await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 }));
+      assert.deepEqual([outcome.amountNano, outcome.stoppedAtEpoch], [String(10 * E), null], refusal.code);
+      assert.ok(net.seen.claims.every((c) => c.node !== spent || c.body.claims_data === undefined), 'nothing submitted there');
+    }
+    // every node refusing so: the first part's answer, as before
+    installEnv();
+    partsNetwork({ step1For: () => limited });
+    await rejectsWith(driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), 'NETWORK');
+    installEnv();
+    partsNetwork({ step1For: () => busy });
+    await rejectsWith(driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), 'CLAIM_BUSY');
+  });
+
+  it('a last part the live figure shows taken in part counts its epochs up to the watermark, one that expired nothing', async () => {
+    // the second part (epochs 9 to 12) applies through epoch 10 only
+    installEnv();
+    let net = partsNetwork({ appliedThrough: (epochs) => (epochs[0] === 9 ? 10 : epochs.at(-1)) });
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: String(6 * E), txHash: hashOf(2), stoppedAtEpoch: '11', whole: false,
+    });
+    assert.equal(net.submitted.length, 2);
+    // the second part is in no block past its last height: the answer is the first part's
+    installEnv();
+    net = partsNetwork({ appliedThrough: (epochs) => (epochs[0] === 9 ? 8 : epochs.at(-1)), validUntil: 1600, tipHeight: 1601 });
+    assert.deepEqual(await driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), {
+      status: 'ok', qnet: W, nodeId: N, amountNano: String(4 * E), txHash: hashOf(1), stoppedAtEpoch: '9', whole: false,
+    });
+    // the first part expired: nothing moved
+    installEnv();
+    net = partsNetwork({ appliedThrough: () => 4, validUntil: 1600, tipHeight: 1601 });
+    await rejectsWith(driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 })), 'CLAIM_REFUSED');
+    assert.equal(net.submitted.length, 1);
+  });
+
+  it('one move of a wallet at a time: a second one while it runs is CLAIM_BUSY, and nothing of it is signed', async () => {
+    const env = installEnv();
+    partsNetwork();
+    const first = driven(nodes.claimForSite(N, { shownNano: String(10 * E), until: Date.now() + 150_000 }));
+    await flush(2);
+    await rejectsWith(nodes.claimForSite(S, { shownNano: String(10 * E), until: Date.now() + 150_000 }), 'CLAIM_BUSY');
+    assert.equal((await first).amountNano, String(10 * E));
+    assert.equal(env.calls.signNodeClaim, 1, 'the second move signed nothing');
+    // once it ended, the next one runs
+    partsNetwork();
+    assert.equal((await driven(nodes.claimForSite(N))).status, 'ok');
+  });
+});
+
 // ---------------------------------------------------------------- the node the site names (decision 47)
 
 describe('nodes: the move names the wallet\'s light or super node', () => {
@@ -1028,7 +1352,7 @@ describe('nodes: the move names the wallet\'s light or super node', () => {
     const env = installEnv();
     const net = claimNetwork();
     assert.deepEqual(await nodes.claimForSite(S), {
-      status: 'ok', qnet: W, nodeId: S, amountNano: '2500000000', txHash: 'cd'.repeat(32), stoppedAtEpoch: null,
+      status: 'ok', qnet: W, nodeId: S, amountNano: '2500000000', txHash: 'cd'.repeat(32), stoppedAtEpoch: null, whole: true,
     });
     const [first, second] = net.seen.claims;
     assert.equal(first.body.node_id, S);

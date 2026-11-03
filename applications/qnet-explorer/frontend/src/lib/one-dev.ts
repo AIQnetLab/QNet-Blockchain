@@ -17,6 +17,5 @@ export const solanaTxUrl = (signature: string): string => `https://explorer.sola
 
 // The network of this release's activations and of its testnet faucet, from that cluster: devnet is testnet, whose tokens
 // have no value and which the site's testnet faucet sends. A constant of the release, never a server setting, so a
-// deployment that sets nothing never tells a visitor to send real tokens to an address the site reads only on devnet
-// (SITE-R3-01).
+// deployment that sets nothing never tells a visitor to send real tokens to an address the site reads only on devnet.
 export const ACTIVATION_NETWORK: 'testnet' | 'mainnet' = BURN_CLUSTER === 'devnet' ? 'testnet' : 'mainnet';

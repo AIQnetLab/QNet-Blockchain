@@ -153,11 +153,16 @@ describe('MOBNET-R3-03: an accepted send is settled by its nonce too', () => {
     const screen = read('src/screens/WalletScreen.js');
     const poll = screen.slice(screen.indexOf('const startTxConfirmationPolling'), screen.indexOf('const startUnknownOutcomeResolution'));
     expect(poll).toMatch(/walletManager\.resolveSubmitByNonce\(settleWith\.from, settleWith\.nonce/);
-    // The row under the handed hash, still pending or marked not found (L-10), takes the hash that landed and shows it in
-    // a block, or goes when a row of that hash is listed already.
-    expect(poll).toMatch(/const handed = \(r\) => unsettledRow\(r\) && r\.hash === txHash;/);
-    expect(poll).toMatch(/const rows = listed \? prev\.filter\(r => !handed\(r\)\) : prev\.map\(r => \(handed\(r\) \? \{ \.\.\.r, hash: landedHash \} : r\)\);/);
-    expect(screen).toMatch(/const unsettledRow = \(r\) => r\.status === 'pending' \|\| r\.status === 'dropped';/);
+    // The row under the handed hash, still pending or expired, takes the hash that landed and shows it in a block, or goes
+    // when a row of that hash is listed already: the one rule History's own read applies (withNonceAnswer).
+    expect(poll).toMatch(/setTxHistory\(prev => withNonceAnswer\(prev, txHash, answer\)\);/);
+    const { withNonceAnswer, historyBadge } = require('../src/utils/txHistory');
+    const handed = { hash: 'handed', from: FROM, to: TO, status: 'pending', timestamp: 1, type: 'send' };
+    const landed = withNonceAnswer([handed], 'handed', { landed: true, txHash: 'landed-copy' });
+    expect(landed.map((r) => [r.hash, historyBadge(r)])).toEqual([['landed-copy', 'confirmed']]);
+    const listed = { ...handed, hash: 'landed-copy', status: 'unverified' };
+    expect(withNonceAnswer([handed, listed], 'handed', { landed: true, txHash: 'landed-copy' }).map((r) => [r.hash, historyBadge(r)]))
+      .toEqual([['landed-copy', 'confirmed']]);
     expect(poll).toMatch(/res\.replaced \? 'tx_not_applied_title' : 'tx_unbound_title'/);
     expect(screen).toMatch(/const settle = \{\s*from: result\.from, nonce: result\.nonce, kind: 'transfer'/);
     expect(screen).toMatch(/startTxConfirmationPolling\(result\.txHash, settle\);/);
@@ -212,7 +217,7 @@ describe('MOBNET-R3-05: a token amount is scaled by the decimals the user record
     const screen = read('src/screens/WalletScreen.js');
     expect(screen).toMatch(/balance: walletManager\._formatBaseUnits\(held\.balanceBase \|\| '0', dec\),\s*decimalsTrusted: true/);
     expect(screen).toMatch(/tokenVisible\(tk\.contract, \{ hidden: hiddenTokens, added, shown: shownTokensRef\.current \}\)\s*&& tk\.decimalsTrusted/);
-    expect(screen).toMatch(/if \(!recorded \|\| Number\(recorded\.decimals\) !== Number\(sendingToken\.decimals\)\) \{\s*setTxResult\(\{ success: false, title: t\('send_cannot_title'\), error: t\('send_token_unrecorded'\) \}\);/);
+    expect(screen).toMatch(/if \(!recorded \|\| Number\(recorded\.decimals\) !== Number\(sendingToken\.decimals\)\) \{\s*refuse\(t\('send_token_unrecorded'\)\);/);
   });
 });
 
@@ -263,7 +268,7 @@ describe('MOBNET-R3-08: look-alike names and unasked tokens in the history', () 
     expect(rows).toMatch(/symbolTone: reserved \? color\.ember : tone/);
     expect(rows).toMatch(/if \(d\.reserved\) fields\.push\(<Text key="reserved" style=\{styles\.txDetailWarning\}>\{t\('tok_reserved_warning'\)\}<\/Text>\);/);
     // The rows (with the state of a node balance move in transit: services/ClaimTransit) filtered the same way.
-    expect(screen).toMatch(/\? withMoveStates\(txHistory, moveState\)\.filter\(rowVisible\)/);
+    expect(screen).toMatch(/\? withNodeEvents\(withMoveStates\(txHistory, transit\.owner === wallet\?\.qnetAddress \? transit : null\)\.filter\(historyRowVisible\),/);
     expect(screen).toMatch(/t\('hist_unasked_hidden', \{ count: unaskedRows \}\)/);
   });
 });

@@ -304,19 +304,21 @@ async function verifyActivation(qnetAddress, node) {
 }
 
 // Pinned nodes asked two first, then one more at a time: a node that knows a node for this wallet refuses the burn
-// (NODE_EXISTS), and one authoritative "no" (a node at the network's height) is needed to go on. A non-authoritative
-// "no" (a node behind the network) is no proof; no authoritative answer from any node is NETWORK: no burn.
+// (NODE_EXISTS), and two authoritative "no" answers (nodes at the network's height) are needed to go on. One node's
+// word, or a "no" of a node behind the network, is no proof; fewer than two from all the nodes is NETWORK: no burn.
 async function refuseExistingNode(qnetAddress) {
   const nodes = shuffled(QNET.NODES);
   let first = true;
+  let vouched = 0;
   while (nodes.length > 0) {
     const wave = nodes.splice(0, first ? 2 : 1);
     first = false;
     const answers = await Promise.all(wave.map((node) => verifyActivation(qnetAddress, node)));
     if (answers.some((body) => body?.verified === true)) throw new WalletError('NODE_EXISTS');
-    if (answers.some((body) => body?.verified === false && body.authoritative === true)) return;
+    vouched += answers.filter((body) => body?.verified === false && body.authoritative === true).length;
+    if (vouched >= 2) return;
   }
-  log.warn('verify-activation', 'no authoritative answer');
+  log.warn('verify-activation', 'fewer than two authoritative answers', `authoritative=${vouched}`);
   throw new WalletError('NETWORK');
 }
 

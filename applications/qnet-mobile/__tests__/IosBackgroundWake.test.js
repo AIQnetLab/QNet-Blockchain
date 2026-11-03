@@ -35,6 +35,29 @@ describe('iOS background wake wiring', () => {
     expect(at).toBeLessThan(delegate.indexOf('return true', launch));
   });
 
+  // The installed messaging library, patched at install (patches/@react-native-firebase+messaging+23.7.0.patch): its two
+  // blocks were written as expressions, built and never run, so every push held the app for the 25 s fallback, which
+  // the system weighs when it decides later wakes.
+  it('ends a push wake when the JS handler is done, not at the messaging library\'s 25 s fallback', () => {
+    const lib = path.join(__dirname, '..', 'node_modules', '@react-native-firebase', 'messaging');
+    const native = (f) => fs.readFileSync(path.join(lib, 'ios', 'RNFBMessaging', f), 'utf8');
+    const module = native('RNFBMessagingModule.m');
+    const appDelegate = native('RNFBMessaging+AppDelegate.m');
+    // A block that starts a statement with the main queue before it is never dispatched.
+    const unrun = /[;{}]\s*dispatch_get_main_queue\(\)\s*,\s*\^\s*\{/;
+    expect(module).not.toMatch(unrun);
+    expect(appDelegate).not.toMatch(unrun);
+    // The JS handler's end completes the push and ends its background task, on the main queue.
+    expect(module).toMatch(/RCT_EXPORT_METHOD\(completeNotificationProcessing\) \{\s*(\/\/[^\n]*\n\s*)*dispatch_async\(dispatch_get_main_queue\(\), \^\{\s*RNFBMessagingAppDelegate \*appDelegate = \[RNFBMessagingAppDelegate sharedInstance\];\s*if \(appDelegate\.completionHandler\) \{\s*appDelegate\.completionHandler\(UIBackgroundFetchResultNewData\);/);
+    // The expiry handler, which the system calls on the main thread, ends the task before it returns.
+    expect(appDelegate).toMatch(/beginBackgroundTaskWithExpirationHandler:\^\{\s*(\/\/[^\n]*\n\s*)*if \(sharedInstance\.backgroundTaskId != UIBackgroundTaskInvalid\) \{\s*\[application endBackgroundTask:sharedInstance\.backgroundTaskId\];\s*sharedInstance\.backgroundTaskId = UIBackgroundTaskInvalid;\s*\}\s*\}\];/);
+    // The library completes once the background handler's promise settles; index.js's handler awaits handlePushMessage.
+    expect(fs.readFileSync(path.join(lib, 'lib', 'index.js'), 'utf8'))
+      .toMatch(/const handlerPromise = Promise\.resolve\(backgroundMessageHandler\(remoteMessage\)\);\s*handlerPromise\.finally\(\(\) => \{\s*this\.native\.completeNotificationProcessing\(\);/);
+    expect(fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8'))
+      .toMatch(/setBackgroundMessageHandler\(async remoteMessage => \{\s*if \(remoteMessage\?\.data\) \{\s*await handlePushMessage\(remoteMessage\.data\);\s*\}\s*\}\);/);
+  });
+
   it('declares the fetch background mode and no processing task', () => {
     const modes = plist.slice(plist.indexOf('<key>UIBackgroundModes</key>'));
     const list = modes.slice(0, modes.indexOf('</array>'));
@@ -155,6 +178,25 @@ describe('device-side wake rules', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  // The push wake's time is its answer: with no device upkeep owed (a lease window, a status read, a changed push
+  // token), it ends once the answer and what came of the push are recorded.
+  it('a push wake with nothing owed ends right after its answer and its outcome are recorded', async () => {
+    const anchor = `${28800 + 100}:${'a'.repeat(64)}`;
+    await AsyncStorage.multiSet([
+      ['qnet_light_node_info', JSON.stringify({ nodeId: NODE, walletAddress: 'w', pushType: 'fcm', seq: 1790000000 })],
+      ['qnet_ping_node_id', NODE],
+      [`qnet_ping_dilithium_pk_${NODE}`, 'pk'],
+      ['qnet_last_sent_fcm_token', 'test-fcm-token'],
+    ]);
+    Keychain.getGenericPassword.mockResolvedValue({ password: 'sk' });
+    global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: true }); });
+    expect(await Push.handlePushMessage({ action: 'epoch', anchor })).toBe(true);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((u) => u.endsWith('/api/v1/light-node/ping-response'))).toBe(true);
+    const receipts = JSON.parse(await AsyncStorage.getItem('qnet_push_receipts'));
+    expect(JSON.stringify(receipts)).toContain('answered');
   });
 
   it('re-reads Background App Refresh when the app returns', async () => {

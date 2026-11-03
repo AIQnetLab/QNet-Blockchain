@@ -6,6 +6,8 @@
 /** The thousands mark and the decimal mark of every amount. */
 export const AMOUNT_GROUP = ',';
 const AMOUNT_POINT = '.';
+/** What a value the user hides shows in its place (utils/privacy): an amount, a node name. */
+export const MASK = '••••';
 
 /**
  * A canonical decimal (digits, at most one '.', an optional sign: '-2047243.4405') as every screen writes it
@@ -30,11 +32,11 @@ export function formatNano(nano) {
 }
 
 /**
- * Nano QNC as every screen shows it, exact, with the symbol ("1,500.5 QNC"): '••••' while the user hides amounts, '—'
+ * Nano QNC as every screen shows it, exact, with the symbol ("1,500.5 QNC"): MASK while the user hides amounts, '—'
  * when it is not known (not read yet, or no node answered; never "0 QNC").
  */
 export function qncText(nano, hidden = false) {
-  if (hidden) return '••••';
+  if (hidden) return MASK;
   const qnc = formatNano(nano);
   return qnc === '—' ? qnc : `${amountText(qnc)} QNC`;
 }

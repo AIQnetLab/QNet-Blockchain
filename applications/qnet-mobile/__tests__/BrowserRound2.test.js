@@ -14,7 +14,8 @@ const { Platform } = require('react-native');
 const { sha3_256 } = require('js-sha3');
 const { providerScript, PAGE_OPENED_METHOD } = require('../src/browser/providerScript');
 const { PageSession } = require('../src/browser/bridge');
-const { createDappProvider, CODES, ARM_MS, TIMINGS } = require('../src/browser/dappProvider');
+const { CODES, ARM_MS, TIMINGS } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 const { sendShort, sendUnread } = require('../src/browser/DappSheet');
 const { WalletManager } = require('../src/components/WalletManager');
 const { GENESIS_NODES } = require('../src/config/nodes');
@@ -183,7 +184,7 @@ describe('MBR2-02: a token transfer or a call is signed only on balances read ag
       onChange: (v) => views.push(v),
       ...over,
     };
-    const p = createDappProvider(deps);
+    const p = testProvider(deps);
     const ctx = { origin: SITE, binding: { origin: SITE, doc: 'd', id: 'x', nav: 1 } };
     return { p, deps, ctx, shown: () => views[views.length - 1] };
   }

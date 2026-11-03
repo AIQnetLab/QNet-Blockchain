@@ -27,10 +27,16 @@ describe('Android', () => {
     for (const d of domains) expect(backup).toContain(`<exclude domain="${d}" path="." />`);
   });
 
-  it('the recents screen gets no snapshot; secret screens get FLAG_SECURE, hidden overlays and no a11y scraping', () => {
-    expect(read('android/app/src/main/java/com/qnetmobile/MainActivity.kt')).toMatch(/setRecentsScreenshotEnabled\(false\)/);
+  // A screenshot or a recording of any screen, the recovery phrase's included, is the user's own choice;
+  // only the recents snapshot of a wallet that left the screen is kept out.
+  it('the recents screen gets no snapshot; every screen can be captured; secret screens get hidden overlays and no a11y scraping', () => {
+    const main = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
+    expect(main).toMatch(/setRecentsScreenshotEnabled\(false\)/);
     const security = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
-    for (const marker of ['FLAG_SECURE', 'setHideOverlayWindows', 'ACCESSIBILITY_DATA_SENSITIVE_YES',
+    expect(security).not.toMatch(/FLAG_SECURE|setSecureScreen|secretScreenOn|secureOn|WindowManager/);
+    expect(read('src/services/DeviceSecurity.js')).not.toMatch(/setSecureScreen|useSecureScreen|acquireSecureScreen/);
+    expect(read('src/screens/WalletScreen.js')).not.toMatch(/useSecureScreen|captureCover|native_capture_cover/);
+    for (const marker of ['setHideOverlayWindows', 'ACCESSIBILITY_DATA_SENSITIVE_YES',
       'filterTouchesWhenObscured', 'IME_FLAG_NO_PERSONALIZED_LEARNING', 'clipboard()?.clearNow()',
       'setInvalidatedByBiometricEnrollment(true)', 'AUTH_BIOMETRIC_STRONG', 'BiometricPrompt.CryptoObject',
       'setIsStrongBoxBacked(true)']) {
@@ -125,12 +131,13 @@ describe('Android', () => {
       expect(size(`android/app/src/main/res/drawable-${density}/splash_logo.png`)).toEqual([192 * scale, 192 * scale]);
       expect(fs.existsSync(path.join(ROOT, `android/app/src/main/res/mipmap-${density}/splash_logo.png`))).toBe(false);
     }
-    // The app mark is drawn at 64 at most (welcome, lock; 22 in the header); React Native picks the variant for the
+    // The screens that hold no data draw that same launch image at the same 192 (components/ui/StartScreen).
+    expect(read('src/components/ui/StartScreen.js')).toMatch(/export const START_MARK = Object\.freeze\(\{ box: 192, drawn: 134 \}\);/);
+    // The app mark is drawn at 64 at most (QNC's icon, 22 in the header); React Native picks the variant for the
     // screen's scale.
     for (const [suffix, scale] of [['', 1], ['@2x', 2], ['@3x', 3], ['@4x', 4]]) {
       expect(size(`assets/qnet_logo${suffix}.png`)).toEqual([64 * scale, 64 * scale]);
     }
-    expect(read('src/screens/WalletScreen.styles.js')).toMatch(/lockLogo: \{\s*width: 64,\s*height: 64,/);
     expect(read('src/screens/WalletScreen.styles.js')).toMatch(/headerMark: \{\s*width: 22,\s*height: 22,/);
   });
 });
@@ -152,11 +159,12 @@ describe('iOS', () => {
     expect(plist).toMatch(/<key>NSAllowsArbitraryLoads<\/key>\s*<false\/>/);
     expect(plist).not.toMatch(/NSAllowsLocalNetworking|NSExceptionDomains|NSAllowsArbitraryLoadsInWebContent/);
     const security = read('ios/QNetMobile/QNetSecurityModule.m');
-    for (const marker of ['UIScreenCapturedDidChangeNotification', 'clearPasteboardIfChanged', 'LAPolicyDeviceOwnerAuthentication']) {
+    for (const marker of ['clearPasteboardIfChanged', 'LAPolicyDeviceOwnerAuthentication']) {
       expect(security).toContain(marker);
     }
-    // A screenshot raises no alert of the app's own: the recording cover stays, the system's own notices are the system's.
+    // A screenshot raises no alert of the app's own, and a recording or mirroring covers nothing.
     expect(security).not.toMatch(/UserDidTakeScreenshot|UIAlertController|screenshot/i);
+    expect(security).not.toMatch(/UIScreenCapturedDidChangeNotification|isCaptured|captureCover|setSecureScreen|endEditing/);
     expect(read('src/screens/WalletScreen.js')).not.toMatch(/screenshotTitle|screenshotBody|native_screenshot/);
     const dil = read('ios/QNetMobile/DilithiumModule/DilithiumModule.m');
     expect(dil).toMatch(/#if DEBUG/);
@@ -184,15 +192,19 @@ describe('JavaScript', () => {
   it('the recovery phrase reaches the clipboard only by its Copy button, which clears it; the plain clipboard carries addresses and hashes only', () => {
     expect(screen).not.toMatch(/Copy Recovery Phrase/);
     expect(screen).not.toMatch(/Clipboard\.setString\((mnemonic|seedText|copyText|stored\.code)/);
-    // Two buttons (the new wallet's phrase, the phrase shown again from Settings), one path: DeviceSecurity copySecret.
-    expect(screen.match(/onPress(=\{|: )\(\) => copyRecoveryPhrase\(/g)).toHaveLength(2);
-    // The same path, and only that, takes a private key from Settings → Export private key to the clipboard.
-    expect(screen.match(/copySecret\(/g)).toHaveLength(2);
-    expect(screen).toMatch(/if \(entry && entry\.key && await copySecret\(entry\.key\)\) showCopied\(keyCopiedTimerRef, setKeyCopied, which, null\);/);
-    // The plain clipboard is left for addresses and transaction hashes (copyToClipboard's `text`, the explorer's
-    // fallback `hash`); a pasted phrase is cleared natively without reading the clipboard (DeviceSecurity clearClipboard).
+    // Two places (the new wallet's phrase, the phrase shown again from Settings) and the private key from Settings →
+    // Export private key, one path: the Copy button under the secret (components/ui/SecretCopy), through
+    // DeviceSecurity copySecret; the words and the key are drawn apart from it and copy nothing.
+    expect(screen.match(/\{renderSeedWords\((words|seedReveal)\)\}\n\s+<SecretCopy secret=\{\1\.join\(' '\)\} label=\{t\('secret_copy_phrase'\)\}/g)).toHaveLength(2);
+    expect(screen.match(/<SecretCopy secret=\{entry\.key\} label=\{t\('secret_copy_key'\)\}/g)).toHaveLength(1);
+    expect(screen.match(/<SecretCopy /g)).toHaveLength(3);
+    expect(screen).not.toMatch(/copySecret|renderSecretCopy/);
+    expect(read('src/components/ui/SecretCopy.js')).toMatch(/useCopied\(COPIED_MS, t\)[\s\S]*copy\(\(\) => copySecret\(secret\)\)/);
+    // The plain clipboard is left for addresses and transaction hashes (the one copy's `text`, the explorer's fallback
+    // `hash`); a pasted phrase is cleared natively without reading the clipboard (DeviceSecurity clearClipboard).
     const plain = [...screen.matchAll(/Clipboard\.setString\(([^)]*)\)/g)].map((m) => m[1]);
-    expect(plain.sort()).toEqual(['hash', 'text'].sort());
+    expect(plain).toEqual(['hash']);
+    expect(read('src/components/ui/Copyable.js').match(/Clipboard\.setString\([^;]*;/g)).toEqual(['Clipboard.setString(String(text));']);
   });
 
   it('every masked field and the phrase field keep keyboards out; "never" auto-lock is a choice that asks first', () => {
@@ -223,17 +235,33 @@ describe('JavaScript', () => {
     const lint = require('../.eslintrc.js');
     expect(lint.rules['no-console']).toBe('error');
   });
+
+  // So `npm run lint` reports no use of them as undefined.
+  it('the lint knows the globals every file runs with: BigInt, Buffer, crypto, TextEncoder, TextDecoder', () => {
+    const { execFileSync } = require('child_process');
+    const text = 'export const all = [BigInt(1), Buffer.from(\'\'), crypto.getRandomValues, new TextEncoder(), new TextDecoder()];\n';
+    const args = [path.join(ROOT, 'node_modules/eslint/bin/eslint.js'), '--stdin', '--stdin-filename', 'src/utils/globals.js', '--format', 'json'];
+    let out;
+    try {
+      out = execFileSync(process.execPath, args, { cwd: ROOT, input: text, encoding: 'utf8' });
+    } catch (e) {
+      out = e.stdout;
+    }
+    const [result] = JSON.parse(out);
+    expect(result.messages.filter((m) => m.ruleId === 'no-undef').map((m) => m.message)).toEqual([]);
+  });
 });
 
 describe('round 2: native hardening', () => {
-  it('MPLAT-R2-01: a protected-interaction mode (no FLAG_SECURE) guards the screens that move value', () => {
+  it('MPLAT-R2-01: one protected-interaction mode (no FLAG_SECURE) guards the screens with a secret and those that move value', () => {
     const security = read('android/app/src/main/java/com/qnetmobile/SecurityModule.kt');
     expect(security).toMatch(/fun setProtectInteraction\(on: Boolean\)/);
-    expect(security).toMatch(/val guard = secureOn \|\| protectOn/);
+    expect(security).toMatch(/val guard = protectOn\n/);
     expect(security).toMatch(/window\.setHideOverlayWindows\(guard\)/);
     expect(security).toMatch(/decor\.filterTouchesWhenObscured = guard/);
     const screen = read('src/screens/WalletScreen.js');
-    expect(screen).toMatch(/useProtectedInteraction\(showSendScreen \|\| !!dappSheet \|\| !!linkRequest\)/);
+    expect(screen).toMatch(/useProtectedInteraction\(secretScreen \|\| showSendScreen \|\| !!dappSheet \|\| !!linkRequest\)/);
+    expect(screen.match(/useProtectedInteraction\(/g)).toHaveLength(1);
   });
 
   it('MPLAT-R2-04: the saved view hierarchy (text of every mounted field) never leaves the process', () => {
@@ -242,10 +270,9 @@ describe('round 2: native hardening', () => {
     expect(main).toContain('"android:viewHierarchyState"');
   });
 
-  it('MPLAT-R2-02: iOS refuses third-party keyboards and ends editing while the screen is captured', () => {
+  it('MPLAT-R2-02: iOS refuses third-party keyboards', () => {
     const app = read('ios/QNetMobile/AppDelegate.swift');
     expect(app).toMatch(/shouldAllowExtensionPointIdentifier extensionPointIdentifier: UIApplication\.ExtensionPointIdentifier[\s\S]*?return extensionPointIdentifier != \.keyboard/);
-    expect(read('ios/QNetMobile/QNetSecurityModule.m')).toMatch(/endEditing:YES/);
   });
 
   it('MPLAT-R2-05: PQClean wipes its secret locals and the stack it used; SHAKE states are wiped before free', () => {

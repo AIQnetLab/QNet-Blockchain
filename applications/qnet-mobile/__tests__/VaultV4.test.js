@@ -151,23 +151,26 @@ describe('older vaults stay readable and become version 4 at their first unlock'
     expect((await wm.loadWallet(r.token)).qnetAddress).toBe(B.qnet);
   });
 
-  it('the cleanup keeps a node record\'s node and drops its code and burn; a genesis node is known by its id', async () => {
+  // The node record and server status an older build kept apart go whole, a genesis node's too: the genesis nodes name
+  // the wallet's node again, and the wallet's node record (WalletManager.WALLET_NODE_KEY) stays.
+  it('the cleanup drops an older build\'s node record, its code and burn, and keeps the wallet\'s node record', async () => {
     const wm = manager();
+    const record = { owner: B.qnet, nodeId: 'genesis_node_003', nodeType: 'super', status: null, at: 1 };
     await AsyncStorage.multiSet([
-      [WalletManager.NODE_RECORD_KEY, JSON.stringify({ nodeType: 'super', pseudonym: 'genesis_node_003', code: 'c', burnTxHash: 'tx' })],
+      ['qnet_last_activated_node', JSON.stringify({ nodeType: 'super', pseudonym: 'genesis_node_003', code: 'c', burnTxHash: 'tx' })],
+      ['qnet_cached_server_status', JSON.stringify({ success: true, nodeId: 'genesis_node_003', cachedAt: 1 })],
+      [WalletManager.WALLET_NODE_KEY, JSON.stringify(record)],
       ['qnet_burn_scan', '{}'], ['qnet_update_cache', '{}'], ['qnet_testnet', 'true'], ['node_pseudonym_x', 'y'],
       ['qnet_onchain_reg_pending', '{}'], [`qnet_onchain_reg_pending_${B.qnet}`, '{}'], ['qnet_language', 'ru'],
     ]);
     await wm.cleanupActivationStorage();
-    expect(await stored(WalletManager.NODE_RECORD_KEY))
-      .toEqual({ nodeType: 'super', pseudonym: 'genesis_node_003', isGenesis: true, bootstrapId: '003' });
-    for (const k of ['qnet_burn_scan', 'qnet_update_cache', 'qnet_testnet', 'node_pseudonym_x', 'qnet_onchain_reg_pending',
-      `qnet_onchain_reg_pending_${B.qnet}`]) {
+    for (const k of ['qnet_last_activated_node', 'qnet_cached_server_status', 'qnet_burn_scan', 'qnet_update_cache',
+      'qnet_testnet', 'node_pseudonym_x', 'qnet_onchain_reg_pending', `qnet_onchain_reg_pending_${B.qnet}`]) {
       expect([k, await AsyncStorage.getItem(k)]).toEqual([k, null]);
     }
     expect(await AsyncStorage.getItem('qnet_language')).toBe('ru');
     await wm.cleanupActivationStorage(); // idempotent
-    expect((await stored(WalletManager.NODE_RECORD_KEY)).bootstrapId).toBe('003');
+    expect(await stored(WalletManager.WALLET_NODE_KEY)).toEqual(record);
   });
 
   it('versions 1 (AES-CBC) and 2 (PBKDF2 100k) open with their password and are rewritten', async () => {
@@ -309,7 +312,9 @@ describe('what the screen holds and what Delete leaves', () => {
     const ws = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     const erase = ws.slice(ws.indexOf('const eraseWallet = async'), ws.indexOf('const nodeRunsHere = async'));
     expect(erase).toMatch(/setHwSeal\(null\);/);
-    expect(erase).toMatch(/setBalancesHidden\(false\);/);
+    // Both masks (the amounts, the node names) go back to off with the wallet (utils/privacy).
+    expect(erase).toMatch(/setMasks\(NO_MASKS\);/);
+    expect(require('../src/utils/privacy').NO_MASKS).toEqual({ balances: false, names: false });
   });
 
   it('a reinstall wipes the Keychain items the previous install left; an update keeps them', async () => {

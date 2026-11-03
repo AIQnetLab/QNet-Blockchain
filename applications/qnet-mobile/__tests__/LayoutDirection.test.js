@@ -13,15 +13,15 @@ jest.mock('react-native-safe-area-context', () => require('react-native-safe-are
 jest.mock('../src/screens/WalletScreen', () => {
   const { createElement } = require('react');
   const { Text: MockText } = require('react-native');
-  return () => createElement(MockText, null, 'wallet screen');
+  return { __esModule: true, default: () => createElement(MockText, null, 'wallet screen') };
 });
 
 const AsyncStorage = require('@react-native-async-storage/async-storage');
 const { reloadApp } = require('../src/services/DeviceSecurity');
 const { applyLayoutDirection, layoutLags, settleLayoutDirection } = require('../src/i18n/direction');
 const { LANGUAGES } = require('../src/i18n');
+const { flush } = require('../test-support/screen');
 
-const flush = async (n = 4) => { for (let i = 0; i < n; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
 // Promise turns only, for a test on fake timers.
 const settle = async () => { for (let i = 0; i < 20; i++) await act(async () => { await Promise.resolve(); }); };
 // The running layout's direction, as the native side reported it when the JS started.
@@ -140,8 +140,7 @@ describe('a Latin line starts at the start edge in either direction', () => {
     const flat = (st) => StyleSheet.flatten(st) || {};
     expect(flat(walletStyles.wordmark)).toMatchObject({ marginEnd: 'auto' });
     expect(flat(walletStyles.wordmark).flex).toBeUndefined();
-    for (const st of [walletStyles.display, walletStyles.txResultAmount, walletStyles.txDetailAmount, walletStyles.nodeFigure,
-      infoStyles.fieldValue, headStyles.title]) {
+    for (const st of [walletStyles.txResultAmount, walletStyles.txDetailAmount, infoStyles.fieldValue, headStyles.title]) {
       expect(flat(st).alignSelf).toBe('flex-start');
     }
     for (const st of [infoStyles.linkText, infoStyles.settingText, walletStyles.mgrRowInfo]) expect(flat(st).alignItems).toBe('flex-start');

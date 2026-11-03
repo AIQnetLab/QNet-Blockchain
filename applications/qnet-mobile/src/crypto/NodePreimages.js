@@ -3,15 +3,16 @@
  * claim quote of the wallet's light or super node, one copy for the app and the extension's crypto bundle. Pure JS, no
  * native calls: every builder checks its fields, so nothing malformed is ever signed. Known answers:
  * docs/protocols/light-node.vectors.json (__tests__/LightNodeVectors.test.js; the extension's
- * test/light-node-vectors.test.mjs) and docs/protocols/node-claim.vectors.json (__tests__/NodeClaimVectors.test.js; the
- * extension's test/node-claim-vectors.test.mjs).
+ * test/light-node-vectors.test.mjs), docs/protocols/node-claim.vectors.json (__tests__/NodeClaimVectors.test.js; the
+ * extension's test/node-claim-vectors.test.mjs) and, for the V2 claim payload, docs/protocols/tx-v2.vectors.json (the
+ * extension's test/tx-v2-vectors.test.mjs).
  */
 
 import { blake3 } from '@noble/hashes/blake3.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { sha3_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex, concatBytes, hexToBytes, utf8ToBytes } from '@noble/hashes/utils.js';
-import { QNET_CHAIN_TAG, isValidQnetAddress } from './WalletIdentity.js';
+import { QNET_CHAIN_TAG, isValidQnetAddress, v2Expiry } from './WalletIdentity.js';
 
 // The decimal network id inside the chain tag "q1337|".
 export const QNET_CHAIN_ID = QNET_CHAIN_TAG.slice(1, -1);
@@ -188,6 +189,18 @@ export function claimQuotePreimage(nodeId, wallet) {
 export function claimPayloadPreimage(wallet, ts, claimsData) {
   if (typeof claimsData !== 'string' || claimsData.length === 0) fail('claimsData');
   return `${QNET_CHAIN_TAG}qnet_claim_v1:${walletOf(wallet)}:${u64(ts, 'ts')}:${sha3Hex(claimsData)}`;
+}
+
+/**
+ * The claim payload in the V2 form (docs/protocols/tx-v2.vectors.json, case claim): no timestamp, the last height a
+ * block may carry it, under this chain instance's network id. `expiry` = { networkId, validUntil } (WalletIdentity
+ * v2Expiry).
+ */
+export function claimPayloadPreimageV2(wallet, claimsData, expiry) {
+  if (typeof claimsData !== 'string' || claimsData.length === 0) fail('claimsData');
+  let v2;
+  try { v2 = v2Expiry(expiry); } catch (_) { fail('expiry'); }
+  return `${v2.prefix}qnet_claim_v2:${walletOf(wallet)}:${v2.validUntil}:${sha3Hex(claimsData)}`;
 }
 
 export function statusPreimage(nodeId, ts) {

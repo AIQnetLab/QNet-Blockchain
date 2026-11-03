@@ -135,8 +135,10 @@ export const UNSUPPORTED_PARAM_MESSAGE = 'Unsupported parameter';
 export class WalletError extends Error {
   /**
    * @param {string} code key of ERROR_MESSAGES
-   * @param {{retryAfterMs?: number, field?: string, walkSteps?: number}} [extra] retryAfterMs for BACKOFF; field for
-   *   INVALID_PARAMS; walkSteps for BALANCE_UNCONFIRMED (the walk steps still to go: qnet.walkSteps)
+   * @param {{retryAfterMs?: number, field?: string, walkSteps?: number, refusal?: string}} [extra] retryAfterMs for
+   *   BACKOFF; field for INVALID_PARAMS; walkSteps for BALANCE_UNCONFIRMED (the walk steps still to go: qnet.walkSteps);
+   *   refusal for NODE_REJECTED: the node's typed refusal of the form or the last height (core.EXPIRY_REFUSALS), which
+   *   stays in the worker (its one re-sign) and never reaches a page
    */
   constructor(code, extra = {}) {
     super(code);
@@ -145,6 +147,7 @@ export class WalletError extends Error {
     if (Number.isSafeInteger(extra.retryAfterMs) && extra.retryAfterMs > 0) this.retryAfterMs = extra.retryAfterMs;
     if (typeof extra.field === 'string') this.field = extra.field;
     if (Number.isSafeInteger(extra.walkSteps) && extra.walkSteps > 0) this.walkSteps = extra.walkSteps;
+    if (typeof extra.refusal === 'string') this.refusal = extra.refusal;
   }
 }
 

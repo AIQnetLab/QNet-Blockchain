@@ -2,14 +2,14 @@
 // eligible producers, development/qnet-integration/src/node/committee.rs create_eligible_producers_snapshot). A genesis
 // node names that macroblock (GET /api/v1/state/certified), and the macroblock's proof carries the set as `eligible_raw`
 // (GET /api/v1/macroblock/{index}/proof; ../light/checkpoint.ts decodes it). A registered super node outside the set is
-// registered, not admitted to consensus yet (owner, 11.10). One genesis node is asked, the next when it gives
+// registered, not admitted to consensus yet. One genesis node is asked, the next when it gives
 // no usable answer; the set is kept a few minutes for every reader (it changes at most once a macroblock, 90 blocks) and
 // read at most once at a time. Every value is public chain data; nothing of a visitor is sent.
 
 import { readCappedBytes } from '../../lib/capped-body.ts';
 import { GENESIS_NODES } from '../../lib/genesis-nodes.ts';
 import { decodeEligibleNodeIds } from '../light/checkpoint.ts';
-import { unbudgeted, type UpstreamBudget } from './upstream.ts';
+import { sharedUpstreamBudget, unbudgeted, type UpstreamBudget } from './upstream.ts';
 
 export const ELIGIBLE_CACHE_MS = 300_000;
 // A failed read is tried again after this long, not on every status read.
@@ -118,4 +118,17 @@ export function createEligibleSet(options: EligibleOptions = {}): EligibleSet {
     if (kept !== null && age < ELIGIBLE_STALE_MS) return kept.set;
     return read ?? null;
   };
+}
+
+// The process's set, on globalThis so the cabinet's super node status and the explorer's node counts share one read, on
+// the cabinet's upstream budget.
+const GLOBAL_KEY = Symbol.for('qnet.eligibleSet');
+
+export function sharedEligibleSet(): EligibleSet {
+  const holder = globalThis as unknown as Record<symbol, EligibleSet | undefined>;
+  const existing = holder[GLOBAL_KEY];
+  if (existing) return existing;
+  const created = createEligibleSet({ budget: sharedUpstreamBudget() });
+  holder[GLOBAL_KEY] = created;
+  return created;
 }

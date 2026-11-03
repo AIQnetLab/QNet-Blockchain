@@ -1,7 +1,7 @@
 // What the node cabinet shows of the QNet extension's answers (docs/protocols/qnet-link-v1.md sections 7, 10 and
 // 14.10), as text keys: an activation's heading, lead and error, a failed call, a move of the node balance, a transfer
 // to a payment address. The extension answers through the browser itself, so its answer is its own report. Pure; the
-// words are in src/lib/texts.ts.
+// words are in src/i18n/locales/en.ts.
 
 import type { MessageKey } from '../texts.ts';
 import type { ActivationAnswer, ActivationErrorCode, ClaimFailure, ExtensionActivation, ExtensionFailure, LinkAnswer, LinkError } from '../qnet-link.ts';
@@ -102,15 +102,16 @@ export function claimErrorKey(error: LinkError, via: ClaimVia): MessageKey {
   }
 }
 
-// What a checked `claim` answer says, as the wallet's report: the key and the values it takes.
-export type ClaimReport = { key: MessageKey; amountNano?: string; epoch?: string };
+// What a checked `claim` answer says, as the wallet's report: the key and the values it takes. An `ok` answer is the
+// total of the request's claims, the rest only from the epoch it names, and the last claim's transaction.
+export type ClaimReport = { key: MessageKey; amountNano?: string; epoch?: string; txHash?: string };
 
 export function claimReport(answer: LinkAnswer, via: ClaimVia): ClaimReport {
   switch (answer.status) {
     case 'ok':
       return answer.stoppedAtEpoch
-        ? { key: 'claim_ok_part', amountNano: answer.amountNano, epoch: answer.stoppedAtEpoch }
-        : { key: 'claim_ok', amountNano: answer.amountNano };
+        ? { key: 'claim_ok_part', amountNano: answer.amountNano, epoch: answer.stoppedAtEpoch, txHash: answer.txHash }
+        : { key: 'claim_ok', amountNano: answer.amountNano, txHash: answer.txHash };
     case 'empty':
       return { key: 'claim_empty' };
     case 'error':

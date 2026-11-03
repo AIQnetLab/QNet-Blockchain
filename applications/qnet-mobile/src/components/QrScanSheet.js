@@ -116,7 +116,7 @@ export default function QrScanSheet({ t, onAddress, onClose, read = readQnetScan
       <View style={s.column}>
         <View style={s.head}>
           <Text style={s.title} accessibilityRole="header">{title || t('scan_title')}</Text>
-          <Action kind="quiet" label={t('common_close')} onPress={onClose} align="end" testID="scan-close" />
+          <Action kind="quiet" label={t('common_close')} onPress={onClose} testID="scan-close" />
         </View>
         <View style={s.frame}>
           {Camera ? (

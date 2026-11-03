@@ -1,7 +1,7 @@
 // What the node cabinet shows of the QNet extension (src/lib/cabinet/extension-view.ts, the texts
-// src/lib/texts.ts and components/cabinet/ExtensionActivate.tsx and NodeClaim.tsx): the words of every answer and
+// src/i18n/locales/en.ts and components/cabinet/ExtensionActivate.tsx and NodeClaim.tsx): the words of every answer and
 // failure, the hold while a burn may be on its way, a light node shown as registered only from the chain, the claim's
-// report (a light or a super node's balance, owner 12.10); and the one rule of the QNet app's view
+// report (a light or a super node's balance); and the one rule of the QNet app's view
 // (src/lib/activate-view.ts). /activate is only a redirect now (next.config.js); the header and the other pages of the
 // app's view are in in-app-pages.test.mjs.
 // Run: npm run test:wallet
@@ -22,13 +22,13 @@ import {
   leadKey,
   recordsLightNode,
 } from '../cabinet/extension-view.ts';
-import { TEXTS } from '../texts.ts';
+import { TEXTS } from './texts-helper.mjs';
+import { CATALOGS } from '../../i18n/catalogs.ts';
 import { ERROR_CODES, LINK_ERRORS, validateActivation } from '../qnet-link.ts';
 import { WALLET_APK_ENV, walletApkUrl } from '../../server/wallet-apk.ts';
 import { VECTORS } from './link-helpers.mjs';
+import { code } from './source.mjs';
 
-const code = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
-  .replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 const has = (key) => Object.prototype.hasOwnProperty.call(TEXTS, key);
 const plain = (name) => JSON.parse(VECTORS.cases.find((c) => c.name === name).plaintext);
 const answer = (status, error) => ({ v: 1, intent: 'activate', status, ...(error ? { error } : {}) });
@@ -70,7 +70,7 @@ test('a burn may be on its way after a pending answer, an error that does not ru
   assert.match(TEXTS.ext_in_flight, /^The extension may still be sending this wallet's burn\. Do not start another activation of this wallet until the burn is final on Solana; the extension then keeps the code in its Settings\.$/);
 });
 
-// XP-R5-03: a burn of this device that another device's older burn beat went through; the page never says "nothing
+// A burn of this device that another device's older burn beat went through; the page never says "nothing
 // was burned" of it.
 test('every answer\'s heading and lead are site texts; a superseded burn', () => {
   const every = VECTORS.cases.map((c) => JSON.parse(c.plaintext)).filter((a) => a.intent === 'activate');
@@ -90,7 +90,7 @@ test('every answer\'s heading and lead are site texts; a superseded burn', () =>
 
   assert.equal(extensionMayHaveBurned({ ok: true, answer: plain('activate-light-pending') }), true);
   assert.equal(extensionMayHaveBurned({ ok: true, answer: plain('activate-super-exists-light') }), false);
-  // Nothing of a 2.x wallet is left on the page (28.09).
+  // Nothing of a 2.x wallet is left on the page.
   assert.equal(Object.keys(TEXTS).some((key) => /previous/.test(key)), false);
   // A light activation is followed on the chain; a declined or failed one is not.
   assert.equal(recordsLightNode(plain('activate-light-ok')), true);
@@ -110,7 +110,7 @@ test('the extension\'s activation on /node/activate: one call, the hold kept for
   assert.match(page, /\{burnInFlight && <p className="note" role="status">\{t\('ext_in_flight'\)\}<\/p>\}/);
   // Every heading from headingKey; one copy button, for the checked code.
   const view = page.slice(page.indexOf('function AnswerView('), page.indexOf('export default function ExtensionActivate'));
-  assert.match(view, /const title = t\(headingKey\(answer\)\);/);
+  assert.match(view, /const title = say\(headingKey\(answer\)\);/);
   assert.equal(view.match(/<h4 className="h3">\{title\}<\/h4>/g)?.length, 3, 'declined, error and result');
   assert.equal(view.match(/<Copy /g)?.length, 1);
   assert.match(view, /\{answer\.supersededBurnTx && \(\s*<Fact label=\{t\('ext_field_superseded'\)\}>\s*<EntityLink kind="solana-tx" value=\{answer\.supersededBurnTx\} \/>/);
@@ -121,26 +121,26 @@ test('the extension\'s activation on /node/activate: one call, the hold kept for
   assert.match(view, /\) : answer\.nodeType === 'super' && answer\.code \? \(\s*<SuperNext code=\{answer\.code\} burnTx=\{burnTx\} burnAmount=\{burnAmount\} nodeId=\{answer\.qnet \? superNodeId\(answer\.qnet\) : null\} \/>/);
   const light = page.slice(page.indexOf('function LightNext('), page.indexOf('function AnswerView('));
   assert.match(light, /const \{ state \} = useNodeStatus\(lightNodeId\(qnet\), viewOnly\);/);
-  // Or as soon as the network lists it for the cabinet's wallet (owner, 30.09: the page moves on by itself).
+  // Or as soon as the network lists it for the cabinet's wallet: the page moves on by itself.
   assert.match(light, /const listed = choice\?\.qnet === qnet && view\.nodes\.includes\('light'\);/);
   assert.match(light, /const registered = listed \|\| \(state\.phase === 'ok' && nodeState\(state\.value\) !== 'none' && nodeState\(state\.value\) !== 'pending'\);/);
-  assert.match(light, /\{registered \? \(\s*<>\s*<Answered>\{t\('ext_light_registered'\)\}<\/Answered>\s*\{linked \? <p>\{t\(offline \? 'next_offline' : waiting \? 'next_device_pending' : 'next_running'\)\}<\/p> : <LinkPhone \/>\}/);
+  assert.match(light, /\{registered \? \(\s*<>\s*<Answered>\{say\('ext_light_registered'\)\}<\/Answered>\s*\{linked \? <p>\{say\(offline \? 'next_offline' : waiting \? 'next_device_pending' : 'next_running'\)\}<\/p> : unknown \? <p>\{t\('device_state_unknown'\)\}<\/p> : <LinkPhone \/>\}/);
   assert.match(light, /const linked = state\.phase === 'ok' && isLinkedState\(nodeState\(state\.value\)\);/);
   assert.match(light, /const waiting = state\.phase === 'ok' && nodeState\(state\.value\) === 'device_pending';/);
   assert.match(light, /const offline = state\.phase === 'ok' && nodeState\(state\.value\) === 'offline';/);
   assert.match(light, /<Recording qnet=\{qnet\} since=\{since\} burnFinal=\{burnFinal\} pending=\{pending\} \/>/);
-  // A browser without the extension is never sent to it for a light node (owner, 06.10).
+  // A browser without the extension is never sent to it for a light node.
   assert.equal(has('ext_light_not_listed'), false);
   // The extension answers aiqnet.io only.
   assert.match(page, /const ok = origin === SITE_ORIGIN \|\| LOCAL_ORIGIN_RE\.test\(origin\);/);
   // Offered only when the extension is there, keyed by the wallet; the node type and the burn only in the state `none`
-  // (R1, R6): neither another type nor Try again brings the button back otherwise.
+  // (one wallet, one burn): neither another type nor Try again brings the button back otherwise.
   const activate = code('components/cabinet/NodeActivate.tsx');
   // Audit M4: the extension burns for its own wallet only, so its activation is offered only when it holds the chosen
   // wallet; one with another wallet is said, never offered.
   assert.match(activate, /const extensionHolds = extension && choice !== null && \(choice\.source === 'extension' \|\| accounts\?\.qnet === choice\.qnet\);/);
   assert.match(activate, /\{extensionHolds && <ExtensionActivate key=\{choice\?\.qnet \?\? ''\} offer onAnswered=\{\(\) => setExtensionAnswered\(true\)\} \/>\}/);
-  assert.match(activate, /\{extension && !extensionHolds && <Next><p>\{t\('act_extension_other_wallet'\)\}<\/p><\/Next>\}/);
+  assert.match(activate, /\{extension && !extensionHolds && <Next><p>\{say\('act_extension_other_wallet'\)\}<\/p><\/Next>\}/);
   assert.doesNotMatch(activate, /\{extension && <ExtensionActivate key=\{choice\?\.qnet \?\? ''\} offer onAnswered/);
   assert.match(activate, /\{extension && <ExtensionActivate key=\{choice\?\.qnet \?\? ''\} offer=\{false\} onAnswered=\{\(\) => setExtensionAnswered\(true\)\} \/>\}/);
   assert.match(activate, /const offer = view\.state === 'none';/);
@@ -154,7 +154,7 @@ test('the extension\'s activation on /node/activate: one call, the hold kept for
   assert.match(page, /setNodeType\(requestedType\(window\.location\.search\)\);/);
 });
 
-// Owner, 29.09: the answer stays on screen (no Done), the cabinet keeps it for its wallet, and the page shows it again.
+// The answer stays on screen (no Done), the cabinet keeps it for its wallet, and the page shows it again.
 test('the extension\'s answer stays: kept for its wallet, its code shown again on the next visit from every source, no Done', () => {
   const page = code('components/cabinet/ExtensionActivate.tsx');
   assert.doesNotMatch(page, /ext_done/);
@@ -162,16 +162,16 @@ test('the extension\'s answer stays: kept for its wallet, its code shown again o
   assert.match(page, /if \(result\.ok\) keepActivation\(result\.answer\);/);
   assert.match(page, /\{ext\.phase === 'done' && <AnswerView answer=\{ext\.answer\} requested=\{ext\.nodeType\} at=\{ext\.at\} \/>\}/);
   // A declined request, an error answer or a failed call offers Try again, only while the wallet has nothing anywhere.
-  assert.match(page, /\{ext\.phase === 'failed' && <Failed action=\{again \? \{ label: t\('try_again'\), onClick: \(\) => setExt\(\{ phase: 'idle' \}\) \} : null\}>\{t\(failureKey\(ext\.failure, 'activate'\)\)\}<\/Failed>\}/);
+  assert.match(page, /\{ext\.phase === 'failed' && <Failed action=\{again \? \{ label: t\('try_again'\), onClick: \(\) => setExt\(\{ phase: 'idle' \}\) \} : null\}>\{say\(failureKey\(ext\.failure, 'activate'\)\)\}<\/Failed>\}/);
   assert.match(page, /\{again && ext\.phase === 'done' && <div className="cab-next-act"><Action kind="text" onClick=\{\(\) => setExt\(\{ phase: 'idle' \}\)\}>\{t\('try_again'\)\}<\/Action><\/div>\}/);
   // The next visit: the code comes back through the wallet's view (the site's record, the extension, the kept answer),
   // on the Overview and the Activate page (NextSteps.tsx), not through a window.
   const steps = code('components/cabinet/NextSteps.tsx');
   assert.match(steps, /return <Burned burn=\{view\.burn\} qnet=\{choice\.qnet\} \/>;/);
-  assert.match(steps, /<span className="ent cab-code">\{burn\.code\}<\/span>\s*<Copy value=\{burn\.code\} \/>/);
+  assert.match(steps, /<span className="ent cab-code" translate="no">\{burn\.code\}<\/span>\s*<Copy value=\{burn\.code\} \/>/);
 });
 
-// Owner, 29.09: after the code, the next step. "Record on the network" asks the extension again only after a few minutes
+// After the code, the next step. "Record on the network" asks the extension again only after a few minutes
 // without the record, only the extension that holds this wallet, and keeps its answer; elsewhere the page says where.
 test('the record on the network: its progress, and Record on the network after a few minutes, from the wallet\'s own extension', () => {
   const steps = code('components/cabinet/NextSteps.tsx');
@@ -181,21 +181,21 @@ test('the record on the network: its progress, and Record on the network after a
   assert.match(steps, /const result = await activateNode\('light'\);/);
   assert.equal(steps.match(/activateNode\(/g)?.length, 1);
   assert.match(steps, /keepActivation\(answer\);/);
-  assert.match(steps, /<p className="note">\{t\('next_record_other_wallet'\)\}<\/p>/);
+  assert.match(steps, /<p className="note">\{say\('next_record_other_wallet'\)\}<\/p>/);
   assert.equal(TEXTS.next_record_again, 'Record on QNet Blockchain');
   assert.match(TEXTS.next_record_again_lead, /nothing is burned again/);
   // "Nothing is burned again" only for a final burn; a registration the extension did not make is not asked of it.
   assert.match(steps, /\{t\(burnFinal \? 'next_record_again_lead' : 'next_record_again_lead_pending'\)\}/);
   assert.doesNotMatch(TEXTS.next_record_again_lead_pending, /nothing is burned/);
-  // Only where the extension is: a browser without it waits for the network (owner, 06.10); never for an address only
+  // Only where the extension is: a browser without it waits for the network; never for an address only
   // viewed.
   assert.match(steps, /\{late && askAgain && extension && !viewOnly && \(/);
   // Asked of the extension again only for a burn of the extension.
   assert.match(steps, /<Recording qnet=\{choice\.qnet\} since=\{null\} pending askAgain=\{view\.burn\?\.way === 'extension'\} \/>/);
   // The steps to the phone: the Wallet page, the same recovery phrase, then Link a device (a phone that is not linked
   // has no button of its own in QNet Wallet: its Node tab shows a light node only on the device it is linked to).
-  assert.match(steps, /\{t\(phoneFlows \? 'next_link_3_qr' : 'next_link_3_app'\)\}/);
-  assert.match(steps, /\{t\('next_link_1'\)\} <Link href="\/wallet">\{t\('guide_link_wallet'\)\}<\/Link>/);
+  assert.match(steps, /\{say\(phoneFlows \? 'next_link_3_qr' : 'next_link_3_app'\)\}/);
+  assert.match(steps, /\{say\('next_link_1'\)\} <Link href="\/wallet">\{t\('guide_link_wallet'\)\}<\/Link>/);
   assert.match(TEXTS.next_link_2, /"Import Existing Wallet"/);
   assert.match(TEXTS.next_link_3_app, /^Linking the phone from this page opens soon\./);
   for (const key of ['next_link_3_qr', 'next_link_3_app']) assert.doesNotMatch(TEXTS[key], /Use this device/, key);
@@ -228,19 +228,28 @@ test('a claim answer is the wallet\'s report, in the words of the wallet that an
   assert.equal(claimErrorKey('NO_WALLET', 'extension'), 'ext_error_NO_WALLET');
   assert.equal(claimErrorKey('NO_WALLET', 'app'), 'link_error_NO_WALLET');
   const base = { v: 1, intent: 'claim', qnet: 'x', nodeId: 'y' };
-  assert.deepEqual(claimReport({ ...base, status: 'ok', amountNano: '2500000000', txHash: 'a'.repeat(64), stoppedAtEpoch: null }, 'app'), { key: 'claim_ok', amountNano: '2500000000' });
-  assert.deepEqual(claimReport({ ...base, status: 'ok', amountNano: '2500000000', txHash: 'a'.repeat(64), stoppedAtEpoch: '41' }, 'extension'), { key: 'claim_ok_part', amountNano: '2500000000', epoch: '41' });
+  assert.deepEqual(claimReport({ ...base, status: 'ok', amountNano: '2500000000', txHash: 'a'.repeat(64), stoppedAtEpoch: null }, 'app'), { key: 'claim_ok', amountNano: '2500000000', txHash: 'a'.repeat(64) });
+  assert.deepEqual(claimReport({ ...base, status: 'ok', amountNano: '2500000000', txHash: 'a'.repeat(64), stoppedAtEpoch: '41' }, 'extension'), { key: 'claim_ok_part', amountNano: '2500000000', epoch: '41', txHash: 'a'.repeat(64) });
   assert.deepEqual(claimReport({ ...base, status: 'empty' }, 'app'), { key: 'claim_empty' });
   assert.deepEqual(claimReport({ v: 1, intent: 'claim', status: 'rejected' }, 'app'), { key: 'link_answer_rejected' });
   assert.deepEqual(claimReport({ v: 1, intent: 'claim', status: 'rejected' }, 'extension'), { key: 'ext_failure_rejected' });
   // Every report says "the answer says" or is a failure: the page shows the balance from the chain.
   for (const key of ['claim_ok', 'claim_ok_part', 'claim_empty']) assert.match(TEXTS[key], /^The answer says /);
   assert.match(TEXTS.claim_ok, /the node balance above follows QNet Blockchain\.$/);
+  // An `ok` answer is the total of the request's claims; what is left stays only from the epoch it names, the first one
+  // its last claim did not take (the text says "from" it, never "up to" or "including" it), in words true also when
+  // nothing is left (a whole balance below 1 QNC names that epoch too), and the last transaction follows.
+  for (const key of ['claim_ok', 'claim_ok_part']) assert.match(TEXTS[key], /^The answer says a total of \{amount\} QNC moved to the wallet[.;] [Ee]ach transaction is credited once a block includes it/);
+  assert.match(TEXTS.claim_ok_part, /Anything left from epoch \{epoch\} on stays in the node balance until it is moved again\.$/);
+  assert.doesNotMatch(TEXTS.claim_ok_part, /The rest/);
+  assert.doesNotMatch(TEXTS.claim_ok_part, /up to epoch|next request/);
+  assert.doesNotMatch(CATALOGS.ru.claim_ok_part, /включительно/);
+  assert.equal(TEXTS.claim_last_tx, 'Last transaction: {tx}');
   // NO_NODE names no node type: the request names a light or a super node.
   assert.doesNotMatch(TEXTS.claim_error_NO_NODE, /light|super/i);
 });
 
-// Owner, 12.10: a node balance, a light or a super node's, is moved through the site too, whichever way the wallet is
+// A node balance, a light or a super node's, is moved through the site too, whichever way the wallet is
 // connected; the extension's own window confirms it on a computer, QNet Wallet on a phone.
 test('Move to wallet on the Overview: the extension for its own wallet, QNet Wallet otherwise, the balance re-read after a report', () => {
   const page = code('components/cabinet/NodeClaim.tsx');
@@ -250,9 +259,9 @@ test('Move to wallet on the Overview: the extension for its own wallet, QNet Wal
   // The app's request names the wallet the page shows and the node; a button on a phone or tablet, a QR otherwise.
   assert.match(page, /const request: ClaimRequest = \{ walletHash: walletHash\(qnet\), nodeId \};/);
   assert.match(page, /if \(device\.phone\) void button\.start\('claim', request\);\s*else void qr\.start\('claim', request\);/);
-  assert.match(page, /\{!phoneFlows \? \(\s*<p className="note">\{t\('claim_closed'\)\}<\/p>/);
+  assert.match(page, /\{!phoneFlows \? \(\s*<p className="note">\{say\('claim_closed'\)\}<\/p>/);
   // Below 1 QNC nothing is offered; the balance is the network's, read again after an answer. The Overview holds the
-  // balance and its Move (owner, 29.09), for every registered node of either type: after its device is unlinked no device
+  // balance and its Move, for every registered node of either type: after its device is unlinked no device
   // is linked, and the balance stays the wallet's to move.
   const home = code('components/cabinet/NodeHome.tsx');
   assert.match(home, /const movable = canMove\(status\.balanceNano\);/);
@@ -282,7 +291,7 @@ test('the app\'s view gets no activation text, and none before the page knows wh
   assert.equal(isInAppBrowser(null), false);
   assert.deepEqual(IN_APP_NAV.map((l) => l.href), ['/explorer', '/privacy', '/terms', '/support']);
 
-  // One rule for every page: the context's hook. Owner, 11.10: only the in-app browser hides; a page's query
+  // One rule for every page: the context's hook. Only the in-app browser hides; a page's query
   // (the app's links still carry ?from=app) changes nothing.
   const context = code('contexts/AppContext.tsx');
   assert.match(context, /export function useActivationContent\(\): boolean \{\s*const \{ providerStatus, providerChannel \} = useWallet\(\);\s*return showsActivationContent\(providerStatus, providerChannel\);/);
@@ -291,34 +300,37 @@ test('the app\'s view gets no activation text, and none before the page knows wh
 
 test('/wallet: one app on every phone and tablet, one unlock rule, one Android package, activation at the node pages', () => {
   const wallet = code('app/wallet/page.tsx');
-  assert.match(wallet, /<h3 className="h3">The app — iPhone, iPad, Android phones and tablets<\/h3>/);
+  assert.match(wallet, /<h3 className="h3">\{t\('wp_app_title'\)\}<\/h3>/);
+  assert.equal(TEXTS.wp_app_title, 'The app — iPhone, iPad, Android phones and tablets');
   assert.doesNotMatch(wallet, /<h[34][^>]*>(Android|iOS)<\/h[34]>/);
-  assert.match(wallet, /Face ID, Touch ID, a fingerprint or the device passcode —\s*and, on a device without any of them, with an app password; a wallet set up with an app password can\s*switch to the device&apos;s authentication\./);
-  // SD-R2-03: the file from aiqnet.io runs the wallet; its node needs Google Play's licence, so the Play listing live for
+  assert.match(TEXTS.wp_app_p1, /Face ID, Touch ID, a fingerprint or the device passcode — and, on a device without any of them, with an app password; a wallet set up with an app password can switch to the device's authentication\./);
+  // The file from aiqnet.io runs the wallet; its node needs Google Play's licence, so the Play listing live for
   // the account (store-listing/README.md, the Node tab's device_unlicensed text). The page says so next to the file.
-  assert.match(wallet, /On Android it is one app, io\.aiqnet\.wallet:\s*the file shared outside Google Play is the same signed build\. It runs the whole wallet; its light node\s*runs once Google Play licenses the install, which needs the Google Play listing to be live for your\s*account, and until then its Node tab says to install QNet Wallet from Google Play\. The app does not\s*update itself: a newer version comes from the store, or as a newer file from the same place\./);
-  assert.doesNotMatch(wallet, /same signed build, with the same features|the Android file is here/);
+  assert.match(TEXTS.wp_app_p2, /On Android it is one app, io\.aiqnet\.wallet: the file shared outside Google Play is the same signed build\. It runs the whole wallet; its light node runs once Google Play licenses the install, which needs the Google Play listing to be live for your account, and until then its Node tab says to install QNet Wallet from Google Play\. The app does not update itself: a newer version comes from the store, or as a newer file from the same place\./);
+  assert.doesNotMatch(TEXTS.wp_app_p2, /same signed build, with the same features|the Android file is here/);
   // Google Play is live; iPhone and iPad install from TestFlight until the App Store listing is (IOS_INSTALL_URL).
-  assert.match(wallet, /On Android\s*it is on\{' '\}\s*<a href=\{PLAY_URL\} target="_blank" rel="noopener noreferrer">Google Play<\/a>/);
+  assert.match(wallet, /play: store\(PLAY_URL, 'Google Play'\)/);
+  assert.match(wallet, /const store = \(href: string, name: string\) => <a href=\{href\} target="_blank" rel="noopener noreferrer" translate="no">\{name\}<\/a>;/);
   assert.match(wallet, /import \{ ANDROID_PLAY_URL as PLAY_URL, IOS_APP_STORE_URL, IOS_INSTALL_URL \} from '@\/lib\/app-links';/);
-  assert.match(wallet, /until the App Store listing is live, it installs from\{' '\}\s*<a href=\{IOS_INSTALL_URL\} target="_blank" rel="noopener noreferrer">TestFlight<\/a>/);
-  assert.match(wallet, /<GetTheApp lead=\{null\} variant="tool" \/>/);
-  assert.doesNotMatch(wallet, /community channel/);
-  assert.doesNotMatch(wallet, /Google Play listings are in preparation/);
+  assert.match(wallet, /testflight: store\(IOS_INSTALL_URL, 'TestFlight'\)/);
+  assert.equal(TEXTS.wp_app_stores_testflight, 'On Android it is on {play}; on iPhone and iPad, until the App Store listing is live, it installs from {testflight}.');
+  assert.match(wallet, /<GetTheApp lead=\{false\} variant="tool" \/>/);
+  for (const key of Object.keys(TEXTS).filter((k) => k.startsWith('wp_'))) {
+    assert.doesNotMatch(TEXTS[key], /community channel|Google Play listings are in preparation|An earlier Android build/, key);
+  }
   const listing = readFileSync(new URL('../../../../../qnet-mobile/store-listing/README.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
   assert.match(listing, /the copy from aiqnet\.io runs the wallet, and its node only once the user accepts Google Play's licence dialog, which needs the Play listing to be live for that user/);
   // The file is offered only once the setting names one, read per request by the server page.
   assert.doesNotMatch(wallet, /^'use client'/m);
   assert.match(wallet, /const apk = walletApkUrl\(\);/);
-  assert.match(wallet, /\{apk && \(\s*<a className="btn btn-text" href=\{apk\} rel="noopener noreferrer">\s*Download QNet Wallet for Android \(APK\)\s*<\/a>\s*\)\}/);
-  // The older Android app installed from a file: Support says how to move (support_move, legal-pages.test.mjs); a
-  // visitor installing today does not need it here.
-  assert.doesNotMatch(wallet, /An earlier Android build/);
-  // A4 (owner, 29.09): a light node from the page's payment address or the extension, a super node only from the
+  assert.match(wallet, /\{apk && \(\s*<a className="btn btn-text" href=\{apk\} rel="noopener noreferrer">\s*\{say\('wp_app_apk'\)\}\s*<\/a>\s*\)\}/);
+  assert.equal(TEXTS.wp_app_apk, 'Download QNet Wallet for Android (APK)');
+  // A light node from the page's payment address or the extension, a super node only from the
   // extension, running on the user's own server; one node per wallet.
-  assert.match(wallet, /Nodes are activated at <Link href="\/node">aiqnet\.io\/node<\/Link>\. In Phase 1 a light node&apos;s 1DEV burn is made\s+by the page from a one-time payment address in the browser, after QNet Wallet confirms the wallet, or by\s+the QNet Wallet extension from its own address; a super node&apos;s burn only by the extension, and the super node\s+runs on the user&apos;s own server with the QNet Blockchain node software\./);
-  assert.match(wallet, /One node per wallet, light or super\. The app burns nothing, sells nothing and shows\s+no price\. Phase 2 moves activation to QNC\./);
-  assert.doesNotMatch(wallet, /One light node per wallet/);
+  assert.match(wallet, /node: <Link href="\/node" translate="no">aiqnet\.io\/node<\/Link>/);
+  assert.match(TEXTS.wp_activation_p, /^Nodes are activated at \{node\}\. In Phase 1 a light node's 1DEV burn is made by the page from a one-time payment address in the browser, after QNet Wallet confirms the wallet, or by the QNet Wallet extension from its own address; a super node's burn only by the extension, and the super node runs on the user's own server with the QNet Blockchain node software\./);
+  assert.match(TEXTS.wp_activation_p, /One node per wallet, light or super\. The app burns nothing, sells nothing and shows no price\. Phase 2 moves activation to QNC\./);
+  assert.doesNotMatch(TEXTS.wp_activation_p, /One light node per wallet/);
   assert.doesNotMatch(wallet, /href="\/activate"|rewards are claimed|enter or recover the code/);
   // The page never shows in the app's view (its layout's guard), so it needs no guard of its own.
   assert.doesNotMatch(wallet, /useActivationContent|\{full &&/);
@@ -349,23 +361,21 @@ test('WALLET_APK_URL: an https address of an .apk file, or no file at all', () =
   const doc = readFileSync(new URL('../../../../../../docs/applications/mobile-wallet.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
   assert.match(doc, /whose tag matches `wallet-<versionName>-<versionCode>` and which carries an asset named `QNet-Wallet\.apk`/);
   assert.match(doc, /`WALLET_APK_URL` names that fixed release \(`\.\.\.\/releases\/download\/<tag>\/<asset>`\), never `\.\.\.\/releases\/latest\/download\/\.\.\.`/);
-  // The deploy scripts and the example leave it empty: no file until the owner names one.
-  for (const path of ['../../../ecosystem.config.example.js', '../../../../../../deployment/deploy-aiqnet.sh', '../../../../../../deployment/deploy-to-1984.sh']) {
-    assert.match(readFileSync(new URL(path, import.meta.url), 'utf8'), /WALLET_APK_URL: ''/, path);
-  }
+  // The deploy script leaves it empty: no file until the owner names one.
+  assert.match(readFileSync(new URL('../../../../../../deployment/deploy-aiqnet.sh', import.meta.url), 'utf8'), /grep -q '\^WALLET_APK_URL=' \$SITE_ENV \|\| echo 'WALLET_APK_URL=' >> \$SITE_ENV/);
 });
 
-// Owner, 29.09: the payment address way says in plain words that it makes a light node, who it is for (a phone, or a
+// The payment address way says in plain words that it makes a light node, who it is for (a phone, or a
 // computer without the extension) and what happens, in five steps: QNet Wallet confirms the wallet first, the burn is the
 // wallet's activation at once, and the registration also works later from any browser. The super node is the QNet
-// extension's alone (A4). The safety sentences the other tests pin stay (cabinet-flow, privacy-claims).
+// extension's alone. The safety sentences the other tests pin stay (cabinet-flow, privacy-claims).
 test('the payment address way: a light node, who it is for and four numbered steps, the testnet faucet named on testnet', () => {
   const page = code('components/cabinet/NodeActivate.tsx');
-  assert.match(page, /<Group level=\{3\} title=\{t\('act_payment_title'\)\}>\s*<p className="lead">\{t\('act_lead'\)\}<\/p>\s*<Steps label=\{t\('progress_label'\)\}>\s*<Step n=\{1\} at="now" title=\{t\('act_reserve_title'\)\} level=\{4\}>\s*<p className="cab-step-s">\{t\('act_way_1'\)\} \{t\('act_way_2'\)\}<\/p>/);
+  assert.match(page, /<Group level=\{3\} title=\{t\('act_payment_title'\)\}>\s*<p className="lead">\{say\('act_lead'\)\}<\/p>\s*<Steps label=\{t\('progress_label'\)\}>\s*<Step n=\{1\} at="now" title=\{say\('act_reserve_title'\)\} level=\{4\}>\s*<p className="cab-step-s">\{say\('act_way_1'\)\} \{t\('act_way_2'\)\}<\/p>/);
   assert.match(page, /<Step n=\{2\} at="ahead" title=\{t\('act_step_pay'\)\} level=\{4\}>\{payAhead\}<\/Step>\s*<Step n=\{3\} at="ahead" title=\{t\('act_burn'\)\} level=\{4\}>\{burnAhead\}<\/Step>\s*<Step n=\{4\} at="ahead" title=\{t\('act_step_register'\)\} level=\{4\}>\{registerAhead\}<\/Step>/);
   assert.match(page, /const payAhead = <p className="cab-step-s">\{t\(ACTIVATION_NETWORK === 'testnet' \? 'act_way_3_testnet' : 'act_way_3_mainnet'\)\}<\/p>;/);
   assert.match(page, /const burnAhead = <p className="cab-step-s">\{t\('act_way_4'\)\}<\/p>;/);
-  assert.match(page, /const registerAhead = <p className="cab-step-s">\{t\('act_way_5'\)\}<\/p>;/);
+  assert.match(page, /const registerAhead = <p className="cab-step-s">\{say\('act_way_5'\)\}<\/p>;/);
   assert.equal(TEXTS.act_payment_title, 'Light node: pay with a one-time address');
   assert.match(TEXTS.act_lead, /^A light node, which runs in QNet Wallet on a phone or tablet\. For a phone, or a computer without the QNet Wallet extension\.$/);
   assert.deepEqual([TEXTS.act_reserve_title, TEXTS.act_step_pay, TEXTS.act_burn, TEXTS.act_step_register], ['Confirm in QNet Wallet', 'Pay', 'Burn', 'Register']);
@@ -378,7 +388,7 @@ test('the payment address way: a light node, who it is for and four numbered ste
   // The super node's card: only the QNet extension; first when the Overview asked for a super node.
   assert.equal(TEXTS.act_super_title, 'Super node: only in the QNet Wallet extension');
   assert.match(TEXTS.super_note, /^A super node is activated only in the QNet Wallet browser extension on a computer, with this same wallet; its server then runs with the same recovery phrase\. A phone or the one-time payment address activates light nodes only\.$/);
-  assert.match(page, /<Group level=\{3\} title=\{t\('act_super_title'\)\}>\s*<p>\{t\('super_note'\)\}<\/p>/);
+  assert.match(page, /<Group level=\{3\} title=\{say\('act_super_title'\)\}>\s*<p>\{say\('super_note'\)\}<\/p>/);
   assert.match(page, /\{wantsSuper \? <>\{superCard\}\{paymentCard\}<\/> : <>\{paymentCard\}\{superCard\}<\/>\}/);
   assert.match(page, /setWantsSuper\(requestedType\(window\.location\.search\) === 'super'\);/);
   // QNet Wallet's confirmation before the address: its words, and a request kept for the record.

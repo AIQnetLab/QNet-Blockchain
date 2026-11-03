@@ -48,6 +48,9 @@ const nextConfig = {
   },
   poweredByHeader: false,
   compress: true,
+  // The proxy (src/proxy.ts) gets the request at the address the server checks a rewrite against. Bound to 127.0.0.1,
+  // Next.js otherwise renames it localhost, and a page in a language (/ru/explorer) is fetched from outside the server.
+  skipProxyUrlNormalize: true,
   // Old links to removed pages land somewhere real: the old node page goes to the explorer, and the old activation
   // page (named in the extension's texts) to the node cabinet's (308). My node's sections before 29.09
   // (src/lib/cabinet/tabs.ts MOVED_PAGES): Devices is the Device tab, Node balance and Activation code are on the

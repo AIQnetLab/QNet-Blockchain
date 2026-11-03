@@ -1,6 +1,6 @@
 'use client';
 
-// Clickable things do not move under the pointer or a finger (B-SPEC 3.6, rules in src/lib/hold.ts): while a mouse or
+// Clickable things do not move under the pointer or a finger (rules in src/lib/hold.ts): while a mouse or
 // pen is over a live list or focus is inside it, on a touch screen from the press on the list until 3 s after the
 // last touch there (or a scroll while it is on screen), and while its frame is scrolled away from the newest end, the
 // newest value is held and applied when the hold ends. One buffer, the latest value, never a growing queue; `back` says

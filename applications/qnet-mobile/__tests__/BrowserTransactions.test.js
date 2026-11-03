@@ -29,8 +29,9 @@ const { pendingFor, putSigned } = require('../src/services/PendingTx');
 const { GENESIS_NODES } = require('../src/config/nodes');
 const R = require('../src/browser/dappRequests');
 const {
-  createDappProvider, CODES, LIMITS, TIMINGS, pageError, describeCallArgs, visibleLabel, SAFE_AMOUNT_NANO,
+  CODES, LIMITS, TIMINGS, pageError, describeCallArgs, visibleLabel, SAFE_AMOUNT_NANO,
 } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 const { contractSend } = require('../src/browser/BrowserScreen');
 const DappSheet = require('../src/browser/DappSheet').default;
 const { formatTokenUnits, SEND_ARM_MS } = require('../src/browser/DappSheet');
@@ -86,7 +87,7 @@ function setup(over = {}) {
     onChange: (v) => views.push(v),
     ...over,
   };
-  const p = createDappProvider(deps);
+  const p = testProvider(deps);
   const ctx = (origin = SITE) => ({ origin, binding: { origin, doc: 'd', id: 'x', nav: 1 } });
   const grant = (origin = SITE) => grants.set(origin, { grantedAt: now, chains: ['qnet', 'solana'], walletId: QNET });
   return { p, deps, state, ctx, grant, shown: () => views[views.length - 1], views, advance: (ms) => { now += ms; } };

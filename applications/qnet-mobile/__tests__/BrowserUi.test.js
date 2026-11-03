@@ -53,13 +53,32 @@ describe('the bottom bar', () => {
     }
   });
 
-  it('each tab is its name alone, the current one marked by a Signal line over it; no icon is drawn', async () => {
+  // One line icon per tab over its name, Signal when current, Fog when not.
+  it('each tab is its line icon over its name, the current one in Signal under a Signal line; the others in Fog', async () => {
     const Svg = require('react-native-svg').default;
+    const { Path } = require('react-native-svg');
     const { StyleSheet } = require('react-native');
     const { color } = require('../src/theme');
+    const { TAB_ICON, TAB_STROKE } = require('../src/components/BottomBar');
     let tree;
     await act(async () => { tree = renderer.create(<BottomBar active="history" onSelect={() => {}} t={t} />); });
-    expect(tree.root.findAllByType(Svg)).toHaveLength(0);
+    const cells = tabCells(tree);
+    for (const cell of cells) {
+      const [svg, ...more] = cell.findAllByType(Svg);
+      const tab = cell.props.testID.slice(4);
+      expect([tab, more.length, svg.props.testID, svg.props.width, svg.props.height]).toEqual([tab, 0, `tab-icon-${tab}`, TAB_ICON, TAB_ICON]);
+      // Outlines in one stroke weight, no fill: a line icon, never a glyph from a font.
+      const paths = svg.findAllByType(Path);
+      expect(paths.length).toBeGreaterThan(0);
+      const tone = tab === 'history' ? color.signal : color.fog;
+      for (const p of paths) expect([tab, p.props.stroke, p.props.strokeWidth, p.props.fill]).toEqual([tab, tone, TAB_STROKE, undefined]);
+      expect(svg.props.fill).toBe('none');
+      // The icon comes first, the name under it.
+      const order = cell.findAll(() => true);
+      expect(order.indexOf(svg)).toBeLessThan(order.indexOf(cell.findByType(Text)));
+    }
+    // Five different drawings.
+    expect(new Set(cells.map((c) => c.findAllByType(Path).map((p) => p.props.d).join('|'))).size).toBe(5);
     expect(tabCells(tree).map((c) => c.findAllByType(Text).map((n) => n.props.children).join(''))).toEqual(
       ['Assets', 'History', 'Browser', 'Node', 'Settings']);
     const marks = tree.root.findAll((n) => n.props.testID === 'tab-current' && typeof n.type === 'string');
@@ -69,9 +88,16 @@ describe('the bottom bar', () => {
     expect(current.findAll((n) => n.props.testID === 'tab-current' && typeof n.type === 'string')).toHaveLength(1);
     const name = current.findAllByType(Text)[0];
     expect(StyleSheet.flatten(name.props.style).color).toBe(color.paper);
+    // The cell holds the line, the icon and one name line at its padding.
+    const { barStyles } = require('../src/components/BottomBar');
+    const { size } = require('../src/theme');
+    const icon = StyleSheet.flatten(barStyles.icon);
+    const nameBox = StyleSheet.flatten(barStyles.name);
+    const label = StyleSheet.flatten(barStyles.label);
+    expect(size.tab).toBeGreaterThanOrEqual(1 + icon.marginTop + TAB_ICON + nameBox.paddingTop + label.lineHeight + nameBox.paddingBottom);
   });
 
-  it('the Node cell is its name alone, as every other tab: no live dot blinks in the bar', async () => {
+  it('the Node cell is its icon and name, as every other tab: no live dot blinks in the bar', async () => {
     let tree;
     await act(async () => { tree = renderer.create(<BottomBar active="assets" onSelect={() => {}} t={t} nodeLive />); });
     const node = tabCells(tree).find((c) => c.props.testID === 'tab-node');

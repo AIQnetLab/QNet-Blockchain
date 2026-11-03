@@ -325,12 +325,14 @@ describe('MPLAT-R5-02: a touch through another app\'s window is dropped, even on
 });
 
 describe('MPLAT-R5-03: below API 33 the recents snapshot is taken of a secure window', () => {
-  it('FLAG_SECURE on the way to the background, cleared on return unless a secret screen holds it', () => {
+  // Every screen in front can be captured; the flag is only ever on while the wallet is not in front.
+  it('FLAG_SECURE on the way to the background, cleared on every return to the front', () => {
     const main = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
     expect(main).toMatch(/override fun onPause\(\) \{\s*if \(Build\.VERSION\.SDK_INT < Build\.VERSION_CODES\.TIRAMISU\) window\.addFlags\(WindowManager\.LayoutParams\.FLAG_SECURE\)\s*super\.onPause\(\)/);
-    expect(main).toMatch(/Build\.VERSION\.SDK_INT < Build\.VERSION_CODES\.TIRAMISU && !SecurityModule\.secretScreenOn/);
+    expect(main).toMatch(/override fun onResume\(\) \{\s*AppNetwork\.toFront\(\)\s*super\.onResume\(\)\s*TaskState\.opened\(this\)\s*TaskState\.watch\(this\)\s*if \(Build\.VERSION\.SDK_INT < Build\.VERSION_CODES\.TIRAMISU\) window\.clearFlags\(WindowManager\.LayoutParams\.FLAG_SECURE\)\s*\}/);
+    expect(main.match(/addFlags\(WindowManager\.LayoutParams\.FLAG_SECURE\)/g)).toHaveLength(1);
     expect(main).toMatch(/setRecentsScreenshotEnabled\(false\)/);
-    expect(KT()).toMatch(/secureOn = on\s*\n\s*secretScreenOn = on/);
+    expect(KT()).not.toMatch(/FLAG_SECURE|secretScreenOn/);
   });
 });
 
@@ -396,21 +398,6 @@ describe('MOBNET-R5-03: the committed light-client pin passes the release gate',
     expect(pin.provenFrom).toEqual({ index: expect.any(Number), hash: expect.stringMatching(/^[0-9a-f]{64}$/) });
     expect(pin.provenFrom.index).toBeLessThan(pin.index);
     expect(checkPin({ source: src, today: pin.generated })).toEqual([]);
-  });
-});
-
-describe('MOBACT-R5-02: the monitored server node changes only on two genesis confirmations', () => {
-  it('a by-wallet answer naming another id is adopted only when confirmServerNode says so; else the linked one is shown', () => {
-    const s = SCREEN();
-    const load = s.slice(s.indexOf('const loadServerNodeStatus = async'), s.indexOf('const loadAllUserNodes = async'));
-    expect(load).toMatch(/const confirmed = await walletManager\.confirmServerNode\(walletAddress, \{\s*nodeType: activatedNodeType, nodeId: status\.nodeId,\s*\}\)/);
-    expect(load).toMatch(/if \(confirmed === true\) \{\s*adopt = status\.nodeId;/);
-    expect(load).toMatch(/const own = linked \? responses\.find\(\(r\) => r\.nodeId === linked\) : null;/);
-    expect(load).toMatch(/if \(adopt\) \{\s*setNodePseudonym\(adopt\);/);
-    expect(load).not.toMatch(/status\.isOnline \|\| !nodePseudonym/);
-    // A move of a server node's balance claims for the linked node.
-    const move = s.slice(s.indexOf('const handleClaimServerNodeRewards = '), s.indexOf('const handleMoveLightBalance = '));
-    expect(move).toMatch(/nodeId: nodePseudonym \|\| serverNodeStatus\?\.nodeId \|\| null,/);
   });
 });
 
@@ -480,7 +467,7 @@ describe('the mobile wallet document describes the shipped behaviour', () => {
 describe('MOBLINK-R5-02: a decided request outlives a lock', () => {
   it('locking keeps the request, which comes back with its outcome', () => {
     const s = SCREEN();
-    const lock = s.slice(s.indexOf('const lockSession = () => {'), s.indexOf('const nextQueuedLink = (r) =>'));
+    const lock = s.slice(s.indexOf('const lockSession = () => {'), s.indexOf('const graceMs = () =>'));
     expect(lock).not.toMatch(/setLinkRequest\(/);
     expect(s).toMatch(/settled=\{!!linkRequest\.settled\}/);
     expect(s).toMatch(/settledOutcome=\{linkRequest\.outcome \|\| null\}/);

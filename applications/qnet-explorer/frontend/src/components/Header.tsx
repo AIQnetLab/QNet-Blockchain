@@ -1,32 +1,33 @@
 'use client';
 
 import { memo, useEffect, useId, useRef, useState } from 'react';
-import Link from 'next/link';
-import { usePathname } from 'next/navigation';
 // One wallet control in the header row at every width; provider code runs only in the browser, after hydration.
 import ConnectWalletButton, { OVERLAY_EVENT } from './wallet/connect-wallet-button';
 import WalletBoundary from './wallet/WalletBoundary';
+import LanguageSwitcher from './LanguageSwitcher';
+import { useMenu } from './ui/useMenu';
 import { useActivationContent, useWallet } from '@/contexts/AppContext';
+import { Link, useI18n, usePath } from '@/i18n/client';
 import { IN_APP_HOME, IN_APP_NAV, type NavLink } from '@/lib/activate-view';
 import { ACTIVATION_NETWORK } from '@/lib/one-dev';
 
-// The site's navigation (owner, 29.09): the logo is Home, then Explorer, My node, Wallet, Testnet (its own tab on a
-// testnet release: the faucet lives there) and the Docs menu, and the wallet control. Privacy and Terms are in the
-// footer's legal line; Support is in the Docs menu. Every link stays on this origin (aiqnet.io, src/lib/hosts.ts):
-// another host would be another origin, where the wallet asks again to connect the site.
+// The site's navigation: the logo is Home, then Explorer, My node, Wallet, Testnet (its own tab on a
+// testnet release: the faucet lives there), the Docs menu and the language menu, and the wallet control. Privacy and
+// Terms are in the footer's legal line; Support is in the Docs menu. Every link stays on this origin (aiqnet.io,
+// src/lib/hosts.ts): another host would be another origin, where the wallet asks again to connect the site.
 const MAIN_NAV: NavLink[] = [
-  { href: '/explorer', label: 'Explorer' },
-  { href: '/node', label: 'My node' },
-  { href: '/wallet', label: 'Wallet' },
-  ...(ACTIVATION_NETWORK === 'testnet' ? [{ href: '/testnet', label: 'Testnet' }] : []),
+  { href: '/explorer', label: 'hdr_explorer' },
+  { href: '/node', label: 'hdr_node' },
+  { href: '/wallet', label: 'hdr_wallet' },
+  ...(ACTIVATION_NETWORK === 'testnet' ? [{ href: '/testnet', label: 'hdr_testnet' } as const] : []),
 ];
 
 // The Docs menu: the documentation, How it works (the node guide), the DAO and Support.
 const DOCS_MENU: NavLink[] = [
-  { href: '/docs', label: 'Documentation' },
-  { href: '/docs/how-it-works', label: 'How it works' },
-  { href: '/dao', label: 'DAO' },
-  { href: '/support', label: 'Support' },
+  { href: '/docs', label: 'docs_title' },
+  { href: '/docs/how-it-works', label: 'guide_title' },
+  { href: '/dao', label: 'hdr_dao' },
+  { href: '/support', label: 'support_title' },
 ];
 
 // The wordmark: the name together, "Blockchain" one weight lighter.
@@ -40,35 +41,10 @@ function isCurrent(pathname: string, href: string): boolean {
 }
 
 // The Docs button and its list: a menu under the button on a wide screen, the same list in place inside the phone's
-// menu. It closes on a link, a tap outside, Escape (focus back on the button) and a new page.
+// menu. It closes on a link, a tap outside, Escape (focus back on the button) and a new page (useMenu).
 function DocsMenu({ pathname }: { pathname: string }) {
-  const [open, setOpen] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
-  const button = useRef<HTMLButtonElement>(null);
-  const listId = useId();
-
-  useEffect(() => {
-    setOpen(false);
-  }, [pathname]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointer = (e: PointerEvent) => {
-      if (root.current && !root.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      setOpen(false);
-      button.current?.focus({ preventScroll: true });
-    };
-    document.addEventListener('pointerdown', onPointer);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('pointerdown', onPointer);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
+  const { t, say } = useI18n();
+  const { open, setOpen, root, button, listId } = useMenu(pathname);
   const current = DOCS_MENU.some((link) => pathname === link.href);
   return (
     <div className="docs" data-open={open || undefined} ref={root}>
@@ -82,12 +58,12 @@ function DocsMenu({ pathname }: { pathname: string }) {
         data-field-clear
         onClick={() => setOpen((was) => !was)}
       >
-        Docs<span className="chev" aria-hidden="true" />
+        {t('hdr_docs')}<span className="chev" aria-hidden="true" />
       </button>
       <div className="docs-menu" id={listId} hidden={!open}>
         {DOCS_MENU.map((link) => (
           <Link key={link.href} href={link.href} className="docs-link" aria-current={pathname === link.href ? 'page' : undefined}>
-            {link.label}
+            {say(link.label)}
           </Link>
         ))}
       </div>
@@ -96,7 +72,8 @@ function DocsMenu({ pathname }: { pathname: string }) {
 }
 
 const HeaderComponent = () => {
-  const pathname = usePathname();
+  const { t, say } = useI18n();
+  const pathname = usePath();
   // In the QNet app's view (its in-app browser) the header leads only to the explorer and the policies: no page about
   // the wallet, its activation, the faucet or the DAO is a tap away. The server's render and the moments before the
   // wallet is detected get the same links, kept invisible, so nothing else is reachable before the page knows where it
@@ -155,7 +132,7 @@ const HeaderComponent = () => {
   return (
     <header className="hdr" data-scrolled={scrolled || undefined} data-open={isMenuOpen || undefined} data-field-fixed data-field-dim="0.25">
       <div className="wrap hdr-in">
-        <Link href={inApp ? IN_APP_HOME : '/'} className="brand" aria-label={NAME} data-field-clear>
+        <Link href={inApp ? IN_APP_HOME : '/'} className="brand" aria-label={NAME} translate="no" data-field-clear>
           <img src="/icon-192.png" alt="" width={28} height={28} />
           <span className="brand-name" aria-hidden="true"><b>{MARK}</b> {WORD}</span>
         </Link>
@@ -165,7 +142,7 @@ const HeaderComponent = () => {
           ref={nav}
           id={navId}
           className="nav"
-          aria-label="Main"
+          aria-label={t('hdr_main')}
           data-pending={providerStatus === 'detecting' || undefined}
           onClick={(e) => {
             if ((e.target as HTMLElement).closest('a')) setIsMenuOpen(false);
@@ -179,10 +156,11 @@ const HeaderComponent = () => {
               aria-current={isCurrent(pathname, link.href) ? 'page' : undefined}
               data-field-clear
             >
-              {link.label}
+              {say(link.label)}
             </Link>
           ))}
           {!inApp && <DocsMenu pathname={pathname} />}
+          <LanguageSwitcher />
         </nav>
 
         <div className="hdr-acct" data-field-clear>
@@ -199,8 +177,8 @@ const HeaderComponent = () => {
           data-field-clear
         >
           <span className="swap">
-            <span data-on={!isMenuOpen}>Menu</span>
-            <span data-on={isMenuOpen}>Close</span>
+            <span data-on={!isMenuOpen}>{t('hdr_menu')}</span>
+            <span data-on={isMenuOpen}>{t('hdr_close')}</span>
           </span>
         </button>
       </div>

@@ -1,9 +1,9 @@
 'use client';
 
-// /node/activate (unified plan flows A and B; shared contracts C1 and C4): a light node paid from a one-time payment
+// /node/activate: a light node paid from a one-time payment
 // address in this browser. QNet Wallet first confirms the wallet the node is for (a QNet Link `reserve` request: the
 // wallet signs its reservation, and the address exists for that wallet only), then the address is funded from the
-// user's own wallet as on mainnet (owner, 29.09 and 19.10: the page names the exact amounts, with buttons that open a
+// user's own wallet as on mainnet (the page names the exact amounts, with buttons that open a
 // wallet with each transfer filled in and one QR code of the address; on testnet it links the Testnet page's faucet for
 // test tokens to the wallet), the burn is bound to that wallet's light node before it is sent and shows its code once
 // final, and one QNet Link `link` request that QNet Wallet confirms registers the node. That last step also works later from any browser where the wallet is connected (NextSteps.tsx
@@ -17,7 +17,7 @@
 // the key lives at most 24 hours; then what arrived goes back to the wallet (test tokens only when the page knows the
 // wallet's Solana address) and the key is deleted. After the burn the key only sends back what is left: once the node
 // is recorded, or at once when the user asks. Nothing new is offered here unless every source of the chosen wallet says
-// it has nothing (the state `none`, src/lib/cabinet/wallet-activation.ts; unified plan R1 and R6): a wallet with a node,
+// it has nothing (the state `none`, src/lib/cabinet/wallet-activation.ts): a wallet with a node,
 // a burn, a burn on its way, another browser's reservation or a source that did not answer gets its state and next step
 // instead. The burn is signed only under the wallet's reservation in the site's activation registry (activation.ts
 // burn). The payment address burns for a light node only; a super node is activated only in the QNet extension, on a
@@ -27,13 +27,11 @@
 // activation is not open yet.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useRouter } from 'next/navigation';
 import { useWallet } from '@/contexts/AppContext';
 import Action from '@/components/ui/Action';
 import EntityLink from '@/components/ui/EntityLink';
 import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
-import { number, t, type MessageKey } from '@/lib/texts';
-import { rich } from '@/lib/rich';
+import { number, type MessageKey } from '@/lib/texts';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useNodeStatus } from '@/hooks/useNodeStatus';
 import { useLinkSession } from '@/hooks/useLinkSession';
@@ -59,10 +57,11 @@ import ExtensionActivate, { requestedType } from './ExtensionActivate';
 import LinkWaiting from './LinkWaiting';
 import { NoNode, NodeNext } from './NextSteps';
 import { Group, Next, Step, Steps } from './parts';
+import { useI18n, useLocaleRouter } from '@/i18n/client';
 
-// How often each stage that waits on the network is looked at again while the page is shown. Every activating page
-// reads Solana through the site's one server, so the funding read is not polled faster than a transfer lands; the
-// page reads at once when it is shown again.
+// How often each stage that waits on the network is looked at again while the page is shown (the registration's own
+// steps also while it is hidden, act.runsHidden). Every activating page reads Solana through the site's one server, so
+// the funding read is not polled faster than a transfer lands; the page reads at once when it is shown again.
 const POLL_MS: Partial<Record<Stage, number>> = {
   funding: 6_000,
   funded: 15_000,
@@ -96,6 +95,7 @@ const BURN_NOTICE: Record<act.BurnResult['outcome'], MessageKey | null> = {
   has_burn: 'act_has_activation',
   reserved: 'act_reserved',
   check_unavailable: 'act_check_unavailable',
+  no_solana: 'check_solana_address',
   reservation: 'act_reservation',
   not_open: 'act_payment_not_open',
 };
@@ -132,6 +132,7 @@ function refusedAnswerText(answer: LinkAnswer): MessageKey {
 type Setup = { phase: 'loading' } | { phase: 'ready'; quote: PriceQuote } | { phase: 'unavailable' };
 
 export default function NodeActivate() {
+  const { t, say, rich } = useI18n();
   const { ready, choice, choose, viewOnly, view, refreshActivation, nodeId, phoneFlows } = useCabinet();
   // The wallet's light node status the cabinet reads anyway: a network that does not list the v2 owner bind on both
   // settling nodes takes no payment burn yet. Read again before an address is made and before a burn is signed.
@@ -153,15 +154,14 @@ export default function NodeActivate() {
   // ?type=super (the Overview's "Activate a super node"): the super node's card comes first.
   const [wantsSuper, setWantsSuper] = useState(false);
   // What is left cannot go back until the payment address gets this much more SOL (lamports), and where it then goes:
-  // the wallet's address, or the one the user entered and pressed Send for, which the page then sends to by itself
-  // (SITE-R2-02).
+  // the wallet's address, or the one the user entered and pressed Send for, which the page then sends to by itself.
   const [short, setShort] = useState<{ dest: string; need: bigint } | null>(null);
   const typedDest = useRef<string | null>(null);
   // The record was an unfinished activation of this browser when the page opened.
   const [resumed, setResumed] = useState(false);
   const busy = useRef(false);
   // Each activation keeps its own request in the browser, so another tab's request for another activation never takes
-  // this one's place, and its answer never reaches this record (SITE-R3-02).
+  // this one's place, and its answer never reaches this record.
   const button = useLinkSession({ slot: record ? `activate.${record.pub}` : undefined, consent24h: true, verify: verifyConsent });
   const qr = useLinkSession({ slot: record ? `activate-qr.${record.pub}` : undefined, consent24h: true, verify: verifyConsent });
   const session = record?.link?.qr ? qr : button;
@@ -192,7 +192,7 @@ export default function NodeActivate() {
   // The chosen wallet's state from every source: nothing new is offered unless it is `none`.
   const offer = view.state === 'none';
   // A funded payment address burns only for the chosen, connected wallet, and only while every source of it says it has
-  // nothing or this browser holds its reservation already (R6): a known burn, a source that is loading, locked or did
+  // nothing or this browser holds its reservation already: a known burn, a source that is loading, locked or did
   // not answer, or another browser's reservation shows the state instead, and nothing is signed.
   const mayBurn = choice !== null && !viewOnly && (offer || (view.state === 'reserved' && view.here));
   const [extensionAnswered, setExtensionAnswered] = useState(false);
@@ -212,7 +212,7 @@ export default function NodeActivate() {
     setWantsSuper(requestedType(window.location.search) === 'super');
   }, [loadSetup, loadRecord]);
 
-  // The price is read again whenever the page is shown again (SITE-R2-05): it steps down as supply is burned, and a
+  // The price is read again whenever the page is shown again: it steps down as supply is burned, and a
   // tab may wait hours for a transfer. The burn reads it once more before it signs (act.burn).
   const priceKnown = setup.phase === 'ready';
   useEffect(() => {
@@ -266,7 +266,7 @@ export default function NodeActivate() {
     if (!record || !isUnfinished(record)) return;
     const every = POLL_MS[record.stage] ?? EXPIRY_POLL_MS;
     const run = () => {
-      if (document.visibilityState === 'hidden') return;
+      if (document.visibilityState === 'hidden' && !act.runsHidden(record)) return;
       void step(record, async (r) => {
         if (isExpired(r, deps.now())) return act.expire(r, deps);
         switch (r.stage) {
@@ -398,8 +398,8 @@ export default function NodeActivate() {
     if (ready && !choice && registeredWallet) choose({ qnet: registeredWallet, source: 'app' });
   }, [ready, choice, registeredWallet, choose]);
 
-  // A finished registration with nothing left to send back opens My node at once (owner 20.10).
-  const router = useRouter();
+  // A finished registration with nothing left to send back opens My node at once.
+  const router = useLocaleRouter();
   const finished = record?.stage === 'done' && registered !== null && !mayReturnLeftovers(record);
   useEffect(() => {
     if (finished) router.replace('/node?tab=overview');
@@ -423,7 +423,7 @@ export default function NodeActivate() {
   const start = async () => {
     if (setup.phase !== 'ready' || working || !choice || viewOnly) return;
     setNotice(null);
-    // Only while every source of the chosen wallet says it has nothing (the burn reserves the wallet again, R6).
+    // Only while every source of the chosen wallet says it has nothing (the burn reserves the wallet again).
     if (!offer) return;
     setWorking(true);
     // No address before the network takes the payment key's owner bind: nothing could be registered with its burn.
@@ -470,7 +470,7 @@ export default function NodeActivate() {
     return opened ?? from;
   });
 
-  // A consent too old for the network (owner, 29.09): QNet Wallet is asked again at once, for the same burn, which keeps
+  // A consent too old for the network: QNet Wallet is asked again at once, for the same burn, which keeps
   // its code; the request opens as the first one would (a button on a phone, a QR code elsewhere).
   const askAgain = () => withRecord(async (r) => {
     const back = await act.relink(r, deps);
@@ -515,9 +515,9 @@ export default function NodeActivate() {
   const askedOther = refundAnswer?.status === 'ok' && !!refundAnswer.qnet && pinned !== null && refundAnswer.qnet !== pinned;
   const refundAskView = refundAsk.state.phase === 'idle' || refundAsk.state.phase === 'done' ? (
     <div className="cab-move-way">
-      {askedOther && <Failed>{t('act_refund_other_wallet')}</Failed>}
-      {refundAnswer && refundAnswer.status !== 'ok' && <Answered>{t(refusedAnswerText(refundAnswer))}</Answered>}
-      <Action kind="solid" onClick={() => void refundAsk.start('connect')} disabled={working}>{t('wallet_ask_app')}</Action>
+      {askedOther && <Failed>{say('act_refund_other_wallet')}</Failed>}
+      {refundAnswer && refundAnswer.status !== 'ok' && <Answered>{say(refusedAnswerText(refundAnswer))}</Answered>}
+      <Action kind="solid" onClick={() => void refundAsk.start('connect')} disabled={working}>{say('wallet_ask_app')}</Action>
     </div>
   ) : (
     <LinkWaiting
@@ -534,7 +534,7 @@ export default function NodeActivate() {
   const confirmView = (r: PaymentRecord, onCancel: () => void) => (confirmState.phase === 'idle' || confirmState.phase === 'done' ? (
     <div className="actions cab-next-act">
       <Action kind="solid" onClick={() => askWallet(r, !device?.phone)} disabled={!device || working}>
-        {t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
+        {say(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
       </Action>
       {device?.phone && <Action kind="text" onClick={() => askWallet(r, true)} disabled={working}>{t('wallet_other_device')}</Action>}
     </div>
@@ -552,7 +552,7 @@ export default function NodeActivate() {
   // The step texts before a step is reached: what it will do.
   const payAhead = <p className="cab-step-s">{t(ACTIVATION_NETWORK === 'testnet' ? 'act_way_3_testnet' : 'act_way_3_mainnet')}</p>;
   const burnAhead = <p className="cab-step-s">{t('act_way_4')}</p>;
-  const registerAhead = <p className="cab-step-s">{t('act_way_5')}</p>;
+  const registerAhead = <p className="cab-step-s">{say('act_way_5')}</p>;
 
   let body: ReactNode;
   // Nothing is offered before every source of the wallet answered: a wallet with an activation never sees a new one for
@@ -577,8 +577,8 @@ export default function NodeActivate() {
     const install = device && !device.phone && !extension ? installTarget(window.navigator) : null;
     // A super node: only the QNet extension on a computer activates it, and it runs on the user's own server.
     const superCard = !extensionHolds && (
-      <Group level={3} title={t('act_super_title')}>
-        <p>{t('super_note')}</p>
+      <Group level={3} title={say('act_super_title')}>
+        <p>{say('super_note')}</p>
         <div className="cab-next-act">
           {install ? (
             <Action href={install.href} external={install.kind === 'store'}>{t('super_note_install')}</Action>
@@ -591,23 +591,23 @@ export default function NodeActivate() {
     // A light node from a one-time payment address, run in QNet Wallet: the four steps, the first one to do now.
     const paymentCard = phoneFlows ? (
       <Group level={3} title={t('act_payment_title')}>
-        <p className="lead">{t('act_lead')}</p>
+        <p className="lead">{say('act_lead')}</p>
         <Steps label={t('progress_label')}>
-          <Step n={1} at="now" title={t('act_reserve_title')} level={4}>
-            <p className="cab-step-s">{t('act_way_1')} {t('act_way_2')}</p>
+          <Step n={1} at="now" title={say('act_reserve_title')} level={4}>
+            <p className="cab-step-s">{say('act_way_1')} {t('act_way_2')}</p>
             {!supported ? (
               <Failed>{t('act_unsupported')}</Failed>
             ) : setup.phase === 'loading' ? (
-              <Waiting>{t('checking')}</Waiting>
+              <Waiting>{say('checking')}</Waiting>
             ) : setup.phase === 'unavailable' ? (
-              <Failed action={{ label: t('try_again'), onClick: () => void loadSetup() }}>{t('act_price_unavailable')}</Failed>
+              <Failed action={{ label: t('try_again'), onClick: () => void loadSetup() }}>{say('act_price_unavailable')}</Failed>
             ) : setup.quote.phase !== 1 ? (
-              <p>{t('act_no_burn_phase')}</p>
+              <p>{say('act_no_burn_phase')}</p>
             ) : paymentClosed ? (
-              <p className="note">{t('act_payment_not_open')}</p>
+              <p className="note">{say('act_payment_not_open')}</p>
             ) : (
               <>
-                <p>{t('act_price', { price: number(setup.quote.cost) })}</p>
+                <p>{say('act_price', { price: number(setup.quote.cost) })}</p>
                 <div className="cab-next-act"><Action kind="solid" onClick={() => void start()} disabled={working || !device}>{t('act_start')}</Action></div>
               </>
             )}
@@ -619,10 +619,10 @@ export default function NodeActivate() {
       </Group>
     ) : !extensionHolds && (
       <Next action={device?.phone && <Action href={`${GUIDE_HREF}?way=computer`}>{t('guide_show_computer')}</Action>}>
-        <p>{t('act_phone_closed')}</p>
+        <p>{say('act_phone_closed')}</p>
         {install && (
           <p className="note">
-            {t('act_get_extension')}{' '}
+            {say('act_get_extension')}{' '}
             <a href={install.href} target={install.kind === 'store' ? '_blank' : undefined} rel="noopener noreferrer">{t('act_get_extension_link')}</a>
           </p>
         )}
@@ -633,7 +633,7 @@ export default function NodeActivate() {
         <h2 className="cab-title">{t(extensionHolds ? 'activate_title' : wantsSuper ? 'action_activate_super' : 'action_activate_light')}</h2>
         {extensionHolds && <ExtensionActivate key={choice?.qnet ?? ''} offer onAnswered={() => setExtensionAnswered(true)} />}
         {/* An extension with another wallet: said, never offered for this one. */}
-        {extension && !extensionHolds && <Next><p>{t('act_extension_other_wallet')}</p></Next>}
+        {extension && !extensionHolds && <Next><p>{say('act_extension_other_wallet')}</p></Next>}
         {/* The extension's card says it among its facts. */}
         {!extensionHolds && <p className="note">{t('one_code')}</p>}
         {wantsSuper ? <>{superCard}{paymentCard}</> : <>{paymentCard}{superCard}</>}
@@ -642,7 +642,8 @@ export default function NodeActivate() {
   } else {
     const stage = record.stage;
     const stopped = STOPPED_TEXT[stage];
-    // The wallet the activation is for: the one QNet Wallet confirmed (or is asked to confirm), else the chosen one.
+    // The wallet the activation is for: the one QNet Wallet confirmed (or is asked to confirm), else the chosen one. Named
+    // without a link: until its node is registered its explorer page shows nothing of this activation.
     const named = pinned ?? choice?.qnet ?? null;
     const confirming = (stage === 'funding' || stage === 'funded') && confirmState.phase !== 'idle' && confirmState.phase !== 'done';
     // The step to do now (activate-steps.ts); null outside the four steps.
@@ -650,8 +651,8 @@ export default function NodeActivate() {
     // QNet Wallet's confirmation asked again while the address is funded: inside the step it belongs to now.
     const reconfirm = confirming && (
       <div className="cab-sub">
-        <h4 className="label">{t('act_reserve_title')}</h4>
-        {named && <p>{rich('act_reserve_lead', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+        <h4 className="label">{say('act_reserve_title')}</h4>
+        {named && <p>{rich('act_reserve_lead', { wallet: <EntityLink kind="address" value={named} link={false} /> })}</p>}
         {confirmView(record, confirmCancel)}
       </div>
     );
@@ -662,21 +663,21 @@ export default function NodeActivate() {
         {resumed && isUnfinished(record) && <p className="note">{t('act_resume')}</p>}
         {now !== null && (
           <Steps label={t('progress_label')}>
-            <Step n={1} at={stepAt(1, now)} title={t('act_reserve_title')}>
+            <Step n={1} at={stepAt(1, now)} title={say('act_reserve_title')}>
               {stage === 'walletConfirm' ? (
                 <>
-                  {named && <p className="cab-step-s">{rich('act_reserve_lead', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+                  {named && <p className="cab-step-s">{rich('act_reserve_lead', { wallet: <EntityLink kind="address" value={named} link={false} /> })}</p>}
                   {confirmView(record, () => void cancel())}
                 </>
-              ) : named && <p className="cab-step-s">{rich('act_reserve_done', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+              ) : named && <p className="cab-step-s">{rich('act_reserve_done', { wallet: <EntityLink kind="address" value={named} link={false} /> })}</p>}
             </Step>
             <Step n={2} at={stepAt(2, now)} title={t('act_step_pay')}>
               {stage === 'funding' && reconfirm}
               {(stage === 'funding' || stage === 'funded') && price === null && (
                 setup.phase === 'unavailable' ? (
-                  <Failed action={{ label: t('try_again'), onClick: () => void loadSetup() }}>{t('act_price_unavailable')}</Failed>
+                  <Failed action={{ label: t('try_again'), onClick: () => void loadSetup() }}>{say('act_price_unavailable')}</Failed>
                 ) : (
-                  <Waiting>{t(setup.phase === 'loading' ? 'checking' : 'act_no_burn_phase')}</Waiting>
+                  <Waiting>{say(setup.phase === 'loading' ? 'checking' : 'act_no_burn_phase')}</Waiting>
                 )
               )}
               {(stage === 'funding' || stage === 'funded') && price !== null && (
@@ -701,7 +702,7 @@ export default function NodeActivate() {
               {stage === 'funded' && price !== null && !confirming && (mayBurn ? (
                 <>
                   <p>{t('act_burn_lead', { price: number(price) })}</p>
-                  {paymentClosed && <p className="note">{t('act_payment_not_open')}</p>}
+                  {paymentClosed && <p className="note">{say('act_payment_not_open')}</p>}
                   <div className="cab-next-act"><Action kind="solid" onClick={() => void burn()} disabled={working || paymentClosed}>{t('act_burn')}</Action></div>
                 </>
               ) : choice === null || viewOnly ? (
@@ -720,12 +721,12 @@ export default function NodeActivate() {
               {now < 4 && registerAhead}
               {(stage === 'burnFinal' || stage === 'linkOpen') && (
                 <>
-                  <p>{t('act_link_lead')}</p>
-                  {named && <p className="note">{rich('act_link_named', { wallet: <EntityLink kind="address" value={named} /> })}</p>}
+                  <p>{say('act_link_lead')}</p>
+                  {named && <p className="note">{rich('act_link_named', { wallet: <EntityLink kind="address" value={named} link={false} /> })}</p>}
                   {stage === 'burnFinal' || session.state.phase === 'idle' ? (
                     <div className="actions cab-next-act">
                       <Action kind="solid" onClick={() => void openRequest(!device?.phone)} disabled={!device || working}>
-                        {t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
+                        {say(device?.phone ? 'act_link_open' : 'act_link_show_qr')}
                       </Action>
                       {device?.phone && <Action kind="text" onClick={() => void openRequest(true)} disabled={working}>{t('wallet_other_device')}</Action>}
                       {stage === 'linkOpen' && <Action kind="quiet" onClick={() => void cancelRequest()}>{t('cancel')}</Action>}
@@ -745,21 +746,21 @@ export default function NodeActivate() {
               {stage === 'consentVerified' && <AnswerCheck record={record} onAnswer={(matches) => void withRecord((r) => act.answerCheck(r, matches, deps))} />}
               {stopped && (
                 <div role="alert">
-                  <p className="rq-failed">{t(stopped, { wallet: named ? shortAddress(named) : '' })}</p>
+                  <p className="rq-failed">{say(stopped, { wallet: named ? shortAddress(named) : '' })}</p>
                   {stage === 'consentStale' ? (
-                    <div className="cab-next-act"><Action kind="solid" onClick={() => void askAgain()} disabled={!device || working}>{t('act_ask_again')}</Action></div>
+                    <div className="cab-next-act"><Action kind="solid" onClick={() => void askAgain()} disabled={!device || working}>{say('act_ask_again')}</Action></div>
                   ) : stage === 'mismatch' && (
                     <div className="cab-next-act"><Action kind="text" onClick={() => void withRecord((r) => act.relink(r, deps))}>{t('act_relink')}</Action></div>
                   )}
                 </div>
               )}
-              {(stage === 'beneficiaryConfirmed' || stage === 'submitted' || stage === 'onChain') && <Waiting>{t('act_recording')}</Waiting>}
-              {stage === 'submitted' && record.submit?.lastCode === 'bind_v2_pending' && <p className="note">{t('act_bind_v2_pending')}</p>}
+              {(stage === 'beneficiaryConfirmed' || stage === 'submitted' || stage === 'onChain') && <Waiting>{say('act_recording')}</Waiting>}
+              {stage === 'submitted' && record.submit?.lastCode === 'bind_v2_pending' && <p className="note">{say('act_bind_v2_pending')}</p>}
               {stage === 'refused' && (
                 record.submit?.lastCode === 'wallet_has_node' ? (
-                  <Failed>{t('act_refused_wallet_has_node')}</Failed>
+                  <Failed>{say('act_refused_wallet_has_node')}</Failed>
                 ) : (
-                  <Failed action={{ label: t('act_try_again'), onClick: () => void withRecord((r) => act.resubmit(r, deps)) }}>{t('act_refused', { code: record.submit?.lastCode ?? 'refused' })}</Failed>
+                  <Failed action={{ label: t('act_try_again'), onClick: () => void withRecord((r) => act.resubmit(r, deps)) }}>{say('act_refused', { code: record.submit?.lastCode ?? 'refused' })}</Failed>
                 )
               )}
               {stage === 'done' && registered && <Registered nodeId={registered.nodeId} />}
@@ -768,7 +769,7 @@ export default function NodeActivate() {
         )}
         {/* Outside the steps: the burn whose wallet's node came from another burn, and what is left going back. */}
         {now === null && receipt}
-        {stage === 'otherBurn' && <Failed>{t('act_other_burn')}</Failed>}
+        {stage === 'otherBurn' && <Failed>{say('act_other_burn')}</Failed>}
         {mayReturnLeftovers(record) && <LeftoversNow busy={working} onSend={() => void withRecord((r) => act.returnLeftovers(r, deps))} />}
         {(stage === 'leftovers' || stage === 'closing') && (
           <Leftovers
@@ -800,7 +801,7 @@ export default function NodeActivate() {
     // Without a wallet the page shows only an unfinished activation of this browser; else My node asks for one first.
     <CabinetFrame tab="activate" open={record === undefined ? null : record !== null && isUnfinished(record)}>
       {body}
-      {shown && shown !== 'act_refund_failed' && <p className="note cab-notice" role="status">{t(shown)}</p>}
+      {shown && shown !== 'act_refund_failed' && <p className="note cab-notice" role="status">{say(shown)}</p>}
     </CabinetFrame>
   );
 }

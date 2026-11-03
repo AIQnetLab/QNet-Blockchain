@@ -1,20 +1,26 @@
-// The explorer in concept B (B-SPEC 6.2 to 6.6): Latest blocks keep their length as heads arrive, list amounts split
+// The explorer: Latest blocks keep their length as heads arrive, list amounts split
 // into a number and a linked unit, sides and suggestions written one way, live tables that move no element, every route
 // with its own loading state, every entity through the one EntityLink, and parts that render only for their own data.
 // Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EN, TEXTS, english } from './texts-helper.mjs';
 import { existsSync, readdirSync } from 'node:fs';
 import {
   RECENT_BLOCKS, ageText, blocksMissing, emptyListText, fillBlocks, listSummary, nextBlocks, partyKind, recentBlock, signatureName,
-  splitAmount, suggestionView, txStatusView,
+  splitAmount, suggestionView, tokenSuggestion, txStatusView,
 } from '../explorer-view.ts';
 import { EPOCH_BLOCKS, epochProgress } from '../cabinet/epochs.ts';
-import { accountView, readRecord, tokensPath } from '../explorer-reads.ts';
+import { accountView, nodeTokenRead, readRecord, tokensPath } from '../explorer-reads.ts';
 import { within } from '../deadline.ts';
+import { logWindow } from '../../server/log-window.ts';
 import { createServer } from 'node:http';
-import { SRC, code, read } from './source.mjs';
+import { txDataLabel } from '../tx-labels.ts';
+import { translator } from '../texts.ts';
+import { LOCALES } from '../languages.ts';
+import { CATALOGS } from '../../i18n/catalogs.ts';
+import { SRC, code, read, repo, sourceFiles } from './source.mjs';
 
 const HASH = (n) => n.toString(16).padStart(64, '0');
 const block = (height) => ({ height, hash: HASH(height), timestamp: 1_792_400_000_000 + height * 1000 });
@@ -77,7 +83,7 @@ test('Latest blocks: rows the head stream left without a hash are filled in plac
   const hook = code('components/explorer/useRecentBlocks.ts');
   assert.match(hook, /const missing = blocksMissing\(blocks, limit\);/);
   assert.match(hook, /if \(!missing \|\| busy\.current \|\| Date\.now\(\) < nextAt\.current \|\| document\.visibilityState === 'hidden'\) return;/);
-  assert.match(hook, /fetch\(`\/api\/blocks\?latest=\$\{limit\}`, \{ cache: 'no-store' \}\)/);
+  assert.match(hook, /fetch\(`\/api\/blocks\?latest=\$\{limit\}`, siteRequest\(\)\)/);
   assert.match(hook, /const READ_MS = 2_000;\nconst IDLE_MS = 15_000;/);
   // The newest blocks come to every visitor from the head snapshot, no query of their own; only a history page (?at=)
   // reads the index.
@@ -102,8 +108,8 @@ test('a list amount: its number as text, its unit apart; a transaction that move
   const cells = code('components/explorer/cells.tsx');
   assert.match(cells, /return <Amount value=\{`\$\{sign\}\$\{parts\.value\}`\} token=\{parts\.token\} symbol=\{parts\.token \? parts\.unit : null\} logo=\{logo\} \/>;/);
   // An address's own list writes the side with the number (+ in, − out), the same cell otherwise.
-  assert.match(code('app/explorer/address/[address]/AddressClient.tsx'), /<TxAmount parts=\{rowAmount\(t\)\} sign=\{t\.from === address \? '−' : '\+'\} \/>/);
-  assert.match(code('components/ui/EntityLink.tsx'), /<span className="amount" title=\{`\$\{value\} \$\{unitText\(\{ token, symbol \}\)\}`\}>\n\s*<span className="amount-v num">\{value\}<\/span> <AmountUnit token=\{token\} symbol=\{symbol\} logo=\{logo\} \/>\n\s*<\/span>/);
+  assert.match(code('app/explorer/address/[address]/AddressClient.tsx'), /<TxAmount parts=\{rowAmount\(x, t\('token_unnamed'\)\)\} sign=\{x\.from === address \? '−' : '\+'\} \/>/);
+  assert.match(code('components/ui/EntityLink.tsx'), /<span className="amount" title=\{`\$\{value\} \$\{unitText\(\{ token, symbol, solana \}, t\('token_unnamed'\)\)\}`\}>\n\s*<span className="amount-v num" translate="no">\{value\}<\/span> <AmountUnit token=\{token\} symbol=\{symbol\} logo=\{logo\} solana=\{solana\} \/>\n\s*<\/span>/);
 });
 
 test('a side of a transaction: an address, the batch marker, a system account, or a node id', () => {
@@ -124,12 +130,12 @@ test('a side of a transaction: an address, the batch marker, a system account, o
 
 test('ages: "now" and counts, the genesis for a record without a real time, digit strings read as numbers', () => {
   const now = 1_792_400_100_000;
-  assert.equal(ageText(now, now), 'now');
-  assert.equal(ageText(now - 5_000, now), '5s ago');
-  assert.equal(ageText(String(now - 180_000), now), '3m ago');
-  assert.equal(ageText(Math.floor((now - 7_200_000) / 1000), now), '2h ago');
-  assert.equal(ageText(now + 3_000, now), 'now', 'a clock a little ahead never reads as the future');
-  for (const genesis of [0, null, undefined, '0', 1_600_000_000_000]) assert.equal(ageText(genesis, now), 'Genesis', String(genesis));
+  assert.equal(ageText(now, now, EN), 'now');
+  assert.equal(ageText(now - 5_000, now, EN), '5s ago');
+  assert.equal(ageText(String(now - 180_000), now, EN), '3m ago');
+  assert.equal(ageText(Math.floor((now - 7_200_000) / 1000), now, EN), '2h ago');
+  assert.equal(ageText(now + 3_000, now, EN), 'now', 'a clock a little ahead never reads as the future');
+  for (const genesis of [0, null, undefined, '0', 1_600_000_000_000]) assert.equal(ageText(genesis, now, EN), 'Genesis', String(genesis));
   // One clock for the page: ages refresh by themselves, the table around them never renders for them.
   const ago = code('components/explorer/Ago.tsx');
   assert.match(ago, /useSyncExternalStore\(on \? subscribe : still, current, onServer\);/);
@@ -137,21 +143,68 @@ test('ages: "now" and counts, the genesis for a record without a real time, digi
 });
 
 test('the list\'s datum and empty line, and how a suggestion is written', () => {
-  assert.equal(listSummary(['Transfer', 'Swap'], false, 1), 'Transfer, Swap · newest first');
-  assert.equal(listSummary([], true, 1), 'All types · oldest first');
-  assert.equal(listSummary([], false, 3), 'Page 3 · newest first');
-  assert.equal(emptyListText(['Transfer', 'Swap']), 'No Transfer or Swap transactions yet');
-  assert.equal(emptyListText([]), 'Waiting for activity on QNet Blockchain…');
-  assert.deepEqual(suggestionView({ type: 'block', label: 'Block #4090481', sublabel: 'Block height', href: '/explorer/block/4090481' }), { kind: 'Block', value: '4,090,481', note: 'Block height' });
-  assert.deepEqual(suggestionView({ type: 'block', label: 'Block #7', sublabel: 'matched by hash', href: '/explorer/block/7' }).note, 'Found by its hash');
-  const tx = suggestionView({ type: 'tx', label: 'Transaction', sublabel: 'abc · not yet indexed', href: `/explorer/tx/${HASH(255)}` });
+  assert.equal(listSummary(['Transfer', 'Swap'], false, 1, EN), 'Transfer, Swap · newest first');
+  assert.equal(listSummary([], true, 1, EN), 'All types · oldest first');
+  assert.equal(listSummary([], false, 3, EN), 'Page 3 · newest first');
+  assert.equal(emptyListText(['Transfer', 'Swap'], EN), 'No Transfer or Swap transactions yet');
+  assert.equal(emptyListText([], EN), 'Waiting for activity on QNet Blockchain…');
+  assert.deepEqual(suggestionView({ type: 'block', label: 'Block #4090481', sublabel: 'Block height', href: '/explorer/block/4090481' }, EN), { kind: 'Block', value: '4,090,481', note: 'Block height' });
+  assert.deepEqual(suggestionView({ type: 'block', label: 'Block #7', sublabel: 'matched by hash', href: '/explorer/block/7' }, EN).note, 'Found by its hash');
+  const tx = suggestionView({ type: 'tx', label: 'Transaction', sublabel: 'abc · not yet indexed', href: `/explorer/tx/${HASH(255)}` }, EN);
   assert.deepEqual(tx, { kind: 'TX', value: '00000000…0000ff', note: 'Not in the index yet' });
-  assert.deepEqual(suggestionView({ type: 'address', label: 'Address', href: `/explorer/address/${ADDRESS}` }).value, '4f1c9a…9b40c1');
-  assert.deepEqual(suggestionView({ type: 'token', label: 'QUSD', symbol: 'QUSD', sublabel: `Q Dollar · 4f1c9a2b3c…b40c11`, href: `/explorer/token/${ADDRESS}` }), { kind: 'Token', value: 'QUSD', note: 'Q Dollar' });
+  assert.deepEqual(suggestionView({ type: 'address', label: 'Address', href: `/explorer/address/${ADDRESS}` }, EN).value, '4f1c9a…9b40c1');
+  assert.deepEqual(suggestionView(tokenSuggestion({ symbol: 'QUSD', name: 'Q Dollar', logo: '' }, ADDRESS), EN), { kind: 'Token', value: 'QUSD', note: 'Q Dollar' });
   // The server echoes the query unencoded: a '%' that is no escape is written as typed, never thrown during render.
   const typed = '0123456789abcdef012eon%zz3456789abcdef0123456789';
-  assert.deepEqual(suggestionView({ type: 'address', label: 'Address', href: `/explorer/address/${typed}` }), { kind: 'Address', value: '012345…456789', note: 'Address' });
-  assert.equal(suggestionView({ type: 'tx', label: 'Transaction', href: '/explorer/tx/ab%E0%A4%A' }).value, 'ab%E0%A4%A');
+  assert.deepEqual(suggestionView({ type: 'address', label: 'Address', href: `/explorer/address/${typed}` }, EN), { kind: 'Address', value: '012345…456789', note: 'Address' });
+  assert.equal(suggestionView({ type: 'tx', label: 'Transaction', href: '/explorer/tx/ab%E0%A4%A' }, EN).value, 'ab%E0%A4%A');
+});
+
+test('each label says what it names in every language: Token, a token without a symbol, a status, a data fact', () => {
+  // "Token" heads a column, a row and a suggestion; "unnamed token" stands only for a symbol a token does not have.
+  const es = translator('es', CATALOGS.es);
+  const unnamed = tokenSuggestion({ symbol: '', name: '', logo: '' }, ADDRESS);
+  assert.deepEqual(suggestionView(unnamed, es), { kind: 'Token', value: 'Token sin nombre', note: CATALOGS.es.sugg_token_note });
+  // The search route sends a token's symbol and name as they are: what a token lacks is written by the page, in every
+  // language, from that one builder; no English word is sent in its place.
+  for (const locale of LOCALES) {
+    const tr = translator(locale, CATALOGS[locale]);
+    assert.deepEqual(suggestionView(unnamed, tr), { kind: CATALOGS[locale].col_token, value: CATALOGS[locale].token_unnamed, note: CATALOGS[locale].sugg_token_note }, locale);
+  }
+  const suggest = code('app/api/search/suggest/route.ts');
+  assert.equal(suggest.match(/results\.push\(tokenSuggestion\(tok, (q|contract)\)\)/g)?.length, 2);
+  assert.doesNotMatch(suggest, /type: 'token'|'Token'|'QRC-20'/);
+  for (const locale of LOCALES) assert.notEqual(CATALOGS[locale].col_token, CATALOGS[locale].token_unnamed, locale);
+  for (const [file, labels] of [['app/explorer/tokens/TokensClient.tsx', 1], ['app/explorer/address/[address]/AddressClient.tsx', 2]]) {
+    assert.equal(code(file).match(/textCol<\w+>\('token', t\('col_token'\)/g)?.length, labels, file);
+  }
+  assert.match(code('app/explorer/tx/[hash]/TransactionClient.tsx'), /<Row label=\{t\('col_token'\)\}><EntityLink kind="token" value=\{call\.contract\}/);
+  assert.match(code('app/explorer/token/[contract]/TokenClient.tsx'), /title=\{absent \? t\('col_token'\) : /);
+  for (const file of sourceFiles()) {
+    for (const m of code(file).matchAll(/.{0,40}t\('token_unnamed'\)/g)) {
+      assert.match(m[0], /(rowAmount\(\w+, |tokenParts\(\w+, |unitText\([^)]*, |\|\| )t\('token_unnamed'\)$/, `${file}: ${m[0]}`);
+    }
+  }
+  // A transaction's status and a balance check's result are the explorer's own Status, never My node's readout.
+  assert.equal(CATALOGS.pt.col_status, 'Status');
+  assert.match(code('app/explorer/tx/[hash]/TransactionClient.tsx'), /<Readout label=\{t\('col_status'\)\} value=\{status\?\.value \?\? null\}/);
+  assert.match(code('app/explorer/address/[address]/AddressClient.tsx'), /<Row label=\{t\('col_status'\)\}>\{result\.verified/);
+  assert.deepEqual(sourceFiles().filter((f) => /t\('ro_status'\)/.test(code(f))), ['components/cabinet/NodeStatus.tsx']);
+  // A data fact the indexer records is named in the page's language; any other field keeps its name, as code.
+  for (const field of ['genesis_id', 'epoch', 'eligible_count', 'batch_id', 'transfer_count', 'node_id', 'node_type', 'burn_tx', 'burn_wallet', 'burn_amount']) {
+    const key = txDataLabel(field);
+    assert.equal(key, `tx_data_${field}`, field);
+    for (const locale of LOCALES) assert.ok(CATALOGS[locale][key], `${locale} ${key}`);
+  }
+  for (const field of ['reward_pool', 'constructor', 'toString', '__proto__']) assert.equal(txDataLabel(field), null, field);
+  assert.equal(translator('ru', CATALOGS.ru)(txDataLabel('eligible_count')), 'Допущенные лёгкие ноды');
+  // Every fact the app's view shows has its words.
+  const tags = read('lib/tx-labels.ts');
+  const inApp = /const IN_APP_DATA_KEYS = new Set\(\[([^\]]*)\]\)/.exec(tags)[1].match(/'(\w+)'/g).map((s) => s.slice(1, -1));
+  for (const field of inApp) assert.ok(txDataLabel(field), field);
+  const page = code('app/explorer/tx/[hash]/TransactionClient.tsx');
+  assert.match(page, /return key \? <>\{t\(key\)\}<\/> : <span className="mono" translate="no">\{name\}<\/span>;/);
+  assert.doesNotMatch(page, /humanizeKey|toUpperCase/);
 });
 
 test('a live table moves no element: rows keep their place and take the new record\'s cells, each landing tinted', () => {
@@ -169,14 +222,14 @@ test('a live table moves no element: rows keep their place and take the new reco
   const list = code('app/explorer/ExplorerClient.tsx');
   assert.match(list, /live=\{isLiveView\}/);
   assert.match(list, /const isLiveView = pos\.page === 1 && pos\.cursor === null && sortOrder === 'desc' && typeFilters\.length === 0;/);
-  // Latest blocks (owner 20.10): one strip of cards above All transactions. Each card keeps its place (keyed by its slot)
+  // Latest blocks: one strip of cards above All transactions. Each card keeps its place (keyed by its slot)
   // and takes the next block, its content keyed by height so a block's flash plays as it lands; only the list's
   // transform moves. Its lines stack, each cut with "…" at the card's edge: the height, the age, the producer, the count.
   const strip = code('components/explorer/LatestBlocks.tsx');
   assert.match(strip, /<li key=\{i\} className="ex-cell">\n\s*<div key=\{b\.height\} className="ex-cell-in" data-new=\{fresh\}>/);
   assert.match(strip, /<span className="ex-cell-h flash" data-new=\{fresh\} data-v=\{int\(b\.height\)\}>/);
   assert.doesNotMatch(strip, /pad-|Dash/);
-  assert.match(sheet, /\.ex-cell-in \{ display: grid; grid-template-rows: 22px repeat\(3, 18px\);/);
+  assert.match(sheet, /\.ex-cell-in \{ display: grid; grid-template-columns: minmax\(0, 1fr\); grid-template-rows: 22px repeat\(3, 18px\);/);
   assert.match(sheet, /\.ex-cell-in > \* \{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; \}/);
   assert.match(sheet, /\.ex-cell-in\[data-new='true'\] \{ animation: rowin var\(--t-flash\) ease-out; \}/);
   assert.match(sheet, /\.ex-cell \{\n\s*flex: none; width: var\(--card-w\); height: var\(--card-h\); padding: 12px 16px; border-left: 1px solid var\(--rule\);/);
@@ -200,7 +253,7 @@ test('a live table moves no element: rows keep their place and take the new reco
   assert.match(homeSheet, /\.blk-in\[data-new\] \.flash::after \{/);
 });
 
-// Owner 20.10: Latest blocks on top, All transactions obvious right under it; the strip slides new blocks in from the
+// Latest blocks on top, All transactions obvious right under it; the strip slides new blocks in from the
 // left by a transform, a mouse drags it, and Hide folds it the way the visitor left it on every later visit.
 test('the strip slides new blocks in by a transform, drags with a mouse and stays folded as the visitor left it', async () => {
   const { slideCount, slideMs } = await import('../slide.ts');
@@ -215,7 +268,7 @@ test('the strip slides new blocks in by a transform, drags with a mouse and stay
   // Hide and Show: the server's reading of the cookie at first (the same markup on both sides), the cookie after.
   const strip = code('components/explorer/LatestBlocks.tsx');
   assert.match(strip, /const open = !useSyncExternalStore\(watch, hiddenNow, \(\) => hidden \?\? false\);/);
-  assert.match(strip, /document\.cookie = stripCookie\(open, window\.location\.protocol === 'https:'\);/);
+  assert.match(strip, /document\.cookie = stripCookie\(open, window\.location\.protocol === 'https:', href\('\/explorer'\)\);/);
   assert.match(code('app/explorer/ExplorerClient.tsx'), /<LatestBlocks seed=\{blocks\} hidden=\{blocksHidden\} \/>/);
   const sheet = read('styles/explorer.css');
   assert.match(sheet, /\.ex-chain\[data-open='false'\] \.ex-chain-body \{\n\s*grid-template-rows: minmax\(0, 0fr\); visibility: hidden;/);
@@ -236,17 +289,17 @@ test('the explorer\'s first paint carries its data, and each part renders only f
   assert.match(page, /const hidden = stripHidden\(\(await cookies\(\)\)\.get\(STRIP_COOKIE\)\?\.value\);\n\s*return <ExplorerClient initial=\{initial\} blocks=\{blocks\} blocksHidden=\{hidden\} \/>;/);
   assert.match(page, /block: headBlockFacts\(s\),/);
   assert.doesNotMatch(page, /getLatestBlocks|lib\/db/);
-  // Light and server nodes as two readings of equal weight (owner 19.10), both from /api/network/stats, written once and
+  // Light and server nodes as two readings of equal weight, both from /api/network/stats, written once and
   // in one order (light first) for the home page and the explorer.
-  const shared = code('components/explorer/ChainReadouts.tsx');
-  assert.match(shared, /<Readout label="Light nodes" value=\{nodes \? int\(nodes\.lightNodes\) : null\} sub="Phones and tablets, last epoch" \/>\s*<Readout label="Server nodes" value=\{nodes \? int\(nodes\.superNodes\) : null\} sub="Super nodes, last epoch" \/>/);
+  const shared = english('components/explorer/ChainReadouts.tsx');
+  assert.match(shared, /<Readout label="Light nodes" value=\{nodes \? int\(nodes\.lightNodes\) : null\} sub="Phones and tablets, last epoch" \/>\s*<Readout label="Server nodes" value=\{nodes && nodes\.superNodes !== null \? int\(nodes\.superNodes\) : null\} sub="Super nodes, last epoch" \/>/);
   assert.match(code('components/explorer/NetworkReadouts.tsx'), /<EpochReadout height=\{height\} \/>\s*<NodeCountReadouts nodes=\{nodes\} \/>/);
   assert.match(code('app/HomeClient.tsx'), /<NodeCountReadouts nodes=\{nodes\} \/>\s*<EpochReadout height=\{height\} \/>/);
   for (const file of ['app/HomeClient.tsx', 'components/explorer/NetworkReadouts.tsx', 'components/cabinet/NodeHome.tsx']) {
-    const src = code(file);
+    const src = english(file);
     assert.doesNotMatch(src, /label="(Light|Server) nodes"|EPOCH_BLOCKS|% EPOCH|endsIn\(/, `${file} writes no epoch or node count reading of its own`);
   }
-  assert.match(code('hooks/useNodeCounts.ts'), /fetch\('\/api\/network\/stats', \{ cache: 'no-store' \}\)/);
+  assert.match(code('hooks/useNodeCounts.ts'), /fetch\('\/api\/network\/stats', siteRequest\(\)\)/);
   // The head moves the readouts and the blocks; the list hears of it through OnHead and renders when its rows change.
   assert.doesNotMatch(code('app/explorer/ExplorerClient.tsx'), /useChainHead/);
   assert.match(code('app/explorer/ExplorerClient.tsx'), /<OnHead every=\{LIVE_REFRESH_MIN_MS\} onHead=\{onHead\} \/>/);
@@ -263,7 +316,7 @@ test('the explorer\'s first paint carries its data, and each part renders only f
 
 test('every explorer route loads as itself: a detail page never shows the list\'s skeleton', () => {
   const routes = ['block/[hash]', 'tx/[hash]', 'address/[address]', 'token/[contract]', 'qnc', 'tokens'];
-  // Review 19.10: these pages grew when their client read answered (the holders, the directory, a block's transactions,
+  // These pages would grow when their client read answered (the holders, the directory, a block's transactions,
   // a transaction's groups, an address's notes, a token's head). The server now renders them with their routes' first
   // answers, read in-process with the visitor's headers; their loading state is the same client view with no answer,
   // which reads nothing.
@@ -303,8 +356,8 @@ test('every explorer route loads as itself: a detail page never shows the list\'
   assert.match(read('styles/explorer.css'), /^\.ex \{ min-height: 100vh; \}$/m);
   // The list's own skeleton has its final geometry: the list's own columns, the strip's frame at a card's height and
   // fifty transaction rows.
-  const loading = code('app/explorer/loading.tsx');
-  assert.match(loading, /const TX_COLUMNS = listColumns\(false\);/);
+  const loading = english('app/explorer/loading.tsx');
+  assert.match(loading, /const columns = useMemo\(\(\) => listColumns\(t, false\), \[t\]\);/);
   assert.match(loading, /<LatestBlocks seed=\{\[\]\} \/>/);
   assert.match(loading, /<DataTable className="ex-txs-tbl" title="All transactions" [^\n]*loadingRows=\{50\}/);
   assert.match(loading, /<div className="ex ex-list">/);
@@ -316,6 +369,13 @@ test('no page waits for a node: first answers come from the index, bounded and k
   const t0 = Date.now();
   assert.equal(await within(40, new Promise(() => {})), null);
   assert.ok(Date.now() - t0 < 400, 'the page goes on without an answer that never comes');
+  // A caller that needs its own word for a late answer gives it; the server keeps this one wait, no copy of its own.
+  assert.equal(await within(30, new Promise(() => {}), 'pending'), 'pending');
+  assert.equal(await within(50, Promise.resolve(7), 'pending'), 7);
+  const waits = sourceFiles().filter((f) => /\bfunction within\b|\bconst within\s*=/.test(code(f)));
+  assert.deepEqual(waits, ['lib/deadline.ts']);
+  // No wait of its own elsewhere either: beside it only the extension's request, which clears its own timer, races.
+  assert.deepEqual(sourceFiles().filter((f) => /\bPromise\.race\(/.test(code(f))).sort(), ['lib/deadline.ts', 'lib/qnet-provider.ts']);
   // No node answer in time: the balance is unknown and read again, never 0; an answer without an account is 0.
   assert.deepEqual(accountView({ answered: false }), { balance_raw: null, genesisAllocation: false, nodeUnread: true });
   assert.deepEqual(accountView({ answered: true, account: null }), { balance_raw: '0', genesisAllocation: false });
@@ -347,10 +407,20 @@ test('no page waits for a node: first answers come from the index, bounded and k
   }
 
   // The wiring: a first answer's request signal is aborted from the start, so no route waits for a node; the answer is
-  // bounded and kept a second by its path (repeated loads and tab switches cost one read); "nothing found" without the
+  // waited for 400 ms at most, inside a page's half-second budget for its first paint (a slower read is left to the
+  // client), and kept a second by its path (repeated loads and tab switches cost one read); "nothing found" without the
   // nodes is no answer, so the client asks them.
   const first = code('server/first-answer.ts');
-  assert.match(first, /export const FIRST_ANSWER_MS = 1_500;/);
+  assert.match(first, /export const FIRST_ANSWER_MS = 400;/);
+  assert.ok(repo('docs/applications/explorer.md').replace(/\s+/g, ' ').includes('a read that has not answered within 400 ms (`FIRST_ANSWER_MS`) is not waited for'), 'explorer.md');
+  // A read past the wait is the designed way of a slow index: one INFO line a minute at most, with how many came late
+  // since the one before, never a WARN for each page.
+  const late = logWindow(60_000);
+  assert.deepEqual([late(1_000), late(2_000), late(30_000), late(61_000), late(62_000), late(200_000)], [1, null, null, 3, null, 2]);
+  assert.match(first, /const lateLine = logWindow\(60_000\);/);
+  assert.match(first, /const late = lateLine\(\);\n\s*if \(late !== null\) console\.log\(`\[INFO\]\[WEB\] first_answer_late path=\$\{path\} wait_ms=\$\{FIRST_ANSWER_MS\} count=\$\{late\}`\);/);
+  assert.doesNotMatch(first, /\[WARN\]\[WEB\] first_answer_late/);
+  assert.ok(repo('docs/applications/explorer.md').replace(/\s+/g, ' ').includes('one `[INFO][WEB] first_answer_late path=… wait_ms=400 count=N` line a minute at most'), 'explorer.md');
   assert.match(first, /export const FIRST_ANSWER_KEEP_MS = 1_000;/);
   assert.match(first, /if \(hit && now - hit\.at < FIRST_ANSWER_KEEP_MS\) return hit\.answer;/);
   assert.match(first, /const answer = await within\(FIRST_ANSWER_MS, \(async \(\) => \{/);
@@ -378,9 +448,31 @@ test('no page waits for a node: first answers come from the index, bounded and k
   assert.match(route, /fetchNode\(`\/api\/v1\/account\/\$\{encodeURIComponent\(address\)\}\/tokens`, \{ deadline \}\)/);
   assert.equal([...route.matchAll(/\.\.\.accountView\(account\),/g)].length, 2);
   assert.doesNotMatch(route, /nodeBalanceRaw/);
-  const client = code('app/explorer/address/[address]/AddressClient.tsx');
+  const client = english('app/explorer/address/[address]/AddressClient.tsx');
   assert.match(client, /if \(!first \|\| initial\?\.record\?\.nodeUnread\) void fetchAddress\(\);/);
   assert.match(client, /<Readout label="Balance" value=\{system \|\| !d \|\| d\.balance_raw === null \? null : qnc\(d\.balance_raw\)\}/);
+});
+
+// A token page whose nodes cannot be read says it could not read the token, with Try again, never that there is none
+// (the route itself against stub nodes: token-route.test.mjs).
+test('the token\'s node answer: "no token" only on the node\'s own not-found; anything else unread is a failed read, kept by nothing', () => {
+  const token = { contract_address: 'c', symbol: 'TKN', decimals: 9, total_supply: '1000' };
+  assert.deepEqual(nodeTokenRead(200, { success: true, token }), { kind: 'token', token });
+  // The node's own not-found: its 404, or its answer that the contract holds no token.
+  assert.deepEqual(nodeTokenRead(404, null), { kind: 'missing' });
+  assert.deepEqual(nodeTokenRead(200, { success: false, error: 'Token not found', contract_address: 'c' }), { kind: 'missing' });
+  assert.deepEqual(nodeTokenRead(200, { success: false, error: 'Contract exists but is not a QRC-20/QRC-721 token' }), { kind: 'missing' });
+  // No node answered (fetchNode null), a node that is limiting or failing, a body that is not its answer, or the node's own
+  // failure to read its state: not known, never "no token".
+  for (const [status, body] of [[null, null], [503, { success: false }], [429, { error: 'Rate limit exceeded' }], [400, {}], [200, null], [200, 'x'],
+    [200, { success: false, error: 'Failed to query token', details: 'io' }], [200, { success: false }], [200, { success: true }], [200, { success: true, token: [] }]]) {
+    assert.deepEqual(nodeTokenRead(status, body), { kind: 'unavailable' }, `${status} ${JSON.stringify(body)}`);
+  }
+  // The page: a 503 is a read that failed (Try again), and the server's kept answer is never a failed one.
+  assert.match(code('app/explorer/token/[contract]/TokenClient.tsx'), /const NO_TOKEN = \[404, 400\];/);
+  assert.deepEqual(readRecord(503, { success: false, error: 'unavailable' }, [404, 400]), { record: null, phase: 'failed' });
+  assert.match(code('server/first-answer.ts'), /if \(res\.status < 500\) Object\.assign\(held, \{ answer: \{ status: res\.status, body \}, at: Date\.now\(\) \}\);/);
+  assert.ok(repo('docs/applications/explorer.md').replace(/\s+/g, ' ').includes('503 `{success: false, error: \'unavailable\'}` with `Cache-Control: no-store` when no node answered or a node failed'), 'explorer.md');
 });
 
 test('every entity in the explorer goes through the one EntityLink; nothing else there is a link', () => {
@@ -397,12 +489,12 @@ test('every entity in the explorer goes through the one EntityLink; nothing else
   }
   // The block page links both neighbours in words once the block is known, the next only once the chain has it, a height
   // the chain has not reached the newest block, and its producer when its address is known.
-  const blockPage = code('app/explorer/block/[hash]/BlockClient.tsx');
+  const blockPage = english('app/explorer/block/[hash]/BlockClient.tsx');
   assert.match(blockPage, /const previous = height > 0;\n\s*const next = head\.height > height;/);
   assert.match(blockPage, /\{previous && <span><span className="fog">Previous <\/span><EntityLink kind="block" value=\{height - 1\} \/><\/span>\}/);
   assert.match(blockPage, /\{next && <span><span className="fog">Next <\/span><EntityLink kind="block" value=\{height \+ 1\} \/><\/span>\}/);
-  // REAL.md 7.4: block 0 has no previous block and, until the head is known, no next one; its empty line kept no link's
-  // box, so "Next 1" arriving moved the page (CLS 0.0086). With no neighbour the line holds the link-sized slot.
+  // Block 0 has no previous block and, until the head is known, no next one: with no neighbour the line holds the
+  // link-sized slot, so "Next 1" arriving moves nothing.
   assert.match(blockPage, /const slot = <span className="ex-neigh-slot" aria-hidden="true">\{'\\u00a0'\}<\/span>;/);
   assert.match(blockPage, /\{!previous && !next && slot\}/);
   assert.match(blockPage, /if \(height !== null && !known && head\.height > 0 && height > head\.height\) \{\n\s*return <span className="ex-neigh"><span><span className="fog">Newest block <\/span><EntityLink kind="block" value=\{head\.height\} \/>/);
@@ -414,7 +506,7 @@ test('every entity in the explorer goes through the one EntityLink; nothing else
     assert.match(src, /more=\{absent \? undefined : \(/, file);
   }
   assert.match(code('app/explorer/address/[address]/AddressClient.tsx'), /\{!system && !absent && \(/);
-  assert.match(code('app/explorer/token/[contract]/TokenClient.tsx'), /title=\{absent \? 'Token' : <span className="ex-title-icon">/);
+  assert.match(english('app/explorer/token/[contract]/TokenClient.tsx'), /title=\{absent \? 'Token' : <span className="ex-title-icon">/);
   assert.match(blockPage, /href=\{producerAddress \? `\/explorer\/address\/\$\{producerAddress\}` : undefined\}/);
 });
 
@@ -426,17 +518,17 @@ test('one epoch reading for the home page, the explorer and My node: the epoch, 
   // The one component: its number links to the epoch's first block; My node gives its own label and value.
   const shared = code('components/explorer/ChainReadouts.tsx');
   assert.match(shared, /const at = epochProgress\(height\);/);
-  assert.match(shared, /sub=\{at \? endsIn\(at\.left\) : undefined\}\s*progress=\{at \? at\.done : null\}/);
+  assert.match(shared, /sub=\{at \? endsIn\(at\.left, t\) : undefined\}\s*progress=\{at \? at\.done : null\}/);
   assert.equal([...code('components/cabinet/NodeHome.tsx').matchAll(/<ThisEpoch value=/g)].length, 3);
 });
 
 test('a transaction\'s status says nothing until its record is read, then confirmed or pending', () => {
-  assert.equal(txStatusView(undefined, false), null);
-  assert.equal(txStatusView('confirmed', false), null, 'a record from this tab still being read shows no status yet');
-  assert.deepEqual(txStatusView('confirmed', true), { value: 'Confirmed', sub: 'In a block', done: true });
-  assert.deepEqual(txStatusView('pending', true), { value: 'Pending', sub: 'Waiting for a block', done: false });
-  const page = code('app/explorer/tx/[hash]/TransactionClient.tsx');
-  assert.match(page, /const status = txStatusView\(tx\?\.status, tx !== null && phase === 'ready'\);/);
+  assert.equal(txStatusView(undefined, false, EN), null);
+  assert.equal(txStatusView('confirmed', false, EN), null, 'a record from this tab still being read shows no status yet');
+  assert.deepEqual(txStatusView('confirmed', true, EN), { value: 'Confirmed', sub: 'In a block', done: true });
+  assert.deepEqual(txStatusView('pending', true, EN), { value: 'Pending', sub: 'Waiting for a block', done: false });
+  const page = english('app/explorer/tx/[hash]/TransactionClient.tsx');
+  assert.match(page, /const status = txStatusView\(tx\?\.status, tx !== null && phase === 'ready', t\);/);
   assert.match(page, /<Readout label="Status" value=\{status\?\.value \?\? null\} sub=\{status\?\.sub\} \/>/);
   assert.match(page, /\{status && <Status tone=\{status\.done \? 'done' : 'quiet'\}>\{status\.value\}<\/Status>\}/);
   assert.doesNotMatch(page, /Waiting for a block/);
@@ -444,7 +536,7 @@ test('a transaction\'s status says nothing until its record is read, then confir
 
 test('the home page\'s live blocks age by the page\'s one clock, held while out of view or during the headline\'s decode', () => {
   const home = code('app/HomeClient.tsx');
-  assert.match(home, /<span className="blk-age">\{b\.timestamp \? <Ago ts=\{b\.timestamp\} on=\{near && active\} \/> : '—'\}<\/span>/);
+  assert.match(home, /<span className="blk-age" style=\{ageBox\}>\{b\.timestamp \? <Ago ts=\{b\.timestamp\} on=\{near && active\} \/> : '—'\}<\/span>/);
   assert.doesNotMatch(home, /setInterval|setNow/);
   const ago = code('components/explorer/Ago.tsx');
   assert.match(ago, /export function useClock\(on = true\): void \{\n\s*useSyncExternalStore\(on \? subscribe : still, current, onServer\);/);
@@ -455,30 +547,31 @@ test('named groups and named Copy acts: a reader hears which readings, which row
   assert.match(code('components/ui/Readouts.tsx'), /<div className="readouts" role=\{label \? 'group' : undefined\} data-size=\{size\} aria-label=\{label\}/);
   const detail = code('components/explorer/Detail.tsx');
   assert.match(detail, /return <div role="group" aria-label=\{label\}><dl className="kv">\{children\}<\/dl><\/div>;/);
-  assert.match(detail, /<Copy value=\{value\} ariaLabel=\{`Copy \$\{label\}`\} \/>/);
-  assert.match(detail, /<Copy value=\{value\} ariaLabel=\{`Copy \$\{name\}`\} \/>/);
+  assert.match(detail, /<Copy value=\{value\} ariaLabel=\{t\('copy_named', \{ name: label \}\)\} \/>/);
+  assert.match(detail, /<Copy value=\{value\} ariaLabel=\{t\('copy_named', \{ name \}\)\} \/>/);
+  assert.equal(TEXTS.copy_named, 'Copy {name}');
   assert.doesNotMatch(detail, /HashValue/);
   const copy = code('components/ui/Copy.tsx');
-  assert.match(copy, /aria-label=\{ariaLabel \?\? label\}/);
-  assert.match(code('components/ui/EntityLink.tsx'), /<Copy value=\{raw\} ariaLabel=\{`Copy \$\{copyName \?\? COPIES\[kind\]\}`\} \/>/);
+  assert.match(copy, /aria-label=\{ariaLabel \?\? shownLabel\}/);
+  assert.match(code('components/ui/EntityLink.tsx'), /<Copy value=\{raw\} ariaLabel=\{copyName \? t\('copy_named', \{ name: copyName \}\) : t\(COPIES\[kind\]\)\} \/>/);
   // Where one kind repeats on a page, each Copy is named by its row.
-  const tx = code('app/explorer/tx/[hash]/TransactionClient.tsx');
+  const tx = english('app/explorer/tx/[hash]/TransactionClient.tsx');
   const names = [...tx.matchAll(/<Party [^>]*copyName="([^"]+)"/g)].map((m) => m[1]);
   assert.deepEqual(names, ['from address', 'to address', 'recipient address']);
   assert.match(code('components/explorer/cells.tsx'), /<EntityLink kind="address" value=\{value as string\} full=\{whole\} copy=\{whole\} copyName=\{copyName\} \/>/);
-  assert.match(code('app/explorer/block/[hash]/BlockClient.tsx'), /<EntityLink kind="block" value=\{b\.previous_hash\} copy copyName="previous block hash" \/>/);
+  assert.match(english('app/explorer/block/[hash]/BlockClient.tsx'), /<EntityLink kind="block" value=\{b\.previous_hash\} copy copyName="previous block hash" \/>/);
   // The block page's five hashes each have a Copy of their own name; every whole value under a title names its kind.
-  const block = code('app/explorer/block/[hash]/BlockClient.tsx');
+  const block = english('app/explorer/block/[hash]/BlockClient.tsx');
   for (const label of ['Merkle root', 'State root', 'VTS hash', 'Signature', 'QRB output']) assert.match(block, new RegExp(`<HashRow label="${label}" value=`), label);
   for (const file of ['app/explorer/block/[hash]/BlockClient.tsx', 'app/explorer/tx/[hash]/TransactionClient.tsx', 'app/explorer/address/[address]/AddressClient.tsx', 'app/explorer/token/[contract]/TokenClient.tsx']) {
-    const src = code(file);
+    const src = english(file);
     const wholes = [...src.matchAll(/<Whole [^>]*>/g)].map((m) => m[0]);
     assert.ok(wholes.length > 0, file);
     for (const w of wholes) assert.match(w, / name="[a-z ]+"/, `${file}: ${w}`);
   }
 });
 
-// B-SPEC 4.4, 5.11, 12.1: the live blocks show each block's producer and transaction count. The head snapshot reads the
+// The live blocks show each block's producer and transaction count. The head snapshot reads the
 // newest 14 blocks once per head (one bounded query), the head event names the head block's, and every live list (the
 // home page's column and ticker, Latest blocks, the Last block readout) shows them; each height and each producer whose
 // address the index knows is a link.
@@ -503,7 +596,7 @@ test('the live blocks carry their producer and transaction count, from one read 
   const filled = fillBlocks(waiting, read, 12);
   assert.deepEqual([filled[0].producer, filled[0].txCount], ['genesis_node_003', 0]);
   assert.equal(blocksMissing(filled, 12), false);
-  assert.deepEqual([txCountText(1), txCountText(0), txCountText(1234), txCountText(null)], ['1 tx', '0 txs', '1,234 txs', '—']);
+  assert.deepEqual([txCountText(1, EN), txCountText(0, EN), txCountText(1234, EN), txCountText(null, EN)], ['1 tx', '0 txs', '1,234 txs', '—']);
   // The server: one narrow, bounded read of the newest blocks in each head refresh; the head event and /api/head share one
   // shape with the head block's facts; /api/blocks and the pages read the snapshot and query nothing themselves.
   const db = code('../lib/db.ts');
@@ -523,13 +616,14 @@ test('the live blocks carry their producer and transaction count, from one read 
   // not known yet stays empty, never a dash.
   const latest = code('components/explorer/LatestBlocks.tsx');
   assert.match(latest, /<span className="ent-fit">\{b\.producer \? <EntityLink kind="node" value=\{b\.producer\} address=\{b\.producerAddress\} \/> : null\}<\/span>/);
-  assert.match(latest, /<span>\{b\.txCount !== null \? txCountText\(b\.txCount\) : null\}<\/span>/);
+  assert.match(latest, /<span>\{b\.txCount !== null \? txCountText\(b\.txCount, t\) : null\}<\/span>/);
   const home = code('app/HomeClient.tsx');
-  assert.match(home, /<span className="blk-txs">\{txCountText\(b\.txCount\)\}<\/span>/);
+  assert.match(home, /<span className="blk-txs">\{txCountText\(b\.txCount, t\)\}<\/span>/);
   assert.match(home, /\{b\.producer \? <EntityLink kind="node" value=\{b\.producer\} address=\{b\.producerAddress\} \/> : <span>—<\/span>\}/);
-  assert.match(code('components/explorer/NetworkReadouts.tsx'), /const by = block \? <>By <EntityLink kind="node" value=\{block\.producer\} address=\{block\.producerAddress\} \/><\/> : 'Since the newest block';/);
-  // A node id links to its address page only when the index knows the address; otherwise it is text (B-SPEC 5.7).
+  assert.match(code('components/explorer/NetworkReadouts.tsx'), /const by = block \? rich\('ro_last_block_by', \{ node: <EntityLink kind="node" value=\{block\.producer\} address=\{block\.producerAddress\} \/> \}\) : t\('ro_last_block_since'\);/);
+  assert.equal(TEXTS.ro_last_block_by, 'By {node}');
+  // A node id links to its address page only when the index knows the address; otherwise it is text.
   const { entity } = await import('../entity.ts');
-  assert.equal(entity('node', 'genesis_node_003', { address: ADDRESS }).href, `/explorer/address/${ADDRESS}`);
-  assert.equal(entity('node', 'genesis_node_003', { address: null }).href, null);
+  assert.equal(entity('node', 'genesis_node_003', EN, { address: ADDRESS }).href, `/explorer/address/${ADDRESS}`);
+  assert.equal(entity('node', 'genesis_node_003', EN, { address: null }).href, null);
 });

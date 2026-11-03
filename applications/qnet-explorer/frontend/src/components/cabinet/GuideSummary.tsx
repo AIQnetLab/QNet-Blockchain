@@ -4,20 +4,23 @@
 // the header's Docs menu too).
 
 import Action from '@/components/ui/Action';
-import { t, type MessageKey } from '@/lib/texts';
+import { type MessageKey } from '@/lib/texts';
 import { SHORT_COMPUTER, SHORT_PHONE, SHORT_SUPER } from '@/lib/cabinet/guide';
 import { GUIDE_HREF } from '@/lib/cabinet/tabs';
+import { useI18n } from '@/i18n/client';
 
 function Way({ title, steps, closed }: { title: MessageKey; steps: MessageKey[]; closed?: MessageKey }) {
+  const { say } = useI18n();
   return (
     <details className="cab-guide">
-      <summary className="cab-guide-t">{t(title)}</summary>
-      {closed ? <p className="note">{t(closed)}</p> : <ol>{steps.map((step) => <li key={step}>{t(step)}</li>)}</ol>}
+      <summary className="cab-guide-t">{say(title)}</summary>
+      {closed ? <p className="note">{say(closed)}</p> : <ol>{steps.map((step) => <li key={step}>{say(step)}</li>)}</ol>}
     </details>
   );
 }
 
 export default function GuideSummary({ phoneFlows }: { phoneFlows: boolean }) {
+  const { t } = useI18n();
   return (
     <aside className="cab-guides" aria-labelledby="guide-short-heading">
       <h2 className="label" id="guide-short-heading">{t('guide_title')}</h2>

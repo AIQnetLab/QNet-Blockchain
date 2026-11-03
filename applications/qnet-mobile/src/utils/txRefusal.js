@@ -5,6 +5,8 @@ import { errorKey, errorText } from '../i18n';
 // The refusals the wallet knows, by the words the nodes use for them; the first that matches names the class.
 const CLASSES = [
   ['key', /pk_unresolved/i],
+  // Its last height passed, or did not fit, after the one re-sign the wallet makes (WalletManager _signAndSubmit).
+  ['expired', /\btx_expired\b|\btx_expiry_beyond_horizon\b/i],
   ['rate', /rate.?limit|too many requests|HTTP 429/i],
   ['busy', /mempool (is )?full|busy|unavailable|temporar|HTTP 5\d\d/i],
   ['balance', /insufficient (balance|funds)|not enough (balance|funds)/i],
@@ -12,11 +14,14 @@ const CLASSES = [
 ];
 // Each class's words.
 const REASON = {
-  key: 'tx_refusal_key', rate: 'tx_refusal_rate', busy: 'tx_refusal_busy', balance: 'tx_refusal_balance',
-  nonce: 'tx_refusal_nonce', other: 'tx_refusal_other',
+  key: 'tx_refusal_key', expired: 'tx_refusal_expired', rate: 'tx_refusal_rate', busy: 'tx_refusal_busy',
+  balance: 'tx_refusal_balance', nonce: 'tx_refusal_nonce', other: 'tx_refusal_other',
 };
 
-/** The class of a node's refusal: 'key', 'rate', 'busy', 'balance', 'nonce', or 'other'; null when there is none. */
+/**
+ * The class of a node's refusal: 'key', 'expired', 'rate', 'busy', 'balance', 'nonce', or 'other'; null when there is
+ * none.
+ */
 export function refusalClass(raw) {
   const s = typeof raw === 'string' ? raw : (raw && typeof raw.message === 'string' ? raw.message : '');
   if (!s.trim()) return null;

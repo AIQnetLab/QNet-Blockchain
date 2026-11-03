@@ -15,28 +15,10 @@ const mockLIGHT = 'light_mobile_1111222233334444';
 const mockState = {};
 
 jest.mock('../src/components/WalletManager', () => {
-  class VaultCorruptError extends Error {}
-  const words = 'abandon ability able about above absent absorb abstract absurd abuse access accident'.split(' ');
-  class FakeWalletManager {
-    constructor() {
-      return new Proxy(this, {
-        get: (target, prop) => {
-          if (prop in target || typeof prop === 'symbol' || prop === 'then') return target[prop];
-          return async () => null;
-        },
-      });
-    }
-    async prepareInstall() {}
-    async vaultState() { return 'sealed'; }
-    async isBiometricEnabled() { return false; }
-    async isBiometricSupported() { return false; }
-    async getPasswordLockStatus() { return { locked: false }; }
-    async unlockWithPassword() { return { ok: true, token: 'session-token' }; }
-    async checkPassword() { return { ok: true }; }
-    async loadWallet() { return { address: mockSOL, solanaAddress: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
-    getBIP39WordList() { return words; }
-    getTrustedNodes() { return ['https://node1.aiqnet.io']; }
-    trustedNodeUrl() { return 'https://node1.aiqnet.io'; }
+  const { fakeWalletManager, walletManagerModule } = require('../test-support/walletMocks');
+  class FakeWalletManager extends fakeWalletManager({
+    qnet: mockQNET, sol: mockSOL, light: mockLIGHT, superNode: 'super_node_5555666677778888', nodes: ['https://node1.aiqnet.io'],
+  }) {
     async getQNCBalanceWithProof() { return { ok: true, balance: 1, balanceNano: '1000000000', verified: true }; }
     // The send check's read (the live figure less this wallet's own unsettled spends): the same figure.
     async qncForSend() { return { ok: true, balanceNano: '1000000000', nonce: '4', pending: [] }; }
@@ -52,20 +34,9 @@ jest.mock('../src/components/WalletManager', () => {
     async getTokenHoldings() { mockState.tokenReads += 1; return []; }
     // The kept transactions' sweep (the one now due sent again): counted.
     async sendDuePending() { mockState.keptSweeps += 1; return false; }
-    async loadNodeRecord() { return null; }
-    async saveNodeRecord() {}
     async confirmServerNode() { return null; }
-    async deviceAuthAvailable() { return false; }
-    generateQNetAddressFromSolana() { return mockQNET; }
-    generateLightNodePseudonym() { return mockLIGHT; }
-    generateSuperNodePseudonym() { return 'super_node_5555666677778888'; }
-    sessionOpen() { return true; }
-    closeSession() {}
   }
-  FakeWalletManager.MIN_PASSWORD_LENGTH = 8;
-  FakeWalletManager.publicWallet = (w) => ({ ...w });
-  FakeWalletManager.canonicalAddress = (a) => a;
-  return { __esModule: true, default: FakeWalletManager, WalletManager: FakeWalletManager, VaultCorruptError };
+  return walletManagerModule(FakeWalletManager);
 });
 
 jest.mock('../src/services/LightNode', () => ({
@@ -89,32 +60,9 @@ jest.mock('../src/services/BackgroundPriority', () => ({
   openBackgroundSettings: jest.fn(async () => true),
 }));
 
-jest.mock('../src/services/PushService', () => ({
-  readUnconfirmedBinding: jest.fn(async () => null),
-  settleUnconfirmedBinding: jest.fn(async () => false),
-  LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
-  readdressIfOwed: jest.fn(async () => false),
+jest.mock('../src/services/PushService', () => require('../test-support/walletMocks').pushServiceModule({
   localBinding: jest.fn(async () => mockState.local),
-  forgetIfReplaced: jest.fn(async () => false),
-  signStatusWithPingKey: jest.fn(async () => null),
-  stopLightNode: jest.fn(async () => ({ unbound: true })),
-  bindThisDevice: jest.fn(async () => ({ ok: true })),
-  selfAttestIfNeeded: jest.fn(async () => false),
-  checkServerNodeStatus: jest.fn(async () => ({ success: false, error: 'network' })),
-  getAllNodesByWallet: jest.fn(async () => ({ success: true, nodes: [] })),
-  getWalletNodeEvents: jest.fn(async () => ({ success: true, nodes: [] })),
-  getNodeEpochs: jest.fn(async () => null),
   getPendingRewards: jest.fn(async () => ({ success: true, pendingRewards: 2e9 })),
-  refreshFcmTokenOnServer: jest.fn(async () => ({})),
-  isTokenRefreshNeeded: jest.fn(async () => false),
-  teardownLightNode: jest.fn(async () => {}),
-  teardownLightNodeIfForeign: jest.fn(async () => {}),
-  resendPendingBinding: jest.fn(async () => false),
-  enrolAgainIfUnleased: jest.fn(async () => false),
-  nodeCheckState: jest.fn(async () => null),
-  endExpiredLink: jest.fn(async () => false),
-  settleUnansweredKey: jest.fn(async () => null),
-  refreshLeaseFromTab: jest.fn(async () => false),
 }));
 
 jest.mock('../src/services/NodeRecordRead', () => ({
@@ -128,7 +76,6 @@ jest.mock('react-native-qrcode-svg', () => {
 });
 jest.mock('../src/services/QNetLink', () => ({
   parseLink: jest.fn(() => null),
-  takeInitialUrl: jest.fn(async () => null),
   openSession: jest.fn(), prepareOffer: jest.fn(), performIntent: jest.fn(), deliverAnswer: jest.fn(), markHandled: jest.fn(),
   LinkRefusal: class LinkRefusal extends Error {},
 }));
@@ -159,9 +106,8 @@ FakeSocket.CONNECTING = 0;
 FakeSocket.OPEN = 1;
 FakeSocket.all = [];
 
-const flush = async (n = 4) => { for (let i = 0; i < n; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
-const texts = (tree) => tree.root.findAllByType(Text)
-  .map((n) => [].concat(n.props.children).flat(Infinity).filter((c) => typeof c === 'string').join('')).join('\n');
+const { flush, texts } = require('../test-support/screen');
+
 const press = async (tree, testID) => {
   await act(async () => { tree.root.find((n) => n.props.testID === testID && typeof n.props.onPress === 'function').props.onPress(); });
   await flush(8);
@@ -502,6 +448,49 @@ describe('the tabs\' reads', () => {
     expect(intervals.mock.calls.slice(marked).filter((c) => (c[1] === 10000 || c[1] === 15000) && c[0].name !== 'sweep')).toEqual([]);
   });
 
+  // Opening the tab while a read runs, tapping it again or its poll firing meanwhile never asks the explorer and the
+  // nodes a second time side by side.
+  it('History reads once per opening: a read asked while one runs joins it, a fresh one after a background read follows it', async () => {
+    const tree = await unlocked();
+    const explorer = () => fetched.filter((u) => u.includes('/api/address/')).length;
+    const nodeRows = () => fetched.filter((u) => u.includes(`/api/v1/account/${mockQNET}/transactions`)).length;
+    // Answers held until released, so a read stays in flight.
+    let held = [];
+    const hold = (match) => {
+      global.fetch = jest.fn(async (url) => {
+        fetched.push(String(url));
+        if (match(String(url))) await new Promise((r) => { held.push(r); });
+        throw new Error('offline in tests');
+      });
+    };
+    const release = async () => { const all = held; held = []; all.forEach((r) => r()); await flush(8); };
+    hold((u) => u.includes('/api/address/'));
+    const mark = timeouts.mock.calls.length;
+    const before = explorer();
+    await press(tree, 'tab-history');
+    expect(explorer()).toBe(before + 1);
+    const rows = nodeRows();
+    // Tapped again while it runs: the same read, nothing asked twice.
+    await press(tree, 'tab-history');
+    expect([explorer(), nodeRows()]).toEqual([before + 1, rows]);
+    await release();
+    // The poll's background read in flight (the node's newest rows held), then a fresh one asked: it waits for it.
+    hold((u) => u.includes('/transactions?limit='));
+    await fire([...waits(30000, mark)].pop());
+    await flush(4);
+    expect(nodeRows()).toBe(rows + 1);
+    await press(tree, 'tab-history');
+    expect(explorer()).toBe(before + 1);
+    await release();
+    expect(explorer()).toBe(before + 2);
+    await release();
+    // Opened again later: read again.
+    await press(tree, 'tab-assets');
+    await press(tree, 'tab-history');
+    expect(explorer()).toBe(before + 3);
+    await release();
+  });
+
   // Before, the 15 s read and the balance read every 30 s each read anew: three live reads or more in 30 s on an open
   // Assets, on the genesis nodes alone.
   it('an open Assets asks for the live figure twice in 30 s, whichever of its two timers fires first', async () => {
@@ -544,5 +533,48 @@ describe('the tabs\' reads', () => {
     expect(texts(tree)).toContain(t('node_background_restricted'));
     await press(tree, 'node-background');
     expect(Bg.openBackgroundSettings).toHaveBeenCalledTimes(1);
+  });
+
+  // The registrations sent after a consent, kept when the app ended before the route took them
+  // (services/RegistrationSubmit), go again from the open wallet whichever tab it opens on, another wallet's on this
+  // device too; with none kept, Assets reads no node status.
+  it('registrations kept across a restart go again from the open wallet on Assets, each wallet\'s; with none kept nothing is read', async () => {
+    const LightNode = require('../src/services/LightNode');
+    const { b64url, lightNodeId } = require('../src/crypto/NodePreimages');
+    const register = () => fetched.filter((u) => u === 'https://aiqnet.io/api/cabinet/register').length;
+    let tree = await unlocked();
+    expect([LightNode.readNodeStatus.mock.calls.length, register()]).toEqual([0, 0]);
+    await act(async () => { tree.unmount(); });
+    mounted.splice(mounted.indexOf(tree), 1);
+    // The new process: the job on the device, the chain not listing the node, the route taking the body.
+    const Manager = require('../src/components/WalletManager').default;
+    const id = jest.spyOn(Manager.prototype, 'generateLightNodePseudonym').mockReturnValue(lightNodeId(mockQNET));
+    const consent = { ts: String(Math.floor(Date.now() / 1000)), pk: b64url(new Uint8Array(1952).fill(7)), sig: b64url(new Uint8Array(3309).fill(9)) };
+    const burnTx = '3iZJZvXPL1uMy6yKz56wub9nCsgSNfrMZ5uEi4JMXn3wQnSPcwMorZtyFm1KkSzSQD8RJy4bkiuXo4NrzX4se5SD';
+    // This wallet's job, and one another wallet on the device left.
+    const other = '006a5c220ca2fa77021eon2b5c6703999066d5411e2ff';
+    for (const qnet of [mockQNET, other]) {
+      await AsyncStorage.setItem(`qnet_registration_submit:${lightNodeId(qnet)}`, JSON.stringify({
+        qnet, burnTx, consent, until: Date.now() + 3600_000, burnAmount: 1500,
+      }));
+    }
+    mockState.local = null;
+    mockState.lightStatus = { ...mockState.lightStatus, onChain: false, deviceBound: false };
+    global.fetch = jest.fn(async (url) => {
+      fetched.push(String(url));
+      if (String(url).endsWith('/api/cabinet/register')) return { status: 200, json: async () => ({ result: 'admitted', txHash: 'a'.repeat(64) }) };
+      throw new Error('offline in tests');
+    });
+    tree = await unlocked();
+    await flush(8);
+    expect(texts(tree)).not.toContain(t('node_background_restricted')); // Assets, not the Node tab
+    expect(register()).toBe(2);
+    expect(LightNode.readNodeStatus.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining([lightNodeId(mockQNET), lightNodeId(other)]));
+    // Taken into the pool: kept until a status read shows the node on the chain.
+    for (const qnet of [mockQNET, other]) {
+      expect(JSON.parse(await AsyncStorage.getItem(`qnet_registration_submit:${lightNodeId(qnet)}`)))
+        .toMatchObject({ qnet, burnTx, admittedAt: expect.any(Number) });
+    }
+    id.mockRestore();
   });
 });

@@ -18,9 +18,12 @@ register('./helpers/chains-activation-loader.mjs', import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => JSON.parse(readFileSync(path.join(HERE, 'fixtures', name), 'utf8'));
 const core = await import('../dist/lib/qnet-core.js');
-const { SOLANA, LIMITS } = await import('../dist/background/config.js');
+const { SITE_HEADERS, SOLANA, LIMITS } = await import('../dist/background/config.js');
 const { WalletError } = await import('../dist/background/errors.js');
-const { WALLET, installEnv, installFetch, solanaRoute, routes, fakeSignature } = await import('./helpers/chains-activation-env.mjs');
+const {
+  WALLET, RELAY_URL, installEnv, installFetch, solanaRoute, relayRoute, solanaCallOf, unreachableEndpoint, routes, fakeSignature,
+  freshSolana,
+} = await import('./helpers/chains-activation-env.mjs');
 const { importApp } = await import('./helpers/app-modules.mjs');
 const solana = await import('../dist/background/solana.js');
 
@@ -779,12 +782,14 @@ describe('chains-activation solana: rpc', () => {
   it('a request error is final and carries its JSON-RPC code; exhausted retries are SOLANA_UNAVAILABLE', async () => {
     installFetch(async () => ({ body: { jsonrpc: '2.0', id: 1, error: { code: -32602, message: 'bad' } } }));
     await assert.rejects(solana.rpc('getSlot', [], { backoffMs: 1 }), (e) => e.code === 'SOLANA_UNAVAILABLE' && e.rpcCode === -32602);
+    installFetch(async () => ({ status: 200, body: 'not json' }));
+    await rejectsWith(solana.rpc('getSlot', [], { backoffMs: 1 }), 'SOLANA_UNAVAILABLE');
+    // neither the endpoint nor the relay answering
+    const offline = await freshSolana();
     installFetch(async () => {
       throw new TypeError('network down');
     });
-    await rejectsWith(solana.rpc('getSlot', [], { backoffMs: 1 }), 'SOLANA_UNAVAILABLE');
-    installFetch(async () => ({ status: 200, body: 'not json' }));
-    await rejectsWith(solana.rpc('getSlot', [], { backoffMs: 1 }), 'SOLANA_UNAVAILABLE');
+    await rejectsWith(offline.rpc('getSlot', [], { backoffMs: 1 }), 'SOLANA_UNAVAILABLE');
   });
 });
 
@@ -971,6 +976,47 @@ describe('chains-activation solana: quote and send', () => {
   });
 });
 
+// A network where the endpoint gives no answer at all (decision 56): the calls go through aiqnet.io's relay, which passes
+// each one on unchanged; each test runs a worker of its own.
+describe('chains-activation solana: a send through aiqnet.io\'s relay', () => {
+  const sol = { asset: 'sol', to: OTHER, amount: '0.01', expectedFeeLamports: '5000', expectedRentLamports: '0' };
+
+  it('quotes, simulates and sends through the relay, the signed bytes as they are, while the endpoint gives no answer', async () => {
+    installEnv();
+    const worker = await freshSolana();
+    const net = devnet();
+    const requests = installFetch(routes(unreachableEndpoint, relayRoute(net.methods)));
+    assert.equal((await worker.quote({ asset: 'sol', to: OTHER, amount: '0.01' })).feeLamports, '5000');
+    const result = await worker.send(sol);
+    assert.equal(net.seen.simulated.length, 1);
+    assert.equal(net.seen.simulated[0].options.sigVerify, true);
+    assert.deepEqual(net.seen.sent.map((s) => s.b64), [net.seen.simulated[0].b64]);
+    const tx = decodeWire(core.base64Decode(net.seen.sent[0].b64));
+    assert.equal(core.verifySolanaSignature(tx.signatures[0], tx.message, WALLET.solanaPublicKey), true);
+    assert.equal(result.status, 'confirmed');
+    // only the quote's first reads tried the endpoint; nothing signed ever went there
+    const direct = requests.filter((r) => SOLANA.RPC_URLS.includes(r.url)).map(solanaCallOf);
+    assert.ok(direct.length >= 1 && direct.every((method) => !['simulateTransaction', 'sendTransaction'].includes(method)), direct.join());
+    assert.ok(requests.filter((r) => r.url === RELAY_URL).every((r) => r.headers['x-qnet-client'] === SITE_HEADERS['x-qnet-client']));
+  });
+
+  it('a refusal through the relay keeps its JSON-RPC code: a preflight refusal is SIMULATION_FAILED, another SOLANA_UNAVAILABLE', async () => {
+    for (const [code, expected] of [[-32002, 'SIMULATION_FAILED'], [-32602, 'SOLANA_UNAVAILABLE']]) {
+      installEnv();
+      const worker = await freshSolana();
+      const net = devnet();
+      net.methods.sendTransaction = ([b64]) => {
+        net.seen.sent.push({ b64 });
+        return { rpcError: { code, message: 'Transaction simulation failed: Blockhash not found' } };
+      };
+      net.methods.getSignatureStatuses = () => ({ context: { slot: 1 }, value: [null] });
+      installFetch(routes(unreachableEndpoint, relayRoute(net.methods)));
+      await rejectsWith(worker.send(sol), expected);
+      assert.equal(net.seen.sent.length, 1, `${code}: one send, refused before it was forwarded`);
+    }
+  });
+});
+
 describe('chains-activation solana: sendAndConfirm', () => {
   const signed = async () => {
     installEnv();
@@ -1014,28 +1060,50 @@ describe('chains-activation solana: sendAndConfirm', () => {
 
   it('a refusal after an attempt whose answer was lost is uncertain: polled, never "cannot land"', async () => {
     const { transaction, signature } = await signed();
+    const worker = await freshSolana();
     const net = devnet();
     let sends = 0;
     net.methods.getSignatureStatuses = () => ({ context: { slot: 1 }, value: [null] });
-    installFetch(routes(async (r) => {
+    const requests = installFetch(routes(async (r) => {
       if (JSON.parse(r.body).method !== 'sendTransaction') return undefined;
       sends++;
       if (sends === 1) throw new TypeError('connection reset');
       return { body: { jsonrpc: '2.0', id: 1, error: { code: -32002, message: 'Transaction simulation failed: AlreadyProcessed' } } };
-    }, solanaRoute(net.methods)));
-    assert.deepEqual(await solana.sendAndConfirm(transaction, { timeoutMs: 50 }), { signature, status: 'pending' });
+    }, solanaRoute(net.methods), relayRoute(net.methods)));
+    assert.deepEqual(await worker.sendAndConfirm(transaction, { timeoutMs: 50 }), { signature, status: 'pending' });
     assert.equal(sends, 2);
+    // the endpoint's answer was lost, so the same signed bytes went again through the relay
+    const sent = requests.filter((r) => solanaCallOf(r) === 'sendTransaction');
+    assert.deepEqual(sent.map((r) => r.url), [SOLANA.RPC_URLS[0], RELAY_URL]);
+    assert.equal(sent[1].body, sent[0].body);
+  });
+
+  it('on the relay route a relay with no usable answer hands the send to the endpoint at once, the same signed bytes', async () => {
+    const { transaction, signature } = await signed();
+    const worker = await freshSolana();
+    const net = devnet({ status: 'finalized' });
+    // a call nobody answered on the endpoint puts this worker on the relay route
+    installFetch(routes(unreachableEndpoint, relayRoute(net.methods)));
+    await worker.rpc('getLatestBlockhash', [{ commitment: 'confirmed' }]);
+    const requests = installFetch(routes((r) => (r.url === RELAY_URL ? { status: 503, body: { error: 'unavailable' } } : undefined),
+      solanaRoute(net.methods)));
+    assert.deepEqual(await worker.sendAndConfirm(transaction, { timeoutMs: 1000 }), { signature, status: 'finalized' });
+    const sent = requests.filter((r) => solanaCallOf(r) === 'sendTransaction');
+    assert.deepEqual(sent.map((r) => r.url), [RELAY_URL, SOLANA.RPC_URLS[0]]);
+    assert.equal(sent[1].body, sent[0].body);
+    assert.equal(net.seen.sent.length, 1);
   });
 
   it('a send nobody answered is polled, and ends pending at the deadline', async () => {
     const { transaction, signature } = await signed();
+    const worker = await freshSolana();
     const net = devnet();
     net.methods.getSignatureStatuses = () => ({ context: { slot: 1 }, value: [null] });
     installFetch(routes(async (r) => {
       if (JSON.parse(r.body).method === 'sendTransaction') throw new TypeError('connection reset');
       return undefined;
-    }, solanaRoute(net.methods)));
-    assert.deepEqual(await solana.sendAndConfirm(transaction, { timeoutMs: 50 }), { signature, status: 'pending' });
+    }, solanaRoute(net.methods), relayRoute(net.methods)));
+    assert.deepEqual(await worker.sendAndConfirm(transaction, { timeoutMs: 50 }), { signature, status: 'pending' });
   });
 
   it('signatureStatus maps the ledger status', async () => {
@@ -1353,6 +1421,40 @@ describe('chains-activation solana: send transaction bytes (independent vectors)
       }
     }
     assert.equal(shapes, 27);
+  });
+
+  // The relay vectors (docs/protocols/solana-relay.vectors.json): the transactions aiqnet.io's relay takes (decision 56);
+  // the site's own test reads the same file. The burn is compiled from its two instructions, in the client order.
+  it('builds each of its sends and burns in the relay vectors byte for byte', () => {
+    const vectors = JSON.parse(readFileSync(path.join(HERE, '../../../docs/protocols/solana-relay.vectors.json'), 'utf8'));
+    const { recentBlockhash, oneDevMint } = vectors.constants;
+    assert.equal(oneDevMint, MINT);
+    const ours = vectors.cases.filter((c) => c.builders.includes('extension'));
+    assert.deepEqual(ours.map((c) => (c.burn ? 'burn' : c.transfer.asset)).sort(), [...Array(5).fill('1dev'), 'burn', 'burn', ...Array(4).fill('sol')]);
+    for (const c of ours) {
+      let message;
+      if (c.burn) {
+        const { owner, nodeType, amountWhole } = c.burn;
+        message = solana.compileLegacyMessage({
+          feePayer: owner,
+          recentBlockhash,
+          instructions: [
+            solana.burnInstruction({ account: core.associatedTokenAddress(owner, MINT), mint: MINT, authority: owner, amount: BigInt(amountWhole) * 1_000_000n }),
+            solana.memoInstruction({ text: SOLANA.NODE_TYPE_MEMO[nodeType], signer: owner }),
+          ],
+        });
+      } else {
+        const t = c.transfer;
+        const token = t.asset !== 'sol';
+        message = solana.transferMessage({
+          owner: t.from, to: t.to, mint: token ? MINT : null, amountRaw: BigInt(t.amount), decimals: token ? 6 : 9,
+          createAccount: token && t.createAccount, references: t.references, memo: t.memo, recentBlockhash,
+        });
+      }
+      assert.equal(Buffer.from(message).toString('hex'), c.message, c.name);
+      const wire = Uint8Array.from(Buffer.from(c.transaction, 'base64'));
+      assert.deepEqual(solana.serializeTransaction(message, [wire.subarray(1, 65)]), wire, c.name);
+    }
   });
 
   it('a send is only ever a transfer with exactly its request\'s references and memo: anything else is refused before it is compiled', () => {
@@ -1736,7 +1838,7 @@ describe('chains-activation solana: history', () => {
     // a page the session's view cache holds is not read again after a worker restart either
     const env = installEnv();
     env.views.solanaHistory = { items: first.items, cursor: first.cursor };
-    const fresh = await import(`../dist/background/solana.js?restart=${Date.now()}`);
+    const fresh = await freshSolana();
     const again = chain();
     installFetch(solanaRoute(again.methods));
     assert.deepEqual((await fresh.getHistory({ limit: 2 })).items.map((item) => item.signature), [S3, S2]);

@@ -7,16 +7,30 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { IN_APP_EXCLUDED_PAGES, IN_APP_HOME, IN_APP_NAV } from '../activate-view.ts';
-import { TEXTS } from '../texts.ts';
+import { EN, TEXTS, english } from './texts-helper.mjs';
+import { SRC, code as sourceCode } from './source.mjs';
 
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8')
-  .replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1').replace(/\{\s*\}/g, '');
+// The code without the empty braces a comment in JSX leaves.
+const code = (path) => sourceCode(path).replace(/\{\s*\}/g, '');
 
-// The source as the app's view renders it: imports dropped, and every `{full && …}` block (shown only
-// outside that view) removed, braces matched.
+// The source as the app's view renders it: imports dropped, every `{full && …}` block (shown only outside that view)
+// removed, braces matched, and every `full ? a : b` read as its `b`.
 function inAppView(src) {
   let out = src.replace(/^import .*$/gm, '');
+  for (;;) {
+    const at = out.indexOf('full ? ');
+    if (at < 0) break;
+    let depth = 0;
+    let end = at + 'full ? '.length;
+    for (; end < out.length; end++) {
+      const c = out[end];
+      if ('({['.includes(c)) depth++;
+      else if (')}]'.includes(c)) depth--;
+      else if (depth === 0 && out.startsWith(' : ', end)) break;
+    }
+    assert.ok(end < out.length, 'balanced condition');
+    out = out.slice(0, at) + out.slice(end + 3);
+  }
   for (;;) {
     const at = out.indexOf('{full && ');
     if (at < 0) return out;
@@ -31,16 +45,16 @@ function inAppView(src) {
   }
 }
 
-// The view with the text of every key it shows (a page that shows src/lib/texts.ts names keys, not words).
+// The view with the text of every key it shows (a page that shows src/i18n/locales/en.ts names keys, not words).
 function withTexts(view) {
-  const keys = [...view.matchAll(/\b(?:t|rich)\('([a-z0-9_]+)'/g)].map((m) => m[1]);
+  const keys = [...view.matchAll(/\b(?:t|say|rich)\('([a-z0-9_]+)'/g)].map((m) => m[1]);
   for (const key of keys) assert.ok(Object.prototype.hasOwnProperty.call(TEXTS, key), key);
   return [view, ...keys.map((key) => TEXTS[key])].join('\n');
 }
 
 const IN_APP_PATHS = new Set(IN_APP_NAV.map((l) => l.href));
 // Text that points to activation or states its cost. Activation lives on the node pages (/node/activate) and the
-// testnet faucet funds it (SITE-7): their addresses are pointers too.
+// testnet faucet funds it: their addresses are pointers too.
 const ACTIVATION_POINTERS = [
   /aiqnet\.io\/activate/i, /\/activate\b/, /aiqnet\.io\/docs/i, /Activate tab/, /what activation costs/i,
   /activation (cost|price)/i, /\b\d[\d,.]*\s*(1DEV|QNC)\b/, /get the extension|chromewebstore|builds are shared/i,
@@ -53,13 +67,13 @@ test('the header in the app\'s view: the explorer and the policies, nothing else
   const header = code('components/Header.tsx');
   assert.match(header, /const inApp = !useActivationContent\(\);/);
   assert.match(header, /const navLinks = inApp \? IN_APP_NAV : MAIN_NAV;/);
-  assert.match(header, /<Link href=\{inApp \? IN_APP_HOME : '\/'\} className="brand" aria-label=\{NAME\} data-field-clear>/);
+  assert.match(header, /<Link href=\{inApp \? IN_APP_HOME : '\/'\} className="brand" aria-label=\{NAME\} translate="no" data-field-clear>/);
   // Before detection the links are laid out but not shown, so nothing moves when the set is known.
   assert.match(header, /data-pending=\{providerStatus === 'detecting' \|\| undefined\}/);
   assert.doesNotMatch(header, /isInAppBrowser/, 'the header uses the one rule, not the channel alone');
   // Every header link is a same-origin path (no second host of the site).
   for (const m of header.matchAll(/href: '([^']*)'/g)) assert.match(m[1], /^\/[a-z-]+(\/[a-z-]+)*$/, m[1]);
-  // Outside the app's view: Explorer, My node, Wallet, Testnet and the Docs menu (owner, 29.09); the Docs menu is never in it.
+  // Outside the app's view: Explorer, My node, Wallet, Testnet and the Docs menu; the Docs menu is never in it.
   assert.match(header, /\{!inApp && <DocsMenu pathname=\{pathname\} \/>\}/);
   assert.equal(header.match(/<DocsMenu /g)?.length, 1);
   assert.doesNotMatch(header, /<a\s/);
@@ -67,9 +81,9 @@ test('the header in the app\'s view: the explorer and the policies, nothing else
   for (const excluded of IN_APP_EXCLUDED_PAGES) assert.equal(IN_APP_PATHS.has(excluded), false, excluded);
 });
 
-// R3-XPD-02: the header's wallet control is shown in the app's view too, where only the app's own provider
+// The header's wallet control is shown in the app's view too, where only the app's own provider
 // connects and no install target or page about the wallet is offered. Outside that view its Connect wallet is My
-// node's (owner, 20.10), the extension's store page on a computer without it included.
+// node's, the extension's store page on a computer without it included.
 test('the header wallet control offers no install target and no My node in the app\'s view', () => {
   const button = code('components/wallet/connect-wallet-button.tsx');
   assert.match(button, /const fullView = useActivationContent\(\);/);
@@ -113,19 +127,21 @@ test('Privacy, Terms and Support in the app\'s view: no pointer to activation or
       assert.ok(IN_APP_PATHS.has(m[1]), `${file} links ${m[1]}`);
     }
   }
-  // The privacy policy names the node pages' and the faucet's addresses only outside the app's view (SITE-7), as links.
+  // The privacy policy names the node pages' and the faucet's addresses only outside the app's view, as links.
   const privacy = code('app/privacy/page.tsx');
   assert.match(privacy, /const full = useActivationContent\(\);/);
-  assert.match(privacy, /The node pages\{full && <> \(<Link href="\/node">aiqnet\.io\/node<\/Link>\)<\/>\} send the server/);
-  assert.match(privacy, /The faucet\{full && <> on <Link href="\/testnet">aiqnet\.io\/testnet<\/Link><\/>\} sends test tokens/);
+  assert.match(privacy, /\{rich\('privacy_website_intro', \{ nodePage: full \? <> \(<Link href="\/node" translate="no">aiqnet\.io\/node<\/Link>\)<\/> : null \}\)\}/);
+  assert.match(TEXTS.privacy_website_intro, /The node pages\{nodePage\} send the server/);
+  assert.match(privacy, /faucetPage: full \? rich\('privacy_website_faucet_on', \{ page: <Link href="\/testnet" translate="no">aiqnet\.io\/testnet<\/Link> \}\) : null,/);
+  assert.match(TEXTS.privacy_website_faucet, /The faucet \{faucetPage\} sends test tokens/);
   // Support shows the documentation link, and the move from the older Android app, only outside the app's view.
   const support = code('app/support/page.tsx');
-  assert.match(support, /\{full && <li>\{rich\('support_contact_docs', \{ link: <Link href="\/docs">aiqnet\.io\/docs<\/Link> \}\)\}<\/li>\}/);
-  assert.match(support, /\{full && \(\s*<section className="doc-sec" id="new-app">\s*<h2>\{t\('support_move_title'\)\}<\/h2>\s*<div className="prose">\s*<p>\{rich\('support_move', \{ walletPage: <Link href="\/wallet">\{t\('support_move_wallet_link'\)\}<\/Link> \}\)\}<\/p>\s*<\/div>\s*<\/section>\s*\)\}/);
+  assert.match(support, /\{full && <li>\{rich\('support_contact_docs', \{ link: <Link href="\/docs" translate="no">aiqnet\.io\/docs<\/Link> \}\)\}<\/li>\}/);
+  assert.match(support, /\{full && \(\s*<section className="doc-sec" id="new-app">\s*<h2>\{say\('support_move_title'\)\}<\/h2>\s*<div className="prose">\s*<p>\{rich\('support_move', \{ walletPage: <Link href="\/wallet">\{t\('support_move_wallet_link'\)\}<\/Link> \}\)\}<\/p>\s*<\/div>\s*<\/section>\s*\)\}/);
   assert.doesNotMatch(inAppView(support), /support_move/);
 });
 
-// R4-XPD-06: Support linked the repository's issue tracker (its front page describes activation and its
+// Support linked the repository's issue tracker (its front page describes activation and its
 // cost, its Releases hold the APK) and the Telegram channel (where the site says Android builds are shared),
 // and the footer linked Telegram and X, also in the app's view. There the only way off the site is the
 // support address.
@@ -143,7 +159,7 @@ test('in the app\'s view the footer, Privacy, Terms and Support link nowhere off
   const support = code('app/support/page.tsx');
   assert.match(support, /\{full && <li>\{rich\('support_contact_bugs', \{ link: <a href="https:\/\/github\.com\/AIQnetLab\/QNet-Blockchain\/issues"/);
   assert.match(support, /\{full && <li>\{rich\('support_contact_community', \{ link: <a href="https:\/\/t\.me\/AiQnetLab"/);
-  assert.match(support, /<li>\{rich\('support_contact_email', \{ address: <a href="mailto:support@aiqnet\.io">support@aiqnet\.io<\/a> \}\)\}<\/li>/);
+  assert.match(support, /<li>\{rich\('support_contact_email', \{ address: <a href="mailto:support@aiqnet\.io" translate="no">support@aiqnet\.io<\/a> \}\)\}<\/li>/);
   assert.equal(TEXTS.support_contact_bugs, 'Bugs and feature requests: {link}');
   assert.equal(TEXTS.support_contact_community, 'Community: {link}');
   assert.equal(TEXTS.support_contact_email, 'Email: {address}');
@@ -176,12 +192,13 @@ test('the explorer (the in-app browser\'s bookmark) links only within the explor
   }
 });
 
-// SD-11: the explorer is the in-app browser's bookmark and the store listing's marketing page. In the app's view its
-// type chips, type badges and system accounts carry no reward, activation, emission or burn word (src/lib/tx-labels.ts;
-// L-14). A part of a page shown only outside that view (`{full && (...)}`) may name them. The token page's own burn
-// wording (a token contract's burn() and its burned supply) stays as it is until the owner decides (L-14).
+// The explorer is the in-app browser's bookmark and the store listing's marketing page. In the app's view its
+// type chips, type badges and system accounts carry no reward, activation, emission or burn word (src/lib/tx-labels.ts).
+// A part of a page shown only outside that view (`{full && (...)}`) may name them. The token page's own burn
+// wording (a token contract's burn() and its burned supply) stays as it is.
 test('the explorer in the app\'s view names reward and activation types by what they change', async () => {
-  const { txTypeLabel, txPartyLabel } = await import('../tx-labels.ts');
+  const { txTypeLabel: label, txPartyLabel } = await import('../tx-labels.ts');
+  const txTypeLabel = (type, full) => label(type, full, EN);
   const WORDS = /reward|activation|emission|burn/i;
   const TOKEN_WORDS = /reward|activation|emission/i;
   for (const type of ['Transfer', 'Reward', 'Swap', 'Heartbeat', 'Light Eligibility', 'Registration', 'Activation', 'Contract', 'System', 'RewardDistribution', 'SystemEmission', 'NodeActivation']) {
@@ -197,8 +214,8 @@ test('the explorer in the app\'s view names reward and activation types by what 
   // The type filters: in the app's view only its own names, outside it the chain's. The row is laid out but not shown until
   // the wallet check ends, so a name that changes moves nothing in view and every name is its own width (even gaps).
   const explorer = code('app/explorer/ExplorerClient.tsx');
-  assert.match(explorer, /\{TX_TYPES\.map\(\(type\) => \([\s\S]*?\{txTypeLabel\(type, full\)\}\n\s*<\/button>/);
-  assert.match(explorer, /<div className="ex-filters" role="group" aria-label="Filter by type" data-pending=\{providerStatus === 'detecting' \|\| undefined\}>/);
+  assert.match(explorer, /\{TX_TYPES\.map\(\(type\) => \([\s\S]*?\{txTypeLabel\(type, full, t\)\}\n\s*<\/button>/);
+  assert.match(explorer, /<div className="ex-filters" role="group" aria-label=\{t\('ex_filter'\)\} data-pending=\{providerStatus === 'detecting' \|\| undefined\}>/);
   assert.doesNotMatch(explorer, /FilterLabel|className="swap"/);
   // A system account's title: in the app's view only its own name; on the site the chain's with the app's under it, unseen,
   // so the title keeps the lines it had before the wallet check ended.
@@ -209,13 +226,14 @@ test('the explorer in the app\'s view names reward and activation types by what 
   assert.match(sheet, /\.ex-filters \{\n\s*display: flex; flex-wrap: nowrap;[^}]*overflow-x: auto;/);
   // Every type mark and every side shown by name goes through the labels: the explorer's one type column and Party.
   const columns = code('components/explorer/columns.tsx');
-  assert.match(columns, /<TxType type=\{get\(r\)\} label=\{txTypeLabel\(get\(r\), full\)\} \/>/);
+  assert.match(columns, /<TxType type=\{get\(r\)\} label=\{txTypeLabel\(get\(r\), full, t\)\} \/>/);
   const cells = code('components/explorer/cells.tsx');
   assert.match(cells, /case 'system': \{\n\s*const name = txPartyLabel\(value as string, full\);/);
   const TX_PAGES = ['app/explorer/ExplorerClient.tsx', 'app/explorer/tx/[hash]/TransactionClient.tsx', 'app/explorer/block/[hash]/BlockClient.tsx', 'app/explorer/address/[address]/AddressClient.tsx'];
   const PARTS = ['columns', 'cells', 'ExplorerSearch', 'LatestBlocks', 'NetworkReadouts', 'ChainReadouts', 'Detail', 'Disclosure'].map((name) => `components/explorer/${name}.tsx`);
   for (const file of [...TX_PAGES, 'app/explorer/qnc/QncClient.tsx', 'app/explorer/token/[contract]/TokenClient.tsx', 'app/explorer/tokens/TokensClient.tsx', ...PARTS]) {
-    const src = code(file);
+    // The page's words in English (its keys written out), as a reader sees them.
+    const src = english(file);
     if (file.startsWith('app/') && file !== 'app/explorer/tokens/TokensClient.tsx') assert.match(src, /const full = useActivationContent\(\);/, file);
     for (const m of src.matchAll(/<TxType type=\{([^}]*)\} label=\{([^}]*)\}/g)) assert.match(m[2], /^txTypeLabel\(/, `${file}: ${m[2]}`);
     assert.doesNotMatch(src, /className=\{?["'`](?:type-badge|addr|address-link)\b/, file);
@@ -225,14 +243,14 @@ test('the explorer in the app\'s view names reward and activation types by what 
     for (const m of shown.matchAll(/>([^<>{}]+)</g)) assert.doesNotMatch(m[1], words, `${file}: ${m[1].trim()}`);
     for (const m of shown.matchAll(/\b(?:label|sub|title|kicker|lead|empty|caption)="([^"]+)"/g)) assert.doesNotMatch(m[1], words, `${file}: ${m[1]}`);
   }
-  const block = code('app/explorer/block/[hash]/BlockClient.tsx');
+  const block = english('app/explorer/block/[hash]/BlockClient.tsx');
   assert.match(block, /\{full \? 'Pool 3 Activations' : 'Pool 3 total'\}/);
   assert.match(block, /<h2 id="blk-consensus" className="tbl-title">\{full \? 'Consensus data \(emission window\)' : 'Consensus data'\}<\/h2>/);
-  assert.match(code('app/explorer/qnc/QncClient.tsx'), /\{full \? <Readout label="Burned" value=\{data \? data\.burned : null\} amount=\{\{ link: false \}\} sub="Out of the supply" \/> : <span \/>\}/);
+  assert.match(english('app/explorer/qnc/QncClient.tsx'), /\{full \? <Readout label="Burned" value=\{data \? data\.burned : null\} amount=\{\{ link: false \}\} sub="Out of the supply" \/> : <span \/>\}/);
 });
 
-// SITE-R2-01: the indexer stores a registration's burn facts in tx_type_data, and the transaction page drew every key
-// of it, so a registration opened in the app's in-app browser showed 'Burn Tx', 'Burn Wallet' and 'Burn Amount 1500'.
+// The indexer stores a registration's burn facts in tx_type_data; a transaction page that drew every key of it would
+// show 'Burn Tx', 'Burn Wallet' and 'Burn Amount 1500' in the app's in-app browser.
 // In the app's view the data card shows only the neutral facts.
 test('the transaction data card shows no burn fact in the app\'s view', async () => {
   const { txDataEntries } = await import('../tx-labels.ts');
@@ -258,11 +276,11 @@ test('the transaction data card shows no burn fact in the app\'s view', async ()
   // The page draws the card from these entries only.
   const page = code('app/explorer/tx/[hash]/TransactionClient.tsx');
   assert.match(page, /const entries = txDataEntries\(tx\?\.tx_type_data, full\)\.filter\(\(\[key\]\) => key !== 'recipients'\);/);
-  assert.match(page, /\{entries\.map\(\(\[key, value\]\) => <Row key=\{key\} label=\{humanizeKey\(key\)\}><DataValue name=\{key\} value=\{value\} \/><\/Row>\)\}/);
+  assert.match(page, /\{entries\.map\(\(\[key, value\]\) => <Row key=\{key\} label=\{<DataLabel name=\{key\} t=\{t\} \/>\}><DataValue name=\{key\} value=\{value\} \/><\/Row>\)\}/);
   assert.equal(page.match(/Object\.entries\(tx\??\.tx_type_data\)/g), null);
 });
 
-// Owner, 11.10: the site hides activation only in the app's in-app browser. A page the app opens in the system
+// The site hides activation only in the app's in-app browser. A page the app opens in the system
 // browser (its links still carry ?from=app) is an ordinary visit: no source of the site reads that query.
 test('a page\'s query never puts the site in the app\'s view', () => {
   for (const url of files(SRC)) {
@@ -272,14 +290,14 @@ test('a page\'s query never puts the site in the app\'s view', () => {
 });
 
 test('the pages about activation, the node cabinet, the faucet, the DAO, the extension and the docs leave the app\'s view', () => {
-  // Unified plan SITE-8: the cabinet, the old activation page and the wallet page join the list.
+  // The cabinet, the old activation page and the wallet page join the list.
   assert.deepEqual([...IN_APP_EXCLUDED_PAGES], ['/', '/docs', '/dao', '/testnet', '/qnet-wallet-extension', '/node', '/activate', '/wallet']);
   const home = code('app/page.tsx');
-  assert.match(home, /<InAppGuard>\s*<HomeClient initialStats=\{initialStats\} blocks=\{blocks\} \/>\s*<\/InAppGuard>/);
+  assert.match(home, /<InAppGuard>\s*<AreaTexts area="home">\s*<HomeClient initialStats=\{initialStats\} blocks=\{blocks\} \/>\s*<\/AreaTexts>\s*<\/InAppGuard>/);
   for (const route of IN_APP_EXCLUDED_PAGES.filter((r) => r !== '/' && r !== '/node' && r !== '/activate')) {
     const layout = `app${route}/layout.tsx`;
     assert.ok(existsSync(new URL(layout, SRC)), layout);
-    assert.match(code(layout), /return <InAppGuard>\{children\}<\/InAppGuard>;/, layout);
+    assert.match(code(layout), /return <InAppGuard>(\{children\}|<AreaTexts area="\w+">\{children\}<\/AreaTexts>)<\/InAppGuard>;/, layout);
   }
   // /activate has no page: it redirects to /node/activate (next.config.js), which the cabinet's guard covers.
   assert.equal(existsSync(new URL('app/activate', SRC)), false);
@@ -287,18 +305,18 @@ test('the pages about activation, the node cabinet, the faucet, the DAO, the ext
   // Every cabinet page renders inside the guard, the wallet around it.
   const cabinet = code('app/node/layout.tsx');
   // The title band is inside the guard too: nothing of the cabinet shows in that view.
-  assert.match(cabinet, /return \(\s*<InAppGuard>\s*<CabinetProvider phoneFlows=\{phoneFlowsEnabled\(\)\}>\s*<PageHead title=\{t\('cabinet_title'\)\} strength=\{0\.32\} kind="cabinet" opacity=\{0\.7\} \/>\s*<>\{children\}<\/>\s*<\/CabinetProvider>\s*<\/InAppGuard>\s*\);/);
+  assert.match(cabinet, /return \(\s*<InAppGuard>\s*<CabinetProvider phoneFlows=\{phoneFlowsEnabled\(\)\}>\s*<PageHead title=\{t\('cabinet_title'\)\} strength=\{0\.32\} kind="cabinet" opacity=\{0\.7\} \/>\s*<AreaTexts area="node">\{children\}<\/AreaTexts>\s*<\/CabinetProvider>\s*<\/InAppGuard>\s*\);/);
   assert.equal(cabinet.match(/\{children\}/g)?.length, 1);
   // No cabinet page is in the app's navigation, and the site's header leads to it only outside that view.
   assert.equal(IN_APP_NAV.some((l) => l.href.startsWith('/node')), false);
-  assert.match(code('components/Header.tsx'), /\{ href: '\/node', label: 'My node' \}/);
+  assert.match(code('components/Header.tsx'), /\{ href: '\/node', label: 'hdr_node' \}/);
   const guard = code('components/InAppGuard.tsx');
   assert.match(guard, /const inApp = isInAppBrowser\(providerChannel\);/);
   assert.match(guard, /if \(inApp\) router\.replace\(IN_APP_HOME\);/);
   assert.match(guard, /if \(inApp\) return null;/);
 });
 
-// SITE-R3-CSP-02: these pages follow the site's one rule too. Before the wallet is detected (the server's
+// These pages follow the site's one rule too. Before the wallet is detected (the server's
 // render included) their text is in the page but hidden, so the app's in-app browser paints none of it
 // while its provider has not announced itself yet; it is displayed only once the page knows it may.
 test('the excluded pages display nothing before the wallet is detected, the server\'s render included', () => {

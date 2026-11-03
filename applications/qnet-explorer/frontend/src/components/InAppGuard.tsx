@@ -11,8 +11,8 @@
 // when it shows.
 
 import { useEffect } from 'react';
-import { useRouter } from 'next/navigation';
 import { useActivationContent, useWallet } from '@/contexts/AppContext';
+import { useLocaleRouter } from '@/i18n/client';
 import { IN_APP_HOME, isInAppBrowser } from '@/lib/activate-view';
 
 const CONTENTS = { display: 'contents' } as const;
@@ -22,7 +22,7 @@ const PENDING = { display: 'contents', visibility: 'hidden' } as const;
 export default function InAppGuard({ children }: { children: React.ReactNode }) {
   const { providerChannel } = useWallet();
   const show = useActivationContent();
-  const router = useRouter();
+  const router = useLocaleRouter();
   const inApp = isInAppBrowser(providerChannel);
 
   useEffect(() => {

@@ -283,7 +283,9 @@ it('the review notes say a node is counted also when the app is opened, and clai
   expect(notes).toMatch(/NODE BALANCE\.[^\n]*answered its status request, in the background or when the app is opened/);
   expect(notes).toMatch(/offers nothing for downloads, referrals, posts, reviews or any promotional action/);
   const push = fs.readFileSync(path.join(ROOT, 'src', 'services', 'PushService.js'), 'utf8');
-  expect(push).toMatch(/app open is a wakeup/); // the behaviour the sentence describes
+  // The behaviour the sentence describes: the first open's work and every return to the app answer.
+  expect(push).toMatch(/async function launchWork\(nodeInfo\) \{[^}]*selfAttestIfNeeded\(nodeInfo\.nodeId, false, undefined, null, \{ opened: true, bindingRead \}\)/);
+  expect(push).toMatch(/async function returnToApp\(\) \{[\s\S]*?const ok = await selfAttestIfNeeded\(info\.nodeId, false, undefined, null, \{ opened: true \}\);/);
 });
 
 // The system is named "QNet Blockchain" in every store text (owner, 12.10), and each field keeps its store limit:

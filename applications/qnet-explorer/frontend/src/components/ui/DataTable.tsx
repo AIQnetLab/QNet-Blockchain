@@ -1,6 +1,6 @@
 'use client';
 
-// One table for every list (B-SPEC 5.9): fixed columns from a <colgroup>, fixed row heights, cells that never wrap, so a
+// One table for every list: fixed columns from a <colgroup>, fixed row heights, cells that never wrap, so a
 // row arriving or a value changing moves nothing. A live table holds new rows while the pointer or focus is inside it,
 // and on a touch screen from a press on it until 3 s after the last touch or scroll (useHold), saying how many wait;
 // it tints each new row as it lands. Up to a tablet's width the table keeps its columns in a frame that
@@ -8,7 +8,9 @@
 // A list of holders (`stack`) instead lays each row out in place, at one fixed height, below that width.
 
 import { Fragment, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { useT } from '@/i18n/client';
 import { tableMinWidth } from '@/lib/geometry';
+import { named } from '@/lib/rich';
 import { HoldLabel } from './Status';
 import { useHold, useLanded } from './useHold';
 
@@ -33,11 +35,12 @@ interface DataTableProps<T> {
   // Two-line rows (a block's height over its hash, From over To).
   tall?: boolean;
   loadingRows?: number;
-  // What is absent, in the visitor's words; the header stays.
+  // What is absent, in the visitor's words; the header stays. A string, here and in `error`, keeps its product names out
+  // of page translation (lib/rich.tsx named).
   empty?: ReactNode;
   // A failed read: a line above the table; the rows shown stay.
   error?: ReactNode;
-  caption: string;
+  caption: ReactNode;
   title?: ReactNode;
   // The datum at the right of the title (a count, a filter); a live table shows Live here.
   meta?: ReactNode;
@@ -60,6 +63,7 @@ export default function DataTable<T>({
   columns, rows, rowKey, tall = false, loadingRows = 10, empty, error, caption, title, meta, tools, live = false, scroll = true, stack, className,
   detail,
 }: DataTableProps<T>) {
+  const t = useT();
   const frame = useRef<HTMLDivElement>(null);
   const hold = useHold(rows, frame, rowKey, live);
   const shown = live ? hold.shown : rows;
@@ -74,7 +78,8 @@ export default function DataTable<T>({
     const el = frame.current;
     if (!el || !scroll) return;
     const check = () => {
-      setAtEnd(el.scrollLeft + el.clientWidth >= el.scrollWidth - 2);
+      // Right to left, the frame scrolls to negative offsets: the distance from the start is the same either way.
+      setAtEnd(Math.abs(el.scrollLeft) + el.clientWidth >= el.scrollWidth - 2);
       setOver(el.scrollWidth > el.clientWidth + 1);
     };
     check();
@@ -100,7 +105,7 @@ export default function DataTable<T>({
         </div>
       )}
       {tools}
-      {error && <p className="tbl-error" role="alert">{error}</p>}
+      {error && <p className="tbl-error" role="alert">{named(error)}</p>}
       <div
         ref={frame}
         className="tbl-frame"
@@ -130,7 +135,7 @@ export default function DataTable<T>({
               : shown.length === 0
                 ? (
                   <tr role={role('row')}>
-                    <td className="tbl-empty" role={role('cell')} colSpan={columns.length}>{empty ?? 'Nothing here yet.'}</td>
+                    <td className="tbl-empty" role={role('cell')} colSpan={columns.length}>{named(empty ?? t('table_empty'))}</td>
                   </tr>
                 )
                 : shown.map((row, i) => {

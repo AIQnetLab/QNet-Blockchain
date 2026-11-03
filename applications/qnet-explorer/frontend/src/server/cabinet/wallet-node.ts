@@ -1,14 +1,15 @@
-// Whether a QNet wallet has a node on the network, of either type (shared contract C3.7): the nodes' on-chain
+// Whether a QNet wallet has a node on the network, of either type: the nodes' on-chain
 // verify-activation (the wallet in the x-qnet-wallet header, never in a URL), two genesis nodes first, then one more at a
 // time, and the wallet's light node through the status route's own reads (node-proxy.ts settlingPair: registered, or
-// being recorded). A "yes" from any node settles it; a "no" needs a node at the network's height and the light node's
-// settled "not registered, not being recorded"; anything less is not known, and no client burns then. The reservation
-// route asks it before a wallet is held (activation-api.ts), with its own cache and its own upstream budget (`reserve`,
-// upstream.ts), so that no flood of anonymous reads makes a reservation answer that the network could not be read; the
-// page reads it through GET /api/cabinet/wallet-node/{wallet}, on the reads' budget: the budget of ids seen registered
-// for a wallet whose node was seen, the small one of unknown ids otherwise (known-nodes.ts), and each client's read that
-// goes upstream counts against its own share (limits.ts CLIENT_BUDGETS.upstreamMiss). The page's answer is kept about
-// its poll interval, a "none" a little longer; a reservation's a few seconds only.
+// being recorded). A "yes" from any node settles it; a "no" needs NONE_ANSWERS nodes at the network's height that say so
+// and the light node's settled "not registered, not being recorded"; anything less, one node's "no" among them, is not
+// known, and no client burns then. The reservation route asks it before a wallet is held (activation-api.ts), with its
+// own cache and its own upstream budget (`reserve`, upstream.ts), so that no flood of anonymous reads makes a
+// reservation answer that the network could not be read; the page reads it through GET
+// /api/cabinet/wallet-node/{wallet}, on the reads' budget: the budget of ids seen registered for a wallet whose node
+// was seen, the small one of unknown ids otherwise (known-nodes.ts), and each client's read that goes upstream counts
+// against its own share (limits.ts CLIENT_BUDGETS.upstreamMiss). The page's answer is kept about its poll interval, a
+// "none" a little longer; a reservation's a few seconds only.
 
 import { readCappedBytes } from '../../lib/capped-body.ts';
 import { GENESIS_NODES } from '../../lib/genesis-nodes.ts';
@@ -28,6 +29,8 @@ export const WALLET_NONE_CACHE_MS = NONE_CACHE_MS;
 export const WALLET_RESERVE_CACHE_MS = RESERVE_CACHE_MS;
 const NODE_TIMEOUT_MS = 4_000;
 const NODE_BODY_MAX_BYTES = 16 * 1024;
+// The authoritative "no" answers that say the wallet has no node: one node's word never frees a wallet for a burn.
+export const NONE_ANSWERS = 2;
 const NODE_ID_RE = /^[a-z0-9_]{1,128}$/;
 
 export type WalletNode = { state: 'registered'; nodeId: string; nodeType: NodeType } | { state: 'none' };
@@ -115,20 +118,20 @@ export function createWalletNode(options: WalletNodeOptions = {}): WalletNodeChe
       const j = Math.floor(random() * (i + 1));
       [order[i], order[j]] = [order[j], order[i]];
     }
-    let absent = false;
+    let noes = 0;
     let size = 2;
     const upstream = upstreamOf(wallet, kind);
-    while (order.length > 0 && !absent) {
+    while (order.length > 0 && noes < NONE_ANSWERS) {
       const got = await Promise.all(order.splice(0, size).map((base) => ask(base, wallet, upstream)));
       const found = got.find((v): v is Extract<Verdict, { verified: true }> => v?.verified === true);
       if (found) {
         known.note(found.nodeId);
         return { state: 'registered', nodeId: found.nodeId, nodeType: found.nodeType };
       }
-      absent = got.some((v) => v?.verified === false && v.authoritative);
+      noes += got.filter((v) => v?.verified === false && v.authoritative).length;
       size = 1;
     }
-    if (!absent) return null;
+    if (noes < NONE_ANSWERS) return null;
     const light = await lightView(lightNodeId(wallet), kind);
     if (light === null) return null;
     if (light.registered || light.pending) return { state: 'registered', nodeId: lightNodeId(wallet), nodeType: 'light' };

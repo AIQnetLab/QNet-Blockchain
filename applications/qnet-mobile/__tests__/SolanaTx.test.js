@@ -185,6 +185,27 @@ describe('the messages, byte for byte', () => {
     expect(PACKET_DATA_SIZE).toBe(1232);
   });
 
+  it('builds each of its transfers in the relay vectors byte for byte (docs/protocols/solana-relay.vectors.json)', () => {
+    // The site's relay takes exactly these transactions (its own test reads the same file), and the extension builds the
+    // same bytes for the cases both wallets share.
+    const vectors = require('../../../docs/protocols/solana-relay.vectors.json');
+    const { recentBlockhash, oneDevMint, oneDevDecimals } = vectors.constants;
+    const ours = vectors.cases.filter((c) => c.builders.includes('app'));
+    expect(ours.map((c) => c.transfer.asset).sort()).toEqual([...Array(6).fill('1dev'), ...Array(4).fill('sol')]);
+    for (const { transfer: t, message, transaction } of ours) {
+      const plan = t.asset === 'sol'
+        ? { kind: 'sol', from: t.from, to: t.to, amount: BigInt(t.amount), references: t.references, memo: t.memo }
+        : {
+          kind: 'token', from: t.from, to: t.to, mint: oneDevMint, decimals: oneDevDecimals, amount: BigInt(t.amount), source: t.source,
+          destination: associatedTokenAddress(t.to, oneDevMint), createDestination: t.createAccount, references: t.references, memo: t.memo,
+        };
+      const built = transferMessage(plan, recentBlockhash);
+      expect(Buffer.from(built).toString('hex')).toBe(message);
+      const wire = Buffer.from(transaction, 'base64');
+      expect(Buffer.from(serializeTransaction(Uint8Array.from(wire.subarray(1, 65)), built)).toString('base64')).toBe(transaction);
+    }
+  });
+
   it('refuses what is not a transfer it can build: no instruction, a bad key, a bad blockhash, a u64 overflow', () => {
     expect(() => compileMessage([], K.from, K.hash)).toThrow();
     expect(() => transferMessage({ kind: 'sol', from: 'nope', to: K.to, amount: 1n }, K.hash)).toThrow();

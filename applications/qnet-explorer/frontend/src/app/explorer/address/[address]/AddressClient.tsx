@@ -1,6 +1,6 @@
 'use client';
 
-// An address (B-SPEC 6.5): its short form as the title, the whole address spaced at its structure with Copy; readouts
+// An address: its short form as the title, the whole address spaced at its structure with Copy; readouts
 // for its balance, transactions, first and last activity; its other tokens, its transactions (newest first, the first
 // page live) and its token transfers. The server renders the first answer into the page (page.tsx), so its notes and
 // tables are there from the first paint; it follows the chain (read again as the head moves, at most every 3 s, only
@@ -11,11 +11,12 @@ import { useParams } from 'next/navigation';
 import { getCache, setCache } from '@/lib/explorer-cache';
 import { addressPath, readRecord } from '@/lib/explorer-reads';
 import { useActivationContent } from '@/contexts/AppContext';
+import { useI18n } from '@/i18n/client';
 import { txPartyLabel } from '@/lib/tx-labels';
 import OnHead from '@/components/explorer/OnHead';
 import { Row, Rows, Whole } from '@/components/explorer/Detail';
 import { TxAmount } from '@/components/explorer/cells';
-import { amountCol, blockCol, fromToCol, hashCol, textCol, timeCol, typeCol } from '@/components/explorer/columns';
+import { amountCol, amountsWidth, blockCol, fromToCol, hashCol, textCol, timeCol, typeCol, useSteadyWidth } from '@/components/explorer/columns';
 import Action from '@/components/ui/Action';
 import DataTable from '@/components/ui/DataTable';
 import EntityLink, { AddressParts, Amount } from '@/components/ui/EntityLink';
@@ -26,6 +27,9 @@ import { Readout, Readouts } from '@/components/ui/Readouts';
 import { isAddressShape } from '@/lib/entity';
 import { ageText, rowAmount, splitAmount, type AmountParts } from '@/lib/explorer-view';
 import { day, int, qnc, short, when } from '@/lib/format';
+import { amountWidth } from '@/lib/geometry';
+import { named } from '@/lib/rich';
+import { siteRequest } from '@/lib/site-request';
 import type { FirstAnswer } from '@/server/first-answer';
 import { number } from '@/lib/texts';
 
@@ -94,6 +98,7 @@ interface BalanceProofResult {
 }
 
 const BalanceVerification = ({ address }: { address: string }) => {
+  const { t, say } = useI18n();
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState<BalanceProofResult | null>(null);
 
@@ -106,7 +111,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
       verificationTime: Math.round(performance.now() - startTime), error,
     });
     try {
-      const response = await fetch(`/api/address/${address}/balance-proof`);
+      const response = await fetch(`/api/address/${address}/balance-proof`, siteRequest());
       const data = await response.json();
       if (data.success && data.verified === true && typeof data.stateRoot === 'string' && typeof data.balanceNano === 'string' && /^\d+$/.test(data.balanceNano)) {
         setResult({
@@ -119,10 +124,13 @@ const BalanceVerification = ({ address }: { address: string }) => {
           verificationTime: Math.round(performance.now() - startTime),
         });
       } else {
-        setResult(failed(typeof data.error === 'string' ? data.error : 'Verification failed'));
+        // The route's reason or status in the page's language; its own error text is English, for API readers.
+        const why = data.reason === 'not_confirmed_yet' ? t('proof_not_confirmed') : data.reason === 'network_unavailable' ? t('proof_network_down')
+          : response.status === 429 ? t('link_rate_limited', { minutes: 1 }) : t('proof_failed');
+        setResult(failed(why));
       }
-    } catch (err) {
-      setResult(failed(err instanceof Error ? err.message : 'Unknown error'));
+    } catch {
+      setResult(failed(t('proof_failed')));
     } finally {
       setVerifying(false);
     }
@@ -130,47 +138,43 @@ const BalanceVerification = ({ address }: { address: string }) => {
 
   return (
     <section className="ex-group" aria-labelledby="addr-proof">
-      <h2 id="addr-proof" className="tbl-title">Balance check</h2>
+      <h2 id="addr-proof" className="tbl-title">{t('proof_title')}</h2>
       <div className="actions">
         <Action kind="text" onClick={() => void verifyBalance()} busy={verifying}>
-          {verifying ? 'Checking…' : result?.verified ? 'Verified by the committee certificate' : 'Verify Balance'}
+          {verifying ? t('proof_checking') : result?.verified ? t('proof_verified') : t('proof_verify')}
         </Action>
       </div>
       {result && (
-        <Rows label="Balance check">
-          <Row label="Status">{result.verified ? 'Proven against the certified state root' : <span className="em">{result.error || 'Verification failed'}</span>}</Row>
+        <Rows label={t('proof_title')}>
+          <Row label={t('col_status')}>{result.verified ? t('proof_proven') : <span className="em">{result.error ? named(result.error) : t('proof_failed')}</span>}</Row>
           {result.verified && (
             <>
-              <Row label="Proven balance">{qnc(result.balanceNano)} QNC{result.exists ? '' : ' (no account yet)'}</Row>
-              <Row label="Checkpoint">{number(result.macroblockIndex)}</Row>
-              <Row label="State at block"><EntityLink kind="block" value={result.stateHeight} /></Row>
-              <Row label="State root"><span className="ex-val">{short('hash', result.stateRoot)}</span></Row>
-              <Row label="Verification time">{number(result.verificationTime)} ms</Row>
+              <Row label={t('proof_balance')}>{t(result.exists ? 'proof_amount' : 'proof_amount_new', { amount: qnc(result.balanceNano) })}</Row>
+              <Row label={t('proof_checkpoint')}>{number(result.macroblockIndex)}</Row>
+              <Row label={t('proof_state_at')}><EntityLink kind="block" value={result.stateHeight} /></Row>
+              <Row label={t('blk_state_root')}><span className="ex-val">{short('hash', result.stateRoot)}</span></Row>
+              <Row label={t('proof_time')}>{t('proof_ms', { ms: number(result.verificationTime) })}</Row>
             </>
           )}
         </Rows>
       )}
-      <p className="note">
-        The balance is proven against the state root that the validator committee of QNet Blockchain signed for this
-        checkpoint. The site checks the committee&apos;s signatures itself, so no single node is trusted. The proven
-        balance is the account&apos;s balance at that checkpoint, which is certified about one to two minutes after its
-        block; the balance shown above is the latest the explorer read and can be newer.
-      </p>
+      <p className="note">{say('proof_note')}</p>
     </section>
   );
 };
 
 type Phase = 'loading' | 'ready' | 'missing' | 'failed';
 // A token transfer's amount (exact from the server, in the token's decimals) with the token its unit links to.
-const tokenParts = (t: TokenTransfer): AmountParts | null => {
-  const parts = splitAmount(`${t.amount} ${t.symbol || 'Token'}`);
-  return parts && { ...parts, token: t.contract };
+const tokenParts = (x: TokenTransfer, unnamed: string): AmountParts | null => {
+  const parts = splitAmount(`${x.amount} ${x.symbol || unnamed}`);
+  return parts && { ...parts, token: x.contract };
 };
 const TX_PER_PAGE = 25;
 
 // `first` is the server's answer (null: it had none, the client reads it); absent while the route loads (loading.tsx):
 // the page's shape with this tab's copy of the address if it has one, and no reads.
 export default function AddressClient({ first }: { first?: FirstAnswer | null }) {
+  const { t, say } = useI18n();
   const params = useParams();
   const address = params.address as string;
   // The app's view names reward and activation types by what they change (src/lib/tx-labels.ts).
@@ -184,7 +188,7 @@ export default function AddressClient({ first }: { first?: FirstAnswer | null })
   const fetchAddress = useCallback(async () => {
     if (!address) return;
     try {
-      const res = await fetch(addressPath(address));
+      const res = await fetch(addressPath(address), siteRequest());
       const read = readRecord<AddressData>(res.status, await res.json(), [400]);
       if (read.record) {
         setData(read.record);
@@ -219,37 +223,44 @@ export default function AddressClient({ first }: { first?: FirstAnswer | null })
       <span data-on="false" aria-hidden="true">{inAppName}</span>
     </span>
   ) : txPartyLabel(address, full);
-  const otherTokens = (d?.tokens ?? []).filter((t) => t.symbol !== 'QNC');
-  const txs = d?.transactions ?? [];
+  const otherTokens = useMemo(() => (d?.tokens ?? []).filter((x) => x.symbol !== 'QNC'), [d?.tokens]);
+  const txs = useMemo(() => d?.transactions ?? [], [d?.transactions]);
   const pages = Math.max(1, Math.ceil(txs.length / TX_PER_PAGE));
   const pageRows = d ? txs.slice((txPage - 1) * TX_PER_PAGE, txPage * TX_PER_PAGE) : null;
 
+  // Each amount column as wide as its longest value (columns.tsx amountsWidth): a token's amount to 18 decimals never
+  // runs into the next column. Kept for the address while its rows refresh, so From / To never moves under the reader.
+  const transfers = useMemo(() => d?.tokenTransfers ?? [], [d?.tokenTransfers]);
+  const txAmountW = useSteadyWidth(useMemo(() => amountsWidth(txs.map((x) => rowAmount(x, t('token_unnamed'))), true), [txs, t]), address);
+  const transferAmountW = useSteadyWidth(useMemo(() => amountsWidth(transfers.map((x) => (x.std === 'qrc721' ? { value: x.amount, unit: '' }
+    : tokenParts(x, t('token_unnamed')))), true), [transfers, t]), address);
   const txColumns = useMemo(() => [
-    hashCol<AddressTx>((t) => t.hash),
-    typeCol<AddressTx>((t) => t.type, full),
-    fromToCol<AddressTx>((t) => t.from, (t) => t.to, full, () => ({ self: address })),
-    amountCol<AddressTx>((t) => <TxAmount parts={rowAmount(t)} sign={t.from === address ? '−' : '+'} />),
-    blockCol<AddressTx>((t) => t.block),
-    timeCol<AddressTx>((t) => t.timestamp),
-  ], [full, address]);
+    hashCol<AddressTx>(t, (x) => x.hash),
+    typeCol<AddressTx>(t, (x) => x.type, full),
+    fromToCol<AddressTx>(t, (x) => x.from, (x) => x.to, full, () => ({ self: address })),
+    amountCol<AddressTx>(t, (x) => <TxAmount parts={rowAmount(x, t('token_unnamed'))} sign={x.from === address ? '−' : '+'} />, t('col_amount'), txAmountW),
+    blockCol<AddressTx>(t, (x) => x.block),
+    timeCol<AddressTx>(t, (x) => x.timestamp),
+  ], [t, full, address, txAmountW]);
 
   const transferColumns = useMemo(() => [
-    hashCol<TokenTransfer>((t) => t.hash),
-    textCol<TokenTransfer>('token', 'Token', (t) => <EntityLink kind="token" value={t.contract} symbol={t.symbol} />, 136),
+    hashCol<TokenTransfer>(t, (x) => x.hash),
+    textCol<TokenTransfer>('token', t('col_token'), (x) => <EntityLink kind="token" value={x.contract} symbol={x.symbol} />, 136),
     // Tokens the contract issued have no sender, tokens destroyed no recipient.
-    fromToCol<TokenTransfer>((t) => t.from, (t) => t.to, full, () => ({ self: address, fromWord: 'Issued', toWord: 'destroyed' })),
-    amountCol<TokenTransfer>((t) => (t.std === 'qrc721'
-      ? <span className="amount-v num">{t.amount}</span>
-      : <TxAmount parts={tokenParts(t)} sign={t.direction === 'out' ? '−' : '+'} logo={t.logo} />)),
-    blockCol<TokenTransfer>((t) => t.block),
-    timeCol<TokenTransfer>((t) => t.timestamp),
-  ], [full, address]);
+    fromToCol<TokenTransfer>(t, (x) => x.from, (x) => x.to, full, () => ({ self: address, fromWord: t('addr_issued'), toWord: t('addr_destroyed') })),
+    amountCol<TokenTransfer>(t, (x) => (x.std === 'qrc721'
+      ? <span className="amount-v num">{x.amount}</span>
+      : <TxAmount parts={tokenParts(x, t('token_unnamed'))} sign={x.direction === 'out' ? '−' : '+'} logo={x.logo} />), t('col_amount'), transferAmountW),
+    blockCol<TokenTransfer>(t, (x) => x.block),
+    timeCol<TokenTransfer>(t, (x) => x.timestamp),
+  ], [t, full, address, transferAmountW]);
 
   const tokenColumns = useMemo(() => [
-    textCol<AddressToken>('token', 'Token', (t) => <EntityLink kind="token" value={t.contract_address} symbol={t.symbol} />, 160),
-    textCol<AddressToken>('name', 'Name', (t) => t.name || null),
-    amountCol<AddressToken>((t) => <Amount value={t.balance} token={t.contract_address} symbol={t.symbol} />, 'Balance', 260),
-  ], []);
+    textCol<AddressToken>('token', t('col_token'), (x) => <EntityLink kind="token" value={x.contract_address} symbol={x.symbol} />, 160),
+    textCol<AddressToken>('name', t('col_name'), (x) => x.name || null),
+    amountCol<AddressToken>(t, (x) => <Amount value={x.balance} token={x.contract_address} symbol={x.symbol} />, t('col_balance'),
+      amountWidth(otherTokens.map((x) => ({ value: x.balance, unit: x.symbol || t('token_unnamed') })), 260)),
+  ], [t, otherTokens]);
 
   const capped = d && d.txCount > txs.length;
   // Not an address: the page says so and shows no empty readouts or rows that would never fill.
@@ -258,32 +269,27 @@ export default function AddressClient({ first }: { first?: FirstAnswer | null })
   return (
     <div className="ex ex-detail">
       <PageHead
-        kicker={system ? 'System account' : isAddressShape(address) ? undefined : 'Address'}
-        // The whole address under the word, in its groups (owner 20.10), with Copy under it.
-        title={name ?? (isAddressShape(address) ? <>Address<span className="ex-title-addr"><AddressParts value={address} /></span></> : address)}
+        kicker={system ? t('addr_system') : isAddressShape(address) ? undefined : t('sugg_address')}
+        // The whole address under the word, in its groups, with Copy under it.
+        title={name ?? (isAddressShape(address) ? <>{t('sugg_address')}<span className="ex-title-addr" translate="no"><AddressParts value={address} /></span></> : address)}
         more={absent ? undefined : (
           <div className="ex-ro" data-field-dim="0.1">
-            <Readouts cols={4} size="tool" label="This address">
-              <Readout label="Balance" value={system || !d || d.balance_raw === null ? null : qnc(d.balance_raw)} amount={{}} sub={system ? 'Not read for a system account' : 'As the node reads it now'} />
-              <Readout label="Transactions" value={d && !system ? `${int(d.txCount)}${d.txCountCapped ? '+' : ''}` : null} sub="Sent and received" />
-              <Readout label="First seen" value={d && d.firstSeen && !system ? day(d.firstSeen) : null} sub={d && d.firstSeen && !system ? when(d.firstSeen) : 'Its oldest listed transaction'} />
-              <Readout label="Last active" value={d && d.lastActive && !system ? ageText(d.lastActive, Date.now()) : null} sub={d && d.lastActive && !system ? when(d.lastActive) : 'Its newest transaction'} />
+            <Readouts cols={4} size="tool" label={t('addr_this')}>
+              <Readout label={t('col_balance')} value={system || !d || d.balance_raw === null ? null : qnc(d.balance_raw)} amount={{}} sub={system ? t('addr_balance_system') : t('addr_balance_sub')} />
+              <Readout label={t('col_transactions')} value={d && !system ? `${int(d.txCount)}${d.txCountCapped ? '+' : ''}` : null} sub={t('addr_txs_sub')} />
+              <Readout label={t('addr_first')} value={d && d.firstSeen && !system ? day(d.firstSeen, t) : null} sub={d && d.firstSeen && !system ? when(d.firstSeen, t) : t('addr_first_sub')} />
+              <Readout label={t('addr_last')} value={d && d.lastActive && !system ? ageText(d.lastActive, Date.now(), t) : null} sub={d && d.lastActive && !system ? when(d.lastActive, t) : t('addr_last_sub')} />
             </Readouts>
           </div>
         )}
       >
-        {system ? <p className="ex-facts"><span>A system account of QNet Blockchain: it holds no key, and the explorer does not read its balance.</span></p> : (
-          isAddressShape(address) ? <Copy value={address} ariaLabel="Copy address" /> : <Whole value={null} name="address" length={46} />
+        {system ? <p className="ex-facts"><span>{say('addr_system_note')}</span></p> : (
+          isAddressShape(address) ? <Copy value={address} ariaLabel={t('account_copy')} /> : <Whole value={null} name={t('addr_name')} length={46} />
         )}
-        {d?.genesisAllocation && (
-          <p className="note">
-            Load-test account: funded in the genesis block for stress tests. Its key is public, so anyone can move this
-            balance; it is not part of the QNC supply and is not counted among holders.
-          </p>
-        )}
-        {phase === 'missing' && <p className="ex-error" role="status">This is not a QNet Blockchain address.</p>}
+        {d?.genesisAllocation && <p className="note">{t('addr_load_test')}</p>}
+        {phase === 'missing' && <p className="ex-error" role="status">{say('wallet_enter_invalid')}</p>}
         {phase === 'failed' && (
-          <p className="ex-error" role="alert">Could not read this address. <Action kind="act" onClick={() => void fetchAddress()}>Try again</Action></p>
+          <p className="ex-error" role="alert">{t('addr_unreadable')} <Action kind="act" onClick={() => void fetchAddress()}>{t('try_again')}</Action></p>
         )}
       </PageHead>
 
@@ -295,28 +301,28 @@ export default function AddressClient({ first }: { first?: FirstAnswer | null })
         */}
 
         {otherTokens.length > 0 && (
-          <DataTable title="Other tokens" caption="Tokens this address holds" columns={tokenColumns} rows={otherTokens} rowKey={(t) => t.contract_address} />
+          <DataTable title={t('addr_other_tokens')} caption={t('addr_other_tokens_caption')} columns={tokenColumns} rows={otherTokens} rowKey={(x) => x.contract_address} />
         )}
 
         {!system && !absent && (
           <section className="ex-group">
             <DataTable
-              title="Transactions"
-              caption="Transactions of this address, newest first"
+              title={t('col_transactions')}
+              caption={t('addr_txs_caption')}
               columns={txColumns}
               rows={pageRows}
-              rowKey={(t) => `${t.hash}:${t.from === address ? 'out' : 'in'}`}
+              rowKey={(x) => `${x.hash}:${x.from === address ? 'out' : 'in'}`}
               live={txPage === 1}
               loadingRows={3}
-              empty={d?.historyUnavailable ? 'The transaction history cannot be read right now; the balance above is current.' : 'No transactions yet.'}
+              empty={d?.historyUnavailable ? t('addr_history_unavailable') : t('addr_no_txs')}
             />
             {txs.length > TX_PER_PAGE && <Pager page={txPage} pages={pages} onPage={(n) => setTxPage(Math.min(Math.max(1, n), pages))} />}
-            {capped && <p className="note">The newest {int(txs.length)} of {int(d!.txCount)}{d!.txCountCapped ? '+' : ''} transactions are listed here.</p>}
+            {capped && <p className="note">{t('addr_capped', { shown: int(txs.length), total: `${int(d!.txCount)}${d!.txCountCapped ? '+' : ''}` })}</p>}
           </section>
         )}
 
         {(d?.tokenTransfers?.length ?? 0) > 0 && (
-          <DataTable title="Token transfers" caption="Token transfers of this address" columns={transferColumns} rows={d!.tokenTransfers} rowKey={(t) => `${t.hash}:${t.contract}:${t.direction}:${t.token_id}`} />
+          <DataTable title={t('addr_token_transfers')} caption={t('addr_token_transfers_caption')} columns={transferColumns} rows={d!.tokenTransfers} rowKey={(x) => `${x.hash}:${x.contract}:${x.direction}:${x.token_id}`} />
         )}
       </div>
     </div>

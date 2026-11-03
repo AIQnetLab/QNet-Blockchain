@@ -4,9 +4,10 @@
 // where a wallet is on its way to a running node (src/lib/cabinet/tabs.ts journey), as four segments with a line on top
 // (done Signal, now Ember, ahead a hairline). Shown only while a step after Activate is open (tabs.ts showJourney).
 
-import { t, type MessageKey } from '@/lib/texts';
+import { type MessageKey } from '@/lib/texts';
 import { journey, journeySteps, type JourneyStep } from '@/lib/cabinet/tabs';
 import type { ActivationView } from '@/lib/cabinet/wallet-activation';
+import { useI18n } from '@/i18n/client';
 
 const STEP_LABEL: Record<JourneyStep, MessageKey> = {
   connect: 'progress_connect',
@@ -17,6 +18,7 @@ const STEP_LABEL: Record<JourneyStep, MessageKey> = {
 };
 
 export default function CabinetProgress({ connected, view }: { connected: boolean; view: ActivationView | null }) {
+  const { t, say } = useI18n();
   const { done, current, nodeType } = journey(connected, view);
   return (
     <ol className="cab-journey" aria-label={t('progress_label')}>
@@ -25,7 +27,7 @@ export default function CabinetProgress({ connected, view }: { connected: boolea
         return (
           <li key={step} data-at={at} aria-current={at === 'now' ? 'step' : undefined}>
             <span className="cab-journey-n" aria-hidden="true">{i + 1}</span>
-            <span className="cab-journey-t">{t(STEP_LABEL[step])}</span>
+            <span className="cab-journey-t">{say(STEP_LABEL[step])}</span>
             {at !== 'ahead' && <span className="cab-journey-k">{t(at === 'done' ? 'progress_done' : 'progress_now')}</span>}
           </li>
         );

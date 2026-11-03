@@ -19,13 +19,14 @@ class MainActivity : ReactActivity() {
   override fun getMainComponentName(): String = "QNetMobile"
 
   override fun onCreate(savedInstanceState: Bundle?) {
-    // A link (QNet Link, a transfer link) is a one-time request: an activity restored, or relaunched from recents, still
-    // carries the intent that first started it, and must not hand that link to the app again.
-    if (savedInstanceState != null || (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
+    // A link (QNet Link, a transfer link) is a one-time request: a new one waits in the inbox until the wallet screen is
+    // done with it; an activity restored, or relaunched from recents, still carries the intent that first started it,
+    // whose link nothing may read again.
+    if (!LinkInbox.receive(this, intent, restored = savedInstanceState != null)) {
       intent.data = null
     }
     super.onCreate(savedInstanceState)
-    // The recents screen shows no snapshot of the wallet (API 33+); secret screens add FLAG_SECURE on top.
+    // The recents screen shows no snapshot of the wallet (API 33+); the user's own screenshots and recordings stay free.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) setRecentsScreenshotEnabled(false)
     // From API 29 the window is edge to edge (MainApplication; set up by super.onCreate), with the bars' look picked from
     // the system's light or dark mode. The app is dark on every screen: light icons on both bars, and no system scrim
@@ -39,27 +40,38 @@ class MainActivity : ReactActivity() {
   }
 
   /**
+   * A link for the running activity (singleTask), or for one just remade after its process ended, which React Native
+   * drops while its context is not up: it waits in the inbox first, and the activity's intent is the newest one.
+   */
+  override fun onNewIntent(intent: Intent) {
+    LinkInbox.receive(this, intent, restored = false)
+    super.onNewIntent(intent)
+    setIntent(intent)
+  }
+
+  /**
    * Below API 33 the recents screen keeps the snapshot taken as the wallet leaves the screen, and nothing but
    * FLAG_SECURE keeps balances, addresses and payees out of it (MPLAT-R5-03). So the window is secure on its way to the
-   * background, and plain again when it returns, unless a secret screen holds the flag (SecurityModule).
+   * background, and plain again the moment it is in front, where every screen can be captured.
    */
   override fun onPause() {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     super.onPause()
-    TaskState.left(this)
+    TaskState.left()
+    // Out of front no idle HTTP connection is kept, so none is pinged there (AppNetwork).
+    AppNetwork.toBack()
   }
 
   /**
    * The app is open: a light node answers again (TaskState clears every sign of a swipe from the recent apps), and the
-   * watch that notices the next swipe starts.
+   * watch that notices the next swipe starts. First, no idle HTTP connection from the background is reused (AppNetwork).
    */
   override fun onResume() {
+    AppNetwork.toFront()
     super.onResume()
     TaskState.opened(this)
     TaskState.watch(this)
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && !SecurityModule.secretScreenOn) {
-      window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-    }
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
   }
 
   // Android 7 to 10 keep no record of a removed task's end: the finishing activity notes it first (TaskState.finished).

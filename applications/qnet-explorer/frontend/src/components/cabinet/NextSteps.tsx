@@ -1,27 +1,26 @@
 'use client';
 
-// Where a wallet without a node on the network stands, and the one thing to do next, in plain words (owner, 29.09;
-// unified plan R1, R3 and R6): the state every source agrees on (src/lib/cabinet/wallet-activation.ts), never a fresh
+// Where a wallet without a node on the network stands, and the one thing to do next, in plain words:
+// the state every source agrees on (src/lib/cabinet/wallet-activation.ts), never a fresh
 // activation while any source knows of one or could not answer. A known burn shows its code first, then its next step
 // (src/lib/cabinet/burn-next.ts): for a light node, its record on the QNet network, registered with QNet Wallet's fresh
-// consent from any browser where the wallet is connected, a phone included (owner, 06.10), whichever way the burn was
-// made (shared contract C4: a payment address's burn completed from the site's record, a burn from the wallet's own
+// consent from any browser where the wallet is connected, a phone included, whichever way the burn was
+// made (a payment address's burn completed from the site's record, a burn from the wallet's own
 // Solana address with that address's owner bind, which QNet Wallet signs; docs/protocols/qnet-link-v1.md section 14);
 // a burn the QNet extension in this browser just made it records itself ("Record on the network" asks it again: its
 // qnet_activateNode answers a wallet that has its activation without burning and queues the record, sections 10 and
-// 14.10), with the phone's first steps while it waits, and the moment the network lists the node (owner, 30.09: the page
+// 14.10), with the phone's first steps while it waits, and the moment the network lists the node (the page
 // moves on by itself; CabinetProvider reads the network every few seconds meanwhile) "Link your phone" in numbered steps
 // with Link a device; for a super node, which only the QNet extension activates, its server with the node software
 // (docs/operators/running-a-node.md), never a phone. A wallet with nothing anywhere is offered both node types, the
 // super node through the extension only.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import Link from 'next/link';
 import { useWallet } from '@/contexts/AppContext';
 import Action from '@/components/ui/Action';
 import Copy from '@/components/ui/Copy';
 import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
-import { number, t, type MessageKey } from '@/lib/texts';
+import { number, type MessageKey, type T } from '@/lib/texts';
 import { burnNext } from '@/lib/cabinet/burn-next';
 import { consentBodyOf, ownBurnBodyOf, postConsent } from '@/lib/cabinet/consent-submit';
 import { verifyConsent } from '@/lib/cabinet/consent-verify';
@@ -41,6 +40,7 @@ import LinkDevice from './LinkDevice';
 import LinkWaiting from './LinkWaiting';
 import { shownTime } from './NodeStatus';
 import { Group, Next, Notes } from './parts';
+import { Link, useI18n } from '@/i18n/client';
 
 // How long the page waits for the record before it offers to ask the extension again.
 export const RECORD_AGAIN_MS = 3 * 60_000;
@@ -55,6 +55,7 @@ const CHECK_TEXT: Record<Check, MessageKey> = {
   server: 'check_server',
   extension: 'check_extension',
   solana: 'check_solana',
+  solana_address: 'check_solana_address',
 };
 
 // The node of wallet `qnet` on its way to the QNet network. `since`: when the extension answered (the kept
@@ -64,6 +65,7 @@ const CHECK_TEXT: Record<Check, MessageKey> = {
 export function Recording({ qnet, since, burnFinal = true, pending = false, askAgain = true }: {
   qnet: string; since: number | null; burnFinal?: boolean; pending?: boolean; askAgain?: boolean;
 }) {
+  const { t, say } = useI18n();
   const { choice, viewOnly, view, keepActivation, refreshActivation } = useCabinet();
   const { providerStatus, providerChannel, accounts, activateNode } = useWallet();
   const [shown] = useState(() => Date.now());
@@ -98,11 +100,11 @@ export function Recording({ qnet, since, burnFinal = true, pending = false, askA
   };
 
   return (
-    <Group title={t('next_record_title')}>
+    <Group title={say('next_record_title')}>
       {/* The extension's own record, or a registration the network holds (a payment address's too). */}
-      <Waiting>{t(pending || !askAgain ? 'registration_pending' : burnFinal ? 'next_recording' : 'ext_lead_pending')}</Waiting>
+      <Waiting>{say(pending || !askAgain ? 'registration_pending' : burnFinal ? 'next_recording' : 'ext_lead_pending')}</Waiting>
       <p className="note">{minutes < 1 ? t('next_waited_now') : t('next_waited', { minutes: number(minutes) })}</p>
-      {view.networkDown && choice?.qnet === qnet && <p className="note" role="status">{t('next_network_down')}</p>}
+      {view.networkDown && choice?.qnet === qnet && <p className="note" role="status">{say('next_network_down')}</p>}
       {/* Asking again is the extension's own way: a browser without it waits for the network, and a burn that does not
           end up registered comes back with Continue in QNet Wallet. */}
       {late && askAgain && extension && !viewOnly && (
@@ -114,20 +116,20 @@ export function Recording({ qnet, since, burnFinal = true, pending = false, askA
               {ask.phase === 'waiting' ? (
                 <Waiting>{t('wallet_extension_waiting')}</Waiting>
               ) : (
-                <div className="cab-next-act"><Action kind="solid" onClick={() => void again()}>{t('next_record_again')}</Action></div>
+                <div className="cab-next-act"><Action kind="solid" onClick={() => void again()}>{say('next_record_again')}</Action></div>
               )}
             </>
           ) : (
-            <p className="note">{t('next_record_other_wallet')}</p>
+            <p className="note">{say('next_record_other_wallet')}</p>
           )}
-          {ask.phase === 'failed' && <Failed>{t(ask.key)}</Failed>}
+          {ask.phase === 'failed' && <Failed>{say(ask.key)}</Failed>}
         </Next>
       )}
-      {ask.phase === 'asked' && <Answered>{t('next_record_asked')}</Answered>}
+      {ask.phase === 'asked' && <Answered>{say('next_record_asked')}</Answered>}
       {/* What needs no record goes on meanwhile; a payment address's registration runs on the phone that consented. */}
       {askAgain && (
         <>
-          <p>{t('next_phone_ready')}</p>
+          <p>{say('next_phone_ready')}</p>
           <ol className="cab-list">
             <PhoneReady />
           </ol>
@@ -139,10 +141,11 @@ export function Recording({ qnet, since, burnFinal = true, pending = false, askA
 
 // The phone's first steps, which need no record: QNet Wallet on it, with this wallet's recovery phrase.
 function PhoneReady() {
+  const { t, say } = useI18n();
   return (
     <>
       <li>
-        {t('next_link_1')} <Link href="/wallet">{t('guide_link_wallet')}</Link>
+        {say('next_link_1')} <Link href="/wallet">{t('guide_link_wallet')}</Link>
       </li>
       <li>{t('next_link_2')}</li>
     </>
@@ -153,17 +156,18 @@ function PhoneReady() {
 // steps. `onLinked`: Link a device right here (the Overview); otherwise, while the site sends link requests, a button to
 // the Device tab, where it is.
 export function LinkPhone({ onLinked }: { onLinked?: () => void }) {
+  const { t, say } = useI18n();
   const { phoneFlows, viewOnly } = useCabinet();
   return (
     <>
       <Group title={t('next_link_title')}>
-        <p>{t('next_link_lead')}</p>
+        <p>{say('next_link_lead')}</p>
         <ol className="cab-list">
           <PhoneReady />
-          <li>{t(phoneFlows ? 'next_link_3_qr' : 'next_link_3_app')}</li>
+          <li>{say(phoneFlows ? 'next_link_3_qr' : 'next_link_3_app')}</li>
         </ol>
         {!onLinked && phoneFlows && !viewOnly && <div className="cab-next-act"><Action kind="solid" href={TAB_HREF.device}>{t('action_link_device')}</Action></div>}
-        <p className="note">{t('next_link_done')}</p>
+        <p className="note">{say('next_link_done')}</p>
       </Group>
       {onLinked && phoneFlows && !viewOnly && <LinkDevice onLinked={onLinked} />}
     </>
@@ -175,16 +179,18 @@ export function LinkPhone({ onLinked }: { onLinked?: () => void }) {
 // the words of the step (a new device waiting for its first answer, a running node, a super node's server, or a node
 // whose status is not read yet).
 export function NodeNext() {
+  const { t, say } = useI18n();
   const { view } = useCabinet();
   const step = nextStep(view);
   if (step === 'link') return <LinkPhone />;
   const text: MessageKey = step === 'offline' ? 'next_offline' : step === 'answer' ? 'next_device_pending' : step === 'running' ? 'next_running'
     : step === 'server' ? 'next_super' : 'act_wallet_has_node';
-  return <Next action={<Action kind="solid" href={TAB_HREF.overview}>{t('next_open_overview')}</Action>}><p>{t(text)}</p></Next>;
+  return <Next action={<Action kind="solid" href={TAB_HREF.overview}>{t('next_open_overview')}</Action>}><p>{say(text)}</p></Next>;
 }
 
 // A command to type on the server, with Copy.
 function Command({ text }: { text: string }) {
+  const { t } = useI18n();
   return (
     <div className="cab-cmd">
       <pre>{text}</pre>
@@ -202,14 +208,15 @@ const NODE_CONTAINER = 'qnet-super';
 const OCTET = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
 const PRIVATE_IPV4 = '^(0|10|127)\\.|^169\\.254\\.|^172\\.(1[6-9]|2[0-9]|3[01])\\.|^192\\.168\\.|^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.|^(22[4-9]|2[3-5][0-9])\\.';
 
-// A super node's server, after its burn (R3): every step with its commands, as the node and its image do them today
-// (owner, 11.10; docs/operators/running-a-node.md): the server and its provider's firewall (the node's pre-flight cannot
+// A super node's server, after its burn: every step with its commands, as the node and its image do them today
+// (docs/operators/running-a-node.md): the server and its provider's firewall (the node's pre-flight cannot
 // see a closed inbound port, and published ports bypass the host's own firewall), the recovery phrase in a root-only
 // file typed with no shell history, the server's public IPv4 (written on the network at registration; peers then take
 // this node's connections from that address only), the image pulled and started with absolute paths, the check (its
 // height, its catching up, its activation and registration in the log, and what each failure means), a new release, and
 // the timeline. Never a phone. `nodeId`: the super node's id the log names, when known.
 export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: string; burnTx: string; burnAmount: number; nodeId?: string | null }) {
+  const { t, say } = useI18n();
   const server = 'free -m\ntimedatectl show -p NTPSynchronized --value';
   const seed = [
     `install -d -m 700 ${NODE_DIR}`,
@@ -269,15 +276,15 @@ export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: s
           <p className="note">{t('super_step_dedicated')}</p>
         </li>
         <li>
-          <p>{t('super_step_ip')}</p>
+          <p>{say('super_step_ip')}</p>
           <Command text={address} />
         </li>
         <li>
-          <p>{t('super_step_start')}</p>
+          <p>{say('super_step_start')}</p>
           <Command text={start} />
         </li>
         <li>
-          <p>{t('super_step_check')}</p>
+          <p>{say('super_step_check')}</p>
           <Command text={check} />
           {nodeId && <p className="note">{t('super_step_node_id', { id: nodeId })}</p>}
           <p className="note">{t('super_step_errors')}</p>
@@ -288,7 +295,7 @@ export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: s
         </li>
       </ol>
       <Notes>
-        <p className="note">{t('super_step_joined')}</p>
+        <p className="note">{say('super_step_joined')}</p>
         <p className="note">
           {t('ext_super_seed')}{' '}
           <a href={RUNNING_A_NODE} target="_blank" rel="noopener noreferrer">{t('ext_super_running')}</a>.
@@ -298,13 +305,14 @@ export function SuperNext({ code, burnTx, burnAmount, nodeId = null }: { code: s
   );
 }
 
-// The code of a known burn, shown first (R1), with the burn it comes from.
+// The code of a known burn, shown first, with the burn it comes from.
 function CodeCard({ burn }: { burn: KnownBurn }) {
+  const { t } = useI18n();
   return (
     <Group title={t('burned_title')}>
       {burn.code ? (
         <p className="ent-copy cab-code-line">
-          <span className="ent cab-code">{burn.code}</span>
+          <span className="ent cab-code" translate="no">{burn.code}</span>
           <Copy value={burn.code} />
         </p>
       ) : (
@@ -317,7 +325,7 @@ function CodeCard({ burn }: { burn: KnownBurn }) {
 }
 
 // What an answer to the finishing request that is no usable consent says, as the wallet's report.
-function answerNotice(answer: LinkAnswer, qnet: string): string {
+function answerNotice(answer: LinkAnswer, qnet: string, t: T): string {
   if (answer.status === 'linked') return t('act_linked_answer');
   if (answer.status === 'error' && answer.error) return t(`link_error_${answer.error}` as MessageKey);
   if (answer.status === 'ok') return t('act_mismatch', { wallet: shortAddress(qnet) });
@@ -325,7 +333,7 @@ function answerNotice(answer: LinkAnswer, qnet: string): string {
 }
 
 // What the register route's answer says, unless it recorded the node (admitted or registered).
-function outcomeNotice(outcome: SubmitOutcome): string | null {
+function outcomeNotice(outcome: SubmitOutcome, t: T): string | null {
   if (outcome.result === 'admitted' || outcome.result === 'registered') return null;
   if (outcome.result === 'stale') return t('act_stale');
   // The network takes the burn's owner bind only from its one-wallet-one-node gate on: no refusal, a calm note instead.
@@ -334,13 +342,14 @@ function outcomeNotice(outcome: SubmitOutcome): string | null {
   return t('act_refused', { code: outcome.code });
 }
 
-// A light burn of the wallet with no node yet, in any browser where the wallet is connected, a phone included (C4): QNet
+// A light burn of the wallet with no node yet, in any browser where the wallet is connected, a phone included: QNet
 // Wallet's fresh consent to register the wallet's light node with this burn. For a payment address's burn (`burner`
 // null) the site completes the registration from its record (the payment key's owner bind came with the burn); for a
 // burn made from the wallet's own Solana address `burner`, the request names that address and QNet Wallet signs its
 // owner bind with the same phrase's Solana key beside the consent, so the page posts the whole body. No key is needed
 // here. The request names the wallet, and only that wallet's answer for this very burn (and burner) is taken.
 export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn: KnownBurn; burner?: string | null }) {
+  const { t, say } = useI18n();
   const { viewOnly, refreshActivation } = useCabinet();
   const device = useDeviceKind();
   const deps = useMemo(() => ({ fetchFn: (url: string, init?: RequestInit) => fetch(url, init) }), []);
@@ -390,19 +399,19 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
     void post(consent);
   }, [answer, usable, qnet, burn.burnTx, burn.burnAmount, burner, post]);
 
-  if (viewOnly) return <Next><p>{t('burned_payment_lead')}</p></Next>;
+  if (viewOnly) return <Next><p>{say('burned_payment_lead')}</p></Next>;
   if (outcome && (outcome.result === 'admitted' || outcome.result === 'registered')) {
     return <Recording qnet={qnet} since={null} pending={outcome.result === 'registered'} askAgain={false} />;
   }
-  const notice = answer && !usable ? answerNotice(answer, qnet) : outcome ? outcomeNotice(outcome) : null;
+  const notice = answer && !usable ? answerNotice(answer, qnet, t) : outcome ? outcomeNotice(outcome, t) : null;
   const waiting = session.state.phase === 'starting' || session.state.phase === 'waiting' || session.state.phase === 'failed';
   return (
-    <Group title={t('act_link_title')}>
-      <p>{t('burned_payment_lead')}</p>
+    <Group title={say('act_link_title')}>
+      <p>{say('burned_payment_lead')}</p>
       {notice && <Failed>{notice}</Failed>}
-      {outcome?.result === 'retry' && outcome.code === 'bind_v2_pending' && <p className="note">{t('act_bind_v2_pending')}</p>}
+      {outcome?.result === 'retry' && outcome.code === 'bind_v2_pending' && <p className="note">{say('act_bind_v2_pending')}</p>}
       {posting ? (
-        <Waiting>{t('act_recording')}</Waiting>
+        <Waiting>{say('act_recording')}</Waiting>
       ) : outcome?.result === 'retry' && body ? (
         <div className="cab-next-act"><Action kind="solid" onClick={() => void post(body)}>{t('try_again')}</Action></div>
       ) : waiting ? (
@@ -416,7 +425,7 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
         />
       ) : (
         <div className="actions cab-next-act">
-          <Action kind="solid" onClick={() => open(!device?.phone)} disabled={!device}>{t(device?.phone ? 'act_link_open' : 'act_link_show_qr')}</Action>
+          <Action kind="solid" onClick={() => open(!device?.phone)} disabled={!device}>{say(device?.phone ? 'act_link_open' : 'act_link_show_qr')}</Action>
           {device?.phone && <Action kind="text" onClick={() => open(true)}>{t('wallet_other_device')}</Action>}
         </div>
       )}
@@ -429,6 +438,7 @@ export function FinishLight({ qnet, burn, burner = null }: { qnet: string; burn:
 // is registered with QNet Wallet from this browser, whatever it is; only a burn the extension here just made and
 // records itself waits for it.
 function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
+  const { t, say } = useI18n();
   const { activation, choice, viewOnly, view } = useCabinet();
   const { providerStatus, providerChannel, accounts } = useWallet();
   const records = usePaymentRecords();
@@ -445,7 +455,7 @@ function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
         burn.code && (
           <>
             {/* The network sees the server before its registration lands: it is catching up (best effort, never a no). */}
-            {view.superConnected && <Answered>{t('super_connected')}</Answered>}
+            {view.superConnected && <Answered>{say('super_connected')}</Answered>}
             <SuperNext code={burn.code} burnTx={burn.burnTx} burnAmount={burn.burnAmount} nodeId={superNodeId(qnet)} />
           </>
         )
@@ -464,6 +474,7 @@ function Burned({ burn, qnet }: { burn: KnownBurn; qnet: string }) {
 
 // A state that could not be read: which check did not answer, Try again, and a read again every half minute.
 function Unknown({ missing, update }: { missing: Check[]; update: boolean }) {
+  const { t, say } = useI18n();
   const { refreshActivation } = useCabinet();
   useEffect(() => {
     const timer = window.setInterval(refreshActivation, UNKNOWN_RETRY_MS);
@@ -471,19 +482,20 @@ function Unknown({ missing, update }: { missing: Check[]; update: boolean }) {
   }, [refreshActivation]);
   return (
     <Next alert action={<Action kind="text" onClick={refreshActivation}>{t('try_again')}</Action>}>
-      {missing.map((check) => <p key={check} className="rq-failed">{t(CHECK_TEXT[check])}</p>)}
-      {update && <p>{t('state_update_extension')}</p>}
+      {missing.map((check) => <p key={check} className="rq-failed">{say(CHECK_TEXT[check])}</p>)}
+      {update && <p>{say('state_update_extension')}</p>}
       <p>{t('state_unknown')}</p>
       <p className="note">{t('state_retry_note')}</p>
     </Next>
   );
 }
 
-// A section's card for a wallet without a node on the QNet network (R1): the state every source agrees on, with its
-// next step; the two node types only when nothing is known anywhere (R2), the super node activated only in the QNet
+// A section's card for a wallet without a node on the QNet network: the state every source agrees on, with its
+// next step; the two node types only when nothing is known anywhere, the super node activated only in the QNet
 // extension. `pending`: the light registration the network is recording (the state says so too). `overview`: the card
 // is on the Overview, which shows the activation's details itself.
 export function NoNode({ pending, overview = false }: { pending: boolean; overview?: boolean }) {
+  const { t, say } = useI18n();
   const { choice, viewOnly, view } = useCabinet();
   if (!choice) return null;
   const card = (children: ReactNode, alert = false, action?: ReactNode) => <Next alert={alert} action={action}>{children}</Next>;
@@ -491,13 +503,13 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
     case 'loading':
       return <Waiting>{t('state_loading')}</Waiting>;
     case 'locked':
-      return card(<p>{t(view.lockedBy === 'not_connected' ? 'state_not_connected' : 'state_locked')}</p>);
+      return card(<p>{say(view.lockedBy === 'not_connected' ? 'state_not_connected' : 'state_locked')}</p>);
     case 'unknown':
       return <Unknown missing={view.missing} update={view.extensionUpdate} />;
     case 'reserved':
       return view.here
         ? card(<p>{t('state_reserved_here')}</p>, false, !viewOnly && <Action kind="solid" href={TAB_HREF.activate}>{t('code_continue')}</Action>)
-        : card(<p>{t('state_reserved', { time: shownTime(view.until) })}</p>);
+        : card(<p>{t('state_reserved', { time: shownTime(view.until, t) })}</p>);
     case 'sending':
       return <Waiting>{t('state_sending')}</Waiting>;
     case 'burned':
@@ -530,7 +542,7 @@ export function NoNode({ pending, overview = false }: { pending: boolean; overvi
           </Next>
           <Notes>
             <p className="note">{t('one_code')}</p>
-            <p className="note">{t('no_node_super_where')}</p>
+            <p className="note">{say('no_node_super_where')}</p>
           </Notes>
         </>
       );

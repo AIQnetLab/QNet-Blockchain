@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The system splash's icon (Android 12 and later): its canvas is 288 dp, so 48 dp of inset on each side draws the launch
+     screen's mark at its 192 dp, centred, as launch_screen.xml and the app's first screen draw it -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/splash_logo"
+    android:inset="48dp" />

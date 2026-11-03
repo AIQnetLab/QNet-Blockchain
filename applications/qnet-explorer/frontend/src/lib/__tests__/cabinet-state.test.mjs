@@ -1,4 +1,4 @@
-// The wallet's state follows the wallet, not the way it was connected (owner, 29.09; R1): the network and the explorer's
+// The wallet's state follows the wallet, not the way it was connected: the network and the explorer's
 // archive, the site's record of its activation (with the search of its Solana address) and the QNet extension that holds
 // it, for every browser and device, and on top what this browser keeps (the extension's answer, an activation made
 // here). A wallet with an activation is never offered one from scratch; an unfinished activation resumes at its step in
@@ -7,15 +7,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { STAGES, TRANSITIONS, isUnfinished } from '../cabinet/flow.ts';
 import { activationFacts, browserActivation, knownOfKept } from '../cabinet/code-check.ts';
 import { visibleTabs, landingTab } from '../cabinet/tabs.ts';
-import { TEXTS } from '../texts.ts';
+import { code, read } from './source.mjs';
+import { TEXTS, shows } from './texts-helper.mjs';
 
-const SRC = new URL('../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n');
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 const WALLET = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const BURN = { tx: '5'.repeat(88), lastValidBlockHeight: 1, amount: 1500 };
 
@@ -62,7 +59,7 @@ test('a wallet with an activation is never offered one from scratch', () => {
   assert.match(page, /if \(!offer\) return;\s*setWorking\(true\);\s*const open = await act\.paymentOpen\(choice\.qnet, deps\);\s*if \(open !== true\) \{[^}]*\}\s*const created = await createPaymentKey\(\{ wallet: choice\.qnet \}\);/);
   // A funded payment address burns only while the chosen, connected wallet's state is still `none` (or this browser holds
   // its reservation): a known burn, a source loading, locked or unreachable, or another browser's reservation shows the
-  // state in place of Burn, and the step itself refuses (R6).
+  // state in place of Burn, and the step itself refuses.
   assert.match(page, /const mayBurn = choice !== null && !viewOnly && \(offer \|\| \(view\.state === 'reserved' && view\.here\)\);/);
   assert.match(page, /const burn = \(\) => withRecord\(async \(r\) => \{\s*if \(price === null \|\| !mayBurn \|\| choice === null\) return undefined;/);
   // While QNet Wallet is asked to confirm the wallet again, Burn waits for it.
@@ -87,24 +84,25 @@ test('the Overview shows what is known of the wallet\'s activation, from the net
   assert.match(home, /const known = useWalletActivation\('light'\);/);
   assert.match(home, /const known = useWalletActivation\('super'\);/);
   // Recorded: the node, its balance with Move, the details, the latest epochs; a super node's own summary with its
-  // balance and Move too (R4; owner, 12.10).
-  for (const part of ["t('overview_title')", "t('balance_title')", '<NodeDetails nodeId={nodeId}', '<RecentEpochs nodeId={nodeId} />', "t('super_title')", "t('balance_lead')", '<Move']) assert.ok(home.includes(part), part);
+  // balance and Move too.
+  for (const part of ["t('overview_title')", "t('balance_title')", '<NodeDetails nodeId={nodeId}', '<RecentEpochs nodeId={nodeId} />', "say('balance_lead')", '<Move']) assert.ok(home.includes(part), part);
+  assert.ok(shows(home, "serverWord(nodeId, 'title')"));
   const details = code('components/cabinet/NodeDetails.tsx');
-  for (const key of ['details_title', 'code_field_status', 'ext_field_type', 'act_code', 'act_burn_tx', 'code_field_amount']) assert.ok(details.includes(`t('${key}')`), key);
-  assert.match(home, /lightStatusText\(state, known\.facts\?\.height \?\? null\)/);
+  for (const key of ['details_title', 'code_field_status', 'ext_field_type', 'act_code', 'act_burn_tx', 'code_field_amount']) assert.ok(shows(details, `'${key}'`), key);
+  assert.match(home, /lightStatusText\(state, known\.facts\?\.height \?\? null, i18n\)/);
 });
 
 test('another browser\'s activation: the site\'s record follows the wallet, and the page says where it goes on', () => {
   // The server keeps a record per wallet (activation-registry.ts); another browser's reservation or burn on its way shows
   // here as such, never as a fresh activation.
   const steps = code('components/cabinet/NextSteps.tsx');
-  assert.match(steps, /<p>\{t\('state_reserved', \{ time: shownTime\(view\.until\) \}\)\}<\/p>/);
+  assert.match(steps, /<p>\{t\('state_reserved', \{ time: shownTime\(view\.until, t\) \}\)\}<\/p>/);
   assert.match(TEXTS.state_reserved, /^An activation of this wallet is starting in another browser or on another device\./);
-  // A2: a payment address's final burn is the wallet's record like the extension's; any browser where the wallet is
+  // A payment address's final burn is the wallet's record like the extension's; any browser where the wallet is
   // connected registers the node with QNet Wallet's fresh consent, and the browser that holds the record goes on there.
   for (const key of ['state_payment_waiting', 'burned_payment_finish']) assert.equal(Object.prototype.hasOwnProperty.call(TEXTS, key), false, key);
   assert.doesNotMatch(steps, /payment_waiting/);
-  // Owner, 06.10: every light burn of the wallet with no node goes on with QNet Wallet from this browser, a phone
+  // Every light burn of the wallet with no node goes on with QNet Wallet from this browser, a phone
   // included: a payment address's from the site's record, one from the wallet's own Solana address with that address
   // named in the request (burn-next.ts; cabinet-own-burn.test.mjs routes every source and way).
   assert.match(steps, /\) : next\.step === 'finish' \? \(\s*<FinishLight qnet=\{qnet\} burn=\{burn\} burner=\{next\.burner\} \/>/);
@@ -122,8 +120,8 @@ test('another browser\'s activation: the site\'s record follows the wallet, and 
   assert.match(steps, /\{t\('next_resume'\)\}/);
   // The provider reads the record for every wallet, with the search of its Solana address at most once per SCAN_CACHE_MS.
   const provider = code('components/cabinet/CabinetProvider.tsx');
-  assert.match(provider, /fetch\(`\/api\/cabinet\/activation\/\$\{encodeURIComponent\(wallet\)\}\$\{withScan \? `\?solana=\$\{encodeURIComponent\(solana\)\}` : ''\}`, REQUEST\)/);
-  // A search that did not finish is asked again after two minutes; a record that cannot be read is no "none" (R6).
+  assert.match(provider, /fetch\(`\/api\/cabinet\/activation\/\$\{encodeURIComponent\(wallet\)\}\$\{withScan \? `\?solana=\$\{encodeURIComponent\(solana\)\}` : ''\}`, siteRequest\(\)\)/);
+  // A search that did not finish is asked again after two minutes; a record that cannot be read is no "none".
   assert.match(provider, /const fresh = kept && kept\.key === key && kept\.view\.complete && now - kept\.at < SCAN_CACHE_MS;/);
   assert.match(provider, /cur\.wallet === wallet && cur\.read\.phase === 'ok' && cur\.read\.value\.state !== 'none' \? cur : \{ wallet, read: \{ phase: 'unavailable' \} \}/);
   // So is the network's "no node": a failed read keeps a node it listed, never a "none".
@@ -155,10 +153,10 @@ test('every expired piece is asked for again in one tap, the progress kept', () 
   assert.match(page, /if \(next === null\) setNotice\(from\.burn \? 'act_returned' : 'act_closed'\);/);
   assert.match(page, /<Action kind="solid" onClick=\{\(\) => void start\(\)\} disabled=\{working \|\| !device\}>\{t\('act_start'\)\}<\/Action>/);
   assert.match(TEXTS.act_closed, /To start again, make a new payment address\.$/);
-  // A wallet that has its node or its activation gets no start card, so its notice offers no new address (owner, 29.09).
+  // A wallet that has its node or its activation gets no start card, so its notice offers no new address.
   assert.match(page, /\} else if \(!record && !offer\) \{/);
   assert.match(page, /const shown: MessageKey \| null = notice === 'act_closed' && !record && !offer \? 'act_closed_has_node' : notice;/);
-  assert.match(page, /\{shown && shown !== 'act_refund_failed' && <p className="note cab-notice" role="status">\{t\(shown\)\}<\/p>\}/);
+  assert.match(page, /\{shown && shown !== 'act_refund_failed' && <p className="note cab-notice" role="status">\{say\(shown\)\}<\/p>\}/);
   assert.doesNotMatch(TEXTS.act_closed_has_node, /make a new payment address/);
   assert.match(TEXTS.act_closed_has_node, /^The activation ended and its payment address is deleted\. This wallet already has a node or an activation, so it needs no new payment address\.$/);
   // The extension's window closed or timed out: Try again on the same step, while the wallet still has nothing anywhere;
@@ -171,5 +169,5 @@ test('every expired piece is asked for again in one tap, the progress kept', () 
   assert.match(noNode, /const timer = window\.setInterval\(refreshActivation, UNKNOWN_RETRY_MS\);/);
   assert.match(noNode, /const UNKNOWN_RETRY_MS = 30_000;/);
   const steps = code('components/cabinet/NextSteps.tsx');
-  assert.match(steps, /\{ask\.phase === 'waiting' \? \(\s*<Waiting>\{t\('wallet_extension_waiting'\)\}<\/Waiting>\s*\) : \(\s*<div className="cab-next-act"><Action kind="solid" onClick=\{\(\) => void again\(\)\}>\{t\('next_record_again'\)\}<\/Action><\/div>/);
+  assert.match(steps, /\{ask\.phase === 'waiting' \? \(\s*<Waiting>\{t\('wallet_extension_waiting'\)\}<\/Waiting>\s*\) : \(\s*<div className="cab-next-act"><Action kind="solid" onClick=\{\(\) => void again\(\)\}>\{say\('next_record_again'\)\}<\/Action><\/div>/);
 });

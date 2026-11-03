@@ -1,4 +1,4 @@
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Base application theme. -->
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
@@ -6,6 +6,10 @@
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
         <!-- Dark background with icon -->
         <item name="android:windowBackground">@drawable/launch_screen</item>
+        <!-- Android 12 and later open with the system's splash: the same mark at the same size and place as the launch
+             screen and the app's first screen, on the same background -->
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/splash_background_color</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31">@drawable/splash_icon</item>
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowContentOverlay">@null</item>
         <!-- The system bars in the app's background colour -->

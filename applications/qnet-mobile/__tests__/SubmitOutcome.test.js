@@ -80,7 +80,7 @@ describe('an unanswered submit', () => {
     expect(r.replaced).toBeUndefined();
   });
 
-  // L-10: a history read that failed says nothing, so History never marks a landed send "Not found" on it.
+  // A history read that failed decides nothing: the row stays Pending until the chain answers by its nonce.
   it('learns nothing when no node gives the history, unlike a history that lists no row at that nonce', async () => {
     const wm = bare();
     for (const history of [{ ok: false, data: null }, { ok: true, data: {} }, null]) {

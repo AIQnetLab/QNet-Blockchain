@@ -1,4 +1,4 @@
-// My node's two pictures of the latest epochs (B-SPEC 5.19): the last 12 settled epochs as a strip of cells, and what
+// My node's two pictures of the latest epochs: the last 12 settled epochs as a strip of cells, and what
 // each of the latest 16 added to the node balance, as bars with a marker at the newest one moved to the wallet. The rows
 // are the history's, newest first. Pure.
 

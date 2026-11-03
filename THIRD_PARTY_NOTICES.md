@@ -197,7 +197,7 @@ The direct dependencies of `applications/qnet-mobile/package.json`.
 | `react-native-keychain` | MIT | OS-backed secure storage for key material |
 | `react-native-get-random-values`, `react-native-quick-base64` | MIT | Secure randomness and Base64 |
 | `@react-native-async-storage/async-storage` | MIT | Local persistence |
-| `@react-native-firebase/app`, `@react-native-firebase/messaging` | Apache-2.0 | Silent data messages that wake a linked light node; the app shows no notification |
+| `@react-native-firebase/app`, `@react-native-firebase/messaging` | Apache-2.0 | Silent data messages that wake a linked light node; the app shows no notification (messaging patched by `patches/@react-native-firebase+messaging+23.7.0.patch`) |
 | `react-native-background-fetch` | MIT | Background execution for Light node pings |
 | `com.google.android.play:integrity` (Android library) | Play Integrity API Terms of Service | The integrity token and Google Play's dialogs in a light node's device check |
 | `androidx.biometric:biometric` (Android library) | Apache-2.0 | The system biometric prompt that unlocks the vault's biometric key on Android |
@@ -236,12 +236,8 @@ The direct dependencies of `frontend/package.json`.
 | `bs58` | MIT | Base58 of Solana addresses and signatures |
 | `js-sha3` | MIT | SHA3-256 in the browser |
 | `tweetnacl` | Unlicense | Ed25519 signature check of DAO votes |
-| `next-themes` | MIT | Theming |
 | `tailwindcss-animate`, `autoprefixer`, `postcss-selector-parser`, and `tailwindcss`, `postcss` (dev only) | MIT | Styling |
-| `@radix-ui/react-dialog`, `@radix-ui/react-dropdown-menu`, `@radix-ui/react-label`, `@radix-ui/react-slot`, `@radix-ui/react-tabs` | MIT | UI primitives |
-| `clsx`, `tailwind-merge`, `date-fns` | MIT | Utility helpers |
-| `class-variance-authority` | Apache-2.0 | Component variants |
-| `lucide-react` | ISC | Icons |
+| `date-fns` | MIT | Utility helpers |
 | `@biomejs/biome` (dev only) | MIT OR Apache-2.0 | Formatting and linting |
 | `eslint`, `eslint-config-next`, `@eslint/eslintrc`, `@types/*` (dev only) | MIT | Linting and types |
 | `@swc/helpers`, `typescript` (dev only) | Apache-2.0 | Build helpers and type checking |

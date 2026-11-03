@@ -1,6 +1,7 @@
 // Legacy Solana messages without @solana/web3.js or @solana/spl-token, shared by the faucet (src/server/solana-tx.ts
 // signs with its key) and the node cabinet (src/lib/cabinet/burn-tx.ts, signed in the browser by the payment key;
-// src/server/cabinet/solana-proxy.ts reads them back before it forwards one). Instructions: Compute Budget, System
+// src/server/cabinet/solana-proxy.ts reads them back before it forwards one, and the wallets' relay theirs,
+// src/lib/wallet-solana-tx.ts). Instructions: Compute Budget, System
 // transfer, SPL Token transfer, burn and close, the idempotent Associated Token Account create and Memo. Account
 // order, message and wire bytes equal what those libraries build (src/lib/__tests__/solana-tx.test.mjs and
 // cabinet-burn-tx.test.mjs check the vectors they generated). No network access and no node: or browser-only API.
@@ -31,6 +32,19 @@ export interface Instruction {
   programId: string;
   keys: AccountMeta[];
   data: Uint8Array;
+}
+
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+// Canonical base64 (the form a wallet sends a transaction or a message in); null for anything else.
+export function decodeBase64(text: string): Uint8Array | null {
+  if (text.length % 4 !== 0 || !B64_RE.test(text)) return null;
+  try {
+    const bytes = Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+    return btoa(String.fromCharCode(...bytes)) === text ? bytes : null;
+  } catch {
+    return null;
+  }
 }
 
 // A base58 string that decodes to exactly 32 bytes (a public key, a program id or a blockhash); null otherwise.
@@ -266,14 +280,25 @@ export interface ParsedInstruction {
   data: Uint8Array;
 }
 
-export interface ParsedTransaction {
-  signatures: Uint8Array[];
+export interface ParsedMessage {
   message: Uint8Array;
   feePayer: string;
   signers: string[];
+  // Every account the message lists, with its role, in the message's order.
+  accounts: AccountMeta[];
   blockhash: string;
   instructions: ParsedInstruction[];
 }
+
+export interface ParsedTransaction extends ParsedMessage {
+  signatures: Uint8Array[];
+}
+
+// The instruction names exactly these accounts, in this order.
+export const keysAre = (ix: ParsedInstruction, keys: string[]): boolean =>
+  ix.accounts.length === keys.length && ix.accounts.every((a, i) => a.pubkey === keys[i]);
+
+export const bytesEqual = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
 
 // A cursor over bytes; every read past the end throws.
 function reader(bytes: Uint8Array) {
@@ -301,8 +326,61 @@ function reader(bytes: Uint8Array) {
   return { take, byte, shortVec: shortVecValue, offset: () => at, done: () => at === bytes.length };
 }
 
-// A legacy transaction's wire bytes read back: signatures, the message, its accounts with their roles, and its
+// The message from the reader's position to the end of `bytes`; throws past the end.
+function readMessage(r: ReturnType<typeof reader>, bytes: Uint8Array): ParsedMessage | null {
+  const messageStart = r.offset();
+  const [required, readonlySigned, readonlyUnsigned] = [r.byte(), r.byte(), r.byte()];
+  // A versioned message starts with the 0x80 bit set.
+  if (required & 0x80 || required === 0) return null;
+  const accountCount = r.shortVec();
+  if (accountCount < required || readonlySigned >= required || readonlyUnsigned > accountCount - required) return null;
+  const accounts: AccountMeta[] = [];
+  for (let i = 0; i < accountCount; i += 1) {
+    const isSigner = i < required;
+    const isWritable = isSigner ? i < required - readonlySigned : i < accountCount - readonlyUnsigned;
+    accounts.push({ pubkey: bs58.encode(r.take(32)), isSigner, isWritable });
+  }
+  if (new Set(accounts.map((a) => a.pubkey)).size !== accounts.length) return null;
+  const blockhash = bs58.encode(r.take(32));
+  const count = r.shortVec();
+  const instructions: ParsedInstruction[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const programIndex = r.byte();
+    if (programIndex >= accountCount) return null;
+    const keyCount = r.shortVec();
+    const metas: AccountMeta[] = [];
+    for (let k = 0; k < keyCount; k += 1) {
+      const at = r.byte();
+      if (at >= accountCount) return null;
+      metas.push({ ...accounts[at] });
+    }
+    const data = r.take(r.shortVec()).slice();
+    instructions.push({ programId: accounts[programIndex].pubkey, accounts: metas, data });
+  }
+  if (!r.done()) return null;
+  return {
+    message: bytes.slice(messageStart),
+    feePayer: accounts[0].pubkey,
+    signers: accounts.slice(0, required).map((a) => a.pubkey),
+    accounts,
+    blockhash,
+    instructions,
+  };
+}
+
+// A legacy message read back (one a wallet asks the fee of, unsigned): its accounts with their roles and its
 // instructions. Null for anything else (a versioned message, trailing bytes, an index out of range, too long).
+export function parseLegacyMessage(message: Uint8Array): ParsedMessage | null {
+  if (!(message instanceof Uint8Array) || message.length > PACKET_DATA_SIZE) return null;
+  try {
+    return readMessage(reader(message), message);
+  } catch {
+    return null;
+  }
+}
+
+// A legacy transaction's wire bytes read back: signatures, then the message as parseLegacyMessage reads it, with one
+// signature for each signer the message requires.
 export function parseLegacyTransaction(wire: Uint8Array): ParsedTransaction | null {
   if (!(wire instanceof Uint8Array) || wire.length > PACKET_DATA_SIZE) return null;
   try {
@@ -310,44 +388,8 @@ export function parseLegacyTransaction(wire: Uint8Array): ParsedTransaction | nu
     const sigCount = r.shortVec();
     const signatures: Uint8Array[] = [];
     for (let i = 0; i < sigCount; i += 1) signatures.push(r.take(64));
-    const messageStart = r.offset();
-    const [required, readonlySigned, readonlyUnsigned] = [r.byte(), r.byte(), r.byte()];
-    // A versioned message starts with the 0x80 bit set.
-    if (required & 0x80 || required === 0 || required !== sigCount) return null;
-    const accountCount = r.shortVec();
-    if (accountCount < required || readonlySigned >= required || readonlyUnsigned > accountCount - required) return null;
-    const accounts: AccountMeta[] = [];
-    for (let i = 0; i < accountCount; i += 1) {
-      const isSigner = i < required;
-      const isWritable = isSigner ? i < required - readonlySigned : i < accountCount - readonlyUnsigned;
-      accounts.push({ pubkey: bs58.encode(r.take(32)), isSigner, isWritable });
-    }
-    if (new Set(accounts.map((a) => a.pubkey)).size !== accounts.length) return null;
-    const blockhash = bs58.encode(r.take(32));
-    const count = r.shortVec();
-    const instructions: ParsedInstruction[] = [];
-    for (let i = 0; i < count; i += 1) {
-      const programIndex = r.byte();
-      if (programIndex >= accountCount) return null;
-      const keyCount = r.shortVec();
-      const metas: AccountMeta[] = [];
-      for (let k = 0; k < keyCount; k += 1) {
-        const at = r.byte();
-        if (at >= accountCount) return null;
-        metas.push({ ...accounts[at] });
-      }
-      const data = r.take(r.shortVec()).slice();
-      instructions.push({ programId: accounts[programIndex].pubkey, accounts: metas, data });
-    }
-    if (!r.done()) return null;
-    return {
-      signatures,
-      message: wire.slice(messageStart),
-      feePayer: accounts[0].pubkey,
-      signers: accounts.slice(0, required).map((a) => a.pubkey),
-      blockhash,
-      instructions,
-    };
+    const parsed = readMessage(r, wire);
+    return parsed && parsed.signers.length === sigCount ? { ...parsed, signatures } : null;
   } catch {
     return null;
   }

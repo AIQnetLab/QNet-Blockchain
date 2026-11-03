@@ -174,7 +174,7 @@ export default Object.freeze({
   historyNotFound: 'Non trovata',
   historyUnverified: 'Non verificata',
   historyDroppedLead: 'QNet Blockchain non conserva più questa transazione e non è andata a buon fine. Non è stato speso nulla; il tuo prossimo invio prende il suo posto.',
-  historyUnverifiedLead: 'L’explorer elenca questa transazione, ma i nodi di QNet Blockchain no: potrebbe essere più vecchia di quanto conservano.',
+  historyUnverifiedLead: 'L’explorer elenca questa transazione, ma i nodi di QNet Blockchain no.',
   historyTokenUnverifiedLead: 'L’explorer elenca questo trasferimento di token, ma il wallet non è ancora riuscito a dimostrarlo su QNet Blockchain.',
   historyReplacedLead: 'Un’altra transazione di questo portafoglio ha preso il suo nonce: questa non potrà mai andare a buon fine.',
   historyType: 'Tipo',

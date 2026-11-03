@@ -4,6 +4,7 @@
 
 import { isAddressShape } from './entity.ts';
 import { ago, amount, epochMs, int, qnc, short } from './format.ts';
+import type { T } from './texts.ts';
 
 // ---------------------------------------------------------------- latest blocks
 
@@ -69,8 +70,8 @@ export function headBlock(head: { height: number; hash: string | null; timestamp
 }
 
 // A block's transaction count as the live lists write it: "1 tx", "3 txs", "—" while not known.
-export function txCountText(count: number | null): string {
-  return count === null ? '—' : `${int(count)} ${count === 1 ? 'tx' : 'txs'}`;
+export function txCountText(count: number | null, t: T): string {
+  return count === null ? '—' : t(count === 1 ? 'txs_one' : 'txs_many', { count: int(count) });
 }
 
 // A row a read of the newest blocks can still complete: its hash or its producer is not known yet.
@@ -145,12 +146,16 @@ const CHAIN_START_MS = 1_704_067_200_000;
 
 // "now", "5s ago", "3m ago", "2d ago"; "Genesis" for a record without a real time. The index's 64-bit columns can
 // arrive as digit strings.
-export function ageText(ts: number | string | null | undefined, now: number): string {
+export function ageText(ts: number | string | null | undefined, now: number, t: T): string {
   const n = Number(ts);
-  if (!n) return 'Genesis';
+  if (!n) return t('genesis');
   const ms = epochMs(n);
-  return ms < CHAIN_START_MS ? 'Genesis' : ago(now - ms);
+  return ms < CHAIN_START_MS ? t('genesis') : ago(now - ms, t);
 }
+
+// Each form an age takes in the page's language, at its longest ("il y a 59 min"): an age's column holds the longest
+// (components/explorer/columns.tsx timeCol).
+export const ageForms = (t: T): string[] => [t('genesis'), t('ago_now'), t('ago_s', { n: 59 }), t('ago_m', { n: 59 }), t('ago_h', { n: 23 }), t('ago_d', { n: 999 })];
 
 // ---------------------------------------------------------------- amounts and names
 
@@ -169,11 +174,12 @@ export function splitAmount(text: string | null | undefined): AmountParts | null
 }
 
 // A list row's amount from its raw values, exact like every other amount on the site (format.ts): a token transfer's
-// in the token's decimals with its symbol, else the QNC moved; none for a transaction that moves nothing.
-export function rowAmount(row: { amount_raw?: string | null; tokenContract?: string | null; tokenSymbol?: string | null; tokenAmountRaw?: string | null; tokenDecimals?: number | null }): AmountParts | null {
+// in the token's decimals with its symbol (`unnamed` for a token without one), else the QNC moved; none for a
+// transaction that moves nothing.
+export function rowAmount(row: { amount_raw?: string | null; tokenContract?: string | null; tokenSymbol?: string | null; tokenAmountRaw?: string | null; tokenDecimals?: number | null }, unnamed: string): AmountParts | null {
   if (row.tokenContract && row.tokenAmountRaw) {
     const value = amount(row.tokenAmountRaw, row.tokenDecimals ?? 9);
-    return value === '0' ? null : { value, unit: row.tokenSymbol || 'Token', token: row.tokenContract };
+    return value === '0' ? null : { value, unit: row.tokenSymbol || unnamed, token: row.tokenContract };
   }
   const value = qnc(row.amount_raw ?? '0');
   return value === '0' ? null : { value, unit: 'QNC' };
@@ -199,23 +205,29 @@ export function partyKind(value: string | null | undefined): PartyKind {
 }
 
 // A transaction's status as its page writes it, only once its record is read: a record still loading is no pending one.
-export function txStatusView(status: string | null | undefined, read: boolean): { value: string; sub: string; done: boolean } | null {
+export function txStatusView(status: string | null | undefined, read: boolean, t: T): { value: string; sub: string; done: boolean } | null {
   if (!read) return null;
-  return status === 'confirmed' ? { value: 'Confirmed', sub: 'In a block', done: true } : { value: 'Pending', sub: 'Waiting for a block', done: false };
+  return status === 'confirmed'
+    ? { value: t('tx_confirmed'), sub: t('tx_in_block'), done: true }
+    : { value: t('tx_pending'), sub: t('tx_waiting_block'), done: false };
 }
 
 // ---------------------------------------------------------------- the list's filter and sort
 
 // The datum beside "All transactions" when the list is not the live first page: what it shows and in which order.
-export function listSummary(labels: readonly string[], ascending: boolean, page: number): string {
-  const order = ascending ? 'oldest first' : 'newest first';
-  const what = labels.length > 0 ? labels.join(', ') : page > 1 ? `Page ${int(page)}` : 'All types';
-  return `${what} · ${order}`;
+export function listSummary(labels: readonly string[], ascending: boolean, page: number, t: T): string {
+  const what = labels.length > 0 ? joined(labels, 'list_and', t) : page > 1 ? t('list_page', { page: int(page) }) : t('list_all_types');
+  return t(ascending ? 'list_oldest' : 'list_newest', { what });
 }
 
 // The empty list's sentence.
-export function emptyListText(labels: readonly string[]): string {
-  return labels.length > 0 ? `No ${labels.join(' or ')} transactions yet` : 'Waiting for activity on QNet Blockchain…';
+export function emptyListText(labels: readonly string[], t: T): string {
+  return labels.length > 0 ? t('list_empty_types', { types: joined(labels, 'list_or', t) }) : t('list_waiting');
+}
+
+// Names one after another, as the page's language joins two of them ("A, B", "A or B").
+function joined(names: readonly string[], how: 'list_and' | 'list_or', t: T): string {
+  return names.reduce((all, name) => t(how, { a: all, b: name }));
 }
 
 // ---------------------------------------------------------------- search suggestions
@@ -230,6 +242,12 @@ export interface Suggestion {
   logo?: string;
 }
 
+// A token's suggestion as the server sends it: its symbol and name exactly as the index has them, empty when the token
+// has none, never a word standing in for them; the page writes its own words for what is missing, in its language.
+export function tokenSuggestion(token: { symbol: string; name: string; logo: string }, contract: string): Suggestion {
+  return { type: 'token', label: token.symbol, sublabel: token.name, href: `/explorer/token/${contract}`, symbol: token.symbol, address: contract, logo: token.logo };
+}
+
 // The entity a suggestion's page names. The server echoes the visitor's query unencoded, so a stray '%' must not throw
 // during render: the raw segment stands then.
 function hrefEntity(href: string): string {
@@ -241,19 +259,19 @@ function hrefEntity(href: string): string {
   }
 }
 
-// A suggestion as the list writes it: its kind, the entity in its short form (from the page it opens) and a note.
-export function suggestionView(s: Suggestion): { kind: string; value: string; note: string } {
+// A suggestion as the list writes it: its kind, the entity in its short form (from the page it opens) and a note; a
+// token's note is its name as the index has it.
+export function suggestionView(s: Suggestion, t: T): { kind: string; value: string; note: string } {
   const id = hrefEntity(s.href);
   switch (s.type) {
     case 'block':
-      return { kind: 'Block', value: /^\d+$/.test(id) ? int(Number(id)) : short('hash', id), note: /hash/i.test(s.sublabel ?? '') ? 'Found by its hash' : 'Block height' };
+      return { kind: t('sugg_block'), value: /^\d+$/.test(id) ? int(Number(id)) : short('hash', id), note: t(/hash/i.test(s.sublabel ?? '') ? 'sugg_block_hash' : 'sugg_block_height') };
     case 'tx':
-      return { kind: 'TX', value: short('hash', id), note: /not yet indexed/i.test(s.sublabel ?? '') ? 'Not in the index yet' : 'Transaction' };
+      return { kind: t('sugg_tx'), value: short('hash', id), note: t(/not yet indexed/i.test(s.sublabel ?? '') ? 'sugg_tx_unindexed' : 'sugg_tx_note') };
     case 'address':
-      return { kind: 'Address', value: short('address', id), note: 'Address' };
+      return { kind: t('sugg_address'), value: short('address', id), note: t('sugg_address') };
     case 'token':
-      // The note without the contract the server shortens after the name; the token page shows it whole.
-      return { kind: 'Token', value: s.symbol || s.label || 'Token', note: (s.sublabel ?? '').replace(/\s*·\s*\S+(…|\.\.\.)\S+$/, '') || 'QRC-20 token' };
+      return { kind: t('col_token'), value: s.symbol || s.label || t('token_unnamed'), note: s.sublabel || t('sugg_token_note') };
     default:
       return { kind: s.type, value: s.label, note: s.sublabel ?? '' };
   }

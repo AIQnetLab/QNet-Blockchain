@@ -36,12 +36,20 @@ const MOBILE_MODULES = new Set([
   'utils/solanaFormat.js',
   // QcLightClient's bounded JSON read (its fetch is this bundle's shims/fetch.js, bounded again)
   'utils/boundedFetch.js',
+  // QcLightClient waits for the app's user actions before each download (in the extension nothing holds it)
+  'utils/userHold.js',
+  // the app's one wait, which QcLightClient uses between reads (it imports nothing)
+  'utils/pause.js',
   // the strict reader of balance and token proof answers (a repeated key refuses one)
   'utils/strictJson.js',
   // amounts as the language writes them, and the amount field's reading of a typed or pasted figure
   'utils/amountFormat.js',
   'utils/sendAmount.js',
   'utils/textEdit.js',
+  // the one rule of the way Solana calls go, direct or through aiqnet.io's relay (it imports nothing)
+  'utils/solanaRoute.js',
+  // the stops and the waits of a node balance's move in parts (it imports nothing)
+  'utils/claimRun.js',
 ].map((p) => path.join(MOBILE_SRC, p)));
 
 // Text the shipped bundle must never contain.

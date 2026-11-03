@@ -1,0 +1,5 @@
+• The Node tab shows your node steadily, whatever its type, as the network names it
+• Move to wallet takes the whole node balance in one press and shows what reached the wallet
+• Send starts with a list of your tokens to choose from
+• SOL and 1DEV keep working where Solana's own address is blocked, and go back to the direct way as soon as it answers
+• After a wallet is deleted the welcome screen opens; after a reset, the recovery phrase screen opens

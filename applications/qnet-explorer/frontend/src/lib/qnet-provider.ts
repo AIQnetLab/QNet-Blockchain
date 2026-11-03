@@ -4,6 +4,7 @@
 
 import jsSha3 from 'js-sha3';
 import bs58 from 'bs58';
+import type { MessageKey } from './texts.ts';
 
 export const QNET_RDNS = 'io.aiqnet.wallet';
 export const EXTENSION_STORE_URL = 'https://chromewebstore.google.com/detail/pahnggomgmhhjjncgfnmmofmplfhkncg';
@@ -194,7 +195,6 @@ export function errorCode(err: unknown): number | null {
 // The one other text a 4001 carries (applications/qnet-wallet CONTRACTS.md 4.5): the wallet refuses this
 // origin for a while after repeated rejections. Compared, never shown.
 export const COOLDOWN_MESSAGE = 'Too many rejected requests from this site, try again later';
-export const COOLDOWN_TEXT = 'Too many declined requests. Try again in a few minutes.';
 
 export function isApprovalCooldown(err: unknown): boolean {
   if (errorCode(err) !== 4001) return false;
@@ -225,19 +225,19 @@ export function providerFailure(err: unknown): ProviderFailure {
   }
 }
 
-// Fixed texts per protocol error code; the wallet's own message text is not shown.
-export function connectErrorMessage(err: unknown): string {
+// A fixed text per protocol error code, by its key (src/i18n/locales/en.ts); the wallet's own message text is not shown.
+export function connectErrorMessage(err: unknown): MessageKey {
   switch (errorCode(err)) {
     case 4001:
-      return isApprovalCooldown(err) ? COOLDOWN_TEXT : 'The connection was rejected in the wallet.';
+      return isApprovalCooldown(err) ? 'ext_failure_cooldown' : 'connect_error_rejected';
     case 4100:
-      return 'The wallet is locked or has not approved this site. Unlock it and try again.';
+      return 'connect_error_unauthorized';
     case 4200:
-      return 'This version of the wallet cannot connect to sites. Update the extension.';
+      return 'connect_error_unsupported';
     case 4900:
-      return 'The wallet is disconnected. Reload the page and try again.';
+      return 'connect_error_disconnected';
     default:
-      return 'The wallet did not connect. Try again.';
+      return 'connect_error_failed';
   }
 }
 
@@ -251,7 +251,7 @@ export async function readAccounts(provider: QNetProvider): Promise<WalletAccoun
   }
 }
 
-export type ConnectResult = { ok: true; accounts: WalletAccounts } | { ok: false; message: string };
+export type ConnectResult = { ok: true; accounts: WalletAccounts } | { ok: false; message: MessageKey };
 
 // qnet_requestAccounts: the wallet asks the user to approve this site.
 export async function requestAccounts(provider: QNetProvider): Promise<ConnectResult> {
@@ -263,7 +263,7 @@ export async function requestAccounts(provider: QNetProvider): Promise<ConnectRe
   }
   const result = parseAccounts(value);
   if (result.kind === 'ok') return { ok: true, accounts: result.accounts };
-  return { ok: false, message: 'The wallet returned an address that is not valid, so nothing is shown.' };
+  return { ok: false, message: 'connect_error_invalid' };
 }
 
 // qnet_disconnect: the wallet drops this site's approval. False when it did not confirm.
@@ -355,7 +355,7 @@ const touchScreen = (nav: NavigatorLike | null | undefined): boolean => typeof n
 
 // An Android tablet browsing in desktop mode, as the common tablet browsers do by default on large tablets: its user
 // agent names a desktop Linux (X11; Linux x86_64) without Android or Mobile, and only the touch screen tells it apart.
-// A laptop whose user agent names CrOS stays a computer, touch screen or not (SITE-5).
+// A laptop whose user agent names CrOS stays a computer, touch screen or not.
 function desktopModeAndroid(nav: NavigatorLike | null | undefined, ua: string): boolean {
   return /\bX11\b|\bLinux (x86_64|aarch64|armv)/.test(ua) && !/\bCrOS\b/.test(ua) && touchScreen(nav);
 }
@@ -386,7 +386,7 @@ export function installTarget(nav: NavigatorLike | null | undefined): InstallTar
   return { kind: 'unsupported', href: '/qnet-wallet-extension' };
 }
 
-// What Connect wallet does, the header's and My node's alike (owner, 20.10): nothing while the wallet is being detected;
+// What Connect wallet does, the header's and My node's alike: nothing while the wallet is being detected;
 // on a phone or tablet it asks QNet Wallet (never an extension offer); on a computer it asks the QNet extension, or
 // without one opens the extension's store page at once (`store`; in a browser that store does not serve, the page that
 // lists the browsers it installs in).

@@ -22,36 +22,79 @@ against a committee quorum certificate, and runs this wallet's light node on the
   seen, its heartbeats this epoch and its node balance ([The Node tab](#the-node-tab)).
   The app only shows it; it activates no node of either type.
 - Confirms that aiqnet.io may prepare this wallet's light node with a one-time payment address, gives this wallet's
-  consent to its node, links it to this device, unlinks it from the device it runs on (from that device, or from any
+  consent to its node (and for that address's burn sends the registration the consent is for to aiqnet.io), links it to this device, unlinks it from the device it runs on (from that device, or from any
   other device that holds the wallet), or moves its node balance, when the user started that on aiqnet.io and confirms
   it on a sheet a verified link opens ([QNet Link](#requests-from-aiqnetio-qnet-link)).
 - Moves a node balance into the wallet.
 - Opens websites in a built-in browser whose pages can connect the wallet through the same provider as the
   browser extension ([In-app browser](#in-app-browser)).
 
-The UI is a single wallet screen under a header (the app mark, "QNet Wallet", and More, which opens Manage tokens and
-Hide balances; on the Browser tab the browser bar's More holds them and the header shows none, so a screen has one More,
+The UI is a single wallet screen under a header (the app mark, "QNet Wallet", and More, which opens Manage tokens,
+Hide balances and Hide node names; on the Browser tab the browser bar's More holds them and the header shows none, so a
+screen has one More,
 both drawn by `src/components/ui/Menu.js`) with a bottom bar of five tabs — Assets, History, Browser, Node, Settings (`src/components/BottomBar.js`,
-each tab its name alone, the current one marked by a line over it, the Node tab carrying the live dot while this
-wallet's node runs, `NodeTab.nodeLive`: its server node online and admitted, or its light node online on this device;
-clear of the gesture bar and home indicator). Every colour, face, size, radius and duration comes from one theme
+each tab its line icon over its name: a wallet, a clock, a globe, a server and a gear, outlines in one stroke weight
+drawn as paths (`TabIcon`, 22 dp), the current tab's icon in Signal under a line over its cell, the others' in Fog;
+clear of the gesture bar and home indicator). A tap on a tab shows its first page with nothing over it
+(`WalletScreen.selectTab`): Assets opens its token list from any screen (a Send form, even one whose send is still being
+checked, which then asks nothing; a token's own screen; the token picker; a detail; Receive), History its list from a
+row's detail, and Browser, tapped while it is open, its start page (the overview, the menu and a typed address close;
+the page of the tab in front stays loaded under it, as the browser's own Start page leaves it), while switching to
+Browser from another tab keeps the page it showed. Node and Settings open nothing the bar can reach: their prompts and
+sheets cover it. A transaction's result on screen goes as its Done makes it go (a send's leads to the token list, a
+move's reads the node again; a move in parts goes on) before the tab tapped shows its first page; a result that came
+while the Browser tab was open comes into view first, over the tab tapped. Every colour, face, size, radius and duration comes from one theme
 (`src/theme.js`): a dark ink background, Signal (`#3CF0DC`) only for what can be acted on or is live, Ember
 (`#FFB547`) for what needs the user; words in Archivo, numbers, addresses and labels in Martian Mono, both under the SIL
 Open Font License 1.1 and bundled as six static faces in `assets/native/fonts/` with their licence texts (Android reads
 the folder as an asset source, iOS lists the faces in `UIAppFonts`; `scripts/fonts/build-fonts.py` cuts them from the
 families' variable files). Russian sets words in the system face and keeps Martian Mono for numbers and labels;
-Chinese, Japanese, Korean and Arabic set words and labels in the system face, without capitals or tracking. Shared
-pieces live in `src/components/ui/` (actions, fields, tabs, status words, switch, sheet, screen head).
-Send and Receive are buttons on Assets (Send opens QNC on the QNet Blockchain side and SOL on the Solana side, and each token row
-opens its own Send); the QNet Blockchain Send form switches between QNC and every QNet Blockchain token the Assets list shows, the Solana form
-between SOL and 1DEV; Android back returns from Receive and the other tabs to Assets.
-It includes QR receive, clipboard copy, hideable balances and spam-token hiding. Assets and Receive show the address
-whole as the screen's subject, on two lines: a QNet Blockchain address in its own structure (19 hex characters and
-"eon", then 15 hex characters and the 8-character check, `utils/addressDisplay.addressParts`), a Solana address in groups
-of four (each line shrinking before anything wraps or is cut; a larger system text size counts up to 1.2 times), as the
-QNet Link sheet and a site's connect sheet show both addresses on one fitted line; a tap on it, or the Copy act under
-it, copies the raw address ("Copied" on the act for two seconds). The asset rows draw no icon: the symbol, the name and
-the contract id say which asset it is, and "Solana devnet" is said once above the Solana rows. On Receive the QR code
+Chinese, Japanese, Korean and Arabic set words and labels in the system face, without capitals or tracking. The
+welcome screen's "QNet Wallet" is set in the system face, bold, in every language (`theme.systemFace`). An `&` in a
+button label, a sheet title or a screen title is set in the platform's sans face at the weight of the words around it
+(`ui/amp`), because Archivo draws the sign as an ornament; a text with `&` is used only in those places. Shared
+pieces live in `src/components/ui/` (actions, fields, tabs, status words, switch, sheet, screen head, section, press).
+The screens are built of rounded blocks: a section (`ui/Section`) holds its content on the one card of the theme
+(`theme.card`: Surface, a hairline border, corners of 16) with its kicker inside it, its rows running to the card's
+edges and no hairline along its top or bottom edge; the Node tab's sections, a transaction's fields, the browser's
+start page and the transactions not settled on Assets are sections, and a History row, a token row and the address on
+Assets are cards of their own. Settings keep their groups on the page: each group's kicker over a strong rule, then its
+rows (`WalletScreen` `SettingGroup`). Fields have corners of 12, buttons, chips and the switch are pills, and a sheet's
+top corners are rounded (`theme.radius`). Every action is a pill (`ui/Action`) but a small act and a short act inside a
+line of data (Scan, Max, Revoke), which is underlined: the one filled action of a view, the other way forward on a
+Signal tone, a lesser action standing on its own (Receive, Cancel, View in the explorer, New tab) drawn by its outline,
+one that cannot be undone by an Ember outline, and a small act in a bar, a head or a card (Back, More, Done, Close,
+Forgot?, the browser's Back and More) as its word alone in Signal (14, semibold) with no outline, on a target of 44 by
+44 at least, on the centre line of the row it stands in; a tab's Close in the browser's tab overview stands inside the
+tab's card on its title's line. A link inside a sentence stays a link. An action or a card that is pressed settles to 97% of its
+size and 85% of its opacity in 120 ms and back on release (`ui/Press`, native driver; with the system's reduce-motion
+setting on it only dims); a sheet slides up in 240 ms from its first frame, and stands in place with that setting on,
+as the app last read it (`ui/Status` `useReduceMotion`), so it never waits for the system's answer.
+Send and Receive are buttons on Assets. Send opens the token picker of the network shown ("Choose a token",
+`TokenPicker`: QNC and every QNet Blockchain token the Assets list shows, or SOL and 1DEV, each drawn as its Assets row,
+with a search over the symbol, the name and the contract or mint); no token is chosen for the user, and the one picked
+opens its Send form, titled "Send {symbol}", which sends that token only. A token's own screen (below) opens its Send
+form without the picker, and Back from that form returns to the token's screen. Android back closes the picker, a Send
+form and a token's own screen, and returns from Receive and the other tabs to Assets.
+It includes QR receive, clipboard copy, hideable balances and spam-token hiding. Assets shows the address whole on one
+line in its rounded card, the copy mark at its end: the line shrinks to fit, to 45% of its size at most, which holds a
+whole QNet Blockchain or Solana address on a 320 dp screen at the largest system text size it counts (1.2 times), so
+nothing is cut (`ui/Copyable` `ADDRESS_LINE`), as the QNet Link sheet and a site's connect sheet show both addresses on
+one fitted line. Receive shows it whole as the screen's subject, on two lines: a QNet Blockchain address in its own
+structure (19 hex characters and "eon", then 15 hex characters and the 8-character check,
+`utils/addressDisplay.addressParts`), a Solana address in groups of four, each line shrinking, to half its size at most,
+before anything wraps or is cut (a larger system text size counts up to 1.2 times). A tap on either copies the raw
+address.
+Every value that can be copied is copied that one way (`src/components/ui/Copyable.js`): a tap anywhere on it, its
+copy mark at the end of the value's own line (under a label, centred on the value, never level with the label)
+turning to a Signal tick for two seconds and back, while "Copied" in Signal stands in the value's place, the value
+keeping its room so nothing moves, as the address on Assets shows it; no Copy word is drawn for it. A secret (the recovery phrase, a private key) is the one exception: a tap on it copies
+nothing, and its own Copy button under it does (below). Each asset row starts with the asset's round icon
+(`src/components/TokenIcons.js`, every icon bundled, nothing fetched): QNC is the app mark, SOL its mark and 1DEV its
+image; any other token, and a token with a contract whose symbol copies a known one, is drawn as its first letter, so a
+look-alike never wears a known icon. Then the symbol, the name and the contract id say which asset it is, and "Solana
+devnet" is said once above the Solana rows; a tap on a row opens the asset's own screen, and a long press on a QNet
+Blockchain token offers to hide it. On Receive the QR code
 (176 dp with a quiet zone of 24) sits at the column's start, then the line on what the address takes and the address. Every label with its value, on every screen (the Node
 tab, the Send forms, a send's review and result, a site's request sheet, the QNet Link sheet, a transaction's detail,
 Settings), is drawn by one component (`src/components/InfoRow.js`) in one type per role, rows parted by hairlines: the
@@ -62,8 +105,19 @@ screen: the texts are written to fit side by side at full size, a larger system 
 the two shrink together by at most a fifth; a figure (an amount) may shrink to half its size, its label
 giving way far less, and one that would not fit even so goes under its label, whole. A total in two currencies takes a
 line for each. An id or an address to share sits whole on one line under its label, a hash is shortened in its middle
-and copied whole on a tap (its label line carries a Copy act that answers Copied), and a text that must be read whole
+and copied whole on a tap (the copy mark at the end of the value's line), and a text that must be read whole
 (a memo, a recipient to confirm) wraps under its label.
+A submitted transaction's result (a send, a token transfer, a move of a node balance: `src/components/TxResultCard.js`)
+is one full screen in three parts: at the top its state in History's words ("Pending", or "Moving" for a move, after the
+live dot while no block holds it; "Confirmed" in Mint; "Failed" in Ember for a move no block took; a refusal has no state
+line, its title in Ember says it), then the title, the amount and its note; under them one card of its details in the
+order of a transaction's detail screen (the fee reviewed, where a move came from, the recipient, the hash, the block once
+a genesis node reports it); and at the foot, out of the scroll over a hairline, "View in the explorer" over Done. A
+transaction no block took keeps its hash to copy and has no "View in the explorer": a send the chain says expired, or
+whose nonce another transaction of the wallet took, and a move whose one part expired (`WalletScreen.txResultShown`).
+A refused or expired transaction shows no fee. Done on a send the network took (or may have: no node answered yet)
+opens Assets' token list, wherever the send began; on a refusal it returns to the filled-in form; on a move of a node
+balance it reads the node again.
 A value stays selectable. A balance on Assets sits beside its token while it fits two fifths of the row at half its
 size; a longer one (a token's exact balance has up to 18 decimals) takes a line of its own under the token, whole, and a
 token's symbol and name wrap rather than lose their ends. Every amount on screen (Assets, the Send forms with their
@@ -75,7 +129,15 @@ and compares alike whatever the language and the amount field takes the same poi
 exact decimal text, never through a floating-point number, so a 64- or 128-bit amount keeps every digit. A QNC amount counted in nano (a node balance, a move's amount and the part of it in the wallet, the figures of a
 site's request sheet) is written exact to the nano the same way on every screen (`amountFormat` `formatNano`,
 `qncText`), "••••" while amounts are hidden and "—" while it is not known, never "0 QNC". What a field, a signature,
-a site's answer and the history cache hold stays canonical (digits and a point).
+a site's answer and the history cache hold stays canonical (digits and a point). More's two switches mask what a
+screenshot or a screen recording would show (`src/utils/privacy.js`): Hide balances every amount (a send's or a move's
+result screen too: its amount, fee and the moved amount in its note, as a History detail, and every figure of a send
+refused for want of balance on either network, the balance included: on the Solana form what the send needs, its fee,
+a new token account's rent, the balance, what would stay and the least an account keeps, `SolanaSend.refusalText`),
+Hide node names every
+node's name (the Node tab's name line and the node name of a History detail, each of which a tap still copies whole, and
+a History row's "Node …" line), each value "••••" in its own line and style so nothing moves; each is kept on the device
+(`qnet_hide_balances`, `qnet_hide_node_names`) and off until turned on. A request sheet shows what it asks to confirm.
 Receive has the title "Receive", the QR code and one
 line: "Your address for QNC and tokens on QNet Blockchain." or "Your Solana address for SOL and Solana tokens.", with no
 warning boxes. The screens carry titles, labels, short buttons and short errors; a confirmation line appears only
@@ -86,6 +148,32 @@ ends); a longer time than the current one asks for the password or the screen lo
 values, in every build while QNet Blockchain is a testnet (`src/config/nodes.js`). The layout adapts to the screen: tab
 content sits in one centred column on tablets, tab labels shrink to fit, and dialogs scroll and stay above the
 keyboard; the iPad build takes every orientation, Split View and Slide Over.
+
+A tap on an asset on Assets opens its own screen (`src/screens/TokenScreens.js`): its icon, name and symbol under Back,
+Receive and Send for it, a warning for a token the wallet does not know, its balance, Information, Security and its
+Activity: the History entries that move it (`HistoryTab.assetEntries`: a swap under both of its assets, an action that
+moved nothing left out), the first five and Show all, which on QNet Blockchain loads older pages when the list is
+scrolled to its end; a row opens its detail over Assets, and the QNet Blockchain rows are read again as the screen
+opens. Information names the token, its symbol, its
+network, its contract or mint (whole, copied by a tap) and its decimals, then the facts a source answered; Information
+and Security hold only what a source answered (`src/services/TokenFacts.js`), never a row left empty: QNC's total
+supply, the part in circulation and its holders from a genesis node's index (`GET /api/v1/richlist?limit=1`:
+`total_supply_raw`, `circulating_raw`, `holder_count`; no proof covers it); a
+QNet Blockchain token's supply, creation time and creator, and what its contract allows, from a node's
+`GET /api/v1/token/{contract}` answer (`mintable`, `mint_authority`, `metadata_mutable`, `freezable`; a node that does
+not report one of them leaves its row out, `WalletManager.tokenInfoOf`), and its holders from the explorer index
+History reads, which replays the token's transfers (`GET https://aiqnet.io/api/token/{contract}/holders?limit=10`:
+`holder_count`, and the share of `circulating_raw` the ten largest `holders[].balance_raw` hold, floored to a hundredth
+of a percent; neither when the answer says `truncated` is not false, counts no holder or cannot be read, the share alone
+left out when the balances do not add up; no proof covers it, as for QNC's holders); SOL's total supply and the part
+in circulation (`getSupply`) and 1DEV's mint (its supply, mint and freeze authorities, `getAccountInfo`) from
+Solana at `confirmed` ([the way to Solana](#solana-sends)). Each part is on screen as soon as its source answers: a
+QNet Blockchain token's rows from its node do not wait for the index, whose holders join them when it answers (it is
+read within `FIRST_CONTACT_MS`, 20 s). Security opens with a QNet Blockchain token's "Top 10 holders' share" (87.53%)
+where the index gave it, then draws the same rows for both networks, each Yes or No:
+"More can be issued" (with "Who can issue more" and the address, copied by a tap, when the source names one), "Name and
+symbol can change" and "Can be frozen" (with "Who can freeze" where the mint names one); each Yes is in Ember and each
+No in Mint. No row says whether holders may destroy their own: a transfer to the burn address destroys any token.
 
 Every interface string is in 11 languages: English (the source), Chinese (Simplified), Russian, Spanish, Korean,
 Japanese, Portuguese, French, German, Arabic and Italian — one file per language in `src/i18n/locales/`, looked
@@ -107,7 +195,7 @@ note, figure or value that may be Latin letters takes its own width at the start
 own script), and the switch's knob slides toward the end edge. Addresses, hashes, codes and amounts stay left to right (`writingDirection: 'ltr'`, the
 History amount line in an `ltr` row), and a value put into an Arabic sentence is wrapped in a bidi isolate. The wallet's own errors are translated by code; what a node answered
 is shown after them as details. The native prompts (biometric and Face ID reasons, the Android biometric button, the
-iOS screen-recording cover, the Android notice for a tap through another app's window) get their words from the same
+Android notice for a tap through another app's window) get their words from the same
 tables. Recovery phrases,
 addresses, env names (`QNET_*`), token symbols and brand names are never translated. The few texts that name Google
 Play live in `src/i18n/overlays/android/` (`overlay.android.js`), which no iOS build carries. Tests: every key in every
@@ -180,11 +268,12 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
 - The recovery phrase shown again from Settings goes the moment the app leaves the front (the screen going off
   included); one whose vault opens only after the app left the front, or after the wallet locked, is never put on
   screen (`exportSeedPhrase`).
-- The recovery phrase, at creation and when shown again from Settings, has a Copy button (an explicit tap only). At
-  creation a warning next to it says that anyone who can read the clipboard can take the wallet; shown again from
-  Settings, one warning stands before the password ("Anyone with these words controls your wallet. Never enter them on
-  a website and never share them.", as the browser extension says it), and after the check the phrase is on screen at
-  once with only Copy and Done: no second warning and no clipboard text (owner, 06.10 and 07.10).
+- The recovery phrase, at creation and when shown again from Settings, is copied only by the Copy button under its
+  words (`src/components/ui/SecretCopy.js`: an outlined button with its label alone, "Copy phrase"); a tap on the
+  words copies nothing. At creation a warning under it says that anyone who can read the clipboard can take the wallet;
+  shown again from Settings, one warning stands before the password ("Anyone with these words controls your wallet.
+  Never enter them on a website and never share them.", as the browser extension says it), and after the check the
+  phrase is on screen at once with only its Copy button and Done under it: no second warning.
   The phrase leaves the clipboard after 60 seconds if it is still there, and at once on Delete wallet
   (`DeviceSecurity.copySecret`, `clearSecretCopy`). iOS
   writes it for this device only (no Universal Clipboard) with that expiry on the pasteboard item, so it goes while
@@ -196,7 +285,9 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   a clipboard the app cannot read (in the background Android lets an app write the clipboard but not read it) is
   cleared all the same, a clip copied since in another app included, as the copy hint says ("The clipboard is cleared
   in 60 seconds"), so the phrase never waits on the clipboard for the app's next open; so is the clip below Android 8,
-  which gives no timestamp. The button reads "Copied" for as long as the copy may be on the clipboard, then Copy again.
+  which gives no timestamp. Once the copy landed the button turns Signal (its outline and its word) and says Copied for
+  two seconds, then is the dark Copy button again, as every copy of the app does (`SecretCopy`, which shares the one
+  copy's state with `Copyable`: `useCopied`, `COPIED_MS`); the clipboard rule above is unchanged.
 - Settings → **Export Private Key** asks first which account's key (the QNet Blockchain key or the Solana key, as the browser extension asks), with the form that key is written in under the choice, then one warning and the check of the
   recovery phrase: a fresh password check (under the screen lock a fresh device authentication) under the same lockout,
   never on a rooted, jailbroken or instrumented device, the apps that can read the screen named first
@@ -204,10 +295,11 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   is derived. The QNet Blockchain key is shown as its 32-byte ML-DSA-65 key-generation seed in hex, the compact form the
   wallet derives it from (table above), the Solana key as its 64-byte secret key in base58. Each is handed over only
   after the key it makes is checked to give the wallet's address (the QNet Blockchain one by a FIPS 204 key generation from the seed); a wallet without its recovery phrase on the device shows the QNet Blockchain key as not available. After the check the
-  key is on screen at once (owner, 06.10) under its name with the form it is written in and a Copy button under the
-  phrase's clipboard rule (an explicit tap, cleared after 60 seconds, at once on Delete wallet), then Done: no second
-  warning, no press-and-hold, no address beside it, no clipboard text. The screen is a secret screen (no capture,
-  overlays kept out) and goes on Done, on lock and the moment the app leaves the front. Nothing of either key is
+  key is on screen at once under its name with the form it is written in, in a box that copies nothing,
+  with its Copy button under it ("Copy key", `SecretCopy`, under the phrase's clipboard rule: cleared after 60 seconds,
+  at once on Delete wallet), then Done: no second warning, no press-and-hold, no address beside it. The screen is guarded
+  (overlays kept out; a screenshot of it is the user's own choice, as of every screen) and goes on Done, on lock and the
+  moment the app leaves the front. Nothing of either key is
   stored, logged or sent. For both exports, Show reads "Verifying…" while the check runs and a second tap starts
   nothing; under the screen lock a refusal is the prompt's, never "Incorrect password": a failed prompt says the wallet
   could not be unlocked, a cancel and iOS's refusal of a read while the app is not in front say nothing, and a secret
@@ -265,19 +357,47 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   taken for a password wallet: the recovery screen offers Try again instead of a password field whose attempts the
   lockout would count. Seed export, security settings and delete re-run the same check. The vault is the same
   version-4 format, and every signing path is the same — only the source of the password differs.
-- The lock screen is plain, the same at launch, after Lock Wallet and after an auto-lock: the app's mark and name, and
-  the unlock itself. Under the screen lock the system prompt opens by itself and nothing stands under it; once the
+- The screens that hold no data (the first read of the stored wallet, loading, welcome, lock, deleting the wallet) draw
+  the app's mark where the launch screen draws it: the launch screen's own image (`splash_logo`), its 192 box centred on
+  the window, so the mark neither moves nor changes size from launch to wallet or between these screens; what each says
+  stands under it and its actions at the foot, in a column hung from the mark's own line that starts 16 dp
+  (`START_GAP`) under its outer ring (the rings are 134 of the 192 box, `START_MARK.drawn`), so no system bar, text
+  size or content brings a line over the mark; the column scrolls when it does not fit, and an open keyboard (the lock
+  screen's password) lifts the mark and the column together (`src/components/ui/StartScreen.js`). The
+  welcome screen writes "QNet Wallet" under the mark (the system face, bold, at 28, in Signal, centred) and "Get started
+  with QNet Blockchain", with Create New Wallet and Import Existing Wallet at the foot.
+- The lock screen is plain, the same at launch, after Lock Wallet and after an auto-lock: the app's mark (no name
+  under it), and the unlock itself at the foot. Under the screen lock the system prompt opens by itself and nothing stands under it; once the
   prompt ended without opening the wallet (cancelled, failed), an **Unlock your wallet** button asks again. A password
   wallet shows its password field, the same button and, where set up, biometric unlock. What an unlock that did not
-  open the wallet says sits under the title (under the password field in a password wallet) across the column's width,
+  open the wallet says sits under the mark (under the password field in a password wallet) across the column's width,
   start-aligned and clear of the lines around it (`styles.lockMessage`); the column scrolls when a very
-  large system text size makes it taller than the screen. The welcome and lock screens carry a still field of hex
-  characters along their top (`components/ui/HexField`, one fixed seed, no animation, hidden from screen readers) over
-  the app mark and its name. At the foot of the screen a
+  large system text size makes it taller than the screen. The welcome and lock screens carry a live field over the
+  top half of the window (`components/ui/HexField`): 10 columns of glyph cells on a fixed grid of 20 dp, where a head
+  steps down one cell every 2 to 5 ticks of one 33 ms clock and writes a new glyph in each cell it enters, and between
+  steps its glyph changes 12 times a second (`HEAD_FLICKER_PER_S`); its trail of 8 to 14 cells keeps its glyphs in their
+  cells and fades toward its end, and each trail cell in sight changes its glyph on its own about 0.65 times a second
+  (`TRAIL_SWAP_PER_CELL_S`, once in about 1.5 s) at the brightness it had; each column fades out as its head nears the
+  middle of the screen. The app's own view draws the whole field on the UI thread (`QNetHexField`: Android
+  `HexField.kt`, a View drawn on its Canvas from the display's frame callback; iOS `HexField.swift`, drawn in
+  `draw(_:)` from a display link asking for 30 frames a second), from ports of the module's hash, plan, steps, shades
+  and clock: `HexRain.kt`, which the JVM test `HexRainTest` checks bit for bit against the vectors written from the
+  module (`__tests__/fixtures/hex_field_vectors.json`: two field heights, 400 ticks), and `HexRain.swift`, which
+  `__tests__/HexFieldNative.test.js` holds to the module's lines. Nothing of the field crosses to JS while it runs.
+  Each frame takes the ticks due on the 33 ms clock, 8 at most past the tick it stood at
+  (`MAX_CATCH_UP`; after a longer stall it goes on from there), and the view draws again only when one of them
+  changed a cell. The module's own field (at most 140 glyph nodes, one render a tick, each render waiting for a drawn
+  frame and then as long as its own work took) is the reference the ports follow and draws only where no such view
+  is registered (the test suite). Stopped while the app is in the background or inactive and while its view is off
+  screen, a still frame under the system's reduce-motion setting, hidden from screen readers and accessibility
+  services and taking no touch, sized by the window so a keyboard neither cuts nor restarts it.
+  The line right under the mark (the welcome line, Loading, Deleting the wallet) is centred under it
+  (`styles.markLine`). Under the unlock a
   small act **Forgot? Reset the wallet** opens the erase confirmation (typed ERASE, and under the screen lock a fresh
-  device check), after which the wallet is restored from its recovery phrase; it is never shown while the system
+  device check), after which the import opens by itself, the same one as the welcome screen's Import
+  (`WalletScreen.startImport`), and the wallet is restored from its recovery phrase; it is never shown while the system
   prompt is up. No erase choice stands next to Unlock. Before the stored wallet was read the screen shows only the
-  app's name, never the welcome screen of a device without a wallet. An unlock prompt owed at a cold start (the app's
+  app's mark, never the welcome screen of a device without a wallet. An unlock prompt owed at a cold start (the app's
   state still read as in the background for a moment) is looked at again 750 ms later
   (`src/screens/WalletScreen.js` `autoUnlockRef`). No field on this screen or any other takes the focus by itself: the
   password field is focused only when it is tapped, and so is every other field (the browser's address bar after a tap
@@ -313,10 +433,11 @@ Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte detached sig
   certificate, the device key, the push token, the scheduled and periodic wakes and the node records go, so the deleted
   wallet's node can send no answer from this device again whatever the network does. Then the wallet's own data goes,
   and only then is the network's answer awaited, for at most 8 seconds from the signature; Firebase is waited for at
-  most 4 seconds to forget the token. One plain screen says "Deleting the wallet…" throughout, and "The wallet was
-  deleted from this device." ends it; a device check that failed (not one the user cancelled) says the wallet could
-  not be deleted (`WalletScreen.eraseWallet`, `PushService.stopLightNode` with `forgetDevice`). Erase from the lock
-  screen or the recovery screen does the same, and its failed device check says the wallet could not be erased; on
+  most 4 seconds to forget the token. One plain screen says "Deleting the wallet…" throughout, and the welcome screen
+  that follows ends it, with no notice over it; a device check that failed (not one the user cancelled) says the wallet
+  could not be deleted (`WalletScreen.eraseWallet`, `PushService.stopLightNode` with `forgetDevice`). Erase from the
+  lock screen or the recovery screen does the same and ends on the import, and its failed device check says the wallet
+  could not be erased; on
   Android a screen-lock key the Keystore reports corrupted counts as a removed screen lock there ("not set"), so such a
   wallet can still be erased.
 - Deleting the wallet, erasing it, and another wallet taking its place also wipe what the in-app browser left on the
@@ -477,34 +598,63 @@ no proof badge; only the checks above make a value count as proven where the app
   ping answers and everything carrying a device identifier.
 - **Transaction history.** The whole history comes from the explorer archive
   (`https://aiqnet.io/api/address/{addr}/history`, 50 rows a page, older pages loaded when the list is scrolled to its
-  end; opening the tab, pull-to-refresh and a return to the app ask for the first page, the explorer is asked then only,
-  and background refreshes ask one genesis node: [Requests from the open app](#requests-from-the-open-app)); the node's
+  end; every opening of the tab, pull-to-refresh and a return to the app ask for the first page, the explorer is asked
+  then only, and background refreshes ask one genesis node: [Requests from the open app](#requests-from-the-open-app));
+  one read of a wallet's history runs at a time (`WalletScreen` `loadTxHistory`): a read asked while one runs gets that
+  read, and one that asks the explorer while a background read runs follows it once. The node's
   `/api/v1/account/{addr}/transactions` and token-transfer feed add the newest rows and stand in when the explorer is
-  down, and `/api/v1/account/{addr}/node-events` adds node lifecycle rows. Rows are rendered as served and only those
+  down, and `/api/v1/account/{addr}/node-events` adds node lifecycle rows; only a list of events is that read's answer,
+  so a refusal (a rate limit's body) or an error keeps the node events shown. Rows are rendered as served and only those
   the wallet is a party to are kept. A refresh merges into the list instead of replacing it: an archived row missing
   from the explorer's first page is dropped only when it is inside the span that page covers and older than five
-  minutes. QRC-20/721 transfer rows a node can still prove (the last 24 hours) carry logs-root inclusion proofs, checked
+  minutes. QRC-20/721 transfer rows of a block whose logs the genesis nodes still keep (below) carry logs-root
+  inclusion proofs (`tokenRowsToProve`: chosen by block, never by the clock, each until its verdict is final), checked
   after the balance read in flight and two at a time, so a check that walks to an old macroblock never holds the balance
-  up. Which rows count as on chain (`src/utils/txHistory.js` `withListing`, the browser extension's rule): a row only
-  the explorer archive holds (the site's host, not a node) is Unverified, and one node's newest row Pending, until two
-  genesis nodes list it alike in `GET /api/v1/transactions/history?address=&per_page=100`
+  up. Which rows count as on chain (`src/utils/txHistory.js` `withListing`, the browser extension's rule): a genesis
+  node keeps at least the newest `TX_INDEX_RETENTION_BLOCKS` = 100,000 blocks (about 28 hours) of its transaction index,
+  and below them no node lists, looks up or proves a transaction, so a row only the explorer archive holds (the site's
+  host, not a node) whose block is 100,000 or more below the height of the figure read last (the live figure's block or
+  a certified read's checkpoint) is Confirmed at once, a QNC row or a token row: the archive's row is the chain's only
+  record of it (the row is flagged `inBlock`). A genesis node keeps the logs of at least its newest
+  `MICROBLOCK_BODY_RETENTION_BLOCKS` = 86,400 blocks, and with them its token transfers and their proofs, none at or
+  below the floor its token-transfer answer reports (`oldest_available`), so a token row only the archive holds whose
+  block is at or below the logs floor is Confirmed the same way: the floor is the highest one a genesis node reported
+  this session, never above 86,400 below the figure's height, which stands in while none was reported. Every read
+  judges every row the list holds this way: the fresh rows, the ones kept from earlier reads, an older page, the cached
+  rows, and the rows on screen again with each new figure. A row only the archive holds of a newer block is Unverified
+  until two genesis nodes list it alike in `GET /api/v1/transactions/history?address=&per_page=100`
   (`WalletManager.agreedHistoryRows`: every genesis node asked at once, the read ending when all answered or 700 ms
   after the second answer; a row compared by its hash, both parties and its amount in nanoQNC, a contract call, deploy
   or registration by its hash alone). They are asked with every read that asks the explorer, and with any other that
-  brought a row one node reports which no earlier read found listed. A listed row is Confirmed, except received QNC, which says
+  brought a row one node reports which no earlier read found listed. A row on the list past the newest 100 the listing
+  reads is looked up by its hash after each History read (`rowsToLookUp`, `WalletManager.lookedUpHistoryRows`:
+  `GET /api/v1/transaction/{hash}` on three genesis nodes, `HISTORY_LOOKUP_ROWS` = 8 rows a read, newest first, one at
+  a time, each once a session once two of them answered; never the node's `page=` paging): two that report
+  it included alike, as the listing compares it and at the row's block, list it the same way (a key by hash alone
+  counts only for a transaction this wallet sent); a batch credit is the listing's alone, as a lookup names the batch.
+  A listed row is Confirmed, except received QNC, which says
   "Not credited yet" until the wallet's figure read last covers its block (the live figure's height, read after each
   account event of the address socket, every 15 seconds on Assets while the socket is not live, and once by a History
   read that lists such a row; a certified read's checkpoint), and Confirmed from
   then on: being listed proves a block carries the transaction, never that it applied, which the balance shows. A send
   of this wallet whose result card saw it in a block is Confirmed at once, with that block (`markInBlock`: the row is
-  flagged `inBlock`, and every row of its hash a node or the archive brings later takes the flag, so it never shows
-  Pending again); so is a token transfer a genesis node reports (its token-transfer feed decodes only transactions that
-  applied). A logs proof anchored to a committee-certified logs root adds the verified mark to a token row in the
-  background and never takes Confirmed away; a token transfer only the archive holds is Unverified. A row once listed,
-  reported in a block or proven stays so while the archive returns it unverified. Up to 500 rows (the archive's, the
-  listed ones and the ones reported in a block, with their status) are cached per wallet address and shown while a
-  session's first fetch is in flight; a row an older build cached as confirmed on the archive's word alone reads as
-  Unverified (`checkedCachedRows`). A node's row of a transaction the archive holds under another key (a batch
+  flagged `inBlock`, and every row of its hash, brought later or kept from before, takes the flag in each merge, so it
+  never shows Pending or Unverified again); so is a token transfer a genesis node reports (its token-transfer feed
+  decodes only transactions that applied), and every row of the genesis node's own transaction index (its status
+  `confirmed`, or `no_effect` for a node balance move that moved nothing: the index keys each row by its block height,
+  `nodeNativeRow`), with the archive's row of the same transaction. A node registration is Confirmed by the node event
+  of its node or its block: the registry's (node-events), or the one the light node's status makes, two genesis nodes
+  saying the node is on the chain with the registration height a signed answer names (`nodeEventRow`,
+  `withNodeEvents`; no read of its own, the status the Node tab already read). A logs proof anchored to a committee-certified logs root adds the verified mark to a token row in the
+  background and never takes Confirmed away from a row a genesis node reported; a token transfer only the archive holds
+  of a block whose logs the nodes keep is Unverified, and one its logs proof contradicted keeps that verdict on its row
+  (`proofRejected`, `withProofVerdicts`: through merges and the cache, for the same transfer only; no window, no result
+  card and no other row of its hash marks it in a block, and an entry of several legs is in a block only when every
+  leg is). A row once listed, in a block or proven stays so while the archive returns it unverified. Up to
+  500 rows (the archive's, the listed ones and the ones in a block, with their status) are cached per wallet address and
+  shown while a session's first fetch is in flight; a row an older build cached as confirmed on the archive's word alone
+  reads as Unverified (`checkedCachedRows`) until it is listed or its block is 100,000 or more below the figure read
+  last, or, a token row, at or below the logs floor. A node's row of a transaction the archive holds under another key (a batch
   payment's credit `hash:bN`) goes as soon as the archive's row is there, so no payment shows twice. The tab is titled
   "History" and is split by network exactly as Assets is, with the same QNet Blockchain · Solana selector (one choice shared with Assets): QNet Blockchain lists the wallet's transactions there of every asset and its node lifecycle rows, Solana the sends made
   on this device (said once above that list); there are no filter chips. It says "No transactions yet" when empty
@@ -514,31 +664,45 @@ no proof badge; only the checks above make a value count as proven where the app
   "Sent 0 QNC" beside it, and the value rows of one transaction (its token transfers, a batch's credits) are one row
   with their legs; the rows each feed served stay as they are in the cache. Rows come newest first under a header for
   their day (`historySections`): Today, Yesterday, then the date as the app's language writes it (the year only when it
-  is not this year's), and Earlier last for rows without a real time. Each row holds at 320 dp and draws no icon and no
-  badge: on its start what
+  is not this year's), and Earlier last for rows without a real time, the header over its rows' cards. Each row is a
+  card of its own that holds at 320 dp, with no badge: at its start the token's icon (40 dp; a swap's two tokens at 28 dp,
+  the one received in front at the lower end; a row that moves nothing keeps the room empty), then what
   happened in plain words (Sent, Received, Sent to self, Burned, Swap, Node registered, Node back online, Node check-in,
   Moved from node, Contract call, Contract deployed: the transaction's type decides, `txKind`, either source naming it;
   an activation transaction of older blocks reads Node registered) over whom it was with: "To: abcdef…uvwxyz" or "From:
   abcdef…uvwxyz" (the first and last six characters, `utils/addressDisplay.shortAddress`), the node ("Node light_…"), the contract ("Contract 1a2b3c…9f0e"), "From: node balance" for a move from the
   node, "Genesis" or "QNet Blockchain" for a sender that is QNet Blockchain itself (never its id), nothing for a swap (its two legs say it) or a transfer to the wallet itself (as in the extension), or its block when none is
   known; a row not final says its status after it, Pending, Unverified, Not credited yet, Moving (a move of the node
-  balance in transit), Failed or Not found (`historyBadge`, `describeTx`; a confirmed row says no status), as the
+  balance in transit), Failed or Expired (`historyBadge`, `describeTx`; a confirmed row says no status), as the
   extension does: whom with keeps one line, and the status goes under it when both do not fit. On its
-  end the amount with its sign and symbol in the mono face, incoming in Mint with +, outgoing in Paper with − (the
-  minus sign, as the extension writes it), a transfer to the wallet itself in Paper, and in Fog for one that failed or
-  was not found (nothing moved), whose status word is in Ember; a swap has two lines, the received leg first, and a row that moves nothing (a node registration, a contract
-  call without value) has none. A row's screen-reader label says, in the extension's order, what happened, the amounts
+  end the amount with its sign and symbol in the mono face, at the title's height, incoming in Mint with +, outgoing in
+  Paper with − (the minus sign, as the extension writes it), a transfer to the wallet itself in Paper, and in Fog for one
+  that failed or expired (nothing moved), whose status word is in Ember; a swap's received leg is at the title's
+  height and its paid leg at the height of the line under it, and a row that moves nothing (a node registration, a
+  contract call without value) has none. An amount takes at most 60% of the row's text; its number shrinks to fit, to
+  half its size at most, and is never cut, and a symbol wider than 64 dp ends in an ellipsis. The title takes a second line
+  when it does not fit beside the amount, and shrinks, to 80% of its size at most, only when two lines do not hold it;
+  the amount stays at its height. A number that would not fit its line even
+  at half its size on a 320 dp screen at the largest text size (about fifteen characters, `HistoryTab.fitsBeside`) takes,
+  with the other leg, a line of its own under the row. A row's screen-reader label says, in the extension's order, what happened, the amounts
   (not while amounts are hidden), whom with, its status and the time. A transaction sent from this wallet that no source
-  reports 65 minutes after it was sent (the wallet sends it again by itself for 30 minutes, a node keeps each copy 30
-  minutes, and a 5-minute margin: `PENDING_ROW_MAX_MS`, as long as `services/PendingTx` `mayLandUntil` allows it to
-  land) is Not found instead of staying Pending for ever, and a source's row with its hash still replaces it; neither
-  Pending nor Not found rows are kept on the device, and a send reported in a block is never Not found. Before a row is marked Not found the chain is asked by the send's
-  nonce: one that landed, under its own hash or as a copy under another, becomes a node's reported row under the hash
-  that landed (the archive's row replaces it once listed); one whose nonce another transaction took goes; one no node
-  answered for stays Pending until a later refresh can ask (`rowsDueToDrop`, `mergeHistory` `settled`), and so does one
-  whose sent history no node gave (`resolveSubmitByNonce` learns nothing from a read that failed). A confirmed, failed
-  or reported row with the same hash always replaces a Pending or Not found row, an older page's included, and the result
-  card's own check by nonce removes either. The amount is written in the one amount format (comma groups, point
+  lists yet stays Pending however long ago it was sent: only the chain ends it, never a clock. Every History read that
+  any source answered asks the chain about each such send by its nonce once the read's rows are on screen, so a received
+  transfer and the live figure never wait for it, one ask per send at a time (`rowsToSettle`: the oldest first, eight a
+  read at most, `HISTORY_LOOKUP_ROWS`; `settleSentRows`, `resolveSubmitByNonce`), and each answer goes on its row when it
+  comes (`nonceAnswer`, `withNonceAnswer`): a block
+  holds it, under its own hash or as a copy under another, and the row is Confirmed under the hash that landed (it goes
+  when a row of that hash is listed already); its nonce is taken by another transaction (a replacement, or a send the
+  same recovery phrase signed elsewhere) or by a contract call the wallet cannot bind to this one, and the row goes, the
+  transaction listed at that nonce taking its place; the chain's height passed the last height a V2 send signed,
+  its nonce still free, and the row says Expired, as its result card does ("No block took it in time. Nothing was taken
+  from the wallet."). No answer, a nonce not reached yet (a V1 send has no last height), or a nonce spent with no row to
+  bind it decide nothing: the row stays Pending for a later read. The result card's own check by nonce applies the same
+  answer to the row. What the wallet itself does with such a send follows its kept copy, not its row
+  (`services/PendingTx`: sent again by itself for up to 30 minutes after signing, kept until the chain settles its
+  nonce, below). A row in a block is kept on the device; Pending and Expired rows are not. A
+  confirmed, failed or reported row with the same hash always replaces a Pending or Expired row, an older page's
+  included. The amount is written in the one amount format (comma groups, point
   decimals) with few decimals and never a suffix or an exponent (`compactAmount`: at most eight decimals below 1, four
   from 1, two from 1,000 and up to a million, the whole number rounded from a million); the detail shows the exact
   figure in it. A row's number never ends in an ellipsis; only a token's symbol, a name, may. The amounts take at most
@@ -555,14 +719,15 @@ no proof badge; only the checks above make a value count as proven where the app
   hidden or format character (a direction override, U+202E, can make a symbol read as QNC), and every token symbol and name, on
   History as on Assets, Send and Manage tokens, is written with such characters replaced by � (`tokenSafety.tokenLabel`,
   `usesReservedName`). Tapping a row opens its detail screen over
-  the tab, with Back (the word) over its title, what happened: the exact amounts in the figure face, the status in a
-  word, the node's type and
+  the tab, with Back (the word) over its title, what happened: the exact amounts in the figure face, then one section
+  of its fields, first the status in a word (in Mint when confirmed, in Fog on its way, in Ember when nothing moved),
+  the node's type and
   name for a node row, the fee, both addresses (each copies; a sender that is QNet Blockchain itself is named in words and
   neither copied nor drawn as an id: "Node balance" for a move of the node balance, "Genesis", and "QNet Blockchain" for
   "system" and any other system account, `systemSenderKey`), the time, the transaction hash (copies), the block when a
-  source named it, a memo when there is one, and one text action: "View in the explorer" for a transaction the network ran (a QNet Blockchain one in a block opens QNet Blockchain Explorer, a Solana send the cluster's public explorer, `config/nodes.js`
-  `solanaExplorerTxUrl`), otherwise (one still pending or not found, a Solana send that expired unrun) "Copy the
-  transaction hash"; a node event the registry alone reports has no transaction hash, so neither.
+  source named it, a memo when there is one, and under the section one action: "View in the explorer" for a transaction the network ran (a QNet Blockchain one in a block opens QNet Blockchain Explorer, a Solana send the cluster's public explorer, `config/nodes.js`
+  `solanaExplorerTxUrl`), and none for one still pending or expired or a Solana send that expired unrun, whose hash
+  a tap on its field copies; a node event the registry alone reports has no transaction hash, so neither.
 - **Account events.** The node sends `{"type":"BalanceUpdate","data":{"address","block_height"}}` on the address
   socket after each block that touched this wallet (a native balance, the fee wallet, a token transfer). It carries no
   amount and is a hint only (`WalletScreen.followAccountEvent`): 1 second later the live QNC figure is read, again a
@@ -722,6 +887,14 @@ by committee signatures from what it verified, in the background: nothing the us
 
 ## Requests, signing and sending
 
+Every `fetch` and `XMLHttpRequest` request to aiqnet.io and to the five genesis names carries
+`User-Agent: QNetWallet/<version> (<build>; <platform> <system version>)`, for example
+`QNetWallet/1.3.1 (31; android 28)`, so what reaches them can be tied to a build; it is set once on React Native's
+`XMLHttpRequest`, which its `fetch` is built on (`src/utils/clientAgent.js`,
+installed by `index.js`, background wakes included), with the version and build from the native build
+(`QNetAppBuild`: Android `BuildConfig`, iOS `Info.plist`). No other host gets it, and it holds nothing that tells one
+device from another.
+
 Balance, token, token-transfer, reward-claim, transaction-submit and contract calls go through a
 hedged path: two nodes, a per-attempt timeout and a hedge timer, first success wins and the rest are
 aborted. For a read, an answer counts only when it is 2xx, its body was read within the attempt's time (the timer runs
@@ -729,7 +902,8 @@ until the body is read, so a body that stalls times out) and it is not a node's 
 that node's failure, and the next node is asked at once. Only when every node failed is the last failure returned.
 Balance and token proofs ask up to three genesis names. A submit settles only on an answer that took the transaction. Single plain requests against one node are used for the light client's
 macroblock-proof and registry fetches, node discovery, the native transaction-history list and the explorer history
-page, the Solana devnet balance reads (which rotate over the endpoints on a rate limit), and every push, ping,
+page, the Solana devnet calls (to the cluster's endpoint, or through aiqnet.io once that endpoint gave this device no
+answer: [the way to Solana](#solana-sends)), and every push, ping,
 self-attestation, binding and device-layer call. Requests
 where the **server builds the transaction** go to exactly one node, since hedging them would produce
 two distinct on-chain transactions for one logical operation.
@@ -738,7 +912,8 @@ The hedged path picks two genesis names in random order, a node that failed thre
 30 seconds last; only the light client's macroblock lineage steps also use the agreed endpoints of the
 discovery list (one of them first, then the genesis names), which is asked again once it is 30 minutes old.
 A read that needs two genesis names to agree (the QNC balance the Assets tab may lower to, a token's description,
-what an address is, whether the wallet has a server node) asks three of them in random order, and the other two only
+what an address is, whether a server node is the wallet's, the wallet's node, which the first answer that names it
+already shows: [Which nodes the tab shows](#the-node-tab)) asks three of them in random order, and the other two only
 when those three gave no verdict (`WalletManager._fromGenesis`); the agreed balance read is shared for 10 seconds,
 and while it runs. The certified head a proof's freshness is judged by asks all five for their certified frontier, at
 most once a minute, and so does the account nonce a send plans from (one read at a time per address). An agreement
@@ -765,8 +940,31 @@ Canonical signed messages. Every message the wallet key signs carries the chain 
 | Ping delegation | `q{chain_id}\|delegate_ping:v2:{ping_pubkey}:{node_id}:{seq}` |
 | Attach (the device's push channel) | `q{chain_id}\|light_attach:{node_id}:{sha3(ping_pubkey)}:{sha3(push_target)}:{seq}:{ts}` |
 
-The consent is signed only on the link sheet of a `link` request, for the burn the request names; the app
-submits no registration: the node cabinet or the browser extension submits it with the burner's owner bind. For a
+The V2 form. A transfer, a contract call, a deploy and a claim's step 2 can sign the last height a block may carry them
+(`valid_until`) and no timestamp, under the build's `NETWORK_ID` (the hash of block 0):
+`q{chain_id}|{network_id}|transfer_v2:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}:{valid_until}`,
+`…|contract_call_v2:{from}:{sha3_256_hex(dataStr)}:{nonce}:{gas_price}:{gas_limit}:{valid_until}`,
+`…|contract_deploy_v2:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}:{valid_until}` and
+`…|qnet_claim_v2:{wallet}:{valid_until}:{sha3_256(claims_data)}` (`src/crypto/WalletIdentity.js`, `NodePreimages.js`;
+the node's known answers are `docs/protocols/tx-v2.vectors.json`). A send signs it when every genesis answer of the
+agreed account nonce says `tx_v2`, with `valid_until` = their highest `next_height` + 600 (`TX_V2_LIFETIME_BLOCKS`),
+and the V1 form otherwise; the request body then
+names `valid_until`. A move of the node balance signs the form its quote offers: with `valid_until` the V2 message built
+here, the node's `sign_message_v2` only compared with it (another one refuses the move). A typed refusal of the form or
+the height (`tx_v2_before_gate`, `tx_expiry_required`, `tx_expired`, `tx_expiry_beyond_horizon`) is answered by one
+re-sign at the same nonce: the V1 form before the gate, else the V2 form with a genesis node's fresh `next_height`; a
+second refusal is the answer ("no block took it in time" for the last two). A V2 transaction not in a block once a genesis
+node's tip is past its `valid_until`, its nonce still free there, failed and took nothing: it leaves the kept list
+(`PendingTx.expireByHeight`), its result card says Expired ("No block took it in time. Nothing was taken from the
+wallet."), its History row says Expired too (`txHistory.withNonceAnswer`), and a move in transit ends with its whole
+amount back on the node (`ClaimTransit`, `claim_note_expired`).
+No clock decides it.
+
+The consent is signed only on the link sheet of a `link` request, for the burn the request names. The app sends no
+registration to a node itself: for the burn of the page's one-time payment address it posts the consent body to
+aiqnet.io's register route, which adds the burner's owner bind its record keeps and submits the registration to one
+genesis node ([QNet Link](#requests-from-aiqnetio-qnet-link), `src/services/RegistrationSubmit.js`); for any other burn
+the node cabinet or the browser extension submits it with the burner's owner bind. For a
 burn made from the wallet's own Solana address (a request with `burner`), the wallet's Solana key signs that owner
 bind itself, the v1 form `qnet_onchain_reg:{N}:{W}:{proof}:{T}:{sha3(K)}:{burnTx}` with the consent's T
 (`WalletManager.signOwnBurnBind`, built by `NodePreimages.ownerBindPreimage`), and the cabinet submits it. The
@@ -822,7 +1020,13 @@ recipient in groups of four characters, as captured when Send was tapped (the on
 amount, fee and total, and the in-app browser's recipient warnings (never paid, a look-alike of a known address,
 only ever sent to this wallet). Its Confirm arms after one and a half seconds untouched. Then the fresh check runs,
 the password prompt, the system biometric prompt or the screen-lock prompt, which shows the whole recipient too. The
-Send button turns busy, with a spinner, from the tap until the send is over, and a second tap starts nothing. Before
+Send button turns busy, with a spinner, from the tap until the send is over, and a second tap starts nothing; only
+the form the send began on shows it busy. A send whose form closed (Back, the Assets tab, another token's form) before
+the user confirmed it raises nothing more: no refusal, no unconfirmed-transactions question, no review and no fresh
+check, on the QNet and the Solana Send forms alike; once the user confirmed it, its outcome (sent, unknown, or the
+network's refusal of the submitted transaction) is shown wherever the screen is. A question the send asks
+("Unconfirmed transactions": replace one or send in addition) that Back or a lock takes away counts as Cancel, so the
+send ends there. Before
 the review the form reads, all at once, the QNC balance, a token send's token balance, what the recipient is and the
 wallet's kept transactions. A recipient that is a contract (a built-in token, the token being sent included, or any
 other contract: none sends QNC or a token on) is refused with "This address is a contract, not an account. …", decided
@@ -877,8 +1081,9 @@ decimals as the asset takes: a token at most six and never more than its own dec
 of 0 a whole number), QNC five, after its fee; they work in whole base units from the token's exact balance
 (`src/utils/sendAmount.js`). An amount with more decimals than the token has says "This token has at most N decimal
 places." under the field and on Send. A node's refusal is said in the app's language, never in the node's own words
-(`src/utils/txRefusal.js`): a nonce out of order, not enough balance, a key the network does not know yet, a busy
-network or too many requests, each by its own text, inside "Not accepted yet (…)" or "Refused (…)", and as the detail
+(`src/utils/txRefusal.js`): a nonce out of order, not enough balance, a key the network does not know yet, a last
+height that passed or did not fit after the one re-sign (`tx_expired`, `tx_expiry_beyond_horizon`: "no block took it
+in time"), a busy network or too many requests, each by its own text, inside "Not accepted yet (…)" or "Refused (…)", and as the detail
 of "The transaction failed." on the result card; any other refusal or an internal error says the operation's text
 alone. A 64-character hex recipient has its own text.
 
@@ -888,9 +1093,9 @@ QRC-721 mint, transfer, approve, transferFrom; plus `deployToken` and `deployNft
 
 ## Solana sends
 
-The Solana side of Assets lists SOL and 1DEV; its Send button opens the Solana Send form with SOL, and each row opens
-it with its own token (`src/screens/SolanaSend.js`). The form, laid out like the QNet Blockchain one, has the token (SOL or 1DEV,
-switchable on the form), the recipient with the Scan act on its label's line, the amount (digits and one decimal point,
+The Solana side of Assets lists SOL and 1DEV; its Send button opens the token picker with both, and the token picked, or
+Send on a token's own screen, opens the Solana Send form of that token (`src/screens/SolanaSend.js`). The form, laid out
+like the QNet Blockchain one and titled by its token, has the recipient with the Scan act on its label's line, the amount (digits and one decimal point,
 no more decimal places than the token has) with MAX, the fee of a one-signature transfer (0.000005 SOL) and the total.
 MAX reads the balance now: all SOL but that fee, or all of the token in the account a transfer spends from. The 1DEV
 figure on Assets and the form's Available line follow the same rule (`heldTokenBase`: the fullest initialized account
@@ -898,6 +1103,30 @@ of this owner and mint), and both balances are read at `confirmed`, as the send'
 and a refusal's "balance" agree and move when a send is confirmed; a read that fails keeps the figure shown. The
 transfer goes from the wallet's Solana address, the Ed25519 key of the same recovery phrase, to the Solana cluster
 and RPC endpoint the balances use (`src/config/nodes.js`: devnet in every build).
+
+**The way to Solana.** Every Solana call of the app, the SOL and 1DEV figures, the quote, MAX, the submit, the status
+reads and a token's facts, goes through one client (`src/services/SolanaSend.js` `solanaRpc`): one JSON-RPC request,
+two attempts. It goes to the cluster's endpoint (`SOLANA_RPC_ENDPOINTS`, 8 s an attempt) until an attempt there gets no
+answer at all, no response or none within its 8 s; the attempt after it then goes at once, with the same body, to the
+site the app already uses (`SOLANA_RELAY_URL`, `${EXPLORER_API}/api/cabinet/solana`, so `https://aiqnet.io/api/cabinet/solana`;
+20 s an attempt, as the site itself waits on the endpoint), which passes it on to Solana, and so does every call after
+it. Only what the call carries travels there, the addresses it reads and a transfer already signed on the device; no
+key leaves it. A rate limit, a server error or an unreadable body from the endpoint is an answer: the next attempt goes
+to the endpoint again, and the way stays as it was. An attempt at the site that gets no usable answer (none at all, a
+server error, an unreadable body) is followed by one at the endpoint itself, whose usable answer puts the calls back on
+it (`src/utils/solanaRoute.js` `solanaAttemptAfter` gives each attempt its way). The way is kept on the device
+(`qnet_solana_route_v1`, `{ v: 1, via: 'direct' | 'site', probeAt }`, read strictly by `src/utils/solanaRoute.js`;
+anything else is the endpoint), read once per start, so after a restart the calls go straight through the site and no
+call waits on the endpoint again; it names no address, a wallet switch keeps it and erasing the app's data removes
+it. On the site route
+a direct `getBlockHeight` runs beside a call, one at a time and never waited for, once 300 s have passed since the last
+direct try (`SOLANA_DIRECT_RETRY_MS`), after a network change (the `qnetNetworkBack` event, which iOS also sends at each
+start) or when the last try is dated after the device's clock: a block height puts the calls back on the endpoint,
+anything else keeps them on the site from that moment; an answer of the endpoint to a call that went to it before the
+switch puts them back on the endpoint too. A send keeps every rule below on either way: an attempt on either way that
+got no usable answer, followed by a refusal, leaves the send unknown, and it is never signed again.
+The site passes on exactly the transfers the app builds: `docs/protocols/solana-relay.vectors.json` holds them, and
+`__tests__/SolanaTx.test.js` builds each of the app's cases byte for byte.
 
 **Scan.** The scan opens the same camera sheet as on the QNet Blockchain form, titled "Scan a Solana address"
 (`src/utils/solanaRequest.js`). It takes a Solana address (base58 of exactly 32 bytes, in its canonical form), which
@@ -922,11 +1151,22 @@ a payment request: the token by its mint, an amount within the token's decimals.
 opens over Assets with the recipient and the amount filled in and the line "Filled in from a link. Check the address
 and the amount." above the form; the user reviews and confirms as for any send, and Back returns to Assets. A link
 that cannot be read says "This payment request cannot be read" (another mint: "This wallet does not hold the
-requested token") under "Request not opened", and opens nothing. While the wallet is locked or not there yet, a QNet
-Link request is on screen or a Send form is open, the request waits and opens once that is over; one waits at most,
-a newer link replacing it. A link a page of the in-app browser handed over is refused first, as a QNet Link one. The
-app registers no custom URL scheme and reads no `solana:` link, so another site's mainnet payment request never fills
-in a devnet Send.
+requested token") under "Request not opened", and opens nothing. While the wallet is locked or not there yet (the
+lock screen says "A request through aiqnet.io is waiting. Unlock the wallet to see it." while a transfer request or a
+QNet Link request waits for the user; a decided one whose answer is still on its way says "Sending the answer to
+aiqnet.io…" instead), or a QNet Link request on
+screen waits for the user's decision, the request waits and opens right after (a decided one gives way to it at once,
+also while a send under way holds the form back, so only that send's result stays, its answer going on in the
+background); requests that wait open one after another in the order they came,
+one that waited behind an earlier link once the form that link opened is closed. It takes the place of a Send form
+the user has open, being what the user asked for last, unless a send is under way (being checked, reviewed, confirmed,
+signed or sent, or its result on screen), whether or not its form is still open (a lock meanwhile does not end it,
+since the wallet screen holds that state, not the form): then it opens right after that send, once its result is
+closed. A link that waits stays in the link inbox until
+its form opened ([QNet Link](#requests-from-aiqnetio-qnet-link)), so a screen made anew still opens it, and so does a
+new process within 600 s of the link's arrival. A link a page of the in-app browser handed over is refused first, as
+a QNet Link one. The app registers no custom URL scheme and reads no `solana:` link, so another site's mainnet payment
+request never fills in a devnet Send.
 
 **Checks before anything is signed** (`src/services/SolanaSend.js` `quoteSolanaSend`). Send reads, now: the SOL
 balance, the rent-exempt minimum of an account, and for SOL the recipient's balance; for a token also its mint (it
@@ -963,9 +1203,9 @@ not a refusal: the transaction's id is its signature, known before it is sent, s
 Confirmation" and the send is followed like any other. The same holds for a refusal that comes only after an attempt
 nobody answered (the same bytes sent again): the first attempt may have reached the network, so the transfer is never
 signed a second time then, and its signature settles it. An endpoint that already holds this very transaction
-("already processed") has it on its way: the send is pending. History lists the Solana sends made on this device among
-the other rows by time, with a chip per Solana token (kept on the device, `qnet_solana_sends_v1:<address>`, the newest
-100; Solana transfers received, or sent elsewhere, are not listed, and a line above the list says so, "SOL and 1DEV:
+("already processed") has it on its way: the send is pending. History's Solana side lists the Solana sends made on this
+device by time, each row with its token's icon, and a token's own screen lists its own (kept on the device,
+`qnet_solana_sends_v1:<address>`, the newest 100; Solana transfers received, or sent elsewhere, are not listed, and a line above the list says so, "SOL and 1DEV:
 only sends made from this device are listed here", whenever the wallet holds SOL or 1DEV or lists a Solana send). A pending one is asked about by its signature every
 3 seconds, then every 15 (`getSignatureStatuses`): confirmed or finalized is Confirmed, a transaction the network ran
 and failed is Failed once that run is confirmed (a run seen only at `processed` may be on a fork that is dropped), and
@@ -973,7 +1213,8 @@ one whose blockhash passed its last valid block height unrun (the full history a
 not go through in time and now never can. Nothing was sent." and a row with no fee (nobody charged one; a run that
 failed keeps the fee it was charged, and a row's fee is the network fee only, never a new account's rent). The result
 card follows, and the balances are read again. A Solana transaction has no page in QNet Blockchain Explorer, so its result card
-copies the signature; its History detail opens it on the cluster's public explorer once the network ran it.
+offers no View in the explorer and a tap on its signature copies it; its History detail opens it on the cluster's public
+explorer once the network ran it.
 
 ## Moving the node balance
 
@@ -992,13 +1233,70 @@ the quoted batch. The node quotes a batch; the client then:
   cannot be confirmed;
 - **rebuilds the sign message locally** and refuses to sign the node's `sign_message` verbatim,
   aborting loudly on any mismatch. The same ML-DSA-65 key also signs transfer messages, so signing a
-  server-supplied string would let any node in the hedged pool obtain a transfer signature.
+  server-supplied string would let any node in the hedged pool obtain a transfer signature. The V2 message of a quote
+  that offers a last height (`valid_until`, `sign_message_v2`) is rebuilt and compared the same way.
+
+A move the network did not take says why, in the user's words: the node balance is empty, the smallest move is 1 QNC,
+a move is already running, QNet Blockchain has no record of this node yet, too many requests right now, no block took
+the move in time; any other refusal says that QNet Blockchain did not take the move and the balance stays on the node.
 
 The smallest move is 1,000,000,000 nanoQNC (1 QNC); only a batch the node's quote capped, with more epochs left to
 move, may be smaller. See [economics](../economics/overview.md). The node balance
-stays out of the wallet balance until a move lands. The
-result shows the amount of the batch actually submitted and, when the quote stopped early, the epoch it stopped at,
-to move again after the batch is credited. A move needs no device: the web's `claim` request names the node, the
+stays out of the wallet balance until a move lands.
+
+**One press moves the balance shown.** One claim holds what one quote holds: a quote stops at 512 epochs (`MAX_BATCH`),
+at 128 KiB of proofs (`CLAIM_QUOTE_BYTE_BUDGET`) or once the leaf rebuilds one request may make are spent
+(`stopped_reason` `batch_full`, `quote_byte_budget`, `rebuild_budget`: `src/utils/claimRun.js` `SIZE_STOPS`,
+`ClaimTransit.movesOn`). After
+such a part Move to wallet sends the next part by itself once the part before is in the wallet (the wallet's live
+figure shows its watermark at the part's last epoch: `WalletScreen.moveSettled`, no clock), quoted with
+`after` set to that part's last epoch, and only at genesis nodes whose node balance read shows it applied (a first
+unclaimed epoch past it, or nothing left), then at those that answered with none (`WalletManager._appliedFirst`; a node
+that did not answer is not asked either): a node counts every claim request of an address, quotes too, in its
+limit per address, so one that has not applied the part yet is not asked; one whose quote still starts before it hands
+over to the next, and its head and node balance count for nothing (`WalletManager._behindClaim`). Fewer than two such
+nodes is `CLAIM_BEHIND`, with no claim request sent, asked again twice 3 seconds apart (`src/utils/claimRun.js`
+`BEHIND_TRIES`, `BEHIND_WAIT_MS`). Any quote, the first part's too, passes over a node that cannot serve an epoch, one
+where this address spent its claim budget (`code` `rate_limited`) and one busy with another request for the node
+(`claim_busy`): `WalletManager._handsOver`; when every node answers so, that answer is the refusal. The run is one function,
+`MoveRun.runMove`, which the Node tab's button and a QNet Link claim sheet both start through `WalletScreen.startMove`
+(one run at a time: a second press, or a sheet, while one runs or a move is in transit starts nothing). It goes on until the balance shown when Move was
+pressed has moved, a quote stops at an epoch the nodes cannot serve now (`root_not_here`, `not_ready`,
+`local_corruption`, `epoch_unservable`: that part alone moves, and its card says "Part of the balance was moved. Move
+again later for the rest." while it is in transit), or the next part is not sent. The press covers the whole balance shown, so no part asks
+for anything again: a claim only ever credits this wallet. A part due while the wallet is locked is not sent; a lock
+while a part is in transit only pauses the wait, and another wallet or the screen going ends the run
+(`endMoveRun`). Each part is a move in transit of its own (below), and one result card says the run, as the parts'
+records say it whenever it is drawn: what they put in the wallet or have on the way, exact to the nano (a part taken
+in part counts its share, one that expired nothing: `MoveRun.runMovedNano`; a move whose one part expired says what it
+submitted, which stays on the node), a "Transactions" row with their count, the hash of the last part that counts so
+(`MoveRun.lastCountedPart`) with "View in the explorer" (a move whose one part expired keeps that hash, with no
+explorer page) and the last part's block once a genesis node reports it,
+"The balance moves in more than one transaction. The next one goes once this one is in a block." while the next part
+is to go, then the last part's state counting the parts before it (`ClaimTransit.runNote`). A next part that was not
+sent says what the parts put in the wallet, that the rest stays on the node, and why when the refusal's code says more
+(too many requests, the smallest move is 1 QNC); one nobody answered says what is in the wallet and that the network
+did not answer in time; nothing left to quote is the whole balance moved, and the card then names no stop. Done (or a
+tab) takes the card away and the
+run goes on; a run that ends short (a part not sent, or one not taken in whole) brings it back while no other card is
+up, and a second press before the screen draws again starts nothing. A claim sheet of a QNet Link request runs the
+same run from the balance the sheet showed, under its one Confirm, and answers once, at its end: its total, its last
+claim, and where that one stopped when the run ended short (`claim` below), as the claims' records show them: a last
+claim its record shows taken in part counts its share, with the rest from the first of its epochs the network did not
+apply (`ClaimTransit.restEpochOf`), one that expired counts nothing and the answer is the claims before it (its only
+claim expired: `CLAIM_REFUSED`), by the card's own rule (`MoveRun.runMovedNano`, `lastCountedPart`). The answer
+stays as it was sent; the sheet's outcome is drawn as the card is, from the claims' records each time: its headline
+"Move submitted:" with what they put in the wallet or have on the way (a move whose one claim expired says what it
+submitted), and its note what the card's says (`ClaimTransit.runNote`), so a last claim the run did not wait for, that
+its record later shows taken in part or expired, changes both alike. The answer is due while the relay's
+session lives (600 seconds from its start), so the sheet's run sends a next part only while at least
+`LINK.CLAIM_ANSWER_MARGIN_S` = 150 seconds of the session are left, and a wait for a part's block ends at that moment
+too: the part stays in transit, followed by its record, and only the request stops sending; the sheet then says "Part
+of the balance was moved. Move again later for the rest." The margin covers the slowest part the claim path's own timeouts allow, about 115 seconds (two hedged quotes,
+the cross-check reads, the submit and one signing again), and the answer's first post (up to 20 seconds). While a next
+part is to go, the sheet says "The balance moves in more than one transaction, each once the one
+before is in a block. Keep QNet Wallet open until the last one is sent: the website gets the total then." (a phone
+suspends an app in the background, and no task carries the run). A move needs no device: the web's `claim` request names the node, the
 wallet's light or super node, and the app moves that node's balance from any device that holds the wallet, whichever
 device runs a light node (the Node tab shows a light node only on the device it is bound to, a super node on every
 device). Step 1's `node_id` is then the node the request names (`NodePreimages.claimQuotePreimage` takes a light or a
@@ -1008,7 +1306,7 @@ super node id), the same quote and claim the Node tab makes for that node.
 (`last_claimed_epoch`) in one step when a block includes it, so the wallet's figure at a genesis node's live tip holds
 the amount from that block on. The node balance and its watermark are the wallet's, not a node's: the network sums one
 wallet's reward leaves whichever of its node ids is asked, so all of this is per wallet. Once the network took a move
-(the Node tab's card, or a QNet Link claim sheet, whose answer the sheet hands to the screen), the device keeps a record
+(each part of a run, the Node tab's or a QNet Link claim sheet's: `WalletScreen.startMove` records it), the device keeps a record
 of it (`qnet_claim_transit_v1`, a record for each of up to four wallets on the device, no secret in it): the node id it
 was made by, the amount (the sum of the batch signed), the epoch below the batch's first one, its last epoch, each
 epoch's amount, the transaction hash, the time and the rest of the node balance. The epochs come from the batch signed,
@@ -1048,12 +1346,15 @@ with no first unclaimed epoch, the answer the node gives right after a whole mov
 with none the last figure stays. So a node lagging behind a move never brings the moved amount back, on that read or
 any later one, and a live answer that was wrong judges no node balance once a certified read settled or reverted it.
 
-Nothing else ends a move: no time limit, and no node's answer about the node balance. A QNet Blockchain transaction
-carries no expiry the consensus enforces (no `valid_until` height); a node drops a transaction from its mempool after
-its own TTL, but that is the node's local choice, not a rule of the chain, so a batch not seen yet can still be
-included later. The only states are therefore the ones the chain shows: in transit (no watermark past the batch's
-first epoch yet), done, or in part. However long a move stays in transit, the Node tab says "Moving X" with Move to
-wallet off; there is no "did not go through" until the network has a consensus expiry rule for transactions. A record
+A V2 claim (one that signed its last height, `valid_until`, kept with the move) that a live or certified figure of a block
+past that height shows none of has expired: no block can take it any more (the chain's own rule), so it leaves transit at
+once, the card says "No block took the move in time. The whole amount stays on the node.", its History row is not
+confirmed, and the whole amount is back on the node balance. Nothing else ends a move: no time limit, and no node's
+answer about the node balance. A V1 claim carries no expiry the consensus enforces; a node drops a transaction from its
+mempool after its own TTL, but that is the node's local choice, not a rule of the chain, so a V1 batch not seen yet can
+still be included later. The only states are therefore the ones the chain shows: in transit (no watermark past the
+batch's first epoch yet), done, in part, or, for a V2 claim, expired. However long a V1 move stays in transit, the Node
+tab says "Moving X" with Move to wallet off. A record
 an earlier build marked as not gone through is read back as a move in transit, until a watermark settles it, unless the
 wallet's kept certified watermark is past its first epoch already (its epochs are then in the QNC figure or back on the
 node balance, none of it in transit). A claim is signed by this wallet as a send is, so its proof reads ask for the
@@ -1062,38 +1363,59 @@ newest certified state for ten minutes after it (`lastOwnSendAt`).
 ## The Node tab
 
 The tab (`src/screens/NodeTab.js`, states picked by `nodeView`) shows this wallet's node as the network records it:
-its light node, its super node, or both. One wallet, one node (owner, 11.10): a light node shows only on the device it
-is bound to (`NodeTab.lightShownHere`: bound here, or being linked here by the link sheet). A light node bound to
-another device or to none is not shown. Bound to another device, the tab says "This wallet's node is linked to another
-device, or to this device before QNet Wallet was reinstalled." (the network cannot tell a reinstall here from another
-device); bound to none, or with no binding here and no verdict, what it says for a wallet without a node, "This wallet
-has no node."; with no balance, no button and no word about binding or activation (binding is done on aiqnet.io). A super node shows on every device that holds the wallet.
+its light node, its super node, or both. One wallet, one node: a light node runs only on the device it
+is bound to (`NodeTab.lightShownHere`: bound here, or being linked here by the link sheet). Bound to another device, the
+tab names that device and offers nothing to run the node here (the other-device card below); bound to
+none, it says what it says for a wallet without a node, "This wallet has no
+node." over QNet Blockchain's two kinds of node, a card each: Light node, "Light nodes run in QNet Wallet", and Super
+node, "Super nodes run on a server" (where each kind runs, never that one runs here); with no balance, no button and no word about binding or
+activation (binding is done on aiqnet.io). Before the first answer of its light node's status, and with no super node
+named for the wallet (below), the tab says "Checking node status…" alone and names no kind of node. With no binding here
+and no verdict (the status could not be read, or the owners do not agree whether a device is bound) it says
+"Checking node status…" or "QNet Blockchain could not be reached. Pull down to try again." alone (`NodeTab`
+`Unsettled`): it names no kind of node and never says the wallet has none. That takes two owners' word that the light
+node is not on the chain and two genesis nodes' authoritative word that the wallet has no node at all; until both are
+in, a light node not on the chain reads "Checking node status…". A super node
+shows on every device that holds the wallet. With Hide node names on, each node's name reads "••••" in its line.
 A light node's status comes from its three shard owners among the genesis nodes (`src/services/LightNode.js`
 `readNodeStatus`, [light node messages](../protocols/light-node-messages.md) section 7): "no node" needs two of them
-to agree, and one answer or a split shows "QNet Blockchain could not be reached." Of the owners that say the node is
+to agree, and one answer or a split shows "QNet Blockchain could not be reached." The status settles as soon as the
+answers in hand decide every verdict two owners must give alike (on the chain or not, the forms two list, whether a
+device is bound, the day it was linked, and of the signed form the binding sequence), without waiting for the third
+owner; the signed form goes out then. The card shows that status at once where it shows no verdict of the node yet,
+and the third owner's answer refines it when it comes; the status is read again on the linking schedule below while
+the open Node tab shows no verdict. A step the user confirmed on a status read a moment ago (Use this device on the
+QNet Link sheet, `PushService.bindThisDevice` with `known`) does not read the public status again: the two owners'
+verdicts it was decided on (on the chain, the forms) stand, only the signed form is read, and the node counts as not on
+the chain then only when two owners refuse that signed form as `not_registered`. The card shows before the upkeep a read starts (the link sheet's binding sent
+again, an enrolment again with a token, a lease refresh), which waits on device checks and the network; one that went
+through reads the status again. Of the owners that say the node is
 on the chain, any one's word is enough for what counts the device: an owner may have taken this device's answer while
 another was down, and the one relay that tells the others may be lost. So "Answered this epoch" is yes when any of them
 says so, Offline (`needs_reactivation`) only when every one of them says so, the counted epochs are the owner's with the
-latest counted epoch (read, not shown: the tab names no count of epochs and no device model, which the site's node
-cabinet shows with its per-epoch history; owner, 11.10), and the device view is online when any says so, with the
-latest epoch any counted it in. The
+latest counted epoch (the node on this device shows no count of epochs and no device model, which the site's node
+cabinet shows with its per-epoch history; the other-device card shows that device's model and the last
+counted epoch), and the device view is online when any says so, with the latest epoch any counted it in. The
 public status also carries
-the bound device's view (`device`: its state `online`, `offline`, `unlinked` or `other_device_pending`, the UTC day it
-was linked, the last epoch it was counted in; display only), read strictly. A device that holds a binding of the node
+the bound device's view (`device`: its state `online`, `offline`, `unlinked` or `other_device_pending`, its platform and
+model, the UTC day it was linked, the last epoch it was counted in; display only), read strictly; the day it was linked
+that two owners report alike is `linkedSinceAgreed`. A device that holds a binding of the node
 also reads the signed status from every owner (its binding sequence, device state, refresh window, rotation epoch,
 pause, from the first owner that takes the signature): signed with the ping key; with no ping key here, or one two
 owners refuse, with the open wallet's key instead (a background wake never signs with the wallet key). The binding
 sequence two signed answers name alike (B, `bindingSeqAgreed`, whichever key signed) and whether two owners say a
-device is bound (D) decide where the node runs (`NodeTab.bindingVerdict`, contract 4 of 04.10):
+device is bound (D) decide where the node runs (`LightNode.bindingVerdict`; the Node tab and the
+answer at an open read it alike):
 
 | This device's binding L | B and D | Where the node runs (`nodeView`) | The tab |
 |---|---|---|---|
-| none | D true / D false / no verdict | another device / no device / checking | the node not shown: "This wallet's node is linked to another device, or to this device before QNet Wallet was reinstalled." / "This wallet has no node." / "This wallet has no node." |
-| L | B = L's sequence (D true or no verdict) | this device | Online or Offline; when the network linked it less than an epoch ago and nothing counted it yet (`other_device_pending`), "Linked to this device. Waiting for its first answer." |
-| L | B above L's, D true | another device; this device stops once its binding is 10 minutes old | the node not shown: linked to another device |
-| L | B at or above L's, D false | no device (unlinked here, or by the wallet key from anywhere); this device stops the same way | the node not shown: "This wallet has no node." |
+| none | D true / D false / no verdict | another device / no device / checking | the other-device card / the no-node view / "Checking node status…" alone |
+| L | B = L's sequence (D true or no verdict) | this device | Online or Offline; while the device has not answered yet and was linked, or the node registered, less than an epoch ago (`other_device_pending`), "Linked to this device. Waiting for its first answer." |
+| L | B above L's, D true | another device; this device stops once its binding is 10 minutes old | the other-device card |
+| L | B at or above L's, D false | no device (unlinked here, or by the wallet key from anywhere); this device stops the same way | the node not shown: the no-node view |
 | L | B below L's | for 10 minutes after the binding, this device with the waiting line (the owner that took it passes it on); then as above | as that |
-| L | no B (no signed answer, a refused key, no network) | the last verdict read for this binding, else this device; never another device or no device | as that |
+| L | no B, D true, the bound device linked on a later UTC day than L (`linkedSinceAgreed`) | another device: a newer binding holds the node, which the owners' refusal of L's ping key keeps from naming its B; this device stops the same way | the other-device card |
+| L | otherwise no B (no signed answer, a refused key, no network) | the last verdict read for this binding, else this device | as that |
 
 A refused ping key, or no ping key to sign with, never says the node runs elsewhere on its own. Only the signed status
 carries `device_tag_h`, bound to a nonce the app picks per read (the public one never names the device), which a
@@ -1102,23 +1424,27 @@ naming this device's key is enough, and it counts as another key only when two o
 device's (an owner a rotation's statement has not reached yet still names the key before). A tag of another key only
 says that the device's key for the node is missing, with **Use this device**.
 
-Each node is a group with no box around it, the groups parted by space and rules: its identity (its type, its id with
-Copy for a light node, and its status in a word: the live dot and Online, or Offline or Waiting for admission in
-Ember), then the node balance as the tab's figure (in Signal while at least 1 QNC can move) with **Move to wallet**,
-then its status rows under a kicker. Where **Use this device** is offered it is the solid action and the move is a text
-action under it.
+Each node is two sections: its identity (its status as a chip, the live dot and Online, or Offline or Waiting for
+admission in Ember, before its type, and its whole name on one line under them, shrunk to fit and never cut, copied
+whole by a tap as every value is, with the copy mark at its end, also while it is shown masked), then one Status section: the epoch bar and the status rows, the Background row in Mint while the system lets the
+app run unrestricted and in Ember while it restricts it (with the one button to lift it under it), what the state asks
+for or waits for, and at its foot the node balance's row (in Signal while at least 1 QNC can move) with **Move to
+wallet** under it. Where **Use this device** is offered it is the solid action and the move is a text action under the
+balance. The tab's title is pinned over its scroll (`stickyHeaderIndices`) in a band of the screen's ink that starts at
+the scroll view's own top edge (the scroll pads no top, `styles.nodeScroll`), so the sections pass under it and none
+shows above it; at rest the title sits 32 dp under the top bar, as every tab's title does.
 
 | State | What the tab shows |
 |---|---|
-| no node | "This wallet has no node." Nothing to tap, no link. Also a light node bound to no device, or with no binding on this device that the network gives no verdict on, and one aiqnet.io recorded that the network does not list yet (no device is bound to it). |
-| another device | "This wallet's node is linked to another device, or to this device before QNet Wallet was reinstalled." Nothing to tap, no balance. |
+| no node | "This wallet has no node.", then a Light node card ("Light nodes run in QNet Wallet") and a Super node card ("Super nodes run on a server"). Nothing to tap, no link. Only once two genesis nodes say the wallet has no node and two owners that its light node is not on the chain; until then "Checking node status…". Also a light node bound to no device, and one aiqnet.io recorded that the network does not list yet (no device is bound to it). |
+| another device | The light node's identity (Online, or Offline in Ember, by `needs_reactivation`; its type and name), then its Status: "The node runs on iPhone 15 Pro." (the model the status names; with none, "This wallet's node is linked to another device, or to this device before QNet Wallet was reinstalled.", as the network cannot tell a reinstall here from another device); Offline: "It did not answer for 2 epochs, so QNet Blockchain stopped waking it. It resumes when QNet Wallet is opened on iPhone 15 Pro." (with no model, "on the device it is linked to"); a device that has not answered yet and was linked, or whose node registered, less than an epoch ago (`other_device_pending`): "Waiting for its first answer." in place of that; "Last counted: Epoch 1,234" (from `counted.last_counted_epoch`; "None yet" before the first; no row when the owners report no count); the node balance and **Move to wallet**. No **Use this device**. Under a super node's card the same card, without the balance and its move (on that card). |
 | linking | "The node will run on this device once QNet Blockchain records it." (a pending-link record of the link sheet); while the owners report the registration in the genesis nodes' pool (`registration_pending`), "QNet Blockchain is recording the node in a block. It will run on this device once that is done." While a link is pending and the chain does not list the node, its status is read again every 10 seconds for the first two minutes after the link, then every minute, on every tab while the app is in front (`requestPace.linkingReadMs`), starting at once when the QNet Link sheet answers `ok`; the same schedule, from the time it went, while a binding with no answer waits (below) |
 | not recorded | "QNet Blockchain did not record the node. Nothing changed on this device." (the record's 24 hours passed and two owners say the node is not on the chain; the binding the sheet kept, with its ping key, push token and wakes, goes with the record, as it does when two owners refuse its ping key) |
 | this device | Online (with the live dot) or Offline (Online only from the network's `needs_reactivation`), "Answered this epoch", the epoch clock ("Epoch ends in ~3 h 47 min": the time left, at least a minute), "Background: Unrestricted" or "Restricted" with, while restricted, one button to the system settings ([Background priority](#background-priority-on-android-and-ios)), the node balance and **Move to wallet** (it takes a balance of 1 QNC or more, with no note under it); no button ends the node here (below); with the device state: from the next epoch, a device check that waits (below), paused until a date; a device check not finished once the chain's epoch is past the key rotation's due epoch plus the node's 30-day grace (180 epochs: until then the node still counts the unrotated key, and a check not finished waits for something a new key does not end) says the key was not renewed in time and offers **Use this device**; a pause with no end (the device's certificate chain was revoked) says the device can't run the node right now and offers **Use this device**, the one way back; a binding that holds no device key once two genesis nodes take them (made before they did, or its key is gone after a reinstall, a restore or an offload) says so as advice (until the network requires the device signature its replies still count, so it never says the node is not counted) and offers **Use this device**, unless the device cannot run a node at all, which says only that |
-| checking, network not reached | for the node this device holds a binding of: "Checking node status…" or "QNet Blockchain could not be reached.", then the node balance and **Move to wallet** |
-| server node | a super or genesis node of this wallet, which runs on its server, on every device that holds the wallet: its type and id heading the card, Active (with the live dot) or Offline, "Last seen: {time} ago" (from the node's `last_seen_ago_seconds`, only when the answering node saw it), "Network admission: Admitted" when the node reports its admission to the epoch's rewarded set (`admission` `admitted`, `NodeTab.rewardAdmission`), "Epoch heartbeats: n of m needed", "Epochs not admitted: k" when any (below; no missed epochs: the site's cabinet shows them), the epoch clock, a permanent ban when there is one ("Reputation: Banned", its reason, double signing, under it), the node balance and **Move to wallet**; no code, price or link. Before its first answer "Checking node status…"; a read that fails keeps the last good status of the node on screen, with "QNet Blockchain could not be reached. Pull down to try again." above it (`NodeTab.keptServerStatus`), and with none that sentence alone; the server text ("Super nodes run on a server") only when the network says the node is not registered |
-| server node waiting for admission | a super node the network registered and does not admit to consensus yet (a network rule holds outside super nodes back while registrations stay open): its status `admission` `waiting` (the node's `super_admission_label`: outside the epoch's consensus-admitted set), as the site shows it (`PushService.checkServerNodeStatus` `admission`, `NodeTab.waitingAdmission`). Its status says "Registered, not admitted to consensus yet" in Ember, never Offline; the balance and **Move to wallet** as above. A node that names no admission, or `not_required` (no admission rule governs the epoch), reads as before |
-| not on the network yet | for a super node: "This wallet's super node has not joined QNet Blockchain yet. It runs on a server with QNet Blockchain node software." (aiqnet.io records the node, below, and the network does not list a super node); nothing to tap |
+| checking, network not reached | for the node this device holds a binding of: "Checking node status…" or "QNet Blockchain could not be reached.", then the node balance and **Move to wallet**; with no binding here, that line alone, no kind of node named |
+| server node | a super or genesis node of this wallet, which runs on its server, on every device that holds the wallet: its type and id heading the card, Active (with the live dot) or Offline, "Last seen: {time} ago" (from the node's `last_seen_ago_seconds`, only when the answering node saw it), "Network admission: Admitted" when the node reports its admission to the epoch's rewarded set (`admission` `admitted`, `NodeTab.rewardAdmission`), "Epoch heartbeats: n of m needed", "Epochs not admitted: k" when any (below; no missed epochs: the site's cabinet shows them), the epoch clock, a permanent ban when there is one ("Reputation: Banned", its reason, double signing, under it), the node balance and **Move to wallet**; no code, price or link. Its status is that of the node the genesis nodes name (below), read by its id: only an answer that names that node registered replaces it (`NodeTab.serverStatusAfter`). Any other (not registered, no node or another node named, a failure, a timeout) keeps the last good status on screen with "QNet Blockchain could not be reached. Pull down to try again." above it, and never shows another node's status; with no good status yet, "Checking node status…", or after a read that got no answer that sentence alone. Only two genesis nodes saying the wallet has no node take the card off the tab |
+| server node waiting for admission | a super node the network registered and does not admit to consensus yet (a network rule holds outside super nodes back while registrations stay open): its status `admission` `waiting` (the node's `super_admission_label`: outside the epoch's consensus-admitted set), as the site shows it (`LightNode.serverStatusOf` `admission`, `NodeTab.waitingAdmission`). Its status says "Registered, not admitted to consensus yet" in Ember, never Offline; the balance and **Move to wallet** as above. A node that names no admission, or `not_required` (no admission rule governs the epoch), reads as before |
+| not on the network yet | for a super node: "This wallet's super node has not joined QNet Blockchain yet. It runs on a server with QNet Blockchain node software." (aiqnet.io records the node, below, and two genesis nodes say the wallet has no node); nothing to tap. While the genesis nodes' word is out, or once they name a node, it is never said |
 
 **The last missed epoch.** The device view also carries `last_miss` and `last_answer` (light node messages section
 7), read strictly: a missing field (an older node), an unknown reason or a field of another type gives nothing. Of the owners that say the node is on the chain, the record with the highest epoch is taken,
@@ -1135,9 +1461,9 @@ tab's read send this device's push token again, a new one in place of the one th
 A device that cannot run a node (below) keeps the whole wallet; its tab says "This device can't run a node." (or,
 on an Android secondary profile, that the node runs only in the main profile) and offers nothing to run.
 
-Moving the node balance takes only the wallet key, so every state of the light node this device runs, and the super
-node's card on every device, shows the balance and **Move to wallet** (not linking or not recorded: no node on the chain
-yet); the balance of a light node not shown here is not read. The balance is the wallet's, so with both cards it shows,
+Moving the node balance takes only the wallet key, so every state of the light node this device runs, the card of one
+on another device, and the super node's card on every device, show the balance and **Move to wallet** (not linking or
+not recorded: no node on the chain yet); the balance of a light node bound to no device is not read. The balance is the wallet's, so with both cards it shows,
 and moves, once: on the super node's card. A balance no genesis gave yet, or one only refused (a
 refusal body is a failed read, never 0), shows "—" with the button off; a failed read keeps the last figure. A move in
 transit shows "Moving X" on the button, off, and the rest of the balance ([Moving the node
@@ -1145,18 +1471,30 @@ balance](#moving-the-node-balance)).
 
 **Which nodes the tab shows.** The wallet's node ids are pure functions of its address, the node's own derivations:
 `light_mobile_` and `super_node_` followed by the first 16 hex characters of blake3 of `LIGHT_NODE_PRIVACY_` or
-`SUPER_NODE_PRIVACY_` and the address (`WalletManager.generateLightNodePseudonym`, `generateSuperNodePseudonym`), and
-`genesis_node_00N` for a genesis wallet. On opening the tab (and on pull-to-refresh) the app asks a genesis node for the
-wallet's nodes (`/api/v1/activations/by-wallet`) and for the chain's registrations of those ids with the height each
-was registered at (`/api/v1/account/{addr}/node-events`, `PushService.getWalletNodeEvents`: only the ids the wallet
-derives are taken, and the burn field is not read). A super or genesis node is linked to the wallet only when two
-genesis nodes confirm it (`/api/v1/verify-activation`); a light node record an older build kept on the device never
-stands in its way. A super node's card comes first; the wallet's light node shows under it when the chain lists both
-(an older wallet) and the light node is bound to this device, with no balance of its own (the wallet's balance and its
-move are on the server card), and a link request for
-the light node still answers `NODE_OTHER`. Under a server node the light card shows only a node of the wallet on this
-device (on the chain and bound here, or a link of it pending here), and its status is read again (every 5 minutes) only
-then.
+`SUPER_NODE_PRIVACY_` and the address (`WalletManager.generateLightNodePseudonym`, `generateSuperNodePseudonym`); a
+genesis wallet's node is its `genesis_node_00N`. Which node is the wallet's, of every type, is the genesis nodes' word
+alone (`WalletManager.walletNode`, `/api/v1/verify-activation`: the chain's rows of the wallet's genesis, super and
+light ids, in that order), read on opening the tab, on pull-to-refresh, on every return to the app with the tab open,
+and with the 5-minute refresh while they have not answered: the first answer that names a node shows it at once, a second answer
+alike confirms it in the background, and only two answers that the wallet has none, from nodes at the network's height
+(`authoritative`), take it off the tab; with no verdict what is shown stays. The app keeps no table of genesis wallets:
+a genesis node is named as any other node. A super or genesis node gets the server card, read by its id from the five
+genesis names (`LightNode.readServerNodeListed`): the first answer that names it registered shows while the card has
+no good status of it, the best of them (online first, then the most heartbeats) once they are in. One genesis node's
+answer by the wallet (`PushService.checkServerNodeStatus`) only hints that the node has another id, which the tab
+takes once two genesis nodes confirm it (`WalletManager.confirmServerNode`). The chain's registrations of the wallet's
+ids with the height each was registered at (`/api/v1/account/{addr}/node-events`, `PushService.getWalletNodeEvents`:
+of an answer about this wallet only its derived ids and a genesis node's, and the burn field is not read) give a
+server node's registration height only. The device keeps one record of the wallet's node
+(`qnet_wallet_node`: the wallet, the node id and type, the last status that named it registered and when, with no
+expiry; a status that says the node is not registered is never kept): the tab shows it at once on the next open until
+the genesis nodes answer, its status marked stale once a read does not name the node. It belongs to the wallet (a
+switch of wallet removes it) and is not one of the caches the crash screen's Clear cache removes. Move to wallet on the
+server card moves the balance of that node. A super node's card comes first; the wallet's light node shows under it when the chain lists both
+(an older wallet) and the light node is on this device (on the chain and bound here, or a link of it pending here) or
+bound to another one (which device runs it, as above), with no balance of its own (the wallet's balance and its move
+are on the server card), and a link request for the light node still answers `NODE_OTHER`. Its status is read again
+(every 5 minutes) only while that card shows (`NodeTab.lightNodeShown`).
 
 **Epochs not admitted of a super node** (`PushService.getNodeEpochs`): the node's verdict on each of the last 64
 epochs the network settled (`/api/v1/rewards/history/{node_id}?limit=64`), from a genesis node, and a second one for
@@ -1168,29 +1506,43 @@ admission, not missed heartbeats) is never missed: it is counted apart. Only the
 "Epochs not admitted" when there is any; the counts of epochs and of missed epochs are the site's. They are read only
 once the registration height is known, again at most every five minutes while the tab is open.
 
-**Before the network lists the node** (`src/services/NodeRecordRead.js`): while the tab is open and the network lists no
-node for the wallet, the app reads aiqnet.io's record of the wallet's node
+**Before the network lists the node** (`src/services/NodeRecordRead.js`): while the tab is open and the genesis nodes
+name no node for the wallet, the app reads aiqnet.io's record of the wallet's node
 (`https://aiqnet.io/api/cabinet/activation/{wallet}`, no credentials) and keeps only its state and node type: on
 opening the tab and on pull-to-refresh, and then with the tab's status refresh every 5 minutes while a record is on
 its way; while the site says "none"
 or cannot be read, the reads back off from 1 minute, doubling to 15. A node
-the site recorded, which it keeps for good, or has on its way (`recorded`, `sending`), as a super node the network does
-not list yet gives the "not on the network yet" line above (a light node so recorded is bound to no device yet, so the
-tab shows no node); a reservation alone (`reserved`) gives nothing. A read that
+the site recorded, which it keeps for good, or has on its way (`recorded`, `sending`), as a super node gives the "not on
+the network yet" line above once two genesis nodes say the wallet has no node (a light node so recorded is bound to no
+device yet, so the tab shows no node); a reservation alone (`reserved`) gives nothing. A read that
 fails, is refused or cannot be parsed changes nothing on the tab: it shows what the network says. The link and reserve
 sheets read the same record before a consent or a reservation (below) and give none when they cannot read it.
 
 - **Use this device** (`PushService.bindThisDevice`): a confirmation that discloses the device check, with a link to
-  the privacy policy, then a fresh authentication. The wallet key signs the delegation and the attach with
+  the privacy policy, then a fresh authentication. The binding acts on the status the user confirmed on (the card's,
+  or the link sheet's: two owners saying the node is on the chain, with their features; `known`): the public status is
+  not read again, and only the binding's sequence is, in the wallet-signed status sent to the three owners at once and
+  taken as soon as two agree, within `FIRST_CONTACT_MS` (20 s). Owners that do not answer in that time stop nothing:
+  the binding goes with `seq = now`, and a node that holds a newer one answers `stale_seq`. Of the network's word, only
+  two owners refusing that signed status as `not_registered` stops it before anything is sent; otherwise only the
+  node's answer to the binding refuses it. With no status in hand the public status is read first, within the same
+  20 s.
+  The wallet key signs the delegation and the attach with
   `seq = max(now, binding_seq + 1)` (the binding two owners name alike, else the first owner's); the push token is
-  taken only now; the body carries the unsigned hint `platform` (`ios`, an iPad included, or `android`), which the
+  taken only now (Firebase waited for at most 8 seconds, `PUSH_TOKEN_WAIT_MS`; with no token by then the binding is
+  made for polling, as on a device without Google Play, and the next open sends a token that came meanwhile:
+  [Liveness](#liveness-pings-and-self-attestation)); the body carries the unsigned hint `platform` (`ios`, an iPad included, or `android`), which the
   public status shows as the bound device's kind; once the node took the binding the tab reads the signed status at once and again 5, 15, 30 and 60
   seconds later while the node has not answered in this epoch (in the front and on this tab only), so the card turns
   from the waiting line to Online without a pull; once two genesis nodes serve `device_v1` the
   binding carries this device's enrolment. It goes to `POST /api/v1/light-node/bind` at the shard owners, first the
   one that issued the device challenge, and is taken only when the answer says `bound: true` for exactly that
-  sequence. One retry follows a `stale_seq`. A binding that went out and got no answer is checked against the node's
-  signed status, read again 2 and 8 seconds later (an issuer answers a bind within its 12-second device budget): a
+  sequence. One retry follows a `stale_seq`, above the binding the signed status names then and never at or below the
+  refused sequence: when neither that binding nor the current second is above it (no owner answered), nothing goes
+  again and the refusal is the answer. A binding that went out
+  and got no answer is checked against the node's signed status, read again after a 2-second pause and, once that read
+  ended, after a 6-second one (`BIND_RECHECK_MS`; each read within 20 s, waiting for every owner's signed answer; an
+  issuer answers a bind within its 12-second device budget): a
   status in which two owners, or the owner that answers first, name its sequence keeps it here as taken, its ping key
   and push token with it and its device key waiting for the device tag; two owners naming a newer binding drop it and
   say the network did not answer. Anything else (no status, or the owners still naming the binding before, as an owner
@@ -1255,9 +1607,15 @@ sheets read the same record before a consent or a reservation (below) and give n
   nothing. Owners refusing this device's key decide nothing on their own. Only an answer read for the binding the
   device holds now counts: a status read before a new binding is not held against it, nor is a binding made less than
   10 minutes ago (the owner that took it passes it on), nor the link sheet's binding while its record still sends it.
-  A launch and a wake read the status with the ping key only, which a replaced device no longer holds: such a device
-  stops at its next reply (`superseded`) or at the next read of the open Node tab. An expired link's binding goes when
-  two owners say no device is bound; a wake reads that status signed with the ping key.
+  A launch and a wake read the status with the ping key only, which a replaced device no longer holds, so no answer
+  names B: such a device stops when two owners date the bound device to a later UTC day than its binding
+  (`linkedSinceAgreed`, the public status's), at its next reply (`superseded`), or at the next read of the open Node
+  tab. The answer at an open of the app (a launch in front, a return to the app) goes only from the device the node is
+  bound to (`PushService.bindingStands`): it waits for the launch's status read, or reads one, and sends
+  nothing when that read ends the binding here or the verdict is another device or none; with no answer in time the
+  binding stands. A pushed answer and a background wake's own read nothing first: the network wakes only the device it
+  links, and a replaced one's answer is refused as `superseded`. An expired link's binding goes when two owners say no
+  device is bound; a wake reads that status signed with the ping key.
 - **Offline**: the screen forces a self-attestation at most every 10 minutes; there is nothing to press.
 
 **One wallet, one node, one device.** A wallet has one node, light or super (a super node only through the browser
@@ -1291,8 +1649,9 @@ answers over the internet:
   boot id) are two starts more than 30 seconds apart two boots. A build whose boot clock does not answer cannot tell,
   and its node answers.
 - Android: swiping the app away from the recent apps stops the node until the app is opened again (`TaskState.kt`).
-  The system also trims tasks from the list by itself; any of three signs sets a mark, and only the third can take such
-  a trim for a swipe:
+  The system also trims tasks from the list by itself, and a phone's own software may trim it within minutes, so a
+  task missing from the list is no sign: a swipe that cannot be told for sure is answered.
+  Either of two sure signs sets a mark (`swipedAway`), the second read only while the first says nothing:
   - A removal mark: a file named by the process that saw its task leave the list, made by the task watch
     (`TaskWatchService.onTaskRemoved`) on every version and, on Android 7 to 10 (API 24-29), first thing in the
     finishing activity's `onDestroy` while its task left the list (Back, which leaves the task listed, takes it back at
@@ -1304,22 +1663,10 @@ answers over the internet:
     7, which sets no such limit, a watch only background answers started stops itself after that minute.
   - From Android 11, the system's record that a process of the app ended for the removed task, by the record's own
     sub-reason (Android 13+) or, where it gives none, its description ("remove task" in any spelling).
-  - The app's task missing from the recent apps (`ActivityManager.appTasks`) while the system's time limit would still
-    keep it there. Beyond the few most recent tasks, the system trims a task once it has been inactive longer than the
-    device's session time (`config_activeTaskDurationHours`, read from the platform's configuration; 6 hours in
-    Android's own and where a build names none), counting from when its activity left the front; whatever the
-    time, it also trims the oldest tasks of a list past 48 (`ActivityTaskManager.getMaxRecentTasksStatic`, 36 on a
-    low-memory device). The app notes the moment it left the front (`TaskState.left`, on the boot clock, with the
-    boot's start count); a task found missing in the same boot, sooner than the session time less a minute after it,
-    is taken for the user's removal. A device that limits recent apps by count instead (a low-memory device, or a set
-    `config_maxNumVisibleRecentTasks`) has no such time, and this sign is not read there.
 
-  While the mark is set `mayAnswer` refuses, and opening the app clears every sign. What none of them sees leaves no
-  mark, and the node answers then: a swipe no running process noted (its process had already ended or, on Android 7
-  to 10, ended without noting it or more than a second after the removal) when the first answer path to ask comes
-  after the session time, or on a device without one. The third sign holds a node the user did not swipe until the
-  next open when the system trimmed its task within the session time: from a list past 48 tasks, or on a device whose
-  own software trims recent apps sooner than its configuration says. A data push still starts a swiped (and noticed) or
+  While the mark is set `mayAnswer` refuses, and opening the app clears every sign. What neither sees leaves no mark,
+  and the node answers then: a swipe no running process noted (its process had already ended or, on Android 7 to 10,
+  ended without noting it or more than a second after the removal). A data push still starts a swiped (and noticed) or
   restarted app in the background; it answers nothing. No periodic wake survives a restart (`startOnBoot = false`):
   opening the app configures it again.
 - iPhone and iPad: closing the app from the app switcher stops the node until the app is opened again. UIKit reports
@@ -1332,8 +1679,8 @@ answers over the internet:
   `TaskState.swift`), read by one `src/services/TaskState.js`, which says false where the module cannot answer. Only a
   push or the periodic fetch wakes the app (`UIBackgroundModes` `remote-notification` and `fetch` only, no VoIP push).
   After a restart the system may launch the app in the background for a push or a fetch without the user opening it,
-  and the launch mounts the app's screens too, so a launch is not an open: its answer and upkeep wait for the app to
-  come to the front (`PushService.initializePushService`), and a push or a fetch then answers nothing until it does.
+  so a launch is not an open: it draws nothing until the app comes to the front (`App.tsx`), its answer and upkeep wait
+  for that (`PushService.initializePushService`), and a push or a fetch then answers nothing until it does.
 
 ## The device check
 
@@ -1427,10 +1774,30 @@ section 14; the app side is `src/services/QNetLink.js` (parser, request, relay c
 - **Only a verified link.** Android declares one App Link filter, `https`, host `link.aiqnet.io`, paths exactly
   `/l` and `/send` (the transfer link, "Solana sends" above), `autoVerify`; the site's `intent:` URL reaches the app
   through the same filter. iOS has the associated domain `applinks:link.aiqnet.io`; its scene (`SceneDelegate.swift`)
-  forwards Universal Links to React Native's `Linking`, and puts the link that launched the app in the launch
-  options, where `Linking.getInitialURL` reads it. The app claims no custom URL scheme: a `solana:` request opens
-  whichever wallet claims it, on that wallet's network, so this devnet build takes none. An Android activity
-  restored or relaunched from recents drops the link that first started it.
+  takes Universal Links, the one that launched the app included. The app claims no custom URL scheme: a `solana:` request opens
+  whichever wallet claims it, on that wallet's network, so this devnet build takes none.
+- **No link is lost or applied twice.** Every link the system hands to the app waits in a native link inbox from the
+  moment it arrives (Android: `MainActivity` in `onCreate` and `onNewIntent`, which also keeps the newest intent with
+  `setIntent`, `LinkInbox.kt`; iOS: the scene, `LinkInbox.swift`), in arrival order, the same link twice being one,
+  until the wallet screen is done with it (`src/services/LinkInbox.js`, the only way links reach the app's JS;
+  React Native's launch URL is read by nothing). The inbox holds up to 8 links: one more is refused and logged
+  (`[WARN][LINK] link_dropped reason=full waiting=8`), never one that waits. It is also kept on the device with each
+  link's arrival time (Android: private shared preferences `qnet_link_inbox`, written with `commit` on every change;
+  iOS: `UserDefaults` key `qnet_link_inbox`), which only a new process reads: a link the process ended on comes back
+  when no more than 600 s (`LINK_LIFE_MS`, a QNet Link session's life) passed since it arrived, an older one is dropped
+  (`[INFO][LINK] link_dropped reason=stale age_s=N`), and a link the screen is done with leaves the device at once, so
+  it never comes back. The screen reads the inbox when it is drawn, when the app comes to the front and on React
+  Native's link event, and takes one link at a time, the oldest, the next once it is done with the one it holds: so
+  links open in the order they came, whether they came before the JS was up, to an activity Android made anew in the
+  running app (Back finishes the activity below Android 12), to one remade after the process ended, while the lock
+  screen was up or while a request was on screen; a screen made anew hears the link not done yet again. The screen is
+  done with a link when it refused it, opened its transfer form, or when the user decided or closed its request, so a
+  link never takes the place of a request the user has still to decide: it comes once that one is decided or closed.
+  A decided request still on screen (its outcome, or its work under way) gives way to the next link at once, a QNet
+  Link request or a transfer link (also one whose form waits for a send's result to be closed), its answer going on in
+  the background (the answer, below); a QNet Link
+  request that came while another was on screen says "Another request arrived while the previous one was open." An Android activity restored or relaunched from recents puts nothing in the inbox and drops
+  the link that first started it.
   `link.aiqnet.io` serves `/.well-known/assetlinks.json` (the Play app-signing certificate) and
   `/.well-known/apple-app-site-association` (the Team ID).
 - **Parsed strictly.** The whole URL must match the revision 2 pattern, with a canonical 32-byte site key that is
@@ -1438,27 +1805,37 @@ section 14; the app side is `src/services/QNetLink.js` (parser, request, relay c
   or anything else, shows "This link cannot be opened." and fetches nothing. A URL on the path `/send` is a transfer
   link instead ("Solana sends" above).
 - **Checked against the relay.** The app reads the session from `https://aiqnet.io` (a constant of the build,
-  10 s timeout, no cookies, a redirect is a failure) and refuses it when its site key or intent differ from the link,
-  when its request is not one the app rebuilds to the link's hash (`requestText`, `reqHashOf`), when it is already
-  answered, has under 30 s left, or was already decided on this device.
+  20 s timeout per try, `FIRST_CONTACT_MS`, no cookies, a redirect is a failure) and refuses it when its site key or
+  intent differ from the link, when its request is not one the app rebuilds to the link's hash (`requestText`,
+  `reqHashOf`), when it is already answered, has under 30 s left, or was already decided on this device. While the
+  relay, and then the network for the sheet's offer, has not answered, the screen keeps loading and tries again (after 1 s, doubling up to 5 s, and
+  at once when the app comes to the front or the network comes back, while the session can still be
+  opened or confirmed); after a try with no answer it says "The network has not answered yet.
+  Still trying…", and "Checking the request…" again once an answer comes.
 - **What each sheet offers**, read before any authentication and signing nothing (`prepareOffer`): the wallet the
   request names by `walletHash` must be the open one (`WALLET_MISMATCH`); for `link` and `claim` the node's status
-  comes from two genesis nodes (`NETWORK` when they give none; for `claim`, below).
+  comes from two genesis nodes, taken as soon as two of its shard owners agree (`LightNode.readAgreedNodeStatus`;
+  `NETWORK` when they give none; for `claim`, below). Every status read of the sheets and of what Confirm does (the
+  status signed with this device's ping key, the wallet's unlink) waits up to `FIRST_CONTACT_MS` (20 s) and settles on
+  two owners' agreement (`NodeLinkActions`).
   - `reserve`: "Set up a light node for this wallet", the node and the wallet, and "The website that showed you this
     link prepares a light node for this wallet only. No funds leave this wallet. QNet Wallet asks you once more when
     the node is added." The request is exactly `{walletHash, burner}`: the wallet, never left out, and the page's
-    one-time payment address, which the sheet does not show. A server node linked here, a super or genesis node that
-    two genesis nodes confirm for the wallet, or a super node's burn aiqnet.io holds for it (reserved, on its way or
-    recorded): `NODE_OTHER`, and `NETWORK` when the genesis nodes do not answer or aiqnet.io's record cannot be read.
-    The sheet shows no price, payment, code or link; the site checks that the wallet has no node yet.
+    one-time payment address, which the sheet does not show. A super or genesis node the genesis nodes name for the
+    wallet (the Node tab's, or the device's record of it until they answer): `NODE_OTHER`. The sheet shows
+    at once; whether the network holds a super or genesis node for the wallet (two genesis nodes confirm it,
+    `/api/v1/verify-activation`) or aiqnet.io holds a super node's burn for it (reserved, on its way or recorded) is
+    read after it shows (`QNetLink.otherNodeHint`): the first source that says so turns the sheet into `NODE_OTHER`
+    while the user has not acted, and no answer holds nothing up, since aiqnet.io's reserve and registration and the
+    chain refuse a second node of one wallet. The sheet shows no price, payment, code or link; the site checks that the
+    wallet has no node yet.
   - `link` for a node on the chain: "Link this wallet's node to this device", the node and the wallet, the device
     check, and, when another wallet's node runs here, "The node of {wallet} stops on this device."; a device that
     cannot run a node answers `BIND_REFUSED`. For a node not on the chain with a burn: the same sheet with the
     wallet's consent, or, on a device that cannot run a node, "This device can't run a node. Confirm to add the node
-    to this wallet. It can run on another device later." With no burn: `NO_NODE`; a server node linked here, or,
-    before a consent, a super or genesis node that two genesis nodes confirm for the wallet, or a super node's burn
-    aiqnet.io holds for it (reserved, on its way or recorded; one wallet, one node type, chosen once): `NODE_OTHER`,
-    and `NETWORK` when the genesis nodes do not answer or aiqnet.io's record cannot be read. A request for a burn made
+    to this wallet. It can run on another device later." With no burn: `NO_NODE`; a super or genesis node the genesis
+    nodes name for the wallet: `NODE_OTHER`. The consent's sheet reads the wallet's other node type as the `reserve` sheet does, after it shows
+    (one wallet, one node type, chosen once). A request for a burn made
     from a Solana address names it (`{burnTx, walletHash, check, burner}`, the wallet and the burn never left out): for
     a node not on the chain the sheet is the same, offered only when `burner` is the open wallet's own Solana address
     (`WALLET_MISMATCH` otherwise); it names no burner, burn, code or price.
@@ -1516,7 +1893,29 @@ section 14; the app side is `src/services/QNetLink.js` (parser, request, relay c
     also signs the burn's owner bind v1 with the same T, checked against the key before it goes and wiped after, and
     the consent carries it as `ownerSig` (b64url, 64 bytes): such a burn was made from this wallet's own address, so no
     one else could sign it. Any other burn's owner bind is the burner's, signed on the website.
-  - `link`, node on the chain: "Use this device" with the sheet's device check; the answer is `linked` with the
+    Right after the answer goes, the wallet sends the registration that consent is for itself when the burn is a
+    one-time payment address's (`src/services/RegistrationSubmit.js`): `POST https://aiqnet.io/api/cabinet/register`
+    with the route's exact consent body ([explorer](explorer.md): `from`, `node_id`, `node_type`,
+    `wallet_address`, `registration_proof`, `timestamp`, `burn_tx_hash`, `burn_amount`, `dilithium_signature`,
+    `dilithium_public_key`; the key and signature as hex, the amount from aiqnet.io's record of the payment burn). The
+    site completes it with the burner and the owner bind its record keeps and submits it to one genesis node; the page
+    only follows the chain, and a second submit of the same consent is the same registration. No answer, a busy route
+    (429, 5xx) or the route's `retry` sends the identical body again after 5 s, doubling up to 2 minutes (at once when
+    the app comes to the front or the network comes back), while the consent is admitted (T + 24 h); a
+    refusal, `stale`, or a record that names no such payment burn ends it (a burn of
+    the wallet's own address is registered by the page with the `ownerSig` the answer carries). One send runs at a
+    time per node; the job (`qnet_registration_submit:<node id>`, one per wallet's light node, the consent and the
+    burn, no secrets) is kept until the chain lists the node or T + 24 h, and only a newer consent for the same node
+    takes its place, never another wallet's; a send under way whose job went meanwhile (the chain listed the node)
+    stops, sending nothing more and writing nothing back. Whenever a wallet is open in front, on whichever tab, every
+    job kept on the device gets one public status read of its own node (none for a job past T + 24 h, which is
+    dropped), and each status read that shows the node not on the chain sends it again, also after a restart, but not
+    within 3 minutes after the route said the node took it into its pool (the register route's `ADMIT_HOLD_MS`, while
+    it answers the same consent with that admission). The sheet then says "QNet Blockchain is recording the node in a
+    block. It will run on this device once that is done." (taken into the pool) or "Linked to this device. Waiting for
+    its first answer." (already recorded), and the Node tab reads the node's status at once and follows it.
+  - `link`, node on the chain: "Use this device" with the sheet's device check, acting on the status the sheet read
+    (its verdict and features: above); the answer is `linked` with the
     binding's sequence. A binding or a move that went out and got no answer is answered `NETWORK` (the protocol has no
     code for an unknown outcome), and this device's sheet says the outcome is not known (the move may have gone
     through; the node may run here), never that nothing changed; the binding waits with its key as above. A refusal
@@ -1546,33 +1945,63 @@ section 14; the app side is `src/services/QNetLink.js` (parser, request, relay c
     can run on any device later."; `stale_seq` reads the status again and is `ok` when two owners say no device is
     bound, else `UNLINK_REFUSED`; any other refusal `UNLINK_REFUSED`, no answer `NETWORK`. This device's own records
     are not touched; the device that ran the node stops at its next reply or status read.
-  - `claim`: the move above, for the node the request names only: the wallet key signs
-    `q1337|claim_rewards:{N}:{W}` with N that node's id and the claim carries it as `node_id`
+  - `claim`: the move above, for the node the request names only, run as the Node tab runs it (One press, above): the
+    wallet key signs `q1337|claim_rewards:{N}:{W}` with N that node's id and each claim carries it as `node_id`
     (`WalletManager.claimRewards` with that node's type and id); the answer names that node (`nodeId`) and is `ok` with
-    the amount as a decimal string, the transaction and the epoch a partial move stopped at, or `empty`. The amount is at least 1 QNC, except for a batch the node's quote capped
-    (the stopping epoch is set, more epochs remain), which may be smaller and is answered as moved, since its
-    transaction is on the way. A move `ok` is in transit on this device as one made from the Node tab (Moving the node
-    balance above), followed the same way, and the Node tab reads the node again; the outcome says, as it happens,
-    that the amount is in the wallet, or what part of it is.
+    the total the run's claims moved as their records show it, as a decimal string (`amountNano`: a last claim taken
+    in part counts its share, one that expired nothing), the last counted claim's transaction (`txHash`) and
+    `stoppedAtEpoch`: null once the whole balance moved, at least 1 QNC in all, otherwise the first epoch that claim did
+    not take (a run of one claim answers the same way; its only claim expired: `CLAIM_REFUSED`); or `empty`. The total is at least 1 QNC unless
+    `stoppedAtEpoch` is set (the last claim's quote was capped, more epochs remain): a whole run below 1 QNC names that
+    stop too (`NodeLinkActions.claimAnswer`), while the sheet's note, told the run left nothing (`run.whole`), names no
+    rest. Each claim `ok` is in transit on this device as one made from the Node tab (Moving
+    the node balance above), followed the same way, and the Node tab reads the node again once the run answered; the
+    outcome says the total as the claims' records show it whenever it is drawn (One press, above), a "Transactions"
+    row with the count past one claim, and, as it happens, what the Node tab's card says of the run
+    (`ClaimTransit.runNote`, `utils/moveText.js` `moveNoteText`).
 - **The answer** is sealed to the page's one-time key (X25519, HKDF-SHA256, AES-256-GCM with a fresh app key and IV)
   under an AAD that binds the session, the intent and the request hash, checked against the site's own rules before
   it goes (`plaintextProblem`: a `claim` answer names the node the request named, the light or super node of its
   wallet; every other answer the wallet's light node), and posted once; after a network failure the identical body is retried while the
-  session lives. If another device answered first the app warns not to trust what the website shows. When the
+  session lives, after 2 s, doubling up to 30 s, and at once when the app comes to the front or the network comes back,
+  the back-off then starting again from 2 s (`src/services/NetworkWake.js`, `utils/pause` `retryBackoff`: Android's
+  default-network watch, `AppNetwork.kt`, and iOS's path watch, `AppNetwork.swift` with `NWPathMonitor`, tell JS
+  `qnetNetworkBack` each time a usable network appears, the first, one after none or one on other interfaces; the same
+  wake ends the waits of the session and offer reads and of the registration above, whose back-offs start again from
+  their first wait too). The iOS module is registered in the Xcode project as Android's is in its package and is built
+  by the iOS build only. The native link inbox writes the link path's lines whatever the JS build (`LinkInbox.kt`,
+  `LinkInbox.swift`): each link the system hands over as the inbox keeps it (`[INFO][LINK] link_received waiting=N`),
+  and the lines the JS asks for with `noteLink` (`src/services/LinkInbox.js`), of four events only, each with its own
+  keys: the request a sheet shows (`request_shown intent=… offer=…`), each answer delivered (`answer_delivered
+  intent=… status=200|201 ms=…`) and, at WARN, one that was not (`[WARN][LINK] answer_not_delivered intent=…
+  outcome=expired|failed|conflict status=…|none ms=…`), and `transfer_form_opened token=…`. A value is written only as
+  a code of at most 16 letters, digits or underscores or a whole number below a billion, so never a session id, a key,
+  an address or a link. Both platforms write them in every build: iOS with `NSLog`, Android with `Log.println`, which
+  the release build's R8 rules (below) keep, and the inbox's own lines (`link_received`, `link_dropped`) the same way.
+  The JS logger, in
+  development builds only, names each link the screen takes (`link_arrived kind=transfer|<intent>|invalid
+  waited=0|1`). An answer the user decided is made and delivered to its end whether or not
+  its sheet is still on screen (`src/services/LinkAnswers.js`): until it arrives or fails, "Sending the answer to aiqnet.io…" stands under the
+  wallet's header on every tab, on the lock screen and on the welcome screen, a sheet shown again after a lock says
+  the same, and the sheet of another request says "The answer to the previous request is still on its way to
+  aiqnet.io." If another device answered first the app warns not to trust what the website shows. When the
   request asked for it (`check: true`) and the relay took an answer that names the wallet, the sheet shows "Check
   number: 482 913", the six digits the page asks the user to compare (kept with the outcome when the wallet locks
-  meanwhile, and in their order in a right-to-left language). The app always shows the outcome itself, with a
-  button to the Node tab after a link.
+  meanwhile, and in their order in a right-to-left language). How the delivery ended is kept with the outcome too, so a
+  sheet shown again after a lock says it as the first one did. The app always shows the outcome itself, with a
+  button to the Node tab after a link. A connect whose answer did not reach the site (expired, failed, or another
+  device's answer taken first) says "The addresses did not reach the website." in place of "The addresses were sent to
+  the website that showed the link.", one line, with only the warning of another device's answer under it.
 - **Nowhere else.** No screen of the app leads to these sheets; the app contacts the relay only when the user opens
   such a link. Their texts are translation keys `link_*`, in every language like the rest of the app.
 
 ## In-app browser
 
-The Browser tab (`src/browser/`) is a general web browser: an address bar that assumes https and shows the page's
-origin with a lock and its registrable domain in bold, back, forward, reload, tabs, share and copy the address, a start
-page with the aiqnet.io explorer and the recent pages, and "Clear browsing data". A page opened (typed, the explorer,
-a recent page) or a link tapped shows its address in the address bar at once, while it loads, without the lock and the
-bold domain, with the progress bar and Stop, and opens in the same tab; once the page commits it is the page's own
+The Browser tab (`src/browser/`) is a general web browser: an address bar at the top, a rounded pill that assumes
+https and shows the page's host centred with its registrable domain in bold, back, forward, reload, tabs, share and copy
+the address, a start page with the aiqnet.io explorer on a card and the recent pages on a card under it, and "Clear
+browsing data". A page opened (typed, the explorer, a recent page) or a link tapped shows its address in the address
+bar at once, while it loads, without the bold domain, with the progress bar and Stop, and opens in the same tab; once the page commits it is the page's own
 address, and a load that ends without committing (a 204, a download, an error, Stop) puts back the address of the page
 still on screen. The origin a site's requests and the confirmation sheets are bound to is always the committed page's.
 A page opened again loads again: the one a tab was first given, after the tab moved on to other pages, and the one on
@@ -1606,7 +2035,7 @@ website works the same with both.
   policy.
 - **Tabs** (`src/browser/tabs.js`), in memory only, never stored. The tabs button next to the address bar shows how many
   are open and opens the tab overview over the browser: each tab by its page's title (hidden characters replaced) and
-  host, or "Start page", the one in front marked by a line at its start; a tap brings a tab forward, Close at its end
+  host, or "Start page", each on a card of its own, the one in front edged in Signal; a tap brings a tab forward, Close at its end
   closes it (a screen reader names the tab it closes; the next tab comes forward, the one before when it was the last;
   closing the only tab leaves a fresh start page), "New tab" (also in More) opens the start page in a new tab in front, and "Close all tabs" leaves
   one fresh start page, after asking first while a tab holds a page (the sites open in them are signed out). While the
@@ -1628,7 +2057,8 @@ website works the same with both.
   width: Back (the word), the address (the domain in full weight, no lock: every page is https), the tab count and
   More, whose menu holds Share, Copy address, Forward (while there is a page to go to), Stop while a page loads or
   Reload otherwise, New tab, Start page and "Clear browsing data" (in Ember), then, under a rule, the header's Manage
-  tokens and Hide balances (the header's More is hidden on this tab).
+  tokens, Hide balances and Hide node names (the header's More is hidden on this tab). The Browser tab tapped while it
+  is open shows the start page the same way (`BrowserScreen` `goHome`, nothing while a sheet is up).
 - **Browsing session.** Cookies and site storage (localStorage, IndexedDB, service workers) live for one browsing
   session: it starts empty with the first page opened while no tab holds a page, and ends once no tab holds one (the
   last such tab closed, "Close all tabs", "Clear browsing data", a change of wallet, the app ending). The two platforms
@@ -1781,7 +2211,13 @@ Only a node that is on the chain and linked to this device is woken, and only su
 app asks for no notification permission and shows no notification (the pushes are silent data messages);
 `firebase.json` turns Firebase's automatic token issue off on both platforms; the token is read only when a binding
 is made or a linked node's token changes (`PushService.pushTarget`) and deleted on Stop, on a takeover and when the
-wallet goes. The network's pushes name no node: `{"action":"epoch","anchor":"{h}:{hash}","sent_at":"{s}"}` (`sent_at`
+wallet goes. Firebase is waited for at most 8 seconds (`PUSH_TOKEN_WAIT_MS`; a network where its servers cannot be
+reached answers nothing): the target is then polling, logged as `[INFO][PUSH] token_unavailable reason=timeout`, a
+binding made so is woken by polling, and the next open or return to the app sends a token that came meanwhile, as for
+any polling binding (`readdressIfOwed`; a binding made without a token drops the record of the token sent for the one
+before, so the same token goes to its owners at once, not as "unchanged" or an hour later); a token issued after the
+wait is deleted while no node is linked here and no
+later read is running or handed that token out. The network's pushes name no node: `{"action":"epoch","anchor":"{h}:{hash}","sent_at":"{s}"}` (`sent_at`
 the network's Unix time, absent from an older node), answered over that anchor at once: every push of an owner's round
 and of its retry round while the epoch is not counted here, whatever a failure or a refusal left behind, none once it
 is, and pushes that arrive together share one answer; `{"action":"wake",…}` from the node's wake route, answered
@@ -1812,6 +2248,16 @@ at most six (when the wake reached the device on its own clock, `its receive tim
 long after it was sent, and the app's outcome; a miss of an epoch the record covers and holds no push of becomes
 `not_delivered`), and it never changes what counts. An older node ignores the field.
 
+On Android 11 and later an answer also carries why the app's last process ended: the flat string fields `last_exit` and
+`last_exit_api` (the Android API level), which the node does not read. With every answer the app reads Android's newest
+record of a process of this app that ended after the
+last one it took (`ActivityManager.getHistoricalProcessExitReasons`, `TaskState.kt lastExit`), as `crash` (a crash, a
+native crash, a failed start), `anr`, `low_memory`, `system_killed` (a signal, excessive resource use, the system's
+freezer, a permission change, a process it depended on), `user_closed` (a stop the user asked for in the system
+settings), `swiped` (the task removed from the recent apps), `other` (the app's own exit, an update, any reason Android
+adds) or `unknown`; keeps it (`qnet_last_exit`, `PushReceipts.noteLastExit`) and sends it with each answer until an
+owner takes one, then never again. iOS keeps no such record, and its answers carry none.
+
 A linked node is woken by Firebase Cloud Messaging when the device has a push token, else by polling. Either
 way the device also gets a periodic BackgroundFetch wake with a 30-minute minimum interval; after its answer a wake also does the device
 layer's upkeep (the lease refresh and the key rotation, [The device check](#the-device-check)). On Android it survives the
@@ -1829,19 +2275,28 @@ A polling device asks `/light-node/pending-challenge` for its challenge from 300
 and signs that poll with the ping key (`ts`, now, and `sig` over `q1337|light_poll:{N}:{ts}`), so the node counts the
 challenge as fetched by this device; with no ping key here, or a signing that fails, the poll goes unsigned and is
 answered alike. The same code signs on iOS and Android, each through its native ML-DSA module.
-A launch the system made in the background (iOS starts the app for a push or a fetch) reads no node status: the push
-or the fetch handler answers and does the device upkeep, and the status is read at the first return to the app. On
-iOS the wake is a
+A launch the system made in the background (iOS starts the app for a push or a fetch) draws nothing and loads none of
+the wallet's screens until the user opens the app (`App.tsx`), and runs none of the launch's own work: it arms the
+wakes, the push or the fetch handler answers and does the device upkeep, and the launch's status read and answer run
+at the first open (`PushService.initializePushService`). On iOS the wake is a
 `BGAppRefreshTask` (`com.transistorsoft.fetch`, declared in `Info.plist` and handed to the library in
 `AppDelegate`): the system picks the time, never sooner than that minimum, and offers no precise one-shot wake; a
 wake of an app the user closed from the app switcher answers nothing until it is opened; every return to the app
 configures the wake again, so a request for it is always pending within the epoch. The Node tab's Background row says whether Background App Refresh is on
 ([Background priority](#background-priority-on-android-and-ios)); it is read again whenever the app returns. The FCM
 background handler and the
-BackgroundFetch headless task (Android) are registered at top level in `index.js`, so pushes and wakes
-that reach a killed app are not lost. Opening the app and returning to it are wakes too. A refreshed FCM
-token is sent to the node's shard owners in rank order, then to the other genesis nodes; never to another node
-(`PushService.js`). A token that changed while the app was closed, or within the hour after the binding, goes out
+BackgroundFetch headless task (Android) are registered at top level in `index.js`, before any of the app's screens
+load (the app's root is required only when the system runs the app's view), so pushes and wakes
+that reach a killed app are not lost. On iOS a push's wake ends when its handler is done: React Native Firebase then
+completes the push and ends its background task on the main queue, and its expiry handler ends the task itself
+(`patches/@react-native-firebase+messaging+23.7.0.patch`; the library as published only builds those two blocks, so a
+push would hold the app until its 25-second fallback). The system weighs an app's background time when it decides its
+later wakes. Opening the app and returning to it are wakes too. A refreshed FCM
+token is sent to the node's three shard owners in rank order and to no other node (`PushService.js`). Owners the
+device cannot work out (no node id, or the
+hash unavailable: `config/nodes.lightShardOwnerUrls` is then empty) get nothing sent, said at WARN
+(`[WARN][PUSH] token_refresh_not_sent reason=owners_unknown`), and so does a ping that names no node to answer at
+(`[WARN][PUSH] ping_not_answered reason=owners_unknown`); status reads, bindings and device challenges then ask nobody. A token that changed while the app was closed, or within the hour after the binding, goes out
 from the next wake of any kind (a push, a background fetch, a return to the app), signed by the ping key, within
 that wake's deadline. Firebase Cloud Messaging and polling are the only wake channels.
 
@@ -1909,7 +2364,9 @@ Two paths prove liveness:
   return), and on Android a one-shot `qnet-answer-retry` alarm (headless, as the periodic fetch; the answer rule still
   decides); iOS has none, so the next push, background fetch or open answers then. A push answered meanwhile drops it.
   Each wake sets one deadline for everything it sends, 25 seconds for a background fetch and 22 for a
-  push, inside the roughly 30 and 25 seconds iOS gives them; a self-attestation round also stays within
+  push, inside the roughly 30 and 25 seconds iOS gives them; a push's wake ends once its answer and what came of the
+  push are recorded, or once the device's upkeep is done where it is owed (a lease window open, a status read due, a
+  push token to send). A self-attestation round also stays within
   20 seconds, each request capped at 6, and wakes that arrive together share one round per node. Every ping answer (a self-attest round, a
   pushed or a polled challenge) goes out one at a time per node, each within its caller's own deadline, and a
   forced round runs again only behind a round that did not attest.
@@ -1973,10 +2430,14 @@ then, which is a second rule beside the two missed epochs.
 At ten million devices a million apps may be open at once, so the app asks the network for what is on screen as
 seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it is not in front:
 
-- **Node tab**: the statuses (the light node's owners, a server node, aiqnet.io's record) when the tab opens, on
+- **Node tab**: the wallet's node (three genesis names, the other two only while those gave no verdict) when the tab
+  opens, on pull-to-refresh and on every return to the app, and with the 5-minute refresh only while the genesis nodes
+  have not answered; the statuses (the light node's owners, a server node by its id from the five genesis names with one
+  read by the wallet, aiqnet.io's record) when the tab opens, on
   pull-to-refresh, on every return to the app and after Use this device, and in between every 5 minutes; while a light
   node is being linked, its status every 10 seconds for the first two minutes after the link and then every minute, on
-  every tab. The node balance once per epoch and node (it changes only when an epoch settles), and at once on
+  every tab, and on the same schedule on the open tab while its light card shows no verdict (the status could not be
+  read, or the owners do not agree yet). The node balance once per epoch and node (it changes only when an epoch settles), and at once on
   pull-to-refresh and when a move ends; nothing while a move is in transit. The epoch clock from one height read, with
   each of those refreshes, counted on at one block a second in between (for at most 10 minutes past the read).
 - **Assets**: the balances when the tab opens, then every 30 seconds, and the wallet's live QNC figure every 15
@@ -1991,8 +2452,9 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 - **History**: everything (the explorer too) when the tab opens, on pull-to-refresh and on a return to the app; in
   between one genesis node's newest rows every 30 seconds, every 60 while the address socket is live. The genesis
   nodes' listing (all five at once) with every read that asks the explorer, and with any other that brought a row one
-  node reports which no earlier read found listed; the live figure once when a read lists a received transfer it does
-  not cover yet.
+  node reports which no earlier read found listed; after each read the lookups by hash of up to 8 rows past the newest
+  100 the listing reads, one at a time on three genesis nodes, each row once a session once two answered (none for a
+  wallet with no such row); the live figure once when a read lists a received transfer it does not cover yet.
 - **Every tab**: one follow tick every 90 seconds while a wallet is open ([Following the head](#following-the-head)):
   the certified head, one walk step, the open wallet's QNC proof. A capsule is asked for only while the walk is long, at
   most once a node in 10 minutes from a node that has none.
@@ -2002,19 +2464,61 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   network) 5 minutes plus up to 5 more drawn evenly. It closes when the app goes to the background and opens again on
   the return, not before the wait it had. It is live from its first account event (a `BalanceUpdate` for this wallet:
   [Account events](#served-by-the-connected-node)) until it closes; a new connection starts not live. Assets and
-  History take that state each time they set their next wait, the 15-second read at each of its ticks.
+  History take that state each time they set their next wait, the 15-second read at each of its ticks. It is pinged
+  every 15 seconds, and one whose ping got no pong before the next fails, within 30 seconds, as a drop: a socket a
+  network silently stopped (a VPN turned off) ends and the next try follows. On Android React Native's WebSocket
+  client is `AppNetwork.socketBuilder`'s (`WebSocketModule.setCustomClientBuilder` in `MainApplication`):
+  `clientBuilder`'s pool and ping, and a 20-second bound on the opening handshake (`SOCKET_OPEN_MS`, OkHttp's call
+  timeout, which ends once the socket is open), so an opening nobody answers ends as a refusal does and the next try
+  follows its wait. On iOS it is React
+  Native's `RCTWebSocketModule` as `patches/react-native+0.81.4.patch` changes it (React Native's own sends no ping
+  and has no read timeout on either platform); the node answers each ping.
+- **What the user waits on first** (`src/utils/userHold.js`; the screens' hook `useHoldForUser` is in
+  `src/utils/userAction.js`): while the QNet Link sheet reads its request, while an answer the user decided is
+  carried out and delivered (its sheet on screen or not, `src/services/LinkAnswers.js`), while a send runs from the tap on Send to its result except while its review waits for the user (the in-app
+  browser's confirmed requests too), and while a move of a node balance or Use this device runs, the background
+  verification starts no new download: the light client's proofs and capsules and the certified-head reads (`QcLightClient`
+  `nodeGet`), the certified balance and token proofs (`WalletManager._proofAnswers`), token-transfer inclusion
+  proofs and History's lookups by hash wait, and a download already under way finishes. The live figures, the statuses and every read of the action
+  itself go at once. One hold lasts at most 60 seconds (`USER_HOLD_MAX_MS`, then `[WARN][NET] user_hold_expired`). A move
+  in parts holds while a part is quoted, signed and sent, not while it waits for a block.
+- **The screen's own timers** end with it, in one cleanup (`WalletScreen`): a send's follow-up (its hash poll from
+  2 seconds and its settle by nonce from 3 minutes, then every 30 seconds for half an hour), which goes on whichever tab
+  is open, the reads after Use this device, a move in parts, and every one-shot timer (`later`: a message's 3 seconds,
+  a pull's spinner, which ends with its read).
+- **Connections** (Android, `AppNetwork.kt`): every client React Native builds shares one HTTP connection pool, and
+  every open HTTP/2 connection gets a PING every 15 seconds. One that does not answer a PING before the next is closed
+  within 30 seconds, and the request on it goes again on a new connection, so a network that silently stops a flow
+  holds no retry on a dead connection. Such a request may have reached its server already, and every one the app sends
+  is taken once however often it comes: a transaction, a claim and a Solana transfer are the same signed bytes under
+  one hash, a ping answer counts once an epoch, a binding, an unbind, a device message and a token refresh are signed
+  for one sequence or stamp, and aiqnet.io answers a repeated relay answer or registration as the first. Out of front
+  no idle connection outlives a quiet of 3 seconds (`QUIET_MS`), so no PING wakes the radio after a wake: idle
+  connections are closed as the app leaves the front and as it comes back, and 3 seconds after the last request that
+  ended while the app is not in front, so a background wake's reads of one genesis node share one connection, which
+  closes in the radio's tail; closing runs off the main thread, since a TLS close writes to the network. A change of the default network (a VPN turned on or off,
+  another Wi-Fi, mobile data, the network lost) reaches the app through the system's default-network callback,
+  registered once at launch (`AppNetwork.watchNetwork`, `ACCESS_NETWORK_STATE`), and retires every connection made
+  before it: idle ones close, and busy ones take no new request (an HTTP/2 connection would otherwise carry the next
+  one) and close once their requests end, their PING failing them within 30 seconds if the old network is gone, so
+  every request after the change opens a new connection on the new network (`[INFO][NET] network_changed
+  connections_retired=N`). On iOS the requests go through React Native's one
+  `NSURLSession` with the default configuration (`RCTHTTPRequestHandler`, which exposes only that configuration), and
+  the system closes an idle HTTP/2 connection of it by itself after about a minute (Apple's developer support); the
+  app adds no ping there.
 
 ## Platforms and build
 
 - React Native 0.81.4 with React 19.1.0 on Hermes, `newArchEnabled=false`, Node ≥ 20.
   `crypto.subtle` comes from `react-native-quick-crypto`, installed before any other module.
-- Version 1.3.1 (31) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
+- Version 1.3.1 (32) on both platforms. Android: application id `io.aiqnet.wallet`, minSdk 24, compileSdk and
   targetSdk 36, NDK 27.1.12297006, Kotlin 2.1.20; release builds run R8 in full mode (the default of the Android
   Gradle plugin 8.11) over `proguard-android-optimize.txt` with resource shrinking: React Native's consumer rules keep
   what it reaches by reflection or JNI, the default file keeps native and `JavascriptInterface` methods, AAPT keeps what
   the manifest and layouts name, and of the React Native libraries only background-fetch and svg ship rules of their
   own, the others holding through those and direct references; `proguard-rules.pro` adds only Hermes' Java side, which
-  ships none, and strips `android.util.Log` calls.
+  ships none, and strips the `android.util.Log` level calls (`d`, `v`, `i`, `w`, `e`); every line the app's Android
+  code writes goes through `Log.println` (`prodLog` in `LinkInbox.kt`), which it keeps.
   iOS: bundle id `com.qnetmobile`, iPhone and iPad (`TARGETED_DEVICE_FAMILY = "1,2"`), not offered on Mac or
   Vision Pro; deployment target 15.6 for the app target.
 - Android draws edge to edge from API 29, as Android 15+ enforces it: `MainApplication` turns on React Native's switch
@@ -2028,9 +2532,12 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
 - The app icon and the launch screen are drawn from the vector sources in `assets/app-icon/`: on Android an adaptive
   icon (`ic_launcher_foreground` over `ic_launcher_background`, with the round and legacy icons) and a launch screen
   that shows the app mark alone (`splash_logo`, 192 dp, a drawable per density at exactly that size, so a device
-  receives only its own) on `#05080A`; on iOS the `AppIcon` set and the same mark (`LaunchIcon`, 192 pt at 1x, 2x and
-  3x) on the same background. The app mark inside the app (`assets/qnet_logo.png`, drawn at 72 at most) comes at 1x,
-  2x, 3x and 4x, so no screen decodes it larger than it shows.
+  receives only its own) on `#05080A`; from Android 12 the system's splash shows the same image at the same size on
+  the same background (`windowSplashScreenAnimatedIcon`: `splash_icon`, `splash_logo` inset 48 dp in the splash's
+  288 dp canvas); on iOS the `AppIcon` set and the same mark (the `splash_logo` image set, 192 pt at 1x, 2x and 3x) on
+  the same background. The screens without data draw that image by the same name from the app's own resources, at 192
+  on the window's centre. The app mark in the header and as QNC's icon (`assets/qnet_logo.png`, drawn at 64 at most)
+  comes at 1x, 2x, 3x and 4x, so no screen decodes it larger than it shows.
 - ML-DSA-65 is native: PQClean reference C compiled through the NDK by CMake for `armeabi-v7a`,
   `arm64-v8a`, `x86` and `x86_64` (a release build ships the two ARM ones), exposed through a Kotlin JNI module on Android and an Objective-C
   module on iOS with byte-identical return shapes. The library load is fail-soft: a failed
@@ -2095,9 +2602,12 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   (a debug build also allows `localhost`, `127.0.0.1` and `10.0.2.2` for the Metro bundler). The
   Android manifest sets `allowBackup="false"` with backup and data-extraction rules that exclude the
   app's data. The app's own network reads (balances, history, the nodes' answers) keep no HTTP disk cache on Android:
-  `MainApplication` gives React Native a client without one and deletes the cache an earlier build left; deleting or
+  `MainApplication` gives React Native a client without one (on the shared pool, [Requests from the open
+  app](#requests-from-the-open-app)) and deletes the cache an earlier build left; deleting or
   replacing the wallet also clears the image cache (`clearWebData`).
-- Android screen protection (`SecurityModule.kt`): screens that show or take a secret set `FLAG_SECURE`; they and
+- Screenshots and screen recordings: every screen in front can be captured on both platforms, the recovery phrase and
+  a private key included (saving them is the user's own choice); the only snapshot kept out is the app switcher's.
+- Android screen guard (`SecurityModule.kt`, one mode, `setProtectInteraction`): screens that show or take a secret and
   the screens whose taps move value or approve a request (the send form and its review, a site's sheet, a QNet Link
   request) hide other apps' overlays (API 31+), hide the views from accessibility services that are not assistive
   tools (API 34+), and drop every touch another app's window obscures, also one that covers only part of the window
@@ -2105,8 +2615,8 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   or the paste toolbar mark touches the same way, only while none of the app's own windows is shown, as
   `WindowInspector` lists them), with a short notice at the bottom of the wallet's own window (a view, not a toast,
   whose separate window would mark the next touches too). Below API 33, where the recents screen keeps a
-  snapshot of whatever was shown, the window is secure on its way to the background; from API 33 the recents
-  snapshot is off. Enabled accessibility services that did not come with the system are named, label and package,
+  snapshot of whatever was shown, the window is secure (`FLAG_SECURE`) from the moment it stops being the one in front
+  (`onPause`) to the moment it is again (`onResume`); from API 33 the recents snapshot is off. Enabled accessibility services that did not come with the system are named, label and package,
   at unlock (the password and the screen-lock lock screens alike), before a recovery phrase and on every
   confirmation, on the system prompt itself: its subtitle names them and its description holds a send's recipient,
   which the prompt draws in full (its title is one line), for the screen-lock prompt as for the password wallet's
@@ -2125,12 +2635,14 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   (`UIApplicationSupportsMultipleScenes` false, delegate `$(PRODUCT_MODULE_NAME).SceneDelegate`, no storyboard), which
   Split View, Slide Over and Stage Manager show. `AppDelegate.swift` configures Firebase, registers for remote
   notifications, hands the periodic wake to the library and refuses third-party keyboards. React Native has one root
-  per process (`AppDelegate.runReactNative`), started in the scene's window with the link the scene connected with. A
+  per process (`AppDelegate.runReactNative`), started in the scene's window with no launch options: the link the scene
+  connected with goes to the link inbox first (`LinkInbox.swift`), where the wallet screen reads it once it is up. A
   launch the system makes in the background that connects no scene starts it once launching is done, in a window no
   scene shows yet, so a push or a wake still reaches the JS; a scene that connects while React Native runs (that
-  launch opened later, or the scene connected again) takes that window, and its link reaches `Linking` as one that
+  launch opened later, or the scene connected again) takes that window, and its link goes to the inbox as one that
   comes while the app runs. `SceneDelegate.swift` covers the app-switcher snapshot from resign-active to the next
-  activation, forwards Universal Links to `Linking` and clears the mark of a close from the app switcher
+  activation, puts each Universal Link in the link inbox and then hands it to React Native's `Linking`, whose event only
+  tells a wallet screen that is up to read the inbox, and clears the mark of a close from the app switcher
   ([One wallet, one node, one device](#the-node-tab)); the app registers no URL scheme (no `CFBundleURLTypes`).
 - iOS: `ITSAppUsesNonExemptEncryption` is `NO`: the app's standard algorithms (its own native module and bundled
   crypto libraries, as `store-listing/README.md` lists them) need no export compliance documentation while the App
@@ -2172,7 +2684,7 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   with the runner's analytics off; on Java 17) through `store-screenshots/screenshots.yaml`: Import Existing Wallet
   with a password; Auto-Lock set to Never, the password pasted again for that change (`autolock.yaml`), so no wait
   for a node's answer can lock the wallet under the flows; then Assets with the QNC balance (`01-wallet`), Send
-  (`02-send`), Receive with the QR code (`03-receive`), History
+  with QNC chosen in the token picker (`02-send`), Receive with the QR code (`03-receive`), History
   (`04-history`), the Node tab (`05-node`) and Settings, where Auto-Lock goes back to 1 minute before the language list
   is opened (`06-settings`). The import screen keeps its own one-minute lock while it holds the phrase, so each wait
   there after the paste is at most 40 s; each wait for the screen to settle is at most 3 s. The flows ask the script,

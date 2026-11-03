@@ -4,6 +4,7 @@
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 import {
   claimPayloadPreimage,
+  claimPayloadPreimageV2,
   claimQuotePreimage,
   consentPreimage,
   lightNodeId,
@@ -18,11 +19,13 @@ import { assertBytes } from './bytes.js';
 import { fail } from './errors.js';
 import { ML_DSA65, signChecked } from './signing.js';
 import { signSolanaMessage, verifySolanaSignature } from './solana.js';
+import { expiryAt } from './tx.js';
 
 // `superNodeId`: the wallet's super node id as the node names it (generate_super_node_pseudonym), whose claim quote the
 // signer below also takes.
 export {
   claimPayloadPreimage,
+  claimPayloadPreimageV2,
   claimQuotePreimage,
   consentPreimage,
   lightNodeId,
@@ -33,6 +36,9 @@ export {
   superNodeId,
   walletUnbindPreimage,
 } from '../../../../qnet-mobile/src/crypto/NodePreimages.js';
+
+// The stops and the waits of a node balance's move in parts: the app's own.
+export { BEHIND_TRIES, BEHIND_WAIT_MS, SIZE_STOPS } from '../../../../qnet-mobile/src/utils/claimRun.js';
 
 // The builders refuse a malformed field with a TypeError; a signer reports it as INVALID_NODE_MESSAGE.
 function built(build) {
@@ -97,11 +103,16 @@ export function signClaimQuote({ nodeId, wallet }, secretKey, publicKey) {
 
 /**
  * Step 2: ML-DSA-65 over q1337|qnet_claim_v1:{W}:{ts}:{sha3(claimsData)}, built here from the quoted payload and its
- * timestamp (a node's own copy of the message is never signed). Self-verified.
+ * timestamp (a node's own copy of the message is never signed); with `validUntil`, the V2 form
+ * q1337|{network id}|qnet_claim_v2:{W}:{validUntil}:{sha3(claimsData)}, under this build's network id (expiryAt: a
+ * height outside 1..2^53-1 is INVALID_EXPIRY). Self-verified.
  * @returns {{preimage: string, signature: Uint8Array}}
  */
-export function signClaimPayload({ wallet, ts, claimsData }, secretKey, publicKey) {
-  const preimage = built(() => claimPayloadPreimage(wallet, ts, claimsData));
+export function signClaimPayload({ wallet, ts, claimsData, validUntil = null }, secretKey, publicKey) {
+  const expiry = expiryAt(validUntil);
+  const preimage = built(() => (expiry === null
+    ? claimPayloadPreimage(wallet, ts, claimsData)
+    : claimPayloadPreimageV2(wallet, claimsData, expiry)));
   return { preimage, signature: signChecked(wallet, preimage, secretKey, publicKey) };
 }
 

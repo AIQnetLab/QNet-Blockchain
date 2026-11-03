@@ -2,7 +2,7 @@ import UIKit
 import React
 
 // The app's one scene (Info.plist UIApplicationSceneManifest): it shows React Native's window, covers the app-switcher
-// snapshot, hands the links that open the app to React Native's Linking and marks an open (TaskState.swift).
+// snapshot, puts the links that open the app in the link inbox (LinkInbox.swift) and marks an open (TaskState.swift).
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   var window: UIWindow?
 
@@ -15,7 +15,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
           let app = UIApplication.shared.delegate as? AppDelegate else { return }
     if let running = app.window {
       // React Native already runs (a background launch, or this scene connecting again): the scene takes its window,
-      // and the link it connected with reaches Linking as one does while the app runs.
+      // and the link it connected with goes to the inbox as one does while the app runs.
       running.windowScene = windowScene
       running.frame = windowScene.coordinateSpace.bounds
       running.makeKeyAndVisible()
@@ -23,22 +23,11 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
       connectionOptions.userActivities.forEach { continueLink($0) }
       return
     }
+    // The link that launched the app waits in the inbox for the wallet screen, which reads it once it is up.
+    connectionOptions.userActivities.forEach { continueLink($0) }
     let created = UIWindow(windowScene: windowScene)
     self.window = created
-    app.runReactNative(in: created, launchOptions: SceneDelegate.launchOptions(connectionOptions))
-  }
-
-  // Linking reads the link that launched the app from the launch options (getInitialURL); under a scene it comes in
-  // the connection options, so it is put where Linking reads it.
-  private static func launchOptions(_ options: UIScene.ConnectionOptions) -> [UIApplication.LaunchOptionsKey: Any]? {
-    guard let activity = options.userActivities.first(where: { $0.activityType == NSUserActivityTypeBrowsingWeb }) else {
-      return nil
-    }
-    let entry: [String: Any] = [
-      UIApplication.LaunchOptionsKey.userActivityType.rawValue: NSUserActivityTypeBrowsingWeb,
-      "UIApplicationLaunchOptionsUserActivityKey": activity,
-    ]
-    return [.userActivityDictionary: entry]
+    app.runReactNative(in: created)
   }
 
   // A Universal Link (https://link.aiqnet.io/l or /send, verified by iOS against that host's
@@ -47,8 +36,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     continueLink(userActivity)
   }
 
+  // The link waits in the inbox first; Linking's event only tells a wallet screen that is up to look there.
   private func continueLink(_ activity: NSUserActivity) {
-    guard activity.activityType == NSUserActivityTypeBrowsingWeb else { return }
+    guard activity.activityType == NSUserActivityTypeBrowsingWeb, let url = activity.webpageURL else { return }
+    QNetLinkInbox.offer(url.absoluteString)
     _ = RCTLinkingManager.application(UIApplication.shared, continue: activity, restorationHandler: { _ in })
   }
 

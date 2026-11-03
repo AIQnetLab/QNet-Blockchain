@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
-import { hostRedirect, requestHost } from './lib/hosts';
+import { hostRedirect, requestHost } from './lib/hosts.ts';
+import { DEFAULT_LOCALE, LOCALE_HEADER, NAMED_HEADER, PATH_HEADER, localeCookie } from './lib/languages.ts';
+import { isPageLoad, localeRoute } from './lib/locale-route.ts';
 
 // Content-Security-Policy with a fresh nonce per page response (the Next.js App Router pattern). This is
 // the site's proxy, the Next.js 16 name of middleware (Node.js runtime). Next.js reads the nonce from the
@@ -19,8 +21,7 @@ function newNonce(): string {
 }
 
 // The node cabinet's pages (/node) hold a payment key and open requests to the wallets: they also start no worker,
-// embed no frame and take a manifest from this origin only, and in production upgrade any http address (plan-site
-// section 8).
+// embed no frame and take a manifest from this origin only, and in production upgrade any http address.
 const CABINET_EXTRA = ["worker-src 'none'", "frame-src 'none'", "manifest-src 'self'"];
 
 function isCabinetPath(pathname: string): boolean {
@@ -55,12 +56,43 @@ export function proxy(request: NextRequest) {
   // An API route reaches this point only on a host that serves it without being aiqnet.io (a local run):
   // it keeps its own headers (next.config.js).
   if (pathname.startsWith('/api/')) return NextResponse.next();
-  const csp = policy(newNonce(), isCabinetPath(pathname));
+  // The page's language (src/lib/locale-route.ts): /ru/explorer renders /explorer in Russian.
+  const route = localeRoute({
+    pathname,
+    search,
+    cookie: request.headers.get('cookie'),
+    acceptLanguage: request.headers.get('accept-language'),
+    userAgent: request.headers.get('user-agent'),
+    document: isPageLoad(request.method, request.headers),
+  });
+  const keep = (response: NextResponse) => {
+    if (route.kind === 'none') return response;
+    if (route.keep) response.headers.append('Set-Cookie', localeCookie(route.keep, !DEV));
+    response.headers.set('Vary', 'Accept-Language, Cookie');
+    return response;
+  };
+  // request.url is the address the server checks a rewrite and a redirect against (next.config.js
+  // skipProxyUrlNormalize): on it a rewrite stays inside the server and a redirect leaves as a relative Location.
+  const here = (path: string) => new URL(path, request.url);
+  if (route.kind === 'redirect') return keep(NextResponse.redirect(here(route.location), 307));
+  const path = route.kind === 'page' ? route.path : pathname;
+  const csp = policy(newNonce(), isCabinetPath(path));
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set('Content-Security-Policy', csp);
-  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  requestHeaders.delete(LOCALE_HEADER);
+  requestHeaders.delete(PATH_HEADER);
+  requestHeaders.delete(NAMED_HEADER);
+  if (route.kind === 'page') {
+    requestHeaders.set(LOCALE_HEADER, route.locale);
+    requestHeaders.set(PATH_HEADER, route.path);
+    // An address that names English (/en/..., a browser that keeps no cookie) keeps it in the server's own redirects.
+    if (route.rewrite && route.locale === DEFAULT_LOCALE) requestHeaders.set(NAMED_HEADER, '1');
+  }
+  const response = route.kind === 'page' && route.rewrite
+    ? NextResponse.rewrite(here(`${route.path}${search}`), { request: { headers: requestHeaders } })
+    : NextResponse.next({ request: { headers: requestHeaders } });
   response.headers.set('Content-Security-Policy', csp);
-  return response;
+  return keep(response);
 }
 
 // Every request but API routes (their own CSP in next.config.js) and the build assets under /_next/static,

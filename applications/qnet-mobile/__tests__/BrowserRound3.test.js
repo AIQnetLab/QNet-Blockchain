@@ -15,7 +15,8 @@ jest.mock('../src/crypto/DilithiumCrypto', () => ({
 const fs = require('fs');
 const path = require('path');
 const { sha3_256 } = require('js-sha3');
-const { createDappProvider, CODES, COOLDOWN_MESSAGE, LIMITS, TIMINGS, ARM_MS } = require('../src/browser/dappProvider');
+const { CODES, COOLDOWN_MESSAGE, LIMITS, TIMINGS, ARM_MS } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 const DappSheet = require('../src/browser/DappSheet').default;
 const t = require('../src/i18n').makeT('en');
 
@@ -118,7 +119,7 @@ describe('MB3-03: a page cannot raise sheets in a loop by ending each early', ()
       emit: () => {},
       onChange: (v) => views.push(v),
     };
-    const p = createDappProvider(deps);
+    const p = testProvider(deps);
     return {
       p, views,
       ctx: () => ({ origin: SITE, binding: { origin: SITE, doc, id: 'x', nav: 1 } }),

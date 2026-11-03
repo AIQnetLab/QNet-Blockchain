@@ -1,6 +1,6 @@
 'use client';
 
-// My node's connect card before a wallet (owner, 20.10): one main action by device, the header's Connect wallet too
+// My node's connect card before a wallet: one main action by device, the header's Connect wallet too
 // (useConnectWallet). On a computer it asks the QNet extension (qnet_requestAccounts), or without the extension opens
 // its store page; on a phone or tablet it asks QNet Wallet with a QNet Link `connect` request
 // (docs/protocols/qnet-link-v1.md section 14), whose button then opens the app. Under it the other ways as text
@@ -16,11 +16,12 @@ import { useWallet } from '@/contexts/AppContext';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
 import { APP_CONNECT_EVENT, takeAppConnect } from '@/lib/cabinet/connect-card';
-import { t, type MessageKey } from '@/lib/texts';
+import { type MessageKey } from '@/lib/texts';
 import type { LinkAnswer } from '@/lib/qnet-link';
 import { isEonAddress, type ConnectWay } from '@/lib/qnet-provider';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
+import { useI18n } from '@/i18n/client';
 
 // What a `connect` answer that names no wallet says, as the answer's report (it came through the relay).
 function answerText(answer: LinkAnswer): MessageKey {
@@ -36,6 +37,7 @@ function mainWords(way: Exclude<ConnectWay, { kind: 'wait' }>): [MessageKey, Mes
 }
 
 export default function WalletChoice() {
+  const { t, say } = useI18n();
   const { choose } = useCabinet();
   const { providerStatus, providerChannel } = useWallet();
   const device = useDeviceKind();
@@ -88,7 +90,7 @@ export default function WalletChoice() {
   let main: ReactNode;
   if (active) {
     main = finished ? (
-      <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{t(answerText(finished))}</Answered>
+      <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{say(answerText(finished))}</Answered>
     ) : active.state.phase !== 'done' && (
       <LinkWaiting
         state={active.state}
@@ -106,9 +108,9 @@ export default function WalletChoice() {
     main = (
       <>
         {way.kind === 'install'
-          ? <Action kind="solid" href={way.href} external={way.store}>{t(label)}</Action>
-          : <Action kind="solid" onClick={run}>{t(label)}</Action>}
-        <p className="note">{t(note)}</p>
+          ? <Action kind="solid" href={way.href} external={way.store}>{say(label)}</Action>
+          : <Action kind="solid" onClick={run}>{say(label)}</Action>}
+        <p className="note">{say(note)}</p>
       </>
     );
   }
@@ -118,11 +120,11 @@ export default function WalletChoice() {
   if (!active && !waiting) {
     others = device.phone ? (
       <>
-        <Action href="/wallet">{t('connect_get_app_link')}</Action>
-        {extension && <Action onClick={askExtension}>{t('connect_ext')}</Action>}
+        <Action href="/wallet">{say('connect_get_app_link')}</Action>
+        {extension && <Action onClick={askExtension}>{say('connect_ext')}</Action>}
       </>
     ) : (
-      <Action onClick={showQr}>{t('connect_app_qr')}</Action>
+      <Action onClick={showQr}>{say('connect_app_qr')}</Action>
     );
   }
 
@@ -130,7 +132,7 @@ export default function WalletChoice() {
     <>
       <div className="cab-connect-main">
         {main}
-        {failed && <Failed>{t('wallet_extension_failed')}</Failed>}
+        {failed && <Failed>{say('wallet_extension_failed')}</Failed>}
       </div>
       {others && <div className="cab-connect-alt">{others}</div>}
     </>
@@ -139,6 +141,7 @@ export default function WalletChoice() {
 
 // View by address: an address typed only to look, a view, never a connected wallet (CabinetProvider viewAddress).
 export function ViewByAddress() {
+  const { t, say } = useI18n();
   const { viewAddress } = useCabinet();
   const [address, setAddress] = useState('');
   const [invalid, setInvalid] = useState(false);
@@ -156,7 +159,7 @@ export function ViewByAddress() {
   return (
     <form className="cab-view-by" onSubmit={submit} noValidate>
       <label className="label" htmlFor="cabinet-address">{t('connect_view_title')}</label>
-      <p className="note" id="cabinet-address-note">{t('connect_view_note')}</p>
+      <p className="note" id="cabinet-address-note">{say('connect_view_note')}</p>
       <div className="cab-field-row">
         <input
           id="cabinet-address"
@@ -176,7 +179,7 @@ export function ViewByAddress() {
         />
         <button type="submit" className="btn btn-text">{t('wallet_enter_submit')}</button>
       </div>
-      {invalid && <p className="cab-field-error" id="cabinet-address-error" role="alert">{t('wallet_enter_invalid')}</p>}
+      {invalid && <p className="cab-field-error" id="cabinet-address-error" role="alert">{say('wallet_enter_invalid')}</p>}
     </form>
   );
 }

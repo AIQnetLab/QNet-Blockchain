@@ -1,8 +1,8 @@
 /**
  * Sending SOL and the Solana tokens the wallet lists, from the wallet's Solana address (the key of the same recovery
- * phrase on m/44'/501'/0'/0'). Reads go to the Solana RPC endpoint the balances use (config/nodes); the transaction is
- * built in crypto/SolanaTx and signed by WalletManager.signSolanaMessage, after the review and the fresh check the
- * screen asks for.
+ * phrase on m/44'/501'/0'/0'). Reads go to the Solana RPC endpoint the balances use (config/nodes), or through the site
+ * when that endpoint gives this device no answer (solanaRpc); the transaction is built in crypto/SolanaTx and signed by
+ * WalletManager.signSolanaMessage, after the review and the fresh check the screen asks for.
  *
  * quoteSolanaSend reads what the send needs and refuses, with a code the screen says in the user's language, anything
  * the network would refuse: an amount the wallet does not hold, too little SOL for the network fee (and for the
@@ -15,9 +15,12 @@
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Buffer } from 'buffer';
-import { getSolanaRpcUrl, rotateSolanaRpc, ONE_DEV_MINT } from '../config/nodes';
+import { FIRST_CONTACT_MS, ONE_DEV_MINT, SOLANA_RELAY_URL, getSolanaRpcUrl, rotateSolanaRpc } from '../config/nodes';
+import { lastNetworkBack } from './NetworkWake';
 import { parseStrictJson } from '../utils/strictJson';
 import { amountText } from '../utils/amountFormat';
+import { solanaAttemptAfter, solanaProbeDue, solanaRouteAfter, solanaRouteOf } from '../utils/solanaRoute';
+import logger from '../utils/logger';
 import {
   SOL_DECIMALS, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_ACCOUNT_SIZE,
   associatedTokenAddress, base58Encode, decodeKey, fromBaseUnits, isOnCurve, serializeTransaction, toBaseUnits,
@@ -44,42 +47,140 @@ export const solText = (lamports) => `${amountText(fromBaseUnits(BigInt(lamports
 
 // ── RPC ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+// Which way the calls go (utils/solanaRoute): read from storage once per JS run, then held here and written on change.
+const ROUTE_KEY = 'qnet_solana_route_v1';
+const rpcBody = (method, params) => JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+const PROBE_BODY = rpcBody('getBlockHeight', [{ commitment: 'confirmed' }]);
+let route = null;
+let routeRead = null;
+let routeKept = null;
+let routeWrites = Promise.resolve();
+let probing = false;
+
+function currentRoute() {
+  if (!routeRead) {
+    routeRead = AsyncStorage.getItem(ROUTE_KEY)
+      .then((text) => { routeKept = text; return solanaRouteOf(JSON.parse(text)); })
+      .catch(() => solanaRouteOf(null))
+      .then((kept) => { route = route || kept; });
+  }
+  return routeRead.then(() => route || solanaRouteOf(null));
+}
+
+// Holds `next` and writes it, one write at a time in the order of the changes; a change of way is logged.
+function keepRoute(next, reason) {
+  const before = route;
+  if (before && before.via === next.via && before.probeAt === next.probeAt) return;
+  route = next;
+  if (!before || before.via !== next.via) logger.info(`[INFO][SOLANA] route_changed via=${next.via} reason=${reason}`);
+  routeWrites = routeWrites.then(async () => {
+    const text = route ? JSON.stringify(route) : null;
+    if (text === null || text === routeKept) return;
+    await AsyncStorage.setItem(ROUTE_KEY, text);
+    routeKept = text;
+  }).catch(() => {});
+}
+
+/** Forgets the route held in memory: the next call reads the kept one again, as a fresh JS run does. */
+export function forgetSolanaRoute() {
+  route = null;
+  routeRead = null;
+  routeKept = null;
+}
+
+// One POST within `timeoutMs`, the body read included: { status, ok, text }. It throws only when no answer came at all.
+async function postRpc(url, body, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: controller.signal,
+    });
+    return { status: resp.status, ok: resp.ok, text: await resp.text() };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The result of an answer. An error the endpoint answered is thrown with `rpcError`; a rate limit or an unreadable body
+// as a plain error.
+function rpcResult(answer, afterUnanswered) {
+  if (answer.text.length > MAX_ANSWER_CHARS) throw new Error('answer too large');
+  const body = answer.status === 429 ? null : parseStrictJson(answer.text);
+  if (body && body.error && typeof body.error === 'object') {
+    const message = typeof body.error.message === 'string' ? body.error.message : 'error';
+    throw Object.assign(new Error(message), {
+      rpcError: true, rpcCode: body.error.code, data: body.error.data, afterUnanswered,
+    });
+  }
+  if (!answer.ok || !body || !('result' in body)) throw new Error(`HTTP ${answer.status}`);
+  return body.result;
+}
+
+// On the site route, a direct getBlockHeight beside the calls once one is due, one at a time and never waited for: a
+// block height puts the calls back on the endpoint, anything else keeps them on the site from now.
+function probeDirect() {
+  if (probing || !solanaProbeDue(route, Date.now(), lastNetworkBack())) return;
+  probing = true;
+  postRpc(getSolanaRpcUrl(), PROBE_BODY, RPC_TIMEOUT_MS)
+    .then((answer) => Number.isSafeInteger(rpcResult(answer, false)))
+    .catch(() => false)
+    .then((answered) => {
+      if (!route || route.via !== 'site') return;
+      keepRoute(solanaRouteAfter(answered, Date.now()), answered ? 'probe_answered' : 'no_answer');
+    })
+    .finally(() => { probing = false; });
+}
+
 /**
- * One JSON-RPC call. An error the endpoint answered is thrown with `rpcError` (it saw the request and refused it), and
- * with `afterUnanswered` when an attempt before it got no answer (that attempt may still have been taken); no answer, a
- * rate limit or an unreadable body are tried once more on the next endpoint and then thrown as SOL_RPC with
- * `unanswered`. Integers above 2^53 come back as their decimal text (utils/strictJson).
+ * One JSON-RPC call in two attempts, each the way solanaAttemptAfter (utils/solanaRoute) gives, the first the kept
+ * route's: to the endpoint, or to the site (SOLANA_RELAY_URL), which passes the same call on to Solana. A direct attempt
+ * that got no answer at all puts the calls on the site route and the attempt after it goes there at once with the same
+ * body; a site attempt with no usable answer is followed by one at the endpoint, whose answer puts the calls back on it;
+ * a rate limit or an unreadable body from the endpoint is an answer and is tried there again. An error the endpoint
+ * answered is thrown with `rpcError` (it saw the request and refused it), and with `afterUnanswered` when an attempt
+ * before it got no usable answer (that attempt may still have been taken); two attempts with no usable answer are thrown
+ * as SOL_RPC with `unanswered`. Integers above 2^53 come back as their decimal text (utils/strictJson).
  */
 export async function solanaRpc(method, params) {
+  const body = rpcBody(method, params);
+  let via = (await currentRoute()).via;
+  if (via === 'site') probeDirect();
   let last = null;
+  let prior = null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const url = attempt === 0 ? getSolanaRpcUrl() : rotateSolanaRpc();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+    const direct = via !== 'site';
+    // A direct attempt after a direct one takes the next endpoint; after the site, the one the calls use.
+    const url = !direct ? SOLANA_RELAY_URL : (prior === 'direct' ? rotateSolanaRpc() : getSolanaRpcUrl());
+    prior = via;
+    let answer = null;
     try {
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-        signal: controller.signal,
-      });
-      const text = await resp.text();
-      if (text.length > MAX_ANSWER_CHARS) throw new Error('answer too large');
-      const body = resp.status === 429 ? null : parseStrictJson(text);
-      if (body && body.error && typeof body.error === 'object') {
-        const message = typeof body.error.message === 'string' ? body.error.message : 'error';
-        throw Object.assign(new Error(message), {
-          rpcError: true, rpcCode: body.error.code, data: body.error.data, afterUnanswered: last !== null,
-        });
-      }
-      if (!resp.ok || !body || !('result' in body)) throw new Error(`HTTP ${resp.status}`);
-      return body.result;
+      // An attempt on the site gets the first-contact time: the site itself waits up to 8 s on the endpoint.
+      answer = await postRpc(url, body, direct ? RPC_TIMEOUT_MS : FIRST_CONTACT_MS);
     } catch (e) {
-      if (e && e.rpcError) throw e;
       last = e;
-    } finally {
-      clearTimeout(timer);
     }
+    let got = answer ? 'usable' : 'none';
+    let result;
+    let refusal = null;
+    if (answer) {
+      try {
+        result = rpcResult(answer, last !== null);
+      } catch (e) {
+        if (e && e.rpcError) {
+          refusal = e;
+        } else {
+          last = e;
+          got = 'unusable';
+        }
+      }
+    }
+    const step = solanaAttemptAfter(via, got, Date.now());
+    if (step.route) keepRoute(step.route, step.route.via === 'site' ? 'no_answer' : 'answered');
+    via = step.next;
+    if (got !== 'usable') continue;
+    if (refusal) throw refusal;
+    return result;
   }
   throw Object.assign(new Error((last && last.message) || 'Solana RPC unavailable'), { code: 'SOL_RPC', unanswered: true });
 }
@@ -95,7 +196,11 @@ const lamportsOf = (v) => {
   return BigInt(s);
 };
 
-async function balanceOf(address) {
+/**
+ * The SOL balance of `address` in lamports (a BigInt), read at 'confirmed': the quote, MAX and the Assets figure read it
+ * so. Throws SOL_RPC when it cannot be read.
+ */
+export async function solBalanceOf(address) {
   const r = await read('getBalance', [address, { commitment: 'confirmed' }]);
   return lamportsOf(r && r.value);
 }
@@ -194,7 +299,7 @@ export async function quoteSolanaSend({ from, to, symbol, amount, request = null
   let rent = 0n;
   let checks;
   if (!token.mint) {
-    const [balance, recipientBalance, minimum] = await Promise.all([balanceOf(from), balanceOf(recipient), rentExempt(0)]);
+    const [balance, recipientBalance, minimum] = await Promise.all([solBalanceOf(from), solBalanceOf(recipient), rentExempt(0)]);
     plan = { kind: 'sol', from, to: recipient, amount: amountBase, references, memo };
     checks = { balance, minimum, recipientBalance };
   } else {
@@ -205,7 +310,7 @@ export async function quoteSolanaSend({ from, to, symbol, amount, request = null
     const destination = associatedTokenAddress(recipient, token.mint);
     const [mintInfo, recipientInfo, destinationInfo, source, balance, minimum, accountRent] = await Promise.all([
       accountInfo(token.mint), accountInfo(recipient), accountInfo(destination), sourceAccount(from, token.mint, amountBase),
-      balanceOf(from), rentExempt(0), rentExempt(TOKEN_ACCOUNT_SIZE),
+      solBalanceOf(from), rentExempt(0), rentExempt(TOKEN_ACCOUNT_SIZE),
     ]);
     const mint = parsedInfo(mintInfo, 'mint');
     if (!mintInfo || mintInfo.owner !== TOKEN_PROGRAM_ID || !mint || Number(mint.decimals) !== token.decimals) {
@@ -285,7 +390,7 @@ export async function maxSendable(owner, symbol) {
   const token = solanaToken(symbol);
   if (!token) return null;
   if (!token.mint) {
-    const balance = await balanceOf(owner);
+    const balance = await solBalanceOf(owner);
     return fromBaseUnits(balance > BASE_FEE_LAMPORTS ? balance - BASE_FEE_LAMPORTS : 0n, SOL_DECIMALS);
   }
   return fromBaseUnits(await heldTokenBase(owner, token.mint), token.decimals);

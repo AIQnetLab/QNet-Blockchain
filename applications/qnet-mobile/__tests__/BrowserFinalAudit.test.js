@@ -11,7 +11,8 @@ import { AppState, Text } from 'react-native';
 import Action from '../src/components/ui/Action';
 
 const { sha3_256 } = require('js-sha3');
-const { createDappProvider, CODES, ARM_MS, SEND_ARM_MS } = require('../src/browser/dappProvider');
+const { CODES, ARM_MS, SEND_ARM_MS } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 const DappSheet = require('../src/browser/DappSheet').default;
 const { navigationDecision, EXPLORER_PAGE, WALLET_ONLY_PATHS } = require('../src/browser/url');
 const { WalletManager } = require('../src/components/WalletManager');
@@ -51,7 +52,7 @@ function setup(over = {}) {
     onChange: (v) => views.push(v),
     ...over,
   };
-  const p = createDappProvider(deps);
+  const p = testProvider(deps);
   const ctx = () => ({ origin: SITE, binding: { origin: SITE, doc: 'd', id: 'x', nav: 1 } });
   return { p, deps, ctx, shown: () => views[views.length - 1], views, leave: () => { current = false; } };
 }

@@ -34,7 +34,9 @@ What leaves the device:
   proofs against, which name no address.
 - **Solana RPC** — the Solana address goes to public Solana devnet endpoints for balances, and a Solana transfer the
   user confirms goes there to be sent and followed; so do the addresses it pays and the token accounts it reads. These
-  endpoints are third parties with no contract with the publisher.
+  endpoints are third parties with no contract with the publisher. When such an endpoint gives the device no answer at
+  all, the same requests and the signed transfer go to the explorer instead (`SOLANA_RELAY_URL`, `src/config/nodes.js`),
+  which passes them on to Solana and logs none of them; never a key.
 - **Requests from aiqnet.io (QNet Link)** — only when the user opens an `https://link.aiqnet.io/l` link and confirms on
   the app's own sheet: one answer, end-to-end encrypted to the page that asked, through the publisher's relay (which
   keeps the ciphertext in memory for at most ten minutes and sees the IP address for rate limiting only). The answer
@@ -83,7 +85,7 @@ Therefore:
 | Question | Answer |
 |---|---|
 | Does the app collect or share user data? | Yes. |
-| Personal info → User IDs | Collected and **shared**: the wallet's QNet Blockchain and Solana addresses; the Solana address reaches public Solana RPC endpoints automatically. Purpose: App functionality. Required. |
+| Personal info → User IDs | Collected and **shared**: the wallet's QNet Blockchain and Solana addresses; the Solana address reaches public Solana RPC endpoints automatically, or, when those give the device no answer, the explorer that passes the same request on to them. Purpose: App functionality. Required. |
 | Financial info → Purchase history (and Other financial info) | Collected: the transactions the user signs reach the nodes and stay on the public chain. Not shared (user-initiated). Purpose: App functionality. Required. |
 | Device or other IDs | Collected **only while a node is linked**: the push token and Firebase installation ID, the device key's public part and the device-check token. **Optional.** **Not shared**: the genesis nodes and the device service are the publisher's; Google and Apple act as service providers. Purposes: App functionality; Fraud prevention, security, and compliance. |
 | App activity → Installed apps | Collected **only while a node is linked, on Android**: Google Play's app-access-risk verdict, which says whether apps are running that could view the screen, show themselves over other apps or control the device, and whether other apps are installed (it names no app). **Not processed ephemerally**: the device service decides only on whether the verdict is present, and keeps it with its labels, sealed, 7 days (up to 90 days for a refused, suspect or paused case) for review of an appeal. **Optional.** **Not shared** (Google acts as a service provider). Purpose: Fraud prevention, security, and compliance. |
@@ -203,7 +205,7 @@ never `.../releases/latest/download/...`, which could resolve to this old-key bu
 2. *Wallet without a node*: "Import the phrase. The Node tab says 'This wallet has no node' with nothing to tap. Node
    registrations are made on the aiqnet.io website, outside the app; the app sells nothing."
 3. *Website request sheets*: "With the wallet of set 1 (the one with a node), on the same device open
-   https://aiqnet.io/node in Chrome. Tap 'QNet Wallet on this phone', then 'Open QNet Wallet', and confirm the sheet
+   https://aiqnet.io/node in Chrome. Tap 'Connect QNet Wallet', then 'Open QNet Wallet', and confirm the sheet
    'Share this wallet's addresses' in the app. Back in Chrome, open the Device tab, tap 'Move the node to another device', then 'Open
    QNet Wallet', and confirm the sheet 'Link this wallet's node to this device'. On the Overview, with a node balance
    of 1 QNC or more, 'Move with QNet Wallet', then 'Open QNet Wallet', opens the sheet 'Move node balance to this

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { tokenSuggestion, type Suggestion } from '@/lib/explorer-view';
 import { sanitizeLogo } from '@/lib/sanitize-logo';
 import {
   getTransactionByHash,
@@ -16,17 +17,6 @@ import {
 // hash, address, token-by-contract). Empty list ⇒ client shows "Nothing found"
 // instead of routing to a broken /tx/{q}. Pure DB point-lookups (+ ILIKE token
 // search) — no node round-trip, so it stays cheap enough to call on every keystroke.
-
-export interface Suggestion {
-  type: 'tx' | 'block' | 'address' | 'token';
-  label: string;
-  sublabel?: string;
-  href: string;
-  // Token rows carry these so the client renders a real icon (logo) or a generated avatar.
-  symbol?: string;
-  address?: string;
-  logo?: string;
-}
 
 const MAX_RESULTS = 8;
 
@@ -82,9 +72,7 @@ export async function GET(request: NextRequest) {
     let deploy: ContractDeployRow | null = null;
     try { deploy = await getContractDeployByAddress(q); } catch { deploy = null; }
     const tok = deploy ? parseQrc20(deploy) : null;
-    if (tok) {
-      results.push({ type: 'token', label: tok.symbol || 'Token', sublabel: `${tok.name || 'QRC-20'} · ${shorten(q)}`, href: `/explorer/token/${q}`, symbol: tok.symbol, address: q, logo: tok.logo });
-    }
+    if (tok) results.push(tokenSuggestion(tok, q));
     results.push({ type: 'address', label: 'Address', sublabel: shorten(q), href: `/explorer/address/${q}` });
   }
 
@@ -103,15 +91,7 @@ export async function GET(request: NextRequest) {
       const name = tok.name.toLowerCase();
       if (sym.includes(needle) || name.includes(needle) || contract.toLowerCase() === needle) {
         seen.add(contract);
-        results.push({
-          type: 'token',
-          label: tok.symbol || 'Token',
-          sublabel: `${tok.name || 'QRC-20'} · ${shorten(contract)}`,
-          href: `/explorer/token/${contract}`,
-          symbol: tok.symbol,
-          address: contract,
-          logo: tok.logo,
-        });
+        results.push(tokenSuggestion(tok, contract));
         if (results.length >= MAX_RESULTS) break;
       }
     }

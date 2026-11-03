@@ -1,20 +1,20 @@
 'use client';
 
 import React, { memo, useRef } from 'react';
-import Link from 'next/link';
 import EntityLink from '@/components/ui/EntityLink';
 import { LiveDot } from '@/components/ui/Status';
 import { useActivationContent } from '@/contexts/AppContext';
 import { useChainHead } from '@/hooks/useChainHead';
 import { useIntersectionObserver } from '@/hooks/useIntersectionObserver';
+import { Link, useI18n } from '@/i18n/client';
 import { ANDROID_PLAY_URL, IOS_APP_STORE_URL, IOS_TESTFLIGHT_URL } from '@/lib/app-links';
-import { t } from '@/lib/texts';
+import type { MessageKey } from '@/lib/texts';
 
-// Privacy and Terms on every page, in the small line under the footer (owner, 12.10); Support is in the Docs menu.
+// Privacy and Terms on every page, in the small line under the footer; Support is in the Docs menu.
 // They are pages of the QNet app's view too, where its own menu lists them with Support.
-const FOOTER_LINKS = [
-  { href: '/privacy', label: 'Privacy' },
-  { href: '/terms', label: 'Terms' },
+const FOOTER_LINKS: { href: string; label: MessageKey }[] = [
+  { href: '/privacy', label: 'hdr_privacy' },
+  { href: '/terms', label: 'hdr_terms' },
 ];
 
 // The social marks, drawn in the text colour.
@@ -42,28 +42,29 @@ const FooterComponent = () => {
   // The QNet app's view (and the page before the wallet is detected) links no place off this site
   // (src/lib/activate-view.ts): the repository's front page describes node activation and its cost and its
   // Releases hold the APK; the Telegram channel is where the site says Android builds are shared; and the
-  // X account's posts are about the same subjects (R4-XPD-06). The row keeps its height either way.
+  // X account's posts are about the same subjects. The row keeps its height either way.
   const full = useActivationContent();
+  const { t, say } = useI18n();
   const root = useRef<HTMLElement>(null);
   const near = useIntersectionObserver(root, { rootMargin: '240px 0px' });
   return (
     <footer className={`ftr${near ? '' : ' off'}`} ref={root}>
       <div className="wrap">
-        <p className="ftr-line">QNet Blockchain has you, Eon...<span className="cursor" aria-hidden="true" /></p>
+        <p className="ftr-line">{say('ftr_line')}<span className="cursor" aria-hidden="true" /></p>
         <div className="ftr-row">
-          {full && (<a href="https://github.com/AIQnetLab/QNet-Blockchain/tree/testnet" target="_blank" rel="noopener noreferrer" className="ftr-mark" aria-label="QNet Blockchain on GitHub">
+          {full && (<a href="https://github.com/AIQnetLab/QNet-Blockchain/tree/testnet" target="_blank" rel="noopener noreferrer" className="ftr-mark" aria-label={t('ftr_on', { place: 'GitHub' })}>
             <Mark path={MARKS.github} />
           </a>)}
-          {full && (<a href="https://x.com/AIQnetLab" target="_blank" rel="noopener noreferrer" className="ftr-mark" aria-label="QNet Blockchain on X">
+          {full && (<a href="https://x.com/AIQnetLab" target="_blank" rel="noopener noreferrer" className="ftr-mark" aria-label={t('ftr_on', { place: 'X' })}>
             <Mark path={MARKS.x} />
           </a>)}
-          {full && (<a href="https://t.me/AiQnetLab" target="_blank" rel="noopener noreferrer" className="ftr-mark" aria-label="QNet Blockchain on Telegram">
+          {full && (<a href="https://t.me/AiQnetLab" target="_blank" rel="noopener noreferrer" className="ftr-mark" aria-label={t('ftr_on', { place: 'Telegram' })}>
             <Mark path={MARKS.telegram} />
           </a>)}
           {/* Until the App Store listing is live, iPhone and iPad install from TestFlight, named as such: the App Store
-              badge opens only the listing (owner, 12.10: a badge never opens a placeholder). */}
+              badge opens only the listing, never a placeholder. */}
           {full && !IOS_APP_STORE_URL && (
-            <a href={IOS_TESTFLIGHT_URL} target="_blank" rel="noopener noreferrer" className="ftr-link">TestFlight</a>
+            <a href={IOS_TESTFLIGHT_URL} target="_blank" rel="noopener noreferrer" className="ftr-link" translate="no">TestFlight</a>
           )}
           {/* The official store badges, served from /public/badges (img-src 'self'), off the QNet app's view like every
               other off-site link. One group, so a phone wraps it whole under the marks. */}
@@ -84,12 +85,12 @@ const FooterComponent = () => {
         </div>
         <div className="ftr-legal">
           <span className="ftr-copyright">© 2026 Orrery Group LLC</span>
-          <nav className="ftr-links" aria-label="Site policies">
+          <nav className="ftr-links" aria-label={t('ftr_policies')}>
             {FOOTER_LINKS.map((link) => (
-              <Link key={link.href} href={link.href} className="ftr-link">{link.label}</Link>
+              <Link key={link.href} href={link.href} className="ftr-link">{say(link.label)}</Link>
             ))}
           </nav>
-          <span className="ftr-height"><LiveDot />Block {near ? <LiveHeight /> : <span className="dash">—</span>}</span>
+          <span className="ftr-height"><LiveDot />{t('ftr_block')} {near ? <LiveHeight /> : <span className="dash">—</span>}</span>
         </div>
       </div>
     </footer>

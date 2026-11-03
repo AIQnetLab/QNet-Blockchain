@@ -1,8 +1,8 @@
-// My node's building blocks (B-SPEC 5.14, 6.7): rows and space, no cards. A titled group of rows, label/value rows, the
+// My node's building blocks: rows and space, no cards. A titled group of rows, label/value rows, the
 // notes under a block and the numbered steps of a flow, shared by every section.
 
 import { useId, type ReactNode } from 'react';
-import { t } from '@/lib/texts';
+import { useI18n } from '@/i18n/client';
 
 // A titled group: a hairline on top, the title (with an optional datum or link at its right), then its rows. `level` 3
 // under a section that has its own title (Activate).
@@ -49,7 +49,7 @@ export function Fact({ label, children }: { label: ReactNode; children: ReactNod
   );
 }
 
-// The one next step (B-SPEC 5.14): what to do in at most two sentences, then at most one solid action.
+// The one next step: what to do in at most two sentences, then at most one solid action.
 export function Next({ children, action, alert = false }: { children: ReactNode; action?: ReactNode; alert?: boolean }) {
   return (
     <div className="cab-next" role={alert ? 'alert' : undefined}>
@@ -74,6 +74,7 @@ export function Steps({ label, children }: { label?: string; children: ReactNode
 
 // `level` 4 under a group whose own title is an h3.
 export function Step({ n, at, title, level = 3, children }: { n: number; at: StepAt; title: ReactNode; level?: 3 | 4; children?: ReactNode }) {
+  const { t } = useI18n();
   const Heading = level === 4 ? 'h4' : 'h3';
   return (
     <li className="cab-step" data-at={at} aria-current={at === 'now' ? 'step' : undefined}>

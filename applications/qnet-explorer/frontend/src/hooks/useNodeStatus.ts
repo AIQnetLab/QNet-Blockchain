@@ -12,9 +12,9 @@ import {
   type SuperStatusView,
 } from '@/lib/cabinet/node-view';
 import { parseWalletNode, type WalletNodeView } from '@/lib/cabinet/wallet-activation';
+import { siteRequest } from '@/lib/site-request';
 
 const REFRESH_MS = 30_000;
-const REQUEST: RequestInit = { cache: 'no-store', credentials: 'omit', redirect: 'error' };
 
 export type Loaded<T> = { phase: 'loading' } | { phase: 'ok'; value: T } | { phase: 'unavailable' };
 
@@ -22,7 +22,7 @@ const LOADING: Loaded<never> = { phase: 'loading' };
 
 async function load<T>(url: string, parse: (body: unknown) => T | null): Promise<T | null> {
   try {
-    const res = await fetch(url, REQUEST);
+    const res = await fetch(url, siteRequest());
     return res.status === 200 ? parse(await res.json()) : null;
   } catch {
     return null;
@@ -167,7 +167,7 @@ export function useSuperStatus(nodeId: string | null) {
 }
 
 // A node the network listed stays shown through a read that fails; "no node" does not, so nothing is offered while the
-// network cannot answer (R6).
+// network cannot answer.
 const keepListed = (value: WalletNodeView) => value.state === 'registered';
 
 export function useWalletNode(wallet: string | null) {

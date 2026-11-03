@@ -15,8 +15,9 @@ const { WalletManager } = require('../src/components/WalletManager');
 const { pendingFor } = require('../src/services/PendingTx');
 const { GENESIS_NODES } = require('../src/config/nodes');
 const {
-  createDappProvider, CODES, TIMINGS, COOLDOWN_MESSAGE, parseQncAmount, isEmptyParams, pageError, METHODS,
+  CODES, TIMINGS, COOLDOWN_MESSAGE, parseQncAmount, isEmptyParams, pageError, METHODS,
 } = require('../src/browser/dappProvider');
+const { testProvider } = require('../test-support/provider');
 
 const eon = (seed) => {
   const body = `${seed.repeat(19).slice(0, 19)}eon${seed.repeat(15).slice(0, 15)}`;
@@ -53,7 +54,7 @@ function setup(over = {}) {
     onChange: (v) => views.push(v),
     ...over,
   };
-  const p = createDappProvider(deps);
+  const p = testProvider(deps);
   const ctx = (origin = SITE) => ({ origin, binding: { origin, doc: 'd', id: 'x', nav: 1 } });
   const shown = () => views[views.length - 1];
   const grant = (origin = SITE) => grants.set(origin, { grantedAt: now, chains: ['qnet', 'solana'], walletId: QNET });

@@ -18,39 +18,16 @@ const TO = '02dca74ef2eae3be97feon499504db891ae0c60e364a8';
 const mockState = {};
 
 jest.mock('../src/components/WalletManager', () => {
-  class VaultCorruptError extends Error {}
-  const words = 'abandon ability able about above absent absorb abstract absurd abuse access accident'.split(' ');
-  class FakeWalletManager {
-    constructor() {
-      return new Proxy(this, {
-        get: (target, prop) => {
-          if (prop in target || typeof prop === 'symbol' || prop === 'then') return target[prop];
-          return async () => null;
-        },
-      });
-    }
-    async prepareInstall() {}
-    async vaultState() { return 'sealed'; }
-    async isBiometricEnabled() { return false; }
-    async isBiometricSupported() { return false; }
-    async getPasswordLockStatus() { return { locked: false }; }
-    async unlockWithPassword() { return { ok: true, token: 'session-token' }; }
-    async loadWallet() { return { address: mockSOL, solanaAddress: mockSOL, publicKey: mockSOL, qnetAddress: mockQNET }; }
-    getBIP39WordList() { return words; }
-    getTrustedNodes() { return ['https://node1.aiqnet.io']; }
-    trustedNodeUrl() { return 'https://node1.aiqnet.io'; }
+  const { fakeWalletManager, walletManagerModule, recipientAddress } = require('../test-support/walletMocks');
+  class FakeWalletManager extends fakeWalletManager({
+    qnet: mockQNET, sol: mockSOL, light: 'light_mobile_1111222233334444', nodes: ['https://node1.aiqnet.io'],
+  }) {
     async getTokenHoldings() { return []; }
-    async loadNodeRecord() { return null; }
-    async deviceAuthAvailable() { return false; }
     async agreedGenesisBalance() { return null; }
     async keptTransactions() { return []; }
     async sentRecipients() { return []; }
     async loadBalanceSnapshot() { return null; }
     async saveBalanceSnapshot() { return true; }
-    generateQNetAddressFromSolana() { return mockQNET; }
-    generateLightNodePseudonym() { return 'light_mobile_1111222233334444'; }
-    sessionOpen() { return true; }
-    closeSession() {}
     async getBalance() { return mockState.read('sol', 0.5); }
     async getTokenBalance() { return mockState.read('oneDev', 4); }
     async getQNCBalanceWithProof(addr, verify, opts) {
@@ -64,14 +41,8 @@ jest.mock('../src/components/WalletManager', () => {
     payableRecipientProblem() { return mockState.check('recipient', null); }
     pendingTransactions() { return mockState.check('kept', []); }
   }
-  FakeWalletManager.MIN_PASSWORD_LENGTH = 8;
-  FakeWalletManager.publicWallet = (w) => ({ ...w });
-  FakeWalletManager.canonicalAddress = (a) => a;
-  FakeWalletManager.recipientAddress = (a) => {
-    if (!/^[0-9a-f]{19}eon[0-9a-f]{23}$/.test(String(a))) throw Object.assign(new Error('not an account'), { code: 'HEX_RECIPIENT' });
-    return a;
-  };
-  return { __esModule: true, default: FakeWalletManager, WalletManager: FakeWalletManager, VaultCorruptError };
+  FakeWalletManager.recipientAddress = recipientAddress;
+  return walletManagerModule(FakeWalletManager);
 });
 
 jest.mock('../src/services/LightNode', () => ({
@@ -86,33 +57,7 @@ jest.mock('../src/services/NodeDeviceKey', () => ({
   settleByTag: jest.fn(async () => null),
   showPlayDialog: jest.fn(async () => 'ok'),
 }));
-jest.mock('../src/services/PushService', () => ({
-  readUnconfirmedBinding: jest.fn(async () => null),
-  settleUnconfirmedBinding: jest.fn(async () => false),
-  LAST_ANSWER_KEY: 'qnet_last_self_attest_at',
-  readdressIfOwed: jest.fn(async () => false),
-  localBinding: jest.fn(async () => null),
-  forgetIfReplaced: jest.fn(async () => false),
-  signStatusWithPingKey: jest.fn(async () => null),
-  stopLightNode: jest.fn(async () => ({ unbound: true })),
-  bindThisDevice: jest.fn(async () => ({ ok: true })),
-  selfAttestIfNeeded: jest.fn(async () => false),
-  checkServerNodeStatus: jest.fn(async () => ({ success: false, error: 'network' })),
-  getAllNodesByWallet: jest.fn(async () => ({ success: true, nodes: [] })),
-  getWalletNodeEvents: jest.fn(async () => ({ success: true, nodes: [] })),
-  getNodeEpochs: jest.fn(async () => null),
-  getPendingRewards: jest.fn(async () => ({ success: true, pendingRewards: 0 })),
-  refreshFcmTokenOnServer: jest.fn(async () => ({})),
-  isTokenRefreshNeeded: jest.fn(async () => false),
-  teardownLightNode: jest.fn(async () => {}),
-  teardownLightNodeIfForeign: jest.fn(async () => {}),
-  resendPendingBinding: jest.fn(async () => false),
-  enrolAgainIfUnleased: jest.fn(async () => false),
-  nodeCheckState: jest.fn(async () => null),
-  endExpiredLink: jest.fn(async () => false),
-  settleUnansweredKey: jest.fn(async () => null),
-  refreshLeaseFromTab: jest.fn(async () => false),
-}));
+jest.mock('../src/services/PushService', () => require('../test-support/walletMocks').pushServiceModule());
 jest.mock('../src/services/NodeRecordRead', () => ({
   ...jest.requireActual('../src/services/NodeRecordRead'),
   readNodeRecordState: jest.fn(async () => null),
@@ -124,7 +69,6 @@ jest.mock('react-native-qrcode-svg', () => {
 });
 jest.mock('../src/services/QNetLink', () => ({
   parseLink: jest.fn(() => null),
-  takeInitialUrl: jest.fn(async () => null),
   openSession: jest.fn(), prepareOffer: jest.fn(), performIntent: jest.fn(), deliverAnswer: jest.fn(), markHandled: jest.fn(),
   LinkRefusal: class LinkRefusal extends Error {},
 }));
@@ -157,9 +101,8 @@ const WalletScreen = require('../src/screens/WalletScreen').default;
 
 jest.setTimeout(120000);
 
-const flush = async (n = 4) => { for (let i = 0; i < n; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
-const textOf = (n) => [].concat(n.props.children).flat(Infinity).filter((c) => typeof c === 'string').join('');
-const texts = (tree) => tree.root.findAllByType(Text).map(textOf).join('\n');
+const { flush, textOf, texts, openQncSend } = require('../test-support/screen');
+
 const byTestId = (tree, id) => tree.root.findAll((n) => n.props && n.props.testID === id);
 
 let savedState;
@@ -183,9 +126,7 @@ async function unlocked() {
 
 async function sendForm() {
   const tree = await unlocked();
-  const send = tree.root.findAll((n) => n.props.testID === 'assets-send' && typeof n.props.onPress === 'function')[0];
-  await act(async () => { send.props.onPress(); });
-  await flush(2);
+  await openQncSend(tree);
   const to = tree.root.findAll((n) => n.type === TextInput && n.props.placeholder === t('send_placeholder_eon'))[0];
   await act(async () => { to.props.onChangeText(TO); });
   await act(async () => { tree.root.findAll((n) => n.type === TextInput && n.props.keyboardType === 'decimal-pad')[0].props.onChangeText('0.5'); });
@@ -274,9 +215,7 @@ describe('the Send button', () => {
   it('opening the Send screen starts the balance check, so the tap takes it at once', async () => {
     const tree = await unlocked();
     mockState.calls = [];
-    const send = tree.root.findAll((n) => n.props.testID === 'assets-send' && typeof n.props.onPress === 'function')[0];
-    await act(async () => { send.props.onPress(); });
-    await flush(2);
+    await openQncSend(tree);
     expect(mockState.calls).toEqual(['balance']);
   });
 
@@ -397,12 +336,14 @@ describe('History', () => {
   it('checks token transfers after the balance read in flight, two at a time', () => {
     const ws = fs.readFileSync(path.join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
     expect(ws).toMatch(/const HISTORY_PROOF_CONCURRENCY = 2;/);
-    const p4 = ws.slice(ws.indexOf('const provable = tokenTxs.filter'), ws.indexOf('// The next older explorer page'));
+    const p4 = ws.slice(ws.indexOf('const provable = tokenRowsToProve('), ws.indexOf('// The next older explorer page'));
     const waits = p4.indexOf('await balanceRead.promise.catch(() => {});');
     const proves = p4.indexOf('walletManager.verifyTokenTransferInclusion(row)');
     expect(waits).toBeGreaterThan(0);
     expect(proves).toBeGreaterThan(waits);
     expect(p4).toMatch(/await Promise\.all\(Array\.from\(\{ length: Math\.min\(HISTORY_PROOF_CONCURRENCY, provable\.length\) \}, proveRows\)\);/);
     expect(p4).not.toMatch(/provable\.map\(async/);
+    // The rows are chosen by block (utils/txHistory tokenRowsToProve), never by the clock.
+    expect(p4).not.toMatch(/Date\.now\(\)/);
   });
 });

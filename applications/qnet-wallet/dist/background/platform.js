@@ -1,5 +1,5 @@
 // The browser's chrome.* API as the worker modules that keep state in it call it (session.js, clipboard.js): read at call
-// time, so a test or a restarted worker sees the current one, and every call as a promise.
+// time, so a test or a restarted worker sees the current one, and every call as a promise; and the worker's one wait.
 
 // chrome.alarms may fire a little before `when`; closer than this to the due time counts as reached.
 export const ALARM_EARLY_MS = 1000;
@@ -34,4 +34,15 @@ export function attempt(fn) {
  */
 export function armAlarm(name, when) {
   return attempt(() => (when === null ? chromeApi().alarms.clear(name) : chromeApi().alarms.create(name, { when })));
+}
+
+/**
+ * Resolves after `ms` (none for a negative one): the worker's one wait, which the timers of a test drive.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+export function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, ms));
+  });
 }

@@ -1,15 +1,14 @@
-// CABINET_PHONE_FLOWS (unified plan SITE-8, rollout R5 and R8; src/server/phone-flows.ts): off unless it is exactly
+// CABINET_PHONE_FLOWS (src/server/phone-flows.ts): off unless it is exactly
 // "1". Off, the relay opens only `connect` sessions and the cabinet offers no `link`, `claim`, `reserve` or `unlink`
 // request to QNet Wallet: its read pages and the extension's paths stay. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { PHONE_FLOWS_ENV, phoneFlowsEnabled } from '../../server/phone-flows.ts';
 import { createLinkRelay } from '../../server/link-relay.ts';
 import { CLAIM, LINK } from './link-helpers.mjs';
+import { read } from './source.mjs';
 
-const read = (p) => readFileSync(new URL(`../../${p}`, import.meta.url), 'utf8');
 let scopes = 0;
 
 test('on only with the value 1', () => {
@@ -55,11 +54,11 @@ test('one flag for the relay and the pages: the process relay, the layout, and e
     assert.match(src, /, phoneFlows \} = useCabinet\(\);/, file);
     assert.doesNotMatch(src, /process\.env|CABINET_PHONE_FLOWS/, file);
   }
-  // Closed, Link a device is still a card of its own that names the app's way (review, 28.09: it was fine print).
+  // Closed, Link a device is still a card of its own that names the app's way, never fine print.
   assert.match(read('components/cabinet/LinkDevice.tsx'), /if \(!phoneFlows\) return <ActionBlock title=\{t\('action_link_device'\)\}><p>\{t\('devices_link_closed'\)\}<\/p><\/ActionBlock>;/);
   // Closed, Unlink this device is a card of its own too, saying how the node leaves a device meanwhile.
   // Unlink: closed without the phone flows, unless the extension that holds the wallet signs the wallet's own unbind.
-  assert.match(read('components/cabinet/UnlinkDevice.tsx'), /if \(!phoneFlows && !extension\) return <ActionBlock title=\{t\(wallet \? 'unlink_title_wallet' : 'unlink_title'\)\}><p>\{t\('unlink_closed'\)\}<\/p><\/ActionBlock>;/);
+  assert.match(read('components/cabinet/UnlinkDevice.tsx'), /if \(!phoneFlows && !extension\) return <ActionBlock title=\{t\(wallet \? 'unlink_title_wallet' : 'unlink_title'\)\}><p>\{say\('unlink_closed'\)\}<\/p><\/ActionBlock>;/);
   assert.match(read('components/cabinet/UnlinkDevice.tsx'), /const app = phoneFlows && \(/);
   // A phone that cannot activate here yet is led to the computer's way.
   assert.match(read('components/cabinet/NodeActivate.tsx'), /<Next action=\{device\?\.phone && <Action href=\{`\$\{GUIDE_HREF\}\?way=computer`\}>\{t\('guide_show_computer'\)\}<\/Action>\}>/);

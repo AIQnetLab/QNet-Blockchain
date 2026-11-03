@@ -7,7 +7,8 @@ registers it; the Node tab only shows it and moves its balance. A light node is 
 in the browser, once the app has confirmed that the site may prepare the wallet's light node) or by the QNet Wallet browser
 extension. The app gives the wallet's consent to that registration and links the node to this device, unlinks it, or
 moves the balance of the node the request names (the wallet's light or super node), on a sheet that a verified
-`https://link.aiqnet.io/l` link opens ([QNet Link](../../docs/protocols/qnet-link-v1.md) section 14); its Node tab
+`https://link.aiqnet.io/l` link opens ([QNet Link](../../docs/protocols/qnet-link-v1.md) section 14). For the burn of
+the site's one-time payment key it also sends that registration to aiqnet.io itself, which submits it to a genesis node. Its Node tab
 shows the light node only on the device it is bound to, keeps it running there ("Use this device" where the card offers
 it, after the system's device check) and moves the node balance. One device runs one node. Its Browser
 tab opens websites that can connect the wallet through the same provider as the QNet Wallet browser extension; every connection, signature and send is

@@ -238,17 +238,19 @@ describe('whole addresses fit one line', () => {
       .toMatchObject({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.5, maxFontSizeMultiplier: 1.2 });
     act(() => field.unmount());
     const screen = fs.readFileSync(path.join(ROOT, 'src/screens/WalletScreen.js'), 'utf8');
-    // The Assets card and Receive show the address as their subject (SubjectAddress): whole, on two lines, each one
-    // line whose font shrinks to half at most, a larger text size counted up to 1.2 times.
     // Assets: the whole address on one line in its rounded element, its copy mark beside it, the font shrinking to fit,
     // never cut (owner 20.10).
     const card = screen.slice(screen.indexOf('testID="address-card"'), screen.indexOf('testID="address-card"') + 220);
-    expect(card).toMatch(/<Text style=\{\[styles\.addressPillText, copied && styles\.addressPillCopied\]\} \{\.\.\.ADDRESS_LINE\}>/);
+    expect(card).toMatch(/<Text style=\{styles\.addressPillText\} \{\.\.\.ADDRESS_LINE\}>\{cardAddress\}<\/Text>/);
     expect(card).not.toMatch(/ellipsizeMode/);
-    expect(screen).toMatch(/const ADDRESS_LINE = \{ \.\.\.SUBJECT_LINE, minimumFontScale: 0\.45 \};/);
+    expect(screen).toMatch(/import Copyable, \{ ADDRESS_LINE \} from '\.\.\/components\/ui\/Copyable';/);
+    expect(require('../src/components/ui/Copyable').ADDRESS_LINE)
+      .toEqual({ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0.45, maxFontSizeMultiplier: 1.2 });
+    // Receive shows it as its subject (SubjectAddress): whole, on two lines, each one line whose font shrinks to half at
+    // most, a larger text size counted up to 1.2 times.
     const receive = screen.slice(screen.indexOf('testID="receive-address"'), screen.indexOf('testID="receive-address"') + 120);
     expect(receive).toMatch(/<SubjectAddress address=\{currentReceiveAddress\} \/>/);
-    expect(screen).toMatch(/const SUBJECT_LINE = \{ numberOfLines: 1, adjustsFontSizeToFit: true, minimumFontScale: 0\.5, maxFontSizeMultiplier: 1\.2 \};/);
+    expect(screen).toMatch(/const SUBJECT_LINE = \{ \.\.\.ADDRESS_LINE, minimumFontScale: 0\.5 \};/);
     expect(screen).not.toMatch(/numberOfLines=\{2\}\s*adjustsFontSizeToFit\s*minimumFontScale=\{0\.6\}/);
     // Each line on a 320 dp screen, inside the tab's padding; a site's sheet: the scroll's and the card's padding and
     // border.
@@ -270,7 +272,8 @@ describe('whole addresses fit one line', () => {
     // The Assets card's one line on a 320 dp screen: the tab's padding, the element's padding and border, the gap and the
     // copy mark (18 dp) around it, at the largest text size it follows and its smallest scale (0.45).
     const pill = flat(styles.addressPill);
-    const pillInner = inner - 2 * pill.paddingHorizontal - 2 * pill.borderWidth - pill.columnGap - 18;
+    const { copyableStyles } = require('../src/components/ui/Copyable');
+    const pillInner = inner - 2 * pill.paddingHorizontal - 2 * pill.borderWidth - flat(copyableStyles.line).columnGap - 18;
     const pt = flat(styles.addressPillText);
     for (const text of [QNET, SOL]) {
       expect([...text].length * (MONO_EM * pt.fontSize * LARGEST_TEXT * 0.45 + (pt.letterSpacing || 0) * LARGEST_TEXT))

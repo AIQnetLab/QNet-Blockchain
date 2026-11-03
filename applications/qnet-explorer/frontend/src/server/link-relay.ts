@@ -1,7 +1,7 @@
 // QNet Link relay (docs/protocols/qnet-link-v1.md sections 5 and 14.5): carries one end-to-end encrypted answer
 // from the QNet app to the page that asked. It sees ephemeral public keys, the intent, the request (a burn
 // transaction, a wallet hash, a flag) and ciphertext; never an address or a secret. Sessions live in this
-// process's memory only (one pm2 process), bounded in number, per creating address and in time. Nothing a
+// process's memory only (the site runs as one process), bounded in number, per creating address and in time. Nothing a
 // request carries is logged.
 
 import {
@@ -30,11 +30,11 @@ import {
 // A session with its answer is under 2 KB (a `link` or `reserve` one under 16 KB, and those are capped apart), so the full
 // store stays under 300 MB. Every session in the store holds a place of the address that created it until it is
 // dropped, so filling the store takes MAX_SESSIONS / MAX_LIVE_PER_IP addresses at once, whatever LIMITS.create
-// allows one address over time (SITE-R1-01).
+// allows one address over time.
 export const MAX_SESSIONS = 100_000;
 // Live sessions one address may hold. A page makes one per request and a new one after a failure, and
 // sessions end after SESSION_TTL_S, so this leaves room for many people behind one carrier NAT address. A session
-// whose page read the answer ends READ_GRACE_S later, and one its page released ends at once (SITE-8), so a finished
+// whose page read the answer ends READ_GRACE_S later, and one its page released ends at once, so a finished
 // request gives its address's place back within that grace instead of holding it until the TTL.
 export const MAX_LIVE_PER_IP = 60;
 // `link` and `reserve` sessions carry an answer up to 12 KB: at most this many live, and this many per address, the same
@@ -49,9 +49,8 @@ export const READ_GRACE_S = 120;
 // The relay's own limiter store: the explorer's traffic never takes its room.
 export const LIMITER_ENTRIES = 100_000;
 const PURGE_INTERVAL_MS = 60_000;
-// Per address and route. Carrier NAT puts many phones, and office NAT many computers, behind one address;
-// nginx already caps each address at 10 requests a second for /api/link/, in a zone of the relay's own. A
-// page polls every 2 s (30 a minute). Only requests that pass the origin checks are counted (gate).
+// Per address and route. Carrier NAT puts many phones, and office NAT many computers, behind one address. A page
+// polls every 2 s (30 a minute). Only requests that pass the origin checks are counted (gate).
 export const LIMITS = {
   create: { max: 120, windowMs: 10 * 60_000 },
   session: { max: 120, windowMs: 60_000 },
@@ -185,7 +184,7 @@ export function createLinkRelay(options: LinkRelayOptions = {}): LinkRelay {
 
   // The request's gate: origin, then the per-IP limit of its route. Returns the client's key to go on. The
   // origin check comes first, so a request another page makes from a visitor's browser (a GET by <img> or
-  // a frame has no Origin, but has Sec-Fetch-Site) never spends that visitor's limits (R4-SRA-01).
+  // a frame has no Origin, but has Sec-Fetch-Site) never spends that visitor's limits.
   function gate(request: Request, route: Route): Response | { key: string } {
     if (!originAllowed(request, devOrigins)) return fail(403, 'forbidden_origin');
     const key = clientKey(request);

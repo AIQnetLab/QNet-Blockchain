@@ -1,0 +1,46 @@
+diff --git a/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessaging+AppDelegate.m b/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessaging+AppDelegate.m
+index 9c3651d..797dcce 100644
+--- a/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessaging+AppDelegate.m
++++ b/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessaging+AppDelegate.m
+@@ -163,12 +163,12 @@
+       // If app is in background state, register background task to guarantee async queues aren't
+       // frozen.
+       sharedInstance.backgroundTaskId = [application beginBackgroundTaskWithExpirationHandler:^{
+-        dispatch_get_main_queue(), ^{
+-          if (sharedInstance.backgroundTaskId != UIBackgroundTaskInvalid) {
+-            [application endBackgroundTask:sharedInstance.backgroundTaskId];
+-            sharedInstance.backgroundTaskId = UIBackgroundTaskInvalid;
+-          }
+-        };
++        // QNet patch: the task is ended here (the original only built a block that never ran). The system calls this
++        // handler on the main thread and needs the task ended before it returns.
++        if (sharedInstance.backgroundTaskId != UIBackgroundTaskInvalid) {
++          [application endBackgroundTask:sharedInstance.backgroundTaskId];
++          sharedInstance.backgroundTaskId = UIBackgroundTaskInvalid;
++        }
+       }];
+ 
+       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
+diff --git a/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessagingModule.m b/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessagingModule.m
+index dcc8e84..0b393b6 100644
+--- a/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessagingModule.m
++++ b/node_modules/@react-native-firebase/messaging/ios/RNFBMessaging/RNFBMessagingModule.m
+@@ -220,7 +220,8 @@ RCT_EXPORT_METHOD(getIsHeadless : (RCTPromiseResolveBlock)resolve : (RCTPromiseR
+ }
+ 
+ RCT_EXPORT_METHOD(completeNotificationProcessing) {
+-  dispatch_get_main_queue(), ^{
++  // QNet patch: the block is dispatched (the original only built it, so the wake lasted the 25-second fallback).
++  dispatch_async(dispatch_get_main_queue(), ^{
+     RNFBMessagingAppDelegate *appDelegate = [RNFBMessagingAppDelegate sharedInstance];
+     if (appDelegate.completionHandler) {
+       appDelegate.completionHandler(UIBackgroundFetchResultNewData);
+@@ -230,7 +231,7 @@ RCT_EXPORT_METHOD(completeNotificationProcessing) {
+       [[UIApplication sharedApplication] endBackgroundTask:appDelegate.backgroundTaskId];
+       appDelegate.backgroundTaskId = UIBackgroundTaskInvalid;
+     }
+-  };
++  });
+ }
+ 
+ RCT_EXPORT_METHOD(requestPermission

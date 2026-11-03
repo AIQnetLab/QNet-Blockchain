@@ -13,6 +13,7 @@ import {
   type RelayAnswerBody,
 } from './qnet-link.ts';
 import { closeSiteSession, newSiteSession, openAnswer, sessionRequestBody, type SiteSession } from './qnet-link-crypto.ts';
+import { siteRequest } from './site-request.ts';
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -30,8 +31,6 @@ export type StartResult =
   | { ok: true; session: SiteSession; expiresAt: number }
   | { ok: false; failure: StartFailure; retryAfterS?: number };
 
-const REQUEST: RequestInit = { cache: 'no-store', credentials: 'omit', redirect: 'error' };
-
 function retryAfterSeconds(res: Response): number {
   const value = Number(res.headers.get('retry-after'));
   return Number.isFinite(value) && value > 0 ? Math.min(Math.ceil(value), SESSION_TTL_S) : 60;
@@ -46,12 +45,11 @@ export async function startLinkSession(intent: LinkIntent, request: LinkRequest 
     const startedAt = now();
     let res: Response;
     try {
-      res = await fetchFn(`${base}/api/link/sessions`, {
-        ...REQUEST,
+      res = await fetchFn(`${base}/api/link/sessions`, siteRequest({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: sessionRequestBody(session),
-      });
+      }));
     } catch {
       closeSiteSession(session);
       return { ok: false, failure: 'network' };
@@ -71,7 +69,7 @@ export async function startLinkSession(intent: LinkIntent, request: LinkRequest 
 export async function releaseLinkSession(id: string, options: RelayClientOptions = {}): Promise<void> {
   const { fetchFn = fetch, base = '' } = options;
   try {
-    await fetchFn(`${base}/api/link/sessions/${id}`, { ...REQUEST, method: 'DELETE' });
+    await fetchFn(`${base}/api/link/sessions/${id}`, siteRequest({ method: 'DELETE' }));
   } catch {
     // the relay drops it at its TTL
   }
@@ -89,7 +87,7 @@ export async function pollAnswer(session: Pick<SiteSession, 'id' | 'intent'>, op
   const { fetchFn = fetch, base = '' } = options;
   let res: Response;
   try {
-    res = await fetchFn(`${base}/api/link/sessions/${session.id}/response`, REQUEST);
+    res = await fetchFn(`${base}/api/link/sessions/${session.id}/response`, siteRequest());
   } catch {
     return { kind: 'retry', afterMs: POLL_INTERVAL_MS };
   }

@@ -1,8 +1,7 @@
 'use client';
 
-// Move to wallet, in the Overview's node balance, for a light and for a super node (unified plan SITE-5 and SITE-7;
-// owner, 29.09: it was a page of its own; owner, 12.10: through this site too, whichever way the wallet is connected
-// here). The wallet signs the move of the node it is asked for (docs/protocols/light-node-messages.md section 4): the
+// Move to wallet, in the Overview's node balance, for a light and for a super node, through this site too, whichever
+// way the wallet is connected here. The wallet signs the move of the node it is asked for (docs/protocols/light-node-messages.md section 4): the
 // QNet extension of this computer when it holds the chosen wallet (qnet_claimNodeBalance with the node,
 // docs/protocols/qnet-link-v1.md section 14.10), whose own window confirms it, otherwise QNet Wallet through a QNet Link
 // `claim` request that names the wallet and the node (section 14.4), its button on this phone or tablet or its QR code
@@ -12,17 +11,17 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useWallet } from '@/contexts/AppContext';
 import Action from '@/components/ui/Action';
-import { EpochNumber } from '@/components/ui/EntityLink';
+import EntityLink, { EpochNumber } from '@/components/ui/EntityLink';
 import { Answered, Failed, Waiting } from '@/components/ui/RequestState';
 import { useDeviceKind } from '@/hooks/useDeviceKind';
 import { useLinkSession } from '@/hooks/useLinkSession';
-import { rich } from '@/lib/rich';
-import { t } from '@/lib/texts';
 import { claimReport, failureKey, type ClaimVia } from '@/lib/cabinet/extension-view';
 import { formatQnc } from '@/lib/cabinet/node-view';
 import { walletHash, type ClaimFailure, type ClaimRequest, type LinkAnswer } from '@/lib/qnet-link';
 import { useCabinet } from './CabinetProvider';
 import LinkWaiting from './LinkWaiting';
+import { useI18n } from '@/i18n/client';
+import type { Rich } from '@/lib/rich';
 
 type ExtClaim =
   | { phase: 'idle' }
@@ -30,13 +29,16 @@ type ExtClaim =
   | { phase: 'done'; answer: LinkAnswer }
   | { phase: 'failed'; failure: ClaimFailure };
 
-// The wallet's report in words; the epoch it moved up to is a link.
-function reportText(answer: LinkAnswer, via: ClaimVia): ReactNode {
+// The wallet's report in words: the total its claims moved, the rest from the epoch it names (a link) only when the run
+// ended short, and the last claim's transaction (a link). The amount keeps its digits and direction in every language.
+function reportText(answer: LinkAnswer, via: ClaimVia, rich: Rich): ReactNode {
   const report = claimReport(answer, via);
-  return rich(report.key, {
-    amount: report.amountNano ? formatQnc(report.amountNano) : '',
+  const text = rich(report.key, {
+    amount: report.amountNano ? <span className="num" translate="no">{formatQnc(report.amountNano)}</span> : '',
     epoch: report.epoch ? <EpochNumber epoch={Number(report.epoch)} /> : '',
   });
+  if (!report.txHash) return text;
+  return <>{text} {rich('claim_last_tx', { tx: <EntityLink kind="tx" value={report.txHash} /> })}</>;
 }
 
 // Which ways can move the balance of wallet `qnet` from this page: the extension when it holds that wallet, QNet Wallet
@@ -53,6 +55,7 @@ export function useMoveWays(qnet: string | null): { extension: boolean; app: boo
 // The ways to move the balance of `nodeId`, the wallet's light or super node; kept mounted when the balance falls below
 // 1 QNC, so a report stays on screen.
 export function Move({ qnet, nodeId, movable, onAnswer }: { qnet: string; nodeId: string; movable: boolean; onAnswer: () => void }) {
+  const { t, say, rich } = useI18n();
   const { viewOnly, phoneFlows } = useCabinet();
   const { claimNodeBalance } = useWallet();
   const { extension } = useMoveWays(qnet);
@@ -101,22 +104,23 @@ export function Move({ qnet, nodeId, movable, onAnswer }: { qnet: string; nodeId
               <p className="note">{t('claim_extension_note')}</p>
             </>
           )}
-          {ext.phase === 'waiting' && <Waiting>{t('wallet_extension_waiting')}</Waiting>}
-          {ext.phase === 'done' && <Answered action={{ label: t('start_again'), onClick: idle }}>{reportText(ext.answer, 'extension')}</Answered>}
-          {ext.phase === 'failed' && <Failed action={{ label: t('start_again'), onClick: idle }}>{t(failureKey(ext.failure, 'claim'))}</Failed>}
+          {/* The call answers once the whole move ran, after the confirm too. */}
+          {ext.phase === 'waiting' && <Waiting>{t('claim_extension_waiting')}</Waiting>}
+          {ext.phase === 'done' && <Answered action={{ label: t('start_again'), onClick: idle }}>{reportText(ext.answer, 'extension', rich)}</Answered>}
+          {ext.phase === 'failed' && <Failed action={{ label: t('start_again'), onClick: idle }}>{say(failureKey(ext.failure, 'claim'))}</Failed>}
         </div>
       )}
       {!phoneFlows ? (
-        <p className="note">{t('claim_closed')}</p>
+        <p className="note">{say('claim_closed')}</p>
       ) : (
         <div className="cab-move-way">
           {!active || active.state.phase === 'idle' ? movable && (
             <>
-              <Action kind={extension ? 'text' : 'solid'} onClick={ask} disabled={!device}>{t('claim_with_app')}</Action>
-              <p className="note">{t('claim_app_note')}</p>
+              <Action kind={extension ? 'text' : 'solid'} onClick={ask} disabled={!device}>{say('claim_with_app')}</Action>
+              <p className="note">{say('claim_app_note')}</p>
             </>
           ) : active.state.phase === 'done' ? (
-            <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{reportText(active.state.answer, 'app')}</Answered>
+            <Answered action={{ label: t('start_again'), onClick: active.cancel }}>{reportText(active.state.answer, 'app', rich)}</Answered>
           ) : (
             <LinkWaiting
               state={active.state}

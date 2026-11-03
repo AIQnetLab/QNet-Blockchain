@@ -1,9 +1,10 @@
 'use client';
 
-// Underlined tabs (B-SPEC 5.16) for switching views inside a block: a tab list whose arrow, Home and End keys move
+// Underlined tabs for switching views inside a block: a tab list whose arrow, Home and End keys move
 // between tabs, and the one panel it controls. With a single way available the caller shows no tabs.
 
 import { useId, useRef, type KeyboardEvent, type ReactNode } from 'react';
+import { useI18n } from '@/i18n/client';
 
 interface ViewTabsProps<K extends string> {
   items: readonly { key: K; label: ReactNode }[];
@@ -17,6 +18,7 @@ interface ViewTabsProps<K extends string> {
 }
 
 export default function ViewTabs<K extends string>({ items, value, onChange, label, children, className }: ViewTabsProps<K>) {
+  const { dir } = useI18n();
   const base = useId();
   const list = useRef<HTMLDivElement>(null);
   const tabId = (key: K) => `${base}-tab-${key}`;
@@ -24,7 +26,9 @@ export default function ViewTabs<K extends string>({ items, value, onChange, lab
 
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
     const at = items.findIndex((item) => item.key === value);
-    const next = e.key === 'ArrowRight' ? at + 1 : e.key === 'ArrowLeft' ? at - 1 : e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1 : null;
+    // The arrow toward the end of the line goes to the next tab: right in a left-to-right page, left in Arabic.
+    const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+    const next = step ? at + (dir === 'rtl' ? -step : step) : e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1 : null;
     if (next === null) return;
     e.preventDefault();
     const item = items[(next + items.length) % items.length];

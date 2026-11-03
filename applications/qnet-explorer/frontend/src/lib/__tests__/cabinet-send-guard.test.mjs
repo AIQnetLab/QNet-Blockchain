@@ -1,20 +1,19 @@
 // The node cabinet's door to Solana (src/server/cabinet/solana-proxy.ts, src/lib/cabinet/burn-tx.ts): /send
 // forwards the cabinet's burn and refund signed by their payment address and refuses every other program, a second
 // signer, a transfer from another account, a burn of another mint and another memo; a burn only under the wallet's
-// reservation with the payment key's owner bind, announced in the activation registry before it leaves (R6, C4); the
+// reservation with the payment key's owner bind, announced in the activation registry before it leaves; the
 // price is two nodes' agreed quote; the
 // payment, blockhash and tx reads answer exact shapes. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { ed25519 } from '@noble/curves/ed25519';
 import bs58 from 'bs58';
 import {
-  compileLegacyMessage, memo, parseLegacyTransaction, setComputeUnitLimit, setComputeUnitPrice, singleSignerWire, systemTransfer,
+  memo, parseLegacyTransaction, setComputeUnitLimit, setComputeUnitPrice, systemTransfer,
   tokenBurn, tokenCloseAccount, tokenTransfer, createAssociatedTokenAccountIdempotent,
 } from '../solana-message.ts';
+import { b64, fakeRpc, keyOf, seed, signedWith } from './solana-helpers.mjs';
 import { LIGHT_MEMO, burnInstructions, classifyCabinetTx, oneDevAccountOf, refundInstructions } from '../cabinet/burn-tx.ts';
 import { ONE_DEV_MINT } from '../one-dev.ts';
 import { activationCode } from '../qnet-link.ts';
@@ -24,25 +23,20 @@ import {
 } from '../../server/cabinet/solana-proxy.ts';
 import { CABINET_LIMITS } from '../../server/cabinet/limits.ts';
 import { READ_PASS_RE } from '../cabinet/burn-tx.ts';
-import { RpcError } from '../../server/solana-rpc.ts';
-import { BACKOFF_MAX_MS, BACKOFF_START_MS, PUBLIC_RPC_URL, RpcBackoff, SEND_METHODS, accountBatcher, laneOf, solanaRpcUrl, withBackoff } from '../../server/solana-endpoint.ts';
+import { ANSWER_DEFAULT_MAX_BYTES, ANSWER_MAX_BYTES, RpcError, parseExactJson, sendTransaction, solanaRpc } from '../../server/solana-rpc.ts';
+import {
+  BACKOFF_MAX_MS, BACKOFF_START_MS, PUBLIC_RPC_URL, RpcBackoff, SEND_METHODS, STATUS_BATCH_MAX, accountBatcher, laneOf, solanaRpcUrl, statusBatcher,
+  withBackoff,
+} from '../../server/solana-endpoint.ts';
 
-const seed = (label) => createHash('sha256').update(label).digest();
-const keyOf = (label) => ({ seed: seed(label), pub: bs58.encode(ed25519.getPublicKey(seed(label))) });
 const PAYER = keyOf('guard-payer');
 const OTHER = keyOf('guard-other');
 const DEST = keyOf('guard-dest');
 const BLOCKHASH = bs58.encode(seed('guard-blockhash'));
 const OTHER_MINT = bs58.encode(seed('guard-mint'));
 
-function signed(instructions, signers = [PAYER]) {
-  const message = compileLegacyMessage(instructions, signers[0].pub, BLOCKHASH);
-  const sigs = signers.map((s) => ed25519.sign(message, s.seed));
-  if (sigs.length === 1) return singleSignerWire(sigs[0], message);
-  return Uint8Array.from([sigs.length, ...sigs.flatMap((s) => [...s]), ...message]);
-}
+const signed = (instructions, signers = [PAYER]) => signedWith(BLOCKHASH, instructions, signers);
 const shapeOf = (instructions, signers) => classifyCabinetTx(parseLegacyTransaction(signed(instructions, signers)));
-const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 
 test('the burn shape: exactly the cabinet\'s burn, with or without the compute budget', () => {
   assert.deepEqual(shapeOf(burnInstructions(PAYER.pub, 1500)), { kind: 'burn', payer: PAYER.pub, whole: 1500 });
@@ -96,17 +90,6 @@ test('the refund shape: one destination for everything, from the payment address
 });
 
 // ---------------------------------------------------------------- the routes
-
-function fakeRpc(answers = {}) {
-  const calls = [];
-  const rpc = async (method, params) => {
-    calls.push({ method, params });
-    const a = answers[method];
-    if (a instanceof Error) throw a;
-    return typeof a === 'function' ? a(params) : a;
-  };
-  return { rpc, calls };
-}
 
 let scopes = 0;
 // The wallet's reservation a burn is sent under, the payment key's owner bind it carries, and the registry's announce,
@@ -171,14 +154,14 @@ test('/send forwards the cabinet\'s shapes only, validly signed, and meters the 
   for (let i = 0; i < 5; i += 1) assert.equal((await q.send(post({ tx: b64(good), reservation: R, ownerSig: OS }, { 'x-test-ip': `198.51.100.${i}` }))).status, 200);
   assert.equal((await q.send(post({ tx: b64(good), reservation: R, ownerSig: OS }, { 'x-test-ip': '198.51.100.99' }))).status, 429);
 
-  // SITE-2: junk naming a payment address (its burn's shape, a signature that is not its key's) spends nothing of
+  // Junk naming a payment address (its burn's shape, a signature that is not its key's) spends nothing of
   // that address's budget, from however many clients: its own signed sends still go through.
   const { p: v } = proxy({ sendTransaction: 'sig' });
   for (let i = 0; i < 12; i += 1) assert.equal((await v.send(post({ tx: b64(forged), reservation: R, ownerSig: OS }, { 'x-test-ip': `192.0.2.${i}` }))).status, 400);
   for (let i = 0; i < 5; i += 1) assert.equal((await v.send(post({ tx: b64(good), reservation: R, ownerSig: OS }, { 'x-test-ip': `198.51.100.${i}` }))).status, 200, `send ${i}`);
 });
 
-// R6 and A2 (shared contracts C3.3 and C4): a burn is forwarded only after the registry announced it under the wallet's
+// One wallet, one burn: a burn is forwarded only after the registry announced it under the wallet's
 // reservation, with the payer and whole amount of the burn itself and the payment key's v2 owner bind of the reserved
 // wallet; a burn without the bind is refused; a refund needs neither, and carries neither.
 test('/send refuses a burn without an announced reservation or its owner bind, and forwards a refund without them', async () => {
@@ -317,7 +300,7 @@ test('/tx: pending, expired past its blockhash (looked at twice), failed, finali
   }
 });
 
-// SITE-6: every activating page reads Solana through the one site server. The endpoint is a server setting, balance
+// Every activating page reads Solana through the one site server. The endpoint is a server setting, balance
 // reads of many pages go out as one call, and a 429 makes the server back off instead of adding to the count.
 test('the Solana endpoint: a server setting, one call for many balance reads, a back-off after 429', async () => {
   assert.equal(solanaRpcUrl({}), PUBLIC_RPC_URL);
@@ -371,9 +354,53 @@ test('the Solana endpoint: a server setting, one call for many balance reads, a 
   assert.match(page, /if \(document\.visibilityState === 'visible'\) run\(\);/);
 });
 
-// SITE-R2-08: one process-wide client backed off for everyone after any 429, and reads of made-up signatures cost one to
-// three calls each, so a script reading random signatures from many addresses could make the endpoint answer 429 and
-// stop every visitor's sends and reads. Sends now back off apart from reads, and reads of signatures this server did
+// The wallets' relay reads through the same client and batches: the cabinet's payment read keeps its exact call, a
+// batch reads at the commitment and slice it was made for, statuses go out 256 at a time, a send's refusal keeps the
+// endpoint's code, no answer is read past its method's cap, and an integer past 2^53 stays exact without becoming a
+// number any reader takes.
+test('the shared client and batches serve the relay without changing what the cabinet reads', async () => {
+  const net = fakeRpc({ getMultipleAccounts: (params) => ({ value: params[0].map(() => null) }) });
+  await accountBatcher(net.rpc, { windowMs: 1 })(['a', 'b']);
+  assert.deepEqual(net.calls[0].params[1], { encoding: 'jsonParsed', commitment: 'confirmed' }, 'the cabinet\'s payment read as before');
+  await accountBatcher(net.rpc, { windowMs: 1, commitment: 'finalized', slice: 166 })(['c']);
+  assert.deepEqual(net.calls[1].params, [['c'], { encoding: 'base64', dataSlice: { offset: 0, length: 166 }, commitment: 'finalized' }]);
+  await accountBatcher(net.rpc, { windowMs: 1, commitment: 'finalized' })(['d']);
+  assert.deepEqual(net.calls[2].params[1], { encoding: 'jsonParsed', commitment: 'finalized' });
+
+  const statuses = fakeRpc({ getSignatureStatuses: (params) => ({ value: params[0].map((s) => ({ s })) }) });
+  const status = statusBatcher(statuses.rpc, { windowMs: 1 });
+  const got = await Promise.all(Array.from({ length: STATUS_BATCH_MAX + 44 }, (_, i) => status([`sig${i}`])));
+  assert.deepEqual(got[299], [{ s: 'sig299' }]);
+  assert.deepEqual(statuses.calls.map((c) => c.params[0].length), [256, 44]);
+  assert.deepEqual(statuses.calls[0].params[1], { searchTransactionHistory: true });
+  assert.equal(STATUS_BATCH_MAX, 256);
+  await assert.rejects(statusBatcher(fakeRpc({ getSignatureStatuses: { value: [] } }).rpc, { windowMs: 1 })(['x']), /rpc_malformed_status/);
+
+  const refusing = fakeRpc({ sendTransaction: new RpcError(-32002, 'Transaction simulation failed: Blockhash not found') });
+  assert.deepEqual(await sendTransaction(refusing.rpc, Uint8Array.of(1)), { state: 'refused', error: 'Transaction simulation failed: Blockhash not found', code: -32002 });
+
+  // An answer past its method's cap fails as malformed, whatever it holds; under the cap it is read.
+  const sized = (bytes) => solanaRpc('https://rpc.example', {
+    fetchFn: async () => new Response(`{"jsonrpc":"2.0","id":1,"result":{"value":"${'x'.repeat(bytes)}"}}`, { status: 200 }),
+  });
+  assert.equal(ANSWER_DEFAULT_MAX_BYTES, 1024 * 1024);
+  assert.deepEqual(ANSWER_MAX_BYTES, { getSignaturesForAddress: 2 * 1024 * 1024, getTokenAccountsByOwner: 256 * 1024 });
+  await assert.rejects(sized(2 * 1024 * 1024)('getMultipleAccounts', []), /rpc_malformed/);
+  assert.equal((await sized(1024)('getMultipleAccounts', [])).value.length, 1024);
+  await assert.rejects(sized(300 * 1024)('getTokenAccountsByOwner', []), /rpc_malformed/);
+  assert.equal((await sized(1024 * 1024 + 10)('getSignaturesForAddress', [])).value.length, 1024 * 1024 + 10);
+
+  // Exact past 2^53, written back as the same digits; the cabinet's own readers still refuse such a value.
+  const exact = parseExactJson('{"value":[{"lamports":18446744073709551615},null],"small":5,"float":1.5}');
+  assert.equal(JSON.stringify(exact), '{"value":[{"lamports":18446744073709551615},null],"small":5,"float":1.5}');
+  assert.equal(typeof exact.value[0].lamports, 'object');
+  assert.equal(parsePaymentAccounts(exact, PAYER.pub), null);
+  assert.deepEqual(parsePaymentAccounts(parseExactJson('{"value":[{"lamports":5},null]}'), PAYER.pub), { sol: '5', oneDev: '0', accountExists: false });
+});
+
+// One process-wide client backing off for everyone after any 429, with reads of made-up signatures at one to three
+// calls each, would let a script reading random signatures make the endpoint answer 429 and stop every visitor's sends
+// and reads. Sends back off apart from reads, and reads of signatures this server did
 // not forward share a small budget a second; a page's reads of its own transactions are never held back.
 test('reads cannot stop sends, and reads of signatures the site never sent share a small budget', async () => {
   // A 429 on a read backs off the reads only; a send still goes, and a 429 on a send backs off the sends only.
@@ -397,7 +424,9 @@ test('reads cannot stop sends, and reads of signatures the site never sent share
   failing.clear();
   assert.equal(await backed('getBlockHeight', []), 'ok');
   assert.deepEqual(lines, [`[WARN][SOLANA] rpc_rate_limited lane=read backoff_ms=${BACKOFF_START_MS}`, `[WARN][SOLANA] rpc_rate_limited lane=send backoff_ms=${BACKOFF_START_MS}`]);
-  assert.deepEqual([...SEND_METHODS], ['sendTransaction', 'getLatestBlockhash']);
+  // A wallet's simulation before its send (the relay) backs off with the sends, never behind a flood of reads.
+  assert.deepEqual([...SEND_METHODS], ['sendTransaction', 'getLatestBlockhash', 'simulateTransaction']);
+  assert.equal(laneOf('simulateTransaction'), 'send');
   assert.equal(laneOf('getTransaction'), 'read');
 
   // Made-up signatures from many clients within one second: OTHER_TX_READS.max of them reach Solana, the rest are
@@ -419,11 +448,11 @@ test('reads cannot stop sends, and reads of signatures the site never sent share
   assert.deepEqual(OTHER_TX_READS, { max: 2, windowMs: 1_000 });
 });
 
-// SITE-R3-01: the reads exempt from that budget were those of signatures in a list in the server's memory, which every
-// restart emptied, which anyone could fill with 50,000 fresh keys' burns before they were even sent, and one client could
-// use up the whole budget. A page's own reads now carry a read pass, an HMAC of the signature under the server's key,
+// A list in the server's memory of the signatures exempt from that budget would empty at every restart, anyone could
+// fill it with fresh keys' burns before they were sent, and one client could use up the whole budget. A page's own reads
+// carry a read pass, an HMAC of the signature under the server's key,
 // which outlives a restart and needs no list; a refused send earns none; and each client gets its own share of the rest.
-test('SITE-R3-01: the read pass outlives a restart and no list; one client cannot use up the budget of other signatures', async () => {
+test('the read pass outlives a restart and no list; one client cannot use up the budget of other signatures', async () => {
   const key = readPassKey('11'.repeat(32));
   assert.deepEqual([...key], Array(32).fill(0x11));
   assert.equal(readPassKey('11'.repeat(31)).length, 32, 'too short: a key of the process');
@@ -471,10 +500,10 @@ test('SITE-R3-01: the read pass outlives a restart and no list; one client canno
   assert.deepEqual(CABINET_LIMITS.txOther, { max: 12, windowMs: 60_000 });
 });
 
-// SITE M-14: a pass holder asking with a new `lvh` each time missed the cache and skipped every budget. The status by
+// A pass holder asking with a new `lvh` each time would miss the cache and skip every budget. The status by
 // signature, the block height and a finalized transaction are kept apart, the lvh-dependent state is worked out here,
 // reads with a pass share OWN_TX_READS, and a refund earns a pass only from a payment address a reservation named.
-test('M-14: a new lvh costs no Solana read, pass holders share a budget, and a refund earns a pass only from a known payment address', async () => {
+test('a new lvh costs no Solana read, pass holders share a budget, and a refund earns a pass only from a known payment address', async () => {
   const methods = (calls, m) => calls.filter((c) => c.method === m).length;
   // Each read from a client of its own (one client's route limit is not what is tested here).
   const at = (lvh) => get(`/x?lvh=${lvh}`, { 'x-test-ip': `10.${Math.floor(lvh / 250)}.${lvh % 250}.1` });

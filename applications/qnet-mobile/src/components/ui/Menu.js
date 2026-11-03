@@ -7,7 +7,7 @@
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Toggle } from './Toggle';
-import { color, layer, shadow, space, themed } from '../../theme';
+import { color, layer, radius, shadow, space, themed } from '../../theme';
 
 export default function Menu({ items, onClose, closeLabel, top, level = 'root' }) {
   const pane = level === 'pane';
@@ -42,7 +42,7 @@ const s = themed((type) => ({
   backdropPane: { zIndex: 50 },
   card: {
     position: 'absolute', end: space.s8, minWidth: 220, maxWidth: '90%', backgroundColor: color.surface, borderWidth: 1,
-    borderColor: color.rule, paddingVertical: space.s4, ...shadow,
+    borderColor: color.rule, borderRadius: radius.tile, paddingVertical: space.s4, ...shadow,
   },
   cardRoot: { ...layer.menu },
   cardPane: { zIndex: 51, elevation: 12 },

@@ -7,15 +7,17 @@ import fs from 'fs';
 import path from 'path';
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
-import { Text } from 'react-native';
+import { StyleSheet, Text } from 'react-native';
 import Action from '../src/components/ui/Action';
+import Section from '../src/components/ui/Section';
 import Status from '../src/components/ui/Status';
 import NodeTab, {
-  nodeView, linkedHere, bindingVerdict, refusalText, deviceText, agoText, checkState, CHECK_RUNNING_MS, lightShownHere,
-  waitingAdmission, keptServerStatus, rewardAdmission, nodeLive,
+  nodeView, refusalText, deviceText, agoText, checkState, CHECK_RUNNING_MS, lightShownHere,
+  waitingAdmission, serverStatusAfter, rewardAdmission,
 } from '../src/screens/NodeTab';
 import {
-  readNodeStatus, agreedFeatures, readLinkPending, BIND_SETTLE_MS, LINK_PENDING_KEY,
+  readNodeStatus, readAgreedNodeStatus, agreedFeatures, readLinkPending, linkedHere, bindingVerdict, BIND_SETTLE_MS,
+  LINK_PENDING_KEY,
 } from '../src/services/LightNode';
 import { lightShardOwnerUrls } from '../src/config/nodes';
 import { hasKey, makeT } from '../src/i18n';
@@ -35,33 +37,9 @@ const status = (over = {}) => {
   return s;
 };
 const LOCAL = { nodeId: NODE, seq: 1790000000, pushType: 'fcm' };
-
-// The tab bar's live dot says what the Node tab says, from the same verdicts: no read of its own.
-describe('the tab bar\'s live dot', () => {
-  const server = (over = {}) => ({ status: { success: true, registered: true, isOnline: true, ...over } });
-  const light = (over = {}) => ({ status: status(over), local: LOCAL });
-
-  it('lights for a server node online and admitted, not for one offline or waiting for admission', () => {
-    expect(nodeLive({ server: server() })).toBe(true);
-    expect(nodeLive({ server: server({ isOnline: false }) })).toBe(false);
-    expect(nodeLive({ server: server({ admission: 'waiting' }) })).toBe(false);
-    expect(nodeLive({ server: server({ admission: 'admitted' }) })).toBe(true);
-  });
-
-  it('lights for this wallet\'s light node online on this device only', () => {
-    expect(nodeView(light()).state).toBe('here');
-    expect(nodeLive({ light: light() })).toBe(true);
-    // Offline in the network's own verdict.
-    expect(nodeLive({ light: light({ needsReactivation: true }) })).toBe(false);
-    // Bound to another device, to none, or not on the chain: not this device's to show.
-    expect(nodeLive({ light: { status: status() } })).toBe(false);
-    expect(nodeLive({ light: light({ bindingSeqAgreed: LOCAL.seq + 5 }) })).toBe(false);
-    expect(nodeLive({ light: light({ onChain: false }) })).toBe(false);
-    expect(nodeLive({ light: null, server: null })).toBe(false);
-    // Either node running is enough.
-    expect(nodeLive({ server: server({ isOnline: false }), light: light() })).toBe(true);
-  });
-});
+// What the tab shows for a wallet without a node (and a light node on no device): the line, then a card for each kind.
+const NO_NODE = [t('node_title'), t('node_none'), t('node_title_light'), t('node_light_device'), t('node_title_super'),
+  t('node_super_server')].join('\n');
 
 describe('the state, from the status alone', () => {
   it('checks first, and says "unknown" rather than "no node" when the network gives no verdict', () => {
@@ -108,6 +86,23 @@ describe('the state, from the status alone', () => {
     expect(nodeView({ status: status({ bindingSeqAgreed: S + 5, deviceBound: false }), local: LOCAL }).state).toBe('no_device');
   });
 
+  // With no binding sequence (the owners refuse the ping key of a binding that was replaced, and a background read has no
+  // other key), the day two owners date the network's binding to, later than this device's binding, tells it all the
+  // same; the same day or an earlier one decides nothing.
+  it('without a binding sequence, a binding two owners date to a later day than this one is another device\'s', () => {
+    const S = LOCAL.seq;
+    const day = S - (S % 86400);
+    expect(nodeView({ status: status({ linkedSinceAgreed: day + 86400 }), local: LOCAL }).state).toBe('elsewhere');
+    for (const d of [day, day - 86400, null]) {
+      expect([d, bindingVerdict(status({ linkedSinceAgreed: d }), LOCAL)]).toEqual([d, 'here']);
+    }
+    // Only with a device bound on two owners' word, and never for a binding older builds made (no sequence).
+    expect(bindingVerdict(status({ linkedSinceAgreed: day + 86400, deviceBoundAgreed: null }), LOCAL)).toBe('here');
+    expect(bindingVerdict(status({ linkedSinceAgreed: day + 86400 }), { ...LOCAL, seq: 0 })).toBe('here');
+    // A binding sequence two owners name decides as before.
+    expect(bindingVerdict(status({ linkedSinceAgreed: day + 86400, bindingSeqAgreed: S }), LOCAL)).toBe('here');
+  });
+
   it('a binding made here that the owners do not name yet waits for them, then the network decides', () => {
     const NOW = Date.UTC(2026, 9, 4, 12, 0, 0);
     const local = { ...LOCAL, boundAt: Math.floor(NOW / 1000) - 60 };
@@ -116,7 +111,7 @@ describe('the state, from the status alone', () => {
     const later = NOW + BIND_SETTLE_MS + 1000;
     expect(nodeView({ status: status(older), local, now: later }).state).toBe('elsewhere');
     expect(nodeView({ status: status({ ...older, deviceBound: false }), local, now: later }).state).toBe('no_device');
-    // The network linked this device less than an epoch ago and has not counted it yet: here, waiting, Offline.
+    // The network linked this device and has not counted it since: here, waiting, Offline.
     const pending = { platform: 'android', linkedSince: 1790035200, lastAnswerEpoch: null, state: 'other_device_pending' };
     expect(nodeView({ status: status({ bindingSeqAgreed: LOCAL.seq, needsReactivation: true, device: pending }), local: LOCAL }))
       .toMatchObject({ state: 'here', online: false, notice: { key: 'node_linked_waiting' } });
@@ -207,11 +202,79 @@ describe('what each state shows', () => {
   const statusOf = (tree) => tree.root.findAllByType(Status).map((n) => [n.props.tone, n.props.label]);
   const light = (over) => ({ nodeId: NODE, status: status(), local: null, pending: null, answeredAt: null, balanceNano: 0, ...over });
 
-  it('no node: the one sentence, no button and no link', () => {
-    const tree = render({ light: light({ status: status({ onChain: false }) }) });
-    expect(shown(tree)).toContain(t('node_none'));
+  // QNet Blockchain has two kinds of node: a wallet without one names both, and before the first answer the tab names
+  // no kind of node.
+  it('no node: that it has none, then both kinds on a card each with where it runs; no button and no link', () => {
+    const tree = render({ light: light({ status: status({ onChain: false }) }), walletNode: 'none' });
+    expect(shown(tree)).toBe(NO_NODE);
+    const cards = tree.root.findAllByType(Section).map((n) => [n.props.testID, n.props.title]);
+    expect(cards).toEqual([['node-none-light', t('node_title_light')], ['node-none-super', t('node_title_super')]]);
     expect(buttons(tree)).toEqual([]);
     expect(tree.root.findAll((n) => typeof n.props.onPress === 'function')).toEqual([]);
+    // Where each kind runs, never that one runs here: the wallet has none.
+    expect([t('node_light_device'), t('node_super_server')]).toEqual(['Light nodes run in QNet Wallet', 'Super nodes run on a server']);
+  });
+
+  it('before the first answer it names no kind of node: the wallet may have none', () => {
+    const tree = render({ light: null });
+    expect(shown(tree)).toBe(`${t('node_title')}\n${t('node_checking')}`);
+    expect(shown(tree)).not.toContain(t('node_title_light'));
+    // This device's light node being checked keeps its title.
+    expect(shown(render({ light: light({ local: LOCAL, status: null }) }))).toContain(t('node_title_light'));
+  });
+
+  // "No node" takes two owners' word on the light node and two genesis nodes' word that the wallet has none at all: while
+  // the wallet's node is unknown, or the genesis nodes name one, a light node not on the chain is still being checked.
+  it('no light node on the chain and the wallet\'s node unknown or named: being checked, never "no node"', () => {
+    for (const walletNode of [null, undefined, { nodeId: NODE, nodeType: 'light' }]) {
+      const tree = render({ light: light({ status: status({ onChain: false }) }), walletNode });
+      expect([walletNode, shown(tree)]).toEqual([walletNode, `${t('node_title')}\n${t('node_checking')}`]);
+      expect(buttons(tree)).toEqual([]);
+    }
+    expect(shown(render({ light: light({ status: status({ onChain: false }) }), walletNode: 'none' }))).toBe(NO_NODE);
+  });
+
+  it('a hidden node name: masked in its line, light and super alike; shown again when the user turns it off', () => {
+    const SUPER_ID = 'super_node_60a735f53dd87f1b';
+    const lightTree = render({ light: light({ local: LOCAL }), namesHidden: true });
+    const id = (tree) => tree.root.find((n) => n.type === Text && n.props.testID === 'node-id');
+    const copy = (tree) => tree.root.find((n) => n.props.testID === 'node-id-copy' && typeof n.props.onPress === 'function');
+    expect(id(lightTree).props.children).toBe('••••');
+    expect(copy(lightTree).props.accessibilityLabel).toBe(`${t('node_name')} ••••`);
+    expect(shown(lightTree)).not.toContain(NODE);
+    const superStatus = { success: true, registered: true, isOnline: true, nodeId: SUPER_ID, pendingRewards: 2e9 };
+    const superTree = render({ server: { nodeType: 'super', nodeId: SUPER_ID, status: superStatus, epochs: null }, light: null, namesHidden: true });
+    expect(id(superTree).props.children).toBe('••••');
+    expect(shown(superTree)).not.toContain(SUPER_ID);
+    // The same line and style either way, so nothing moves.
+    const plain = render({ light: light({ local: LOCAL }) });
+    expect(id(plain).props.children).toBe(NODE);
+    expect(id(plain).props.style).toBe(id(lightTree).props.style);
+    expect(id(plain).props.numberOfLines).toBe(id(lightTree).props.numberOfLines);
+    expect(copy(plain).props.accessibilityLabel).toBe(`${t('node_name')} ${NODE}`);
+  });
+
+  // The node's name is copied as every value is, by a tap on it; a hidden name still copies whole.
+  it('a tap on the node\'s name copies it whole, hidden or not; its copy mark turns to the tick', async () => {
+    const Clipboard = require('@react-native-clipboard/clipboard').default;
+    const SUPER_ID = 'super_node_60a735f53dd87f1b';
+    const superStatus = { success: true, registered: true, isOnline: true, nodeId: SUPER_ID, pendingRewards: 2e9 };
+    const glyphs = (tree) => tree.root.findAll((n) => typeof n.type === 'string' && /^copy-glyph/.test(n.props.testID || ''))
+      .map((n) => n.props.testID);
+    for (const [props, whole] of [
+      [{ light: light({ local: LOCAL }), namesHidden: true }, NODE],
+      [{ server: { nodeType: 'super', nodeId: SUPER_ID, status: superStatus, epochs: null }, light: null }, SUPER_ID],
+    ]) {
+      const tree = render(props);
+      const copy = tree.root.find((n) => n.props.testID === 'node-id-copy' && typeof n.props.onPress === 'function');
+      expect(copy.findAll((n) => n.type === Text && n.props.testID === 'node-id')).toHaveLength(1);
+      expect(glyphs(tree)).toEqual(['copy-glyph']);
+      Clipboard.setString.mockClear();
+      await act(async () => { await copy.props.onPress(); });
+      expect(Clipboard.setString).toHaveBeenCalledWith(whole);
+      expect(glyphs(tree)).toEqual(['copy-glyph-done']);
+      await act(async () => { tree.unmount(); });
+    }
   });
 
   it('no node id yet, or a registration on its way: no button', () => {
@@ -262,26 +325,29 @@ describe('what each state shows', () => {
     }
   });
 
-  // Owner, 11.10: one wallet, one node. A light node bound to another device, or to none, is not this device's to show:
-  // no balance, no button and no word about binding or activation. A node on another device says so ("This wallet has
-  // no node." on the phone the node left was false), which covers a reinstall here, as the network cannot tell it from
-  // another device; any other says what a wallet without a node says.
-  it('another device, no device, or no binding here: one sentence, nothing to press', () => {
+  // One wallet, one node. A light node bound to none is not this device's to show: what a wallet without a node says,
+  // no balance, no button. With no binding here and no verdict yet nothing names a kind of node, and nothing says the
+  // wallet has none (that takes two owners' word): it is being checked, or could not be read.
+  it('no device: what a wallet without a node says; no binding here and no verdict: never "no node", nothing to press', () => {
     const S = LOCAL.seq;
+    for (const l of [
+      light({ status: status({ deviceBound: false }), balanceNano: 2 * 1e9 }), // bound to no device
+      light({ local: LOCAL, status: status({ bindingSeqAgreed: S, deviceBound: false }), balanceNano: 2 * 1e9 }), // unlinked
+    ]) {
+      const tree = render({ light: l, refusal: { reason: 'device_unsupported' } });
+      expect(shown(tree)).toBe(NO_NODE);
+      expect(buttons(tree)).toEqual([]);
+      expect(lightShownHere(l, nodeView(l))).toBe(false);
+    }
     for (const [l, key] of [
-      [light({ balanceNano: 2 * 1e9 }), 'node_elsewhere'], // bound elsewhere, no binding here (or a reinstall here)
-      [light({ status: status({ deviceBound: false }), balanceNano: 2 * 1e9 }), 'node_none'], // bound to no device
-      [light({ local: LOCAL, status: status({ bindingSeqAgreed: S + 5 }), balanceNano: 2 * 1e9 }), 'node_elsewhere'], // taken over
-      [light({ local: LOCAL, status: status({ bindingSeqAgreed: S, deviceBound: false }), balanceNano: 2 * 1e9 }), 'node_none'], // unlinked
-      [light({ status: status({ deviceBoundAgreed: null }), balanceNano: 2 * 1e9 }), 'node_none'], // no verdict, no binding here
-      [light({ status: status({ onChain: null }), balanceNano: 2 * 1e9 }), 'node_none'], // network not reached, no binding here
+      [light({ status: status({ deviceBoundAgreed: null }), balanceNano: 2 * 1e9 }), 'node_checking'], // no verdict, no binding here
+      [light({ status: status({ onChain: null }), balanceNano: 2 * 1e9 }), 'node_unreachable'], // network not reached, no binding here
     ]) {
       const tree = render({ light: l, refusal: { reason: 'device_unsupported' } });
       expect(shown(tree)).toBe(`${t('node_title')}\n${t(key)}`);
       expect(buttons(tree)).toEqual([]);
       expect(lightShownHere(l, nodeView(l))).toBe(false);
     }
-    expect(t('node_elsewhere')).toBe("This wallet's node is linked to another device, or to this device before QNet Wallet was reinstalled.");
     // The node on no device keeps what a wallet without a node says: the site's sentence only (owner, 11.10).
     expect(hasKey('node_no_device')).toBe(false);
     // Not read yet: still being checked; bound here or being linked here: shown.
@@ -289,6 +355,64 @@ describe('what each state shows', () => {
     expect(lightShownHere(light({ local: LOCAL }), nodeView(light({ local: LOCAL })))).toBe(true);
     const pending = light({ status: status({ onChain: false }), pending: { nodeId: NODE, T: 1, expired: false } });
     expect(lightShownHere(pending, nodeView(pending))).toBe(true);
+  });
+
+  // On another device the tab says exactly which device runs the node ("The node runs on iPhone 15 Pro", the model the
+  // status names), its status by the network's verdict, the last counted epoch and the node balance with its move; one
+  // the network stopped waking says why and where it resumes. Never Use this device here.
+  it('another device: which device runs it, its status, the last counted epoch, the balance; no Use this device', () => {
+    const S = LOCAL.seq;
+    const IPHONE = { platform: 'ios', model: 'iPhone 15 Pro', linkedSince: 1790035200, lastAnswerEpoch: 151, state: 'online' };
+    const counted = { since: 60, counted: 48, last: 1234 };
+    const onAnother = (over = {}, more = {}) => light({ balanceNano: 2.5e9, status: status({ device: IPHONE, counted, ...over }), ...more });
+    const sentence = (tree) => tree.root.find((n) => n.type === Text && n.props.testID === 'node-elsewhere').props.children;
+    const stoppedLine = (tree) => tree.root.findAll((n) => n.type === Text && n.props.testID === 'node-elsewhere-stopped');
+
+    // Online on the other device: its model, the chip, the last counted epoch, the balance and Move to wallet.
+    let tree = render({ light: onAnother() });
+    expect(nodeView(onAnother())).toEqual({ state: 'elsewhere', online: true, model: 'iPhone 15 Pro', waiting: false, stopped: false });
+    expect(sentence(tree)).toBe('The node runs on iPhone 15 Pro.');
+    expect(statusOf(tree)).toEqual([['live', t('node_status_online')]]);
+    expect(stoppedLine(tree)).toEqual([]);
+    expect(shown(tree)).toContain(`${t('node_last_counted')}\nEpoch 1,234`);
+    expect(shown(tree)).toContain(`${t('node_balance')}\n2.5 QNC`);
+    expect(shown(tree)).toContain(NODE);
+    expect(buttons(tree)).toEqual(['node-move']);
+    expect(moveButton(tree).props.disabled).toBe(false);
+
+    // The network stopped waking it: Offline, why, and where it resumes; still nothing to run it here, whatever this
+    // device's refusal, key or check would offer on its own node.
+    const off = onAnother({ needsReactivation: true, features: ['device_v1'] }, { device: { capable: true } });
+    tree = render({ light: off, refusal: { reason: 'device_unsupported' } });
+    expect(statusOf(tree)).toEqual([['needs', t('node_status_offline')]]);
+    expect(stoppedLine(tree).map((n) => n.props.children)).toEqual([
+      'It did not answer for 2 epochs, so QNet Blockchain stopped waking it. It resumes when QNet Wallet is opened on iPhone 15 Pro.',
+    ]);
+    expect(buttons(tree)).toEqual(['node-move']);
+    expect(shown(tree)).not.toContain(t('node_use'));
+
+    // Linked to that device and not answered since: waiting, never "stopped", and nothing said of how long ago.
+    tree = render({ light: onAnother({ needsReactivation: true, device: { ...IPHONE, state: 'other_device_pending' } }) });
+    expect(stoppedLine(tree)).toEqual([]);
+    expect(shown(tree)).toContain(t('node_elsewhere_waiting'));
+    expect(t('node_elsewhere_waiting')).toBe('Waiting for its first answer.');
+
+    // No model in the status (a binding of a build before the model, or this device before a reinstall): today's
+    // sentence, and the stopped line names the device it is linked to.
+    tree = render({ light: onAnother({ needsReactivation: true, device: { ...IPHONE, model: null } }) });
+    expect(sentence(tree)).toBe(t('node_elsewhere'));
+    expect(stoppedLine(tree).map((n) => n.props.children)).toEqual([t('node_elsewhere_stopped_device')]);
+
+    // Never counted yet; counted unknown (an older node): no epoch row.
+    expect(shown(render({ light: onAnother({ counted: { since: 1, counted: 0, last: null } }) })))
+      .toContain(`${t('node_last_counted')}\n${t('node_counted_none')}`);
+    expect(shown(render({ light: onAnother({ counted: null }) }))).not.toContain(t('node_last_counted'));
+
+    // Taken over from this device: the same card. A hidden name stays masked here too.
+    const taken = light({ local: LOCAL, status: status({ bindingSeqAgreed: S + 5, device: IPHONE, counted }), balanceNano: 2.5e9 });
+    expect(sentence(render({ light: taken }))).toBe('The node runs on iPhone 15 Pro.');
+    expect(shown(render({ light: taken, namesHidden: true }))).not.toContain(NODE);
+    expect(lightShownHere(taken, nodeView(taken))).toBe(false);
   });
 
   it('an unknown balance reads as unknown, never 0 QNC, and cannot be moved', () => {
@@ -312,7 +436,7 @@ describe('what each state shows', () => {
     expect(shown(tree)).toContain(t('node_cant_run'));
     expect(buttons(tree)).toEqual(['node-move']);
     // The wallet stays whole: no node says so.
-    const none = render({ light: light({ status: status({ onChain: false }), device: { capable: false, reason: 'device_desktop' } }) });
+    const none = render({ light: light({ status: status({ onChain: false }), device: { capable: false, reason: 'device_desktop' } }), walletNode: 'none' });
     expect(shown(none)).toContain(t('node_none'));
   });
 
@@ -338,7 +462,7 @@ describe('what each state shows', () => {
     expect(moveButton(tree).props.disabled).toBe(false);
   });
 
-  it('the node tile: its status chip before its type, its whole name under them on one line with no Copy, the epoch mark', () => {
+  it('the node tile: its status chip before its type, its whole name under them on one line, copied by a tap, the epoch mark', () => {
     const epoch = Math.floor(2241840 / 14400);
     const mark = (tree) => tree.root.findAll((n) => typeof n.type === 'string' && /^node-epoch-(answered|waiting)$/.test(n.props.testID || ''))
       .map((n) => n.props.testID);
@@ -349,18 +473,58 @@ describe('what each state shows', () => {
     const row = tree.root.find((n) => typeof n.type === 'string' && n.props.testID === 'node-head-row');
     const [first, last] = [row.children[0], row.children[row.children.length - 1]];
     expect([first.findAll((n) => n.props.testID === 'node-status').length > 0, last.type]).toEqual([true, Text]);
-    // The whole name on one line, shrunk to fit and never cut, and nothing copies it.
+    // The whole name on one line, shrunk to fit and never cut, in the one copy element (components/ui/Copyable) with its
+    // copy mark at the end; no Copy word.
     const name = tree.root.find((n) => n.type === Text && n.props.testID === 'node-id');
     expect([[].concat(name.props.children).join(''), name.props.numberOfLines, name.props.adjustsFontSizeToFit, name.props.ellipsizeMode, name.props.onPress])
       .toEqual([NODE, 1, true, undefined, undefined]);
-    expect(tree.root.findAll((n) => n.props.testID === 'node-id' && typeof n.props.onPress === 'function').length).toBe(0);
-    expect(shown(tree)).not.toContain(t('common_copy'));
+    const Copyable = require('../src/components/ui/Copyable').default;
+    const copy = tree.root.findAllByType(Copyable);
+    expect(copy.map((c) => [c.props.text, c.props.testID])).toEqual([[NODE, 'node-id-copy']]);
+    expect(copy[0].findAll((n) => n === name)).toHaveLength(1);
+    expect(tree.root.findAll((n) => typeof n.type === 'string' && /^copy-glyph/.test(n.props.testID || ''))).toHaveLength(1);
     tree = render({ light: light({ local: LOCAL, status: status({ answered: false }) }) });
     expect(mark(tree)).toEqual(['node-epoch-waiting']);
     // The title stays with the tab unless the screen pins it above its scroll.
     const heads = (tr) => tr.root.findAll((n) => n.type === Text && n.props.accessibilityRole === 'header').map((n) => n.props.children);
     expect(heads(render({ light: light({ local: LOCAL }) }))).toEqual([t('node_title')]);
     expect(heads(render({ light: light({ local: LOCAL }), showHead: false }))).toEqual([]);
+  });
+
+  // Two sections: the node's identity on top (type, whole name, status chip), then one Status
+  // section with the epoch bar and the rows, the Background row in Mint while unrestricted and in Ember while
+  // restricted, and the node balance with Move to wallet at its foot. A server node's card is built the same way.
+  it('two sections: the identity, then the status with the balance and Move to wallet at its foot', () => {
+    const { color } = require('../src/theme');
+    const sections = (tree) => tree.root.findAll((n) => n.type === Section);
+    // What the section holds, in order, by the ids of its parts.
+    const order = (node) => node.findAll((n) => n !== node
+      && /^node-(epoch-bar|background-value|background|use|balance|move)$/.test(n.props.testID || ''), { deep: false })
+      .map((n) => n.props.testID);
+    const toneOf = (tree) => StyleSheet.flatten(tree.root.find((n) => n.type === Text && n.props.testID === 'node-background-value')
+      .props.style).color;
+    const here = (priority) => render({ onOpenBackground: noop, light: light({ local: LOCAL, balanceNano: 2e9, status: status({ answered: true }),
+      background: { priority, changeable: true } }) });
+    const tree = here('unrestricted');
+    const [identity, card, ...more] = sections(tree);
+    expect([identity.props.testID, card.props.testID, more.length]).toEqual(['node-identity', 'node-status-section', 0]);
+    // The identity holds the chip, the type and the whole name (a tap copies it), and no action.
+    expect(identity.findAll((n) => n.props.testID === 'node-status').length).toBeGreaterThan(0);
+    expect(identity.findAll((n) => n.type === Text && n.props.testID === 'node-id')).toHaveLength(1);
+    expect(identity.findAllByType(Action)).toHaveLength(0);
+    expect(card.props.title).toBe(t('node_status'));
+    expect(order(card)).toEqual(['node-epoch-bar', 'node-background-value', 'node-balance', 'node-move']);
+    expect(toneOf(tree)).toBe(color.mint);
+    // Restricted: Ember, with the one way to lift it under the row; the balance and Move still last.
+    const held = here('restricted');
+    expect(toneOf(held)).toBe(color.ember);
+    expect(order(sections(held)[1])).toEqual(['node-epoch-bar', 'node-background-value', 'node-background', 'node-balance', 'node-move']);
+    // A server node: its identity, then its status with the balance and Move to wallet last.
+    const server = render({ server: { nodeType: 'super', nodeId: 'super_node_60a735f53dd87f1b',
+      status: { success: true, registered: true, isOnline: true, pendingRewards: 2e9, lastSeen: 1, lastSeenAgoSeconds: 60 } }, light: null });
+    const [sId, sCard, ...sMore] = sections(server);
+    expect([sId.props.testID, sCard.props.testID, sMore.length]).toEqual(['node-identity', 'node-status-section', 0]);
+    expect(order(sCard)).toEqual(['node-epoch-bar', 'node-balance', 'node-move']);
   });
 
   it('this device, Offline: the hint, nothing to press for it; below 1 QNC nothing moves, with no note about it', () => {
@@ -570,50 +734,107 @@ describe('what each state shows', () => {
     }
   });
 
-  // A super node shows on every device with its status, last seen, balance and move (owner, 11.10): a read that fails
-  // keeps the last good status (stale, said above it) rather than turn the card into the server text and back; before
-  // its first answer it is being checked; the server text is for a node the network says is not registered.
-  it('a super node\'s card: checking first, the last good status kept while a read fails, the server text only when not registered', () => {
+  // A light node on another device shows under the server card too: which device runs it, its status and its last
+  // counted epoch; the wallet's one balance and its move stay on the server card.
+  it('a wallet with a super node and a light node on another device: both cards, the server first, one balance and one move', () => {
+    const IPHONE = { platform: 'ios', model: 'iPhone 15 Pro', linkedSince: 1790035200, lastAnswerEpoch: 151, state: 'online' };
+    const moved = [];
+    const tree = render({
+      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ pendingRewards: 3e9 }), epochs: null },
+      light: light({ balanceNano: 3e9, status: status({ device: IPHONE, counted: { since: 60, counted: 48, last: 1234 } }) }),
+      onMove: () => moved.push('light'), onMoveServer: () => moved.push('server'),
+    });
+    const text = shown(tree);
+    expect(text.indexOf(SUPER)).toBeGreaterThan(-1);
+    expect(text.indexOf(SUPER)).toBeLessThan(text.indexOf('The node runs on iPhone 15 Pro.'));
+    expect(text).toContain(`${t('node_last_counted')}\nEpoch 1,234`);
+    expect(statusOf(tree)).toEqual([['live', t('node_active')], ['live', t('node_status_online')]]);
+    expect(text.split(t('node_balance')).length - 1).toBe(1);
+    expect(text.split('3 QNC').length - 1).toBe(1);
+    expect(text).not.toContain(t('node_use'));
+    expect(buttons(tree)).toEqual(['node-move']);
+    act(() => { moveButton(tree).props.onPress(); });
+    expect(moved).toEqual(['server']);
+    // A server card that shows no balance (not registered): the other device's card keeps it, with its move.
+    const unregistered = render({
+      server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ registered: false }), epochs: null },
+      light: light({ balanceNano: 3e9, status: status({ device: IPHONE }) }),
+    });
+    expect(shown(unregistered)).toContain('The node runs on iPhone 15 Pro.');
+    expect(shown(unregistered)).toContain(`${t('node_balance')}\n3 QNC`);
+    expect(buttons(unregistered)).toEqual(['node-move']);
+  });
+
+  // Only an answer that names the card's node registered replaces its status; any other keeps the last good one, said
+  // stale above it, so the card never turns into another and back. Before a good status it is being checked, and a
+  // failed read with none says the network could not be reached.
+  it('a super node\'s card: only an answer about its node replaces the status; any other keeps the last good one, stale', () => {
     const card = (status) => render({ server: { nodeType: 'super', nodeId: SUPER, status, epochs: null }, light: null });
+    const generic = (tree) => shown(tree).includes(t('node_super_server'));
     expect(shown(card(null))).toContain(t('node_checking'));
-    expect(shown(card(null))).not.toContain(t('node_super_server'));
     expect(shown(card({ success: false, error: 'network' }))).toContain(t('node_unreachable'));
     expect(buttons(card({ success: false, error: 'network' }))).toEqual([]);
     const good = serverStatus();
-    const kept = keptServerStatus(good, { success: false, error: 'network' }, SUPER);
-    expect(kept).toEqual({ ...good, stale: true });
-    const text = shown(card(kept));
-    expect(text).toContain(t('node_unreachable'));
-    expect(statusOf(card(kept))).toEqual([['live', t('node_active')]]);
-    expect(text).toContain('2 QNC');
-    expect(buttons(card(kept))).toEqual(['node-move']);
-    expect(text).not.toContain(t('node_super_server'));
-    // The next good answer replaces it, with no stale mark; another node's status is not kept for this one.
-    expect(keptServerStatus(kept, serverStatus({ pendingRewards: 5e9 }), SUPER)).toEqual(serverStatus({ pendingRewards: 5e9 }));
-    expect(keptServerStatus(good, { success: false }, 'super_node_other')).toEqual({ success: false });
-    expect(keptServerStatus(null, null)).toEqual({ success: false, error: 'network' });
-    expect(shown(card(serverStatus({ registered: false })))).toContain(t('node_super_server'));
+    // Not registered, no node named, another node, a failure, nothing at all: the last good status stays, marked stale.
+    for (const answer of [
+      serverStatus({ registered: false }), { success: true, registered: false, nodeId: null, isOnline: false },
+      serverStatus({ nodeId: 'super_node_other' }), { success: false, error: 'network' }, null,
+    ]) {
+      const kept = serverStatusAfter(good, answer, SUPER);
+      expect([answer, kept]).toEqual([answer, { ...good, stale: true }]);
+      const tree = card(kept);
+      expect(shown(tree)).toContain(t('node_unreachable'));
+      expect(statusOf(tree)).toEqual([['live', t('node_active')]]);
+      expect(shown(tree)).toContain('2 QNC');
+      expect(buttons(tree)).toEqual(['node-move']);
+      expect(generic(tree)).toBe(false);
+      expect(serverStatusAfter(kept, answer, SUPER)).toBe(kept);
+    }
+    // The next answer about the node replaces it, with no stale mark.
+    const next = serverStatus({ pendingRewards: 5e9 });
+    expect(serverStatusAfter({ ...good, stale: true }, next, SUPER)).toBe(next);
+    // With no good status of this node, never another node's: an answer leaves it being checked, a failure unreachable.
+    expect(serverStatusAfter(serverStatus({ nodeId: 'super_node_other' }), serverStatus({ registered: false }), SUPER)).toBe(null);
+    expect(serverStatusAfter(null, serverStatus({ nodeId: 'super_node_other' }), SUPER)).toBe(null);
+    expect(serverStatusAfter(good, { success: false }, 'super_node_other')).toEqual({ success: false, error: 'network' });
+    expect(serverStatusAfter(null, null, SUPER)).toEqual({ success: false, error: 'network' });
+    // A status that says the node is not registered never shows as a card of its own.
+    expect(shown(card(serverStatus({ registered: false })))).toContain(t('node_checking'));
+    expect(generic(card(serverStatus({ registered: false })))).toBe(false);
+    expect(hasKey('node_super_server_sub')).toBe(false);
   });
 
-  it('a super node aiqnet.io recorded that the network does not list yet: its sentence, nothing to press; a light one is not this device\'s', () => {
+  // What aiqnet.io records of a super node is said only once two genesis nodes say the wallet has no node: while the
+  // wallet's node is unknown nothing is claimed, and a node they name shows as itself.
+  it('a super node aiqnet.io recorded for a wallet the genesis nodes say has none: its sentence, nothing to press; a light one is not this device\'s', () => {
     // A light node bound to no device yet is not shown (owner, 11.10): what a wallet without a node shows.
-    let tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'light' });
-    expect(shown(tree)).toBe(`${t('node_title')}\n${t('node_none')}`);
+    let tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'light', walletNode: 'none' });
+    expect(shown(tree)).toBe(NO_NODE);
     expect(buttons(tree)).toEqual([]);
-    tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'super' });
+    tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'super', walletNode: 'none' });
     expect(shown(tree)).toContain(t('node_title_super'));
     expect(shown(tree)).toContain(t('node_not_on_network_super'));
     expect(shown(tree)).not.toContain(t('node_super_server'));
     expect(buttons(tree)).toEqual([]);
-    // A linked server node whose registration the network does not record yet says the same.
-    tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ registered: false }), epochs: null }, light: null, recorded: 'super' });
-    expect(shown(tree)).toContain(t('node_not_on_network_super'));
-    expect(buttons(tree)).toEqual([]);
+    // While the wallet's node is unknown: being checked, neither "not joined" nor "no node".
+    tree = render({ light: light({ status: status({ onChain: false }) }), recorded: 'super' });
+    expect(shown(tree)).toBe(`${t('node_title')}\n${t('node_checking')}`);
+    // A node the genesis nodes name whose status is still being read or could not be read: its card, never "not joined".
+    for (const s of [null, { success: false, error: 'network' }]) {
+      tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: s, epochs: null }, light: null, recorded: 'super',
+        walletNode: { nodeId: SUPER, nodeType: 'super' } });
+      expect(shown(tree)).toContain(t(s ? 'node_unreachable' : 'node_checking'));
+      expect(shown(tree)).not.toContain(t('node_not_on_network_super'));
+    }
+    // Its status in: the detailed card, its balance and its move.
+    tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: null }, light: null, recorded: 'super',
+      walletNode: { nodeId: SUPER, nodeType: 'super' } });
+    expect(statusOf(tree)).toEqual([['live', t('node_active')]]);
+    expect(buttons(tree)).toEqual(['node-move']);
+    expect(shown(tree)).not.toContain(t('node_not_on_network_super'));
     // Without such a record, as before.
-    tree = render({ light: light({ status: status({ onChain: false }) }) });
+    tree = render({ light: light({ status: status({ onChain: false }) }), walletNode: 'none' });
     expect(shown(tree)).toContain(t('node_none'));
-    tree = render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus({ registered: false }), epochs: null }, light: null });
-    expect(shown(tree)).toContain(t('node_super_server'));
     expect(t('node_not_on_network_super')).toBe(
       "This wallet's super node has not joined QNet Blockchain yet. It runs on a server with QNet Blockchain node software.");
     expect(hasKey('node_not_on_network_light')).toBe(false);
@@ -623,8 +844,8 @@ describe('what each state shows', () => {
     const trees = [
       render({ server: { nodeType: 'super', nodeId: SUPER, status: serverStatus(), epochs: { counted: 1, missed: 0 } },
         light: light({ local: LOCAL, status: status() }) }),
-      render({ light: light({ status: status({ onChain: false }) }), recorded: 'super' }),
-      render({ light: light({ status: status({ onChain: false }) }), recorded: 'light' }),
+      render({ light: light({ status: status({ onChain: false }) }), recorded: 'super', walletNode: 'none' }),
+      render({ light: light({ status: status({ onChain: false }) }), recorded: 'light', walletNode: 'none' }),
     ];
     for (const tree of trees) {
       expect(shown(tree)).not.toMatch(/QNET-|https?:|www\.|aiqnet|1DEV|price|\$/i);
@@ -640,7 +861,7 @@ describe('what each state shows', () => {
   it('the open tab asks the owners for a signature check at most every five minutes', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'screens', 'WalletScreen.js'), 'utf8');
     expect(src).toMatch(/const SIGNED_STATUS_MS = 5 \* 60_000;/);
-    expect(src).toMatch(/if \(!server \|\| lightShownRef\.current\) loadLightNodeStatus\(\{ fresh: false \}\);\s*\}, NODE_STATUS_MS\);/);
+    expect(src).toMatch(/if \(!server \|\| lightShownRef\.current\) load\.loadLightNodeStatus\(\{ fresh: false \}\);\s*\}, NODE_STATUS_MS\);/);
     // While a binding with no answer waits, every read asks for the network's word on it.
     expect(src).toMatch(/const sign = !!unconfirmed \|\| \(!!local && \(fresh \|\| !same \|\| Date\.now\(\) - last\.at >= SIGNED_STATUS_MS\)\);/);
     // It is settled by this read's word only, before the check that would end the binding it replaced.
@@ -666,12 +887,24 @@ describe('the status, from the shard owners', () => {
   const answers = (byOwner, post = () => ({ success: false })) => {
     global.fetch = jest.fn((url, opts) => {
       calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
-      if (opts && opts.method === 'POST') return reply(post(url));
+      if (opts && opts.method === 'POST') {
+        const p = post(url);
+        return p && typeof p.then === 'function' ? p.then(reply) : reply(p);
+      }
       const i = owners.findIndex((o) => url.startsWith(o));
       const a = byOwner[i];
+      if (a && typeof a.then === 'function') return a.then(reply);
       return a instanceof Error ? Promise.reject(a) : reply(a);
     });
   };
+  // An owner's answer that comes only when the test gives it.
+  const later = () => {
+    let give;
+    const p = new Promise((r) => { give = r; });
+    p.give = give;
+    return p;
+  };
+  const flush = () => new Promise((r) => { setTimeout(r, 0); });
 
   it('asks only the three shard owners, the public form with no nonce (it names no device, ND-7)', async () => {
     answers([pub(), pub(), pub()]);
@@ -763,6 +996,90 @@ describe('the status, from the shard owners', () => {
     }
     answers([pub({ onchain_registered: false, device }), pub({ onchain_registered: false, device }), pub()]);
     expect((await readNodeStatus(NODE)).device).toBe(null);
+  });
+
+  it('the day of the bound device\'s binding only as two owners report it alike', async () => {
+    const device = { platform: 'ios', model: 'iPhone 15 Pro', linked_since: 1790035200, last_answer_epoch: 1240, state: 'online' };
+    answers([pub({ device }), pub({ device }), pub()]);
+    expect((await readNodeStatus(NODE)).linkedSinceAgreed).toBe(1790035200);
+    answers([pub({ device }), pub({ device: { ...device, linked_since: 1790121600 } }), pub()]);
+    expect((await readNodeStatus(NODE)).linkedSinceAgreed).toBe(null);
+    answers([pub({ device }), new Error('down'), { success: false, error: 'rate limited' }]);
+    expect((await readNodeStatus(NODE)).linkedSinceAgreed).toBe(null);
+  });
+
+  // A shard owner that does not answer (down, or a connection gone silent) holds nothing back: the status settles as
+  // soon as two owners agree, and the third refines what one owner's word decides.
+  it('settles once two owners agree, before the third, which then refines it (answered on any owner\'s word)', async () => {
+    const third = later();
+    answers([pub({ answered_this_epoch: false }), pub({ answered_this_epoch: false }), third]);
+    const agreed = jest.fn();
+    let done = null;
+    const read = readNodeStatus(NODE, { onAgreed: agreed }).then((s) => { done = s; });
+    await flush();
+    expect(agreed).toHaveBeenCalledTimes(1);
+    expect(agreed.mock.calls[0][0]).toMatchObject({ onChain: true, deviceBoundAgreed: true, answered: false, features: ['bind_v2', 'status_signed'] });
+    expect(done).toBe(null);
+    third.give(pub({ answered_this_epoch: true }));
+    await read;
+    expect(done).toMatchObject({ onChain: true, answered: true });
+    expect(agreed).toHaveBeenCalledTimes(1);
+    // The sheet's read takes the agreed status and never waits for the third.
+    const slow = later();
+    answers([pub(), pub(), slow]);
+    expect(await readAgreedNodeStatus(NODE)).toMatchObject({ onChain: true });
+    slow.give(pub());
+    // No node, as soon as two owners say so.
+    const down = later();
+    answers([pub({ onchain_registered: false }), down, pub({ onchain_registered: false })]);
+    expect((await readAgreedNodeStatus(NODE)).onChain).toBe(false);
+    down.give(pub({ onchain_registered: false }));
+  });
+
+  it('waits for the third while it could still change a verdict two owners must give alike', async () => {
+    const splits = [
+      [pub(), pub({ onchain_registered: false })], // on the chain or not
+      [pub({ device_bound: true }), pub({ device_bound: false })], // whether a device is bound
+      [pub({ features: ['bind_v2'] }), pub({ features: ['bind_v2', 'status_signed'] })], // a form one of them lists
+    ];
+    for (const [a, b] of splits) {
+      const third = later();
+      answers([a, b, third]);
+      const agreed = jest.fn();
+      const read = readNodeStatus(NODE, { onAgreed: agreed });
+      await flush();
+      expect(agreed).not.toHaveBeenCalled();
+      third.give(pub());
+      await read;
+      // Every answer was in by then: the read itself is the answer.
+      expect(agreed).not.toHaveBeenCalled();
+    }
+  });
+
+  it('asks for the signed status once the public verdicts settle, and settles on the binding two signed answers name', async () => {
+    const third = later();
+    answers([pub(), pub(), third], () => ({ ...pub(), binding_seq: 1790000000, device_state: 'active' }));
+    const sign = jest.fn(async () => ({ signer: 'ping', sig: 'ab' }));
+    const agreed = jest.fn();
+    const read = readNodeStatus(NODE, { signStatus: sign, onAgreed: agreed });
+    await flush();
+    expect(calls.filter((c) => c.body)).toHaveLength(3);
+    expect(agreed).toHaveBeenCalledTimes(1);
+    expect(agreed.mock.calls[0][0]).toMatchObject({ onChain: true, bindingSeqAgreed: 1790000000, keyOurs: true, signer: 'ping' });
+    third.give(pub());
+    expect(await read).toMatchObject({ onChain: true, bindingSeqAgreed: 1790000000, keyOurs: true });
+    // Signed answers that name two bindings wait for the third.
+    const seqs = { 0: later(), 1: 5, 2: 6 };
+    answers([pub(), pub(), pub()], (url) => {
+      const i = owners.findIndex((o) => url.startsWith(o));
+      return i === 0 ? seqs[0].then((seq) => ({ ...pub(), binding_seq: seq })) : { ...pub(), binding_seq: seqs[i] };
+    });
+    const waiting = jest.fn();
+    const split = readNodeStatus(NODE, { signStatus: sign, onAgreed: waiting });
+    await flush();
+    expect(waiting).not.toHaveBeenCalled();
+    seqs[0].give(6);
+    expect((await split).bindingSeqAgreed).toBe(6);
   });
 
   it('the pending-link record lives T + 24 h + 10 min', async () => {

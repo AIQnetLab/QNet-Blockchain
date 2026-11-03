@@ -4,6 +4,7 @@
 // that code throws stays inside this boundary: the header keeps working and shows a plain button.
 
 import { Component, type ReactNode } from 'react';
+import { ConnectLabel } from './connect-wallet-button';
 
 export default class WalletBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
@@ -17,7 +18,7 @@ export default class WalletBoundary extends Component<{ children: ReactNode }, {
     return (
       <div className="wallet-widget">
         <button type="button" className="connect" onClick={() => window.location.reload()}>
-          Connect<span className="c-long"> wallet</span>
+          <ConnectLabel />
         </button>
       </div>
     );

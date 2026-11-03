@@ -236,36 +236,46 @@ describe('B3: the node answers only while the app runs, opened since the device 
       expect(answered()).toBe(true);
     });
 
-    // The first launch in this file: the return-to-app subscription is registered once per process.
-    it('a launch in the background holds its answer and upkeep until the app comes to the front', async () => {
-      await linked();
-      let resume = null;
-      const spy = jest.spyOn(AppState, 'addEventListener').mockImplementation((type, handler) => {
+    // The return-to-app subscription is registered once per process, by whichever launch of this group runs first: kept
+    // here for every test of it, run alone or together.
+    let resume = null;
+    let listen;
+    beforeAll(() => {
+      listen = jest.spyOn(AppState, 'addEventListener').mockImplementation((type, handler) => {
         if (type === 'change') resume = handler;
         return { remove: jest.fn() };
       });
-      try {
-        await Push.initializePushService(); // iOS: a push launched the app after a restart
-        await settle();
-        expect(BackgroundFetch.configure).toHaveBeenCalled(); // the wakes stay configured
-        expect(calls).toEqual([]);
-        expect(typeof resume).toBe('function');
-        AppState.currentState = 'active';
-        resume('active');
-        await settle();
-        expect(JSON.parse(await AsyncStorage.getItem(Gate.OPENED_BOOT_KEY))).toEqual(clock(60_000));
-        expect(calls.some((c) => c.url.endsWith('/api/v1/height'))).toBe(true); // the held self-attest
-        expect(calls.some((c) => c.url.includes('/light-node/status'))).toBe(true); // the held status read
-      } finally {
-        spy.mockRestore();
-      }
+    });
+    afterAll(() => { listen.mockRestore(); });
+
+    it('a launch in the background holds its answer and upkeep until the app comes to the front', async () => {
+      await linked();
+      await Push.initializePushService(); // iOS: a push launched the app after a restart
+      await settle();
+      expect(BackgroundFetch.configure).toHaveBeenCalled(); // the wakes stay configured
+      expect(calls).toEqual([]);
+      expect(typeof resume).toBe('function');
+      AppState.currentState = 'active';
+      resume('active');
+      await settle();
+      expect(JSON.parse(await AsyncStorage.getItem(Gate.OPENED_BOOT_KEY))).toEqual(clock(60_000));
+      expect(calls.some((c) => c.url.endsWith('/api/v1/height'))).toBe(true); // the held self-attest
+      expect(calls.some((c) => c.url.includes('/light-node/status'))).toBe(true); // the held status read
     });
 
-    it('a launch the rule allows runs its work at once, as before', async () => {
+    // The push or the fetch that started the process answers by its own handler: a second round beside it only costs
+    // the wake's time.
+    it('a launch in the background runs no work of its own where the node may answer either; the first open runs it', async () => {
       await linked();
       await Gate.noteOpen(); // opened earlier in this boot; the system ended the process meanwhile
       await Push.initializePushService();
       await settle();
+      expect(BackgroundFetch.configure).toHaveBeenCalled();
+      expect(calls).toEqual([]);
+      AppState.currentState = 'active';
+      resume('active');
+      await settle();
+      expect(calls.some((c) => c.url.includes('/light-node/status'))).toBe(true);
       expect(calls.some((c) => c.url.endsWith('/api/v1/height'))).toBe(true);
     });
 

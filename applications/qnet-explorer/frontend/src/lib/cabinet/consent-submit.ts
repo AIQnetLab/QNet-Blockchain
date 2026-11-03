@@ -1,5 +1,5 @@
-// The wallet's consent to register its light node, as the page posts it to POST /api/cabinet/register (shared contract
-// C4). For a payment address's burn: the consent body, with nothing of the payment key, which the site completes with
+// The wallet's consent to register its light node, as the page posts it to POST /api/cabinet/register.
+// For a payment address's burn: the consent body, with nothing of the payment key, which the site completes with
 // the owner bind its record keeps. The activation page posts it from its record (activation.ts), and any other page
 // where the wallet is connected posts it with QNet Wallet's fresh consent (NextSteps.tsx FinishLight), with no payment
 // key in the browser. For a burn made from the wallet's own Solana address: the own-burn body, the consent with that
@@ -7,9 +7,13 @@
 // key module.
 
 import { ED25519_SIGNATURE_BYTES, MLDSA65_PUBLIC_KEY_BYTES, MLDSA65_SIGNATURE_BYTES, bytesToHex, decodeB64url, type Consent } from '../qnet-link.ts';
-import { SUBMIT_KEYS, buildConsentBody, parseSubmitOutcome, type ConsentBody, type SubmitBody, type SubmitOutcome } from './registration.ts';
+import { SUBMIT_KEYS, SUBMIT_TIMEOUT_MS, buildConsentBody, parseSubmitOutcome, type ConsentBody, type SubmitBody, type SubmitOutcome } from './registration.ts';
+import { SITE_REQUEST_MS, siteRequest } from '../site-request.ts';
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
+
+// The site waits up to SUBMIT_TIMEOUT_MS for the node; the same body sent again joins the answer on its way (register.ts).
+export const REGISTER_REQUEST_MS = SUBMIT_TIMEOUT_MS + SITE_REQUEST_MS;
 
 // The consent body of `qnet`'s consent {ts, pk, sig} (base64url key and signature) to `burnTx` of `burnAmount`.
 export function consentBodyOf(qnet: string, consent: { ts: string | number; pk: string; sig: string }, burnTx: string, burnAmount: number): ConsentBody {
@@ -33,9 +37,9 @@ export async function postConsent(body: ConsentBody | SubmitBody, { fetchFn }: {
   let status: number;
   let answer: unknown = null;
   try {
-    const res = await fetchFn('/api/cabinet/register', {
-      cache: 'no-store', credentials: 'omit', redirect: 'error', method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
+    const res = await fetchFn('/api/cabinet/register', siteRequest({
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }, REGISTER_REQUEST_MS));
     status = res.status;
     try {
       answer = await res.json();

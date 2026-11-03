@@ -2,7 +2,6 @@ package com.qnetmobile
 
 import com.facebook.react.bridge.*
 import android.util.Base64
-import android.util.Log
 
 /**
  * QNet Dilithium3 Native Module for React Native
@@ -42,7 +41,7 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
                 System.loadLibrary("dilithium_native")
                 true
             } catch (t: Throwable) {
-                Log.e("DILITHIUM", "native lib load failed (unsupported ABI?): ${t.message}")
+                prodLog("DILITHIUM", true, "[WARN][CRYPTO] native_lib_load_failed error=${t.javaClass.simpleName}")
                 false
             }
         }

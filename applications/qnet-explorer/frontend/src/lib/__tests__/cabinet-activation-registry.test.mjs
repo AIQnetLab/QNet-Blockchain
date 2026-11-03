@@ -1,8 +1,8 @@
 // The activation registry (src/server/cabinet/activation-registry.ts, activation-api.ts, burn-scan.ts; the reservation
 // and record proofs of src/lib/cabinet/burn-record.ts): one wallet, one burn and one code, for a light or a super node,
-// whichever browser, device or client starts it (unified plan R1 and R6; shared contracts C1-C5). A reservation needs
+// whichever browser, device or client starts it. A reservation needs
 // the wallet's own signed reservation, fresh for its way: a stranger can neither hold a wallet nor burn in its name. Two
-// reservations racing for one wallet: one wins. A reservation expires and can be taken again, a burn on its way cannot. A
+// reservations racing for one wallet: one wins; the same signed reservation sent again gets the one it made. A reservation expires and can be taken again, a burn on its way cannot. A
 // payment address's burn leaves only with the payment key's v2 owner bind of the reserved wallet and is the wallet's
 // record for good once final. A burn is recorded only with a proof and only once Solana holds it final and valid; nobody
 // can plant one for another wallet. The same burner's older burn replaces a newer one; another burn never does. The
@@ -16,7 +16,7 @@ import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import { ed25519 } from '@noble/curves/ed25519';
 import bs58 from 'bs58';
 import {
-  OFFCHAIN_CONTEXT, RECORD_STATES, RESERVATION_TTL_MS, RESERVE_PROOF_FUTURE_S, RESERVE_PROOF_PAST_S, SETTLE_AFTER_MS, burnRecordEnvelope,
+  DROP_SETTLE_MS, OFFCHAIN_CONTEXT, RECORD_STATES, RESERVATION_TTL_MS, RESERVE_PROOF_FUTURE_S, RESERVE_PROOF_PAST_S, SETTLE_AFTER_MS, burnRecordEnvelope,
   burnRecordMessage, parseActivationRecord, recordCode, reservationMessage, verifyBurnRecordProof, verifyReservationProof,
 } from '../cabinet/burn-record.ts';
 import { ownerBindMessageV2 } from '../cabinet/registration.ts';
@@ -30,8 +30,8 @@ import {
 } from '../../server/cabinet/burn-scan.ts';
 import { CABINET_LIMITS, KEYED_LIMITS } from '../../server/cabinet/limits.ts';
 import { activationOriginAllowed } from '../../server/request-guard.ts';
+import { read } from './source.mjs';
 
-const read = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const seed = (label) => createHash('sha256').update(label).digest();
 const utf8 = (s) => new TextEncoder().encode(s);
 const T0 = 1_790_000_000_000;
@@ -59,13 +59,13 @@ function proofFor(w, facts, { context = OFFCHAIN_CONTEXT, sk = w.sk, pk = w.pk, 
   };
 }
 
-// The wallet's signed reservation (C1) of these fields at `time` (Unix seconds).
+// The wallet's signed reservation of these fields at `time` (Unix seconds).
 function holdFor(w, fields, time = S0, { context = OFFCHAIN_CONTEXT, sk = w.sk, pk = w.pk } = {}) {
   const env = burnRecordEnvelope(reservationMessage(fields.wallet, fields.nodeType, fields.way, fields.burner, time));
   return { pk: encodeB64url(pk), sig: encodeB64url(ml_dsa65.sign(env, sk, { context: utf8(context) })), time };
 }
 
-// The payment key's v2 owner bind (C4) of `burnTx` for `w`'s light node, by the burner's Ed25519 seed, as hex.
+// The payment key's v2 owner bind of `burnTx` for `w`'s light node, by the burner's Ed25519 seed, as hex.
 function ownerBind(w, burnTx, edSeed = PAY.edSeed, pk = w.pk) {
   const nodeId = lightNodeId(w.qnet);
   return bytesToHex(ed25519.sign(utf8(ownerBindMessageV2(nodeId, w.qnet, consentProof(burnTx, nodeId, w.qnet), pk, burnTx)), edSeed));
@@ -133,7 +133,7 @@ const payReserve = (w, burner = PAY.solana, time = S0) => {
   return { ...fields, burnAmount: 1500, proof: holdFor(w, fields, time) };
 };
 
-test('C1: the record message and its envelope are exact, and the proof needs both keys of the wallet', () => {
+test('the record message and its envelope are exact, and the proof needs both keys of the wallet', () => {
   const burnTx = sig('c1');
   const facts = { wallet: A.qnet, nodeType: 'super', burner: A.solana, burnTx, burnAmount: 1500 };
   const m = burnRecordMessage(A.qnet, 'super', A.solana, burnTx, 1500);
@@ -152,9 +152,9 @@ test('C1: the record message and its envelope are exact, and the proof needs bot
   assert.equal(verifyBurnRecordProof(facts, { ...proofFor(A, facts), extra: 1 }), false, 'exact keys');
 });
 
-// A1 (owner, 29.09): only the wallet itself holds itself: the extension signs with the wallet's keys, QNet Wallet signs
+// Only the wallet itself holds itself: the extension signs with the wallet's keys, QNet Wallet signs
 // a payment address's reservation before the address exists.
-test('C1: the reservation message is exact; only the wallet\'s own fresh signature over these very fields holds it', () => {
+test('the reservation message is exact; only the wallet\'s own fresh signature over these very fields holds it', () => {
   const fields = { wallet: A.qnet, nodeType: 'light', way: 'payment', burner: PAY.solana };
   const m = reservationMessage(A.qnet, 'light', 'payment', PAY.solana, 1_790_000_000);
   assert.equal(m, `QNet node reservation v1\nwallet: ${A.qnet}\nnode: light\nway: payment\nburner: ${PAY.solana}\ntime: 1790000000\ncluster: devnet`);
@@ -187,7 +187,7 @@ test('C1: the reservation message is exact; only the wallet\'s own fresh signatu
   assert.equal(verifyReservationProof(ext, holdFor(A, ext, S0 - 9_999, { sk: B.sk }), S0), 'invalid');
 });
 
-test('C1: the reserve route refuses an unsigned, forged, other wallet\'s or stale reservation, and keeps the proof it took', async () => {
+test('the reserve route refuses an unsigned, forged, other wallet\'s or stale reservation, and keeps the proof it took', async () => {
   const s = setup();
   const reserve = (body) => s.api.reserve(post('reserve', body)).then(json);
   const { proof, ...unsigned } = reserveBody(A);
@@ -219,7 +219,7 @@ test('C1: the reserve route refuses an unsigned, forged, other wallet\'s or stal
   assert.ok(JSON.stringify(ext).length < PROOF_BODY_MAX_BYTES);
 });
 
-test('C3.2 + C4: two browsers reserve one wallet at once: exactly one wins, and the other is told it is held', async () => {
+test('two browsers reserve one wallet at once: exactly one wins, and the other is told it is held', async () => {
   const s = setup();
   const answers = await Promise.all([
     s.api.reserve(post('reserve', reserveBody(A), { 'x-test-ip': '198.51.100.1' })),
@@ -239,7 +239,48 @@ test('C3.2 + C4: two browsers reserve one wallet at once: exactly one wins, and 
   assert.equal(s.store.rows.size, 1);
 });
 
-test('C3.2: every source is asked first; any that cannot answer holds nothing', async () => {
+test('the same signed reservation sent again gets the reservation it made; any other request for the held wallet is refused', async () => {
+  let t = T0;
+  let asked = 0;
+  const s = setup({ now: () => t, node: () => { asked += 1; return { state: 'none' }; } });
+  const reserve = (body, ip = '198.51.100.7') => s.api.reserve(post('reserve', body, { 'x-test-ip': ip })).then(json);
+  const pay = { way: 'payment', burner: PAY.solana };
+  const body = reserveBody(A, pay);
+  const first = await reserve(body);
+  assert.equal(first.status, 200);
+  // An answer the page gave up on, sent again a minute later: the same answer from the record, the network not asked.
+  t += 60_000;
+  assert.deepEqual(await reserve(body, '198.51.100.8'), first);
+  assert.equal(asked, 1);
+  assert.equal(s.store.rows.size, 1);
+  // Another request for the held wallet: signed again, another amount under the same signature, the extension's.
+  for (const other of [reserveBody(A, pay, { time: S0 + 1 }), { ...body, burnAmount: 1499 }, reserveBody(A, {}, { time: S0 + 60 })]) {
+    const got = await reserve(other);
+    assert.equal(got.status, 409, JSON.stringify(other).slice(0, 80));
+    assert.equal(got.body.error, 'reserved');
+  }
+  assert.equal(s.store.rows.get(A.qnet).reservation, first.body.reservation);
+  // Sent twice at once (two tabs of one payment): one reservation, both told it.
+  const bodyB = reserveBody(B, pay);
+  const twice = await Promise.all([reserve(bodyB, '198.51.100.9'), reserve(bodyB, '198.51.100.10')]);
+  assert.equal(twice[0].status, 200);
+  assert.deepEqual(twice[1], twice[0]);
+  assert.equal(s.store.rows.size, 2);
+  // Once it ended, the same signed reservation makes a new one.
+  t += RESERVATION_TTL_MS;
+  const renewed = await reserve(body);
+  assert.equal(renewed.status, 200);
+  assert.notEqual(renewed.body.reservation, first.body.reservation);
+  assert.equal(renewed.body.until, t + RESERVATION_TTL_MS);
+  // Its burn on its way: the same request is told so, not given the reservation again.
+  const tx = sig('same-again');
+  assert.equal(await s.api.announcePayment(renewed.body.reservation, PAY.solana, 1500, tx, ownerBind(A, tx)), A.qnet);
+  const pending = await reserve(body);
+  assert.equal(pending.status, 409);
+  assert.equal(pending.body.error, 'burn_pending');
+});
+
+test('the reserve route asks every source first; any that cannot answer holds nothing', async () => {
   const s = setup({ node: null });
   assert.deepEqual((await json(await s.api.reserve(post('reserve', reserveBody(A))))).body, { error: 'network_unavailable' });
   // A node of either type holds the wallet (one wallet, one node).
@@ -260,6 +301,18 @@ test('C3.2: every source is asked first; any that cannot answer holds nothing', 
   const found = [{ burnTx: sig('old'), nodeType: 'super', burnAmount: 1500 }];
   s.state.scan = { complete: true, unusable: false, burns: found };
   assert.deepEqual((await json(await s.api.reserve(post('reserve', pay)))), { status: 409, body: { error: 'burn_found', burns: found } });
+  // Without the wallet's own Solana address, which may hold its burn already, the payment way holds nothing; the
+  // refusal's line names nothing of the request.
+  s.state.scan = { complete: true, unusable: false, burns: [] };
+  const lines = [];
+  const log = console.log;
+  console.log = (...line) => lines.push(line.join(' '));
+  try {
+    assert.deepEqual(await json(await s.api.reserve(post('reserve', reserveBody(A, { way: 'payment', burner: B.solana, solana: null })))), { status: 400, body: { error: 'solana_required' } });
+  } finally {
+    console.log = log;
+  }
+  assert.deepEqual(lines, ['[INFO][CABINET] reserve_refused reason=no_solana']);
   assert.equal(s.store.rows.size, 0, 'nothing held');
   // The database itself not answering: unavailable, nothing burns.
   const broken = createActivationApi({
@@ -275,7 +328,7 @@ test('C3.2: every source is asked first; any that cannot answer holds nothing', 
   }
 });
 
-test('C3.0: the site and the extension may call; another site\'s page may not; a 429 names when to come back', async () => {
+test('the activation routes: the site and the extension may call; another site\'s page may not; a 429 names when to come back', async () => {
   const req = (headers) => new Request('https://aiqnet.io/api/cabinet/activation/x', { headers: { host: 'aiqnet.io', ...headers } });
   assert.equal(activationOriginAllowed(req({}), false), true);
   assert.equal(activationOriginAllowed(req({ origin: 'https://aiqnet.io', 'sec-fetch-site': 'same-origin' }), false), true);
@@ -324,9 +377,9 @@ test('an expired reservation can be taken again; a burn on its way cannot; an an
   assert.equal(s.store.rows.get(A.qnet).state, 'sending');
 });
 
-// A2 (owner, 29.09): a payment address's burn is the wallet's for good: announced with the payment key's v2 owner bind
+// A payment address's burn is the wallet's for good: announced with the payment key's v2 owner bind
 // of the reserved wallet, recorded once final exactly like an extension burn, never released after a day.
-test('C4: a payment burn leaves only with the v2 owner bind of the reserved wallet, and once final it is the wallet\'s record', async () => {
+test('a payment burn leaves only with the v2 owner bind of the reserved wallet, and once final it is the wallet\'s record', async () => {
   let t = T0;
   const s = setup({ now: () => t });
   const input = payReserve(B);
@@ -401,7 +454,8 @@ test('settle: a landed burn is recorded whichever way; one never found, or faile
   assert.deepEqual(parseActivationRecord(view, A.qnet), view);
   assert.equal(s.store.rows.get(A.qnet).burnSlot, 555);
 
-  // A burn announced and never found: the wallet is free again SETTLE_AFTER_MS after the announce.
+  // A burn announced and never found: the wallet is free again once two reads DROP_SETTLE_MS apart, the first
+  // SETTLE_AFTER_MS after the announce or later, find it nowhere; one lagging answer frees nothing.
   const C = walletOf('c');
   const r3 = (await json(await s.api.reserve(post('reserve', reserveBody(C))))).body;
   const tx3 = sig('never');
@@ -413,6 +467,11 @@ test('settle: a landed burn is recorded whichever way; one never found, or faile
   t += 2;
   assert.equal((await json(await s.api.get(get(C.qnet), C.qnet))).body.state, 'sending', 'Solana unreachable: the row stays');
   s.solana.setDown(false);
+  assert.equal((await json(await s.api.get(get(C.qnet), C.qnet))).body.state, 'sending', 'one read that finds it nowhere: the row stays');
+  t += DROP_SETTLE_MS - 1;
+  assert.equal((await json(await s.api.get(get(C.qnet), C.qnet))).body.state, 'sending', 'a second read too soon after the first');
+  assert.equal((await json(await s.api.reserve(post('reserve', reserveBody(C, {}, { time: Math.floor(t / 1000) }))))).status, 409, 'still held meanwhile');
+  t += 1;
   assert.equal((await json(await s.api.get(get(C.qnet), C.qnet))).body.state, 'none');
   // A burn that failed on chain frees the wallet at once; a payment burn too.
   const r4 = (await json(await s.api.reserve(post('reserve', reserveBody(C, {}, { time: Math.floor(t / 1000) }))))).body;
@@ -429,7 +488,7 @@ test('settle: a landed burn is recorded whichever way; one never found, or faile
   assert.deepEqual(RECORD_STATES, ['none', 'reserved', 'sending', 'recorded']);
 });
 
-test('C3.5: a record needs the wallet\'s proof and a final, valid burn of its burner; nothing can be planted', async () => {
+test('the record route: a record needs the wallet\'s proof and a final, valid burn of its burner; nothing can be planted', async () => {
   const s = setup();
   const burnTx = sig('rec');
   const facts = { wallet: A.qnet, nodeType: 'light', burner: A.solana, burnTx, burnAmount: 1500 };
@@ -468,7 +527,7 @@ test('C3.5: a record needs the wallet\'s proof and a final, valid burn of its bu
   }
 });
 
-test('C3.5: the same burner\'s older burn replaces a newer record; another burn never does', async () => {
+test('the record route: the same burner\'s older burn replaces a newer record; another burn never does', async () => {
   const s = setup();
   const newer = sig('newer');
   const older = sig('older');
@@ -487,9 +546,7 @@ test('C3.5: the same burner\'s older burn replaces a newer record; another burn 
   assert.equal(back.body.activation.burnTx, older);
 });
 
-// The extension-overrides-payment branch is gone (C4): a payment burn on its way or recorded is the wallet's, like the
-// extension's.
-test('C4: a payment burn on its way or recorded is the wallet\'s: the extension\'s own burn does not take its place', async () => {
+test('a payment burn on its way or recorded is the wallet\'s: the extension\'s own burn does not take its place', async () => {
   const s = setup();
   const r = await s.registry.reserve(payReserve(A));
   const payTx = sig('pay-first');
@@ -533,6 +590,43 @@ test('release frees only a reservation without a burn; the sweep ends only reser
   assert.equal(s.store.rows.has(A.qnet), false);
   assert.equal(s.store.rows.get(B.qnet).state, 'recorded');
   assert.equal(SWEEP_EVERY_MS, 600_000);
+});
+
+// The wallets' Solana relay sends the extension's burn on only once the extension announced it (solana-relay.ts): the
+// registry finds it by its signature, on its way or recorded; a payment address's burn, a reservation without a burn
+// and an unknown signature are none; a database that cannot answer is unavailable.
+test('announcedBurn: the extension\'s burn by its signature, announced or recorded, and nothing else', async () => {
+  const s = setup();
+  const r = (await json(await s.api.reserve(post('reserve', reserveBody(A, { nodeType: 'super' }))))).body;
+  const burnTx = sig('relay-ext');
+  assert.equal(await s.api.announcedBurn(burnTx), null, 'a reservation without a burn');
+  const facts = { wallet: A.qnet, nodeType: 'super', burner: A.solana, burnTx, burnAmount: 1500 };
+  assert.equal((await s.api.announce(post('announce', { wallet: A.qnet, reservation: r.reservation, burnTx, proof: proofFor(A, facts) }))).status, 200);
+  assert.equal((await s.store.byBurnTx(burnTx)).state, 'sending');
+  assert.deepEqual(await s.api.announcedBurn(burnTx), { burner: A.solana, burnAmount: 1500, nodeType: 'super' });
+  s.solana.land(burnTx, { payer: A.solana, memo: 'QNET_NODE_TYPE:SUPER' });
+  assert.equal((await json(await s.api.get(get(A.qnet), A.qnet))).body.state, 'recorded');
+  assert.deepEqual(await s.api.announcedBurn(burnTx), { burner: A.solana, burnAmount: 1500, nodeType: 'super' }, 'recorded');
+  // A payment address's burn, and a signature the registry does not hold.
+  const p = await s.registry.reserve(payReserve(B));
+  const payTx = sig('relay-pay');
+  assert.equal((await s.registry.announcePayment(p.reservation, PAY.solana, 1500, payTx, ownerBind(B, payTx))).ok, true);
+  assert.equal((await s.store.byBurnTx(payTx)).way, 'payment');
+  assert.equal(await s.api.announcedBurn(payTx), null);
+  assert.equal(await s.store.byBurnTx(sig('relay-unknown')), null);
+  assert.equal(await s.registry.announcedBurn(sig('relay-unknown')), null);
+  // The PostgreSQL statement reads the row by its unique burn; a database that cannot answer is unavailable.
+  const flat = (q) => q.replace(/\s+/g, ' ');
+  assert.match(flat(SQL.byBurnTx), /^SELECT .* FROM cabinet_activations WHERE burn_tx = \$1$/);
+  const seen = [];
+  assert.equal(await createPgStore(async (text, params) => { seen.push([text, params]); return { rows: [] }; }).byBurnTx(burnTx), null);
+  assert.deepEqual(seen, [[SQL.byBurnTx, [burnTx]]]);
+  const broken = createActivationApi({
+    registry: createActivationRegistry({ store: createPgStore(async () => { throw new Error('connection refused'); }), check: async () => null }),
+    walletNode: async () => ({ state: 'none' }), scan: async () => ({ complete: true, unusable: false, burns: [] }),
+    now: () => T0, scope: `relay${Math.random()}`, devOrigins: false, clientKey: () => ({ ok: true, ip: '203.0.113.9' }),
+  });
+  assert.equal(await broken.announcedBurn(burnTx), 'unavailable');
 });
 
 test('the search of a wallet\'s Solana address: only its own burns count, oldest first; the budget and the cache', async () => {
@@ -585,7 +679,7 @@ test('the search of a wallet\'s Solana address: only its own burns count, oldest
   solana.setDown(false);
   // Kept per address; the server's budget, past which a search is not complete. Only a search that reads the marked
   // transactions (A's) or further pages takes one of the scarce budget; an address with no such history (B's) costs one
-  // listing, counted against the larger list budget (SITE H-5).
+  // listing, counted against the larger list budget.
   let t = 0;
   let asked = 0;
   const counting = async (method, params) => { if (method === 'getSignaturesForAddress') asked += 1; return solana.rpc(method, params); };
@@ -612,7 +706,7 @@ test('the search of a wallet\'s Solana address: only its own burns count, oldest
   assert.equal((await lanes(A.solana, undefined, 'public')).complete, true, 'from the cache');
 });
 
-// SITE H-5: a QNet wallet costs nothing, so a signed request is no scarce thing. Each client the route names has its own
+// A QNet wallet costs nothing, so a signed request is no scarce thing. Each client the route names has its own
 // share of each lane before a search takes anything of the server's, and only a search past the first listing takes a
 // scarce place: many throwaway wallets from a few IP addresses leave the lane to everyone else.
 test('a drain from many fresh wallets on a few IPs: each IP its share, nothing scarce for empty addresses, the lane stays open', async () => {
@@ -664,7 +758,7 @@ test('a drain from many fresh wallets on a few IPs: each IP its share, nothing s
   assert.equal((await scanner(walletOf('h5-next').solana, 0, 'reserve', [ips[0]])).complete, true);
 });
 
-// SITE H-5, the routes: the reservation does not sign the Solana address it names, so the page's own finished search of
+// The routes: the reservation does not sign the Solana address it names, so the page's own finished search of
 // it (kept 5 minutes) answers the reservation; a new search is charged to the client. The register route charges the
 // burner's search to its client and to the node.
 test('the routes charge each search to its client; a reservation reuses the page\'s recent finished search', async () => {
@@ -705,7 +799,7 @@ test('the routes charge each search to its client; a reservation reuses the page
   assert.equal(other.status, 200);
   // The register route names its client and the node to the search.
   const register = read('server/cabinet/register.ts');
-  assert.match(register, /return cabinetJson\(200, await ownBurn\(checked\.body as SubmitBody, \[\.\.\.\(client === null \? \[\] : \[client\]\), `node:\$\{id\}`\]\)\);/);
+  assert.match(register, /if \(own\) return ownBurn\(checked\.body as SubmitBody, \[\.\.\.\(client === null \? \[\] : \[client\]\), `node:\$\{id\}`\]\);/);
   assert.match(register, /await options\.scan\(body\.burn_wallet, clients\)/);
   assert.match(read('app/api/cabinet/register/route.ts'), /const scan: OwnBurnScan = \(address, clients\) => api\(\)\.scan\(address, undefined, 'reserve', clients\);/);
 });
@@ -813,6 +907,8 @@ test('PgStore against TEST_DATABASE_URL: two reservations at once, one wins; eve
     assert.equal((await store.byReservation(held.reservation)).wallet, A.qnet);
     const moved = await store.announce({ wallet: A.qnet, reservation: held.reservation, way: 'extension', burner: A.solana, burnAmount: 1500, burnTx: 'tx', proof: { pk: 'p' } });
     assert.equal(moved.wallet, A.qnet);
+    assert.equal((await store.byBurnTx('tx')).wallet, A.qnet);
+    assert.equal(await store.byBurnTx('no such burn'), null);
     assert.equal(await store.reserve(input('4'.repeat(32))), null, 'a burn on its way holds the wallet');
     assert.equal((await store.get(A.qnet)).state, 'sending');
 
@@ -825,9 +921,11 @@ test('PgStore against TEST_DATABASE_URL: two reservations at once, one wins; eve
     const view = async (w) => registry.view(w, await registry.current(w));
     await query('DELETE FROM cabinet_activations', []);
     // The extension's burn: reserved, announced with its proof, landed and final: recorded, with its slot and times.
-    const r1 = await registry.reserve({ wallet: A.qnet, nodeType: 'super', way: 'extension', burner: A.solana, burnAmount: 1500, proof: reserveBody(A, { nodeType: 'super' }).proof });
+    const in1 = { wallet: A.qnet, nodeType: 'super', way: 'extension', burner: A.solana, burnAmount: 1500, proof: reserveBody(A, { nodeType: 'super' }).proof };
+    const r1 = await registry.reserve(in1);
     assert.ok(r1.ok);
     assert.equal(r1.until > Date.now(), true);
+    assert.deepEqual(await registry.reserve(in1), r1, 'the same signed reservation again, read back from the row');
     const tx1 = sig('pg-ext');
     const f1 = { wallet: A.qnet, nodeType: 'super', burner: A.solana, burnTx: tx1, burnAmount: 1500 };
     const p1 = proofFor(A, f1);

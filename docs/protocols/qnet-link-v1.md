@@ -196,9 +196,7 @@ Common rules:
   `X-Forwarded-For` is never read. Without `X-Real-IP` (a request that did not pass nginx) it is the
   socket address. An IPv6 address counts as its /64. A failed resolution → 503. Over the limit → 429
   with `Retry-After` in seconds. The limits allow for many phones or computers behind one carrier or
-  office NAT address. nginx separately caps each address at 10 requests a second on `/api/link/`, in a
-  zone of the relay's own apart from the rest of `/api`, and refuses the requests above by
-  `Sec-Fetch-Site` before that limit counts them.
+  office NAT address.
 
   | Route | Limit per IP |
   | --- | --- |
@@ -256,8 +254,11 @@ with `ct` decoding to 17..1040 bytes. First write wins: 201 `{"ok": true}` store
 to the stored one (all three strings) gets 200 `{"ok": true}` (a retry after a lost answer); any other
 body gets 409. 404 for an unknown or ended session, 400 for a schema violation. A retry reaches the stored
 answer only while the session lives: once the site has read the answer, 120 s more (section 5). The app waits 2, 4,
-8 and 16 s between its first tries and 30 s after that, so a retry after a lost reply lands within that grace unless
-the app stays offline longer; a later retry gets 404, although the site may already hold the answer.
+8 and 16 s between its first tries and 30 s after that, and tries again at once when the app comes to the front or
+the device's network comes back, its waits then starting again from 2 s, so a retry after a lost reply lands within
+that grace unless the app stays offline longer; a later retry gets 404, although the site may already hold the
+answer. A `connect` answer that did not reach the site (404, no answer before the session ended, or 409) is said on
+the device as the addresses not reaching the website, never as sent.
 
 ### 5.4 `GET /api/link/sessions/:id/response` (site)
 
@@ -440,7 +441,10 @@ The site's node cabinet (aiqnet.io/node) asks the extension to activate, and ope
 2. A relay session, whatever its intent: create it (sections 5.1, 6); on 409 retry once with a new key pair and
    id. Poll `GET …/response` every 2 s; poll at once when the page becomes visible again; stop on 200, on 404, or
    600 s after creation (then expired: the page offers Ask again, a new request with the same content). A session the page gives up before that (the user cancelled,
-   or a new request replaces it) it releases (section 5.5), best effort.
+   or a new request replaces it) it releases (section 5.5), best effort. Each of these requests, the create, a
+   poll and the release, ends after 20 s without its answer (`SITE_REQUEST_MS`, the site's `src/lib/site-request.ts`):
+   a create that ends so fails as the site not reached and the page offers to start again, a poll that ends so is
+   sent again after the poll interval, and a release that ends so leaves the session to end by itself (section 5).
 3. The extension's result, checked as section 7.2, is shown as the wallet's report: the code with a copy button,
    node type, burn transaction (Solana explorer link on the burn cluster), amount, and next steps (`light`: the
    page reads the chain until the node is listed, section 14.9; `super`: `QNET_ACTIVATION_CODE`,
@@ -827,10 +831,17 @@ One JSON object with `v` = `1`, `intent` equal to the session's, `status`, and e
 - `link` `linked`: the node was on the chain and this device is linked now; `seq` is the binding's sequence (decimal
   string): the new binding's, or, when nothing was sent because the node already ran here, the sequence of the binding
   this device holds. A `burnTx` in the request was not used.
-- `claim` `ok`: the claim of the request's node was submitted; `nodeId` is the request's. `txHash` is 64 lowercase hex. `stoppedAtEpoch` is `null` for a claim of
-  the whole balance; for a part (the node's quote stopped before the whole balance, and more epochs remain to claim
-  later), it is the first epoch the claim did not take, as a decimal string. `amountNano` (decimal string) is at
-  least 1 QNC when `stoppedAtEpoch` is `null`, and above zero when it is set.
+- `claim` `ok`: the claims of the request's node were submitted, one or more under the one confirmation, each sent
+  once the one before is in a block (sections 14.8 and 14.10); `nodeId` is the request's. `amountNano` (decimal
+  string) is what they moved: the sum of their amounts, except that a last claim the wallet saw taken only in part
+  counts the part the network applied, and one it saw expire counts nothing (the answer then names the claims before
+  it). `txHash` (64 lowercase hex) is the hash of the last claim it counts. `stoppedAtEpoch` is `null` when they moved
+  the whole balance and total at least 1 QNC. Otherwise it is the first epoch that claim did not take, as a decimal
+  string: the run ended short (that claim's quote stopped before the whole balance, more epochs
+  remain to claim later, and no further claim was sent), or it moved the whole balance in less than 1 QNC. The total
+  is at least 1 QNC when `stoppedAtEpoch` is `null`, and above zero when it is set. A claim after the first that fails
+  ends the run short, and the answer is `ok` with the claims before it: an `error` answer still means that nothing was
+  done. A wallet that sends one claim per request answers in the same form, with that claim's amount and hash.
 - `claim` `empty`: the node balance is below 1 QNC.
 - `reserve` `ok`: the wallet signed its reservation of a light node paid from the request's `burner`. `time` is `T`
   (decimal string, Unix seconds), `pk` the wallet's ML-DSA-65 public key (b64url, 1952 bytes), `sig` (b64url, 3309
@@ -902,19 +913,21 @@ Example (vector `link-linked`):
 1. Accept a link only as delivered by the system through the link filter (an App Link, or an `intent:` URL naming
    the package, section 4.1) or as a Universal Link, and parse it as section 14.3. A link that does not parse is
    refused with a neutral message and nothing is fetched.
-2. `GET /api/link/sessions/:id` from the relay base URL (HTTPS, system CAs, 10 s timeout, no cookies, a redirect is
-   a failure). Refuse when: not 200; `sitePub`, `intent`, `request` or `reqHash` differ from the link; `reqHash` is
-   not the hash of the request bytes the app builds from `request`; `answered` is true ("already answered on
-   another device"); `expiresIn` < 30; or this id was already handled on this device (the app remembers handled ids
-   for the TTL).
+2. `GET /api/link/sessions/:id` from the relay base URL (HTTPS, system CAs, 20 s timeout per try, no cookies, a
+   redirect is a failure). Refuse when: not 200; `sitePub`, `intent`, `request` or `reqHash` differ from the link;
+   `reqHash` is not the hash of the request bytes the app builds from `request`; `answered` is true ("already
+   answered on another device"); `expiresIn` < 30; or this id was already handled on this device (the app remembers
+   handled ids for the TTL).
 3. Pick the wallet: the one whose `walletHash` equals the request's (after unlock), `WALLET_MISMATCH` when none does;
    the open wallet when the request has none. A `link` request with `burner` for a node not on the chain:
    `WALLET_MISMATCH` unless `burner` is that wallet's own Solana address. A `claim` request: `WALLET_MISMATCH` unless
    `nodeId` is that wallet's light node id `N` or its super node id `S`, which the app computes from the wallet.
 4. Compute `N` and, for a `burnTx`, `proof` itself. Read the node's status from two genesis nodes: on the chain → the
    device sheet, answered `linked`; not on the chain and no `burnTx` → `NO_NODE`; a server node → `NODE_OTHER`. For
-   `reserve`: a server node on the chain, or aiqnet.io's record naming a super node's burn for the wallet →
-   `NODE_OTHER`; either source not answering → `NETWORK` (the same checks as for a consent). For `claim`: whether the
+   `reserve` and a consent, the sheet shows at once; a server node on the chain that two genesis nodes confirm, or
+   aiqnet.io's record naming a super node's burn for the wallet, read after it shows, turns it into `NODE_OTHER` while
+   the user has not acted, and no answer holds nothing up (aiqnet.io's reserve and registration and the chain refuse a
+   second node of one wallet). For `claim`: whether the
    chain lists the request's node, as two genesis nodes report it alike (a light node's public status, a super node's
    `GET /api/v1/node/status`, its `onchain_registered`): not on the chain → `NO_NODE`; no answer alike → `NETWORK`. For
    `unlink`: this device's
@@ -968,8 +981,18 @@ Example (vector `link-linked`):
      key whose rotation is due counts as past it), no device check ended), the
      node runs here already: nothing is signed, checked or sent, and the answer is `linked` with that binding's `seq`.
      Otherwise the enrolment with `seq = max(now, binding_seq + 1)` on `/light-node/bind`; answer `linked`.
-   - `claim`: the claim of light-node-messages section 4 (quote, then payload) for the request's `nodeId`: the quote
-     signs `q1337|claim_rewards:{nodeId}:{W}` and `/rewards/claim` carries `node_id` = `nodeId`; `ok` or `empty`.
+   - `claim`: the Node tab's move of the balance the sheet showed, under the one confirmation: claims of
+     light-node-messages section 4 (quote, then payload) for the request's `nodeId`, each quote signing
+     `q1337|claim_rewards:{nodeId}:{W}` and each `/rewards/claim` carrying `node_id` = `nodeId`. After a claim whose
+     quote stopped at its size (512 epochs, 128 KiB of proofs, or the leaf rebuilds of one request), the next one is
+     quoted from the epochs that claim left, once it is in a block, and only while at least 150 s of the session
+     remain. A wait for a claim's block ends at that moment too: that claim stays in transit and the answer goes
+     then. A next claim is quoted only at genesis nodes whose node balance read shows the claim before applied, since a
+     node limits the claim requests of an address, quotes included; any quote passes over a node that cannot serve an
+     epoch, has that limit spent for this address, or is busy with another request for the node. The run ends once the
+     balance shown has moved, at a quote the nodes cannot serve, at a claim refused,
+     unanswered, expired or taken only in part, or when the wallet locks. One answer at the end: `ok` (section 14.7)
+     or `empty`.
    - `unlink` on the device that runs the node: the ping key signs the unbind for the binding's sequence (`POST
      /api/v1/light-node/unbind`, with the device key's release when the node holds that key, light-node-messages section
      5.7), within 8 seconds; a binding this device sent with no answer that the network may hold is unbound beside it
@@ -987,7 +1010,13 @@ Example (vector `link-linked`):
    device answered this request first; do not trust what the website shows". Network failure: retry the identical
    body while the session lives. 404: the session expired. In every case the app shows the outcome itself, so
    nothing depends on the site receiving it. After 201 or 200 for a request with `check: true` the app shows "Check
-   number: 482 913".
+   number: 482 913". After a `link` `ok` for a one-time payment address's burn the app also sends the registration
+   that consent is for itself, to `POST /api/cabinet/register` of the relay base URL with the route's consent body,
+   and again after a network failure while the consent is admitted; the page needs no tab of its own for it and only
+   follows the chain, and the route takes the page's submit of the same consent as the same registration. Once the
+   route took it, the app's outcome line says "QNet Blockchain is recording the node in a block. It will run on this
+   device once that is done." (`admitted`) or "Linked to this device. Waiting for its first answer." (`registered`). A
+   burn made from the wallet's own Solana address is registered by the page, with the answer's `ownerSig`.
 9. The app's screens name no price, burn, payment or activation code. The in-app browser refuses the pages of
    `link.aiqnet.io` and the site's `/node`, `/activate`, `/wallet` and `/l` pages, and opens no `intent:` URL. It
    also refuses the pages the site keeps out of the app's view (its home page, `/docs`, `/dao`, `/testnet` and
@@ -1041,7 +1070,10 @@ Example (vector `link-linked`):
    naming the node when the extension holds the wallet the page shows, and a `claim` request naming that wallet and the
    node (beside the extension's, or alone), its button on a phone or tablet and its QR code on a computer. It needs no
    check number: the request names the wallet and the node, and only that wallet's key signs what the network takes. A
-   genesis node's balance is only shown.
+   genesis node's balance is only shown. An `ok` answer of either way is shown as the wallet's report: the total
+   moved, what is left from `stoppedAtEpoch` on only when the answer names that epoch (in words also true when nothing
+   is left), and the last claim's transaction
+   (`txHash`) as a link; the node balance is then read again from the nodes (rule 5).
 
 ### 14.10 Extension methods
 
@@ -1049,7 +1081,7 @@ Example (vector `link-linked`):
 | --- | --- | --- |
 | `qnet_activateNode` | as section 10 | as section 10; after a light burn the extension also records the node on the chain, so the page reads the chain for "Registered" |
 | `qnet_getActivation` | none | as section 10.1: what the extension knows of the wallet's activation, never a window |
-| `qnet_claimNodeBalance` | `{nodeId}`: the wallet's light node id or super node id (section 14.4) | the `claim` answer of section 14.7 without `v` and `intent`: `ok`, `empty` or `error` (`WALLET_MISMATCH` for a node that is not the wallet's); a closed window is the provider error 4001 |
+| `qnet_claimNodeBalance` | `{nodeId}`: the wallet's light node id or super node id (section 14.4) | the `claim` answer of section 14.7 without `v` and `intent`: `ok`, `empty` or `error` (`WALLET_MISMATCH` for a node that is not the wallet's); a closed window is the provider error 4001. Under its one approval the extension moves the balance its window showed as the app does (section 14.8): a next claim once the one before is in a block, and only within 150 s of the page's call, when a wait for a claim's block ends too, so that its one answer comes inside the page's 5-minute wait. One move of a wallet runs at a time: another call meanwhile is `CLAIM_BUSY` |
 | `qnet_unlinkNodeDevice` | none | the `unlink` answer of section 14.7 without `v` and `intent`: `ok` with `unbound: true` (the wallet key's unbind, section 14.8), or `error` with `NO_WALLET`, `NOT_LINKED`, `NETWORK`, `UNLINK_REFUSED` or `INTERNAL`; a closed window is the provider error 4001; an extension without the method answers 4200 |
 
 All four methods answer only the origins of section 10 (4100 for any other). `qnet_claimNodeBalance` acts on the
@@ -1150,5 +1182,10 @@ App behaviour (`src/services/transferLink.js`):
 3. Otherwise the Solana Send form of the token opens with the recipient and the amount filled in and the line "Filled
    in from a link. Check the address and the amount."; the user reviews, may change them, and confirms as for any
    send. Nothing is signed or sent before that.
-4. While the wallet is locked or not there yet, a QNet Link request is on screen or a Send form is open, the request
-   waits and opens once that is over; at most one waits, a newer link replacing it.
+4. While the wallet is locked or not there yet, or a QNet Link request on screen waits for the user's decision, the
+   request waits and opens right after; a decided QNet Link request gives way to it at once, its answer still
+   delivered. Links open one at a time in the order they arrived, one that waited behind an earlier link once the form
+   that link opened is closed. A fresh link takes the place of a Send form the user has open, unless a send is under
+   way, whether or not its form is still open (being checked, reviewed, signed or submitted, or its result on screen);
+   it opens once that send ended and its result was closed. The app keeps a link the system delivered until its form opened, whatever
+   happens to the app's screen meanwhile, and across the process ending for up to 600 s from the link's arrival.

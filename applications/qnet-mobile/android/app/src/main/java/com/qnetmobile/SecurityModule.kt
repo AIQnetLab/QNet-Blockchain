@@ -30,7 +30,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.Window
-import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
@@ -80,8 +79,9 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * QNetSecurity: what the wallet needs from the platform to keep its secrets on the device.
  *
- * - Secret screens: FLAG_SECURE, overlay windows hidden (API 31+), non-assistive accessibility services
- *   locked out (API 34+), obscured touches dropped, keyboard personalised learning off in focused fields.
+ * - Guarded screens (a secret shown or typed, value moved, a request approved): overlay windows hidden (API 31+),
+ *   non-assistive accessibility services locked out (API 34+), obscured touches dropped, keyboard personalised learning
+ *   off in focused fields. No screen is kept from a screenshot or a recording.
  * - Password and recovery-phrase fields, on every screen and API level: no text, text events or text actions for
  *   accessibility services (MPLAT-R4-01).
  * - Keystore keys for the vault: a device seal (non-exportable, no user authentication, StrongBox when present), a
@@ -134,14 +134,9 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
         private const val CLIP_IS_SENSITIVE = "android.content.extra.IS_SENSITIVE"
         private const val OBSCURED_NOTICE_MS = 3000L
         private const val OBSCURED_NOTICE_COLOR = 0xF21E2235.toInt()
-
-        /** Whether a secret screen holds FLAG_SECURE (MainActivity keeps it on its way to the background). */
-        @Volatile @JvmStatic var secretScreenOn = false
-            private set
     }
 
     private val main = Handler(Looper.getMainLooper())
-    @Volatile private var secureOn = false
     @Volatile private var protectOn = false
     @Volatile private var guardOn = false
     @Volatile private var obscuredText = "Another app is drawing over the wallet. The tap was ignored."
@@ -153,7 +148,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
 
     override fun getName(): String = NAME
 
-    // ── Secret screens ───────────────────────────────────────────────────────────────────────────
+    // ── Guarded screens ──────────────────────────────────────────────────────────────────────────
 
     private val focusListener = ViewTreeObserver.OnGlobalFocusChangeListener { _, focused -> noLearning(focused) }
 
@@ -167,14 +162,11 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
         (field.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)?.restartInput(field)
     }
 
-    // `secure`: a screen that shows or takes a secret (FLAG_SECURE too). `guard`: any screen whose taps move
-    // value or approve a request — the send form, a site's or aiqnet.io's confirmation (MPLAT-R2-01). Both keep
-    // overlays out, drop touches that arrive through an obscuring window, and (API 34+) hide the views from an
-    // accessibility service that is not an assistive tool, which also drops the actions and gestures it injects.
-    private fun applySecure(activity: Activity, secure: Boolean, guard: Boolean) {
+    // `guard`: a screen that shows or takes a secret, or whose taps move value or approve a request (the send form, a
+    // site's or aiqnet.io's confirmation). Overlays stay out, touches through an obscuring window are dropped and, from
+    // API 34, an accessibility service that is not an assistive tool neither sees the views nor acts on them.
+    private fun applyGuard(activity: Activity, guard: Boolean) {
         val window = activity.window ?: return
-        if (secure) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) window.setHideOverlayWindows(guard)
         val decor = window.decorView
         decor.filterTouchesWhenObscured = guard
@@ -197,19 +189,11 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
 
     private fun reapply() {
         val activity = reactContext.currentActivity ?: return
-        val secure = secureOn
-        val guard = secureOn || protectOn
-        activity.runOnUiThread { runCatching { applySecure(activity, secure, guard) } }
+        val guard = protectOn
+        activity.runOnUiThread { runCatching { applyGuard(activity, guard) } }
     }
 
-    @ReactMethod
-    fun setSecureScreen(on: Boolean) {
-        secureOn = on
-        secretScreenOn = on
-        reapply()
-    }
-
-    /** The guard of a secret screen without FLAG_SECURE: for screens that move value (MPLAT-R2-01). */
+    /** The guard of a screen that shows or takes a secret, moves value or approves a request. */
     @ReactMethod
     fun setProtectInteraction(on: Boolean) {
         protectOn = on
@@ -242,7 +226,7 @@ class SecurityModule(private val reactContext: ReactApplicationContext) :
             runCatching {
                 if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) app.reactHost?.reload("layout direction")
                 else app.reactNativeHost.reactInstanceManager.recreateReactContextInBackground()
-            }.onFailure { android.util.Log.w("QNetSecurity", "[WARN][I18N] layout restart failed error=${it.javaClass.simpleName}") }
+            }.onFailure { prodLog("QNetSecurity", true, "[WARN][I18N] layout_restart_failed error=${it.javaClass.simpleName}") }
         }
     }
 

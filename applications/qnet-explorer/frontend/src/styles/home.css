@@ -30,6 +30,9 @@
 
 /* The live column at the hero's right edge: the rain falls into it, the matrix becomes the chain. */
 .stream { grid-column: 10 / span 3; align-self: end; display: flex; flex-direction: column; min-width: 0; transition: opacity 1s ease .2s; }
+/* Under 1,100 px three columns are narrower than a row's first line in the longer languages (a height and its count): the
+   column takes the free one beside the copy. */
+@media (min-width: 861px) and (max-width: 1099px) { .stream { grid-column: 9 / span 4; } }
 .hero[data-decoding] .stream { opacity: 0; }
 .stream-head { display: flex; align-items: center; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--rule-strong); }
 /* A window of fixed height: rows fill it from the top, so nothing around it moves as blocks arrive. */
@@ -41,17 +44,17 @@
 .stream-list { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
 .blk { height: var(--row-2); border-bottom: 1px solid var(--rule); font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); line-height: 1.35; color: var(--fog); }
 .blk-in { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: 24px 18px; column-gap: 12px; align-content: center; height: 100%; }
-/* A row: the height with its transaction count, the age at the right; under them the hash and the producer. */
-.blk-h { display: flex; align-items: baseline; gap: 12px; min-width: 0; font-size: 15px; letter-spacing: -.02em; white-space: nowrap; }
+/* A row: the height with its transaction count across the column; under them the producer, which gives way, and the age
+   at the right. Each line holds one of the language's phrases, so in every language neither runs into the other's field. */
+.blk-h { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 12px; min-width: 0; font-size: 15px; letter-spacing: -.02em; white-space: nowrap; }
 .blk-h .ent { font-size: inherit; }
 .blk-h .flash { position: relative; }
 .blk-txs { font-size: var(--t-label); letter-spacing: 0; color: var(--fog); }
-.blk-in[data-new] .flash::after { content: attr(data-v); position: absolute; left: 0; top: 0; color: var(--ember); opacity: 0; pointer-events: none; animation: emberfade var(--t-flash) ease-out; }
-/* The age keeps the width of "59m ago", so its box stays put as "9s ago" becomes "10s ago". */
-.blk-age { min-width: 7ch; text-align: right; white-space: nowrap; align-self: center; }
-.blk-by { grid-column: 1 / -1; display: flex; gap: 14px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.blk-in[data-new] .flash::after { content: attr(data-v); position: absolute; inset-inline-start: 0; top: 0; color: var(--ember); opacity: 0; pointer-events: none; animation: emberfade var(--t-flash) ease-out; }
+/* The age's box holds the language's longest age (HomeClient), so nothing beside it moves as "9s ago" becomes "10s ago". */
+.blk-age { grid-area: 2 / 2; text-align: end; white-space: nowrap; align-self: center; }
+.blk-by { grid-area: 2 / 1; display: flex; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .blk-by .ent { font-size: inherit; overflow: hidden; text-overflow: ellipsis; }
-.blk-hash { flex: none; }
 .hero-ro { padding-bottom: clamp(36px, 4vw, 56px); --ro-sub-lines: 2; }
 /* A tablet in portrait: three across; the measured rate takes the two places beside the supply. */
 @media (min-width: 600px) and (max-width: 860px) {
@@ -63,13 +66,13 @@
 .get-body { display: grid; grid-template-columns: 264px minmax(0, 1fr); column-gap: clamp(32px, 5vw, 80px); padding-bottom: 40px; }
 .qr { position: relative; width: 264px; margin: 0; }
 .qr-code { display: block; width: 264px; height: 264px; border-radius: var(--radius); }
-.qr figcaption { position: absolute; top: 100%; left: 0; margin-top: 16px; white-space: nowrap; }
-.stores { display: grid; grid-template-rows: repeat(3, 88px); margin: 0; padding: 0; list-style: none; }
+.qr figcaption { position: absolute; top: 100%; inset-inline-start: 0; margin-top: 16px; white-space: nowrap; }
+.stores { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: repeat(3, 88px); margin: 0; padding: 0; list-style: none; }
 .stores li { border-top: 1px solid var(--rule-strong); }
 .stores li:last-child { border-bottom: 1px solid var(--rule-strong); }
 .store {
   height: 100%; display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 4fr) minmax(0, 4fr); align-items: center; column-gap: 24px;
-  padding: 0 8px 0 4px; transition: background-color var(--t-hover);
+  padding: 0; padding-inline: 4px 8px; transition: background-color var(--t-hover);
 }
 .store:hover { background: var(--fill-store); }
 .store-n { font-weight: 640; font-stretch: 104%; font-size: clamp(22px, 2vw, 28px); letter-spacing: -.02em; color: var(--paper); white-space: nowrap; }
@@ -102,7 +105,8 @@
 
 /* ---------- Security model: one row each, the datum on the left ---------- */
 .feat { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); padding: 36px 0 44px; border-top: 1px solid var(--rule); }
-.feat-k { grid-column: 1 / span 5; margin: 0; font-family: var(--font-mono); font-stretch: 80%; font-weight: 300; font-size: var(--t-datum); line-height: 1.05; letter-spacing: -.035em; color: var(--paper); }
+/* A datum of two phrases breaks between them, its lines even, never inside a word of any script. */
+.feat-k { grid-column: 1 / span 5; margin: 0; font-family: var(--font-mono); font-stretch: 80%; font-weight: 300; font-size: var(--t-datum); line-height: 1.05; letter-spacing: -.035em; color: var(--paper); text-wrap: balance; word-break: keep-all; }
 .feat-t { grid-column: 6 / span 7; }
 .feat .h3 { margin-bottom: 12px; }
 .feat .body { max-width: 62ch; }
@@ -141,7 +145,9 @@
 
 .split { margin-top: 22px; display: flex; gap: 3px; }
 .split > div { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.split i { display: block; height: 6px; background: var(--paper); }
+/* The quarter's words stand at its end, so a name longer than the quarter runs back under the bar, never past it. */
+.split > div + div { align-items: flex-end; }
+.split i { display: block; align-self: stretch; height: 6px; background: var(--paper); }
 .split > div + div i { background: var(--fog); }
 .split-v { font-family: var(--font-mono); font-stretch: 87.5%; font-size: var(--t-small); color: var(--paper); }
 .split-n { font-size: var(--t-sub); color: var(--fog); white-space: nowrap; }
@@ -186,15 +192,15 @@
 .mb dt { font-family: var(--font-mono); font-stretch: 87.5%; font-size: 12px; color: var(--fog); }
 .mb dd { margin: 10px 0 0; display: grid; grid-template-columns: minmax(0, 1fr) 60px; align-items: center; column-gap: 14px; }
 .mb .track { position: relative; height: 10px; }
-.mb .track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--paper); }
-.mb b { font-family: var(--font-mono); font-stretch: 80%; font-weight: 300; font-size: 22px; line-height: 1; letter-spacing: -.02em; color: var(--paper); text-align: right; }
+.mb .track i { position: absolute; inset-inline-start: 0; top: 0; bottom: 0; background: var(--paper); }
+.mb b { font-family: var(--font-mono); font-stretch: 80%; font-weight: 300; font-size: 22px; line-height: 1; letter-spacing: -.02em; color: var(--paper); text-align: end; }
 .specs { margin-top: clamp(80px, 9vw, 128px); }
 .spec { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--col-gap); padding: 28px 0 32px; border-top: 1px solid var(--rule); }
 .spec .h3 { grid-column: 1 / span 4; }
 .spec .body { grid-column: 6 / span 7; }
 .spec .body p { margin: 0; }
-.pools { list-style: none; counter-reset: pool; display: grid; gap: 10px; margin: 0 0 10px; padding: 0; }
-.pools li { counter-increment: pool; display: grid; grid-template-columns: 28px 1fr; }
+.pools { list-style: none; counter-reset: pool; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin: 0 0 10px; padding: 0; }
+.pools li { counter-increment: pool; display: grid; grid-template-columns: 28px minmax(0, 1fr); }
 .pools li::before { content: counter(pool) '.'; font-family: var(--font-mono); font-size: 13px; color: var(--fog); padding-top: 3px; }
 @media (max-width: 960px) {
   .phase { grid-column: 1 / -1; }

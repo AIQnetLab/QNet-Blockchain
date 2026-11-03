@@ -12,10 +12,10 @@ const TEAM_ID_RE = /^[A-Z0-9]{10}$/;
 // and release > App integrity (classic key). A build signed with the upload key for local testing is not listed:
 // the site's Android button names the package, which opens it without the association.
 export const ANDROID_PLAY_PACKAGE = 'io.aiqnet.wallet';
-// The live Google Play listing of that package (owner, 05.10: accepted into the store).
+// The live Google Play listing of that package, in which the app is published.
 export const ANDROID_PLAY_URL = `https://play.google.com/store/apps/details?id=${ANDROID_PLAY_PACKAGE}`;
 // The iOS app's store listing (https://apps.apple.com/app/id<numeric app id>) once it is published; until then null, and
-// the footer shows the badge without a link, with a TestFlight link beside it (owner, 12.10: a badge never opens a
+// the footer shows the badge without a link, with a TestFlight link beside it (a badge never opens a
 // placeholder). Setting it turns that badge into the link.
 export const IOS_APP_STORE_URL: string | null = null;
 // The public TestFlight group, where iPhone and iPad install the app until the App Store listing is live.

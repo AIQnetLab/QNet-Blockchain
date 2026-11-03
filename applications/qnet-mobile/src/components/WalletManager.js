@@ -15,7 +15,7 @@ import * as bip39 from 'bip39';
 import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 import * as Keychain from 'react-native-keychain';
 import {
-  EXPLORER_API, GENESIS_NODES, SOLANA_CLUSTER, getSolanaRpcUrl, rotateSolanaRpc, shuffledGenesisNodes,
+  EXPLORER_API, GENESIS_NODES, SOLANA_CLUSTER, shuffledGenesisNodes,
 } from '../config/nodes';
 // Post-quantum BFT light-client: trustless committee-QC state-root verification
 // (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
@@ -34,10 +34,13 @@ import {
 import {
   planNonce, pendingFor, pendingEntry, settle, putSigned, updateEntry, pendingChoices, recentSettled, bodyHashOf,
   pendingView, stoppable, stopLandsUntil, stopFrom, stoppedUntil, autoSendable, refusalHeals, mayLandUntil,
-  RESEND_HELD_MS, normalSpend, ownSpends, spendableFrom,
+  RESEND_HELD_MS, normalSpend, ownSpends, spendableFrom, expireByHeight, expiredRecord,
 } from '../services/PendingTx';
 import { parseStrictJson, u64Text } from '../utils/strictJson';
-import { txLookupState, listingKeysOfNodeRow } from '../utils/txHistory';
+import { txLookupState, listingKeysOfNodeRow, listingKey, lookupListingKeys } from '../utils/txHistory';
+import { afterUserActions } from '../utils/userHold';
+import { pause } from '../utils/pause';
+import { valueBy } from '../utils/deadline';
 
 // An epoch (u64 decimal text, or a number) as a number where it is exact; null otherwise.
 const epochNumber = (v) => {
@@ -53,14 +56,14 @@ import {
 // Calldata, gas and request bodies: the one copy the extension and the SDK compile too (tx-vectors.json).
 import {
   contractCallData, contractCallIntrinsicGas, contractCallRequestJson, transferRequestJson, toU64String, TX_ROUTES,
-  buildContractCall as buildWasmCall,
+  buildContractCall as buildWasmCall, txExpiryFromAccount, expiryRefusalOf, resignFormOf, expiryAt,
 } from '../crypto/TxBuilders';
 import { nodeReservationMessage, signOffchainMessage, signSiteRecord } from '../crypto/OffchainMessage';
 import { base58Encode, fromBaseUnits, messageFeePayer, PACKET_DATA_SIZE } from '../crypto/SolanaTx';
-import { SOLANA_TOKENS, heldTokenBase } from '../services/SolanaSend';
+import { SOLANA_TOKENS, heldTokenBase, solBalanceOf } from '../services/SolanaSend';
 import {
-  attachPreimage, b64url, consentPreimage, delegationPreimage, lightNodeId, ownerBindPreimage, registrationProof,
-  statusPreimage, walletUnbindPreimage,
+  attachPreimage, b64url, claimPayloadPreimage, claimPayloadPreimageV2, consentPreimage, delegationPreimage, lightNodeId,
+  ownerBindPreimage, registrationProof, statusPreimage, walletUnbindPreimage,
 } from '../crypto/NodePreimages';
 import {
   GAS_PRICE, TRANSFER_GAS_LIMIT, STORAGE_DEPOSIT_NANO, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT, feeNano, NANO_PER_QNC,
@@ -80,8 +83,10 @@ import {
   state as deviceAuthStoreState,
 } from '../services/DeviceAuthStore';
 import { forgetKeys as forgetNodeDeviceKeys, NODE_DEVICE_KEY_SERVICE } from '../services/NodeDeviceKey';
+import { serverStatusNames } from '../services/LightNode';
 import { PING_KEY_PREFIX, forgetUnconfirmedBinding, pingKeyService, storePingKey } from '../services/PingKeys';
 import { createPasswordLimiter } from '../utils/passwordLimiter';
+import { settleReads } from '../utils/settleReads';
 import logger from '../utils/logger';
 import { LANGUAGE_KEY, tr } from '../i18n';
 
@@ -2695,7 +2700,7 @@ export class WalletManager {
       try {
         return (await this._readDeviceAuthFlag()) ? 'yes' : 'no';
       } catch (_) {
-        if (i + 1 < attempts) await new Promise((r) => setTimeout(r, retryMs));
+        if (i + 1 < attempts) await pause(retryMs);
       }
     }
     return 'unknown';
@@ -2955,11 +2960,7 @@ export class WalletManager {
 
   async _capsuleFirst(index, head) {
     if (!Number.isSafeInteger(head) || !(stepsToVerify(index) > OWN_ROOT_WALK_STEPS)) return;
-    let timer;
-    await Promise.race([
-      this._refreshCapsule(head).catch(() => null),
-      new Promise((resolve) => { timer = setTimeout(resolve, WalletManager.CAPSULE_WAIT_MS); }),
-    ]).finally(() => clearTimeout(timer));
+    await valueBy(this._refreshCapsule(head).catch(() => null), Date.now() + WalletManager.CAPSULE_WAIT_MS, undefined);
   }
 
   // The last verified balances of the open wallet, sealed under the vault's data key like the anchors, so the Assets tab
@@ -3266,7 +3267,7 @@ export class WalletManager {
         return (await this._vaultCandidates()).length > 0 ? 'ok' : 'none';
       } catch (e) {
         if (e instanceof VaultCorruptError) return 'corrupt';
-        if (i + 1 < attempts) await new Promise((r) => setTimeout(r, retryMs));
+        if (i + 1 < attempts) await pause(retryMs);
       }
     }
     return 'unreadable';
@@ -4169,7 +4170,7 @@ export class WalletManager {
   // auto-lock, discovered nodes — are not in it, and transaction history is kept per wallet (services/HistoryCache).
   static WALLET_SCOPED_KEYS = [
     'qnet_address', 'qnet_address_scheme',
-    'qnet_last_activated_node', 'qnet_cached_server_status', 'qnet_node_link_pending',
+    'qnet_wallet_node', 'qnet_node_link_pending',
     'qnet_custom_tokens', 'qnet_hidden_tokens', 'qnet_node_rewards', 'qnet_rate_limit',
     'qnet_last_sent_fcm_token', 'qnet_last_token_refresh_ts', 'qnet_needs_token_refresh',
     'qnet_pending_txs', 'qnet_qc_anchors', 'qnet_balance_cache',
@@ -4609,9 +4610,12 @@ export class WalletManager {
       });
     });
     return new Promise((resolve, reject) => {
+      // The second node's start, which a request that settled before it has no use for.
+      let hedge = null;
       // Every launched request ended without a settling answer (settleOn only).
       const finish = () => {
         settled = true;
+        clearTimeout(hedge);
         if (answers.length > 0) resolve({ ...answers[0], answers: answers.slice(), unanswered });
         else reject(lastErr || new Error('all nodes failed'));
       };
@@ -4622,7 +4626,7 @@ export class WalletManager {
           pending--;
           if (settled) return;
           if (!settleOn || settleOn(res)) {
-            settled = true; ctrls.forEach(c => { try { c.abort(); } catch (_) {} });
+            settled = true; clearTimeout(hedge); ctrls.forEach(c => { try { c.abort(); } catch (_) {} });
             resolve(settleOn ? { ...res, answers: [...answers, res], unanswered } : res);
             return;
           }
@@ -4636,12 +4640,15 @@ export class WalletManager {
           if (launched < bases.length) launch(launched);            // failed → next immediately
           else if (pending === 0) {
             if (settleOn) finish();
-            else reject(lastErr || new Error('all nodes failed'));
+            else {
+              clearTimeout(hedge);
+              reject(lastErr || new Error('all nodes failed'));
+            }
           }
         });
       };
       launch(0);
-      if (bases.length > 1) setTimeout(() => { if (!settled && launched < 2) launch(1); }, hedgeMs);
+      if (bases.length > 1) hedge = setTimeout(() => { if (!settled && launched < 2) launch(1); }, hedgeMs);
     });
   }
 
@@ -4705,10 +4712,13 @@ export class WalletManager {
       }
     };
     return new Promise((resolve, reject) => {
+      // The second node's start, which a read that settled before it has no use for.
+      let hedge = null;
       const next = () => {
         if (launched < bases.length) { launch(launched); return; }
         if (pending > 0) return;
         settled = true;
+        clearTimeout(hedge);
         if (lastAnswer) resolve(lastAnswer);
         else reject(lastErr || new Error('all nodes failed'));
       };
@@ -4721,6 +4731,7 @@ export class WalletManager {
           if (settled) return;
           if (res.ok) {
             settled = true;
+            clearTimeout(hedge);
             ctrls.forEach((c) => { try { c.abort(); } catch (_) { /* already over */ } });
             resolve(res);
             return;
@@ -4735,7 +4746,7 @@ export class WalletManager {
       };
       if (bases.length === 0) { reject(new Error('all nodes failed')); return; }
       launch(0);
-      if (bases.length > 1) setTimeout(() => { if (!settled && launched < 2) launch(1); }, hedgeMs);
+      if (bases.length > 1) hedge = setTimeout(() => { if (!settled && launched < 2) launch(1); }, hedgeMs);
     });
   }
 
@@ -4773,6 +4784,11 @@ export class WalletManager {
     if (!res || !res.ok || !res.data) return { landed: false, known: false };
     const accountNonce = Number(res.data.nonce) || 0;
     if (accountNonce < nonce) {
+      // A V2 transaction whose last height this answer's tip passed, its nonce still free, never goes into a block: it
+      // failed and took nothing (the chain's height decides it, never a clock).
+      if (await this._expiredAt(address, nonce, { nonce: accountNonce, nextHeight: res.data.next_height })) {
+        return { landed: false, known: true, expired: true };
+      }
       // Nodes admit only the account's next nonce: an appended transaction goes out again once the one before it
       // has applied, and not before (MOBNET-R2-04).
       if (nonce === accountNonce + 1) await this.rebroadcastPending(address, nonce).catch(() => false);
@@ -4787,8 +4803,7 @@ export class WalletManager {
       };
     }
     const row = await this._appliedRowAtNonce(address, nonce);
-    // No node gave the history: nothing learned, as when the account went unread (a history row is never marked not
-    // found on a read that failed, L-10).
+    // No node gave the history: nothing learned, as when the account went unread.
     if (row === undefined) return { landed: false, known: false };
     if (!row) return { landed: false, known: true, spent: true };
     const txHash = typeof row.hash === 'string' ? row.hash : null;
@@ -4800,6 +4815,17 @@ export class WalletManager {
     if (bound === true) return { landed: true, known: true, txHash };
     if (bound === false) return { landed: false, known: true, replaced: true };
     return { landed: false, known: true, unbound: true, txHash };
+  }
+
+  /**
+   * Whether this wallet's transaction at `nonce` expired by a genesis node's answer `tip` ({ nonce, nextHeight }): the kept
+   * V2 transactions it ends leave the store (PendingTx expireByHeight), and one that left that way before stays expired.
+   */
+  async _expiredAt(address, nonce, tip) {
+    const gone = Number.isSafeInteger(tip.nextHeight) ? await expireByHeight(address, tip).catch(() => []) : [];
+    if (gone.some((e) => e.nonce === nonce)) return true;
+    if (await pendingEntry(address, nonce).catch(() => null)) return false;
+    return !!(await expiredRecord(address, nonce).catch(() => null));
   }
 
   /**
@@ -4863,12 +4889,15 @@ export class WalletManager {
   async transactionStatusAt(address, nonce) {
     const unknown = { status: 'unknown', blockHeight: null, txHash: null };
     if (!Number.isSafeInteger(nonce) || nonce < 1) return unknown;
-    let confirmed;
+    let account;
     try {
-      confirmed = await this._agreedGenesisNonce(address);
+      account = await this._agreedGenesisAccount(address);
     } catch (_) {
       return unknown;
     }
+    const confirmed = account.nonce;
+    // An expired V2 transaction is no longer pending: no block can take it.
+    if (account.tip) await expireByHeight(address, account.tip).catch(() => []);
     const kept = await pendingEntry(address, nonce).catch(() => null);
     if (confirmed < nonce) return kept && WalletManager.stillSent(kept) ? { ...unknown, status: 'pending' } : unknown;
     const mine = kept ? pendingView(kept) : (await recentSettled(address).catch(() => [])).find((r) => r && r.nonce === nonce);
@@ -4878,18 +4907,31 @@ export class WalletManager {
   }
 
   /**
+   * What three genesis nodes answer to GET /api/v1/transaction/{hash}: `height`, the block of the included transaction
+   * that at least MIN_GENESIS_AGREEMENT of them report alike (with `key`, only answers whose lookupListingKeys for
+   * `owner` hold that listing key count), else null; `answered`, how many gave an answer (found or not_found).
+   */
+  async _lookupAgreement(hash, { key = null, owner = null } = {}) {
+    const path = `/api/v1/transaction/${encodeURIComponent(hash)}`;
+    let answered = 0;
+    const heights = await Promise.all(this.getTrustedNodes(3).map((base) => this._getJson(base, path, 4000).then((d) => {
+      if (d && (d.status === 'found' || d.status === 'not_found')) answered += 1;
+      if (txLookupState(d, hash) !== 'included') return null;
+      if (key !== null && !lookupListingKeys(d, hash, owner).includes(key)) return null;
+      return d.transaction.block_height;
+    }, () => null)));
+    const count = new Map();
+    for (const h of heights) if (h !== null) count.set(h, (count.get(h) || 0) + 1);
+    const agreed = [...count].filter(([, n]) => n >= MIN_GENESIS_AGREEMENT).map(([h]) => h);
+    return { height: agreed.length === 1 ? agreed[0] : null, answered };
+  }
+
+  /**
    * The block height of the included transaction `hash` that at least MIN_GENESIS_AGREEMENT genesis nodes report alike
    * (the extension's rule, CONTRACTS.md 4.9), or null: one node, lagging or hostile, never names the height alone.
    */
   async _agreedBlockHeight(hash) {
-    const path = `/api/v1/transaction/${encodeURIComponent(hash)}`;
-    const heights = await Promise.all(this.getTrustedNodes(3).map((base) => this._getJson(base, path, 4000)
-      .then((d) => (txLookupState(d, hash) === 'included' && Number.isSafeInteger(d.transaction.block_height)
-        && d.transaction.block_height >= 0 ? d.transaction.block_height : null), () => null)));
-    const count = new Map();
-    for (const h of heights) if (h !== null) count.set(h, (count.get(h) || 0) + 1);
-    const agreed = [...count].filter(([, n]) => n >= MIN_GENESIS_AGREEMENT).map(([h]) => h);
-    return agreed.length === 1 ? agreed[0] : null;
+    return (await this._lookupAgreement(hash)).height;
   }
 
   // History's receive labels (wallet-galc plan P1; the extension's nodeConfirmedRows): the newest rows of a node's
@@ -4942,6 +4984,27 @@ export class WalletManager {
       for (const k of keys) counts.set(k, (counts.get(k) || 0) + 1);
     }
     return new Set([...counts].filter(([, n]) => n >= MIN_GENESIS_AGREEMENT).map(([k]) => k));
+  }
+
+  /**
+   * History's rows past the newest HISTORY_LISTING_PAGE (utils/txHistory rowsToLookUp), asked about by hash, never through
+   * the node's `page=` (it skips rows): one at a time, in order, each after what the user waits on (utils/userHold), as
+   * the inclusion proofs wait. { listed, answered }, by listing key: `listed`, the rows at least MIN_GENESIS_AGREEMENT
+   * genesis nodes report included alike as the listing compares them (_lookupAgreement), at the row's block when it
+   * names one; `answered`, the rows that many nodes answered for (a row fewer answered is asked again by a later read).
+   */
+  async lookedUpHistoryRows(address, rows) {
+    const listed = new Set();
+    const answered = new Set();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const key = listingKey(row);
+      if (key === null) continue;
+      await afterUserActions();
+      const r = await this._lookupAgreement(row.hash, { key, owner: address }).catch(() => ({ height: null, answered: 0 }));
+      if (r.answered >= MIN_GENESIS_AGREEMENT) answered.add(key);
+      if (r.height !== null && (!Number.isSafeInteger(row.block) || row.block === r.height)) listed.add(key);
+    }
+    return { listed, answered };
   }
 
   // A send is checked against the wallet's figure at a genesis node's live tip (the owner's rule, 18.10): the proof route
@@ -5177,39 +5240,50 @@ export class WalletManager {
     } catch (_) { /* kept next time */ }
   }
 
-  static nonceReads = new Map(); // address -> the agreed nonce read in flight
+  static nonceReads = new Map(); // address -> the agreed account read in flight
 
   /**
    * The highest account nonce at least MIN_GENESIS_AGREEMENT genesis nodes report alike; throws NONCE_UNKNOWN when no
    * two agree. One read at a time per address (the send check and the nonce plan of one send ask together). It settles
-   * as soon as no answer still out can change it (_settleGenesis): fewer are out than an agreement needs, and none of
+   * as soon as no answer still out can change it (settleReads): fewer are out than an agreement needs, and none of
    * them could still bring a higher value to an agreement.
    */
   _agreedGenesisNonce(address) {
+    return this._agreedGenesisAccount(address).then((a) => a.nonce);
+  }
+
+  /**
+   * _agreedGenesisNonce's read with what the same answers say of the next block: { nonce, txV2 (every answer of that
+   * nonce says the network takes the V2 form), nextHeight (the highest next height they name, or null), tip ({ nonce,
+   * nextHeight: the lowest }, or null) }. One read gives the nonce, the form a transaction signs (TxBuilders
+   * txExpiryFromAccount) and the fate of a kept one by height (PendingTx expireByHeight).
+   */
+  _agreedGenesisAccount(address) {
     const running = WalletManager.nonceReads.get(address);
     if (running) return running;
-    const read = this._agreedGenesisNonceNow(address).finally(() => {
+    const read = this._agreedGenesisAccountNow(address).finally(() => {
       if (WalletManager.nonceReads.get(address) === read) WalletManager.nonceReads.delete(address);
     });
     WalletManager.nonceReads.set(address, read);
     return read;
   }
 
-  async _agreedGenesisNonceNow(address) {
+  async _agreedGenesisAccountNow(address) {
     let keyed = 0;
     const reads = GENESIS_NODES.map((base) => this._getJson(base, `/api/v1/account/${address}`, 4000).then((a) => {
       if (!a || !/^\d+$/.test(String(a.nonce))) return null;
       // The genesis answers also say whether the chain holds this wallet's key (pk elision), late ones included.
       if (a.has_dilithium_pk === true && ++keyed >= MIN_GENESIS_AGREEMENT) WalletManager.pkBound[address] = true;
-      return Number(a.nonce);
+      const next = Number.isSafeInteger(a.next_height) && a.next_height > 0 ? a.next_height : null;
+      return { nonce: Number(a.nonce), txV2: a.tx_v2 === true, nextHeight: next };
     }, () => null));
     const countsOf = (list) => {
       const counts = new Map();
-      for (const n of list) if (n !== null) counts.set(n, (counts.get(n) || 0) + 1);
+      for (const a of list) if (a !== null) counts.set(a.nonce, (counts.get(a.nonce) || 0) + 1);
       return counts;
     };
     const agreedOf = (counts) => [...counts].filter(([, n]) => n >= MIN_GENESIS_AGREEMENT).map(([nonce]) => nonce);
-    const answers = await this._settleGenesis(reads, (got, left) => {
+    const answers = await settleReads(reads, (got, left) => {
       if (left >= MIN_GENESIS_AGREEMENT) return false;
       const counts = countsOf(got);
       const agreed = agreedOf(counts);
@@ -5221,7 +5295,39 @@ export class WalletManager {
       throw Object.assign(new Error('The network could not confirm this wallet\'s transaction count. Try again in a moment.'),
         { code: 'NONCE_UNKNOWN' });
     }
-    return Math.max(...agreed);
+    const nonce = Math.max(...agreed);
+    const same = answers.filter((a) => a && a.nonce === nonce);
+    const heights = same.map((a) => a.nextHeight).filter((h) => h !== null);
+    return {
+      nonce,
+      txV2: same.every((a) => a.txV2),
+      nextHeight: heights.length ? Math.max(...heights) : null,
+      tip: heights.length ? { nonce, nextHeight: Math.min(...heights) } : null,
+    };
+  }
+
+  /**
+   * The one re-sign a typed refusal of the form or the last height in `answer` (a node's answer or its words) asks for,
+   * for a send and a claim of `address` alike: { expiry: null } signs the V1 form (tx_v2_before_gate), { expiry } the V2
+   * form with next_height + TX_V2_LIFETIME_BLOCKS from a genesis node's account answer read now; null is no re-sign (any
+   * other answer, or no answer that names a next height).
+   */
+  async _resignExpiry(address, answer, nonce = null) {
+    const form = resignFormOf(expiryRefusalOf(answer));
+    let expiry = null;
+    if (form === 'v2') {
+      try {
+        const res = await this._hedged(`/api/v1/account/${address}`, { timeoutMs: 4000, hedgeMs: 700 });
+        expiry = res && res.ok ? txExpiryFromAccount(res.data, NETWORK_ID, true) : null;
+      } catch (_) {
+        expiry = null;
+      }
+      if (!expiry) return null;
+    } else if (form !== 'v1') {
+      return null;
+    }
+    logger.warn(`[WARN][SEND] resign_after_typed_refusal form=${form} nonce=${nonce === null ? 'claim' : nonce}`);
+    return { expiry };
   }
 
   /**
@@ -5287,36 +5393,10 @@ export class WalletManager {
     const order = shuffledGenesisNodes();
     const first = order.slice(0, WalletManager.GENESIS_AGREEMENT_FIRST);
     const ask = (base) => Promise.resolve().then(() => read(base)).catch(() => null);
-    const answers = await this._settleGenesis(first.map(ask), (got, left) => left < MIN_GENESIS_AGREEMENT && decided(got));
+    const answers = await settleReads(first.map(ask), (got, left) => left < MIN_GENESIS_AGREEMENT && decided(got));
     if (order.length <= first.length || decided(answers)) return answers;
     const rest = await Promise.all(order.slice(first.length).map(ask));
     return [...answers, ...rest];
-  }
-
-  /**
-   * The answers of `reads` (promises; one that rejects answers null), in the order they came: as soon as
-   * `determined(answers, left)` says the `left` still out cannot change the outcome, else once all are in. Only when an
-   * agreement read is decided changes, never what decides it; the reads still out run on and are ignored.
-   */
-  _settleGenesis(reads, determined) {
-    return new Promise((resolve) => {
-      const got = [];
-      let left = reads.length;
-      let done = false;
-      const settleIfDecided = () => {
-        if (done || (left > 0 && !determined(got, left))) return;
-        done = true;
-        resolve(got.slice());
-      };
-      if (left === 0) { settleIfDecided(); return; }
-      for (const p of reads) {
-        Promise.resolve(p).catch(() => null).then((v) => {
-          got.push(v);
-          left -= 1;
-          settleIfDecided();
-        });
-      }
-    });
   }
 
   /**
@@ -5355,11 +5435,11 @@ export class WalletManager {
   }
 
   /**
-   * Signs and submits one nonce-bound transaction. `sign(nonce)` returns { path, body, pk }: the request
-   * with its signature over that nonce, and the public key hex for a resend that has to carry it. The signed
-   * request is kept before anything is sent, and every resend is those same bytes. Returns
-   * { accepted: true, data, nonce, replaced } or { accepted: false, error, unknown }. One at a time.
-   * `extra` describes the transaction ({ kind, to, amountNano, method }) for the screens and the resolver.
+   * Signs and submits one nonce-bound transaction. `sign(nonce, expiry)` returns { path, body, pk }: the request
+   * with its signature over that nonce, in the V2 form when `expiry` ({ networkId, validUntil }) is given, and the public
+   * key hex for a resend that has to carry it. The signed request is kept before anything is sent, and every resend is
+   * those same bytes. Returns { accepted: true, data, nonce, replaced } or { accepted: false, error, unknown }. One at a
+   * time. `extra` describes the transaction ({ kind, to, amountNano, method }) for the screens and the resolver.
    */
   // `expectNonce`: the nonce a confirmation screen showed; another one throws NONCE_CHANGED before signing.
   // `choice`: what the user chose about this wallet's unsettled transactions (resolveNonce).
@@ -5368,13 +5448,16 @@ export class WalletManager {
   async _signAndSubmit(from, sign, extra = {}, { expectNonce = null, choice = null, oneInFlight = false } = {}) {
     const lane = this._txLane || Promise.resolve();
     const run = lane.then(async () => {
+      // Started first, so the nonce plan joins this read: the same genesis answers give the nonce and the form it signs.
+      const account = this._agreedGenesisAccount(from).catch(() => null);
       const plan = await this.resolveNonce(from, choice);
       if ((expectNonce !== null && plan.nonce !== expectNonce) || (oneInFlight && plan.nonce !== plan.confirmed + 1)) {
         const e = new Error('The wallet\'s next transaction number changed');
         e.code = 'NONCE_CHANGED';
         throw e;
       }
-      const { path, body, pk } = await sign(plan.nonce);
+      const facts = await account;
+      const expiry = facts ? txExpiryFromAccount({ tx_v2: facts.txV2, next_height: facts.nextHeight }, NETWORK_ID) : null;
       const summary = {
         kind: extra.kind || 'other',
         to: typeof extra.to === 'string' ? extra.to : null,
@@ -5387,14 +5470,21 @@ export class WalletManager {
       // The most it can take (services/PendingTx ownSpends): what a send after it is checked against until the live
       // state it is checked by holds its nonce.
       const spend = normalSpend(extra.spend);
-      const entry = {
-        from, nonce: plan.nonce, path, body, bodyHash: bodyHashOf(body), pk: pk || null, summary, spend, createdAt: Date.now(),
+      const signKeepSend = async (form) => {
+        const { path, body, pk } = await sign(plan.nonce, form);
+        const entry = {
+          from, nonce: plan.nonce, path, body, bodyHash: bodyHashOf(body), pk: pk || null, summary, spend, createdAt: Date.now(),
+        };
+        await putSigned(entry);
+        WalletManager.lastOwnSendAt.set(from, Date.now());
+        // A recipient the user signed for becomes a known one (sentRecipients), before anything is sent.
+        await this._rememberRecipient(extra.kind === 'transfer' ? extra.to : extra.recipient, from).catch(() => {});
+        return this._sendPending(entry);
       };
-      await putSigned(entry);
-      WalletManager.lastOwnSendAt.set(from, Date.now());
-      // A recipient the user signed for becomes a known one (sentRecipients), before anything is sent.
-      await this._rememberRecipient(extra.kind === 'transfer' ? extra.to : extra.recipient, from).catch(() => {});
-      const out = await this._sendPending(entry);
+      let out = await signKeepSend(expiry);
+      // A typed refusal of the form or the last height is answered by one re-sign at the same nonce, never more.
+      const again = out.accepted ? null : await this._resignExpiry(from, out.error, plan.nonce);
+      if (again) out = await signKeepSend(again.expiry);
       const replaced = !!plan.replaces;
       if (out.accepted) return { accepted: true, data: out.data, nonce: plan.nonce, replaced };
       return {
@@ -5506,8 +5596,11 @@ export class WalletManager {
     const now = Date.now();
     if (!kept.some((e) => autoSendable(e, now)) && now - (this._keptSettleAt || 0) < 60_000) return false;
     this._keptSettleAt = now;
-    const confirmed = await this._agreedGenesisNonce(address);
+    const account = await this._agreedGenesisAccount(address);
+    const confirmed = account.nonce;
     if (!Number.isSafeInteger(confirmed)) return false;
+    // A V2 transaction no block can take any more leaves the list first, so it is never sent again.
+    if (account.tip) await expireByHeight(address, account.tip).catch(() => []);
     const live = await settle(address, confirmed);
     const next = live.find((e) => e.nonce === confirmed + 1);
     return next ? this.rebroadcastPending(address, next.nonce) : false;
@@ -5755,30 +5848,15 @@ export class WalletManager {
     }
   }
 
-  // SOL balance on Solana devnet (config/nodes SOLANA_CLUSTER).
+  // SOL balance on Solana devnet (config/nodes SOLANA_CLUSTER), by the app's one Solana client and the read the send's
+  // quote and MAX use (services/SolanaSend solBalanceOf, at 'confirmed'). null (not 0) when it cannot be read, an error
+  // answer included ⇒ keep last-known.
   async getBalance(publicKey) {
-    // 2 attempts, rotating the Solana RPC endpoint on 429/failure; null (not 0) ⇒ keep last-known.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const rpcUrl = attempt === 0 ? getSolanaRpcUrl() : rotateSolanaRpc();
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), 5000);
-        const response = await fetch(rpcUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          // 'confirmed', as the send's quote reads it: the figure moves when a send is confirmed, not a poll later.
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [publicKey, { commitment: 'confirmed' }] }),
-          signal: controller.signal,
-        }).finally(() => clearTimeout(t));
-        if (response.ok) {
-          const data = await response.json();
-          const lamports = data && data.result ? data.result.value : undefined;
-          // A JSON-RPC error answer carries no figure: a failed attempt, never a balance of 0.
-          if (typeof lamports === 'number' && Number.isFinite(lamports) && lamports >= 0) return lamports / 1e9; // lamports → SOL
-        }
-      } catch (error) { /* rotate + retry */ }
+    try {
+      return Number(await solBalanceOf(publicKey)) / 1e9; // lamports → SOL
+    } catch (_) {
+      return null;
     }
-    return null;
   }
 
   // A Solana token's balance on Solana devnet (1DEV): what a send can move, by the rule MAX and the send use
@@ -6005,9 +6083,7 @@ export class WalletManager {
 
   async _anchorsLoaded() {
     if (!this._anchorsReady) return;
-    let timer;
-    await Promise.race([this._anchorsReady, new Promise((resolve) => { timer = setTimeout(resolve, WalletManager.ANCHORS_WAIT_MS); })])
-      .finally(() => clearTimeout(timer));
+    await valueBy(this._anchorsReady, Date.now() + WalletManager.ANCHORS_WAIT_MS, undefined);
   }
 
   /**
@@ -6112,7 +6188,8 @@ export class WalletManager {
    * `passes` (a pinned index, then 'latest'; a later pass only when the earlier one reached a node: one that answered,
    * a pinned macroblock whose view no node keeps any more among them, not a rate limit). `judge(res)` reads a 200
    * answer: { verified: result } ends it, { figure } keeps the first figure whose proof folded under the root its node
-   * served. Any answer without a verifiable proof is no answer: the next node is asked.
+   * served. Any answer without a verifiable proof is no answer: the next node is asked. A certified read is
+   * verification, so each request starts once no user action holds the network (utils/userAction).
    * { verified } | { figure, answered, error }.
    */
   async _proofAnswers(path, nodes, passes, judge) {
@@ -6126,6 +6203,7 @@ export class WalletManager {
         const left = this._proofOrder(nodes).filter((u) => !tried.includes(u));
         if (left.length === 0) break;
         let res;
+        await afterUserActions();
         try {
           res = await this._hedged(`${path}?mb=${mb}`, {
             timeoutMs: 5000, hedgeMs: 800, raw: true, nodes: left, maxBytes: WalletManager.PROOF_ANSWER_MAX_BYTES,
@@ -6512,14 +6590,28 @@ export class WalletManager {
 
   /**
    * The token a GET /api/v1/token/{contract} answer describes: { success: true, token: { contract_address, standard,
-   * name, symbol, decimals, logo, total_supply, deployer } } → { contract, standard, name, symbol, decimals, logo,
-   * totalSupply, deployer }, or null for a miss ("Token not found", a contract that is no token) or another contract.
+   * name, symbol, decimals, logo, total_supply, deployer, deployed_at, mintable, mint_authority, burnable,
+   * metadata_mutable, freezable } } → { contract, standard, name, symbol, decimals, logo, totalSupply, deployer,
+   * deployedAt (ms, from its block's time in seconds; null when the node gives none), mintable, mintAuthority, burnable,
+   * metadataMutable, freezable }, or null for a miss ("Token not found", a contract that is no token) or another
+   * contract. What the token allows is undefined where the node gave no such field (an older node) or an unreadable one;
+   * mintAuthority is a QNet address (canonicalAddress) or null when the node names none.
    */
   static tokenInfoOf(body, contract) {
     const tk = body && typeof body === 'object' && body.success === true && body.token && typeof body.token === 'object'
       ? body.token : null;
     if (!tk || tk.contract_address !== contract || !Number.isInteger(tk.decimals) || tk.decimals < 0 || tk.decimals > 255) return null;
     const text = (v) => (typeof v === 'string' ? v : '');
+    const flag = (v) => (typeof v === 'boolean' ? v : undefined);
+    const authority = (v) => {
+      if (v === null) return null;
+      try {
+        return typeof v === 'string' ? WalletManager.canonicalAddress(v) : undefined;
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const deployedSec = /^\d{1,12}$/.test(String(tk.deployed_at)) ? Number(tk.deployed_at) : 0;
     return {
       contract,
       standard: text(tk.standard),
@@ -6529,6 +6621,12 @@ export class WalletManager {
       logo: text(tk.logo),
       totalSupply: typeof tk.total_supply === 'string' ? tk.total_supply : null,
       deployer: typeof tk.deployer === 'string' && tk.deployer ? tk.deployer : null,
+      deployedAt: deployedSec > 0 ? deployedSec * 1000 : null,
+      mintable: flag(tk.mintable),
+      mintAuthority: authority(tk.mint_authority),
+      burnable: flag(tk.burnable),
+      metadataMutable: flag(tk.metadata_mutable),
+      freezable: flag(tk.freezable),
     };
   }
 
@@ -6548,6 +6646,30 @@ export class WalletManager {
     if (!info) return null;
     // '' logo ⇒ the client renders a generated avatar.
     return { ...info, name: info.name || info.symbol || 'Token' };
+  }
+
+  /**
+   * QNC's supply as a GET /api/v1/richlist answer gives it (the chain's emission and the burn address's balance):
+   * { totalNano, circulatingNano, holders } (nano as decimal text, holders a count), or null for anything else.
+   */
+  static qncSupplyOf(body) {
+    const nano = (v) => (typeof v === 'string' && /^\d{1,30}$/.test(v) ? v : null);
+    if (!body || typeof body !== 'object' || body.success !== true) return null;
+    const totalNano = nano(body.total_supply_raw);
+    const circulatingNano = nano(body.circulating_raw);
+    if (totalNano === null || circulatingNano === null) return null;
+    return { totalNano, circulatingNano, holders: Number.isSafeInteger(body.holder_count) && body.holder_count >= 0 ? body.holder_count : null };
+  }
+
+  // QNC's supply and holder count (GET /api/v1/richlist?limit=1, the node's index; no proof covers it), or null.
+  async getQncSupply() {
+    try {
+      const res = await this._hedged('/api/v1/richlist?limit=1', { timeoutMs: 5000, hedgeMs: 800 });
+      return res && res.ok ? WalletManager.qncSupplyOf(res.data) : null;
+    } catch (e) {
+      logger.warn(`[WARN][QNC] supply_read_failed err=${e && e.message}`);
+      return null;
+    }
   }
 
   // How long an agreed token description is reused: the in-app browser reads it for every token request of a site.
@@ -6707,19 +6829,25 @@ export class WalletManager {
   // Decoded QRC-20/721 token-transfer events for an account (effect-sourced, success-gated).
   //   GET /api/v1/account/{addr}/token-transfers?limit=N
   // Each row embeds its token metadata (symbol/decimals/logo) — no extra fetch. `amount` is a u64
-  // base-unit DECIMAL STRING (quoted in JSON, so JSON.parse keeps it exact). Returns the transfers
-  // array, or [] on any error/miss. Never throws.
+  // base-unit DECIMAL STRING (quoted in JSON, so JSON.parse keeps it exact). Returns { transfers, oldestAvailable }: the
+  // rows ([] on any error/miss) and the answering node's prune floor of its logs (`oldest_available`: no token transfer
+  // at or below it is kept or proven there; null when it names none). Never throws.
   async getAccountTokenTransfers(address, limit = 50) {
-    if (!address || typeof address !== 'string') return [];
+    const none = { transfers: [], oldestAvailable: null };
+    if (!address || typeof address !== 'string') return none;
     let res;
     try {
       res = await this._hedged(`/api/v1/account/${address}/token-transfers?limit=${limit}`, { timeoutMs: 5000, hedgeMs: 800 });
     } catch (e) {
       logger.warn('[QRC20] token transfers fetch failed:', e.message);
-      return [];
+      return none;
     }
-    if (!res.ok || !res.data || typeof res.data !== 'object') return [];
-    return Array.isArray(res.data.transfers) ? res.data.transfers : [];
+    if (!res || !res.ok || !res.data || typeof res.data !== 'object') return none;
+    const floor = res.data.oldest_available;
+    return {
+      transfers: Array.isArray(res.data.transfers) ? res.data.transfers : [],
+      oldestAvailable: Number.isSafeInteger(floor) && floor >= 0 ? floor : null,
+    };
   }
 
   // P4 trustless check for ONE token transfer: fetch its /logs/proof, BIND the proven leaf to this
@@ -6734,6 +6862,7 @@ export class WalletManager {
   async verifyTokenTransferInclusion(row) {
     if (!row || typeof row !== 'object' || !row.tx_hash || typeof row.tx_hash !== 'string') return 'rejected';
     let res;
+    await afterUserActions();
     try {
       res = await this._hedged(`/api/v1/logs/proof?tx_hash=${row.tx_hash}&log_index=${row.log_index || 0}`, { timeoutMs: 5000, hedgeMs: 800 });
     } catch (_) { return 'pending'; }
@@ -6959,61 +7088,147 @@ export class WalletManager {
   }
 
 
-  // ── Node records ──────────────────────────────────────────────────────────────────────────────────
-  // The app registers no node: payment and registration happen on aiqnet.io or in the browser extension. It keeps
-  // the record of the node this wallet runs or monitors, and derives the light node's id itself.
+  // ── The wallet's node ─────────────────────────────────────────────────────────────────────────────
+  // The app registers no node: payment and registration happen on aiqnet.io or in the browser extension. The
+  // genesis nodes name the wallet's node, of every type (walletNode); the app keeps the last one they named, and
+  // derives the light node's id itself.
 
-  static NODE_RECORD_KEY = 'qnet_last_activated_node';
+  // One genesis node's verify-activation answer for `walletAddress` (the wallet in a header, never the URL), or null.
+  async _verifyActivation(base, walletAddress, timeoutMs) {
+    const ctl = new AbortController();
+    const guard = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch(`${base}/api/v1/verify-activation`, {
+        method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress }, signal: ctl.signal,
+      });
+      return r.ok ? await r.json() : null;
+    } catch (_) {
+      return null;
+    } finally {
+      clearTimeout(guard);
+    }
+  }
+
+  /**
+   * What one verify-activation answer says of the wallet's node: { nodeId, nodeType } when it names one (either null
+   * from a node that leaves it out), 'none' when it vouches that the wallet has none (a node behind the network does
+   * not: `authoritative` false), null when it tells nothing.
+   */
+  static activationWord(a) {
+    if (!a || typeof a !== 'object') return null;
+    if (a.verified === true) {
+      return {
+        nodeId: typeof a.node_id === 'string' && a.node_id ? a.node_id : null,
+        nodeType: typeof a.node_type === 'string' && a.node_type ? a.node_type : null,
+      };
+    }
+    return a.verified === false && a.authoritative !== false ? 'none' : null;
+  }
+
+  /**
+   * The wallet's node from the genesis nodes' words (activationWord): `node` { nodeId, nodeType, confirmed: true } once
+   * two name it alike; else 'none' once two vouch that the wallet has none; else the first one named, unconfirmed;
+   * else null. `settled` once two agree either way.
+   */
+  static walletNodeVerdict(words) {
+    const named = words.filter((w) => w && w !== 'none' && w.nodeId);
+    const agreed = named.find((w) => named.filter((x) => x.nodeId === w.nodeId).length >= MIN_GENESIS_AGREEMENT);
+    if (agreed) return { node: { nodeId: agreed.nodeId, nodeType: agreed.nodeType, confirmed: true }, settled: true };
+    if (words.filter((w) => w === 'none').length >= MIN_GENESIS_AGREEMENT) return { node: 'none', settled: true };
+    const first = named[0];
+    return { node: first ? { nodeId: first.nodeId, nodeType: first.nodeType, confirmed: false } : null, settled: false };
+  }
+
+  /**
+   * This wallet's node, of every type, as the genesis nodes answer for it (GET /api/v1/verify-activation: the chain's
+   * rows of its genesis, super and light ids, in that order): { nodeId, nodeType, confirmed }, `confirmed` once two name
+   * it alike; 'none' only once two answer authoritatively that the wallet has none; null when nothing can be told.
+   * `onNamed(node)` hears the first answer that names a node at once, before the others are in: the wallet acts on that
+   * answer, and the rest confirm it in the background. `timeoutMs`: each genesis node's answer.
+   */
+  async walletNode(walletAddress, { timeoutMs = 8000, onNamed = null } = {}) {
+    if (!walletAddress) return null;
+    let named = false;
+    // A late answer after the verdict names nothing: only the answers the verdict counted may show a node.
+    let settled = false;
+    const answers = await this._fromGenesis(async (base) => {
+      const word = WalletManager.activationWord(await this._verifyActivation(base, walletAddress, timeoutMs));
+      if (!settled && word && word !== 'none' && word.nodeId && !named && typeof onNamed === 'function') {
+        named = true;
+        try { onNamed({ nodeId: word.nodeId, nodeType: word.nodeType, confirmed: false }); } catch (_) { /* the verdict stands */ }
+      }
+      return word;
+    }, (words) => WalletManager.walletNodeVerdict(words).settled);
+    settled = true;
+    return WalletManager.walletNodeVerdict(answers).node;
+  }
 
   /**
    * Whether `walletAddress` has a registered server node of `nodeType` (with id `nodeId`, when a node names one),
-   * as at least two genesis nodes each report it (MOBACT-R3-03). One node's by-wallet listing never links a server
-   * node to the wallet: a lagging or compromised node could name one the wallet does not have, and a linked server
-   * node takes the Node tab's place of this wallet's own light activation. true; false when two genesis nodes answer
-   * authoritatively that there is no such node; null when nothing can be told. `timeoutMs`: each genesis node's answer.
+   * as at least two genesis nodes each report it: true; false when two answer that it has no such node (none at all,
+   * or another one); null when nothing can be told. `timeoutMs`: each genesis node's answer.
    */
   async confirmServerNode(walletAddress, { nodeType = null, nodeId = null, timeoutMs = 8000 } = {}) {
     if (!walletAddress) return null;
-    const verdictOf = (list) => {
+    const verdictOf = (words) => {
       let yes = 0;
       let no = 0;
-      for (const a of list) {
-        if (!a || typeof a !== 'object') continue;
-        if (a.verified === true) {
-          const typeOk = !nodeType || !a.node_type || a.node_type === nodeType;
-          const idOk = !nodeId || !a.node_id || a.node_id === nodeId;
-          if (typeOk && idOk) yes += 1; else no += 1;
-        } else if (a.verified === false && a.authoritative !== false) {
+      for (const w of words) {
+        if (w === 'none') {
           no += 1;
+        } else if (w) {
+          const typeOk = !nodeType || !w.nodeType || w.nodeType === nodeType;
+          const idOk = !nodeId || !w.nodeId || w.nodeId === nodeId;
+          if (typeOk && idOk) yes += 1; else no += 1;
         }
       }
       if (yes >= MIN_GENESIS_AGREEMENT) return true;
       if (no >= MIN_GENESIS_AGREEMENT) return false;
       return null;
     };
-    const answers = await this._fromGenesis(async (base) => {
-      const ctl = new AbortController();
-      const guard = setTimeout(() => ctl.abort(), timeoutMs);
-      try {
-        const r = await fetch(`${base}/api/v1/verify-activation`, {
-          method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress }, signal: ctl.signal,
-        });
-        return r.ok ? await r.json() : null;
-      } catch (_) {
-        return null;
-      } finally {
-        clearTimeout(guard);
-      }
-    }, (list) => verdictOf(list) !== null);
+    const answers = await this._fromGenesis(
+      async (base) => WalletManager.activationWord(await this._verifyActivation(base, walletAddress, timeoutMs)),
+      (words) => verdictOf(words) !== null,
+    );
     return verdictOf(answers);
   }
 
-  /** Drops a kept server-node record that is not a genesis node's (it proved not to be this wallet's). */
-  async forgetServerNodeRecord() {
+  // The wallet's node as the genesis nodes last named it, with the last status that named that node registered (a
+  // server node's): { owner, nodeId, nodeType, status, at }, `at` when it was written. One record, kept with no
+  // expiry until they name another node or two say the wallet has none; it shows at once on the next open.
+  static WALLET_NODE_KEY = 'qnet_wallet_node';
+
+  /**
+   * Keeps `nodeId` (`nodeType`) as `owner`'s node. `status` is kept only when it names that node registered
+   * (LightNode.serverStatusNames); otherwise the kept status of the same node stays, and another node keeps none.
+   */
+  async saveWalletNode({ owner, nodeId, nodeType, status = null }) {
+    if (!owner || typeof nodeId !== 'string' || !nodeId || typeof nodeType !== 'string' || !nodeType) return;
+    let kept = serverStatusNames(status, nodeId) ? status : null;
+    if (!kept) {
+      const prev = await this.loadWalletNode(owner);
+      kept = prev && prev.nodeId === nodeId ? prev.status : null;
+    }
+    await AsyncStorage.setItem(WalletManager.WALLET_NODE_KEY, JSON.stringify({ owner, nodeId, nodeType, status: kept, at: Date.now() }));
+  }
+
+  /** `owner`'s node record (saveWalletNode), or null: none, another wallet's, or one that cannot be read. */
+  async loadWalletNode(owner) {
+    let rec = null;
+    try { rec = JSON.parse((await AsyncStorage.getItem(WalletManager.WALLET_NODE_KEY)) || 'null'); } catch (_) { rec = null; }
+    if (!owner || !rec || typeof rec !== 'object' || rec.owner !== owner) return null;
+    if (typeof rec.nodeId !== 'string' || !rec.nodeId || typeof rec.nodeType !== 'string' || !rec.nodeType) return null;
+    return {
+      owner, nodeId: rec.nodeId, nodeType: rec.nodeType,
+      status: serverStatusNames(rec.status, rec.nodeId) ? rec.status : null, at: Number.isSafeInteger(rec.at) ? rec.at : 0,
+    };
+  }
+
+  /** Drops `owner`'s node record: two genesis nodes said the wallet has no node. */
+  async forgetWalletNode(owner) {
     try {
-      const record = JSON.parse((await AsyncStorage.getItem(WalletManager.NODE_RECORD_KEY)) || 'null');
-      if (record && record.nodeType !== 'light' && !record.isGenesis) await AsyncStorage.removeItem(WalletManager.NODE_RECORD_KEY);
-    } catch (_) { /* the next check drops it */ }
+      if (await this.loadWalletNode(owner)) await AsyncStorage.removeItem(WalletManager.WALLET_NODE_KEY);
+    } catch (_) { /* the next 'none' drops it */ }
   }
 
   /**
@@ -7041,42 +7256,16 @@ export class WalletManager {
     try { return await openRecord(dekKey, rec, purpose); } catch (_) { return null; }
   }
 
-  /** The node this wallet runs or monitors: { nodeType, pseudonym, walletAddress, isGenesis?, bootstrapId? }. */
-  async saveNodeRecord({ nodeType, pseudonym = null, walletAddress, isGenesis = false, bootstrapId = null }) {
-    if ((nodeType !== 'light' && nodeType !== 'super') || !walletAddress) return;
-    const record = { nodeType, walletAddress, timestamp: Date.now() };
-    if (pseudonym) record.pseudonym = String(pseudonym);
-    if (isGenesis && /^00[1-5]$/.test(String(bootstrapId))) {
-      record.isGenesis = true;
-      record.bootstrapId = String(bootstrapId);
-    }
-    await AsyncStorage.setItem(WalletManager.NODE_RECORD_KEY, JSON.stringify(record));
-  }
-
-  /** The node record, if it belongs to one of `ownAddresses` (older builds tagged either address). */
-  async loadNodeRecord(ownAddresses) {
-    let record = null;
-    try { record = JSON.parse((await AsyncStorage.getItem(WalletManager.NODE_RECORD_KEY)) || 'null'); } catch (_) {}
-    if (!record || typeof record !== 'object' || (record.nodeType !== 'light' && record.nodeType !== 'super')) return null;
-    if (!record.walletAddress || !(ownAddresses || []).filter(Boolean).includes(record.walletAddress)) return null;
-    const out = { nodeType: record.nodeType, walletAddress: record.walletAddress };
-    if (typeof record.pseudonym === 'string' && record.pseudonym) out.pseudonym = record.pseudonym;
-    if (record.isGenesis && /^00[1-5]$/.test(String(record.bootstrapId))) {
-      out.isGenesis = true;
-      out.bootstrapId = String(record.bootstrapId);
-    }
-    return out;
-  }
-
   // What older builds kept for activation in the app: the sealed code record and its plaintext copies, burn searches,
   // QNet Link burns, pending registrations, the site APK's update check, the network switch, keys named after a code,
-  // and the copy of the push token every launch used to take.
+  // the copy of the push token every launch used to take, and the node record and server status kept apart (the
+  // wallet's node record holds both now).
   static ACTIVATION_LEFTOVER_KEYS = [
     'qnet_activation_codes', 'qnet_activation_meta_light', 'qnet_activation_meta_super', 'qnet_activation_meta_full',
     'qnet_link_burn', 'qnet_link_burn_superseded', 'qnet_burn_scan', 'qnet_burn_scan_other',
     'qnet_onchain_reg_pending', 'qnet_activation_unconfirmed_at',
     'qnet_update_checked_at', 'qnet_update_dismissed_code', 'qnet_update_cache', 'qnet_testnet',
-    'qnet_fcm_token',
+    'qnet_fcm_token', 'qnet_last_activated_node', 'qnet_cached_server_status',
   ];
   static ACTIVATION_LEFTOVER_PREFIXES = [
     'qnet_onchain_reg_pending_', 'node_pseudonym_', 'node_next_ping_', 'node_last_ping_', 'blockchain_check_',
@@ -7084,24 +7273,10 @@ export class WalletManager {
   ];
 
   /**
-   * Once per launch, before the node record is read: the leftovers go, and a node record that still names a code or a
-   * burn keeps only its node (a genesis node is known by its id; a genesis wallet is linked again by its address).
-   * Idempotent and local.
+   * Once per launch, before the wallet's node record is read: the leftovers go (a code, a burn, an older build's node
+   * record: the genesis nodes name the wallet's node again). Idempotent and local.
    */
   async cleanupActivationStorage() {
-    try {
-      const record = JSON.parse((await AsyncStorage.getItem(WalletManager.NODE_RECORD_KEY)) || 'null');
-      if (record && typeof record === 'object' && ('code' in record || 'burnTxHash' in record)) {
-        const g = /^genesis_node_(00[1-5])$/.exec(typeof record.pseudonym === 'string' ? record.pseudonym : '');
-        if (g && !record.bootstrapId) {
-          record.isGenesis = true;
-          record.bootstrapId = g[1];
-        }
-        delete record.code;
-        delete record.burnTxHash;
-        await AsyncStorage.setItem(WalletManager.NODE_RECORD_KEY, JSON.stringify(record));
-      }
-    } catch (_) { /* an unreadable record is left for the owner check to ignore */ }
     try {
       const all = await AsyncStorage.getAllKeys();
       const doomed = all.filter((k) => WalletManager.ACTIVATION_LEFTOVER_KEYS.includes(k)
@@ -7289,17 +7464,20 @@ export class WalletManager {
 
   /**
    * A node's refusal of a move of the node balance, as a coded error: NO_REWARDS (nothing to move), MIN_CLAIM,
-   * NOT_REGISTERED, CLAIM_BUSY (a move of this node is running), RATE_LIMITED or CLAIM_REFUSED. The node's own words
+   * NOT_REGISTERED, CLAIM_BUSY (a move of this node is running), RATE_LIMITED, TX_EXPIRED (its last height passed or
+   * did not fit, after the one re-sign) or CLAIM_REFUSED. The node's own words
    * never reach the screen (they are English and speak the node's language); the screen says the code's text, and the
    * words go to the log only.
    */
   static claimRefusal(answer, httpStatus = null) {
     const words = String((answer && (answer.error || answer.message)) || '');
-    const code = /no claimable|no pending/i.test(words) ? 'NO_REWARDS'
-      : /minimum claim/i.test(words) ? 'MIN_CLAIM'
-        : /not registered/i.test(words) ? 'NOT_REGISTERED'
-          : /already in progress/i.test(words) ? 'CLAIM_BUSY'
-            : httpStatus === 429 || /rate limit|too many/i.test(words) ? 'RATE_LIMITED' : 'CLAIM_REFUSED';
+    const expiry = expiryRefusalOf(answer);
+    const code = expiry === 'tx_expired' || expiry === 'tx_expiry_beyond_horizon' ? 'TX_EXPIRED'
+      : /no claimable|no pending/i.test(words) ? 'NO_REWARDS'
+        : /minimum claim/i.test(words) ? 'MIN_CLAIM'
+          : /not registered/i.test(words) ? 'NOT_REGISTERED'
+            : /already in progress/i.test(words) ? 'CLAIM_BUSY'
+              : httpStatus === 429 || /rate limit|too many/i.test(words) ? 'RATE_LIMITED' : 'CLAIM_REFUSED';
     if (words) logger.warn('[claimRewards] refused:', code, words.slice(0, 200));
     return Object.assign(new Error('The network refused the move of the node balance'), { code });
   }
@@ -7309,8 +7487,10 @@ export class WalletManager {
    * claims read strictly (amounts exact past 2^53, a repeated key refuses it), epochs strictly ascending above the
    * watermark it reports, amounts summing to amount_nano (at least 1 QNC for a whole batch, above zero for a part, which
    * stops at a stopped_at_epoch above its last epoch), a claim timestamp, and the message the wallet builds itself (the
-   * node's copy, when it sends one, must be the same). { claimsData, entries: [{ epoch, amount }], watermark, lastEpoch,
-   * amountNano, timestamp, stoppedAtEpoch, stoppedReason, epochsClaimed, signMessage }; throws otherwise.
+   * node's copy, when it sends one, must be the same). A quote with valid_until offers the V2 form: `v2` = { validUntil,
+   * signMessage }, its message built here too and the node's sign_message_v2, when sent, held to it. { claimsData,
+   * entries: [{ epoch, amount }], watermark, lastEpoch, amountNano, timestamp, stoppedAtEpoch, stoppedReason, epochsClaimed,
+   * signMessage, v2 }; throws otherwise.
    */
   static checkedClaimQuote(body, walletAddress) {
     if (!body.claims_data || !body.sign_message) throw new Error('Node returned an incomplete claim quote');
@@ -7351,41 +7531,96 @@ export class WalletManager {
     if (stopped === null && quoted < BigInt(NANO_PER_QNC)) throw Object.assign(new Error('The smallest move is 1 QNC'), { code: 'MIN_CLAIM' });
     const ts = body.claim_timestamp;
     if (!Number.isSafeInteger(ts) || ts <= 0) throw new Error('Node returned no claim timestamp — refusing to sign');
-    const { sha3_256 } = require('js-sha3');
-    const signMessage = `${QNET_CHAIN_TAG}qnet_claim_v1:${walletAddress}:${ts}:${sha3_256(body.claims_data)}`;
+    const signMessage = claimPayloadPreimage(walletAddress, ts, body.claims_data);
     // Not fatal by itself (the message built here is what is signed either way), but a node that asks for another one
     // is refused loudly.
     if (body.sign_message !== signMessage) throw new Error('Node asked the wallet to sign a different message — refusing');
+    const v2 = WalletManager._claimV2(walletAddress, body.claims_data, body.valid_until);
+    if (body.valid_until !== undefined && body.valid_until !== null && !v2) throw new Error('Node quoted a malformed last height — refusing to sign');
+    if (v2 && body.sign_message_v2 !== undefined && body.sign_message_v2 !== null && body.sign_message_v2 !== v2.signMessage) {
+      throw new Error('Node asked the wallet to sign a different message — refusing');
+    }
     return {
       claimsData: body.claims_data, entries, watermark, lastEpoch: prev, amountNano: sum.toString(), timestamp: ts,
-      stoppedAtEpoch: stopped, stoppedReason: body.stopped_reason ?? null, epochsClaimed: body.epochs_claimed, signMessage,
+      stoppedAtEpoch: stopped, stoppedReason: body.stopped_reason ?? null, epochsClaimed: body.epochs_claimed, signMessage, v2,
     };
   }
 
+  // The V2 claim this wallet signs over `claimsData` with last height `validUntil` ({ validUntil, signMessage }, the
+  // message built here: NodePreimages claimPayloadPreimageV2), or null when `validUntil` is no height.
+  static _claimV2(walletAddress, claimsData, validUntil) {
+    if (!Number.isSafeInteger(validUntil) || validUntil <= 0) return null;
+    return { validUntil, signMessage: claimPayloadPreimageV2(walletAddress, claimsData, expiryAt(validUntil)) };
+  }
+
   /**
-   * Step 1 from the first of `nodes` that can quote (the extension's quoteRequest): a node that cannot serve an epoch (no
-   * quote, its stopped_reason set: rewards_api.rs) hands over to the next one, as its answer asks. When none can, the last
-   * such answer; a failure only when no node answered at all. A quote submits nothing, so it may be hedged.
+   * Step 1 from the first of `nodes` that can quote (the extension's quoteRequest): one that hands over (_handsOver)
+   * leaves it to the next, and so does one behind the wallet's last claim (`after`, its last epoch: _behindClaim). When
+   * none can, the last answer that handed over, else CLAIM_BEHIND when every node that answered is behind; a failure only
+   * when no node answered at all. A quote submits nothing, so it may be hedged.
    */
-  async _claimQuote(request, nodes) {
+  async _claimQuote(request, nodes, after = null) {
     let left = Array.isArray(nodes) ? nodes.slice() : [];
     let unservable = null;
+    let behind = false;
     while (left.length > 0) {
       let res;
       try {
         res = await this._hedged('/api/v1/rewards/claim', { method: 'POST', timeoutMs: 8000, hedgeMs: 1200, body: request, nodes: left });
       } catch (e) {
         if (unservable) return unservable;
+        if (behind) throw WalletManager.claimBehind();
         throw e;
       }
       const d = res && res.data;
-      if (!(d && typeof d === 'object' && d.needs_signature !== true && typeof d.stopped_reason === 'string')) return res;
-      unservable = res;
+      const lagging = WalletManager._behindClaim(d, after);
+      if (!lagging && !WalletManager._handsOver(d)) return res;
+      if (lagging) behind = true;
+      else unservable = res;
       const served = left.includes(res.base) ? res.base : left[0];
       left = left.filter((b) => b !== served);
     }
     if (unservable) return unservable;
+    if (behind) throw WalletManager.claimBehind();
     throw new Error('all nodes failed');
+  }
+
+  /**
+   * Whether a quote answer `d` comes from a node that has not applied the wallet's claim ending at epoch `after` yet (a
+   * part of a move already in a block): its watermark below that epoch, or a stop at an epoch that claim settled. Such a
+   * node would quote epochs the wallet moved already; null `after` judges nothing.
+   */
+  static _behindClaim(d, after) {
+    if (after === null || !d || typeof d !== 'object') return false;
+    if (d.needs_signature === true) return Number.isSafeInteger(d.last_claimed_epoch) && d.last_claimed_epoch < after;
+    return typeof d.stopped_reason === 'string' && Number.isSafeInteger(d.stopped_at_epoch) && d.stopped_at_epoch <= after;
+  }
+
+  // A quote answer that leaves the quote to another genesis node (the extension's handsOver): one that cannot serve an
+  // epoch (stopped_reason set: rewards_api.rs), one where this address spent its claim budget (the node's limit per
+  // address, which quotes count in), and one busy with another request for the node. No quote either way.
+  static _handsOver(d) {
+    return !!d && typeof d === 'object' && d.needs_signature !== true && (typeof d.stopped_reason === 'string'
+      || d.code === 'rate_limited' || d.code === 'claim_busy' || /rate limit exceeded|already in progress/i.test(String(d.error || '')));
+  }
+
+  // Every genesis node that answered a quote is behind the wallet's last claim: the next part waits for them.
+  static claimBehind() {
+    return Object.assign(new Error('No genesis node has applied the wallet\'s last claim yet'), { code: 'CLAIM_BEHIND' });
+  }
+
+  /**
+   * The genesis nodes a next part is quoted at (`after`: the last epoch of the part before; the extension's
+   * appliedFirst): those whose node balance read shows that part applied (a head past it, or nothing left) first, then
+   * those that answered with no head; never one whose head is at or below it, nor one that did not answer. Every quote
+   * spends the address's claim budget at the node it goes to.
+   */
+  async _appliedFirst(nodeId, after) {
+    const reads = await Promise.all(this.getTrustedNodes(GENESIS_NODES.length)
+      .map(async (base) => ({ base, read: await this._pendingAt(nodeId, base) })));
+    const applied = ({ read }) => !!read && (read.head !== null ? read.head > after : read.amount === '0');
+    const unknown = ({ read }) => !!read && read.head === null && read.amount !== '0';
+    return [...reads.filter(applied), ...reads.filter(unknown)].map((r) => r.base);
   }
 
   /**
@@ -7395,12 +7630,13 @@ export class WalletManager {
    * So every batch is held to another genesis node's quote of the same request (the extension's corroborated, EXT-R3-01;
    * the claim_rewards signature carries no time): honest nodes list the same epochs and amounts from the same watermark
    * and differ only in where they stop. The quote ending lower is the one signed, and only when the other lists exactly
-   * its entries up to its last epoch. Returns that quote (with its `base`).
+   * its entries up to its last epoch. Returns that quote (with its `base`). `after`: as _claimQuote's; `among`: the nodes
+   * that may quote (default: every genesis node).
    */
-  async _corroboratedQuote(request, checked, walletAddress) {
-    const others = this.getTrustedNodes(GENESIS_NODES.length).filter((b) => b !== checked.base);
+  async _corroboratedQuote(request, checked, walletAddress, after = null, among = null) {
+    const others = (among || this.getTrustedNodes(GENESIS_NODES.length)).filter((b) => b !== checked.base);
     if (others.length === 0) throw new Error('No second node to check the claim batch against — retry');
-    const res = await this._claimQuote(request, others);
+    const res = await this._claimQuote(request, others, after);
     const body = res && res.data;
     if (!res.ok || !body || body.needs_signature !== true) throw WalletManager.claimRefusal(body || {}, res.status);
     const second = { ...WalletManager.checkedClaimQuote(body, walletAddress), base: res.base };
@@ -7419,9 +7655,11 @@ export class WalletManager {
    * first epoch (one that disagrees refuses: a batch that dropped its head would burn those epochs behind the watermark),
    * and for a whole batch (no stopped_at_epoch) the pending total two of them report alike must not exceed it: that total
    * counts the epochs the claim path serves and can only under-report it, so a whole batch below it skipped an epoch the
-   * wallet holds a leaf in. No head, or for a whole batch no two totals alike, is no check: nothing is signed.
+   * wallet holds a leaf in. No head, or for a whole batch no two totals alike, is no check: nothing is signed. A node
+   * whose head is at or below `after` (the last epoch of the wallet's claim before this one) has not applied that claim:
+   * its word counts for nothing.
    */
-  async _crossCheckedClaim(nodeId, others, checked) {
+  async _crossCheckedClaim(nodeId, others, checked, after = null) {
     const full = checked.stoppedAtEpoch === null;
     const first = checked.entries[0].epoch;
     const queue = Array.isArray(others) ? others.slice() : [];
@@ -7433,7 +7671,7 @@ export class WalletManager {
       const reads = await Promise.all(queue.splice(0, wave).map((base) => this._pendingAt(nodeId, base)));
       wave = 1;
       for (const read of reads) {
-        if (!read) continue;
+        if (!read || (after !== null && read.head !== null && read.head <= after)) continue;
         if (read.head !== null) {
           if (read.head !== first) {
             throw new Error(`Node quoted a batch starting at epoch ${first}, expected ${read.head} — retry on another node`);
@@ -7477,7 +7715,9 @@ export class WalletManager {
 
   // Move a node's balance (the network's per-epoch accounting for it) into the wallet with one transaction the wallet
   // key signs. Works for every node type: light, super, genesis. The node checks the balance; the wallet checks the batch.
-  async claimRewards(nodeType, walletAddress, password, serverPendingRewards = null, actualNodeId = null) {
+  // `after`: the last epoch of the wallet's claim before this one, in a block already (the next part of a move): a node
+  // behind it is not asked to quote and its word does not count (_behindClaim).
+  async claimRewards(nodeType, walletAddress, password, serverPendingRewards = null, actualNodeId = null, { after = null } = {}) {
     try {
       // The node balance as the caller read it (nanoQNC), when it did.
       if (serverPendingRewards !== null && serverPendingRewards <= 0) {
@@ -7536,7 +7776,11 @@ export class WalletManager {
         ...(dilithiumSignature && { dilithium_signature: dilithiumSignature }),
         ...(dilithiumPublicKey && { dilithium_public_key: dilithiumPublicKey }),
       };
-      const claimRes = await this._claimQuote(request, this.getTrustedNodes(GENESIS_NODES.length));
+      // A next part goes only to nodes that applied the one before, and waits while fewer than two did (a quote and the
+      // one it is held to).
+      const quoteNodes = after === null ? this.getTrustedNodes(GENESIS_NODES.length) : await this._appliedFirst(nodeId, after);
+      if (quoteNodes.length < 2) throw WalletManager.claimBehind();
+      const claimRes = await this._claimQuote(request, quoteNodes, after);
       let claimResult = claimRes.data || {};
       if (!claimRes.ok) throw WalletManager.claimRefusal(claimResult, claimRes.status);
       // The batch signed: the epoch below its first one, its last epoch and its parts ([epoch, nanoQNC text] each). The
@@ -7544,12 +7788,13 @@ export class WalletManager {
       let quoteWatermark = null;
       let quoteLastEpoch = null;
       let quoteParts = [];
+      let quoteValidUntil = null; // the last height the claim signed (the V2 form), else null
 
       if (claimResult.needs_signature) {
         let checked = { ...WalletManager.checkedClaimQuote(claimResult, walletAddress), base: claimRes.base };
-        checked = await this._corroboratedQuote(request, checked, walletAddress);
+        checked = await this._corroboratedQuote(request, checked, walletAddress, after, quoteNodes);
         await this._crossCheckedClaim(nodeId,
-          this.getTrustedNodes(GENESIS_NODES.length).filter((b) => b !== checked.base), checked);
+          this.getTrustedNodes(GENESIS_NODES.length).filter((b) => b !== checked.base), checked, after);
         // The move in transit is followed by the batch signed, never by the quoting node's other words (its watermark,
         // its total): the epoch below its first one, which other nodes confirmed, and the sum of its signed amounts.
         quoteWatermark = checked.entries[0].epoch - 1;
@@ -7564,29 +7809,41 @@ export class WalletManager {
         //
         // The preimage is fully derivable here: both inputs are values this client already holds and
         // already sends back in the same POST, so the node's copy is pure convenience and is now
-        // treated as untrusted (checkedClaimQuote builds it). Mirror of BlockchainNode::claim_sign_message.
-        const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+        // treated as untrusted (checkedClaimQuote builds it). Mirror of BlockchainNode::claim_sign_message,
+        // and of the V2 form (docs/protocols/tx-v2.vectors.json, case claim) when the quote offers a last height.
+        const { signWithDilithium, signDetached } = require('../crypto/DilithiumCrypto');
         const dilithiumKeys = await this._walletDilithiumKeys(password);
-        const claimsSignature = await signWithDilithium(
-          checked.signMessage, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
         // Signed by this wallet as a send is: its proof reads ask for the newest certified state from now on (_proofIndex).
         WalletManager.lastOwnSendAt.set(walletAddress, Date.now());
-        const submitRes = await this._submitClaim({
+        // V1 carries the quoted timestamp its message signs, so the payload cannot be re-stamped into a fresh hash and
+        // replayed; V2 signs no timestamp and names its last height instead, and its signature is the raw detached one as
+        // hex, the bytes the node verifies (claim_authorized).
+        const submitIn = async (v2) => this._submitClaim({
           node_id: nodeId,
           wallet_address: walletAddress,
           dilithium_signature: dilithiumSignature,
           dilithium_public_key: dilithiumKeys.publicKey,
           claims_data: checked.claimsData,
-          claims_signature: claimsSignature,
-          // Inside the signed message and reused as the TX timestamp, so the payload cannot be
-          // re-stamped into a fresh hash and replayed.
-          claim_timestamp: checked.timestamp,
+          claims_signature: v2
+            ? await signDetached(v2.signMessage, dilithiumKeys.secretKey)
+            : await signWithDilithium(checked.signMessage, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId),
+          ...(v2 ? { valid_until: v2.validUntil } : { claim_timestamp: checked.timestamp }),
         });
+        let signedV2 = checked.v2;
+        let submitRes = await submitIn(signedV2);
+        // A typed refusal of the form or the last height: one re-sign, never more (as a send's, _signAndSubmit).
+        const again = submitRes.ok && submitRes.data && submitRes.data.success ? null
+          : await this._resignExpiry(walletAddress, submitRes.data);
+        if (again) {
+          signedV2 = again.expiry ? WalletManager._claimV2(walletAddress, checked.claimsData, Number(again.expiry.validUntil)) : null;
+          submitRes = await submitIn(signedV2);
+        }
         const submitted = submitRes.data || {};
         if (!submitRes.ok || !submitted.success) throw WalletManager.claimRefusal(submitted, submitRes.status);
         // The quote's stop point survives the submit, so the UI can name the epoch the batch stopped at.
         claimResult = { ...submitted, epochs_claimed: checked.epochsClaimed, amount_nano: checked.amountNano,
                         stopped_at_epoch: checked.stoppedAtEpoch, stopped_reason: checked.stoppedReason };
+        quoteValidUntil = signedV2 ? signedV2.validUntil : null;
       }
 
       if (!claimResult.success) throw WalletManager.claimRefusal(claimResult);
@@ -7622,6 +7879,7 @@ export class WalletManager {
         prevWatermark: quoteWatermark, // the epoch below the batch's first one, when it quoted
         lastEpoch: quoteLastEpoch, // the last epoch of the batch signed, when it quoted
         parts: quoteParts.length ? quoteParts : null, // its epochs with their amounts, when it quoted
+        validUntil: quoteValidUntil, // past it, no block takes the claim (ClaimTransit: expired)
         pending: true, // submitted; credited on inclusion — balance updates on the next status poll
         timestamp: Date.now(),
         nextClaim: claimResult.next_claim_time || (Date.now() + 24 * 60 * 60 * 1000),
@@ -7706,14 +7964,17 @@ export class WalletManager {
       const { signDetached } = require('../crypto/DilithiumCrypto');
 
       // The canonical message MUST byte-match the node's build_canonical_verify_message Transfer arm:
-      // "q{chain}|transfer:from:to:amount:nonce:gas_price:gas_limit". FIX-5: the RAW detached ML-DSA-65
+      // "q{chain}|transfer:from:to:amount:nonce:gas_price:gas_limit", or its V2 form when the network takes one
+      // (WalletIdentity transferPreimage with `expiry`). The request carries the RAW detached ML-DSA-65
       // signature as hex (3309 B → 6618 hex chars) and, until the chain has committed it, the RAW pubkey
       // as hex (1952 B → 3904 hex chars); the node rehydrates an elided key from state (pk-ELISION). The
       // key is outside the signed message, so a resend that attaches it is the same transaction.
       const sinceMs = Date.now();
-      const sent = await this._signAndSubmit(fromAddress, async (txNonce) => {
-        const fields = { from: fromAddress, to, amountNano: amountSmallest, nonce: txNonce, gasPrice, gasLimit };
-        const message = transferPreimage(fromAddress, to, amountSmallest, txNonce, gasPrice, gasLimit);
+      const sent = await this._signAndSubmit(fromAddress, async (txNonce, expiry) => {
+        const fields = {
+          from: fromAddress, to, amountNano: amountSmallest, nonce: txNonce, gasPrice, gasLimit, validUntil: expiry && expiry.validUntil,
+        };
+        const message = transferPreimage(fromAddress, to, amountSmallest, txNonce, gasPrice, gasLimit, expiry);
         const signature = await signDetached(message, dilSkHex);
         // Every integer here is a safe one, so the parsed body writes back as the same bytes.
         const body = JSON.parse(transferRequestJson(fields, signature, WalletManager._pkElidable(fromAddress) ? null : dilPkHex));
@@ -7794,9 +8055,11 @@ export class WalletManager {
 
     // The signature covers the gas, so no relay can raise it. pk-ELISION as in sendQNC.
     const reserveNano = feeNano(Number(gasPrice), Number(gasLimit)) + (method === 'transfer' ? STORAGE_DEPOSIT_NANO : 0);
-    const sent = await this._signAndSubmit(from, async (txNonce) => {
-      const fields = { from, contract: contractAddress, method, args: argList, nonce: txNonce, gasPrice, gasLimit };
-      const message = contractCallPreimage(from, dataStr, txNonce, gasPrice, gasLimit);
+    const sent = await this._signAndSubmit(from, async (txNonce, expiry) => {
+      const fields = {
+        from, contract: contractAddress, method, args: argList, nonce: txNonce, gasPrice, gasLimit, validUntil: expiry && expiry.validUntil,
+      };
+      const message = contractCallPreimage(from, dataStr, txNonce, gasPrice, gasLimit, expiry);
       const signature = await signDetached(message, dilSkHex); // FIX-5: raw detached hex
       const body = JSON.parse(contractCallRequestJson(fields, signature, WalletManager._pkElidable(from) ? null : dilPkHex));
       return { path: TX_ROUTES.call.path, body, pk: dilPkHex };
@@ -7825,8 +8088,8 @@ export class WalletManager {
     const { signDetached } = require('../crypto/DilithiumCrypto');
     // The most fee does not depend on the nonce: reserved while the call is unsettled (MOB-BR-R3-02).
     const reserveNano = Number(buildWasmCall({ from, contract, method, args, nonce: 1, gasLimit }).maxFeeNano);
-    const sent = await this._signAndSubmit(from, async (txNonce) => {
-      const tx = buildWasmCall({ from, contract, method, args, nonce: txNonce, gasLimit });
+    const sent = await this._signAndSubmit(from, async (txNonce, expiry) => {
+      const tx = buildWasmCall({ from, contract, method, args, nonce: txNonce, gasLimit, expiry });
       const signature = await signDetached(tx.preimage, dilSkHex);
       const body = JSON.parse(contractCallRequestJson(tx, signature, WalletManager._pkElidable(from) ? null : dilPkHex));
       return { path: tx.path, body, pk: dilPkHex };
@@ -7976,14 +8239,15 @@ export class WalletManager {
       this._deployField(decimals) + this._deployField(initialSupply) +
       this._deployField(!!mintable) + this._deployField(!!burnable) +
       this._deployField(logo));
-    const sent = await this._signAndSubmit(from, async (txNonce) => {
-      const message = contractDeployPreimage(from, codeHash, txNonce, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT);
+    const sent = await this._signAndSubmit(from, async (txNonce, expiry) => {
+      const message = contractDeployPreimage(from, codeHash, txNonce, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT, expiry);
       return {
         path: '/api/v1/token/deploy', pk: dilPkHex,
         body: {
           from, name, symbol, decimals, initial_supply: initialSupply, nonce: txNonce,
           mintable, burnable, logo,
           dilithium_signature: await signDetached(message, dilSkHex), dilithium_public_key: dilPkHex,
+          ...WalletManager._validUntilField(expiry),
         },
       };
     }, { kind: 'deploy', spend: { qncNano: String(feeNano(DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT)) } }, { choice: opts.choice || null });
@@ -8005,17 +8269,23 @@ export class WalletManager {
 
     // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc721, ..) — NIST FIPS 202.
     const codeHash = sha3_256('QRC721|' + this._deployField(name) + this._deployField(symbol));
-    const sent = await this._signAndSubmit(from, async (txNonce) => {
-      const message = contractDeployPreimage(from, codeHash, txNonce, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT);
+    const sent = await this._signAndSubmit(from, async (txNonce, expiry) => {
+      const message = contractDeployPreimage(from, codeHash, txNonce, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT, expiry);
       return {
         path: '/api/v1/nft/deploy', pk: dilPkHex,
         body: {
           from, name, symbol, nonce: txNonce,
           dilithium_signature: await signDetached(message, dilSkHex), dilithium_public_key: dilPkHex,
+          ...WalletManager._validUntilField(expiry),
         },
       };
     }, { kind: 'deploy', spend: { qncNano: String(feeNano(DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT)) } }, { choice: opts.choice || null });
     return WalletManager._acceptedOrUnknown(sent, 'NFT collection deploy');
+  }
+
+  // The `valid_until` a V2 request body names (the height its signature covers); nothing for the V1 form.
+  static _validUntilField(expiry) {
+    return expiry ? { valid_until: Number(expiry.validUntil) } : {};
   }
 
   // A stored vault, readable or not: a copy that fails to parse is never deleted (see vaultState). A read error

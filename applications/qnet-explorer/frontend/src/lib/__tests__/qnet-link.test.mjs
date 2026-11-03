@@ -250,7 +250,7 @@ test('requests: exact keys and forms, the request bytes and their hash', () => {
     { ...link, walletHash: '74940B0126365748' }, { ...link, walletHash: '4940b0126365748' }, null, [link],
   ]) assert.equal(checkRequest('link', bad), null, JSON.stringify(bad));
   assert.equal(checkRequest('claim', link), null);
-  // A `claim` request names the wallet and its light or super node (owner, 12.10); the earlier one named no node.
+  // A `claim` request names the wallet and its light or super node.
   for (const c of EARLIER_CLAIMS) assert.equal(checkRequest('claim', c.request), null, c.name);
   for (const n of CLAIM.invalidSessionRequests) assert.equal(checkRequest('claim', JSON.parse(n.body).request), null, n.why);
   for (const w of CLAIM.wallets) {
@@ -323,7 +323,7 @@ test('answers: every case is accepted in its context, every invalid plaintext fa
   }
 });
 
-// Owner, 12.10: the answer names the node the request named, the light or the super node of its wallet.
+// The answer names the node the request named, the light or the super node of its wallet.
 test('answers: a claim answer names the requested node of its own wallet', () => {
   const [kat, other] = CLAIM.wallets;
   const c = CLAIM.cases.find((x) => x.name === 'claim-super-ok');
@@ -342,7 +342,7 @@ test('answers: a claim answer names the requested node of its own wallet', () =>
   assert.deepEqual(check({}, null), { ok: false, reason: 'nodeId' });
 });
 
-// SITE-R2-03, owner decision 27.09 (EXT-R1-03 option (a)): a claim whose quote stopped at an epoch may move less than
+// A claim whose quote stopped at an epoch may move less than
 // 1 QNC, so a balance spread over many small epochs can always be moved; a full claim still moves at least 1 QNC, and
 // no claim moves nothing.
 test('answers: a capped claim below 1 QNC is read; a full one below 1 QNC and a zero one are not', () => {
@@ -358,6 +358,19 @@ test('answers: a capped claim below 1 QNC is read; a full one below 1 QNC and a 
   assert.equal(check({ amountNano: '1000000000', stoppedAtEpoch: null }).ok, true);
   // A malformed stoppedAtEpoch is still refused at its own check.
   assert.deepEqual(check({ amountNano: '400000000', stoppedAtEpoch: 155 }), { ok: false, reason: 'stoppedAtEpoch' });
+});
+
+// The amount is the total of the request's claims, one or several (section 14.7): the floors above, and no ceiling of
+// one claim, so a run of many claims reads as one answer with its last claim's hash.
+test('answers: a claim answer\'s amount is its run\'s total, with no ceiling but the u64', () => {
+  const c = CLAIM.cases.find((x) => x.name === 'claim-super-ok');
+  const answer = JSON.parse(c.plaintext);
+  const check = (over) => validateAnswer(JSON.stringify({ ...answer, ...over }), { intent: 'claim', ...contextOf(c.context, vectorVerify) });
+  const total = { amountNano: '18446744073709551615', txHash: 'c'.repeat(64) };
+  for (const stoppedAtEpoch of [null, '1124']) {
+    assert.deepEqual(check({ ...total, stoppedAtEpoch }), { ok: true, answer: { ...answer, ...total, stoppedAtEpoch } });
+    assert.deepEqual(check({ ...total, amountNano: '18446744073709551616', stoppedAtEpoch }), { ok: false, reason: 'amountNano' });
+  }
 });
 
 test('answers: a consent is refused without a verifier, when it throws, and outside the window', () => {
@@ -378,7 +391,7 @@ test('answers: a consent is refused without a verifier, when it throws, and outs
   assert.deepEqual(validateAnswer(c.plaintext, { ...base, request: { burnTx: null, walletHash: null, check: false }, verify: vectorVerify }), { ok: false, reason: 'status' });
 });
 
-// A1: QNet Wallet's `reserve` answer is the wallet's own signature over its reservation of a light node paid from the
+// QNet Wallet's `reserve` answer is the wallet's own signature over its reservation of a light node paid from the
 // request's payment address; the request always names the wallet, and the site takes the answer within its window.
 test('reserve: the request names the wallet and the payment address; the answer is the wallet\'s signed reservation', () => {
   const c = LINK.cases.find((x) => x.name === 'reserve-ok');
@@ -531,7 +544,7 @@ test('crypto: fresh sessions draw fresh ids and non-extractable keys; a request 
   await assert.rejects(newSiteSession('connect', { walletHash: null }), /request/);
   await assert.rejects(newSiteSession('link', null), /request/);
   await assert.rejects(newSiteSession('link', { walletHash: null }), /request/);
-  // A `claim` request names the wallet and its node (owner, 12.10).
+  // A `claim` request names the wallet and its node.
   await assert.rejects(newSiteSession('claim', { walletHash: null }), /request/);
   await assert.rejects(newSiteSession('claim', { walletHash: '74940b0126365748' }), /request/);
   await assert.rejects(newSiteSession('claim', { walletHash: '74940b0126365748', nodeId: 'genesis_node_001' }), /request/);

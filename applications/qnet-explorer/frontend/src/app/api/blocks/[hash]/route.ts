@@ -3,49 +3,11 @@ import { fetchNode } from '@/lib/node-api';
 import { getBlockByHeight, getBlockByHash, getTransactionsByBlock, BlockRow } from '../../../../../lib/db';
 import type { Block, BlockTransaction } from '@/lib/types';
 import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
+import { mapTxType } from '@/lib/tx-mapping';
 import { quoteBigInts } from '@/indexer/transform';
 
-// ============================================================================
-// PRODUCTION v2.97: PostgreSQL-first with Node RPC fallback
-// ============================================================================
-
-// Map transaction type to display name
-// v3.15: Claims from system_rewards_pool show as Transfer
-function getTransactionType(txType: unknown, fromAddress?: string): string {
-  if (!txType) return 'Unknown';
-  
-  // Claim rewards from pool = Transfer (not Reward)
-  if (fromAddress === 'system_rewards_pool') {
-    return 'Transfer';
-  }
-  
-  if (typeof txType === 'string') return txType;
-  
-  // Handle Rust enum serialization: { "Transfer": {...} } or { "NodeRegistration": {...} }
-  if (typeof txType === 'object' && txType !== null) {
-    const typeKey = Object.keys(txType)[0];
-    const typeMap: Record<string, string> = {
-      'Transfer': 'Transfer',
-      'NodeRegistration': 'Registration',
-      'NodeActivation': 'Activation',
-      'RewardDistribution': 'Reward',
-      'CreateAccount': 'System',
-      'PingAttestation': 'Light Eligibility',
-      'PingCommitmentWithSampling': 'Light Eligibility',
-      'HeartbeatCommitment': 'Heartbeat',
-      'LightNodeEligibilityBitmap': 'Light Eligibility',
-      'BitmapCommitment': 'Light Eligibility',
-      'Swap': 'Swap',
-      'ContractDeploy': 'Contract',
-      'ContractCall': 'Contract',
-      'BatchTransfers': 'Transfer',
-      'BatchNodeActivations': 'Activation',
-      'BatchRewardClaims': 'Transfer',
-    };
-    return typeMap[typeKey] || typeKey || 'Unknown';
-  }
-  return 'Unknown';
-}
+// A block from the explorer's archive first, else from a node. Its transactions are named as every other list names
+// them (src/lib/tx-mapping.ts), from the archive's stored type or a node's own.
 
 // Convert byte array to hex string
 // Returns empty string if input is not valid (undefined/null/not array)
@@ -141,7 +103,7 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
       const t = tx as Record<string, unknown>;
       return {
         hash: (t.hash as string) || '',
-        type: getTransactionType(t.tx_type, (t.from as string)),
+        type: mapTxType(t.tx_type as string | object | undefined, t.from as string, t.data),
         from: (t.from as string) || '',
         // No recipient (a heartbeat, a registration) stays none, as the other lists say it, never the sender again.
         to: (t.to as string) || 'N/A',
@@ -179,7 +141,7 @@ async function fetchBlock(identifier: string, deadline: AbortSignal): Promise<Bl
       
       const transactions: BlockTransaction[] = dbTransactions.map(tx => ({
         hash: tx.hash,
-        type: getTransactionType(tx.tx_type, tx.from_address),
+        type: mapTxType(tx.tx_type, tx.from_address, tx.data),
         from: tx.from_address,
         to: tx.to_address || 'N/A',
         amount: String(tx.amount || 0),

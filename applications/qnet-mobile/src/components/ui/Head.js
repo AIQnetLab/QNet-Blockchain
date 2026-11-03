@@ -5,6 +5,7 @@
 import React from 'react';
 import { Text, View } from 'react-native';
 import Action from './Action';
+import { plainAmp } from './amp';
 import { color, size, space, themed } from '../../theme';
 
 export default function Head({ title, onBack, backLabel, backTestID, style, titleStyle, testID, children = null }) {
@@ -15,7 +16,7 @@ export default function Head({ title, onBack, backLabel, backTestID, style, titl
           <Action kind="quiet" label={backLabel} onPress={onBack} testID={backTestID} />
         </View>
       ) : null}
-      {title ? <Text style={[s.title, titleStyle]} accessibilityRole="header" testID={testID}>{title}</Text> : null}
+      {title ? <Text style={[s.title, titleStyle]} accessibilityRole="header" testID={testID}>{plainAmp(title, 'title')}</Text> : null}
       {children}
     </View>
   );

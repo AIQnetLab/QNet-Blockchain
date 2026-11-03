@@ -1018,7 +1018,8 @@ async function eraseAll() {
     const language = (await session.storedLanguage()) !== null ? [STORAGE_KEYS.SETTINGS] : [];
     // an earlier wallet that could not be read for certain stays too: it is never removed by guess
     const keepEarlier = await earlier.readEarlierWallet().then((parsed) => parsed !== null, () => true);
-    await clearArea(storage.local, [], keepEarlier ? [...language, ...earlier.EARLIER_KEYS] : language);
+    // the Solana route (solana.js) is no wallet data, and a Solana call still running may write it again after the clear
+    await clearArea(storage.local, [STORAGE_KEYS.SOLANA_ROUTE], keepEarlier ? [...language, ...earlier.EARLIER_KEYS] : language);
     // what an earlier version left that opens nothing goes with it, its pages' copy too
     if (!keepEarlier) {
       await earlier.deleteEarlierDatabase().catch((error) => log.error('earlier database not deleted', error?.code ?? error?.name));

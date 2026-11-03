@@ -6,14 +6,15 @@
 
 import { useEffect, useRef } from 'react';
 import { useActivationContent } from '@/contexts/AppContext';
-import { t } from '@/lib/texts';
 import { showConnectCard } from '@/lib/cabinet/connect-card';
 import { CONNECT_ID } from '@/lib/cabinet/tabs';
 import { useCabinet } from './CabinetProvider';
 import GuideSummary from './GuideSummary';
 import WalletChoice, { ViewByAddress } from './WalletChoice';
+import { useI18n } from '@/i18n/client';
 
 export default function ConnectScreen() {
+  const { t } = useI18n();
   const { phoneFlows } = useCabinet();
   const card = useRef<HTMLElement>(null);
   // The page is displayed once the wallet detection is over (src/components/InAppGuard.tsx).

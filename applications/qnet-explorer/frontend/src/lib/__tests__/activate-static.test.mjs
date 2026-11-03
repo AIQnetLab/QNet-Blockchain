@@ -5,11 +5,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { TEXTS } from '../texts.ts';
-
-const read = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
-// Comments may name what the code must not do; only code is checked.
-const code = (path) => read(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+import { code, read } from './source.mjs';
+import { TEXTS } from './texts-helper.mjs';
 
 const CLIENT_FILES = [
   'components/cabinet/ExtensionActivate.tsx',
@@ -89,19 +86,20 @@ test('/send is a server page that never reads its URL, and leads to installing Q
   const page = code('app/send/page.tsx');
   assert.doesNotMatch(page, /['"]use client['"]/);
   assert.doesNotMatch(page, /location|hash|[sS]earchParams|\bparams\b|useEffect|<script|\bdocument\.|\bwindow\./);
-  // It imports nothing that runs in the browser: the site's origin and its texts.
-  assert.deepEqual([...page.matchAll(/from '([^']+)'/g)].map((m) => m[1]), ['next', '@/lib/hosts', '@/lib/rich', '@/lib/texts']);
+  // It imports nothing that runs in the browser: the site's origin and its words in the visitor's language.
+  assert.deepEqual([...page.matchAll(/from '([^']+)'/g)].map((m) => m[1]), ['next', '@/lib/hosts', '@/i18n/server']);
   assert.match(page, /robots: \{ index: false, follow: false \}/);
   for (const key of ['send_lead', 'send_reason_missing', 'send_reason_update', 'send_reason_embedded', 'send_by_hand', 'send_only_yours']) {
-    assert.match(page, new RegExp(`\\b(?:t|rich)\\('${key}'`), key);
+    assert.match(page, new RegExp(`\\b(?:t|say|rich)\\('${key}'`), key);
   }
-  assert.match(page, /const activatePage = <a href=\{`\$\{SITE_ORIGIN\}\/node\/activate`\}>aiqnet\.io\/node\/activate<\/a>;/);
-  assert.match(page, /walletPage: <a href=\{`\$\{SITE_ORIGIN\}\/wallet`\}>\{t\('l_wallet_page'\)\}<\/a>/);
+  // The pages it names are aiqnet.io's, in the visitor's language.
+  assert.match(page, /const activatePage = <a href=\{`\$\{SITE_ORIGIN\}\$\{href\('\/node\/activate'\)\}`\} translate="no">aiqnet\.io\/node\/activate<\/a>;/);
+  assert.match(page, /walletPage: <a href=\{`\$\{SITE_ORIGIN\}\$\{href\('\/wallet'\)\}`\}>\{t\('l_wallet_page'\)\}<\/a>/);
   // By hand: the card's own title, quoted as the page shows it.
   assert.ok(TEXTS.send_by_hand.includes(`"${TEXTS.act_fund_manual_title}"`));
 });
 
-// Unified plan SITE-8: /activate is a permanent (308) redirect to the cabinet's activation, where the extension's
+// /activate is a permanent (308) redirect to the cabinet's activation, where the extension's
 // path lives (components/cabinet/ExtensionActivate.tsx); links in the extension's texts keep working.
 test('/activate is only the redirect to /node/activate', () => {
   assert.equal(existsSync(new URL('../../app/activate', import.meta.url)), false);

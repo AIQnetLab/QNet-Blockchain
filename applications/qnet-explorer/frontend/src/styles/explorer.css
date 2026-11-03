@@ -1,4 +1,4 @@
-/* explorer.css: the explorer area in concept B (B-SPEC 6.2 to 6.6): the list page, block, transaction, address, token
+/* explorer.css: the explorer area: the list page, block, transaction, address, token
    and QNC pages. Tokens only (tokens.css); tables, readouts, rows and tabs are the shared primitives. */
 
 /* ---------- Search (components/explorer/ExplorerSearch.tsx): one group, the field and Search flush at one height ---------- */
@@ -18,8 +18,9 @@
 }
 .ex-search-q:focus-visible { outline: none; }
 .ex-search-q::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
-/* The words in the empty field: the whole sentence on a computer, a short one on a phone, never cut. */
-.ex-search-ph { align-self: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fog); pointer-events: none; }
+/* The words in the empty field: the whole sentence on a computer, a short one on a phone, never cut: words longer than
+   the field (in some languages) take a second line, balanced, inside the field's height. */
+.ex-search-ph { align-self: center; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; text-wrap: balance; color: var(--fog); pointer-events: none; }
 .ex-search-q:not(:placeholder-shown) + .ex-search-ph { visibility: hidden; }
 .ex-ph-short { display: none; }
 .ex-search-go { grid-area: 1 / 2; height: 100%; border-radius: 0; }
@@ -41,11 +42,11 @@
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--signal);
   text-decoration: underline; text-decoration-color: var(--signal-line); text-underline-offset: .25em;
 }
-.ex-sugg-note2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; color: var(--fog); font-family: var(--f-sans); font-stretch: 100%; font-size: 13px; }
+.ex-sugg-note2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: end; color: var(--fog); font-family: var(--f-sans); font-stretch: 100%; font-size: 13px; }
 .ex-sugg-note { margin: 0; padding: 14px 16px; font-size: var(--t-note); color: var(--fog); }
 
 /* ---------- The list page: the band, the Latest blocks strip, All transactions across the width ---------- */
-/* Owner 20.10: the transactions obvious and at the top. A tighter band; on a computer the title, lead and search at the
+/* The transactions obvious and at the top. A tighter band; on a computer the title, lead and search at the
    left and the readouts beside them, so All transactions starts on the first screen. The readouts are three across down
    to a phone's two. */
 .ex-list .page-head { padding-top: calc(var(--hdr) + clamp(20px, 2.6vw, 36px)); padding-bottom: clamp(18px, 2vw, 28px); }
@@ -69,12 +70,13 @@
 /* Latest blocks (components/explorer/LatestBlocks.tsx): a title line, then one row of cards of fixed size between two
    rules, scrolled sideways inside its own frame. The row slides by a transform, so nothing around it moves. */
 .ex-chain { --card-h: 100px; --card-w: 184px; min-width: 0; }
-.ex-chain-head { display: flex; align-items: center; gap: 8px 18px; min-height: 44px; }
-/* On the narrowest phones, while a touch holds the strip, the title gives up its last letters before anything overflows. */
-.ex-chain-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--paper); white-space: nowrap; }
-.ex-chain-all { margin-left: auto; }
+.ex-chain-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; min-height: 44px; }
+/* Where the title, the Live mark and the actions do not fit one line (a phone, a longer language), the actions take a
+   line of their own at its end: no word is broken or cut. */
+.ex-chain-title { color: var(--paper); overflow-wrap: break-word; }
+.ex-chain-acts { display: flex; align-items: center; column-gap: inherit; margin-inline-start: auto; }
 /* Hide folds the row away; its cards leave the tab order with it. */
-.ex-chain-body { display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden; transition: grid-template-rows var(--t-sheet) var(--ease-out); }
+.ex-chain-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden; transition: grid-template-rows var(--t-sheet) var(--ease-out); }
 .ex-chain[data-open='false'] .ex-chain-body {
   grid-template-rows: minmax(0, 0fr); visibility: hidden; transition: grid-template-rows var(--t-sheet) var(--ease-out), visibility 0s linear var(--t-sheet);
 }
@@ -98,7 +100,7 @@
   flex: none; width: var(--card-w); height: var(--card-h); padding: 12px 16px; border-left: 1px solid var(--rule);
   font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-label); line-height: 18px; color: var(--fog);
 }
-.ex-cell-in { display: grid; grid-template-rows: 22px repeat(3, 18px); align-content: center; height: 100%; min-width: 0; }
+.ex-cell-in { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 22px repeat(3, 18px); align-content: center; height: 100%; min-width: 0; }
 .ex-cell-in > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ex-cell-in[data-new='true'] { animation: rowin var(--t-flash) ease-out; }
 .ex-cell-h { font-size: 16px; line-height: 22px; letter-spacing: -.02em; }
@@ -173,24 +175,27 @@
 /* A long hash in a detail row: its short form and Copy on one line. */
 /* Copy inside a row keeps its 44 px target over the row's padding, so a row with Copy is as tall as one without. */
 .ex .kv .act { margin-block: -10px; }
+/* Where Copy wraps under its value (a longer language's word), the lines keep those 10 px apart: its target never covers
+   the value's link. */
+.ex .kv :is(.ent-copy, .ex-val) { row-gap: 10px; }
 .ex-val { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 16px; font-family: var(--font-mono); font-stretch: 80%; font-size: 13.5px; color: var(--paper); }
 
 /* A group that opens (components/explorer/Disclosure.tsx): one row closed. */
 .ex-disc { border-top: 1px solid var(--rule-strong); border-bottom: 1px solid var(--rule); }
 .ex-disc-h { margin: 0; }
 .ex-disc-btn {
-  display: flex; align-items: center; gap: 16px; width: 100%; min-height: 64px; margin: 0; padding: 10px 4px 10px 0; border: 0; background: none;
-  cursor: pointer; text-align: left; font: inherit; color: var(--paper); transition: background-color var(--t-hover);
+  display: flex; align-items: center; gap: 16px; width: 100%; min-height: 64px; margin: 0; padding: 10px 0; padding-inline-end: 4px; border: 0; background: none;
+  cursor: pointer; text-align: start; font: inherit; color: var(--paper); transition: background-color var(--t-hover);
 }
 .ex-disc-btn:hover { background: var(--fill-row); }
-.ex-disc-btn .label { margin-right: auto; }
-.ex-chev { width: 8px; height: 8px; margin: 0 6px 4px 0; border-right: 1.5px solid var(--fog); border-bottom: 1.5px solid var(--fog); transform: rotate(45deg); transition: transform 200ms ease; }
+.ex-disc-btn .label { margin-inline-end: auto; }
+.ex-chev { width: 8px; height: 8px; margin: 0 0 4px; margin-inline-end: 6px; border-right: 1.5px solid var(--fog); border-bottom: 1.5px solid var(--fog); transform: rotate(45deg); transition: transform 200ms ease; }
 .ex-disc-btn[aria-expanded='true'] .ex-chev { transform: rotate(225deg); margin-bottom: -4px; }
 .ex-disc > div { padding-bottom: 24px; }
 
 /* The block history (app/explorer/blocks): how many blocks are newer than page 1 and Show newest, one line that keeps
    its place while there are none. */
-.ex-newer { display: flex; align-items: center; gap: 18px; min-height: 44px; margin: -6px 0 12px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); color: var(--fog); }
+.ex-newer { display: flex; flex-wrap: wrap; align-items: center; gap: 0 18px; min-height: 44px; margin: -6px 0 12px; font-family: var(--font-mono); font-stretch: 80%; font-size: var(--t-data); color: var(--fog); }
 .ex-newer[data-on='false'] { visibility: hidden; }
 /* The count keeps the width of "99,999 newer blocks", so Show newest stays put as it grows. */
 .ex-newer > .num { min-width: 19ch; }
@@ -200,7 +205,7 @@
 .ex-lookup .form-note { min-height: 1.5em; }
 .ex-filter-field { max-width: 520px; margin: 0 0 16px; }
 .ex-tabpanel { padding-top: 24px; display: flex; flex-direction: column; gap: 16px; }
-/* A second view of an entity the row already links (B-SPEC 5.7): the same mono text, in Fog. */
+/* A second view of an entity the row already links: the same mono text, in Fog. */
 .ent.fog { color: var(--fog); }
 
 @media (max-width: 860px) {
@@ -231,7 +236,3 @@
 @media (max-width: 380px) {
   .ex-chain-head { column-gap: 12px; }
 }
-
-/* A table's title stays on one line; on a narrow column the Live mark goes under it. */
-.ex .tbl-head { flex-wrap: wrap; row-gap: 6px; }
-.ex .tbl-title { white-space: nowrap; }

@@ -433,6 +433,39 @@ describe('Android back with tabs', () => {
   });
 });
 
+describe('the Browser tab tapped while it is open', () => {
+  const onStart = (m) => m.tree.root.findAll((n) => n.props.testID === 'bookmark-aiqnet').length > 0;
+
+  it('shows the start page over the tab in front, its page kept loaded and paused, with no overview or menu over it', async () => {
+    const m = await twoTabs();
+    const [, w2] = m.webs();
+    await m.press('browser-tabs');
+    expect([m.overviewShown(), onStart(m)]).toEqual([true, false]);
+    await act(async () => { m.ref.current.goHome(); });
+    expect([m.overviewShown(), onStart(m)]).toEqual([false, true]);
+    // The page stays under the start page, with its media paused: the browsing session goes on.
+    expect(m.webs()).toHaveLength(2);
+    expect(m.paused(w2)).toBeGreaterThan(0);
+    // The menu closes too, and a second tap changes nothing more.
+    const Menu = require('../src/components/ui/Menu').default;
+    await act(async () => { m.tree.root.findAll((n) => n.props.label === 'common_more' && n.props.onPress)[0].props.onPress(); });
+    expect(m.tree.root.findAllByType(Menu)).toHaveLength(1);
+    await act(async () => { m.ref.current.goHome(); });
+    expect([m.tree.root.findAllByType(Menu).length, onStart(m), m.webs().length]).toEqual([0, true, 2]);
+    await m.unmount();
+  });
+
+  it('changes nothing while a sheet is on screen: a sheet is modal', async () => {
+    const m = await twoTabs();
+    await m.send(m.webs()[1], { method: 'qnet_requestAccounts' });
+    expect(m.last()).not.toBe(null);
+    await act(async () => { m.ref.current.goHome(); });
+    expect(onStart(m)).toBe(false);
+    await act(async () => { m.last().actions.reject(m.last().view.id); });
+    await m.unmount();
+  });
+});
+
 describe('the tab overview', () => {
   it('names each tab by title or host (the start page by name), marks the one in front, switches and closes', async () => {
     const m = await twoTabs(OTHER);
@@ -845,6 +878,26 @@ describe('the toolbar', () => {
     await act(async () => { await actions.approve(view.id); });
     expect(m.injected(w2).some((c) => c.includes('"event":"accountsChanged"'))).toBe(true);
     expect(m.injected(w1).some((c) => c.includes('"event"'))).toBe(false);
+    await m.unmount();
+  });
+
+  // Plainly a browser: the address on a rounded bar at the top, the page's host centred on it; the start
+  // page's bookmark and recent pages on cards (components/ui/Section).
+  it('the address is a pill with the host centred; the start page lists its sites on cards', async () => {
+    const { radius } = require('../src/theme');
+    const Section = require('../src/components/ui/Section').default;
+    const m = await mount();
+    const field = m.tree.root.findAll((n) => typeof n.props.onSubmitEditing === 'function' && typeof n.props.placeholder === 'string')[0];
+    expect(StyleSheet.flatten(field.props.style).borderRadius).toBe(radius.pill);
+    const cards = m.tree.root.findAllByType(Section);
+    expect(cards.map((c) => c.findAll((n) => n.props.testID === 'bookmark-aiqnet').length > 0)).toEqual([true, false]);
+    expect(cards[1].props.title).toBe('browser_recent');
+    await m.openAddress('dapp.example');
+    await m.nav(m.webs()[0], `${SITE}/one`);
+    const bar = m.tree.root.findAll((n) => n.props.testID === 'browser-address' && typeof n.type === 'string')[0];
+    expect(StyleSheet.flatten(bar.props.style)).toMatchObject({ borderRadius: radius.pill, height: 40 });
+    expect(StyleSheet.flatten(bar.findAll((n) => n.type === Text)[0].props.style).textAlign).toBe('center');
+    expect(m.tree.root.findAllByType(Section)).toHaveLength(0);
     await m.unmount();
   });
 

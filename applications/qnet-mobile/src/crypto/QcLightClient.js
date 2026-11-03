@@ -31,6 +31,8 @@ import {
   GALC_V2_MINT_INTERVAL,
 } from '../config/genesisConsensus';
 import { boundedGetJson } from '../utils/boundedFetch';
+import { afterUserActions } from '../utils/userHold';
+import { pause } from '../utils/pause';
 
 // ── consensus constants (mirror checkpoint_bft.rs — MUST stay in lockstep with the node) ──
 const COMMITTEE_THRESHOLD = 1000; // ≤1000 eligible ⇒ whole set is the committee
@@ -358,8 +360,10 @@ function readWait(base, now = Date.now()) {
 }
 
 // One GET of `base + path`, counted against the node's budget: { body } (any answer but the rate limit's), { limited }
-// (the node's rate limit: it is left alone for the time it asks) or { error }. Never throws.
+// (the node's rate limit: it is left alone for the time it asks) or { error }. Never throws. It starts once no user
+// action holds the network (utils/userHold): verification runs in the background and never slows what the user waits on.
 async function nodeGet(base, path, maxBytes, timeoutMs = 10000) {
+  await afterUserActions();
   const now = Date.now();
   const list = recentReads(base, now);
   list.push(now);
@@ -477,10 +481,9 @@ export function checkpointContentDigest(cp) {
 }
 
 // ── QC admission on device ──────────────────────────────────────────────────
-// The threshold a checkpoint's certificate must meet, or null to REFUSE the checkpoint outright.
-// A recovery anchor is attacker-chosen wire data that used to select a lower bar; the node refuses
-// any checkpoint carrying one (RC_ENABLED = false, node.rs v2_rc_disabled / check_content), so a
-// device that accepted it would confirm state no full node ever finalized. The bar is ALWAYS strict.
+// The threshold a checkpoint's certificate must meet, or null to refuse the checkpoint: every full node refuses one
+// carrying a recovery anchor (wire data its sender chooses), so a device that took it would confirm state no full node
+// finalized.
 export function checkpointQuorum(cp, committee) {
   if (cp && cp.recovery_anchor) return null;
   return quorumSize(committee.length);
@@ -643,7 +646,6 @@ export function recomputeRegistryRoot(entries) {
 // SHA3, a 2 KiB SHAKE256 and 1024 lane adds, and on the app's JS thread a long snapshot must not hold back taps, the
 // auto-lock or the lock on leaving the app.
 const REGISTRY_YIELD_EVERY = 256;
-const yieldNow = () => new Promise((resolve) => { setTimeout(resolve, 0); });
 
 async function recomputeRegistryRootYielding(entries) {
   const state = new Uint16Array(LANES);
@@ -652,7 +654,7 @@ async function recomputeRegistryRootYielding(entries) {
     const lanes = ltHashRowLanes(e);
     for (let i = 0; i < LANES; i++) state[i] = (state[i] + lanes[i]) & 0xffff;
     n += 1;
-    if (n % REGISTRY_YIELD_EVERY === 0) await yieldNow();
+    if (n % REGISTRY_YIELD_EVERY === 0) await pause(0);
   }
   return registryRootOf(state);
 }
@@ -1084,7 +1086,6 @@ async function fetchFirst(nodes, path, maxBytes, accept = null) {
 const STEP = { VERIFIED: 'verified', FAILED: 'failed', TRANSIENT: 'transient', NOT_CERTIFIED: 'not_certified' };
 const STEP_WAIT_MAX_MS = 2000;
 export const NOT_FOUND_MORE_NODES = 2;
-const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 const proofPath = (j) => '/api/v1/macroblock/' + j + '/proof';
 const notCertifiedYet = (body) => !!body && typeof body === 'object' && body.error === 'macroblock_not_found';
 // Targets the nodes said are not certified yet: index -> when. Lets a caller tell "not certified yet" from a walk
@@ -1134,7 +1135,7 @@ async function verifyStep(j, nodesProvider, hooks, tally = null, ahead = null, t
           console.warn('[WARN][LIGHT] walk_paused j=' + j + ' (every node at its read budget)');
           return STEP.TRANSIENT;
         }
-        await sleep(wait);
+        await pause(wait);
         continue;
       }
       got = await nodeGet(base, proofPath(j), PROOF_MAX_BYTES, LARGE_READ_TIMEOUT_MS);

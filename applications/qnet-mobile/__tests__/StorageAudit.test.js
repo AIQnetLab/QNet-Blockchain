@@ -94,14 +94,17 @@ it('create, unlock, cleanup, history, lock, switch and delete leave nothing secr
 
   // What an older build left: a node record naming its code and burn, plaintext copies, keys named after a code.
   await AsyncStorage.multiSet([
-    [WalletManager.NODE_RECORD_KEY, JSON.stringify({ nodeType: 'light', pseudonym: wm.generateLightNodePseudonym(QNET), code: KAT, burnTxHash: OLD_BURN })],
+    ['qnet_last_activated_node', JSON.stringify({ nodeType: 'light', pseudonym: wm.generateLightNodePseudonym(QNET), code: KAT, burnTxHash: OLD_BURN })],
     ['qnet_activation_meta_light', JSON.stringify({ burnTxHash: OLD_BURN, burnAmount: 1500 })],
     ['qnet_link_burn', JSON.stringify({ burnTx: OLD_BURN })], ['qnet_onchain_reg_pending', JSON.stringify({ burnTxHash: OLD_BURN })],
     [`qnet_identity_pk_${KAT}`, 'pk'], ['qnet_update_dismissed_code', '17'],
   ]);
   await wm.cleanupActivationStorage();
   await audit('cleanup');
-  expect(await AsyncStorage.getItem(WalletManager.NODE_RECORD_KEY)).toContain('"nodeType":"light"');
+  // The older node record goes whole: the genesis nodes name the wallet's node again (WalletManager.walletNode).
+  expect(await AsyncStorage.getItem('qnet_last_activated_node')).toBe(null);
+  await wm.saveWalletNode({ owner: QNET, nodeId: wm.generateLightNodePseudonym(QNET), nodeType: 'light' });
+  await audit('node record');
 
   await saveCachedHistory(QNET, [{ hash: 'h1', from: OTHER.qnet, to: QNET, status: 'confirmed', timestamp: 1 }]);
   await audit('history');

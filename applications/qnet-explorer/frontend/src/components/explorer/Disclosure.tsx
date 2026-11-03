@@ -1,6 +1,6 @@
 'use client';
 
-// A titled group that opens in place (B-SPEC 6.3): a full-width row button with the title, a count and a chevron;
+// A titled group that opens in place: a full-width row button with the title, a count and a chevron;
 // closed it is one row, so opening it moves only what is under it.
 
 import { useId, useState, type ReactNode } from 'react';

@@ -1,19 +1,24 @@
 /**
  * A status said in a word, never in a filled pill: live (a Signal dot with its slow ring, then the word), done (Paper),
- * quiet (Fog), needs (Ember: something to do or that went wrong), none (an empty ring). The word carries the meaning;
- * colour only repeats it. With the system's reduce-motion setting on, the ring stands still.
+ * ok (Mint: settled, as a transaction's status is written), quiet (Fog), needs (Ember: something to do or that went
+ * wrong), none (an empty ring). The word carries the meaning; colour only repeats it. With the system's reduce-motion
+ * setting on, the ring stands still.
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { AccessibilityInfo, Animated, Easing, Text, View } from 'react-native';
 import { color, motion, radius, size, space, themed } from '../../theme';
 
-// Whether the system's reduce-motion setting is on; true until it has been read, so nothing moves before.
+// The setting as last read anywhere in the app: true until the first read, so nothing moves before.
+let lastReduce = true;
+
+// Whether the system's reduce-motion setting is on: what was last read, read again on mount and followed while mounted.
 export function useReduceMotion() {
-  const [reduce, setReduce] = useState(true);
+  const [reduce, setReduce] = useState(lastReduce);
   useEffect(() => {
     let alive = true;
-    AccessibilityInfo.isReduceMotionEnabled().then((v) => { if (alive) setReduce(!!v); }, () => {});
-    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', (v) => setReduce(!!v));
+    const take = (v) => { lastReduce = !!v; if (alive) setReduce(lastReduce); };
+    AccessibilityInfo.isReduceMotionEnabled().then(take, () => {});
+    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', take);
     return () => { alive = false; if (sub && sub.remove) sub.remove(); };
   }, []);
   return reduce;
@@ -63,6 +68,7 @@ const s = themed((type) => ({
   word: { ...type('note') },
   live: { color: color.paper },
   done: { color: color.paper },
+  ok: { color: color.mint },
   quiet: { color: color.fog },
   needs: { color: color.ember },
   none: { color: color.fog },

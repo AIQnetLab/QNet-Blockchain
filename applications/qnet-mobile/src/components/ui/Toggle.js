@@ -1,6 +1,7 @@
 /**
- * An on/off switch and a checkbox, both square-cornered. The switch's knob slides in 150 ms (transform only); off is
- * an Edge outline, on a Signal track with an Ink knob. The checkbox is an Edge square, Signal with an Ink tick when ticked.
+ * An on/off switch and a checkbox. The switch is a pill with a round knob that slides in 150 ms (transform only); off is
+ * an Edge outline, on a Signal track with an Ink knob. The checkbox is an Edge box with softened corners, Signal with an
+ * Ink tick when ticked.
  */
 import React, { useEffect, useRef } from 'react';
 import { Animated, Easing, I18nManager, Pressable, View } from 'react-native';
@@ -57,14 +58,14 @@ export function Checkbox({ checked, onPress, accessibilityLabel, testID }) {
 
 const s = themed(() => ({
   track: {
-    width: 40, height: 22, padding: 3, borderRadius: radius.box, borderWidth: 1, borderColor: color.edge,
+    width: 40, height: 22, padding: 3, borderRadius: radius.pill, borderWidth: 1, borderColor: color.edge,
     justifyContent: 'center',
   },
   trackOn: { backgroundColor: color.signal, borderColor: color.signal },
-  knob: { width: 14, height: 14, borderRadius: radius.box, backgroundColor: color.edge },
+  knob: { width: 14, height: 14, borderRadius: radius.pill, backgroundColor: color.edge },
   knobOn: { backgroundColor: color.ink },
   box: {
-    width: 22, height: 22, borderRadius: radius.box, borderWidth: 1, borderColor: color.edge,
+    width: 22, height: 22, borderRadius: radius.dot, borderWidth: 1, borderColor: color.edge,
     alignItems: 'center', justifyContent: 'center',
   },
   boxOn: { backgroundColor: color.signal, borderColor: color.signal },

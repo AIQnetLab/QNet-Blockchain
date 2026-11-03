@@ -14,7 +14,7 @@ Security vulnerabilities must not be filed as public issues or pull requests. Fo
 | --- | --- |
 | Rust | A recent stable toolchain. The workspace pins no `rust-toolchain.toml`, but dependencies set the floor: `wasmi` 0.47 declares `rust-version = "1.86"`, so anything older will not build. Add the `rustfmt` and `clippy` components. |
 | Build tools (Linux) | `build-essential`, `pkg-config`, `libssl-dev`. These are what CI installs, and RocksDB needs a C/C++ toolchain. |
-| Node.js | The mobile app declares `engines.node >= 20`. The explorer front end is built on Node 18 in CI. |
+| Node.js | The mobile app declares `engines.node >= 20`. The explorer front end declares `engines.node >= 22` (Next.js 16); CI's front-end job sets up Node 22. |
 | Python | Required by `applications/qnet-cli`, which declares `python_requires >= 3.8`, and by any Cargo command that enables the `python` feature — including `--all-features`, which pulls in `pyo3` through `qnet-state`, `qnet-mempool` and `qnet-sharding` and needs a discoverable Python 3 interpreter at build time. |
 
 ```bash
@@ -91,7 +91,9 @@ cd contracts && cargo test                                  # the contract helpe
 
 Two notes. The mobile app runs `patch-package` on `postinstall`, and `.gitattributes` forces `*.patch`
 to LF — on Windows, do not let `core.autocrlf` rewrite those files or `npm install` will fail. The
-explorer's `lint` script shells out to `bunx` for Biome and `tsc`, so it needs `bun` on PATH.
+explorer's `lint` script runs Biome's linter over `src`, `scripts` and `lib`, then the TypeScript check
+(`tsc --noEmit -p tsconfig.json`), both from the explorer's own `node_modules`; `lint:fix` writes Biome's fixes
+to the same folders.
 
 ## Continuous integration
 

@@ -173,7 +173,7 @@ export default Object.freeze({
   historyNotFound: 'غير موجودة',
   historyUnverified: 'غير متحقق منها',
   historyDroppedLead: 'لم تعد QNet Blockchain تحتفظ بهذه المعاملة ولم تكتمل. لم يُنفق شيء؛ إرسالك التالي يحل محلها.',
-  historyUnverifiedLead: 'يعرض المستكشف هذه المعاملة، لكن عقد QNet Blockchain لا تعرضها: ربما تكون أقدم مما تحتفظ به.',
+  historyUnverifiedLead: 'يعرض المستكشف هذه المعاملة، لكن عقد QNet Blockchain لا تعرضها.',
   historyTokenUnverifiedLead: 'يعرض المستكشف تحويل الرمز هذا، لكن المحفظة لم تتمكن بعد من إثباته على QNet Blockchain.',
   historyReplacedLead: 'أخذت معاملة أخرى من هذه المحفظة الـ nonce الخاص بها: لا يمكن لهذه المعاملة أن تكتمل أبدًا.',
   historyType: 'النوع',

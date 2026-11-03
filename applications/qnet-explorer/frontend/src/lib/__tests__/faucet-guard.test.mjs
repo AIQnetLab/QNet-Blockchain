@@ -1,11 +1,8 @@
 // The /testnet faucet's admission (src/server/faucet-guard.ts) and its global budget (src/server/faucet-budget.ts).
-// SITE-R1-02: on testnet the old faucet skipped its per-address cooldown and its per-IP window, and shared the faucet
-// wallet and the Solana send lane with a second funding route (since retired), so one script at nginx's 10 requests a
-// second emptied the wallet and pushed the send lane into back-offs for everyone.
-// SITE M-13: the hourly cap could still be taken by three to six IP addresses scripting claims at the start of each hour,
-// shutting the faucet to everyone activating a node; the per-IP window was shared by both tokens. Now each token has its
-// own window per IP and per network block, and most of the hour is kept for claims with the faucet pass the node cabinet
-// gets for the wallet it activates (src/server/faucet-pass.ts), one claim of each token per wallet a day.
+// Every claim keeps its per-address cooldown and its windows per IP and per network block, each token its own, so one
+// script cannot empty the faucet wallet or crowd the shared Solana send lane; and most of the hour is kept for claims with
+// the faucet pass the node cabinet gets for the wallet it activates (src/server/faucet-pass.ts), one claim of each token
+// per wallet a day, so a few addresses scripting claims at the start of an hour cannot shut it to people activating.
 // Run: npm run test:wallet
 
 import { test } from 'node:test';
@@ -24,10 +21,14 @@ import {
   FAUCET_PASSES_PER_IP, FAUCET_PASSES_PER_NETWORK, FAUCET_PASS_PER_IP, FAUCET_PASS_TTL_S, checkFaucetPass, createFaucetPassRoute, faucetPassKey, mintFaucetPass,
   sharedFaucetPassKey,
 } from '../../server/faucet-pass.ts';
-import { FAUCET_PASS_RE, PASS_HANDOVER_KEY, handOverPass, requestFaucetPass, retryAt, takeHandedPass } from '../faucet-handover.ts';
+import {
+  FAUCET_PASS_RE, PASS_HANDOVER_KEY, PASS_MARGIN_MS, PASS_RETRY_MS, PASS_WAIT_MS, createFaucetPasses, handOverPass, requestFaucetPass, retryAt,
+  takeHandedPass,
+} from '../faucet-handover.ts';
 import { OFFCHAIN_CONTEXT, burnRecordEnvelope, reservationMessage } from '../cabinet/burn-record.ts';
 import { encodeB64url, eonOfPublicKey } from '../qnet-link.ts';
 import { createRateLimiter } from '../../../lib/rate-limit.ts';
+import { repo } from './source.mjs';
 
 const HOUR = 60 * 60 * 1000;
 
@@ -125,10 +126,10 @@ test('the route admits every claim through the guard on every network, before it
   const route = readFileSync(new URL('../../app/api/faucet/claim/route.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(route, /environment !== 'testnet'|environment === 'testnet'/, 'no network skips a limit');
   const admit = route.indexOf('const admission = legacyFaucetGuard().admit(walletAddress, tokenType, getRateLimitKey(request), wallet);');
-  const send = route.indexOf('const result = await sendTokens(tokenType, amount, walletAddress);');
+  const send = route.indexOf('const result = await sendTokens(tokenType, amount, walletAddress, deadline);');
   assert.ok(admit > 0 && send > admit);
   assert.match(route, /if \(result\.releasable === true\) admission\.release\(\);/);
-  // SITE-R3-01: one table of test-token amounts, and no amounts at all off testnet; that refusal comes before anything
+  // One table of test-token amounts, and no amounts at all off testnet; that refusal comes before anything
   // is admitted or sent, and the network is the release's (src/server/faucet-config.ts), never a setting.
   assert.match(route, /const FAUCET_AMOUNTS = \{ '1DEV': 1500, SOL: 0\.01 \} as const;/);
   assert.match(route, /const faucetAmounts = \(environment: 'testnet' \| 'mainnet'\): typeof FAUCET_AMOUNTS \| null => \(environment === 'mainnet' \? null : FAUCET_AMOUNTS\);/);
@@ -160,7 +161,7 @@ test('a budget: fixed windows on the epoch, a place given back only in its windo
   assert.throws(() => createFaucetBudget({ max: 1, windowMs: 0 }), RangeError);
 });
 
-// ---------------------------------------------------------------- SITE M-13
+// ---------------------------------------------------------------- the faucet pass
 
 const seed = (label) => createHash('sha256').update(label).digest();
 const T0 = 1_790_000_000_000;
@@ -168,13 +169,13 @@ function walletOf(label) {
   const { secretKey, publicKey } = ml_dsa65.keygen(seed(`qnet:${label}`));
   return { sk: secretKey, pk: publicKey, qnet: eonOfPublicKey(publicKey), solana: bs58.encode(ed25519.getPublicKey(seed(`solana:${label}`))) };
 }
-// The wallet's signed reservation (C1) of a payment address's light burn at `time` (Unix seconds), as the record's hold.
+// The wallet's signed reservation of a payment address's light burn at `time` (Unix seconds), as the record's hold.
 function holdFor(w, burner, time) {
   const env = burnRecordEnvelope(reservationMessage(w.qnet, 'light', 'payment', burner, time));
   return { pk: encodeB64url(w.pk), sig: encodeB64url(ml_dsa65.sign(env, w.sk, { context: new TextEncoder().encode(OFFCHAIN_CONTEXT) })), time };
 }
 
-test('M-13: three to six IP addresses at the start of an hour take only the open share; activations keep theirs', () => {
+test('three to six IP addresses at the start of an hour take only the open share; activations keep theirs', () => {
   const { g, advance } = guard();
   assert.equal(PASS_SHARE, 0.8);
   assert.deepEqual(passPlaces(30), { pass: 24, open: 6 });
@@ -205,7 +206,7 @@ test('M-13: three to six IP addresses at the start of an hour take only the open
 // The places kept for passes are kept pro rata through the hour: those claims with a pass have not taken by their share
 // of the hour so far open to anyone, so the hour is not lost while no one activates; and however hard others claim, a
 // claim with a pass later in the hour still finds its part.
-test('M-13: the places kept for passes open pro rata through the hour; a claim with a pass later still finds its part', () => {
+test('the places kept for passes open pro rata through the hour; a claim with a pass later still finds its part', () => {
   const { g, advance } = guard();
   const open = (token, n) => g.admit(addr(), token, { ok: true, ip: `203.1.${n}.9` });
   // :00, no one activating: the open share, then a refusal that names when the next place opens (a 24th of the hour).
@@ -248,7 +249,7 @@ test('M-13: the places kept for passes open pro rata through the hour; a claim w
   assert.equal(s.admit(addr(), 'SOL', { ok: true, ip: '192.1.98.2' }, 'wallet-late-again').ok, true);
 });
 
-test('M-13: one claim of each token per wallet a day with a pass, whatever address it names; per network block too', () => {
+test('one claim of each token per wallet a day with a pass, whatever address it names; per network block too', () => {
   const { g, advance } = guard();
   const first = g.admit(addr(), '1DEV', ip(70), 'wallet-daily');
   assert.equal(first.ok, true);
@@ -272,7 +273,7 @@ test('M-13: one claim of each token per wallet a day with a pass, whatever addre
   assert.equal(networkOf('2001:db8:aa:bb::/64'), '2001:db8:aa::/48');
 });
 
-test('M-13: the faucet pass: the wallet and its end under the server key, checked in constant time, short-lived', () => {
+test('the faucet pass: the wallet and its end under the server key, checked in constant time, short-lived', () => {
   const key = faucetPassKey('33'.repeat(32));
   assert.deepEqual([...key], Array(32).fill(0x33));
   assert.equal(faucetPassKey('33'.repeat(31)).length, 32, 'too short: a key of the process');
@@ -302,13 +303,12 @@ test('M-13: the faucet pass: the wallet and its end under the server key, checke
   const route = readFileSync(new URL('../../app/api/faucet/claim/route.ts', import.meta.url), 'utf8');
   assert.match(route, /const wallet = checkFaucetPass\(sharedFaucetPassKey\(\), pass, Date\.now\(\)\);/);
   assert.match(route, /\.\.\.\(admission\.retryAfterS \? \{ retryAfterS: admission\.retryAfterS \} : \{\}\),/);
-  // The env template and the explorer doc name the key.
-  const REPO = new URL('../../../../../../', import.meta.url);
-  assert.match(readFileSync(new URL('applications/qnet-explorer/frontend/ecosystem.config.example.js', REPO), 'utf8'), /FAUCET_PASS_KEY/);
-  assert.match(readFileSync(new URL('docs/applications/explorer.md', REPO), 'utf8'), /\| `FAUCET_PASS_KEY` \|/);
+  // The deploy script makes the key and the explorer doc names it.
+  assert.match(repo('deployment/deploy-aiqnet.sh'), /echo FAUCET_PASS_KEY=\\\$\(openssl rand -hex 32\) >> \$SITE_ENV/);
+  assert.match(repo('docs/applications/explorer.md'), /\| `FAUCET_PASS_KEY` \|/);
 });
 
-test('M-13: POST /api/faucet/pass gives a pass only for the wallet\'s own signed reservation, on testnet, a few per client', async () => {
+test('POST /api/faucet/pass gives a pass only for the wallet\'s own signed reservation, on testnet, a few per client', async () => {
   let t = T0;
   const key = faucetPassKey('55'.repeat(32));
   const limiter = createRateLimiter({ now: () => t });
@@ -351,7 +351,7 @@ test('M-13: POST /api/faucet/pass gives a pass only for the wallet\'s own signed
 // A QNet wallet costs nothing, so anyone can sign reservations for throwaway wallets: a pass is scarce only by the few each
 // client IP and each network block get an hour, counted once the reservation verified. Without them five addresses would
 // take every place kept for passes.
-test('M-13: a pass costs its client one of a few an hour, and its network block one of a few more', async () => {
+test('a pass costs its client one of a few an hour, and its network block one of a few more', async () => {
   let t = T0;
   const key = faucetPassKey('77'.repeat(32));
   const limiter = createRateLimiter({ now: () => t });
@@ -397,18 +397,23 @@ test('M-13: a pass costs its client one of a few an hour, and its network block 
   assert.equal((await route(post(throwaway('m13-next-hour'), '198.51.100.7'))).status, 200);
 });
 
-test('M-13: the payment card asks for the pass with its hold and hands it over; the Testnet page sends it and says when to try again', async () => {
+test('the payment card asks for the pass with its hold and hands it over; the Testnet page sends it and says when to try again', async () => {
   // The client: the hold and its payment address go to the pass route; anything but a pass is none.
   const w = walletOf('m13-client');
   const hold = { wallet: w.qnet, pk: 'pk', sig: 'sig', time: 1 };
   const asked = [];
   const ok = mintFaucetPass(faucetPassKey('66'.repeat(32)), w.qnet, T0).pass;
   const fetchFn = async (url, init) => { asked.push({ url, body: JSON.parse(init.body) }); return new Response(JSON.stringify({ pass: ok, until: 1 }), { status: 200 }); };
-  assert.equal(await requestFaucetPass(hold, 'PayAddr', fetchFn), ok);
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', fetchFn, T0), { pass: ok });
   assert.deepEqual(asked, [{ url: '/api/faucet/pass', body: { wallet: w.qnet, burner: 'PayAddr', proof: { pk: 'pk', sig: 'sig', time: 1 } } }]);
-  assert.equal(await requestFaucetPass(hold, 'PayAddr', async () => new Response('{"error":"invalid_proof"}', { status: 400 })), null);
-  assert.equal(await requestFaucetPass(hold, 'PayAddr', async () => new Response('{"pass":"nope"}', { status: 200 })), null);
-  assert.equal(await requestFaucetPass(hold, 'PayAddr', async () => { throw new Error('offline'); }), null);
+  // A refused confirmation is never asked again, past the hourly passes not before the refusal's time, and a failure
+  // to reach the site or an answer that is no pass leaves the next press free to ask.
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', async () => new Response('{"error":"invalid_proof"}', { status: 400 }), T0), { pass: null, retryAt: Infinity });
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', async () => new Response('{"error":"not_found"}', { status: 404 }), T0), { pass: null, retryAt: Infinity });
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', async () => new Response('{"error":"rate_limited","retryAfterS":900}', { status: 429 }), T0), { pass: null, retryAt: T0 + 900_000 });
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', async () => new Response('', { status: 429 }), T0), { pass: null, retryAt: T0 + PASS_RETRY_MS });
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', async () => new Response('{"pass":"nope"}', { status: 200 }), T0), { pass: null, retryAt: null });
+  assert.deepEqual(await requestFaucetPass(hold, 'PayAddr', async () => { throw new Error('offline'); }, T0), { pass: null, retryAt: null });
   // Kept in this tab's session storage, read once and removed, as the address is.
   const area = new Map();
   const storage = { getItem: (k) => area.get(k) ?? null, setItem: (k, v) => area.set(k, v), removeItem: (k) => area.delete(k) };
@@ -427,15 +432,102 @@ test('M-13: the payment card asks for the pass with its hold and hands it over; 
   assert.equal(retryAt(null, T0), null);
   const strip = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const steps = strip('components/cabinet/ActivateSteps.tsx');
-  assert.match(steps, /void requestFaucetPass\(\{ wallet: holdWallet, pk: holdPk, sig: holdSig, time: holdTime \}, record\.pub\)/);
+  // The card asks for a pass only when its faucet link is followed, never as it shows: the server gives few passes an
+  // hour.
+  assert.doesNotMatch(steps, /requestFaucetPass|useEffect\([^;]*faucetPasses/);
   assert.match(steps, /const hold = ACTIVATION_NETWORK === 'testnet' \? record\.hold \?\? null : null;/);
-  assert.match(steps, /const toFaucet = \(\) => \{\s*if \(walletSolana\) handOver\(walletSolana\);\s*if \(pass\) handOverPass\(pass\);\s*\};/);
+  assert.match(steps, /\s*if \(walletSolana\) handOver\(walletSolana\);\s*if \(!hold\) return;\s*const kept = faucetPasses\.ready\(hold\);\s*if \(kept\) handOverPass\(kept\);/);
+  // While the pass is asked for the link is busy and takes no second click; the move to the faucet happens only if the
+  // card is still shown at the address it was clicked on, so a visitor gone elsewhere meanwhile stays there.
+  assert.match(steps, /const toFaucet = \(event: MouseEvent<HTMLAnchorElement>\) => \{\s*if \(passWait\) \{\s*event\.preventDefault\(\);\s*return;\s*\}/);
+  assert.match(steps, /event\.preventDefault\(\);\s*const from = window\.location\.href;\s*setPassWait\(true\);\s*void faucetPasses\.obtain\(hold, record\.pub, PASS_WAIT_MS\)\.then\(\(got\) => \{\s*if \(got\) handOverPass\(got\);\s*if \(!shown\.current\) return;\s*setPassWait\(false\);\s*if \(window\.location\.href === from\) router\.push\(FAUCET_HREF\);/);
+  assert.match(steps, /useEffect\(\(\) => \{\s*shown\.current = true;\s*return \(\) => \{\s*shown\.current = false;\s*\};\s*\}, \[\]\);/);
+  assert.match(steps, /<Link href=\{FAUCET_HREF\} onClick=\{toFaucet\} aria-busy=\{passWait \|\| undefined\}>/);
+  assert.equal(steps.match(/router\.push\(/g)?.length, 1);
+  assert.match(strip('styles/base.css'), /\.btn\[aria-busy='true'\], a\[aria-busy='true'\] \{ cursor: progress; \}/);
   const page = strip('app/testnet/page.tsx');
   assert.match(page, /setFaucetPass\(takeHandedPass\(\)\);/);
   assert.match(page, /const withPass = faucetPass \? \{ pass: faucetPass \} : \{\};/);
   assert.equal(page.match(/tokenType: '(?:1DEV|SOL)', \.\.\.withPass \}/g).length, 2);
   // The time through the site's one formats module (14:05, or Oct 20, 14:05 beyond the next twelve hours).
-  assert.match(page, /return ` Try again at \$\{clockAt\(at, now\)\}\.`;/);
+  assert.match(page, /return ` \$\{t\('faucet_try_at', \{ time: clockAt\(at, now, t\) \}\)\}`;/);
   assert.doesNotMatch(page, /Intl\.DateTimeFormat/);
-  assert.match(page, /setErrorMessage\(err \+ tryAgain\(both, answered\)\);/);
+  assert.match(page, /setErrorMessage\(err \+ tryAgain\(both, answered, t\)\);/);
+});
+
+// A pass is asked for only when the faucet link is followed, once per wallet's confirmation while it lasts, and never
+// while a refusal holds.
+test('the faucet pass: asked for once per confirmation while it lasts, shared by presses meanwhile, never during a refusal', async () => {
+  let t = T0;
+  const w = walletOf('pass-once');
+  const hold = { wallet: w.qnet, pk: 'pk', sig: 'sig', time: 1 };
+  const key = faucetPassKey('77'.repeat(32));
+  let answer = () => new Response(JSON.stringify(mintFaucetPass(key, w.qnet, t)), { status: 200 });
+  let asked = 0;
+  let release = null;
+  const fetchFn = async () => {
+    asked += 1;
+    if (release !== null) await new Promise((resolve) => { const go = release; release = null; go(resolve); });
+    return answer();
+  };
+  const passes = createFaucetPasses(fetchFn, () => t);
+  assert.equal(passes.ready(hold), null, 'nothing asked for before the link is followed');
+  assert.equal(asked, 0);
+  // Two presses at once share one request.
+  const [a, b] = await Promise.all([passes.obtain(hold, 'PayAddr'), passes.obtain(hold, 'PayAddr')]);
+  assert.equal(a, b);
+  assert.equal(checkFaucetPass(key, a, t), w.qnet);
+  assert.equal(asked, 1);
+  // Kept while it lasts: no request on the next presses or visits.
+  t += FAUCET_PASS_TTL_S * 1000 - PASS_MARGIN_MS - 1;
+  assert.equal(passes.ready(hold), a);
+  assert.equal(await passes.obtain(hold, 'PayAddr'), a);
+  assert.equal(asked, 1);
+  // Too close to its end: a new one.
+  t += 1;
+  assert.equal(passes.ready(hold), null);
+  const c = await passes.obtain(hold, 'PayAddr');
+  assert.notEqual(c, a);
+  assert.equal(asked, 2);
+  // Another confirmation of the wallet (asked again) is another pass.
+  answer = () => new Response(JSON.stringify({ error: 'rate_limited', retryAfterS: 600 }), { status: 429 });
+  const again = { ...hold, time: 2 };
+  assert.equal(await passes.obtain(again, 'PayAddr'), null);
+  assert.equal(asked, 3);
+  // A refusal holds until its time: presses meanwhile ask nothing and go on at once.
+  for (let i = 0; i < 5; i += 1) assert.equal(await passes.obtain(again, 'PayAddr'), null);
+  assert.equal(asked, 3);
+  t += 600_000;
+  answer = () => new Response(JSON.stringify(mintFaucetPass(key, w.qnet, t)), { status: 200 });
+  assert.equal(checkFaucetPass(key, await passes.obtain(again, 'PayAddr'), t), w.qnet);
+  assert.equal(asked, 4);
+  // A press waits only so long; the pass that comes later is kept for the next one.
+  const late = { ...hold, time: 3 };
+  let go;
+  release = (resolve) => { go = resolve; };
+  assert.equal(await passes.obtain(late, 'PayAddr', 10), null);
+  go();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(checkFaucetPass(key, passes.ready(late), t), w.qnet);
+  assert.equal(asked, 5);
+  // A pass that comes in time leaves no timer of the wait behind.
+  const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+  const quick = { ...hold, time: 5 };
+  const before = timers();
+  assert.equal(checkFaucetPass(key, await passes.obtain(quick, 'PayAddr', 60_000), t), w.qnet);
+  assert.equal(timers(), before, 'the wait\'s timer went with the answer');
+  assert.equal(asked, 6);
+  // A refused confirmation is never asked again.
+  answer = () => new Response(JSON.stringify({ error: 'stale_proof' }), { status: 400 });
+  const stale = { ...hold, time: 4 };
+  assert.equal(await passes.obtain(stale, 'PayAddr'), null);
+  t += 30 * 24 * HOUR;
+  assert.equal(await passes.obtain(stale, 'PayAddr'), null);
+  assert.equal(asked, 7);
+  // explorer.md states the card's rules with these numbers.
+  const doc = repo('docs/applications/explorer.md').replace(/\s+/g, ' ');
+  assert.equal(PASS_MARGIN_MS, 60_000, 'explorer.md: "until a minute before it ends"');
+  for (const claim of [`the click waits at most ${PASS_WAIT_MS / 1000} s for the pass (\`PASS_WAIT_MS\`)`, `(${PASS_RETRY_MS / 1000} s when it names none)`]) {
+    assert.ok(doc.includes(claim), claim);
+  }
 });

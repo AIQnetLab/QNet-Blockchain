@@ -9,11 +9,11 @@ import BackgroundFetch from 'react-native-background-fetch';
 import { AppState, Platform } from 'react-native';
 // v3.35: Centralized node configuration (no duplication!)
 import {
-  GENESIS_NODES, getRandomGenesisNode, shuffledGenesisNodes, lightShardOwnerUrls, genesisResponseUrl,
+  getRandomGenesisNode, shuffledGenesisNodes, lightShardOwnerUrls, genesisResponseUrl, FIRST_CONTACT_MS,
 } from '../config/nodes';
 import {
-  dropLinkPending, freshMiss, onChainAt, postBind, postPendingBind, postUnbind, readLinkPending, readNodeStatus,
-  writeLinkPending, BIND_SETTLE_MS, LINK_PENDING_KEY,
+  dropLinkPending, freshMiss, linkedHere, newerBindingDay, onChainAt, postBind, postPendingBind, postUnbind, readLinkPending,
+  readAgreedNodeStatus, readNodeStatus, serverStatusOf, writeLinkPending, BIND_SETTLE_MS, LINK_PENDING_KEY,
 } from './LightNode';
 import {
   b64url, deviceTag, pollPreimage, resetRef, statusPreimage, tokenRefreshPreimage, unbindPreimage,
@@ -29,6 +29,8 @@ import {
 } from './PingKeys';
 import { LEGACY_MOVE } from '../config/legacy';
 import logger from '../utils/logger';
+import { pause } from '../utils/pause';
+import { valueBy } from '../utils/deadline';
 
 // Push types: Firebase Cloud Messaging, else polling.
 export const PushType = {
@@ -69,17 +71,10 @@ function fetchWithTimeout(url, opts = {}, ms = 8000) {
   return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(t));
 }
 
-// The promise's value, or `onTimeout` once `deadline` passes first; the promise itself runs on.
-function untilDeadline(promise, deadline, onTimeout) {
-  let timer;
-  const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout), Math.max(0, deadline - Date.now())); });
-  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
-}
-
 // The record of the pushes this device took (PushReceipts) is display data: an answer waits for it at most this long, and
 // goes without it after that (its writes run on, in order).
 const RECEIPTS_WAIT_MS = 1000;
-const receiptsWithin = (promise) => untilDeadline(promise.catch(() => null), Date.now() + RECEIPTS_WAIT_MS, null);
+const receiptsWithin = (promise) => valueBy(promise.catch(() => null), Date.now() + RECEIPTS_WAIT_MS, null);
 
 const _selfAttestRounds = new Map(); // node id -> { force, promise } of the round in flight
 const _pingLanes = new Map();        // node id -> settles when the last queued answer for it is done
@@ -93,7 +88,7 @@ async function inPingLane(nodeId, deadline, answer) {
   const tail = before ? before.then(() => mine) : mine;
   _pingLanes.set(nodeId, tail);
   try {
-    if (before && !(await untilDeadline(before.then(() => true), deadline - SELF_ATTEST_MIN_POST_MS, false))) return false;
+    if (before && !(await valueBy(before.then(() => true), deadline - SELF_ATTEST_MIN_POST_MS, false))) return false;
     return await answer();
   } finally {
     release();
@@ -137,15 +132,38 @@ function refusalRef(enrolment) {
 /**
  * Where the network wakes this device: an FCM token, else polling. `target` is the string the binding signs
  * (light-node-messages section 4). Read only while linking or refreshing a linked node: with auto-init off
- * (firebase.json) Firebase issues no token before this asks for one.
+ * (firebase.json) Firebase issues no token before this asks for one. Firebase is waited for at most PUSH_TOKEN_WAIT_MS
+ * (a network where its servers cannot be reached answers nothing); polling then, and a binding made so takes the token
+ * on a later open (readdressIfOwed).
  */
+export const PUSH_TOKEN_WAIT_MS = 8000;
+const TOKEN_LATE = Symbol('token late');
+let _tokenReads = 0;        // pushTarget calls running
+let _tokenHandedOut = null; // the last token a pushTarget call returned
+
 export async function pushTarget() {
-  try {
+  _tokenReads += 1;
+  const ask = (async () => {
     await messaging().registerDeviceForRemoteMessages();
-    const token = await messaging().getToken();
-    if (token) return { type: PushType.FCM, token, target: token };
+    return messaging().getToken();
+  })();
+  try {
+    const token = await valueBy(ask, Date.now() + PUSH_TOKEN_WAIT_MS, TOKEN_LATE);
+    if (token === TOKEN_LATE) {
+      logger.info(`[INFO][PUSH] token_unavailable reason=timeout wait_ms=${PUSH_TOKEN_WAIT_MS}`);
+      // A token issued after the wait went into no binding: given back unless a node is linked here by then, or a
+      // later read is running or handed it out (Firebase issues one token to every read).
+      ask.then((late) => {
+        if (late && _tokenReads === 0 && late !== _tokenHandedOut) giveBackToken({ token: late });
+      }, () => {});
+    } else if (token) {
+      _tokenHandedOut = token;
+      return { type: PushType.FCM, token, target: token };
+    }
   } catch (e) {
     logger.log('[Push] FCM not available:', e && e.message);
+  } finally {
+    _tokenReads -= 1;
   }
   return { type: PushType.POLLING, target: '' };
 }
@@ -345,6 +363,9 @@ export async function adoptBinding({ nodeId, walletAddress, push, seq, pingPubli
     [`qnet_identity_pk_${nodeId}`, identityPublicKey],
     ...(push.token ? [['qnet_last_sent_fcm_token', push.token], ['qnet_last_token_refresh_ts', String(now)]] : []),
   ]);
+  // A binding made without a token holds none at the owners: the one sent for the binding before is not its own, so the
+  // next token read sends it at once (readdressIfOwed), neither "unchanged" nor an hour later.
+  if (!push.token) await AsyncStorage.multiRemove(['qnet_last_sent_fcm_token', 'qnet_last_token_refresh_ts']);
   if (push.type === PushType.POLLING) {
     const next = await getNextPingTime();
     await setupPollingService(nodeId, (next && next.next_ping_time) || 0);
@@ -392,7 +413,10 @@ function bindBody(nodeId, b, push, seq, ts, model = null) {
  * device that cannot run a node binds nothing. `signer` is the WalletManager holding the open wallet: it signs the
  * status request, the delegation and the attach over values it builds itself. `device`: NodeDeviceKey.checkDevice's
  * answer when the caller has it; `interactive`: Google Play's dialog may fix a token; `epoch`: the chain's epoch as the
- * caller read it (else the one this device last knew). Resolves { ok: true, seq } or { ok: false, reason, ref?,
+ * caller read it (else the one this device last knew); `known` ({ onChain: true, features }): the status the screen
+ * the user confirmed on read a moment ago, which stands (LightNode.readNodeStatus `known`): the read here then asks only
+ * for the binding's sequence, and its silence never stops the binding, which the node refuses when it is stale or the
+ * node is not on the chain. Resolves { ok: true, seq } or { ok: false, reason, ref?,
  * unknown? }: a /bind refusal reason, 'not_registered' or 'network', with the support reference of a refused enrolment
  * (refusalRef); `unknown` when the binding went out, got no answer, and no status told whether the node took it
  * (MN-R4-04): it then waits with its ping key until the network names one (settleUnconfirmedBinding). It waits for an
@@ -405,7 +429,6 @@ export function bindThisDevice(args) {
 // After a /bind that got no answer, the node's signed status is read again at these waits (ms): an issuer answers a bind
 // within its device budget (12 s), so a binding it took is in its status by then (MN-R4-04).
 export const BIND_RECHECK_MS = [2000, 6000];
-const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Whether the node took the binding `seq` that got no answer: { taken: false, known: true } when two owners name a newer
@@ -413,10 +436,10 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * { taken: false, known: false } otherwise: no signed status came, or the owners still name the binding before, as an
  * owner the binding has not reached yet does too, so only a later status tells (settleUnconfirmedBinding).
  */
-async function bindOutcome(nodeId, seq, signStatus) {
+async function bindOutcome(seq, readStatus) {
   for (const ms of BIND_RECHECK_MS) {
     await pause(ms);
-    const s = await readNodeStatus(nodeId, { signStatus }).catch(() => null);
+    const s = await readStatus().catch(() => null);
     const B = s && Number.isSafeInteger(s.bindingSeqAgreed) ? s.bindingSeqAgreed : null;
     if (B !== null && B > seq) return { taken: false, known: true };
     if (B === seq || (s && s.signed && s.signed.bindingSeq === seq)) return { taken: true, status: s };
@@ -529,9 +552,14 @@ async function rotationFellDue(nodeId, status, epoch = null) {
   return Number.isSafeInteger(now) && dues.some((due) => now >= due);
 }
 
-async function bindNow({ signer, credential, nodeId, device = null, interactive = false, epoch = null }) {
+async function bindNow({ signer, credential, nodeId, device = null, interactive = false, epoch = null, known = null }) {
   const signStatus = (id, ts) => signer.signNodeStatus(credential, id, ts);
-  let status = await readNodeStatus(nodeId, { signStatus });
+  // Every read here is one the user waits on; once a verdict is in hand (`known`), only the signed part is asked. The
+  // go/no-go read settles on agreement; the check of an unanswered binding waits for the issuer's own answer too.
+  const readStatus = (whole = false) => (whole ? readNodeStatus : readAgreedNodeStatus)(nodeId, {
+    signStatus, timeoutMs: FIRST_CONTACT_MS, deadline: Date.now() + FIRST_CONTACT_MS, known,
+  });
+  let status = await readStatus();
   // iOS: this install's current key, when it has one, proves itself with an assertion, also when the node moves back
   // here from another device (the network keeps a key's entry past the record it served), so no move adds to Apple's
   // count of attested keys; one the network no longer holds answers device_not_genuine, and the key is then replaced
@@ -544,16 +572,18 @@ async function bindNow({ signer, credential, nodeId, device = null, interactive 
     await giveBackToken(taken);
     return answer;
   };
+  // The binding's sequence at `ts`: above the binding two owners name alike, and above the one the first owner names (a
+  // newer one it holds already).
+  const seqAt = (s, ts) => Math.max(ts, Math.max(Number.isSafeInteger(s.bindingSeqAgreed) ? s.bindingSeqAgreed : 0,
+    (s.signed && s.signed.bindingSeq) || 0) + 1);
   for (let attempt = 0; ; attempt++) {
     if (status.onChain === false) return end({ ok: false, reason: 'not_registered' });
     if (status.onChain !== true || !status.features.includes('bind_v2')) return end({ ok: false, reason: 'network' });
+    known = { onChain: true, features: status.features };
     const dev = status.features.includes(Enrolment.FEATURE_DEVICE) ? (device || await checkDevice()) : null;
     if (dev && dev.capable !== true) return end({ ok: false, reason: dev.reason || 'device_unsupported' });
     const ts = Math.floor(Date.now() / 1000);
-    // Above the binding two owners name alike, and above the one the first owner names (a newer one it holds already).
-    const held = Math.max(Number.isSafeInteger(status.bindingSeqAgreed) ? status.bindingSeqAgreed : 0,
-      (status.signed && status.signed.bindingSeq) || 0);
-    const seq = Math.max(ts, held + 1);
+    const seq = seqAt(status, ts);
     const push = await pushTarget();
     taken = push;
     let b;
@@ -590,7 +620,7 @@ async function bindNow({ signer, credential, nodeId, device = null, interactive 
       // Sent and unanswered: the node may have taken it. Its signed status tells; a binding it took is kept here as
       // taken, its device key waiting for the device tag, as the link sheet keeps one (MN-R4-04).
       if (!r.ok && r.reason === 'network') {
-        const outcome = await bindOutcome(nodeId, seq, signStatus);
+        const outcome = await bindOutcome(seq, () => readStatus(true));
         if (outcome.taken) {
           await Enrolment.settle(enrolment, false, { unanswered: true });
           const tagged = !!enrolment
@@ -625,10 +655,11 @@ async function bindNow({ signer, credential, nodeId, device = null, interactive 
         await forgetKeys().catch(() => {});
         continue;
       }
-      // Another device bound meanwhile: once more above its sequence.
+      // Another device bound meanwhile: once more above the binding the owners name now, never again at or below the
+      // refused sequence (a read that names nothing newer), which the node would only refuse again.
       if (r.reason === 'stale_seq' && attempt === 0) {
-        status = await readNodeStatus(nodeId, { signStatus });
-        continue;
+        status = await readStatus();
+        if (status.onChain !== true || seqAt(status, Math.floor(Date.now() / 1000)) > seq) continue;
       }
       await giveBackToken(push);
       // A refusal of this device's enrolment carries the reference support finds its case by (SD-R2-01): the node's own,
@@ -980,7 +1011,7 @@ const RELEASE_WAIT_MS = 3000;
 export async function stopLightNode({ waitForNetwork = true, forgetDevice = false } = {}) {
   const unbinds = [];
   const deadline = Date.now() + UNBIND_WAIT_MS;
-  const post = (nodeId, body, first = null) => unbinds.push(untilDeadline(
+  const post = (nodeId, body, first = null) => unbinds.push(valueBy(
     postUnbind(nodeId, body, { deadline, first }).then((r) => r.ok, () => false), deadline, false));
   const nodeId = await AsyncStorage.getItem('qnet_ping_node_id').catch(() => null);
   // The waiting binding of this device's node, or of the node it waits for when none runs here; another node's (a
@@ -1009,7 +1040,7 @@ export async function stopLightNode({ waitForNetwork = true, forgetDevice = fals
       // An owner that does not give the release's challenge in time leaves the unbind without it.
       const releaseBy = Date.now() + RELEASE_WAIT_MS;
       const release = binding.hw
-        ? await untilDeadline(Enrolment.releaseBlock(nodeId, binding.seq, { deadline: releaseBy }).catch(() => null), releaseBy, null)
+        ? await valueBy(Enrolment.releaseBlock(nodeId, binding.seq, { deadline: releaseBy }).catch(() => null), releaseBy, null)
         : null;
       const ts = Math.floor(Date.now() / 1000);
       const sig = await signDetached(unbindPreimage(nodeId, binding.seq, ts), sk);
@@ -1254,8 +1285,8 @@ export async function respondToChallenge(nodeId, challenge, responseUrl, deadlin
       logger.warn('[Push] Dilithium3 ping key unavailable — ping missed (will retry next window)');
       return false;
     }
-    const url = responseUrl ? genesisResponseUrl(responseUrl) : lightShardOwnerUrls(pingNodeId)[0];
-    return (await answerInLane(pingNodeId, challenge, [url], deadline, evidence)).kind === 'ok';
+    const urls = responseUrl ? [genesisResponseUrl(responseUrl)] : lightShardOwnerUrls(pingNodeId).slice(0, 1);
+    return (await answerInLane(pingNodeId, challenge, urls, deadline, evidence)).kind === 'ok';
   } catch (error) {
     logger.warn('[Push] Error responding to challenge:', error.message || error);
     return false;
@@ -1384,6 +1415,12 @@ function evidenceFields(evidence, answeredAt, report = null) {
   };
 }
 
+// Why the app's last process ended (PushReceipts.noteLastExit) as the answer's flat fields, strings as every other
+// field, since an older node takes a body of strings only and ignores fields it does not know.
+function exitFields(exit) {
+  return exit ? { last_exit: exit.reason, last_exit_api: String(exit.api) } : {};
+}
+
 // The signed fields of an answer to `challenge`, or null when this device cannot sign it (no ping key here).
 async function signedAnswer(pingNodeId, challenge) {
   const Keychain = require('react-native-keychain');
@@ -1449,9 +1486,12 @@ async function answerChallenge(pingNodeId, challenge, urls, deadline, evidence) 
       return outcome('refused', { reason: 'not_a_challenge' });
     }
     const targets = urls.filter(Boolean);
+    // No target at all: no shard owner could be worked out here (lightShardOwnerUrls) and no node was named; only
+    // unusable ones: the node named one that is not a genesis node. Either way the answer goes nowhere else.
     if (targets.length === 0) {
-      logger.warn('[Push] ping refused: the answer would leave the genesis nodes');
-      return outcome('refused', { reason: 'not_genesis' });
+      const reason = urls.length === 0 ? 'owners_unknown' : 'not_genesis';
+      logger.warn(`[WARN][PUSH] ping_not_answered reason=${reason}`);
+      return outcome('refused', { reason });
     }
     const signed = await signedAnswer(pingNodeId, challenge);
     if (!signed) {
@@ -1459,13 +1499,15 @@ async function answerChallenge(pingNodeId, challenge, urls, deadline, evidence) 
       logger.warn('[Push] Dilithium3 ping key unavailable — ping missed (will retry next window)');
       return outcome('nokey');
     }
-    // Only a self-attestation names its epoch; a stamp of an older node carries no record.
+    // Only a self-attestation names its epoch; a stamp of an older node carries no record. Why the app's last process
+    // ended goes with every answer until an owner takes one (PushReceipts.noteLastExit).
     const anchorEpoch = anchorEpochOf(challenge);
     const report = anchorEpoch !== null ? await receiptsWithin(Receipts.reportFor(pingNodeId, anchorEpoch)) : null;
+    const exit = await receiptsWithin(Receipts.noteLastExit());
     const post = async (apiUrl) => {
       const timeoutMs = Math.min(RESPONSE_MS, deadline - Date.now());
       if (timeoutMs < SELF_ATTEST_MIN_POST_MS) return outcome('network');
-      const body = { ...signed.fields, ...evidenceFields(evidence, Math.floor(Date.now() / 1000), report) };
+      const body = { ...signed.fields, ...evidenceFields(evidence, Math.floor(Date.now() / 1000), report), ...exitFields(exit) };
       try {
         const response = await fetchWithTimeout(`${apiUrl}/api/v1/light-node/ping-response`, {
           method: 'POST',
@@ -1488,6 +1530,7 @@ async function answerChallenge(pingNodeId, challenge, urls, deadline, evidence) 
     const out = await postHedged(targets, post, deadline, retrying ? HEDGE_RETRY_MS : HEDGE_MS);
     if (out.kind === 'ok') {
       logger.log('[Push] ✅ Ping response sent (Dilithium3 delegation, quantum-safe)');
+      if (exit) await receiptsWithin(Receipts.exitReported(exit.at));
       // Only a polling device needs its next ping time; a pushed one is woken. Not awaited: a background wake spends its
       // time on the proof.
       if (signed.binding && signed.binding.pushType === PushType.POLLING) getNextPingTime().catch(() => {});
@@ -1689,20 +1732,21 @@ export async function knownChainEpoch() {
  * PULL self-attestation: sign a fresh same-epoch block hash and submit through the standard
  * ping-response endpoint (challenge = "selfattest:{height}:{hash}"). Proves this-epoch liveness
  * on ANY wakeup (push, background fetch, app open or return) — no dependency on FCM delivery.
- * Deduped per epoch locally; the node dedupes per epoch too. Rounds are per node: concurrent callers (a push
- * launch also mounts the app) share one, each within its own deadline. Behind a round that did not attest a caller goes
+ * Deduped per epoch locally; the node dedupes per epoch too. Rounds are per node: concurrent callers (a push that
+ * comes as the app is opened) share one, each within its own deadline. Behind a round that did not attest a caller goes
  * on only with what that round lacked: a forced one (Offline, "I'm back") behind any other, a pushed one behind a round
  * that a hold kept silent or that had no anchor to answer, an open of the app behind a round a hold kept silent. A pushed
  * anchor does not wait behind a lesser round that has none: it starts its own at once.
  * `anchor` ("{h}:{hash}", from a per-epoch push) is answered as it is; the device reads a fresh block only when the
- * network refuses it as stale or could not be reached. `how`: { pushed, opened, evidence }: `pushed` when the network
- * delivered this round's push or challenge, which is answered at once whatever hold a failure or refusal left (only an
- * epoch this device already attested skips it); `opened` when the user opened the app or returned to it; `evidence` the
- * push's (pushEvidence), sent with the answer. No answer goes inside an epoch's closing gap (inAnswerGap): that epoch is
- * closed (closeEpoch), and nothing is sent, set or held for the next one.
+ * network refuses it as stale or could not be reached. `how`: { pushed, opened, evidence, bindingRead }: `pushed` when the
+ * network delivered this round's push or challenge, which is answered at once whatever hold a failure or refusal left
+ * (only an epoch this device already attested skips it); `opened` when the user opened the app or returned to it, whose
+ * answer goes only while the node is bound here (bindingStands, from `bindingRead`, the launch's status read, when
+ * given); `evidence` the push's (pushEvidence), sent with the answer. No answer goes inside an epoch's closing gap
+ * (inAnswerGap): that epoch is closed (closeEpoch), and nothing is sent, set or held for the next one.
  */
 export async function selfAttestIfNeeded(nodeId, force = false, wakeDeadline = undefined, anchor = null, how = {}) {
-  const { pushed = false, opened = false, evidence = null } = how || {};
+  const { pushed = false, opened = false, evidence = null, bindingRead = null } = how || {};
   const deadline = Math.min(Date.now() + SELF_ATTEST_BUDGET_MS, wakeDeadline || Infinity);
   const id = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
   if (!id) return false;
@@ -1712,13 +1756,13 @@ export async function selfAttestIfNeeded(nodeId, force = false, wakeDeadline = u
     // A pushed anchor needs no read of the chain: it goes now, not behind a round still reading one (a launch for the
     // push starts such a round too); the ping lane keeps their POSTs one at a time.
     if (pushedAnchor && !running.anchored && running.level < level) break;
-    const r = await untilDeadline(running.promise, deadline, null);
+    const r = await valueBy(running.promise, deadline, null);
     if (r === null) return false; // this caller's deadline came first; the round runs on
     if (r || level <= running.level) return r;
     if (!running.held && level < 3 && !(level === 2 && pushedAnchor)) return r;
   }
   const round = { level, anchored: !!pushedAnchor, held: false, promise: null };
-  round.promise = runSelfAttest(id, { force, pushed, opened, evidence }, deadline, pushedAnchor)
+  round.promise = runSelfAttest(id, { force, pushed, opened, evidence, bindingRead }, deadline, pushedAnchor)
     .then((r) => {
       round.held = r === HELD;
       return r === true;
@@ -1731,7 +1775,7 @@ export async function selfAttestIfNeeded(nodeId, force = false, wakeDeadline = u
 // A round a hold kept silent: it sent nothing.
 const HELD = 'held';
 
-async function runSelfAttest(nodeId, { force, pushed, opened, evidence }, deadline, pushedAnchor) {
+async function runSelfAttest(nodeId, { force, pushed, opened, evidence, bindingRead }, deadline, pushedAnchor) {
   const cap = () => Math.min(SELF_ATTEST_CALL_MS, deadline - Date.now());
   let pingNodeId = null;
   try {
@@ -1825,6 +1869,8 @@ async function runSelfAttest(nodeId, { force, pushed, opened, evidence }, deadli
     // live node never misses its window. Asked only until an owner took an answer of this binding (`last`), which says
     // the node is on the chain: a wake after that reads the height and one block only.
     if (last === null && await onChainAt(apiUrl, pingNodeId, cap()) === false) return false;
+    // An open's answer goes only from the device the node is bound to: one another device replaced sends nothing.
+    if (opened && !force && !(await bindingStands(pingNodeId, deadline, bindingRead))) return false;
     // Canonical hash of block `anchor` = previous_hash of block anchor+1 (the chain link); never a block of the epoch
     // before, which no owner takes.
     const anchor = Math.max(height - 2, epoch * EPOCH_BLOCKS);
@@ -2016,7 +2062,7 @@ export async function teardownLightNode({ keepToken = false, forgetDevice = fals
   try {
     const [[, pingNodeId], [, info], [, sent]] = await AsyncStorage.multiGet(
       ['qnet_ping_node_id', 'qnet_light_node_info', 'qnet_last_sent_fcm_token']);
-    if (!keepToken && (pingNodeId || info || sent)) await untilDeadline(dropPushToken(), Date.now() + TOKEN_DROP_WAIT_MS, null);
+    if (!keepToken && (pingNodeId || info || sent)) await valueBy(dropPushToken(), Date.now() + TOKEN_DROP_WAIT_MS, null);
     if (forgetDevice) await forgetKeys().catch(() => {});
     // Stop the precise scheduled wake, the next answer's wake, the epoch's backup wake AND the periodic configured fetch
     // (all call selfAttest).
@@ -2072,18 +2118,22 @@ export { BIND_SETTLE_MS };
  * `bindingSeqAgreed`) and whether two say a device is bound (D, `deviceBoundAgreed`): a newer binding with a device bound
  * (B > seq, D true: another device answers for the node now), or no device bound at or past this binding (B >= seq,
  * D false: it was withdrawn, by this device, by the wallet key from anywhere, or a device that replaced this one stopped
- * since; MN-R2-04). This one stops waking and gives its push token back; nothing is sent. Owners refusing this device's
- * key decide nothing alone, nor does a status without B (contract 4). `seq`: the sequence of this device's binding when
+ * since). Without B, a device bound on a later UTC day than this binding (LightNode.newerBindingDay), the one
+ * thing the public status says of the binding the network holds: the owners refuse a replaced binding's ping key, so no
+ * read with it names B. This one stops waking and gives its push token back; nothing is sent. Owners refusing this
+ * device's key decide nothing alone (contract 4). `seq`: the sequence of this device's binding when
  * the status was read; a binding made since then is not judged by it, nor one made less than BIND_SETTLE_MS ago, nor the
  * QNet Link sheet's binding while its record still sends it (the node takes it later). True when it did.
  */
 export async function forgetIfReplaced(nodeId, status, seq = null) {
   const B = status && Number.isSafeInteger(status.bindingSeqAgreed) ? status.bindingSeqAgreed : null;
   const D = status ? status.deviceBoundAgreed : null;
-  if (B === null || (D !== true && D !== false)) return false;
+  if (D !== true && D !== false) return false;
   const binding = await localBinding(nodeId);
   if (!binding || (seq !== null && binding.seq !== seq)) return false;
-  if (!((B > binding.seq && D === true) || (B >= binding.seq && D === false))) return false;
+  const replaced = B === null ? D === true && newerBindingDay(status, binding.seq)
+    : (B > binding.seq && D === true) || (B >= binding.seq && D === false);
+  if (!replaced) return false;
   const age = binding.boundAt !== null ? Date.now() - binding.boundAt * 1000 : Infinity;
   if (age >= 0 && age < BIND_SETTLE_MS) return false;
   if (D === false) {
@@ -2092,6 +2142,22 @@ export async function forgetIfReplaced(nodeId, status, seq = null) {
   }
   await teardownLightNode();
   return true;
+}
+
+// The status of this device's binding as its ping key reads it, or null when nothing readable came.
+const readBindingStatus = (nodeId) => readNodeStatus(nodeId, { signStatus: signStatusWithPingKey }).catch(() => null);
+
+/**
+ * Whether the node is bound to this device as the Node tab says it (LightNode.linkedHere), the only device an open of the
+ * app answers from. `read`: the launch's status read, else one now; no answer within `deadline` leaves the binding standing.
+ */
+async function bindingStands(nodeId, deadline, read = null) {
+  const local = await localBinding(nodeId);
+  if (!local) return false;
+  const status = await valueBy(read || readBindingStatus(nodeId), deadline, null);
+  if (!status) return true;
+  if (!read && await forgetIfReplaced(nodeId, status, local.seq)) return false;
+  return linkedHere(status, local);
 }
 
 /**
@@ -2280,7 +2346,7 @@ async function maintainDevice(deadline) {
 const TOKEN_REFRESH_DEBOUNCE_SEC = 3600; // 1 hour
 
 /**
- * Sends the device's current push target to the genesis nodes, only while this wallet's node is linked here. Signed by
+ * Sends the device's current push target to the node's shard owners, only while this wallet's node is linked here. Signed by
  * the ping key (Keychain, after first unlock), so it works with the wallet locked. A binding made with a sequence signs
  * the target itself (light-node-messages section 4, token refresh); a binding an older build made signs the v1 message.
  * `deadline` (ms): a wake's, which every POST stays within; no owner is asked once too little of it is left. `force`:
@@ -2369,16 +2435,21 @@ export async function refreshFcmTokenOnServer(nodeId, { deadline = null, force =
         return { success: false, error: e.message };
       }
     };
-    // Only a node that took this device's ping replies holds its identity: the shard owners. Try them in
-    // rank order, then the other genesis nodes; never a third-party node, which could replay the signature
-    // with a token of its own.
+    // Only the node's three shard owners keep its binding, and the other genesis nodes answer `not_owner`: they are tried
+    // in rank order, never a third-party node, which could replay the signature with a token of its own. Owners this
+    // device cannot work out get nothing sent, and nothing else does either.
     let result = { success: false };
-    const owners = lightShardOwnerUrls(nodeId);
-    for (const url of [...owners, ...GENESIS_NODES.filter((u) => !owners.includes(u))]) {
+    let owners = 0;
+    for (const url of lightShardOwnerUrls(nodeId)) {
+      owners += 1;
       const ms = Math.min(10000, deadline ? deadline - Date.now() : Infinity);
       if (ms < SELF_ATTEST_MIN_POST_MS) break;
       result = await postRefresh(url, ms);
       if (result.success) break;
+    }
+    if (owners === 0) {
+      logger.warn('[WARN][PUSH] token_refresh_not_sent reason=owners_unknown');
+      return { success: false, error: 'owners_unknown' };
     }
     if (result.success) {
       await AsyncStorage.multiSet([
@@ -2485,16 +2556,11 @@ export async function isTokenRefreshNeeded() {
 
 
 let _resumeAttest = null; // the AppState subscription, registered once per process
-let _launchWorkOwed = false; // the launch's answer and upkeep, held until the app is opened (AnswerGate refused them)
-let _launchStatusOwed = false; // the launch's status read, held until the app comes to the front (launchWork)
+let _launchWorkOwed = false; // the launch's status read, answer and upkeep, held until the first open (launchWork)
 
 /**
- * At launch: the wakes of a node linked to this device (its periodic fetch) and the return-to-app wake. The launch's
- * answer and upkeep run now only where the node may answer (AnswerGate); otherwise at the first return to the app, which
- * also notes this boot as opened. iOS launches the app in the background for a push or a fetch, so a launch is not an
- * open, and such a launch reads no status (launchWork). Takes no push token: one exists only once a node is linked here, and only a binding made without one, or one the
- * network has no push address for, takes it again (readdressIfOwed). Never rejects: the caller registers the foreground
- * push handler after it.
+ * At launch: arms the node's wakes, background launches included (iOS hands its periodic wake only to a configured
+ * handler); the launch's status read, answer and upkeep wait for the first open in front (launchWork). Never rejects.
  */
 export async function initializePushService() {
   // The last update of the old Android package runs no node: a node it ran stops here, and nothing wakes it again.
@@ -2529,13 +2595,13 @@ export async function initializePushService() {
   } else {
     await configureBackgroundFetch();
   }
-  if (await mayAnswer()) await launchWork(nodeInfo);
+  if (AppState.currentState === 'active') await launchWork(nodeInfo);
   else _launchWorkOwed = true;
 }
 
 // The app came to the front: this boot is opened, the periodic wake is armed again (on iOS a new background refresh
-// request, so one is always pending within the epoch), and the launch's work runs if the launch held it, else a
-// self-attest, the status read a launch in the background left (launchWork) and a push address owed (readdressIfOwed).
+// request, so one is always pending within the epoch), and the launch's work runs if the launch held it (launchWork),
+// else a self-attest while the node is bound here (bindingStands) and a push address owed (readdressIfOwed).
 async function returnToApp() {
   await noteOpen();
   const s = await AsyncStorage.getItem('qnet_light_node_info');
@@ -2549,12 +2615,7 @@ async function returnToApp() {
   }
   const ok = await selfAttestIfNeeded(info.nodeId, false, undefined, null, { opened: true });
   await rearmAnswerTimer(info.nodeId);
-  if (_launchStatusOwed) {
-    _launchStatusOwed = false;
-    await launchStatus(info);
-  } else {
-    await readdressIfOwed(info.nodeId);
-  }
+  await readdressIfOwed(info.nodeId);
   return ok;
 }
 
@@ -2564,26 +2625,25 @@ async function rearmAnswerTimer(nodeId) {
   if (hold && hold.kind === 'retry' && hold.wake !== false && hold.until > Date.now()) scheduleAnswerAt(nodeId, hold.until);
 }
 
+// The launch's work, at the first open (in front only): the status read first, which the open's answer waits for
+// (bindingStands), then the answer for this epoch if not yet given (deduped inside).
 async function launchWork(nodeInfo) {
-  // PULL: app open is a wakeup — attest for this epoch if not yet done (deduped inside). A launch in front is an open.
-  const opened = AppState.currentState === 'active';
-  selfAttestIfNeeded(nodeInfo.nodeId, false, undefined, null, { opened })
-    .then(() => (opened ? rearmAnswerTimer(nodeInfo.nodeId) : null))
+  const bindingRead = (await launchStatus(nodeInfo)).read;
+  selfAttestIfNeeded(nodeInfo.nodeId, false, undefined, null, { opened: true, bindingRead })
+    .then(() => rearmAnswerTimer(nodeInfo.nodeId))
     .catch(() => {});
-  // The status read runs in front only: a launch in the background (iOS starts the app for a push or a fetch, whose own
-  // handler answers and does the device upkeep) reads none, and the first return to the app reads it.
-  if (opened) await launchStatus(nodeInfo);
-  else _launchStatusOwed = true;
 }
 
 // A device another one replaced stops waking at its next open, whichever tab is open; a binding the QNet Link sheet left
-// pending goes again, and the device layer does its upkeep.
+// pending goes again, and the device layer does its upkeep. Returns { read }: the status read, which the open's answer
+// waits for, and the caller does not.
 async function launchStatus(nodeInfo) {
   const signedFor = await localBinding(nodeInfo.nodeId);
   const readAt = Date.now();
-  readNodeStatus(nodeInfo.nodeId, { signStatus: signStatusWithPingKey })
+  const read = readBindingStatus(nodeInfo.nodeId);
+  read
     .then(async (status) => {
-      if (await forgetIfReplaced(nodeInfo.nodeId, status, signedFor ? signedFor.seq : null)) return;
+      if (!status || await forgetIfReplaced(nodeInfo.nodeId, status, signedFor ? signedFor.seq : null)) return;
       if (signedFor) await settleUnansweredKey(nodeInfo.nodeId, status);
       await Enrolment.noteStatus(nodeInfo.nodeId, status, { readAt });
       await resendPendingBinding(nodeInfo.nodeId, status);
@@ -2591,163 +2651,36 @@ async function launchStatus(nodeInfo) {
       await maintainDevice(Date.now() + WAKE_FETCH_MS);
     })
     .catch(() => {});
+  return { read };
 }
 
 /**
- * Check Server node (Super/Genesis) status
- * Used for monitoring server nodes from mobile app
- * v3.35: Added retry logic with different nodes
+ * A server node's status as one genesis node resolves the wallet to its node (GET /api/v1/node/status, the wallet in the
+ * X-QNet-Wallet header, never the URL), a different genesis node for each try: only the Node tab's hint that the
+ * wallet's node id changed (its card reads the node by id, LightNode.readServerNodeListed). LightNode.serverStatusOf's
+ * status, or { success: false, error }.
  */
-export async function checkServerNodeStatus(nodeId = null, walletAddress = null, maxRetries = 3) {
-  // Nodes are asked by node id, or by wallet in a header.
-  let queryParams = '';
-  let walletHeader = null; // wallet sent via X-QNet-Wallet header, never the URL
-
-  if (nodeId) {
-    queryParams = `node_id=${encodeURIComponent(nodeId)}`;
-  } else if (walletAddress) {
-    // Wallet-bridge: resolve the node on-chain by wallet (works for server-activated supers and
-    // offline/banned nodes — no dependence on the RAM activation registry that misses them).
-    // Privacy: the wallet goes in the X-QNet-Wallet header, NOT the URL (see fetch below).
-    walletHeader = walletAddress;
-  } else {
-    return { success: false, error: 'node_id or wallet required' };
-  }
-  
+export async function checkServerNodeStatus(walletAddress, maxRetries = 3) {
+  if (!walletAddress) return { success: false, error: 'wallet required' };
   let lastError = null;
-  const order = shuffledGenesisNodes(); // a different genesis node for each retry
-
+  const order = shuffledGenesisNodes();
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const apiUrl = order[attempt % order.length];
-      const url = queryParams
-        ? `${apiUrl}/api/v1/node/status?${queryParams}`
-        : `${apiUrl}/api/v1/node/status`;
-
-      const response = await fetchWithTimeout(url, {
-        method: 'GET',
-        headers: walletHeader ? { 'X-QNet-Wallet': walletHeader } : undefined,
+      const response = await fetchWithTimeout(`${order[attempt % order.length]}/api/v1/node/status`, {
+        method: 'GET', headers: { 'X-QNet-Wallet': walletAddress },
       }, 8000);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const result = await response.json();
-
-      if (result.success) {
-        // Only Super/Genesis nodes are real nodes
-        // Light nodes = regular mobile app users (NOT nodes)
-        
-        // Required heartbeats for NETWORK LIVENESS (NOT rewards!)
-        // This is P2P heartbeat for node health, not transaction validation
-        let requiredHeartbeats = result.required_heartbeats;
-        if (!requiredHeartbeats && result.node_type === 'super') {
-          requiredHeartbeats = 9; // Super nodes: 9/10 (90%) for network liveness
-        }
-        // NO FALLBACK - if node_type is not 'super', it's invalid
-        
-        return {
-          success: true,
-          nodeId: result.node_id,
-          nodeType: result.node_type,
-          // Whether the chain records the node's registration (the node's reg_height): false only on the node's word,
-          // undefined when it said nothing (an older node), so the Node tab's "registered" check reads it.
-          registered: typeof result.onchain_registered === 'boolean' ? result.onchain_registered
-            : (typeof result.registered === 'boolean' ? result.registered : undefined),
-          isOnline: result.is_online,
-          lastSeen: result.last_seen,
-          lastSeenAgoSeconds: result.last_seen_ago_seconds,
-          heartbeatCount: result.heartbeat_count || 0,
-          requiredHeartbeats: requiredHeartbeats || 9, // Super nodes only
-          isRewardEligible: result.is_reward_eligible,
-          // A super node's admission to the epoch's consensus-admitted set, as the node reports it: 'admitted',
-          // 'waiting' (registered, not admitted to consensus yet: NodeTab says so instead of Offline) or 'not_required'
-          // (no admission rule governs the epoch); undefined when it says nothing (an older node) or something else.
-          admission: ADMISSION_STATES.includes(result.admission) ? result.admission : undefined,
-          reputation: result.reputation, // BLOCKCHAIN reputation from DeterministicReputationState
-          currentBlockHeight: result.current_block_height,
-          needsAttention: result.needs_attention,
-          message: result.message,
-          // Rewards info (QNC tokens in smallest units)
-          // TODO(trustless): pending_rewards is an UNPROVEN /node/status value (a
-          // malicious node can inflate it). To make it MITM-proof, source it from the
-          // QC-certified account path: extend the /balance/proof endpoint to return
-          // pending_rewards and fold it into the merkle leaf (verifyMerkleProof already
-          // hashes a pending_rewards slot, currently pinned 0), then gate the displayed
-          // figure on QcLightClient.verifyMacroblockStateRoot like the balance. Node-side
-          // change required; out of scope for this light-client module.
-          pendingRewards: result.pending_rewards,
-        };
-      }
-
+      if (result.success) return serverStatusOf(result);
       return { success: false, error: result.error || 'Unknown error' };
     } catch (error) {
       lastError = error;
-      // v3.35: Wait before retry (exponential backoff)
-      if (attempt < maxRetries - 1) {
-        await new Promise(r => setTimeout(r, (attempt + 1) * 500));
-      }
+      // Each retry waits 500 ms longer than the one before.
+      if (attempt < maxRetries - 1) await pause((attempt + 1) * 500);
     }
   }
-  
-  // All retries failed
   logger.warn(`[Push] Server node status failed after ${maxRetries} retries:`, lastError?.message);
   return { success: false, error: lastError?.message || 'Network error' };
-}
-
-// NOTE: WebSocket support can be added later for real-time updates
-// For now, server nodes don't need polling - user can pull-to-refresh
-// Server handles heartbeats automatically, rewards calculated at end of 4h window
-
-/**
- * Get ALL nodes owned by a wallet address (Light, Full, Super, Genesis)
- * Returns unified list for display in mobile app
- * @param {string} walletAddress - EON wallet address
- */
-export async function getAllNodesByWallet(walletAddress) {
-  try {
-    const apiUrl = genesisNode();
-    
-    // NEW: Call without node_type to get ALL nodes. Wallet via header, not the URL (privacy).
-    const response = await fetchWithTimeout(
-      `${apiUrl}/api/v1/activations/by-wallet`,
-      { method: 'GET', headers: { 'X-QNet-Wallet': walletAddress } }
-    );
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const result = await response.json();
-    
-    if (result.success && result.nodes) {
-      // CRITICAL: Filter out pending_activation and HASH-only entries
-      // These are NOT real activated nodes — just code generation records
-      const realNodes = result.nodes.filter(n => 
-        n.status !== 'pending_activation' && 
-        !(n.activation_code && typeof n.activation_code === 'string' && n.activation_code.startsWith('HASH:'))
-      );
-      logger.log(`[Nodes] Found ${realNodes.length} real nodes for wallet (${result.nodes.length} total incl pending)`);
-      return {
-        success: true,
-        nodes: realNodes,
-        totalNodes: realNodes.length
-      };
-    }
-    
-    // The node answered but did not answer with a node list: unknown, not "this wallet owns nothing".
-    // Reported as success it collapsed the node view exactly like the HTTP failure below.
-    if (result && result.success === false) {
-      return { success: false, nodes: [], totalNodes: 0, error: result.error || 'node returned success:false' };
-    }
-    return { success: true, nodes: [], totalNodes: 0 };
-  } catch (error) {
-    // Distinguish a network/HTTP failure from a genuinely empty wallet: a failed
-    // lookup must NOT read as "no nodes" (that collapses the node view on a transient
-    // hiccup). success:false → the caller keeps its last-known node state.
-    return { success: false, nodes: [], totalNodes: 0, error: error.message };
-  }
 }
 
 /**
@@ -2782,16 +2715,20 @@ export async function getPendingRewards(nodeId) {
   }
 }
 
+// A genesis node's id, which is its wallet's super node.
+const GENESIS_NODE_ID = /^genesis_node_00[1-5]$/;
+
 /**
  * The nodes the chain registered for a wallet (GET /api/v1/account/{wallet}/node-events, the node registry rows, kept
- * for the life of the chain), from a genesis node, a second one when the first does not answer. Only the ids this wallet
- * derives are taken (`ids`: { light, super, genesis }, genesis null for any other wallet), so no answer can name another
- * wallet's node; the type follows the id. The event's burn is not read: the registry keeps none for it.
+ * for the life of the chain), with the height each was registered at, from a genesis node, a second one when the first
+ * does not answer. Only an answer about this wallet counts, and of it only the ids the wallet derives (`ids`: { light,
+ * super }) and a genesis node's id (a super node), so no answer can name another wallet's node; the type follows the
+ * id. The event's burn is not read: the registry keeps none for it.
  * { success: true, nodes: [{ nodeId, nodeType: 'light' | 'super', height }] }, or { success: false } when no node answered.
  */
 export async function getWalletNodeEvents(walletAddress, ids) {
   if (!walletAddress || !ids) return { success: false };
-  const typeOf = (id) => (id === ids.light ? 'light' : (id === ids.super || (ids.genesis && id === ids.genesis) ? 'super' : null));
+  const typeOf = (id) => (id === ids.light ? 'light' : (id === ids.super || GENESIS_NODE_ID.test(id) ? 'super' : null));
   for (const base of shuffledGenesisNodes().slice(0, 2)) {
     try {
       const response = await fetchWithTimeout(`${base}/api/v1/account/${encodeURIComponent(walletAddress)}/node-events`, { method: 'GET' });
@@ -2816,8 +2753,6 @@ const EPOCH_BLOCKS = 14400;
 const KEYS_PER_EPOCH = 160;
 const HISTORY_EPOCHS = 64;
 const HISTORY_STATUSES = ['claimable', 'claimed', 'not_eligible', 'not_admitted', 'shard_not_certified', 'unavailable'];
-// The admission states a node's status reports for a super node (rewards_api.rs, light_nodes.rs).
-const ADMISSION_STATES = ['admitted', 'waiting', 'not_required'];
 
 // One node's per-epoch history for `nodeId`: { wallet, rows: [{ epoch, status }] } newest first, or null.
 function parseEpochHistory(body) {
@@ -2903,11 +2838,10 @@ export default {
   isTokenRefreshNeeded,
   backgroundRefreshFcmToken,
   
-  // Server node status (Super/Genesis - single API call)
+  // A server node's status by the wallet (the Node tab's hint of another node id)
   checkServerNodeStatus,
-  
-  // Get all nodes by wallet (unified view), the chain's registrations of them, and a node's epochs
-  getAllNodesByWallet,
+
+  // The chain's registrations of the wallet's nodes, and a node's epochs
   getWalletNodeEvents,
   getNodeEpochs,
 

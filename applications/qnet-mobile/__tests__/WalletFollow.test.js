@@ -579,6 +579,69 @@ describe('the move of a node balance', () => {
     await expect(manager({ any: inside }, agreeing(5, 2000000000)).claimRewards('light', W, 'pw', 2_000_000_000, NODE))
       .rejects.toThrow(/stop inside its own batch/);
   });
+
+  // The next part of a move in parts: the part before ended at epoch 4 and is in a block. A node that has
+  // not applied it yet still holds those epochs: it quotes them again (watermark below 4) and reports them as its head.
+  describe('the next part of a move, after a part that ended at epoch 4', () => {
+    const behindQuote = quote([[3, '1000000000'], [4, '1000000000']], { last_claimed_epoch: 2 });
+    const next = quote([[5, '1000000000'], [6, '2000000000']]);
+    const asked = (wm) => wm._hedged.mock.calls.filter((c) => c[0] === '/api/v1/rewards/claim').map((c) => c[1].nodes[0]);
+
+    it('a node behind it hands over to the next, and its head and node balance count for nothing', async () => {
+      const pending = { ...agreeing(5, 3000000000), 'https://b': { first_unclaimed_epoch: 3, pending_rewards_nano: 5000000000 } };
+      const wm = manager({ 'https://a': behindQuote, any: next }, pending);
+      const r = await wm.claimRewards('light', W, 'pw', null, NODE, { after: 4 });
+      expect(r).toMatchObject({ success: true, amountNano: '3000000000', prevWatermark: 4, lastEpoch: 6 });
+      // b's head shows the part before not applied: it is never asked to quote (every quote spends its claim budget for
+      // this address); a's quote from before that part hands over.
+      expect(asked(wm)).toEqual(['https://a', 'https://c', 'https://a', 'https://d']);
+      expect(signedClaims().map((c) => c[0])).toEqual([next.sign_message]);
+      // Without it the same answers refuse the part: node b's head is not the batch's.
+      const again = manager({ 'https://a': next, any: next }, pending);
+      await expect(again.claimRewards('light', W, 'pw', null, NODE)).rejects.toThrow(/expected 3/);
+    });
+
+    it('every node behind it is CLAIM_BEHIND, and nothing is signed', async () => {
+      const wm = manager({ any: behindQuote }, agreeing(3, 5000000000));
+      await expect(wm.claimRewards('light', W, 'pw', null, NODE, { after: 4 })).rejects.toMatchObject({ code: 'CLAIM_BEHIND' });
+      expect(signedClaims()).toEqual([]);
+      expect(wm._submitClaim).not.toHaveBeenCalled();
+      // the heads say so: no quote is asked for at all; one node that applied it is no quote and its check either
+      expect(asked(wm)).toEqual([]);
+      const one = manager({ any: next }, { ...agreeing(3, 5000000000), 'https://c': { first_unclaimed_epoch: 5, pending_rewards_nano: 3000000000 } });
+      await expect(one.claimRewards('light', W, 'pw', null, NODE, { after: 4 })).rejects.toMatchObject({ code: 'CLAIM_BEHIND' });
+      expect(asked(one)).toEqual([]);
+      // a node that did not answer its read is not asked either: c applied it, d did not answer
+      const silent = { ...agreeing(3, 5000000000), 'https://c': { first_unclaimed_epoch: 5, pending_rewards_nano: 3000000000 } };
+      delete silent['https://d'];
+      const quiet = manager({ any: next }, silent);
+      await expect(quiet.claimRewards('light', W, 'pw', null, NODE, { after: 4 })).rejects.toMatchObject({ code: 'CLAIM_BEHIND' });
+      expect(asked(quiet)).toEqual([]);
+    });
+
+    it('nothing left at the nodes is no node behind: the next quote is asked, and finds the whole balance moved', async () => {
+      const none = Object.fromEntries(NODES.map((b) => [b, { first_unclaimed_epoch: null, pending_rewards_nano: 0 }]));
+      const wm = manager({ any: { success: false, error: 'No claimable rewards' } }, none);
+      await expect(wm.claimRewards('light', W, 'pw', null, NODE, { after: 4 })).rejects.toMatchObject({ code: 'NO_REWARDS' });
+      expect(asked(wm)).toEqual(['https://a']);
+    });
+  });
+
+  it('a node where this address spent its claim budget, or busy with another request, hands the quote over', async () => {
+    const q = quote([[5, '3000000000']]);
+    const limited = { success: false, code: 'rate_limited', error: 'Rate limit exceeded', retry_after_seconds: 1800 };
+    const busy = { success: false, code: 'claim_busy', error: 'Claim already in progress for this node. Please wait and retry.' };
+    const asked = (wm) => wm._hedged.mock.calls.filter((c) => c[0] === '/api/v1/rewards/claim').map((c) => c[1].nodes[0]);
+    const wm = manager({ 'https://a': limited, 'https://b': busy, any: q }, agreeing(5, 3000000000));
+    expect(await wm.claimRewards('light', W, 'pw', 3_000_000_000, NODE)).toMatchObject({ success: true, amountNano: '3000000000' });
+    expect(asked(wm)).toEqual(['https://a', 'https://b', 'https://c', 'https://a', 'https://b', 'https://d']);
+    // every node so: that answer is the refusal
+    await expect(manager({ any: limited }, agreeing(5, 3000000000)).claimRewards('light', W, 'pw', 3_000_000_000, NODE))
+      .rejects.toMatchObject({ code: 'RATE_LIMITED' });
+    await expect(manager({ any: busy }, agreeing(5, 3000000000)).claimRewards('light', W, 'pw', 3_000_000_000, NODE))
+      .rejects.toMatchObject({ code: 'CLAIM_BUSY' });
+    expect(signedClaims().map((c) => c[0])).toEqual([q.sign_message]);
+  });
 });
 
 describe('what genesis nodes list of this wallet\'s history', () => {
@@ -603,5 +666,70 @@ describe('what genesis nodes list of this wallet\'s history', () => {
     // Fewer than two answers: nothing is known.
     wm._getJson = jest.fn(async (base) => (base === 'https://a' ? { transactions: rows[base] } : null));
     expect(await wm.agreedHistoryRows(W)).toBe(null);
+  });
+});
+
+// A row inside the nodes' window but past the newest 100 the listing reads is asked about by its hash
+// on three genesis nodes; two that report the transaction as the listing compares it, at the row's block, list it.
+describe('rows past the listing, looked up by hash', () => {
+  const FROM = 'f'.repeat(45);
+  const archive = (hash, block, over = {}) => ({
+    hash, from: FROM, to: W, amountNano: '2500000000', txType: 'Transfer', status: 'unverified', type: 'receive', block, ...over,
+  });
+  const tx = (hash, block, over = {}) => ({ hash, from: FROM, to: W, amount: 2500000000, status: 'confirmed', block_height: block, tx_type: 'Transfer', ...over });
+  // `answers`: base -> hash -> the node's answer (an Error is thrown, absent is not_found).
+  const lookups = (answers) => {
+    const wm = new WalletManager();
+    wm.getTrustedNodes = () => ['https://a', 'https://b', 'https://c'];
+    wm._getJson = jest.fn(async (base, p) => {
+      const hash = decodeURIComponent(p.split('/').pop());
+      const a = (answers[base] || {})[hash];
+      if (a instanceof Error) throw a;
+      return a === undefined ? { status: 'not_found', transaction: null } : { status: 'found', transaction: a };
+    });
+    return wm;
+  };
+
+  it('two nodes alike at the row\'s block list it; another amount, another block or a lone answer do not', async () => {
+    const down = new Error('down');
+    const rows = [archive('H1', 500), archive('H2', 501), archive('H3', 502), archive('H4', 503), archive('H5', 504)];
+    const wm = lookups({
+      'https://a': { H1: tx('H1', 500), H2: tx('H2', 501), H3: tx('H3', 777), H4: tx('H4', 503), H5: tx('H5', 504) },
+      'https://b': { H1: tx('H1', 500), H2: tx('H2', 501, { amount: 2500000001 }), H3: tx('H3', 777), H4: down, H5: down },
+      'https://c': { H1: down, H2: down, H3: down, H4: down },
+    });
+    const { listed, answered } = await wm.lookedUpHistoryRows(W, rows);
+    expect(rows.filter((r) => listed.has(listingKey(r))).map((r) => r.hash)).toEqual(['H1']);
+    // H4: only a answered (b and c threw): asked again by a later read. H5: c says not_found, so two answered.
+    expect(rows.filter((r) => answered.has(listingKey(r))).map((r) => r.hash)).toEqual(['H1', 'H2', 'H3', 'H5']);
+    // Only the lookup of a transaction by its hash: never a history page.
+    expect(wm._getJson.mock.calls.every(([, p]) => p.startsWith('/api/v1/transaction/') && !p.includes('page='))).toBe(true);
+  });
+
+  it('a call another address sent is no row of this wallet by its hash alone; not found anywhere is answered, not listed', async () => {
+    const call = archive('H6', 600, { from: W, to: 'c'.repeat(64), amountNano: '0', txType: 'ContractCall', type: 'send' });
+    const foreign = tx('H6', 600, { from: FROM, to: 'c'.repeat(64), amount: 0, tx_type: 'ContractCall { method: "x" }' });
+    const wm = lookups({ 'https://a': { H6: foreign }, 'https://b': { H6: foreign } });
+    expect((await wm.lookedUpHistoryRows(W, [call])).listed.size).toBe(0);
+    const own = tx('H6', 600, { from: W, to: 'c'.repeat(64), amount: 0, tx_type: 'ContractCall { method: "x" }' });
+    expect((await lookups({ 'https://a': { H6: own }, 'https://b': { H6: own } }).lookedUpHistoryRows(W, [call])).listed.has(listingKey(call))).toBe(true);
+    const none = await lookups({}).lookedUpHistoryRows(W, [archive('H7', 700)]);
+    expect([none.listed.size, none.answered.size]).toEqual([0, 1]);
+    // A row that names no block counts at any block two report alike.
+    const { block, ...unnamed } = archive('H8', 800);
+    expect(block).toBe(800);
+    const h8 = { 'https://a': { H8: tx('H8', 801) }, 'https://b': { H8: tx('H8', 801) } };
+    expect((await lookups(h8).lookedUpHistoryRows(W, [unnamed])).listed.size).toBe(1);
+  });
+
+  it('the token-transfer feed gives its rows and the answering node\'s logs floor', async () => {
+    const wm = new WalletManager();
+    const x = { tx_hash: 'H9', log_index: 0 };
+    wm._hedged = jest.fn(async () => ({ ok: true, data: { transfers: [x], oldest_available: 2116800 } }));
+    expect(await wm.getAccountTokenTransfers(W, 50)).toEqual({ transfers: [x], oldestAvailable: 2116800 });
+    wm._hedged = jest.fn(async () => ({ ok: true, data: { transfers: [x] } }));
+    expect(await wm.getAccountTokenTransfers(W, 50)).toEqual({ transfers: [x], oldestAvailable: null });
+    wm._hedged = jest.fn(async () => { throw new Error('down'); });
+    expect(await wm.getAccountTokenTransfers(W, 50)).toEqual({ transfers: [], oldestAvailable: null });
   });
 });

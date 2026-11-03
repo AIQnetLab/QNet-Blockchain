@@ -90,7 +90,7 @@ describe('navigation policy', () => {
     expect(handedOverByBrowser('assets', t0, t0 + 60_000)).toBe(false);
     expect(handedOverByBrowser('browser', 0, t0)).toBe(false);
     const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
-    const receive = src.slice(src.indexOf('const receive = (url) => {'), src.indexOf('takeInitialUrl(Linking).then(receive)'));
+    const receive = src.slice(src.indexOf('watchLinks((url, release, { waited }) => {'), src.indexOf('linkQueueRef.current = { link, release };'));
     expect(receive.indexOf('handedOverByBrowser(')).toBeGreaterThan(0);
     expect(receive.indexOf('handedOverByBrowser(')).toBeLessThan(receive.indexOf('parseLink(url)'));
   });

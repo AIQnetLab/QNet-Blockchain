@@ -22,6 +22,9 @@ import { isSolanaAddress, isSolanaSignature } from '../utils/solanaFormat';
 import { eonFromPublicKeyBytes } from '../crypto/WalletIdentity';
 import { lightNodeId, ownNodeType } from '../crypto/NodePreimages';
 import { FIRST_CONTACT_MS } from '../config/nodes';
+import { settleReads } from '../utils/settleReads';
+import { retryBackoff, retryPause } from '../utils/pause';
+import { noteLink } from './LinkInbox';
 
 const CAPS = Object.freeze({
   connect: Object.freeze({ plaintext: 1024, ct: 1040 }),
@@ -57,6 +60,10 @@ export const LINK = Object.freeze({
   RELAY_TIMEOUT_MS: FIRST_CONTACT_MS,
   // Every u64 of an answer is a decimal string; the smallest move is 1 QNC.
   CLAIM_MIN_NANO: 1000000000,
+  // A `claim` runs its next part only while this much of the session is left: the slowest part that still goes through
+  // takes about 115 s by the claim path's own timeouts, and the answer's first post up to 20 s more, so the one answer the
+  // run gives at its end reaches the relay before the session ends.
+  CLAIM_ANSWER_MARGIN_S: 150,
   // A consent is admitted this long after it was signed (qnet-link-v1 section 14.2).
   CONSENT_PAST_S: 86400,
   CONSENT_FUTURE_S: 300,
@@ -209,15 +216,6 @@ export function parseLink(url) {
   if (!key || !contributoryKey(key)) return null;
   if (reqHash !== undefined && !decodeB64url(reqHash, 32)) return null;
   return Object.freeze(reqHash === undefined ? { id, sitePub, intent } : { id, sitePub, intent, reqHash });
-}
-
-let initialTaken = false;
-
-/** The URL that launched the app, once per run (a remount must not replay it). */
-export async function takeInitialUrl(linking) {
-  if (initialTaken) return null;
-  initialTaken = true;
-  try { return await linking.getInitialURL(); } catch (_) { return null; }
 }
 
 // ---------------------------------------------------------------- crypto (sections 6 and 14.6)
@@ -391,8 +389,8 @@ export function plaintextProblem(text, session, { now = Math.floor(Date.now() / 
   }
   if ('seq' in obj && !isU64(obj.seq)) return 'seq';
   if ('unbound' in obj && typeof obj.unbound !== 'boolean') return 'unbound';
-  // A claim takes at least 1 QNC, except a part the node's quote capped (`stoppedAtEpoch` set: more epochs remain), which
-  // may be less, so the whole balance can always be moved in several claims (owner decision 6, 27.09).
+  // A claim answer's total is at least 1 QNC, except when its last claim's quote was capped (`stoppedAtEpoch` set: more
+  // epochs remain), which may be less, so the whole balance can always be moved in several claims.
   if ('amountNano' in obj) {
     const capped = obj.stoppedAtEpoch !== null && obj.stoppedAtEpoch !== undefined;
     const least = capped ? 1n : BigInt(LINK.CLAIM_MIN_NANO);
@@ -432,16 +430,18 @@ export class LinkRefusal extends Error {
   }
 }
 
-const pause = (ms) => new Promise((r) => { setTimeout(r, ms); });
-
 // Runs `attempt` again, with the wait doubling up to `maxWait`, while its result is `transient` and the next try still
-// starts before `deadline`; stops early once `cancelled()`. The last result.
-async function retryWhile(attempt, transient, { deadline, now, sleep, wait, maxWait, cancelled = () => false }) {
+// starts before `deadline`; stops early once `cancelled()`. `onRetry()` hears each try that is followed by another. The
+// last result. The app's waits (retryPause) end at once when the network comes back or the app comes to the front, and
+// the back-off then starts again from its first wait (retryBackoff).
+async function retryWhile(attempt, transient, { deadline, now, sleep, wait, maxWait, cancelled = () => false, onRetry = () => {} }) {
+  const backoff = retryBackoff(wait, maxWait, sleep);
   for (;;) {
+    backoff.trying();
     const result = await attempt();
-    if (!transient(result) || cancelled() || now() + wait >= deadline) return result;
-    await sleep(wait);
-    wait = Math.min(wait * 2, maxWait);
+    if (!transient(result) || cancelled() || now() + backoff.nextMs() >= deadline) return result;
+    onRetry();
+    await backoff.pause();
   }
 }
 
@@ -530,12 +530,12 @@ export async function markHandled(id, now = Date.now()) {
  * The relay's session for a parsed link, checked against it: { expiresAt, request } (`request` null for `connect`).
  * Throws LinkRefusal. A session this device already decided on is refused before anything is fetched. A slow or
  * failing network is waited out for as long as the session could still be opened; only the relay's answer refuses it.
- * `cancelled()`: the screen went, so no further try is made.
+ * `cancelled()`: the screen went, so no further try is made; `onRetry()`: a try got no answer and another follows.
  */
-export async function openSession(link, { now = Date.now, sleep = pause, cancelled = () => false } = {}) {
+export async function openSession(link, { now = Date.now, sleep = retryPause, cancelled = () => false, onRetry = () => {} } = {}) {
   if (await wasHandled(link.id, now())) throw new LinkRefusal('handled');
   const reply = await relayRetry(`/api/link/sessions/${link.id}`, {}, {
-    deadline: now() + (LINK.SESSION_TTL_S - LINK.MIN_REMAINING_S) * 1000, now, sleep, wait: 1000, maxWait: 5000, cancelled,
+    deadline: now() + (LINK.SESSION_TTL_S - LINK.MIN_REMAINING_S) * 1000, now, sleep, wait: 1000, maxWait: 5000, cancelled, onRetry,
   });
   if (!reply) throw new LinkRefusal('network');
   if (reply.status === 404) throw new LinkRefusal('not_found');
@@ -554,7 +554,7 @@ export async function openSession(link, { now = Date.now, sleep = pause, cancell
  * not build goes out as INTERNAL. `onCheck(number)` hears the check number once the relay took an answer that names
  * this wallet, when the request asked for it (`check: true`).
  */
-export async function deliverAnswer(link, session, answer, { now = Date.now, sleep = pause, onCheck = null } = {}) {
+export async function deliverAnswer(link, session, answer, { now = Date.now, sleep = retryPause, onCheck = null } = {}) {
   const view = { intent: link.intent, request: (session && session.request) || null };
   let plaintext;
   try {
@@ -565,17 +565,20 @@ export async function deliverAnswer(link, session, answer, { now = Date.now, sle
   const sealed = seal({ id: link.id, intent: link.intent, reqHash: link.reqHash || null, sitePub: link.sitePub, plaintext });
   const body = JSON.stringify(sealed.body);
   const named = JSON.parse(plaintext).qnet !== undefined;
+  const start = now();
   const reply = await relayRetry(`/api/link/sessions/${link.id}/response`, { method: 'POST', body }, {
     deadline: session.expiresAt, now, sleep, wait: 2000, maxWait: 30000,
   });
-  if (!reply) return 'failed';
-  if (reply.status === 201 || reply.status === 200) {
+  const outcome = !reply ? 'failed' : (reply.status === 201 || reply.status === 200 ? 'delivered'
+    : ({ 409: 'conflict', 404: 'expired' }[reply.status] || 'failed'));
+  const took = { intent: link.intent, status: reply ? reply.status : 'none', ms: Math.max(0, now() - start) };
+  if (outcome === 'delivered') {
     if (onCheck && named && view.request && view.request.check === true) onCheck(sealed.check);
-    return 'delivered';
+    noteLink('answer_delivered', took);
+  } else {
+    noteLink('answer_not_delivered', { ...took, outcome });
   }
-  if (reply.status === 409) return 'conflict';
-  if (reply.status === 404) return 'expired';
-  return 'failed';
+  return outcome;
 }
 
 // ---------------------------------------------------------------- the intents (section 14.8)
@@ -609,24 +612,28 @@ async function runsHere(node, nodeId, local) {
   return (await node.offersUse(nodeId, status, local).catch(() => true)) !== true;
 }
 
-// One wallet, one node type, chosen once: no light node is prepared or consented to for a wallet the network holds a
-// super or genesis node for (two genesis nodes decide), or whose super node's burn aiqnet.io holds and the network does
-// not list yet (reserved, on its way or recorded). A source that cannot answer gives nothing. null when neither stands
-// in the way, else the error code.
-async function otherNodeProblem(node, qnet) {
-  if (typeof node.otherNode !== 'function' || typeof node.record !== 'function') return 'INTERNAL';
-  const [other, record] = await Promise.all([node.otherNode(qnet), node.record(qnet)]);
-  if (other === true) return 'NODE_OTHER';
-  if (record && record.state !== 'none' && record.nodeType === 'super') return 'NODE_OTHER';
-  if (other !== false || !record) return 'NETWORK';
-  return null;
+/**
+ * One wallet, one node type, chosen once: whether a light node the offer reserves or consents to (`reserve`, `link` in
+ * `consent`) stands against the wallet's super or genesis node, which two genesis nodes list (`node.otherNode`), or a
+ * super node's burn aiqnet.io holds and the network does not list yet (`node.record`). Asked after the sheet shows the
+ * request, as a hint: aiqnet.io's reserve and registration and the chain refuse such a node whatever it says, so no
+ * answer holds nothing up. 'NODE_OTHER' on the first source that says so, else null.
+ */
+export async function otherNodeHint(offer, node) {
+  const asks = !!offer && (offer.kind === 'reserve' || (offer.kind === 'link' && offer.mode === 'consent'));
+  if (!asks || !node || typeof node.otherNode !== 'function' || typeof node.record !== 'function') return null;
+  const said = await settleReads([
+    Promise.resolve().then(() => node.otherNode(offer.qnet)).then((other) => other === true),
+    Promise.resolve().then(() => node.record(offer.qnet)).then((r) => !!r && r.state !== 'none' && r.nodeType === 'super'),
+  ], (got) => got.includes(true));
+  return said.includes(true) ? 'NODE_OTHER' : null;
 }
 
 /**
  * What the confirmation screen shows for a request, read before any authentication and without signing anything.
  * `node` is the Node side the wallet screen hands over (services/NodeLinkActions): status, device, balance, the
- * wallet's other node (`otherNode`), aiqnet.io's record of its burn (`record`), this device's binding (`binding`), and
- * the actions that sign. Answers { kind: 'connect', addresses } · { kind: 'reserve', qnet, nodeId, burner } ·
+ * wallet's other node and aiqnet.io's record of its burn (`otherNode`, `record`: otherNodeHint, after the sheet shows),
+ * this device's binding (`binding`), and the actions that sign. Answers { kind: 'connect', addresses } · { kind: 'reserve', qnet, nodeId, burner } ·
  * { kind: 'link', mode: 'consent' | 'device', nodeId, qnet, device, switchFrom } · { kind: 'link', mode: 'here', nodeId, qnet,
  * seq } (the node runs here already) · { kind: 'unlink', mode: 'here', nodeId,
  * qnet, since } · { kind: 'unlink', mode: 'wallet', nodeId, qnet, platform, since } · { kind: 'claim', nodeId, nodeType,
@@ -676,8 +683,7 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
     if (!request.walletHash || !isSolanaAddress(request.burner) || typeof node.reserve !== 'function') {
       return unavailable('INTERNAL');
     }
-    const problem = await otherNodeProblem(node, qnet);
-    return problem ? unavailable(problem) : { kind: 'reserve', qnet, nodeId, burner: request.burner };
+    return { kind: 'reserve', qnet, nodeId, burner: request.burner };
   }
 
   const status = await node.status(nodeId);
@@ -704,8 +710,6 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
     const own = walletAddresses(wallet);
     if (!own || own.solana !== burner) return unavailable('WALLET_MISMATCH');
   }
-  const problem = await otherNodeProblem(node, qnet);
-  if (problem) return unavailable(problem);
   // A device that runs the node takes a pending binding with the consent; one that cannot gives the consent only.
   if (capable && !(features.includes('bind_v2') && features.includes('pending_bind'))) return unavailable('NETWORK');
   return {
@@ -716,14 +720,15 @@ export async function prepareOffer(link, { wallet, session = null, node = null }
 /**
  * An offer read (`prepare`: prepareOffer for the screen's request) taken again with backoff while the network has not
  * answered it yet (unavailable NETWORK) and at least MIN_REMAINING_S of `session` would be left to confirm in; any other
- * offer, or the last one, is the answer. `cancelled()`: the screen went, so no further read is made.
+ * offer, or the last one, is the answer. `cancelled()`: the screen went, so no further read is made; `onRetry()`: a read
+ * got no answer and another follows.
  */
-export function readOffer(prepare, session, { now = Date.now, sleep = pause, cancelled = () => false } = {}) {
+export function readOffer(prepare, session, { now = Date.now, sleep = retryPause, cancelled = () => false, onRetry = () => {} } = {}) {
   const deadline = session && Number.isFinite(session.expiresAt) ? session.expiresAt - LINK.MIN_REMAINING_S * 1000 : 0;
   return retryWhile(
     () => Promise.resolve().then(prepare).catch(() => unavailable('INTERNAL')),
     (o) => !!o && o.kind === 'unavailable' && o.error === 'NETWORK',
-    { deadline, now, sleep, wait: 1000, maxWait: 5000, cancelled },
+    { deadline, now, sleep, wait: 1000, maxWait: 5000, cancelled, onRetry },
   );
 }
 
@@ -752,8 +757,12 @@ async function claimOffer(node, qnet, nodeId) {
 
 const u64Text = (n) => (typeof n === 'bigint' ? n.toString() : String(n));
 
-/** The answer { status, ... } to a request the user confirmed. Only the confirmation screen calls this. */
-export async function performIntent(link, offer, { node = null, now = Date.now } = {}) {
+/**
+ * The answer { status, ... } to a request the user confirmed. Only the confirmation screen calls this. `session`: the
+ * relay's session the answer goes to, whose end bounds a `claim`'s run (CLAIM_ANSWER_MARGIN_S); `onProgress(view)` hears
+ * each part of that run.
+ */
+export async function performIntent(link, offer, { node = null, session = null, onProgress = () => {}, now = Date.now } = {}) {
   if (offer.kind === 'connect') {
     const { qnet, solana } = offer.addresses;
     return { status: 'ok', qnet, solana };
@@ -786,7 +795,10 @@ export async function performIntent(link, offer, { node = null, now = Date.now }
   }
   if (offer.kind === 'claim_empty') return { status: 'empty', qnet, nodeId };
   if (offer.kind === 'claim') {
-    const r = await node.claim({ nodeId, qnet, amountNano: offer.amountNano });
+    // The Node tab's run of the balance the sheet showed, its next part only while CLAIM_ANSWER_MARGIN_S of the session
+    // is left; the answer is its total, its last claim and where that one stopped (section 14.7).
+    const until = session && Number.isFinite(session.expiresAt) ? session.expiresAt - LINK.CLAIM_ANSWER_MARGIN_S * 1000 : null;
+    const r = await node.claim({ nodeId, qnet, amountNano: offer.amountNano, until, onPart: onProgress });
     if (r.status === 'empty') return { status: 'empty', qnet, nodeId };
     if (r.status !== 'ok') {
       return {
@@ -796,16 +808,19 @@ export async function performIntent(link, offer, { node = null, now = Date.now }
     return {
       status: 'ok', qnet, nodeId, amountNano: u64Text(r.amountNano), txHash: r.txHash,
       stoppedAtEpoch: r.stoppedAtEpoch === null || r.stoppedAtEpoch === undefined ? null : u64Text(r.stoppedAtEpoch),
+      ...(r.run ? { run: r.run } : {}),
     };
   }
-  // `reason`, `retryAfterSeconds`, `ref`, `here`, `already`, `byWallet` and `unknown` are for this device's screen only:
-  // an answer's plaintext carries the keys of its row alone. `ref`: the support reference of a refused enrolment
+  // `reason`, `retryAfterSeconds`, `ref`, `here`, `already`, `byWallet`, `unknown` and a claim's `run` are for this
+  // device's screen only: an answer's plaintext carries the keys of its row alone. `ref`: the support reference of a refused enrolment
   // (light-node-messages section 5.9). `unknown`: the request went out and no answer told whether it was done; the wire
   // says NETWORK, the screen never "nothing changed" (MN-R4-05). `already`: the node runs here already, and the binding
   // the network holds is this device's: nothing is signed or sent for it.
   if (offer.kind === 'link' && offer.mode === 'here') return { status: 'linked', qnet, nodeId, seq: u64Text(offer.seq), already: true };
   if (offer.kind === 'link' && offer.mode === 'device') {
-    const r = await node.useDevice({ nodeId, device: offer.device });
+    // The offer stands on two owners saying the node is on the chain with these features: the binding acts on that.
+    const known = Array.isArray(offer.features) ? { onChain: true, features: offer.features } : null;
+    const r = await node.useDevice({ nodeId, device: offer.device, known });
     if (r.ok) return { status: 'linked', qnet, nodeId, seq: u64Text(r.seq) };
     return {
       status: 'error', error: r.reason === 'network' ? 'NETWORK' : 'BIND_REFUSED', reason: r.reason || null, ...(r.ref ? { ref: r.ref } : {}),

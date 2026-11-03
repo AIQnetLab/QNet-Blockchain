@@ -16,7 +16,7 @@ register('./helpers/chains-activation-loader.mjs', import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const raw = (name) => readFileSync(path.join(HERE, 'fixtures', name), 'utf8');
 const core = await import('../dist/lib/qnet-core.js');
-const { QNET } = await import('../dist/background/config.js');
+const { QNET, RECORD_PATH } = await import('../dist/background/config.js');
 const { WalletError } = await import('../dist/background/errors.js');
 const {
   WALLET, installEnv, installFetch, emptyState, routes, flush,
@@ -47,6 +47,7 @@ const G1 = '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d';
 const TO = '02dca74ef2eae3be97feon499504db891ae0c60e364a8';
 const TX_HASH = 'ab'.repeat(32);
 const FEE = String(core.fees.TRANSFER_FEE_NANO);
+const NET_ID = core.genesisConsensus.NETWORK_ID;
 
 async function rejectsWith(promise, code) {
   await assert.rejects(promise, (error) => {
@@ -56,26 +57,38 @@ async function rejectsWith(promise, code) {
   });
 }
 
+// A node's typed refusal of a transaction's form or last height, as the transaction and contract call routes answer it.
+const refused = (code) => ({ body: { success: false, error: 'Failed to add transaction to mempool', details: `${code}: the node's words`, code } });
+
 // Routes requests to the pinned nodes: handler({node, path, request}) → {status?, body} | undefined.
 const nodeRoute = (handler) => async (request) => {
   const url = new URL(request.url);
   if (!QNET.NODES.includes(url.origin)) return undefined;
   return handler({ node: url.origin, path: url.pathname + url.search, request });
 };
+// Every pinned node answering GET /api/v1/height at `height`, or none answering (null).
+const heightRoute = (height) => nodeRoute(({ path: p }) => {
+  if (p !== '/api/v1/height') return undefined;
+  if (height === null) throw new TypeError('node down');
+  return { body: `{"height":${height}}` };
+});
 
-const accountText = (address, balance, nonce, pk = false) => (
-  `{"address":"${address}","balance":${balance},"has_dilithium_pk":${pk},"is_node":false,"node_type":null,"nonce":${nonce},"reputation":0.0}`);
+// `form`: what the answer says of the V2 form ({tx_v2, next_height}), absent for a node that names none.
+const accountText = (address, balance, nonce, pk = false, form = null) => (
+  `{"address":"${address}","balance":${balance},"has_dilithium_pk":${pk},"is_node":false,"node_type":null,"nonce":${nonce},"reputation":0.0`
+  + `${form === null ? '' : `,"tx_v2":${form.tx_v2},"next_height":${form.next_height}`}}`);
 
 /**
  * The certified network (helpers/certified-net.mjs, installed: a fresh light client rooted at its anchors) with this
  * wallet's account at `balance` and `nonce` in its certified state, and every pinned node reporting the same account on
  * GET /api/v1/account/{a}, the chain's nonce now (perNode: node → {balance, nonce, pk} | null: that node's answer, null
  * for a node down). `accounts` and `tokens` add to the certified state, `logsRoot` is its checkpoint's logs_root; `net`
- * tunes the nodes (helpers/certified-net.mjs).
+ * tunes the nodes (helpers/certified-net.mjs). `form`: what every account answer says of the V2 form ({tx_v2,
+ * next_height}), or none; node → form (or null) for each node's own.
  */
 function chain({
   balance = '5000000000000', nonce = '0', pk = false, perNode = null, onPost = null, sent = null, accounts = {}, tokens = {},
-  logsRoot = undefined,
+  logsRoot = undefined, form = null,
 } = {}) {
   if (!NOBLE_INSTALLED) throw new Error('run npm run bundle:install: the test committee signs with the bundle\'s ML-DSA-65');
   const log = { posts: [], sentReads: 0 };
@@ -94,7 +107,7 @@ function chain({
       const fields = net.newest().fieldsOf.get(account[1]);
       const answer = perNode ? perNode(node, account[1]) : { balance: fields?.balance ?? '0', nonce: fields?.nonce ?? '0', pk };
       if (answer === null) throw new TypeError('node down');
-      return { body: accountText(account[1], answer.balance, answer.nonce, answer.pk) };
+      return { body: accountText(account[1], answer.balance, answer.nonce, answer.pk, typeof form === 'function' ? form(node) : form) };
     }
     if (p === '/api/v1/transaction' && request.method === 'POST') {
       log.posts.push(request);
@@ -160,6 +173,24 @@ describe('chains-activation qnet: node client', () => {
     await rejectsWith(qnet.nodeRequest('/api/v1/x', { headers: { authorization: 'x' } }), 'INTERNAL');
     await rejectsWith(qnet.nodeRequest('/api/v1/x', { headers: { 'x-qnet-wallet': 'a\nb' } }), 'INTERNAL');
     assert.equal(requests.length, 0);
+  });
+
+  it('names the build on every request to aiqnet.io, and on none to a pinned node', async () => {
+    installEnv();
+    const manifest = JSON.parse(readFileSync(path.join(HERE, '..', 'dist', 'manifest.json'), 'utf8'));
+    const requests = installFetch(() => ({ status: 503, body: '' }));
+    await qnet.siteRequest('GET', `${RECORD_PATH}${ME}`);
+    await qnet.siteRequest('POST', `${RECORD_PATH}release`, { wallet: ME });
+    await rejectsWith(qnet.getHistory({}), 'NETWORK');
+    await rejectsWith(qnet.nodeRequest('/api/v1/height', { nodes: [QNET.NODES[0]] }), 'NETWORK');
+    const site = requests.filter((r) => r.url.startsWith(`${QNET.EXPLORER_API}/`));
+    assert.ok(site.some((r) => r.method === 'GET' && r.url === `${QNET.EXPLORER_API}${RECORD_PATH}${ME}`));
+    assert.ok(site.some((r) => r.method === 'POST' && r.url === `${QNET.EXPLORER_API}${RECORD_PATH}release`));
+    assert.ok(site.some((r) => r.url.startsWith(`${QNET.EXPLORER_API}/api/address/`)));
+    for (const r of site) assert.equal(r.headers['x-qnet-client'], `QNetWallet-Extension/${manifest.version}`, r.url);
+    const node = requests.filter((r) => QNET.NODES.some((n) => r.url.startsWith(`${n}/`)));
+    assert.ok(node.length > 0);
+    for (const r of node) assert.equal(r.headers['x-qnet-client'], undefined, r.url);
   });
 
   it('hedges: a silent node is joined by the next, the first answer wins and the other is aborted', async () => {
@@ -539,10 +570,11 @@ describe('chains-activation qnet: the send rule at the live tip', () => {
 
   it('the live read marks no node old and stands for no certified figure', async () => {
     installEnv();
-    const { route } = chain({ balance: '7', nonce: '4' });
+    // the leaf's claim watermark comes with it: a move of a node balance follows its parts by it (nodes.claimForSite)
+    const { route } = chain({ accounts: { [ME]: { balance: '7', nonce: '4', last_claimed_epoch: '812' } } });
     installFetch(route);
     const before = QNET.NODES.map((node) => core.nodeMarkedOld(node));
-    assert.deepEqual(await qnet.liveAccountFigure(ME), { balanceNano: '7', nonce: '4', blockHeight: FIRST_INDEX * 90 + 45 });
+    assert.deepEqual(await qnet.liveAccountFigure(ME), { balanceNano: '7', nonce: '4', blockHeight: FIRST_INDEX * 90 + 45, lastClaimedEpoch: '812' });
     assert.deepEqual(QNET.NODES.map((node) => core.nodeMarkedOld(node)), before, 'its body is the live route\'s, no older node\'s');
     await rejectsWith(qnet.liveAccountFigure('x'), 'INVALID_ADDRESS');
     // a certified read afterwards is judged on its own: nothing of the live read stands as certified
@@ -557,7 +589,7 @@ describe('chains-activation qnet: the send rule at the live tip', () => {
     unborn.install();
     const fresh = routes(unborn.route, route);
     installFetch(fresh);
-    assert.deepEqual(await qnet.liveAccountFigure(ME), { balanceNano: '0', nonce: '0', blockHeight: null });
+    assert.deepEqual(await qnet.liveAccountFigure(ME), { balanceNano: '0', nonce: '0', blockHeight: null, lastClaimedEpoch: null });
     // the popup's balance does not wait for the certified absence proof: 0 at once, nothing to spend, nonce 1 next
     installFetch((request) => (new URL(request.url).search.includes('mb=')
       ? new Promise((resolve) => setTimeout(() => resolve(fresh(request)), 3000)) : fresh(request)));
@@ -1000,13 +1032,14 @@ describe('chains-activation qnet: transactions decided at the live tip', () => {
     assert.ok(!net.requests.some((r) => r.includes('/balance/proof') || r.includes('/macroblock/')), net.requests.join(' '));
   });
 
-  it('a send is never held behind a run of resubmitPending: its node reads come before the send queue', async () => {
+  it('a send is never held behind a run of resubmitPending, nor by a form read past 2 s, which then signs the V1 form', async () => {
     installEnv({ state: { ...emptyState(), pendingTransfers: [kept('1', { lastSubmitAt: Date.now() })] } });
     let release;
     const gate = new Promise((resolve) => {
       release = resolve;
     });
-    const base = chain({ nonce: '0', balance: '100000000000' });
+    // the account answer, which names the V2 form, is one of the held reads
+    const base = chain({ nonce: '0', balance: '100000000000', form: { tx_v2: true, next_height: 1000 } });
     installFetch(async (request) => {
       const { pathname, search } = new URL(request.url);
       // every read of this wallet's own account but the live proof hangs until released
@@ -1015,11 +1048,18 @@ describe('chains-activation qnet: transactions decided at the live tip', () => {
     });
     const run = qnet.resubmitPending();
     const timeout = new Promise((resolve) => setTimeout(() => resolve('held'), 5000));
+    const started = Date.now();
     const sent = await Promise.race([qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '2' }), timeout]);
+    const took = Date.now() - started;
     release();
     await run;
     assert.notEqual(sent, 'held', 'the send waited behind the run');
     assert.equal(sent.nonce, '2');
+    assert.ok(took >= 1990 && took < 4000, `the form is waited for 2 s at most: ${took} ms`);
+    const body = base.log.posts.map((r) => JSON.parse(r.body)).find((b) => b.nonce === 2);
+    assert.equal(Object.hasOwn(body, 'valid_until'), false);
+    const preimage = `q1337|transfer:${ME}:${TO}:1000000000:2:${core.fees.GAS_PRICE}:${core.fees.TRANSFER_GAS_LIMIT}`;
+    assert.equal(await core.verifyConsensusSignature(preimage, body.dilithium_signature, body.dilithium_public_key), true);
   });
 
   it('History reads the pending list after the run it starts: a transfer the chain took shows once, as the archive\'s row', async () => {
@@ -1250,6 +1290,238 @@ describe('chains-activation qnet: history', () => {
     await rejectsWith(qnet.getHistory({}), 'NETWORK');
     installFetch(explorerRoute({ success: false, error: 'x' }, []));
     await rejectsWith(qnet.getHistory({}), 'NETWORK');
+  });
+
+  // A page's rows by their number (the first two bytes of the hash) with their status, in order or as one object.
+  const statuses = (read) => read.items.map((i) => [Number.parseInt(i.hash.slice(0, 4), 16), i.status]);
+  const numbered = (read) => Object.fromEntries(statuses(read));
+  // Date.now in each test of the describe that calls it: the real clock moved on by what `later(ms)` adds, so a head
+  // read older than HEAD_CACHE_MS is read again; the real clock after each test.
+  const shiftedClock = () => {
+    const realNow = Date.now;
+    let shift = 0;
+    beforeEach(() => {
+      shift = 0;
+      Date.now = () => realNow() + shift;
+    });
+    afterEach(() => {
+      Date.now = realNow;
+    });
+    return (ms) => {
+      shift += ms;
+    };
+  };
+
+  // A pinned node keeps the newest TX_INDEX_RETENTION_BLOCKS (100,000) blocks of its transaction index, so the archive's
+  // row of an older block, QNC or token, is the chain's only record of it: included at once by the head two pinned nodes
+  // report, on every page, whatever a later head read gets; inside the window the nodes' listing decides.
+  describe('an archive row of a block the pinned nodes\' index no longer reaches', () => {
+    const HEAD = 55_555;
+    const TIP = HEAD * 90;
+    // archive row n (historyRow) at `block`
+    const at = (n, block, from = TO, to = ME, amount = '60') => ({ ...historyRow(n, from, to, amount), block });
+    const page = (request) => {
+      const older = new URL(request.url).searchParams.has('cursor');
+      const items = older ? [at(6, 1000)] : [
+        at(1, TIP - 100_000), at(2, TIP - 99_999), at(3, TIP - 99_999, ME, TO),
+        { ...at(4, TIP - 100_000, TO, ME, '5'), source: 'token', idx: 0, contract: core.deriveContractAddress(ME, 1), kind: 'transfer',
+          std: 'qrc20', token_id: null, symbol: 'GOLD', decimals: 6, logo: '' },
+        at(5, undefined),
+      ];
+      return { body: { success: true, address: ME, items, next_cursor: older ? null : 'abc.1' } };
+    };
+    // the row inside the window this wallet sent: two pinned nodes list it alike
+    const [nodeA, nodeB] = QNET.NODES;
+    const sent = (node) => (node === nodeA || node === nodeB
+      ? [{ hash: historyRow(3, ME, TO).hash, from: ME, to: TO, amount: '60', nonce: 1, type: 'transfer' }] : []);
+    const network = (height) => routes(explorerRoute(page, []), heightRoute(height), chain({ sent }).route);
+    const JUDGED = [[1, 'included'], [2, 'unverified'], [3, 'included'], [4, 'included'], [5, 'unverified']];
+    const later = shiftedClock();
+
+    it('reads included at once on every page, a newer row as the nodes list it, and stays so whatever a later head read gets', async () => {
+      installEnv();
+      installFetch(network(TIP + 30));
+      const first = await qnet.getHistory({});
+      assert.deepEqual(statuses(first), JUDGED);
+      assert.equal(first.items[0].block, TIP - 100_000);
+      assert.deepEqual(statuses(await qnet.getHistory({ cursor: first.cursor })), [[6, 'included']], 'an older page');
+      // no node answering the head read, then nodes far behind: the window does not move back
+      for (const height of [null, TIP - 90_000]) {
+        later(61_000);
+        installFetch(network(height));
+        assert.deepEqual(statuses(await qnet.getHistory({})), JUDGED, String(height));
+      }
+      core.clearQcCache();
+    });
+
+    it('a chain the pinned nodes no longer serve takes History\'s head with it', async () => {
+      const env = installEnv();
+      env.chainCache = { headIndex: HEAD };
+      installFetch(network(TIP + 30));
+      assert.deepEqual(statuses(await qnet.getHistory({})), JUDGED);
+      later(61_000);
+      installFetch(network(1000 * 90 + 5));
+      assert.equal(await qnet.followChain(), 'changed');
+      assert.deepEqual(statuses(await qnet.getHistory({})),
+        [[1, 'unverified'], [2, 'unverified'], [3, 'included'], [4, 'unverified'], [5, 'unverified']]);
+      core.clearQcCache();
+    });
+  });
+
+  // A row inside the nodes' index but older than the newest rows their listing reads is looked up by its
+  // hash on two pinned nodes (never a page of their history, which skips rows), at most 8 a read, newest first, each once
+  // per worker once both answered; it is in a block when both report it with its identity at its block.
+  describe('an archive row past the rows two pinned nodes list', () => {
+    const TIP = 55_555 * 90;
+    const [ONE, MINE, THEIRS, BATCH] = [15, 16, 17, 18];
+    const transfer = (n) => ({ ...historyRow(n, TO, ME, '60'), block: TIP - 1_000 - n });
+    const deploy = (n) => ({ ...historyRow(n, ME, null, '0'), block: TIP - 1_000 - n, tx_type: 'ContractDeploy' });
+    // every node reports each row as the archive has it at its block, except: row 3 with another amount on all nodes but
+    // the first, row 5 at another block, the row ONE answered by the first node only, THEIRS sent by another address
+    const lookupRoute = (items, lookups) => nodeRoute(({ node, path: p }) => {
+      const m = /^\/api\/v1\/transaction\/([0-9a-z]+)$/.exec(p);
+      if (!m) return undefined;
+      const n = Number.parseInt(m[1].slice(0, 4), 16);
+      lookups.set(n, (lookups.get(n) ?? 0) + 1);
+      if (n === ONE && node !== QNET.NODES[0]) throw new TypeError('node down');
+      const r = items.find((i) => i.hash === m[1]);
+      const tx = r.tx_type === 'ContractDeploy'
+        ? { hash: r.hash, from: n === THEIRS ? TO : ME, to: core.deriveContractAddress(ME, 1), amount: 0, tx_type: 'ContractDeploy' }
+        : { hash: r.hash, from: r.from, to: r.to, amount: n === 3 && node !== QNET.NODES[0] ? 61 : 60, tx_type: 'Transfer { amount: 60 }' };
+      return { body: { tx_hash: r.hash, status: 'found', transaction: { ...tx, status: 'confirmed', block_height: n === 5 ? r.block + 1 : r.block } } };
+    });
+    const later = shiftedClock();
+
+    it('confirms 8 a read, newest first, each once both answered, at its block with its identity; the rest the next reads', async () => {
+      installEnv();
+      const items = [transfer(1), { ...transfer(BATCH), source: 'batch' }, ...[2, 3, 4, 5, 6, 7, 8, 9, 10].map(transfer), deploy(MINE),
+        deploy(THEIRS), transfer(ONE)];
+      const lookups = new Map();
+      const requests = installFetch(routes(explorerRoute({ success: true, address: ME, items, next_cursor: null }, []), heightRoute(TIP + 30),
+        lookupRoute(items, lookups), chain({ sent: [] }).route));
+      const first = numbered(await qnet.getHistory({ limit: 50 }));
+      assert.deepEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => first[n]), ['included', 'included', 'unverified', 'included', 'unverified',
+        'included', 'included', 'included', 'unverified', 'unverified']);
+      assert.deepEqual([...lookups.keys()].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8], 'the 8 newest, the batch row passed over');
+      const second = numbered(await qnet.getHistory({ limit: 50 }));
+      assert.deepEqual([second[9], second[10], second[MINE], second[THEIRS], second[ONE], second[BATCH]],
+        ['included', 'included', 'included', 'unverified', 'unverified', 'unverified']);
+      assert.deepEqual([1, 2, 3, 4, 5, 6, 7, 8].map((n) => lookups.get(n)), [2, 2, 2, 2, 2, 2, 2, 2], 'answered rows are not asked again');
+      await qnet.getHistory({ limit: 50 });
+      assert.equal(lookups.get(ONE), 4, 'a row fewer than two nodes answered is asked again');
+      assert.deepEqual([lookups.get(MINE), lookups.get(THEIRS), lookups.has(BATCH)], [2, 2, false]);
+      assert.equal(requests.some((r) => /[?&]page=/.test(r.url)), false, 'no page of a node\'s history');
+    });
+
+    it('a chain the pinned nodes no longer serve takes the lookups with it', async () => {
+      const env = installEnv();
+      env.chainCache = { headIndex: 55_555 };
+      const items = [transfer(1)];
+      const lookups = new Map();
+      installFetch(routes(explorerRoute({ success: true, address: ME, items, next_cursor: null }, []), heightRoute(TIP + 30),
+        lookupRoute(items, lookups), chain({ sent: [] }).route));
+      assert.deepEqual(numbered(await qnet.getHistory({})), { 1: 'included' });
+      later(61_000);
+      // the other chain holds no such transaction
+      const gone = nodeRoute(({ path: p }) => (p.startsWith('/api/v1/transaction/')
+        ? { body: { tx_hash: p.split('/').pop(), status: 'not_found', transaction: null } } : undefined));
+      installFetch(routes(explorerRoute({ success: true, address: ME, items, next_cursor: null }, []), heightRoute(2_000 * 90 + 5), gone,
+        chain({ sent: [] }).route));
+      assert.equal(await qnet.followChain(), 'changed');
+      assert.deepEqual(numbered(await qnet.getHistory({})), { 1: 'unverified' });
+      core.clearQcCache();
+    });
+  });
+
+  // A pinned node keeps token transfers, their logs and their proofs only above the floor it reports
+  // (`oldest_available`, MICROBLOCK_BODY_RETENTION_BLOCKS = 86,400 below its head at most): a token row at or below it is
+  // in a block, and no proof is asked for it.
+  describe('a token row of a block whose logs no pinned node keeps', () => {
+    // a block whose macroblock the wallet reaches in a few steps (its proof is asked for while a node keeps its logs)
+    const B = FIRST_INDEX * 90 - 5;
+    const TIP = (FIRST_INDEX + 1_100) * 90;
+    const token = (n, block) => ({ ...historyRow(n, TO, ME, '5'), source: 'token', idx: 0, block, contract: core.deriveContractAddress(ME, 1),
+      kind: 'transfer', std: 'qrc20', token_id: null, symbol: 'GOLD', decimals: 6, logo: '' });
+    const floorRoute = (floor, asked) => nodeRoute(({ path: p }) => {
+      if (p !== `/api/v1/account/${ME}/token-transfers?limit=1`) return undefined;
+      asked.push(p);
+      return { body: { address: ME, count: 0, transfers: [], ...(floor === undefined ? {} : { oldest_available: floor }) } };
+    });
+    // the logs proof of each row: `served(hash)` (default: none, the node's refusal)
+    const proofRoute = (asked, served = () => ({ error: 'window_pruned' })) => async (request) => {
+      if (!request.url.includes('/api/v1/logs/proof')) return undefined;
+      const hash = new URL(request.url).searchParams.get('tx_hash');
+      asked.push(hash);
+      return { body: served(hash) };
+    };
+    const network = (items, ...more) => routes(explorerRoute({ success: true, address: ME, items, next_cursor: null }, []), ...more,
+      chain({ sent: [] }).route);
+    const read = async (items, ...more) => {
+      qnet = await worker(`logsFloor=${Math.random()}`);
+      installEnv();
+      installFetch(network(items, ...more));
+      const page = numbered(await qnet.getHistory({}));
+      await qnet.backgroundReads();
+      return page;
+    };
+    const later = shiftedClock();
+
+    it('the floor a node reports, never above 86,400 below the head; nothing judged without a head', async () => {
+      const FLOOR = B - 1;
+      const floors = [];
+      const proofs = [];
+      const page = await read([token(1, FLOOR), token(2, B), { ...historyRow(3, TO, ME, '5'), block: FLOOR }],
+        heightRoute(TIP + 30), floorRoute(FLOOR, floors), proofRoute(proofs));
+      assert.deepEqual(page, { 1: 'included', 2: 'unverified', 3: 'unverified' }, 'a QNC row keeps the index window');
+      assert.deepEqual(proofs, [token(2, B).hash], 'no proof is asked for a row no node keeps the logs of');
+      await qnet.getHistory({});
+      assert.equal(floors.length, 1, 'the floor is read at most once a minute');
+      // none reported: 86,400 below the head stands in
+      assert.deepEqual(await read([token(1, TIP - 86_400), token(2, TIP - 86_399)], heightRoute(TIP + 30), floorRoute(undefined, [])),
+        { 1: 'included', 2: 'unverified' });
+      // a floor above that is one node's word: clamped
+      assert.deepEqual(await read([token(1, TIP - 86_400), token(2, TIP - 86_399)], heightRoute(TIP + 30), floorRoute(TIP - 50_000, [])),
+        { 1: 'included', 2: 'unverified' });
+      assert.deepEqual(await read([token(1, FLOOR)], heightRoute(null), floorRoute(FLOOR, [])), { 1: 'unverified' });
+      core.clearQcCache();
+    });
+
+    it('a row its logs proof contradicted stays unverified once the head takes its block past the floor', async () => {
+      qnet = await worker(`contradictedPast=${Math.random()}`);
+      installEnv();
+      const proofs = [];
+      const other = '11'.repeat(32);
+      const served = (hash) => (hash === token(1, B).hash
+        ? { leaf: other, proof: [], block_root: '22'.repeat(32), window_proof: [], logs_root: '33'.repeat(32), window_end: FIRST_INDEX * 90 }
+        : { error: 'window_not_finalized' });
+      const items = [token(1, B), token(2, B)];
+      installFetch(network(items, heightRoute((FIRST_INDEX + 100) * 90 + 30), proofRoute(proofs, served)));
+      assert.deepEqual(numbered(await qnet.getHistory({})), { 1: 'unverified', 2: 'unverified' });
+      await qnet.backgroundReads();
+      later(61_000);
+      installFetch(network(items, heightRoute((FIRST_INDEX + 1_000) * 90 + 30), proofRoute(proofs, served)));
+      assert.deepEqual(numbered(await qnet.getHistory({})), { 1: 'unverified', 2: 'included' });
+      assert.deepEqual(proofs.sort(), [token(1, B).hash, token(2, B).hash].sort(), 'each asked once, while a node kept its logs');
+      core.clearQcCache();
+    });
+
+    it('a chain the pinned nodes no longer serve takes the logs floor with it: the new chain\'s floor judges a row', async () => {
+      qnet = await worker(`floorChain=${Math.random()}`);
+      const env = installEnv();
+      // the old chain's head 20 macroblocks above the new one's (more than CHAIN_REWIND_MACROBLOCKS), its node's floor above
+      // the row, the new chain's below it
+      const X = TIP - 90_000;
+      env.chainCache = { headIndex: TIP / 90 + 20 };
+      const items = [token(1, X)];
+      installFetch(network(items, heightRoute(TIP + 20 * 90 + 30), floorRoute(X + 5_000, []), proofRoute([])));
+      assert.deepEqual(numbered(await qnet.getHistory({})), { 1: 'included' });
+      await qnet.backgroundReads();
+      later(61_000);
+      installFetch(network(items, heightRoute(TIP + 30), floorRoute(X - 1_000, []), proofRoute([])));
+      assert.equal(await qnet.followChain(), 'changed');
+      assert.deepEqual(numbered(await qnet.getHistory({})), { 1: 'unverified' });
+      core.clearQcCache();
+    });
   });
 });
 
@@ -1674,6 +1946,52 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
     const review = await qnet.preview({ to: eonOf(54), amount: '1' });
     assert.equal(review.nonce, '1');
     assert.deepEqual(review.outstanding.map((p) => [p.nonce, p.kind, p.refused]), [['1', 'call', true]]);
+  });
+
+  it('sendCall: the V2 form at next_height + 600 when the account answers say tx_v2; a typed refusal gets one re-sign at the same nonce', async () => {
+    const form = { tx_v2: true, next_height: 1000 };
+    const callsOf = (log) => log.calls.map((r) => JSON.parse(r.body));
+    const payee = eonOf(55);
+    const request = { kind: 'tokenTransfer', token: TOKEN, to: payee, amountBase: '2500000' };
+    const v1Token = core.buildTokenTransfer({ from: ME, token: TOKEN, to: payee, amount: '2500000', nonce: '1' });
+    const v2Token = core.buildTokenTransfer({ from: ME, token: TOKEN, to: payee, amount: '2500000', nonce: '1', expiry: core.expiryAt('1600') });
+    let env = installEnv();
+    const token = callChain({ balance: '1000000000000', balances: { [ME]: '7000000', [payee]: '3' }, form });
+    installFetch(token.route);
+    assert.equal((await qnet.sendCall({ request, expectedFeeNano: v1Token.maxFeeNano, expectedDepositNano: '0', expectedNonce: '1' })).status, 'submitted');
+    const [signed] = callsOf(token.log);
+    assert.equal(signed.valid_until, 1600);
+    assert.match(v2Token.preimage, new RegExp(`^q1337\\|${NET_ID}\\|contract_call_v2:${ME}:[0-9a-f]{64}:1:10:${v2Token.gasLimit}:1600$`));
+    assert.equal(await core.verifyConsensusSignature(v2Token.preimage, signed.dilithium_signature, signed.dilithium_public_key), true);
+    assert.equal(core.validUntilOf(env.state().pendingTransfers[0].body), 1600);
+
+    // a contract call refused tx_v2_before_gate: one re-sign in the V1 form at the same nonce, in the refused one's place
+    const call = { kind: 'contractCall', contract: GAME, method: 'play', args: 'c0ffee', gasLimit: null };
+    const v1Call = core.buildContractCall({ from: ME, contract: GAME, method: 'play', args: 'c0ffee', nonce: '1' });
+    const v2Call = core.buildContractCall({ from: ME, contract: GAME, method: 'play', args: 'c0ffee', nonce: '1', expiry: core.expiryAt('1600') });
+    env = installEnv();
+    let answered = 0;
+    const gate = callChain({ form, onCall: () => (++answered === 1 ? refused('tx_v2_before_gate') : { body: { success: true, tx_hash: TX_HASH } }) });
+    installFetch(gate.route);
+    assert.deepEqual(await qnet.sendCall({ request: call, expectedFeeNano: v1Call.maxFeeNano, expectedDepositNano: '0', expectedNonce: '1' }),
+      { txHash: TX_HASH, status: 'submitted', nonce: '1', from: ME });
+    const [first, second] = callsOf(gate.log);
+    assert.equal(first.valid_until, 1600);
+    assert.equal(await core.verifyConsensusSignature(v2Call.preimage, first.dilithium_signature, first.dilithium_public_key), true);
+    assert.equal(Object.hasOwn(second, 'valid_until'), false);
+    assert.equal(second.nonce, 1);
+    assert.equal(await core.verifyConsensusSignature(v1Call.preimage, second.dilithium_signature, second.dilithium_public_key), true);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.nonce, p.kind, p.outcome, core.validUntilOf(p.body)]), [['1', 'call', 'pending', null]]);
+    assert.equal(env.calls.signQnetCall, 2);
+
+    // a second typed refusal is the answer: two posts, both kept refused at the one nonce, never a loop
+    env = installEnv();
+    const expired = callChain({ form, onCall: () => refused('tx_expired') });
+    installFetch(expired.route);
+    await rejectsWith(qnet.sendCall({ request: call, expectedFeeNano: v1Call.maxFeeNano, expectedDepositNano: '0', expectedNonce: '1' }), 'NODE_REJECTED');
+    assert.equal(expired.log.calls.length, 2);
+    assert.deepEqual(callsOf(expired.log).map((b) => [b.nonce, b.valid_until]), [[1, 1600], [1, 1600]]);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.nonce, p.outcome]), [['1', 'refused'], ['1', 'refused']]);
   });
 
   it('prepareCall: a call without input carries "" in its calldata, as the mobile app builds it; null or uppercase is refused', async () => {
@@ -2173,8 +2491,7 @@ describe('chains-activation qnet: dApp token transfers and contract calls', () =
   });
 });
 
-// Owner, 06.10: balances load fast, and cached chain data of a chain the wallet no longer follows never hangs the wallet;
-// a pending row resolves in a bounded time.
+// Balances load fast, and cached chain data of a chain the wallet no longer follows never hangs the wallet.
 describe('chains-activation qnet: fast balance reads (owner, 06.10)', () => {
   it('a silent node does not hold a proof read for its whole timeout: the next node joins after the hedge', async () => {
     installEnv();
@@ -2241,7 +2558,6 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
     nonce, to: TO, amountNano: '1000000000', feeNano: FEE, body: `{"n":${nonce}}`, txHash: null, createdAt: Date.now(),
     lastSubmitAt: Date.now(), outcome: 'pending', kind: 'transfer', call: null, ...extra,
   });
-  const heightRoute = (height) => nodeRoute(({ path: p }) => (p === '/api/v1/height' ? { body: `{"height":${height}}` } : undefined));
 
   it('a network head far below the one this wallet saw is another chain: its anchors, pending sends and balances go', async () => {
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [pendingRecord('7'), pendingRecord('8')] } });
@@ -2398,7 +2714,10 @@ describe('chains-activation qnet: the chain this wallet follows (owner, 06.10)',
   });
 });
 
-describe('chains-activation qnet: a pending row resolves (owner, 06.10)', () => {
+// A V1 transaction (no last height) no node can hold any more is released by the wallet: the next send takes its nonce,
+// its amount is no longer kept back, and its record leaves the vault a day later. Only the chain decides its fate, so
+// History, the sent screen and a site's status never call it dropped.
+describe('chains-activation qnet: a V1 transaction no node holds is released, never failed by a clock', () => {
   const HOUR = 60 * 60 * 1000;
   const record = (nonce, ageMs, extra = {}) => ({
     nonce, to: TO, amountNano: '1000000000', feeNano: FEE, body: `{"n":${nonce}}`, txHash: null, createdAt: Date.now() - ageMs,
@@ -2407,22 +2726,42 @@ describe('chains-activation qnet: a pending row resolves (owner, 06.10)', () => 
   const historyRoute = (request) => (request.url.startsWith(`${QNET.EXPLORER_API}/api/address/`)
     ? { body: { success: true, address: ME, items: [], next_cursor: null } } : undefined);
 
-  it('a send no node can hold any more, its nonce free, reads as dropped; the next send takes its nonce', async () => {
+  it('a stale V1 send no node can hold, its nonce free, reads stale and pending; the next send takes its nonce and amount', async () => {
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('5', 2 * HOUR), record('6', 10 * 60 * 1000)] } });
     installFetch(routes(historyRoute, chain({ balance: '5000000000000', nonce: '4', sent: [] }).route));
-    const fresh = await worker(`dropped=${Date.now()}`);
+    const fresh = await worker(`released=${Date.now()}`);
     const balance = await fresh.getBalance();
-    // the dropped send's amount is no longer kept back: the next send takes its place
+    // the released send's amount is no longer kept back: the next send takes its place
     assert.equal(balance.spendableNano, String(5_000_000_000_000n - 1_000_000_000n - BigInt(FEE)));
     const history = await fresh.getHistory({});
-    assert.deepEqual(history.pending.map((p) => [p.nonce, p.status]), [['6', 'pending'], ['5', 'dropped']]);
+    assert.deepEqual(history.pending.map((p) => [p.nonce, p.status]), [['6', 'pending'], ['5', 'stale']], 'no clock says it did not go through');
+    // the sent screen and a site get the same answer: its nonce is free, so it may still apply
+    assert.deepEqual(await fresh.sentStatus({ nonce: '5' }), { status: 'pending' });
+    assert.deepEqual(await fresh.transactionStatus({ from: ME, nonce: '5' }), { status: 'pending', from: ME, nonce: '5', txHash: null, blockHeight: null });
     const preview = await fresh.preview({ to: TO, amount: '2' });
-    assert.equal(preview.replacesNonce, '5', 'the new send is signed at the dropped one\'s nonce');
+    assert.equal(preview.replacesNonce, '5', 'the new send is signed at the released one\'s nonce');
     assert.equal(preview.nonce, '5');
-    assert.equal(env.state().pendingTransfers.length, 2, 'nothing is dropped from the vault before its day');
+    assert.equal(env.state().pendingTransfers.length, 2, 'nothing leaves the vault before its day');
+    // the chain decides it: another transaction of this wallet took its nonce
+    const other = { from: ME, to: eonOf(77), amount: 7, nonce: 5, type: 'transfer', hash: 'ff'.repeat(32) };
+    installFetch(routes(historyRoute, chain({ balance: '5000000000000', nonce: '5', sent: [other] }).route));
+    await fresh.resubmitPending();
+    assert.deepEqual((await fresh.getHistory({})).pending.map((p) => [p.nonce, p.status]), [['6', 'pending'], ['5', 'replaced']]);
   });
 
-  it('a dropped send leaves the list a day after it was dropped; one sent recently never reads as dropped', async () => {
+  it('a V1 send the only node refused, no node can hold it: History says refused, the next send takes its nonce and amount', async () => {
+    const env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('5', 40 * 60 * 1000, { outcome: 'refused' })] } });
+    installFetch(routes(historyRoute, chain({ balance: '5000000000000', nonce: '4', sent: [] }).route));
+    const fresh = await worker(`releasedRefused=${Date.now()}`);
+    assert.equal((await fresh.getBalance()).spendableNano, '5000000000000');
+    assert.deepEqual((await fresh.getHistory({})).pending.map((p) => [p.nonce, p.status]), [['5', 'refused']]);
+    assert.deepEqual(await fresh.sentStatus({ nonce: '5' }), { status: 'pending' });
+    const preview = await fresh.preview({ to: TO, amount: '2' });
+    assert.deepEqual([preview.nonce, preview.replacesNonce], ['5', '5']);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['refused']);
+  });
+
+  it('a released V1 send leaves the vault a day after no node could hold it; one sent recently reads pending', async () => {
     const env = installEnv({ state: { ...emptyState(), pendingTransfers: [record('5', 26 * HOUR), record('6', 50 * 60 * 1000)] } });
     installFetch(routes(historyRoute, chain({ balance: '5000000000000', nonce: '4', sent: [] }).route));
     const fresh = await worker(`expired=${Date.now()}`);
@@ -2849,5 +3188,141 @@ describe('chains-activation qnet: the follow and the capsule (GALC v2)', () => {
     assert.equal(preview.recipient.historyRead, true);
     assert.deepEqual([ownProofReads(net), recipientReads(), archiveReads.length], [before[0] + 1, before[1], before[2]],
       'the wallet\'s own live read only');
+  });
+});
+
+// The V2 form (a signed last height): the send signs it when the pinned nodes say the network takes it, a typed refusal of
+// the form or the height is answered by one re-sign at the same nonce (never more), and a V2 transaction whose last height
+// the pinned nodes' tip passed with its nonce free is dropped by height alone: History and the sent screen say it did not
+// go through and took nothing, it is never sent again, and the next send takes its nonce. No clock decides it.
+describe('chains-activation qnet: the V2 form and its fate by height', () => {
+  const GAS =`${core.fees.GAS_PRICE}:${core.fees.TRANSFER_GAS_LIMIT}`;
+  const postsOf = (log) => log.posts.map((r) => JSON.parse(r.body));
+
+  it('signs the V2 form, last height next_height + 600, when the account answers say the network takes it', async () => {
+    const env = installEnv();
+    const { route, log } = chain({ form: { tx_v2: true, next_height: 1000 } });
+    installFetch(route);
+    const result = await qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' });
+    assert.equal(result.status, 'submitted');
+    const [body] = postsOf(log);
+    assert.equal(body.valid_until, 1600);
+    const preimage = `q1337|${NET_ID}|transfer_v2:${ME}:${TO}:1000000000:1:${GAS}:1600`;
+    assert.equal(await core.verifyConsensusSignature(preimage, body.dilithium_signature, body.dilithium_public_key), true);
+    assert.equal(core.validUntilOf(env.state().pendingTransfers[0].body), 1600);
+    // a node that names no form: the V1 form, exactly as before
+    const v1 = chain({ form: null });
+    installEnv();
+    installFetch(v1.route);
+    await qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' });
+    assert.equal(Object.hasOwn(postsOf(v1.log)[0], 'valid_until'), false);
+  });
+
+  it('tx_v2_before_gate: one re-sign in the V1 form at the same nonce, in the refused one\'s place', async () => {
+    const env = installEnv();
+    let posts = 0;
+    const { route, log } = chain({ form: { tx_v2: true, next_height: 1000 }, onPost: () => (++posts === 1 ? refused('tx_v2_before_gate')
+      : { body: { success: true, tx_hash: TX_HASH } }) });
+    installFetch(route);
+    assert.deepEqual(await qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }),
+      { txHash: TX_HASH, status: 'submitted', nonce: '1', from: ME });
+    const [first, second] = postsOf(log);
+    assert.equal(first.valid_until, 1600);
+    assert.equal(Object.hasOwn(second, 'valid_until'), false);
+    assert.equal(second.nonce, 1);
+    const preimage = `q1337|transfer:${ME}:${TO}:1000000000:1:${GAS}`;
+    assert.equal(await core.verifyConsensusSignature(preimage, second.dilithium_signature, second.dilithium_public_key), true);
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.nonce, p.outcome, core.validUntilOf(p.body)]), [['1', 'pending', null]]);
+  });
+
+  it('tx_expiry_required, tx_expired, beyond the horizon: one re-sign in the V2 form; a second refusal is the answer, never a loop', async () => {
+    for (const code of ['tx_expiry_required', 'tx_expired', 'tx_expiry_beyond_horizon']) {
+      installEnv();
+      let posts = 0;
+      const { route, log } = chain({ form: { tx_v2: false, next_height: 2000 }, onPost: () => (++posts === 1 ? refused(code)
+        : { body: { success: true, tx_hash: TX_HASH } }) });
+      installFetch(route);
+      assert.equal((await qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' })).status, 'submitted', code);
+      assert.deepEqual(postsOf(log).map((b) => b.valid_until ?? null), [null, 2600], code);
+    }
+    const env = installEnv();
+    const { route, log } = chain({ form: { tx_v2: true, next_height: 2000 }, onPost: () => refused('tx_expired') });
+    installFetch(route);
+    await rejectsWith(qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }), 'NODE_REJECTED');
+    assert.equal(log.posts.length, 2);
+    // both stay listed and reserved at the one nonce, as a refused replacement leaves them (R4-EXTQ-01): at most one applies
+    assert.deepEqual(env.state().pendingTransfers.map((p) => [p.nonce, p.outcome]), [['1', 'refused'], ['1', 'refused']]);
+    // any other refusal: no re-sign
+    installEnv();
+    const other = chain({ form: { tx_v2: true, next_height: 2000 }, onPost: () => ({ body: { success: false, details: 'insufficient balance' } }) });
+    installFetch(other.route);
+    await rejectsWith(qnet.send({ to: TO, amount: '1', expectedFeeNano: FEE, expectedNonce: '1' }), 'NODE_REJECTED');
+    assert.equal(other.log.posts.length, 1);
+  });
+
+  const at = Date.now() - 60_000;
+  const keptV2 = (nonce, validUntil) => ({
+    nonce, to: TO, amountNano: '10', feeNano: FEE, body: `{"n":${nonce},"valid_until":${validUntil}}`, txHash: TX_HASH, createdAt: at,
+    lastSubmitAt: at - 600_000, outcome: 'pending', kind: 'transfer', call: null,
+  });
+
+  it('a tip past its last height, its nonce free: dropped by height, never sent again, its nonce taken by the next send', async () => {
+    installEnv({ state: { ...emptyState(), pendingTransfers: [keptV2('1', 1000)] } });
+    // the tip at its last height: a block of that height may still hold it
+    const atEdge = chain({ form: { tx_v2: true, next_height: 1001 } });
+    installFetch(routes(archiveRoute([]), atEdge.route));
+    assert.deepEqual(await qnet.sentStatus({ nonce: '1' }), { status: 'pending' });
+    assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.status), ['pending']);
+
+    const past = chain({ form: { tx_v2: true, next_height: 1002 } });
+    installFetch(routes(archiveRoute([]), past.route));
+    assert.deepEqual(await qnet.sentStatus({ nonce: '1' }), { status: 'dropped' });
+    assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.status), ['dropped']);
+    await qnet.resubmitPending();
+    assert.deepEqual(past.log.posts, [], 'no block can take it: it is not posted again');
+    assert.deepEqual(await qnet.transactionStatus({ from: ME, nonce: '1' }), { status: 'unknown', from: ME, nonce: '1', txHash: null, blockHeight: null });
+    const review = await qnet.preview({ to: TO, amount: '2' });
+    assert.equal(review.nonce, '1', 'the next send takes its nonce');
+    assert.equal(review.replacesNonce, '1');
+  });
+
+  it('the tip is the one two agreeing answers name: one node naming a height past it drops nothing', async () => {
+    const realRandom = Math.random;
+    Math.random = () => 0.999999; // the pinned nodes in their own order: the first two answer
+    try {
+      const [first] = QNET.NODES;
+      const env = installEnv({ state: { ...emptyState(), pendingTransfers: [keptV2('1', 1000)] } });
+      // the other nodes name no height (an older binary): one node's word never moves the tip
+      const alone = chain({ form: (node) => (node === first ? { tx_v2: true, next_height: 5000 } : null) });
+      installFetch(routes(archiveRoute([]), alone.route));
+      assert.deepEqual(await qnet.sentStatus({ nonce: '1' }), { status: 'pending' });
+      assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.status), ['pending']);
+      await qnet.resubmitPending();
+      assert.equal(alone.log.posts.length, 1, 'still sent');
+      assert.deepEqual(env.state().pendingTransfers.map((p) => p.outcome), ['pending']);
+      // both name one: the lowest is the tip, so the high one still moves nothing
+      const low = chain({ form: (node) => ({ tx_v2: true, next_height: node === first ? 5000 : 1001 }) });
+      installFetch(routes(archiveRoute([]), low.route));
+      assert.deepEqual(await qnet.sentStatus({ nonce: '1' }), { status: 'pending' });
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  it('a V1 transaction has no last height: neither a height nor a clock drops it, a site and the sent screen say pending', async () => {
+    installEnv({ state: { ...emptyState(), pendingTransfers: [{ ...keptV2('1', 1), body: '{"n":1}' }] } });
+    const tall = chain({ form: { tx_v2: true, next_height: 999999 } });
+    installFetch(routes(archiveRoute([]), tall.route));
+    assert.deepEqual(await qnet.sentStatus({ nonce: '1' }), { status: 'pending' });
+    assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.status), ['pending']);
+    assert.equal((await qnet.transactionStatus({ from: ME, nonce: '1' })).status, 'pending');
+    // signed 61 minutes ago and last sent then, its nonce free: no longer sent and in no node's mempool, yet its body stays
+    // valid until its nonce is used, so a site's status, the sent screen and History give the one answer, pending
+    const old = Date.now() - 61 * 60_000;
+    installEnv({ state: { ...emptyState(), pendingTransfers: [{ ...keptV2('1', 1), body: '{"n":1}', createdAt: old, lastSubmitAt: old }] } });
+    installFetch(routes(archiveRoute([]), tall.route));
+    assert.deepEqual(await qnet.transactionStatus({ from: ME, nonce: '1' }), { status: 'pending', from: ME, nonce: '1', txHash: null, blockHeight: null });
+    assert.deepEqual(await qnet.sentStatus({ nonce: '1' }), { status: 'pending' });
+    assert.deepEqual((await qnet.getHistory({})).pending.map((i) => i.status), ['stale']);
   });
 });

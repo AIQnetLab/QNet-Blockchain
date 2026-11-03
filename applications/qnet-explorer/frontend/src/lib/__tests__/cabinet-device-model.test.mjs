@@ -1,18 +1,14 @@
-// The linked device by its model (owner, 06.10: the Device tab shows the device itself, not only its platform): the
+// The linked device by its model (the Device tab shows the device itself, not only its platform): the
 // public status's `device.model`, which QNet Wallet sends with each binding and the node keeps with it, read by the
 // site route with the node's own rule, passed on to the page exactly, and shown as "{model} · {platform}". Device names
 // here are made up. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { mergeStatus, parsePublicStatus } from '../../server/cabinet/node-proxy.ts';
 import { DEVICE_MODEL_MAX, deviceName, isDeviceModel, parseStatusView } from '../cabinet/node-view.ts';
-import { TEXTS } from '../texts.ts';
-
-const SRC = new URL('../../', import.meta.url);
-const REPO = new URL('../../../../../../', import.meta.url);
-const read = (base, path) => readFileSync(new URL(path, base), 'utf8').replace(/\r\n/g, '\n');
+import { read, repo } from './source.mjs';
+import { EN, TEXTS } from './texts-helper.mjs';
 
 const status = (over = {}) => ({
   onchain_registered: true, registration_pending: false, device_bound: true, answered_this_epoch: true, needs_reactivation: false,
@@ -27,10 +23,10 @@ test('a model is what the node keeps: 1 to 40 ASCII letters, digits, spaces and 
     assert.equal(isDeviceModel(bad), false, String(bad));
   }
   // One rule for the node, the app and the site.
-  const node = read(REPO, 'development/qnet-integration/src/light_binding.rs');
+  const node = repo('development/qnet-integration/src/light_binding.rs');
   assert.match(node, /pub const MODEL_HINT_MAX: usize = 40;/);
   assert.match(node, /b\.is_ascii_alphanumeric\(\) \|\| b" \.,\+\(\)\/-"\.contains\(&b\)/);
-  const app = read(REPO, 'applications/qnet-mobile/src/services/DeviceModel.js');
+  const app = repo('applications/qnet-mobile/src/services/DeviceModel.js');
   assert.match(app, /export const MODEL_MAX = 40;/);
   assert.match(app, /const MODEL_RE = \/\^\[A-Za-z0-9 \.,\+\(\)\/-\]\+\$\/;/);
 });
@@ -60,23 +56,23 @@ test('the page takes the first settling answer\'s model exactly, beside the plat
 });
 
 test('the Device tab names the device as "{model} · {platform}", the platform alone without a model', () => {
-  assert.equal(deviceName({ platform: 'android', model: 'Acme Phone 7' }), `Acme Phone 7 · ${TEXTS.device_platform_android}`);
-  assert.equal(deviceName({ platform: 'ios', model: 'Acme Tab 3' }), `Acme Tab 3 · ${TEXTS.device_platform_ios_short}`);
-  assert.equal(deviceName({ platform: 'unknown', model: 'Acme Phone 7' }), 'Acme Phone 7');
-  assert.equal(deviceName({ platform: 'android', model: null }), TEXTS.device_platform_android);
-  assert.equal(deviceName({ platform: 'ios', model: null }), TEXTS.device_platform_ios);
-  assert.equal(deviceName({ platform: 'unknown', model: null }), TEXTS.device_platform_unknown);
-  assert.equal(deviceName({ platform: null, model: null }), null);
+  assert.equal(deviceName({ platform: 'android', model: 'Acme Phone 7' }, EN), `Acme Phone 7 · ${TEXTS.device_platform_android}`);
+  assert.equal(deviceName({ platform: 'ios', model: 'Acme Tab 3' }, EN), `Acme Tab 3 · ${TEXTS.device_platform_ios_short}`);
+  assert.equal(deviceName({ platform: 'unknown', model: 'Acme Phone 7' }, EN), 'Acme Phone 7');
+  assert.equal(deviceName({ platform: 'android', model: null }, EN), TEXTS.device_platform_android);
+  assert.equal(deviceName({ platform: 'ios', model: null }, EN), TEXTS.device_platform_ios);
+  assert.equal(deviceName({ platform: 'unknown', model: null }, EN), TEXTS.device_platform_unknown);
+  assert.equal(deviceName({ platform: null, model: null }, EN), null);
   assert.equal(TEXTS.device_model_platform, '{model} · {platform}');
-  const rows = read(SRC, 'components/cabinet/NodeStatus.tsx');
-  assert.match(rows, /\{full \? \([\s\S]*?\{named && deviceName\(named\) && <p className="cab-dev-name">\{deviceName\(named\)\}<\/p>\}/);
+  const rows = read('components/cabinet/NodeStatus.tsx');
+  assert.match(rows, /\{full \? \([\s\S]*?\{named && deviceName\(named, t\) && <p className="cab-dev-name">\{deviceName\(named, t\)\}<\/p>\}/);
   assert.doesNotMatch(rows, /device_platform_/);
 });
 
-// Owner, 13.10: an address only viewed shows no device details at all, its platform included; they are the owner's
+// An address only viewed shows no device details at all, its platform included; they are the owner's
 // (the status read for a view leaves them out too: cabinet-view-mode.test.mjs).
 test('an address only viewed: no platform, no model', () => {
-  const rows = read(SRC, 'components/cabinet/NodeStatus.tsx');
+  const rows = read('components/cabinet/NodeStatus.tsx');
   assert.match(rows, /const named = viewOnly \? null : device;/);
-  assert.equal(deviceName({ platform: 'android', model: null }), TEXTS.device_platform_android);
+  assert.equal(deviceName({ platform: 'android', model: null }, EN), TEXTS.device_platform_android);
 });

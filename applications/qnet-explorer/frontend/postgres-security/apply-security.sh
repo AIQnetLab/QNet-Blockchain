@@ -75,7 +75,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "   Running as root ✓"
+echo "   Running as root"
 
 # ============================================================================
 # 3. Create backups
@@ -96,26 +96,27 @@ echo "   Backups saved to: $BACKUP_DIR"
 # 4. Generate or read secure password
 # ============================================================================
 
+# The writer's password is root's, outside the checkout: the site's user owns the checkout and could read, replace or
+# plant a file there.
+PASSWORD_FILE="/root/.qnet-explorer-writer-password"
+
 if [ "$SKIP_PASSWORD" = false ]; then
     echo "[4/10] Managing database password..."
-    
-    PASSWORD_FILE="../.postgres_password"
-    
+
     if [ ! -f "$PASSWORD_FILE" ]; then
         echo "   Generating new secure password..."
         NEW_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-32)
-        echo -n "$NEW_PASSWORD" > "$PASSWORD_FILE"
-        chmod 600 "$PASSWORD_FILE"
+        (umask 077; echo -n "$NEW_PASSWORD" > "$PASSWORD_FILE")
         echo "   New password generated and saved to: $PASSWORD_FILE"
     else
         NEW_PASSWORD=$(cat "$PASSWORD_FILE")
         echo "   Using existing password from: $PASSWORD_FILE"
     fi
-    
-    echo ""
-    echo "   IMPORTANT: Save this password securely!"
-    echo "   Password: $NEW_PASSWORD"
-    echo ""
+    # It goes into SQL and a URL as it is, so it holds nothing else.
+    if ! [[ "$NEW_PASSWORD" =~ ^[A-Za-z0-9]+$ ]]; then
+        echo "   ERROR: $PASSWORD_FILE must hold letters and digits only"
+        exit 1
+    fi
 else
     echo "[4/10] Skipping password change (--skip-password flag)"
 fi
@@ -191,26 +192,14 @@ echo "   postgresql.conf updated successfully"
 
 echo "[6/10] Updating pg_hba.conf..."
 
-cat > "$PG_CONFIG_DIR/pg_hba.conf" << 'EOF'
-# QNet Explorer - Host-Based Authentication Configuration
-# TYPE  DATABASE        USER            ADDRESS                 METHOD
-
-# Local connections
-local   all             postgres                                peer
-local   qnet_explorer   qnet_user                               scram-sha-256
-
-# Localhost connections (IPv4 and IPv6)
-host    qnet_explorer   qnet_user       127.0.0.1/32            scram-sha-256
-host    qnet_explorer   qnet_user       ::1/128                 scram-sha-256
-
-# Reject all other connections
-host    all             all             0.0.0.0/0               reject
-host    all             all             ::/0                    reject
-EOF
-
+# The rules of pg_hba.security.conf, which apply-security.ps1 writes too: the indexer's role (qnet_user) and the site's
+# (explorer_reader) alike; --allowed-ip turns each commented application server rule into a live one.
+HBA_TEMPLATE="$(dirname "$0")/pg_hba.security.conf"
 if [ "$PRODUCTION" = true ] && [ -n "$ALLOWED_IP" ]; then
-    sed -i "/# Reject all other connections/i hostssl qnet_explorer   qnet_user       $ALLOWED_IP/32          scram-sha-256" "$PG_CONFIG_DIR/pg_hba.conf"
-    echo "   Production mode: Added hostssl rule for $ALLOWED_IP"
+    sed -E "s|^# hostssl qnet_explorer   ([a-z_]+) +XXX\.XXX\.XXX\.XXX/32 .*\$|hostssl qnet_explorer   \1 $ALLOWED_IP/32 scram-sha-256|" "$HBA_TEMPLATE" > "$PG_CONFIG_DIR/pg_hba.conf"
+    echo "   Production mode: Added hostssl rules for $ALLOWED_IP"
+else
+    cp "$HBA_TEMPLATE" "$PG_CONFIG_DIR/pg_hba.conf"
 fi
 
 echo "   pg_hba.conf updated successfully"
@@ -239,13 +228,13 @@ echo "   File permissions set correctly"
 if [ "$SKIP_PASSWORD" = false ]; then
     echo "[8/10] Updating database user password..."
     
-    sudo -u postgres psql -c "ALTER USER qnet_user WITH PASSWORD '$NEW_PASSWORD';" 2>/dev/null || {
+    if sudo -u postgres psql -c "ALTER USER qnet_user WITH PASSWORD '$NEW_PASSWORD';" 2>/dev/null; then
+        echo "   Password updated successfully"
+    else
         echo "   WARNING: Could not update password automatically"
         echo "   Please run manually:"
-        echo "   sudo -u postgres psql -c \"ALTER USER qnet_user WITH PASSWORD '$NEW_PASSWORD';\""
-    }
-    
-    echo "   Password updated successfully"
+        echo "   sudo -u postgres psql -c \"ALTER USER qnet_user WITH PASSWORD '<the password in $PASSWORD_FILE>';\""
+    fi
 else
     echo "[8/10] Skipping database password update (--skip-password flag)"
 fi
@@ -322,7 +311,12 @@ echo ""
 echo "1. Test database connection:"
 echo "   psql -U qnet_user -d qnet_explorer -h localhost"
 echo ""
-echo "2. Update Explorer .env file with new password"
+echo "2. Settings, each in its own root file that systemd reads (deployment/deploy-aiqnet.sh), never a file of the checkout:"
+echo "   The indexer, the one writer, as qnet_user, in /root/qnet-indexer.env:"
+echo "     DATABASE_URL=postgresql://qnet_user:<the password in $PASSWORD_FILE>@localhost:5432/qnet_explorer"
+echo "     QNET_API_URLS=<the node URLs it reads, comma-separated>"
+echo "     then: systemctl restart qnet-indexer"
+echo "   The site as explorer_reader, never as qnet_user, in /root/qnet-explorer.env"
 echo ""
 echo "3. For production deployment:"
 echo "   - Generate SSL certificates:"

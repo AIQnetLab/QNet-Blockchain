@@ -1,8 +1,8 @@
-// The activation routes (shared contract C3): GET /api/cabinet/activation/{wallet}[?solana=] and POST
+// The activation routes: GET /api/cabinet/activation/{wallet}[?solana=] and POST
 // /api/cabinet/activation/{reserve,announce,release,record}, over the registry (activation-registry.ts). The page, the
 // QNet extension and QNet Wallet read a wallet's activation here from any browser or device, and the payment key and the
 // extension hold a reservation before they sign a burn, so a wallet gets one burn and one code, for a light or a super
-// node. A reservation is made only with the wallet's own signed reservation (C1): the extension signs it with the
+// node. A reservation is made only with the wallet's own signed reservation: the extension signs it with the
 // wallet's keys, and for a payment address QNet Wallet signs it before the address exists, so a stranger can neither hold
 // a wallet nor burn in its name. Every answer is JSON with no-store; the origin rule takes the site and the extension
 // (request-guard.ts activationOriginAllowed); each client is metered (limits.ts), each search of a Solana address is
@@ -18,7 +18,7 @@ import { activationOriginAllowed, readJsonPost, DEV_ORIGINS } from '../request-g
 import type { Rpc } from '../solana-rpc.ts';
 import { sharedSolanaRpc } from '../solana-endpoint.ts';
 import {
-  StoreUnavailable, createActivationRegistry, createPgStore, type ActivationRegistry, type ActivationRow, type BurnChecker, type SqlQuery,
+  StoreUnavailable, createActivationRegistry, createPgStore, type ActivationRegistry, type ActivationRow, type BurnChecker, type Reserved, type SqlQuery,
 } from './activation-registry.ts';
 import { checkBurn, createBurnScanner, type BurnCheck, type BurnScanner } from './burn-scan.ts';
 import { memo } from './cache.ts';
@@ -26,9 +26,9 @@ import { cabinetGate, cabinetJson, createGate, type Gate, type GateOptions } fro
 import { walletNode as sharedWalletNode, type WalletNode } from './wallet-node.ts';
 
 // A reservation's search of the wallet's Solana address is no older than this. The reservation the wallet signs does not
-// name that address (C1 reservationMessage: QNet Wallet and the extension sign it as it is), so anyone could name a busy
+// name that address (burn-record.ts reservationMessage: QNet Wallet and the extension sign it as it is), so anyone could name a busy
 // one; the page's own recent finished search of it, kept by the scanner, answers the reservation instead of a new one
-// (SITE H-5). A new search, when none is kept, is charged to the client like the page's.
+// (a signed request costs a stranger nothing). A new search, when none is kept, is charged to the client like the page's.
 export const RESERVE_SCAN_MAX_AGE_MS = SCAN_CACHE_MS;
 // A burn's Solana check is reused this long (a page polling a burn on its way).
 export const CHECK_CACHE_MS = 5_000;
@@ -63,6 +63,10 @@ export interface ActivationApi {
   // Whether a reservation named `burner` as a payment address (POST /api/cabinet/send: only its refund earns a read pass);
   // false when the database cannot answer.
   knowsPaymentBurner(burner: string): Promise<boolean>;
+  // The extension's burn of this signature as the registry holds it, announced or recorded (POST /api/cabinet/solana
+  // forwards only such a burn): its burner, amount and node type; null without one, 'unavailable' when the database
+  // cannot answer.
+  announcedBurn(burnTx: string): Promise<{ burner: string; burnAmount: number; nodeType: NodeType } | null | 'unavailable'>;
   registry: ActivationRegistry;
   // The search of a Solana address the reads use (its kept results shared): the registration of a burn made from the
   // wallet's own Solana address reads its burner's burns here (POST /api/cabinet/register), charged to the clients it
@@ -102,7 +106,8 @@ export function createActivationApi(options: ActivationApiOptions): ActivationAp
     registry,
     scan,
 
-    // C3.1
+    // GET /api/cabinet/activation/[wallet]: the wallet's row as the page shows it, with a search of its Solana address
+    // while it has none.
     async get(request, wallet) {
       const solana = new URL(request.url).searchParams.get('solana');
       const refused = gate(request, solana === null ? 'activation' : 'activationScan');
@@ -116,8 +121,10 @@ export function createActivationApi(options: ActivationApiOptions): ActivationAp
       });
     },
 
-    // C3.2 with C1: the body, the gate, the fields, the wallet's signed reservation (its key is the wallet's and it signed
-    // these very fields; then its time), then the record, the network and the payment's search, then the reservation.
+    // POST /api/cabinet/activation/reserve: the body, the gate, the fields, the wallet's signed reservation (its key is the wallet's and it signed
+    // these very fields; then its time), a payment address's with the wallet's own Solana address only, then the record,
+    // the network and the payment's search, then the reservation.
+    // The same signed reservation sent again gets the reservation it made, at once.
     async reserve(request) {
       const body = await read(request, PROOF_BODY_MAX_BYTES);
       if (!body.ok) return cabinetJson(body.status, { error: body.error });
@@ -135,29 +142,38 @@ export function createActivationApi(options: ActivationApiOptions): ActivationAp
       const checked = verifyReservationProof({ wallet, nodeType, way, burner: b.burner as string }, b.proof, Math.floor(now() / 1000));
       if (checked === 'invalid') return cabinetJson(400, { error: 'invalid_proof' });
       if (checked === 'stale') return cabinetJson(400, { error: 'stale_proof' });
+      // A payment address's burn waits for the search of the wallet's own Solana address, which may hold its burn already.
+      // The line counts the wallet's own reservations sent without it and names nothing of the request.
+      if (way === 'payment' && b.solana === null) {
+        console.log('[INFO][CABINET] reserve_refused reason=no_solana');
+        return cabinetJson(400, { error: 'solana_required' });
+      }
       const proof = parseReservationProof(b.proof) as { pk: string; sig: string; time: number };
+      const input = { wallet, nodeType, way, burner: b.burner as string, burnAmount: b.burnAmount as number, proof: { pk: proof.pk, sig: proof.sig, time: proof.time } };
+      const reserved = (got: Reserved) => cabinetJson(200, { reservation: got.reservation, until: got.until });
       return guarded(async () => {
         const row = await registry.current(wallet);
+        const held = registry.heldBy(row, input);
+        if (held) return reserved(held);
         const blocked = registry.blocking(row);
         if (blocked) return conflict(blocked, wallet, row);
         const node = await options.walletNode(wallet);
         if (node === null) return cabinetJson(503, { error: 'network_unavailable' });
         if (node.state === 'registered') return cabinetJson(409, { error: 'has_node', nodeId: node.nodeId, nodeType: node.nodeType });
-        if (b.way === 'payment' && typeof b.solana === 'string') {
-          const found = await scan(b.solana, RESERVE_SCAN_MAX_AGE_MS, 'reserve', clientsOf(request));
+        if (b.way === 'payment') {
+          const found = await scan(b.solana as string, RESERVE_SCAN_MAX_AGE_MS, 'reserve', clientsOf(request));
           if (found.burns.length > 0) return cabinetJson(409, { error: 'burn_found', burns: found.burns });
           if (found.unusable) return cabinetJson(409, { error: 'burn_unusable' });
           if (!found.complete) return cabinetJson(503, { error: 'scan_incomplete' });
         }
-        const got = await registry.reserve({
-          wallet, nodeType, way, burner: b.burner as string, burnAmount: b.burnAmount as number, proof: { pk: proof.pk, sig: proof.sig, time: proof.time },
-        });
-        if (got.ok) return cabinetJson(200, { reservation: got.reservation, until: got.until });
+        const got = await registry.reserve(input);
+        if (got.ok) return reserved(got);
         return conflict(got.error, wallet, got.row);
       });
     },
 
-    // C3.3
+    // POST /api/cabinet/activation/announce: the extension's burn announced under the wallet's reservation, with its
+    // proof, before it is sent.
     async announce(request) {
       const body = await read(request, PROOF_BODY_MAX_BYTES);
       if (!body.ok) return cabinetJson(body.status, { error: body.error });
@@ -175,7 +191,7 @@ export function createActivationApi(options: ActivationApiOptions): ActivationAp
       });
     },
 
-    // C3.4: always ok, whatever the row was.
+    // POST /api/cabinet/activation/release: always ok, whatever the row was.
     async release(request) {
       const body = await read(request, SMALL_BODY_MAX_BYTES);
       if (!body.ok) return cabinetJson(body.status, { error: body.error });
@@ -191,7 +207,7 @@ export function createActivationApi(options: ActivationApiOptions): ActivationAp
       return cabinetJson(200, { ok: true });
     },
 
-    // C3.5: the extension's burn with its proof; the wallet's own budget counts once the proof verified.
+    // POST /api/cabinet/activation/record: the extension's burn with its proof; the wallet's own budget counts once the proof verified.
     async record(request) {
       const body = await read(request, PROOF_BODY_MAX_BYTES);
       if (!body.ok) return cabinetJson(body.status, { error: body.error });
@@ -237,6 +253,15 @@ export function createActivationApi(options: ActivationApiOptions): ActivationAp
         return await registry.knowsPaymentBurner(burner);
       } catch {
         return false;
+      }
+    },
+
+    async announcedBurn(burnTx) {
+      try {
+        const row = await registry.announcedBurn(burnTx);
+        return row && { burner: row.burner, burnAmount: row.burnAmount, nodeType: row.nodeType };
+      } catch {
+        return 'unavailable';
       }
     },
   };

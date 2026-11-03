@@ -7,6 +7,9 @@ appId: com.qnetmobile
     id: "address-card"
 - tapOn:
     id: "assets-send"
+# Send opens the token picker first; QNC is chosen there.
+- tapOn:
+    id: "pick-QNC"
 - extendedWaitUntil:
     visible: "(?i)To address"
     timeout: 10000

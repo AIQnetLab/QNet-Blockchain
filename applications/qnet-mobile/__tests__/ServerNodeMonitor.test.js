@@ -7,6 +7,7 @@
 const { WalletManager } = require('../src/components/WalletManager');
 const { GENESIS_NODES, EXPLORER_API } = require('../src/config/nodes');
 const { checkServerNodeStatus, getWalletNodeEvents, getNodeEpochs } = require('../src/services/PushService');
+const { readServerNodeListed, serverStatusOf } = require('../src/services/LightNode');
 const { readNodeRecordState, pendingNodeType } = require('../src/services/NodeRecordRead');
 
 const reply = (body, status = 200) => Promise.resolve({ ok: status === 200, status, json: () => Promise.resolve(body) });
@@ -25,67 +26,113 @@ describe('the wallet\'s super node id', () => {
 });
 
 describe('the node status of a server node', () => {
-  it('carries whether the chain registered it, from onchain_registered or registered; nothing when a node says neither', async () => {
-    const body = (over) => ({ success: true, node_id: 'super_node_60a735f53dd87f1b', node_type: 'super', is_online: true,
-      last_seen: 1790000000, last_seen_ago_seconds: 42, heartbeat_count: 4, required_heartbeats: 9, pending_rewards: 0, ...over });
+  const ID = 'super_node_60a735f53dd87f1b';
+  const W = '006a5c220ca2fa77021eon2b5c6703999066d5411e2ff';
+  const body = (over) => ({ success: true, node_id: ID, node_type: 'super', is_online: true,
+    last_seen: 1790000000, last_seen_ago_seconds: 42, heartbeat_count: 4, required_heartbeats: 9, pending_rewards: 0, ...over });
+
+  it('carries whether the chain registered it, from onchain_registered or registered; nothing when a node says neither', () => {
     for (const [over, registered] of [
       [{ onchain_registered: true, registered: true }, true],
       [{ onchain_registered: false, registered: false }, false],
       [{ registered: false }, false],
       [{}, undefined],
     ]) {
-      global.fetch = jest.fn(() => reply(body(over)));
-      const s = await checkServerNodeStatus('super_node_60a735f53dd87f1b', null, 1);
+      const s = serverStatusOf(body(over));
       expect([over, s.registered]).toEqual([over, registered]);
-      expect(s).toMatchObject({ lastSeen: 1790000000, lastSeenAgoSeconds: 42, heartbeatCount: 4, requiredHeartbeats: 9 });
+      expect(s).toMatchObject({ success: true, nodeId: ID, lastSeen: 1790000000, lastSeenAgoSeconds: 42, heartbeatCount: 4, requiredHeartbeats: 9 });
     }
+    expect(serverStatusOf(body({ required_heartbeats: undefined, heartbeat_count: undefined }))).toMatchObject({ heartbeatCount: 0, requiredHeartbeats: 9 });
   });
 
-  it('carries the super node\'s admission when the node reports one; nothing for a missing or unknown value', async () => {
-    const body = (over) => ({ success: true, node_id: 'super_node_60a735f53dd87f1b', node_type: 'super', is_online: true,
-      last_seen: 1790000000, last_seen_ago_seconds: 42, heartbeat_count: 4, required_heartbeats: 9, pending_rewards: 0, ...over });
+  it('carries the super node\'s admission when the node reports one; nothing for a missing or unknown value', () => {
     for (const [over, admission] of [
       [{ admission: 'admitted' }, 'admitted'], [{ admission: 'waiting' }, 'waiting'], [{ admission: 'not_required' }, 'not_required'],
       [{ admission: null }, undefined], [{ admission: 'maybe' }, undefined], [{}, undefined],
     ]) {
-      global.fetch = jest.fn(() => reply(body(over)));
-      const s = await checkServerNodeStatus('super_node_60a735f53dd87f1b', null, 1);
-      expect([over, s.admission]).toEqual([over, admission]);
+      expect([over, serverStatusOf(body(over)).admission]).toEqual([over, admission]);
     }
+  });
+
+  // The Node tab's server card reads its node by id from every genesis node: the first answer that names the node
+  // registered is heard at once, a later one only when it says more (online first, then more heartbeats); an answer
+  // that says it is not registered, or names no node or another one, is no status of it.
+  it('by its id: each answer that names it registered is heard as soon as it says more, and the listing verdict stays', async () => {
+    const answers = [
+      body({ onchain_registered: true, is_online: false, heartbeat_count: 0 }),
+      body({ onchain_registered: false }),
+      body({ onchain_registered: true, is_online: true, heartbeat_count: 3 }),
+      { ...body({ onchain_registered: false }), node_id: null },
+      body({ onchain_registered: true, is_online: true, heartbeat_count: 2 }),
+    ];
+    const asked = [];
+    global.fetch = jest.fn((url) => {
+      const i = GENESIS_NODES.findIndex((g) => url.startsWith(g));
+      asked.push(url);
+      // In the genesis nodes' order, one after the other.
+      return new Promise((resolve) => setTimeout(() => resolve(reply(answers[i])), i * 5));
+    });
+    const heard = [];
+    expect(await readServerNodeListed(ID, { onStatus: (s) => heard.push([s.isOnline, s.heartbeatCount]) })).toBe(null);
+    expect(heard).toEqual([[false, 0], [true, 3]]);
+    expect(asked).toEqual(GENESIS_NODES.map((g) => `${g}/api/v1/node/status?node_id=${ID}`));
+    // Two that say not registered and none that names it: no status at all.
+    global.fetch = jest.fn(() => reply(body({ onchain_registered: false })));
+    heard.length = 0;
+    expect(await readServerNodeListed(ID, { onStatus: (s) => heard.push(s) })).toBe(false);
+    expect(heard).toEqual([]);
+  });
+
+  // The by-wallet read is the tab's hint that the wallet's node has another id: the wallet in a header, never the URL.
+  it('by the wallet: one genesis node, the wallet in a header, read as the by-id answers are', async () => {
+    const calls = [];
+    global.fetch = jest.fn((url, init) => {
+      calls.push([url, init]);
+      return reply(body({ onchain_registered: true }));
+    });
+    expect(await checkServerNodeStatus(W, 1)).toEqual(serverStatusOf(body({ onchain_registered: true })));
+    expect(calls).toHaveLength(1);
+    expect(GENESIS_NODES.some((g) => calls[0][0] === `${g}/api/v1/node/status`)).toBe(true);
+    expect(calls[0][1].headers).toEqual({ 'X-QNet-Wallet': W });
+    global.fetch = jest.fn(() => reply({ success: false, error: 'busy' }));
+    expect(await checkServerNodeStatus(W, 1)).toEqual({ success: false, error: 'busy' });
+    expect(await checkServerNodeStatus(null)).toEqual({ success: false, error: 'wallet required' });
   });
 });
 
 describe('the chain\'s registrations of the wallet\'s nodes (node-events)', () => {
   const W = '006a5c220ca2fa77021eon2b5c6703999066d5411e2ff';
-  const ids = {
-    light: WalletManager.prototype.generateLightNodePseudonym(W), super: 'super_node_60a735f53dd87f1b', genesis: null,
-  };
+  const ids = { light: WalletManager.prototype.generateLightNodePseudonym(W), super: 'super_node_60a735f53dd87f1b' };
 
-  it('takes only the ids this wallet derives, types them by id, ignores the burn, and asks a genesis node by name', async () => {
+  it('takes only the ids this wallet derives and a genesis node\'s, types them by id, ignores the burn, and asks a genesis node by name', async () => {
     const calls = [];
     global.fetch = jest.fn((url) => {
       calls.push(url);
-      return reply({ address: W, count: 4, events: [
+      return reply({ address: W, count: 5, events: [
         { type: 'node_activation', node_id: ids.super, node_type: 'Light', height: 1, timestamp: 0, burn_tx: '' },
         { type: 'node_activation', node_id: ids.light, node_type: 'light', height: 2084000, timestamp: 1, burn_tx: 'x' },
         { type: 'node_activation', node_id: 'super_node_76d638f2b358fc9f', node_type: 'super', height: 5, burn_tx: '' },
-        { type: 'node_activation', node_id: 'genesis_node_001', node_type: 'super', height: 0, burn_tx: '' },
+        { type: 'node_activation', node_id: 'genesis_node_001', node_type: 'light', height: 0, burn_tx: '' },
+        { type: 'node_activation', node_id: 'genesis_node_006', node_type: 'super', height: 0, burn_tx: '' },
         { type: 'other', node_id: ids.light, height: 3 },
       ] });
     });
     expect(await getWalletNodeEvents(W, ids)).toEqual({ success: true, nodes: [
       { nodeId: ids.super, nodeType: 'super', height: 1 },
       { nodeId: ids.light, nodeType: 'light', height: 2084000 },
+      { nodeId: 'genesis_node_001', nodeType: 'super', height: 0 },
     ] });
     expect(calls).toHaveLength(1);
     expect(GENESIS_NODES.some((g) => calls[0] === `${g}/api/v1/account/${W}/node-events`)).toBe(true);
   });
 
-  it('a genesis wallet\'s genesis id is its super node; an answer for another address or none at all is unknown', async () => {
+  // No table of genesis wallets in the app: an answer about this wallet that names a genesis node is the wallet's super
+  // node, as the chain registered it; which node is the wallet's is the genesis nodes' word (WalletManager.walletNode).
+  it('a genesis node in an answer about this wallet is its super node; an answer for another address or none at all is unknown', async () => {
     global.fetch = jest.fn(() => reply({ address: W, events: [{ type: 'node_activation', node_id: 'genesis_node_003', height: 0 }] }));
-    expect(await getWalletNodeEvents(W, { ...ids, genesis: 'genesis_node_003' })).toEqual({ success: true, nodes: [
+    expect(await getWalletNodeEvents(W, ids)).toEqual({ success: true, nodes: [
       { nodeId: 'genesis_node_003', nodeType: 'super', height: 0 }] });
-    global.fetch = jest.fn(() => reply({ address: 'someone else', events: [] }));
+    global.fetch = jest.fn(() => reply({ address: 'someone else', events: [{ type: 'node_activation', node_id: 'genesis_node_003', height: 0 }] }));
     expect(await getWalletNodeEvents(W, ids)).toEqual({ success: false });
     global.fetch = jest.fn(() => Promise.reject(new Error('down')));
     expect(await getWalletNodeEvents(W, ids)).toEqual({ success: false });

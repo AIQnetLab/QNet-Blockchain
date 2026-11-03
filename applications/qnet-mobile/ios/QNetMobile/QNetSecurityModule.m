@@ -1,8 +1,8 @@
 /**
  * QNetSecurityModule.m — iOS side of the QNetSecurity native module (Android: SecurityModule.kt).
  *
- * - Secret screens: while one is shown and the screen is being captured (recording, mirroring, AirPlay) the
- *   window is covered. The app-switcher snapshot is covered by SceneDelegate on every resign-active.
+ * - Every screen can be captured, recorded or mirrored as it is. The app-switcher snapshot is covered by SceneDelegate
+ *   on every resign-active.
  * - The recovery-phrase field: the pasteboard's change count, and clearing what was copied while it was open.
  * - The recovery phrase's Copy: this device only, expiring after a set time, cleared at once by Delete wallet.
  * - The device seal of a password wallet's wrap: a P-256 key in the Secure Enclave, this device only, usable while it
@@ -51,8 +51,6 @@ static NSString *QNetBootId(void)
 @end
 
 @implementation QNetSecurityModule {
-  BOOL _secureOn;
-  UIView *_captureCover;
   NSDictionary<NSString *, NSString *> *_texts; // the app's language (setTexts); English until it is set
   NSInteger _secretCopyCount; // the pasteboard's change count after the recovery phrase's Copy; -1 when none
 }
@@ -67,70 +65,14 @@ RCT_EXPORT_MODULE(QNetSecurity)
 {
   if ((self = [super init])) {
     _secretCopyCount = -1;
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserver:self selector:@selector(captureChanged) name:UIScreenCapturedDidChangeNotification object:nil];
   }
   return self;
-}
-
-- (void)dealloc
-{
-  [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (NSString *)text:(NSString *)key fallback:(NSString *)fallback
 {
   id value = _texts[key];
   return ([value isKindOfClass:[NSString class]] && [value length] > 0) ? value : fallback;
-}
-
-static UIWindow *QNetKeyWindow(void)
-{
-  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-    if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-    for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-      if (window.isKeyWindow) return window;
-    }
-  }
-  return [UIApplication sharedApplication].delegate.window;
-}
-
-- (void)updateCaptureCover
-{
-  BOOL show = _secureOn && [UIScreen mainScreen].isCaptured;
-  if (show) {
-    // The keyboard is drawn in its own window above this cover, and a non-secure field (the recovery phrase)
-    // previews every key: editing ends while the screen is captured, and the cover then takes the taps, so no
-    // field can be focused again until capture stops (MPLAT-R2-02).
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-      if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-      for (UIWindow *w in ((UIWindowScene *)scene).windows) [w endEditing:YES];
-    }
-  }
-  if (show && !_captureCover) {
-    UIWindow *window = QNetKeyWindow();
-    if (!window) return;
-    UIView *cover = [[UIView alloc] initWithFrame:window.bounds];
-    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    cover.backgroundColor = [UIColor colorWithRed:17.0/255.0 green:19.0/255.0 blue:31.0/255.0 alpha:1.0];
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectInset(window.bounds, 32, 0)];
-    label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    label.numberOfLines = 0;
-    label.textAlignment = NSTextAlignmentCenter;
-    label.textColor = [UIColor whiteColor];
-    label.text = [self text:@"captureCover" fallback:@"Hidden while the screen is being recorded or shared."];
-    [cover addSubview:label];
-    [window addSubview:cover];
-    _captureCover = cover;
-  } else if (!show && _captureCover) {
-    [_captureCover removeFromSuperview];
-    _captureCover = nil;
-  }
-}
-
-- (void)captureChanged
-{
-  dispatch_async(dispatch_get_main_queue(), ^{ [self updateCaptureCover]; });
 }
 
 // The texts this module shows by itself, in the app's language (JS: DeviceSecurity.setNativeTexts).
@@ -146,12 +88,6 @@ RCT_EXPORT_METHOD(reloadApp:(RCTPromiseResolveBlock)resolve
 {
   resolve(@YES);
   dispatch_async(dispatch_get_main_queue(), ^{ RCTTriggerReloadCommandListeners(@"layout direction"); });
-}
-
-RCT_EXPORT_METHOD(setSecureScreen:(BOOL)on)
-{
-  _secureOn = on;
-  [self updateCaptureCover];
 }
 
 // The recovery-phrase screen (MPLAT-R3-01): the pasteboard's change count, read without touching its contents, so

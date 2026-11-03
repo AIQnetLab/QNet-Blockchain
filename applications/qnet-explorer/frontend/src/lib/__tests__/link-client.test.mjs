@@ -2,7 +2,7 @@
 // request on the relay (link-relay.ts), an app written with node:crypto reads it from the link, checks the
 // request against the link's hash and answers, the page polls, decrypts and checks the answer and gets the check
 // number. A session kept in the browser (link-store.ts) comes back after a reload. A `claim` request names the wallet and
-// its light or super node (owner, 12.10). Run: npm run test:wallet
+// its light or super node. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -106,7 +106,7 @@ test('link with a known wallet: the request travels, a linked answer for another
   assert.deepEqual(read, { ok: true, answer: { v: 1, intent: 'link', ...linked }, checkNumber: answered.checkNumber });
 });
 
-// Owner decision 27.09 (EXT-R1-03 option (a)): below 1 QNC only for a capped claim (stoppedAtEpoch set), never zero.
+// Below 1 QNC only for a capped claim (stoppedAtEpoch set), never zero.
 test('claim: an answer with a stoppedAtEpoch may move less than 1 QNC; a full claim may not', async () => {
   const { fetchFn } = world();
   const read = async (answer, nodeId = superNodeId(WALLET)) => {
@@ -214,7 +214,7 @@ test('a kept session comes back after a reload and still reads its answer; nothi
   await purgeSessions(Date.now(), store);
   assert.deepEqual([...area.keys()], ['live']);
   area.clear();
-  // SITE-R3-02: each activation keeps its request under its own slot (NodeActivate: activate.<payment address>), so one
+  // Each activation keeps its request under its own slot (NodeActivate: activate.<payment address>), so one
   // tab's request for activation A never takes the place of B's, and each comes back with its own request.
   const requestA = { burnTx: bs58.encode(new Uint8Array(64).fill(5)), walletHash: null, check: false };
   const requestB = { burnTx: bs58.encode(new Uint8Array(64).fill(4)), walletHash: null, check: false };

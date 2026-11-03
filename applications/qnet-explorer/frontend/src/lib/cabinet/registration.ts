@@ -1,5 +1,5 @@
-// The registration the node cabinet submits for a light node (docs/protocols/light-node-messages.md section 4; unified
-// plan R1 and flows A and B; shared contract C4). For a burn from a one-time payment address the page sends the wallet's
+// The registration the node cabinet submits for a light node (docs/protocols/light-node-messages.md section 4).
+// For a burn from a one-time payment address the page sends the wallet's
 // consent from QNet Wallet (the consent body); the site's route checks it again, completes it with the burner and the
 // payment key's owner bind that the site's activation record keeps for the wallet's burn (the v2 bind, signed right after
 // the burn was signed and before it was sent: src/server/cabinet/activation-registry.ts). For a burn made from the
@@ -33,6 +33,11 @@ import { isWholeBurn } from './burn-tx.ts';
 export const SUBMIT_PATH = '/api/v1/node-registration/submit';
 // Two hex ML-DSA-65 values and the rest: about 10.7 KB.
 export const SUBMIT_BODY_MAX_BYTES = 16 * 1024;
+// After a node admits a registration, each client of the route (the page, QNet Wallet) waits this long for the chain
+// before it submits again, and the site answers the same signed registration with that admission meanwhile (register.ts).
+export const ADMIT_HOLD_MS = 180_000;
+// The node collects the committee's burn attestations inside the submit: the site waits this long for its answer.
+export const SUBMIT_TIMEOUT_MS = 30_000;
 
 // What the page posts to /api/cabinet/register: the wallet's consent to this burn, nothing of the payment key.
 export const CONSENT_KEYS = [
@@ -186,7 +191,7 @@ export function completeSubmitBody(body: ConsentBody, burner: string, ownerSig: 
 
 // ---------------------------------------------------------------- the node's answer
 
-// The node's stable `code` of a submit answer (unified plan section 3.4); the text is read when a node sends none,
+// The node's stable `code` of a submit answer; the text is read when a node sends none,
 // as the extension reads it (applications/qnet-wallet/dist/background/nodes.js). `wallet_has_node`: the network's
 // one-node rule (one wallet, one node of either type). `bind_v2_pending`: the v2 owner bind verifies, but the network
 // takes it only from its one-wallet-one-node gate on; the same body goes through later.

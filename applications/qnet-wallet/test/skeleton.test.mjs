@@ -47,9 +47,9 @@ const ORIGINS = [...config.QNET.NODES, config.QNET.EXPLORER_API, ...config.SOLAN
 const DAPP_MATCHES = ['https://aiqnet.io/*', 'https://games.aiqnet.io/*'];
 
 describe('skeleton: store manifest', () => {
-  it('is MV3 3.1.6 on Chrome 111+ with the module worker and the popup', () => {
+  it('is MV3 3.1.7 on Chrome 111+ with the module worker and the popup', () => {
     assert.equal(MANIFEST.manifest_version, 3);
-    assert.equal(MANIFEST.version, '3.1.6');
+    assert.equal(MANIFEST.version, '3.1.7');
     assert.equal(MANIFEST.version, PACKAGE.version);
     assert.equal(MANIFEST.version, config.WALLET_VERSION);
     assert.equal(MANIFEST.minimum_chrome_version, '111');
@@ -273,6 +273,11 @@ describe('skeleton: shipped files', () => {
       [8000, 600000, 120000]);
     assert.deepEqual([LIMITS.ACTIVATION_READS_PER_MINUTE, config.TIMINGS.WALLET_SEARCH_SPACING_MS, config.TIMINGS.WALLET_SEARCH_FRESH_MS],
       [30, 20000, 60000]);
+    // aiqnet.io's relay of the wallet's Solana calls (decision 56): its path on the site the app uses too, the route kept
+    // under the app's key, and the build named on every request to aiqnet.io
+    assert.equal(config.SOLANA.RELAY_PATH, '/api/cabinet/solana');
+    assert.equal(config.STORAGE_KEYS.SOLANA_ROUTE, 'qnet_solana_route_v1');
+    assert.deepEqual(config.SITE_HEADERS, { 'x-qnet-client': `QNetWallet-Extension/${config.WALLET_VERSION}` });
   });
 });
 
@@ -379,7 +384,7 @@ describe('skeleton: dev overlay', () => {
       await rm(path.join(target, 'ui/i18n/ar.js'));
       await writeFile(path.join(target, 'ui/extra.js'), '');
       const manifestPath = path.join(target, 'manifest.json');
-      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.6"', '"version": "3.0.9"'));
+      await writeFile(manifestPath, (await readFile(manifestPath, 'utf8')).replace('"version": "3.1.7"', '"version": "3.0.9"'));
       const configPath = path.join(target, 'background/config.js');
       await writeFile(configPath, (await readFile(configPath, 'utf8')).replace('DEV_BUILD = true', 'DEV_BUILD = false'));
       assert.deepEqual((await checkDevBuild(DIST, target)).sort(), [

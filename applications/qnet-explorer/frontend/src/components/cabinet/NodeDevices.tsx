@@ -7,15 +7,15 @@
 // by side: "Move the node to another device", the same request that runs the node on a phone again, and "Unlink the
 // device" (UnlinkDevice.tsx: the wallet signs it, the QNet extension that holds it or QNet Wallet on any device; the
 // device's own form while the network does not take the wallet's). With none, Link a device in numbered steps
-// (NextSteps.tsx LinkPhone). A super node runs on its server: no device to link, its server's status instead (R3, R4),
+// (NextSteps.tsx LinkPhone). A super node runs on its server: no device to link, its server's status instead,
 // or that it is not on the network yet. Without a node, the state the wallet's sources agree on and the way on
 // (NextSteps.tsx). While the status is read, the ledger stands at its final size.
 
 import { Readout, Readouts } from '@/components/ui/Readouts';
 import { Failed, Waiting } from '@/components/ui/RequestState';
 import { useNodeStatus, useSuperStatus } from '@/hooks/useNodeStatus';
-import { t } from '@/lib/texts';
 import { STATUS_KEPT_MS, isLinkedState } from '@/lib/cabinet/node-view';
+import { serverWord } from '@/lib/cabinet/server-words';
 import { lightSectionState } from '@/lib/cabinet/wallet-activation';
 import CabinetFrame from './CabinetFrame';
 import { useCabinet } from './CabinetProvider';
@@ -24,9 +24,11 @@ import { LinkPhone, NoNode } from './NextSteps';
 import { DeviceRows, StatusGate, SuperRows } from './NodeStatus';
 import UnlinkDevice from './UnlinkDevice';
 import { Group } from './parts';
+import { useI18n } from '@/i18n/client';
 
 // The ledger's geometry while the status is read.
 function Reading() {
+  const { t } = useI18n();
   return (
     <div className="cab-dev" aria-busy="true">
       <div className="cab-dev-top">
@@ -45,6 +47,7 @@ function Reading() {
 }
 
 function Devices({ nodeId }: { nodeId: string }) {
+  const { t } = useI18n();
   const { viewOnly, view } = useCabinet();
   const { state, retry, refresh } = useNodeStatus(nodeId, viewOnly);
   return (
@@ -55,6 +58,8 @@ function Devices({ nodeId }: { nodeId: string }) {
         if (s === 'none' || s === 'pending') return <NoNode pending={s === 'pending'} />;
         // A reported link or unlink: the status is read again once the site's cache of it is over.
         const reread = () => window.setTimeout(refresh, STATUS_KEPT_MS + 1_000);
+        // Which device runs it cannot be read now: said, with no step to link one (the status is read again by itself).
+        if (s === 'device_unknown') return <DeviceRows status={status} />;
         // No device: the steps to link one, with Link a device in place.
         if (!isLinkedState(s)) return <LinkPhone onLinked={reread} />;
         return (
@@ -78,13 +83,14 @@ function Devices({ nodeId }: { nodeId: string }) {
 
 // A super node: no device to link; its server's status.
 function SuperServer({ nodeId }: { nodeId: string }) {
+  const { t, say } = useI18n();
   const { state, retry } = useSuperStatus(nodeId);
   return (
-    <Group title={t('super_title')}>
-      <p>{t('super_device')}</p>
-      {state.phase === 'loading' && <Waiting>{t('super_status_checking')}</Waiting>}
-      {state.phase === 'unavailable' && <Failed action={{ label: t('try_again'), onClick: retry }}>{t('unreachable')}</Failed>}
-      {state.phase === 'ok' && (state.value.registered ? <SuperRows status={state.value} /> : <p>{t(state.value.connected ? 'super_connected' : 'super_not_yet')}</p>)}
+    <Group title={say(serverWord(nodeId, 'title'))}>
+      <p>{say(serverWord(nodeId, 'device'))}</p>
+      {state.phase === 'loading' && <Waiting>{say(serverWord(nodeId, 'checking'))}</Waiting>}
+      {state.phase === 'unavailable' && <Failed action={{ label: t('try_again'), onClick: retry }}>{say('unreachable')}</Failed>}
+      {state.phase === 'ok' && (state.value.registered ? <SuperRows status={state.value} /> : <p>{say(state.value.connected ? 'super_connected' : 'super_not_yet')}</p>)}
     </Group>
   );
 }

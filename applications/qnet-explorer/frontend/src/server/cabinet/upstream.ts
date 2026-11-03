@@ -1,15 +1,15 @@
-// What the site asks of each network node in a second, whatever its visitors do (SITE-R2-09). The per-client limits
+// What the site asks of each network node in a second, whatever its visitors do. The per-client limits
 // (limits.ts) bound one visitor, but many visitors together, or one with many addresses, could still send a node far
 // more than it should take from one server, and the explorer server may be on the nodes' whitelist, which skips their
 // own per-address limits. So each kind of call has a budget per node: a call beyond it is not made and counts as that
 // node not answering (the route tries another node, or answers that the network could not be reached). The kinds are
 // kept apart, so a flood of reads cannot starve a registration or a reservation's check that the wallet has no
 // node: that check runs only for a reservation the wallet signed (activation-api.ts), never for an anonymous read. A
-// page's reads are split by the id they are for (SITE M-12): an id the network was seen to list as registered
+// page's reads are split by the id they are for: an id the network was seen to list as registered
 // (known-nodes.ts) reads on `readKnown`, any other on the small `readUnknown`, so made-up ids, which cost nothing, cannot
 // starve the owners of registered nodes. Each client is also held to its own share of the reads that go upstream
 // (limits.ts CLIENT_BUDGETS.upstreamMiss). Together `readKnown` and `readUnknown` ask a genesis node what `read` alone
-// asked before: 20 reads a second.
+// asked before: 20 reads a second. The wallets' Solana relay has lanes of its own on the Solana endpoint, the same way.
 
 import { createRateLimiter } from '../../../lib/rate-limit.ts';
 
@@ -22,6 +22,14 @@ export const UPSTREAM_BUDGETS = {
   reserve: { max: 10, windowMs: 1_000 },
   // A registration submit (register.ts).
   submit: { max: 2, windowMs: 1_000 },
+  // The wallets' Solana relay (solana-relay.ts), per Solana endpoint: reads (a batch is one), long listings of signatures
+  // (an extension's activation check makes four; this lane holds two checks), simulations and sends. Each client gets
+  // under half of each lane (limits.ts CLIENT_BUDGETS), and that half still holds a wallet's largest step (the
+  // extension's history page, 12 reads). Together 39 of the public endpoint's 100 calls per 10 s for one address, at
+  // most 34 of one method (of its 40); sized for that endpoint, SOLANA_RPC_URL does not change them.
+  solanaRead: { max: 25, windowMs: 10_000 },
+  solanaScan: { max: 9, windowMs: 10_000 },
+  solanaSend: { max: 5, windowMs: 10_000 },
 } as const;
 export type UpstreamKind = keyof typeof UPSTREAM_BUDGETS;
 
@@ -32,7 +40,7 @@ export type UpstreamBudget = (kind: UpstreamKind, url: string) => boolean;
 export const unbudgeted: UpstreamBudget = () => true;
 
 export function createUpstreamBudget({ now = Date.now }: { now?: () => number } = {}): UpstreamBudget {
-  // A handful of nodes times four kinds: the store never fills.
+  // A handful of nodes and one Solana endpoint times a few kinds: the store never fills.
   const limiter = createRateLimiter({ maxEntries: 1_000, now });
   return (kind, url) => {
     let origin: string;

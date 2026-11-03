@@ -5,8 +5,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { fetchSiteAllowed, isJsonRequest, originAllowed, readJsonPost } from '../../server/request-guard.ts';
+import { code } from './source.mjs';
 
 const URL_ = 'https://aiqnet.io/api/faucet/claim';
 const claim = JSON.stringify({ walletAddress: 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk', amount: 1500, tokenType: '1DEV' });
@@ -42,7 +42,7 @@ test('a same-site or scripted POST must still be JSON, small and well formed', a
   assert.equal(isJsonRequest(post({ 'content-type': 'Application/JSON' })), true);
 });
 
-// R4-SRA-01: Fetch Metadata. A browser request that no page of this origin made is refused on any method,
+// Fetch Metadata: a browser request that no page of this origin made is refused on any method,
 // also without an Origin (a GET by <img>, <script> or a frame); the app and scripts send no Sec-Fetch-Site.
 test('Sec-Fetch-Site: absent or same-origin only', async () => {
   const get = (headers) => new Request(URL_, { headers: { host: 'aiqnet.io', ...headers } });
@@ -61,15 +61,11 @@ test('Sec-Fetch-Site: absent or same-origin only', async () => {
   assert.equal(ok.ok, true);
 });
 
-// Comments may name what the code must not do; only code is checked.
-const code = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
-  .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-
 test('the faucet reads its body only through readJsonPost, first thing in POST; the relay uses the same checks', () => {
   const faucet = code('app/api/faucet/claim/route.ts');
   assert.doesNotMatch(faucet, /request\.(json|text|formData|arrayBuffer|blob)\(/);
   const post = faucet.slice(faucet.indexOf('export async function POST'));
-  assert.match(post, /^export async function POST\(request: NextRequest\) \{\s*try \{\s*const read = await readJsonPost\(request, FAUCET_BODY_MAX_BYTES\);/);
+  assert.match(post, /^export async function POST\(request: NextRequest\) \{[^{]*try \{\s*const read = await readJsonPost\(request, FAUCET_BODY_MAX_BYTES\);/);
   const relay = code('server/link-relay.ts');
   assert.match(relay, /from '\.\/request-guard\.ts'/);
   assert.doesNotMatch(relay, /function (originAllowed|isJsonRequest|readBody)\(/, 'one copy of each check');

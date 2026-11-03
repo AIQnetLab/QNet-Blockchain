@@ -51,7 +51,7 @@ android {
         applicationId legacyMove ? "com.qnetmobile" : "io.aiqnet.wallet"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 31
+        versionCode 32
         versionName "1.3.1"
         buildConfigField "boolean", "QNET_LEGACY_MOVE", legacyMove ? "true" : "false"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -150,6 +150,9 @@ dependencies {
 
     // JVM tests (src/test) and on-device tests of the device key (src/androidTest).
     testImplementation("junit:junit:4.13.2")
+    // A local HTTP/2 server over TLS for the connection pool's tests (AppNetworkTest), at React Native's OkHttp version.
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.9.2")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:4.9.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
 
@@ -172,4 +175,9 @@ def qnetBundleCheck = tasks.register("qnetBundleCheck", Exec) {
 }
 tasks.configureEach { task ->
     if (task.name == "preReleaseBuild") task.dependsOn(qnetReleaseCheck, qnetBundleCheck)
+}
+// HexRainTest replays the live field's vectors, which are written outside this module: a change to them runs the JVM
+// tests again instead of keeping an earlier result.
+tasks.withType(Test).configureEach {
+    inputs.file("../../__tests__/fixtures/hex_field_vectors.json").withPropertyName("hexFieldVectors")
 }

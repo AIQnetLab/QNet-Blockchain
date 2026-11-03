@@ -1,4 +1,4 @@
-// The node ids this process has seen the network list as registered (SITE M-12): their reads go on the `readKnown`
+// The node ids this process has seen the network list as registered: their reads go on the `readKnown`
 // budget of each genesis node, every other id on the small `readUnknown` one (upstream.ts), so made-up ids, which cost
 // nothing, can drain only the reads of ids nobody has seen registered yet. An id is kept KNOWN_MS after it was last seen
 // registered, at most KNOWN_MAX of them (the one seen longest ago goes first), with nothing of who read it. In memory

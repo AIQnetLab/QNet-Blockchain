@@ -1,9 +1,9 @@
-// The site's actions (B-SPEC 5.5): solid (one per view), text (secondary, an underline always there) and act (a small
-// action inside a line of data; quiet for Cancel and Close). No arrows (owner 19.10): an action is shown by its fill or
+// The site's actions: solid (one per view), text (secondary, an underline always there) and act (a small
+// action inside a line of data; quiet for Cancel and Close). No arrows: an action is shown by its fill or
 // its underline alone. An internal href is a client-side link, an external one opens in a new tab, no href is a button.
 
-import Link from 'next/link';
 import type { MouseEventHandler, ReactNode } from 'react';
+import { Link } from '@/i18n/client';
 
 export type ActionKind = 'solid' | 'text' | 'act' | 'quiet';
 

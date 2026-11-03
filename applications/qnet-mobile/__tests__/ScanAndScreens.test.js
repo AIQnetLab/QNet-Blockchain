@@ -291,14 +291,13 @@ describe('Receive and the address card', () => {
   it('the address is one rounded element a tap copies, with its copy glyph and no Copy word: one line on Assets, whole on Receive', () => {
     const card = screen.slice(screen.indexOf('testID="address-card"') - 600, screen.indexOf('testID="address-card"') + 500);
     for (const part of [card, receive]) {
-      expect(part).toMatch(/accessibilityRole="button"/);
-      expect(part).toMatch(/copyToClipboard\(/);
-      expect(part).toMatch(/style=\{\(\{ pressed \}\) => \[styles\.addressPill, copied && styles\.addressPillDone, pressed && styles\.rowPressed\]\}/);
-      expect(part).toMatch(/<CopyGlyph done=\{copied\} \/>/);
+      // The one copy of the app (components/ui/Copyable): the rounded element is the target, its mark at the end.
+      expect(part).toMatch(/<Copyable\s+key=\{selectedNetwork\}/);
+      expect(part).toMatch(/style=\{styles\.addressPill\}\s+doneStyle=\{styles\.addressPillDone\}/);
       expect(part).not.toMatch(/common_copy'|slice\(0, ?\d+\)|…/);
     }
-    // Assets: the whole address on one line, shrunk to fit, never cut; copied, the line says so.
-    expect(card).toMatch(/\{\.\.\.ADDRESS_LINE\}>\s*\{copied \? t\('common_copied'\) : cardAddress\}/);
+    // Assets: the whole address on one line, shrunk to fit, never cut; copied, Copyable says so in its place.
+    expect(card).toMatch(/\{\.\.\.ADDRESS_LINE\}>\{cardAddress\}<\/Text>/);
     expect(card).not.toMatch(/ellipsizeMode="middle"/);
     // Receive: every character, as the screen's subject.
     expect(receive).toMatch(/<SubjectAddress address=\{currentReceiveAddress\} \/>/);

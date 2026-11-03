@@ -1,20 +1,19 @@
 // The explorer's pages at phone width and their amounts: every table scrolls inside its card, the list's From / To
-// is never cut whatever the names, no stale rule of the old light theme reaches the dark one, one
-// monospace stack the platform has, and QNC amounts exact and grouped as English writes them. Run: npm run test:wallet
+// is never cut whatever the names, no sheet of the old light theme is left, one monospace stack the platform has, and
+// QNC amounts exact and grouped as English writes them. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { QNC_DECIMALS, formatQnc, formatQncTruncated, formatTokenAmount } from '../token-format.ts';
 import { quoteBigInts } from '../../indexer/transform.ts';
 import * as nodeView from '../cabinet/node-view.ts';
-import { FLEX_MIN, tableMinWidth } from '../geometry.ts';
-import { SRC, read, code } from './source.mjs';
-
-const CSS = read('app/globals.css') + read('app/mobile-fixes.css');
-const SHEET = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
-// Every rule of the sheet as [selector, body], those inside a media query included.
-const RULES = [...SHEET.matchAll(/([^{}]*)\{([^{}]*)\}/g)].map((m) => [m[1].trim(), m[2]]);
+import { FLEX_MIN, tableMinWidth, textLength, wordsLength, wordsWidth } from '../geometry.ts';
+import { ageForms, txCountText } from '../explorer-view.ts';
+import { translator } from '../texts.ts';
+import { CATALOGS } from '../../i18n/catalogs.ts';
+import { SRC, allSheets, read, code } from './source.mjs';
+import { TEXTS, english } from './texts-helper.mjs';
 
 const sources = (dir) => readdirSync(new URL(`${dir}/`, SRC), { recursive: true })
   .filter((name) => /\.tsx?$/.test(name)).map((name) => `${dir}/${name.replace(/\\/g, '/')}`);
@@ -38,7 +37,7 @@ test('QNC amounts are exact from the nano QNC, grouped as English writes them, b
   assert.equal(nodeView.formatUnits, formatTokenAmount);
 });
 
-// Owner, 19.10: one format whatever the visitor's language, 42,578.81988. A formatter given no locale, or one held in a
+// One format whatever the visitor's language, 42,578.81988. A formatter given no locale, or one held in a
 // variable, takes the visitor's (42.578,81988, 42 578,81988, other digits), so every one names English literally.
 const VISITOR_LOCALE = [
   /\.toLocale(?:String|DateString|TimeString)\((?!\s*['"]en(?:-US)?['"])/,
@@ -57,6 +56,13 @@ test('every amount and count is written with comma groups and a decimal point, w
   const all = new Map(['app', 'components', 'contexts', 'hooks', 'lib', 'server', 'indexer'].flatMap(sources)
     .filter((f) => !f.includes('__tests__')).map((f) => [f, code(f)]));
   assert.ok(all.size > 200);
+  // Dates and times take the page's language for their month names, never the visitor's locale and never other digits:
+  // the formats module's date formatters, built from the page's language (dateLocale: Latin digits in Arabic too).
+  const format = all.get('lib/format.ts');
+  assert.equal(format.match(/new Intl\.DateTimeFormat\(tag, /g)?.length, 5);
+  assert.match(format, /const tag = dateLocale\(locale\);/);
+  assert.match(code('lib/languages.ts'), /export const dateLocale = \(locale: Locale\): string => \(locale === 'ar' \? 'ar-u-nu-latn' : locale\);/);
+  all.set('lib/format.ts', format.replace(/new Intl\.DateTimeFormat\(tag, /g, "new Intl.DateTimeFormat('en', "));
   for (const [file, src] of all) {
     for (const pattern of VISITOR_LOCALE) assert.doesNotMatch(src, pattern, file);
   }
@@ -94,12 +100,12 @@ test('the block, transaction and address pages write QNC through formatQnc, neve
   const block = code('app/explorer/block/[hash]/BlockClient.tsx');
   assert.match(block, /<QncAmount nano=\{cd\.fees_collected\} \/>/);
   assert.match(block, /<QncAmount nano=\{cd\.pool3_total_activations\} \/>/);
-  assert.match(block, /amountCol<BlockTransaction>\(\(t\) => <QncAmount nano=\{t\.amount\} \/>/);
+  assert.match(block, /amountCol<BlockTransaction>\(t, \(x\) => <QncAmount nano=\{x\.amount\} \/>/);
   const tx = code('app/explorer/tx/[hash]/TransactionClient.tsx');
-  assert.match(tx, /amountCol<\{ i: number; to: string; amount: string \}>\(\(r\) => <QncAmount nano=\{r\.amount\} \/>/);
+  assert.match(tx, /amountCol<\{ i: number; to: string; amount: string \}>\(t, \(r\) => <QncAmount nano=\{r\.amount\} \/>/);
   // A transaction's own amount and fee are the exact nano QNC of the record (a listed row carries the same raw amount).
   assert.match(tx, /const moved = qnc\(tx\.amount_raw \?\? '0'\);/);
-  assert.match(tx, /<Readout label="Fee" value=\{tx && phase === 'ready' \? qnc\(tx\.fee_raw \?\? '0'\) : null\}/);
+  assert.match(tx, /<Readout label=\{t\('tx_fee'\)\} value=\{tx && phase === 'ready' \? qnc\(tx\.fee_raw \?\? '0'\) : null\}/);
   // QncAmount writes nano QNC through formatQnc (qnc() of src/lib/format.ts), its number as text and its unit as the link.
   assert.match(code('components/explorer/cells.tsx'), /return <Amount value=\{qnc\(nano\)\} \/>;/);
   assert.match(code('lib/format.ts'), /export const qnc = \(nano: [^)]*\): string => formatQnc\(nano\);/);
@@ -124,8 +130,6 @@ test('a block the index does not hold yet keeps an amount beyond 2^53 exact from
 });
 
 test('every table sits in a wrapper that scrolls sideways, so a card never clips it', () => {
-  const WRAPPERS = ['table-wrapper', 'tbl-frame'];
-  for (const name of WRAPPERS.slice(0, 1)) assert.match(SHEET, new RegExp(`^\\.${name} \\{[^}]*overflow-x: auto;`, 'm'), name);
   // The shared table (components/ui/DataTable.tsx) scrolls sideways in its frame on phones and tablets, never narrower
   // than its columns need; from 1,181 px every table fits its frame, so the frame never clips its sticky header there.
   const base = read('styles/base.css');
@@ -151,7 +155,7 @@ test('every table sits in a wrapper that scrolls sideways, so a card never clips
     const src = code(file);
     for (const m of src.matchAll(/<table\b/g)) {
       tables++;
-      assert.ok(WRAPPERS.includes(around(src, m.index)), `${file}: a table outside a scroll wrapper`);
+      assert.ok(around(src, m.index)?.split(' ').includes('tbl-frame'), `${file}: a table outside a scroll wrapper`);
     }
   }
   // The lists are the one table component now; written out and shared, at least a dozen.
@@ -159,35 +163,86 @@ test('every table sits in a wrapper that scrolls sideways, so a card never clips
   assert.ok(tables + lists >= 12, String(tables + lists));
 });
 
+// What a token's method does is one line of its table: the column is as wide as the longest description in the page's
+// language, wider than its 280 px least in some, so a phone scrolls the table sideways instead of cutting the words.
+test('a token\'s methods are whole in every language', () => {
+  const src = code('app/explorer/token/[contract]/TokenClient.tsx');
+  assert.match(src, /textCol<Method>\('desc', t\('tok_what'\), \(m\) => t\(m\.desc\), undefined, undefined, Math\.max\(280, wordsWidth\(\[\.\.\.QRC20_INTERFACE, \.\.\.QRC721_INTERFACE\]\.map\(\(m\) => t\(m\.desc\)\)\)\)\),/);
+  const keys = [...src.matchAll(/desc: '(tok_m_\w+)'/g)].map((m) => m[1]);
+  assert.equal(keys.length, 14);
+  const widest = Math.max(...Object.values(CATALOGS).map((catalog) => wordsWidth(keys.map((k) => catalog[k]))));
+  assert.ok(widest > 280, String(widest));
+});
+
+// A detail row's Copy keeps its 44 px target over the row's padding (a margin that takes its padding back). Where a longer
+// language's word puts it under its value, the gap between the lines is that margin, so the target never covers the
+// value's link.
+test('a detail row\'s Copy that wraps under its value keeps its target off the value', () => {
+  const explorer = read('styles/explorer.css');
+  const reach = Number(/\n\.ex \.kv \.act \{ margin-block: -(\d+)px; \}/.exec(explorer)?.[1]);
+  const gap = Number(/\n\.ex \.kv :is\(\.ent-copy, \.ex-val\) \{ row-gap: (\d+)px; \}/.exec(explorer)?.[1]);
+  assert.ok(reach > 0 && gap >= reach, `row gap ${gap} for a reach of ${reach}`);
+  assert.match(code('components/ui/EntityLink.tsx'), /return <span className="ent-copy">\{shown\}<Copy /);
+  assert.match(code('components/explorer/Detail.tsx'), /<span className="ex-val">\n\s*<span title=\{value\}>\{short\('hash', value\)\}<\/span>\n\s*<Copy /);
+});
+
 // The page's content width at a viewport width, from the tokens (--maxw 1360, --gut clamp(16px, 4vw, 56px)), and the
 // width of `span` of its 12 columns (--col-gap 24).
 const contentWidth = (w) => Math.min(w, 1360) - 2 * Math.min(56, Math.max(16, 0.04 * w));
 const columnsWidth = (w, span) => ((contentWidth(w) - 11 * 24) / 12) * span + (span - 1) * 24;
 
-// Owner 20.10: "<from> to <to>" on one line, a record without a recipient shows its sender alone, the line cut in the
+// The home page's live blocks, from 861 px where the hero shows them as a column: a row's first line is the height and
+// its transaction count, its second the producer, which gives way, and the age, whose box holds the language's longest.
+// Three of the twelve columns hold both lines in every language from 1,100 px; under it the column takes four.
+test('the home page\'s live blocks keep each line inside their column in every language', () => {
+  const home = read('styles/home.css');
+  assert.match(home, /\n\.stream \{ grid-column: 10 \/ span 3;/);
+  assert.match(home, /\n@media \(min-width: 861px\) and \(max-width: 1099px\) \{ \.stream \{ grid-column: 9 \/ span 4; \} \}/);
+  assert.match(home, /\n\.blk-in \{ display: grid; grid-template-columns: minmax\(0, 1fr\) auto; grid-template-rows: 24px 18px; column-gap: 12px;/);
+  assert.match(home, /\n\.blk-h \{ grid-column: 1 \/ -1; display: flex; align-items: baseline; gap: 12px;/);
+  assert.match(home, /\n\.blk-age \{ grid-area: 2 \/ 2;/);
+  assert.match(home, /\n\.blk-by \{ grid-area: 2 \/ 1; display: flex; min-width: 0; white-space: nowrap; overflow: hidden;/);
+  const live = code('app/HomeClient.tsx');
+  assert.match(live, /<span className="blk-h">\n\s*<span className="flash"[^\n]*\n\s*<span className="blk-txs">\{txCountText\(b\.txCount, t\)\}<\/span>\n\s*<\/span>/);
+  assert.match(live, /<span className="blk-by">\n\s*\{b\.producer \? <EntityLink kind="node"[^\n]*\n\s*<\/span>/);
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    const t = translator(locale, catalog);
+    // A height to 99,999,999 at 15 px (.62 em a character where a script drops its -.02 em), the gap, the count at 11.5 px.
+    const first = 10 * 0.62 * 15 + 12 + textLength(txCountText(99_999, t), 0.62) * 0.62 * 11.5;
+    // The age's box in the row's characters (1ch, .62 em) and the gap before it; the producer keeps 48 px of the rest.
+    const second = 12 + Math.ceil(wordsLength(ageForms(t))) * 0.62 * 11.5 + 48;
+    for (let w = 861; w <= 1440; w++) {
+      const room = columnsWidth(w, w <= 1099 ? 4 : 3);
+      assert.ok(first <= room && second <= room, `${locale} at ${w}px: ${first.toFixed(0)} and ${second.toFixed(0)} in ${room.toFixed(0)}`);
+    }
+  }
+});
+
+// "<from> to <to>" on one line, a record without a recipient shows its sender alone, the line cut in the
 // middle to fit its column at every width.
 test('the list\'s From / To: one line, the sender alone without a recipient, each side as whole as its cell allows', async () => {
   // The one flexible column: no width of its own, so it takes what the fixed columns leave; one line of a 44 px row.
   const columns = code('components/explorer/columns.tsx');
-  assert.match(columns, /export function fromToCol<T>\(\n[^)]*\): Column<T> \{\n\s*return \{ key: 'ft', header: 'From \/ To', min: FROM_TO_MIN, cell: \(r\) => <FromTo from=\{from\(r\)\} to=\{to\(r\)\} full=\{full\} \{\.\.\.more\?\.\(r\)\} \/> \};/);
+  assert.match(columns, /export function fromToCol<R>\(\n[^)]*\): Column<R> \{\n\s*return \{ key: 'ft', header: t\('col_from_to'\), min: FROM_TO_MIN, cell: \(r\) => <FromTo from=\{from\(r\)\} to=\{to\(r\)\} full=\{full\} \{\.\.\.more\?\.\(r\)\} \/> \};/);
+  assert.equal(TEXTS.col_from_to, 'From / To');
   assert.match(read('styles/base.css'), /\.tbl td \{ height: var\(--row\);[^}]*white-space: nowrap;/);
   const list = code('app/explorer/ExplorerClient.tsx');
-  assert.match(list, /fromToCol<ActivityItem>\(\(r\) => r\.from, \(r\) => r\.to, full\)/);
+  assert.match(list, /fromToCol<ActivityItem>\(t, \(r\) => r\.from, \(r\) => r\.to, full\)/);
   for (const file of ['app/explorer/ExplorerClient.tsx', 'app/explorer/block/[hash]/BlockClient.tsx', 'app/explorer/loading.tsx']) assert.doesNotMatch(code(file), /\btall\b/, file);
   // "to" is a word of its own between the sides, in Fog, never an arrow; no recipient, no "to".
   const cells = code('components/explorer/cells.tsx');
-  assert.match(cells, /<span className="ex-ft ent-fit">\n\s*\{noFrom && fromWord \? <span className="ex-ft-w">\{fromWord\}<\/span> : side\(from\)\}\n\s*\{!noTo && <span className="ex-ft-to">to<\/span>\}\n\s*\{!noTo && side\(to\)\}\n\s*\{noTo && toWord && <span className="ex-ft-w">\{toWord\}<\/span>\}/);
+  assert.match(cells, /<span className="ex-ft ent-fit">\n\s*\{noFrom && fromWord \? <span className="ex-ft-w">\{fromWord\}<\/span> : side\(from\)\}\n\s*\{!noTo && <span className="ex-ft-to">\{t\('party_to'\)\}<\/span>\}\n\s*\{!noTo && side\(to\)\}\n\s*\{noTo && toWord && <span className="ex-ft-w">\{toWord\}<\/span>\}/);
   assert.match(cells, /const noTo = partyKind\(to\) === 'none';/);
   const sheet = read('styles/explorer.css');
   assert.match(sheet, /\.ex-ft \{ display: flex; align-items: baseline; gap: 0 1ch; min-width: 0; max-width: 100%; white-space: nowrap; \}\n\.ex-ft > \* \{ flex: 0 1 auto; \}/);
   assert.doesNotMatch(sheet, /ex-ft-arr|ex-ft-l\b|flex-direction: column; gap: 2px/);
   // Every transaction list uses the one column: the list, a block's, an address's (its own side in Fog), QNC and token
   // transfers (tokens issued or burned have a word for the empty side); no separate From and To columns remain.
-  const address = code('app/explorer/address/[address]/AddressClient.tsx');
-  assert.match(address, /fromToCol<AddressTx>\(\(t\) => t\.from, \(t\) => t\.to, full, \(\) => \(\{ self: address \}\)\),/);
-  assert.match(address, /fromToCol<TokenTransfer>\(\(t\) => t\.from, \(t\) => t\.to, full, \(\) => \(\{ self: address, fromWord: 'Issued', toWord: 'destroyed' \}\)\),/);
-  assert.match(code('app/explorer/qnc/QncClient.tsx'), /fromToCol<QncTransfer>\(\(t\) => t\.from, \(t\) => t\.to, full\),/);
-  assert.match(code('app/explorer/token/[contract]/TokenClient.tsx'), /fromToCol<TokenTransfer>\(\(t\) => t\.from, \(t\) => t\.to, full, \(\) => \(\{ toWord: 'burned' \}\)\),/);
+  const address = english('app/explorer/address/[address]/AddressClient.tsx');
+  assert.match(address, /fromToCol<AddressTx>\(t, \(x\) => x\.from, \(x\) => x\.to, full, \(\) => \(\{ self: address \}\)\),/);
+  assert.match(address, /fromToCol<TokenTransfer>\(t, \(x\) => x\.from, \(x\) => x\.to, full, \(\) => \(\{ self: address, fromWord: 'Issued', toWord: 'destroyed' \}\)\),/);
+  assert.match(code('app/explorer/qnc/QncClient.tsx'), /fromToCol<QncTransfer>\(t, \(x\) => x\.from, \(x\) => x\.to, full\),/);
+  assert.match(english('app/explorer/token/[contract]/TokenClient.tsx'), /fromToCol<TokenTransfer>\(t, \(x\) => x\.from, \(x\) => x\.to, full, \(\) => \(\{ toWord: 'burned' \}\)\),/);
   for (const file of ['app/explorer/qnc/QncClient.tsx', 'app/explorer/token/[contract]/TokenClient.tsx', 'app/explorer/address/[address]/AddressClient.tsx']) {
     assert.doesNotMatch(code(file), /'From', \(|'To', \(|Counterparty/, file);
   }
@@ -203,16 +258,16 @@ test('the list\'s From / To: one line, the sender alone without a recipient, eac
   // The tokens directory, the widest table that still uses a frame, fits its frame where the frame stops scrolling.
   const tokens = tableMinWidth([{ width: 220 }, { width: 104 }, { min: 128 }, { width: 220 }, { width: 156 }, { width: 136 }, { width: 108 }]);
   assert.ok(contentWidth(1181) >= tokens, `${contentWidth(1181)} < ${tokens}`);
-  assert.match(code('app/explorer/tokens/TokensClient.tsx'), /<EntityLink kind="address" value=\{t\.contract_address\} link=\{false\} \/>, undefined, undefined, 128\),/);
+  assert.match(code('app/explorer/tokens/TokensClient.tsx'), /<EntityLink kind="address" value=\{x\.contract_address\} link=\{false\} \/>, undefined, undefined, 128\),/);
   assert.equal(FLEX_MIN, 176);
   // The list at 1,181 px, where tables stop stacking: the fixed columns leave From / To room for both short sides.
-  assert.match(list, /hashCol<ActivityItem>\(\(r\) => r\.hash\),\n\s*typeCol<ActivityItem>\(\(r\) => r\.type, full\),/);
-  assert.match(list, /amountCol<ActivityItem>\(\(r\) => <TxAmount parts=\{rowAmount\(r\)\} logo=\{r\.tokenLogo\} \/>\),\n\s*\{ \.\.\.blockCol<ActivityItem>\(\(r\) => r\.block, 92\), \.\.\.block \},\n\s*timeCol<ActivityItem>\(\(r\) => r\.timestamp, 72\),/);
+  assert.match(list, /hashCol<ActivityItem>\(t, \(r\) => r\.hash\),\n\s*typeCol<ActivityItem>\(t, \(r\) => r\.type, full\),/);
+  assert.match(list, /amountCol<ActivityItem>\(t, \(r\) => <TxAmount parts=\{rowAmount\(r, t\('token_unnamed'\)\)\} logo=\{r\.tokenLogo\} \/>, t\('col_amount'\), amountW\),\n\s*\{ \.\.\.blockCol<ActivityItem>\(t, \(r\) => r\.block, 92\), \.\.\.block \},\n\s*timeCol<ActivityItem>\(t, \(r\) => r\.timestamp, 72\),/);
   const fixed = 136 + 136 + AMOUNT_W + 92 + 72;
   assert.ok(contentWidth(1181) - fixed >= FROM_TO_MIN, `${contentWidth(1181) - fixed} < ${FROM_TO_MIN}`);
 });
 
-// Owner 20.10: transaction and block lists are tables on phones too ("let the table simply scroll to the right"): one
+// Transaction and block lists are tables on phones too ("let the table simply scroll to the right"): one
 // line a row at one height, scrolled sideways inside their frame with the first column pinned and a fade at the right
 // while columns follow; the page never scrolls sideways. A list of holders still lays each row out in place below a
 // computer's width; its cells keep their table semantics through roles, and only a sort control of the header shows.
@@ -227,22 +282,23 @@ test('transaction and block lists scroll sideways in their frame with the first 
   // The frame: sideways scroll inside it, the first column pinned over an opaque ground, a fade while columns follow.
   assert.match(base, /\.tbl-frame\[data-scroll='true'\] \{ overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; \}/);
   assert.match(base, /\.tbl-frame\[data-scroll='true'\] \.tbl \{ width: max\(100%, var\(--tbl-min, 100%\)\); \}/);
-  assert.match(base, /\.tbl-frame\[data-scroll='true'\] \.tbl th:first-child, \.tbl-frame\[data-scroll='true'\] \.tbl td:first-child \{ position: sticky; left: 0; z-index: 2; background: var\(--ink\); \}/);
-  assert.match(base, /\.tbl-frame\[data-over='true'\]::after \{\n\s*content: ''; position: absolute; top: 0; right: 0; bottom: 0; width: 24px; pointer-events: none;/);
+  // On the reading direction's start and end sides: left and right in a left-to-right page, mirrored in Arabic.
+  assert.match(base, /\.tbl-frame\[data-scroll='true'\] \.tbl th:first-child, \.tbl-frame\[data-scroll='true'\] \.tbl td:first-child \{ position: sticky; inset-inline-start: 0; z-index: 2; background: var\(--ink\); \}/);
+  assert.match(base, /\.tbl-frame\[data-over='true'\]::after \{\n\s*content: ''; position: absolute; top: 0; inset-inline-end: 0; bottom: 0; width: 24px; pointer-events: none;/);
   // The pinned cell is the containing block of its entity's row overlay, so the overlay never covers another cell's link.
   assert.match(base, /\.tbl tbody td:first-child > a\.ent \{ position: static; \}/);
   // One line a row at one height.
-  assert.match(base, /\.tbl td \{ height: var\(--row\); padding: 0 14px 0 0; border-bottom: 1px solid var\(--rule\); color: var\(--text\); white-space: nowrap;/);
+  assert.match(base, /\.tbl td \{ height: var\(--row\); padding: 0; padding-inline-end: 14px; border-bottom: 1px solid var\(--rule\); color: var\(--text\); white-space: nowrap;/);
   // No stacked layout of transactions or blocks is left.
   assert.doesNotMatch(base, /data-stack='tx'|data-stack='blocks'/);
   const wide = base.slice(base.indexOf('@media (max-width: 1180px) {\n  .tbl-frame[data-scroll][data-stack]'));
   assert.match(wide, /^@media \(max-width: 1180px\) \{\n\s*\.tbl-frame\[data-scroll\]\[data-stack\] \{ overflow: visible; \}/);
   // Holders: one line on a tablet, two on a phone (rank and address; balance and share).
   assert.match(wide, /\.tbl-frame\[data-scroll\]\[data-stack='holders'\] \.tbl tbody tr \{\n\s*grid-template-columns: auto minmax\(0, 1fr\) auto auto; grid-template-areas: 'rank address amount pct'; gap: 0 16px; height: var\(--row\);/);
-  assert.match(wide, /grid-template-areas: 'rank address address' 'amount amount pct'; height: var\(--row-2\);/);
+  assert.match(wide, /grid-template-areas: 'rank address pct' 'amount amount amount'; height: var\(--row-2\);/);
   // One column set for both holder lists, each row ranked.
-  assert.match(code('components/explorer/columns.tsx'), /export function holderCols<T extends \{ address: string; percent: string; rank: number \}>\(balance: Get<T, ReactNode>, full: boolean\): Column<T>\[\] \{/);
-  assert.match(code('app/explorer/qnc/QncClient.tsx'), /const holderColumns = useMemo\(\(\) => holderCols<QncHolder & \{ rank: number \}>\(\(h\) => <Amount value=\{h\.balance\} \/>, full\), \[full\]\);/);
+  assert.match(code('components/explorer/columns.tsx'), /export function holderCols<R extends \{ address: string; percent: string; rank: number \}>\(t: T, balance: Get<R, ReactNode>, full: boolean, amounts: readonly \{ value: string; unit: string \}\[\]\): Column<R>\[\] \{/);
+  assert.match(code('app/explorer/qnc/QncClient.tsx'), /const holderColumns = useMemo\(\n\s*\(\) => holderCols<QncHolder & \{ rank: number \}>\(t, \(h\) => <Amount value=\{h\.balance\} \/>, full, \(data\?\.holders \?\? \[\]\)\.map\(/);
   assert.match(code('app/explorer/token/[contract]/TokenClient.tsx'), /const rankedHolders = useMemo\(\(\) => \(holders \? holders\.map\(\(h, i\) => \(\{ \.\.\.h, rank: i \+ 1 \}\)\) : null\), \[holders\]\);/);
   for (const file of ['app/explorer/qnc/QncClient.tsx', 'app/explorer/token/[contract]/TokenClient.tsx']) assert.doesNotMatch(code(file), /'pct', 'Share'/, file);
   assert.match(wide, /\.tbl th\[aria-sort\] \{ position: static;/);
@@ -257,25 +313,13 @@ test('transaction and block lists scroll sideways in their frame with the first 
   }
 });
 
-test('no rule of the old light theme or the old phone search layout reaches the dark explorer', () => {
-  // Table cells and the explorer list's panels take the dark theme's colours only.
-  const TABLE = /(?:^|[\s,>+~])(?:table|thead|tbody|tr|th|td)\b|\.[\w-]*table\b/;
-  let checked = 0;
-  for (const [selector, body] of RULES) {
-    if (!TABLE.test(selector) && !/\.(?:activity|explorer)-/.test(selector)) continue;
-    checked++;
-    assert.doesNotMatch(body, /#f8f9fa|#f0f0f0|#e9ecef|#eee\b|#333\b|#666\b|background(?:-color)?: (?:#fff(?:fff)?|white)\b/i, selector);
-  }
-  assert.ok(checked >= 60, String(checked));
-  // The search field keeps its button beside it at every width, and only the button's own rules size it: the small
-  // phone's narrower padding included.
-  for (const [selector, body] of RULES.filter(([s]) => /\.explorer-search\b/.test(s))) assert.doesNotMatch(body, /flex-direction: column/, selector);
-  for (const [selector, body] of RULES) {
-    const qualified = selector.split(',').map((s) => s.trim()).filter((s) => /\.search-btn(?![\w-])/.test(s) && !/^\.search-btn(:hover| svg)?$/.test(s));
-    if (qualified.length > 0) assert.doesNotMatch(body, /padding|margin/, selector);
-  }
-  const small = SHEET.slice(SHEET.lastIndexOf('@media (max-width: 420px) {'));
-  assert.match(small, /^\s*\.search-btn \{ padding: 0 0\.6rem; min-height: 44px; \}/m);
+// The sheets from before the rebuild (the old light theme, the old explorer's tables, badges and search) matched no
+// element any more: they are gone, and no sheet of the site names their classes.
+test('no rule of the old light theme or the old explorer is left', () => {
+  for (const file of ['app/globals.css', 'app/mobile-fixes.css']) assert.equal(existsSync(new URL(file, SRC)), false, file);
+  const sheets = allSheets();
+  assert.doesNotMatch(sheets, /\.(?:table-wrapper|explorer-search|search-btn|explorer-section|qnet-button|activity-table|type-badge|badge-transfer|node-card)\b/);
+  assert.doesNotMatch(sheets.replace(/\/\*[\s\S]*?\*\//g, ''), /#f8f9fa|#f0f0f0|#e9ecef|background(?:-color)?: (?:#fff(?:fff)?|white)\b/i);
 });
 
 test('text keeps its size on a phone, and monospace text takes one stack of the platform\'s own fonts', () => {
@@ -286,16 +330,14 @@ test('text keeps its size on a phone, and monospace text takes one stack of the 
   assert.match(html, /-webkit-text-size-adjust: 100%;/);
   assert.match(html, /(^|[^-])text-size-adjust: 100%;/);
   // One mono stack: the self-hosted face next/font sets on <html> (src/app/fonts.ts), then the platform's own.
-  assert.match(tokens, /--font-mono: var\(--font-martian\), ui-monospace, Menlo, Consolas, monospace;/);
+  // A script's own faces (--f-script, styles/i18n.css) and the stand-in come between the face and the platform's.
+  assert.match(tokens, /--font-mono: var\(--font-martian\), var\(--f-script\) 'Martian Stand-in', ui-monospace, Menlo, Consolas, monospace;/);
   assert.match(code('app/fonts.ts'), /export const martian = Martian_Mono\(\{[^}]*axes: \['wdth'\],[^}]*variable: '--font-martian',/);
-  assert.match(code('app/layout.tsx'), /className=\{`\$\{archivo\.variable\} \$\{martian\.variable\}`\}/);
-  assert.doesNotMatch(CSS + sheets + tokens, /@font-face/);
+  assert.match(code('app/layout.tsx'), /className=\{`\$\{archivo\.variable\} \$\{cyrillic\.variable\} \$\{martian\.variable\}`\}/);
+  assert.doesNotMatch(sheets + tokens, /@font-face/);
+  // Every family is one of the tokens or inherited, so no other monospace stack is written anywhere in the sheets.
   for (const m of sheets.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/font-family: ([^;]+);/g)) assert.ok(['var(--font-mono)', 'var(--f-sans)', 'inherit'].includes(m[1].trim()), m[1]);
-  // Every family is that token or a sans-serif stack, so no other monospace stack is written anywhere in the sheet.
-  const families = [...SHEET.matchAll(/font-family: ([^;]+);/g)].map((m) => m[1].trim());
-  for (const family of families) assert.ok(family === 'var(--font-mono)' || family === 'inherit' || /, sans-serif$/.test(family), family);
-  assert.ok([...(SHEET + sheets).matchAll(/font-family: var\(--font-mono\);/g)].length >= 25);
-  for (const m of SHEET.matchAll(/(?:^|[\s;{])font: ([^;]+);/g)) assert.equal(m[1].trim(), 'inherit');
+  assert.ok([...sheets.matchAll(/font-family: var\(--font-mono\);/g)].length >= 25);
   // Outside the sheet: inline styles and the guide's pictures name the token; the background's canvas reads it once.
   for (const file of SOURCES) {
     const src = code(file);
@@ -316,9 +358,8 @@ test('text keeps its size on a phone, and monospace text takes one stack of the 
   assert.equal((rain.match(/\bx\.font = /g) ?? []).length, 1);
 });
 
-// REAL.md 7.8 (owner 19.10: one exact format, 42,578.81988): the lists wrote the server's two-decimal QNC
-// ("124,918.60") while the block, transaction and My node pages wrote the exact value. Every list API now carries the raw
-// amount and the page writes it with the one formatter; the two-decimal formatter is gone.
+// One exact format, 42,578.81988, in the lists as on the block, transaction and My node pages: every list API carries
+// the raw amount and the page writes it with the one formatter.
 test('list amounts are exact like every other amount: raw in the APIs, written by the one formatter', async () => {
   const { rowAmount } = await import('../explorer-view.ts');
   const TOKEN = '4f1c9a2b3c4d5e6f708eon1a2b3c4d5e6f7081d9b40c1';
@@ -343,9 +384,9 @@ test('list amounts are exact like every other amount: raw in the APIs, written b
   assert.match(code('app/api/tx/[hash]/route.ts'), /JSON\.parse\(quoteBigInts\(text\)\)/);
   assert.equal(code('app/api/tx/[hash]/route.ts').match(/fee_raw: feeRaw,/g)?.length, 2);
   // The pages write the raw amount through rowAmount (qnc and amount of src/lib/format.ts) and nothing else.
-  assert.match(code('app/explorer/ExplorerClient.tsx'), /<TxAmount parts=\{rowAmount\(r\)\} logo=\{r\.tokenLogo\} \/>/);
-  assert.match(code('app/explorer/qnc/QncClient.tsx'), /<TxAmount parts=\{rowAmount\(t\)\} \/>/);
-  assert.match(code('app/explorer/address/[address]/AddressClient.tsx'), /<Readout label="Balance" value=\{system \|\| !d \|\| d\.balance_raw === null \? null : qnc\(d\.balance_raw\)\}/);
+  assert.match(code('app/explorer/ExplorerClient.tsx'), /<TxAmount parts=\{rowAmount\(r, t\('token_unnamed'\)\)\} logo=\{r\.tokenLogo\} \/>/);
+  assert.match(code('app/explorer/qnc/QncClient.tsx'), /<TxAmount parts=\{rowAmount\(x, t\('token_unnamed'\)\)\} \/>/);
+  assert.match(code('app/explorer/address/[address]/AddressClient.tsx'), /<Readout label=\{t\('col_balance'\)\} value=\{system \|\| !d \|\| d\.balance_raw === null \? null : qnc\(d\.balance_raw\)\}/);
   // A listed row seeds the transaction page with the same raw amount, never a rounded text.
   assert.match(code('app/explorer/ExplorerClient.tsx'), /from: tx\.from, to: tx\.to, amount_raw: tx\.amount_raw \}/);
   // The float-based two-decimal formatter is gone from the whole site.
@@ -354,16 +395,19 @@ test('list amounts are exact like every other amount: raw in the APIs, written b
   }
 });
 
-// Owner 20.10: the "/" key mark sat inside the search field, and focused the field was crooked (a ring around the
-// input alone, standing off it and past the button). The field and Search are one group of one height, flush; focus
+// No "/" key mark inside the search field, and no ring around the input alone standing off it and past the button: the
+// field and Search are one group of one height, flush; focus
 // marks the whole group with a 2 px Signal edge over its own border, nothing outside it. The words in the empty field
 // fit every width: the whole sentence on a computer, a short one on a phone.
 test('the explorer search: one group of one height, focus on the group, its words never cut, no key mark', () => {
   const search = code('components/explorer/ExplorerSearch.tsx');
   assert.doesNotMatch(search, /<kbd|ex-search-key|ex-search-box/);
   assert.match(search, /<div className="ex-search-row">\n\s*<input\n[\s\S]*?className="ex-search-q"\n\s*type="search"\n\s*placeholder=" "/);
-  assert.match(search, /<span className="ex-search-ph" aria-hidden="true">\n\s*<span className="ex-ph-long">Search by block, transaction hash, address or token<\/span>\n\s*<span className="ex-ph-short">Block, hash, address or token<\/span>\n\s*<\/span>\n\s*<button type="submit" className="btn btn-solid btn-sm ex-search-go">Search<\/button>/);
-  assert.match(search, /<label className="sr-only" htmlFor=\{`\$\{id\}-q`\}>Search by block, transaction hash, address or token<\/label>/);
+  assert.match(search, /<span className="ex-search-ph" aria-hidden="true">\n\s*<span className="ex-ph-long">\{t\('search_label'\)\}<\/span>\n\s*<span className="ex-ph-short">\{t\('search_short'\)\}<\/span>\n\s*<\/span>\n\s*<button type="submit" className="btn btn-solid btn-sm ex-search-go">\{t\('search_go'\)\}<\/button>/);
+  assert.match(search, /<label className="sr-only" htmlFor=\{`\$\{id\}-q`\}>\{t\('search_label'\)\}<\/label>/);
+  assert.equal(TEXTS.search_label, 'Search by block, transaction hash, address or token');
+  assert.equal(TEXTS.search_short, 'Block, hash, address or token');
+  assert.equal(TEXTS.search_go, 'Search');
   assert.match(search, /if \(e\.key !== '\/' \|\| e\.metaKey \|\| e\.ctrlKey \|\| e\.altKey\) return;/);
   assert.match(search, /const height = heightOf\(q\);\n\s*if \(height !== null\) return `\/explorer\/block\/\$\{height\}`;/);
   // Nothing in the field itself draws a border or a ring of its own.
@@ -378,9 +422,16 @@ test('the explorer search: one group of one height, focus on the group, its word
   assert.match(sheet, /\.ex-sugg \{\n\s*position: absolute; left: 0; right: 0; top: calc\(100% \+ 4px\);/);
   const phone = sheet.slice(sheet.indexOf('@media (max-width: 720px) {'));
   assert.match(phone, /\.ex-search-row \{ height: 52px; \}\n\s*\.ex-search-q, \.ex-search-ph \{ padding: 0 14px; font-size: 16px; \}\n\s*\.ex-ph-long \{ display: none; \}\n\s*\.ex-ph-short \{ display: inline; \}/);
+  // Never cut in any language: words longer than the field take a second line, inside the field's height at its line
+  // height.
+  const ph = sheet.match(/\n\.ex-search-ph \{([^}]*)\}/)[1];
+  assert.doesNotMatch(ph, /nowrap|ellipsis/);
+  assert.match(ph, /display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; text-wrap: balance;/);
+  assert.match(sheet, /\.ex-search-q, \.ex-search-ph \{ grid-area: 1 \/ 1; min-width: 0; padding: 0 18px; font-size: clamp\(17px, 1\.55vw, 20px\); line-height: 1\.3; \}/);
+  assert.ok(2 * 20 * 1.3 <= 60 - 2 && 2 * 16 * 1.3 <= 52 - 2, 'two lines fit the field');
 });
 
-// Owner 20.10: from the latest blocks a person can open the whole block history. /explorer/blocks lists every block
+// From the latest blocks a person can open the whole block history. /explorer/blocks lists every block
 // newest first, BLOCKS_PER_PAGE a page counted down from page 1's first height, with a pager and a jump to a height.
 test('the block history: every height once, pages counted from page 1, a typed height opens its page', async () => {
   const { BLOCKS_PER_PAGE, heightOf, blockWindow, blocksAnchor, blocksPage, blocksPageTop } = await import('../explorer-view.ts');
@@ -436,18 +487,19 @@ test('the block history reads one page at a time from the index, and the latest 
   assert.match(code('app/explorer/blocks/loading.tsx'), /return <BlocksClient \/>;/);
   const client = code('app/explorer/blocks/BlocksClient.tsx');
   // Fixed rows, every height a link, the hash a second view of the row's block; the pager whenever the page is placed.
-  assert.match(client, /textCol<RecentBlock>\('block', 'Block', \(b\) => <EntityLink kind="block" value=\{b\.height\} \/>, 112\),/);
+  assert.match(client, /textCol<RecentBlock>\('block', t\('col_block'\), \(b\) => <EntityLink kind="block" value=\{b\.height\} \/>, 112\),/);
   assert.match(client, /<EntityLink kind="block" value=\{b\.hash\} link=\{false\} \/>/);
   assert.match(client, /<EntityLink kind="node" value=\{b\.producer\} address=\{b\.producerAddress\} \/>/);
   assert.match(client, /loadingRows=\{BLOCKS_PER_PAGE\}/);
   assert.match(client, /\{at && <Pager page=\{at\.page\} pages=\{at\.pages\} total=\{at\.total\} onPage=\{onPage\} \/>\}/);
   assert.match(client, /go\(\{ anchor: blocksAnchor\(h, newest\), top: h \}\);/);
-  assert.match(client, /window\.history\.replaceState\(null, '', newest \? '\/explorer\/blocks' : `\/explorer\/blocks\?at=\$\{next\.top\}`\);/);
+  // The page's own address, its language included.
+  assert.match(client, /const path = window\.location\.pathname;\n\s*window\.history\.replaceState\(null, '', newest \? path : `\$\{path\}\?at=\$\{next\.top\}`\);/);
   // Only the line of newer blocks renders for each head; the table renders for its own rows.
   assert.equal(client.match(/useChainHead\(\)/g)?.length, 1);
-  assert.match(client, /function NewerBlocks\([^\n]*\) \{\n\s*const \{ height \} = useChainHead\(\);/);
+  assert.match(client, /function NewerBlocks\([^\n]*\) \{\n\s*const t = useT\(\);\n\s*const \{ height \} = useChainHead\(\);/);
   assert.match(client, /const table = useMemo\(\(\) => \(\n\s*<DataTable/);
   assert.match(read('styles/explorer.css'), /\.ex-newer\[data-on='false'\] \{ visibility: hidden; \}/);
   // The strip of latest blocks names the history as a link of its own.
-  assert.match(code('components/explorer/LatestBlocks.tsx'), /<Action kind="act" href="\/explorer\/blocks" className="ex-chain-all">All blocks<\/Action>/);
+  assert.match(code('components/explorer/LatestBlocks.tsx'), /<Action kind="act" href="\/explorer\/blocks" className="ex-chain-all">\{t\('ex_all_blocks'\)\}<\/Action>/);
 });

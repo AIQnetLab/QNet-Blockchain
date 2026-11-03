@@ -1,5 +1,5 @@
 // Wherever the site lists the languages of QNet Wallet, it lists the app's own, in the app's order and with the app's
-// names (owner, 19.10). Run: npm run test:wallet
+// names. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

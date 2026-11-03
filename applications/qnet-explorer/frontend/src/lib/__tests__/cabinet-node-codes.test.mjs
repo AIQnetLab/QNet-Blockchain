@@ -2,15 +2,12 @@
 // the one-node refusal's text, which the legacy light register route answers too) against what the site's register
 // route and the QNet extension make of them (src/lib/cabinet/registration.ts submitOutcome, and the codes and texts of
 // applications/qnet-wallet/dist/background/nodes.js, evaluated from its shipped source): a code, the retry set or the
-// `wallet_has_node` text changed on one side fails here (shared contracts C6, C7). Run: npm run test:wallet
+// `wallet_has_node` text changed on one side fails here. Run: npm run test:wallet
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { RETRY_CODES, submitOutcome } from '../cabinet/registration.ts';
-
-const REPO = new URL('../../../../../../', import.meta.url);
-const read = (path) => readFileSync(new URL(path, REPO), 'utf8').replace(/\r\n/g, '\n');
+import { repo as read } from './source.mjs';
 
 const door = read('development/qnet-integration/src/rpc/registration_door.rs');
 const between = (text, from, to) => {
@@ -30,10 +27,10 @@ const EXT = new Function(`${between(nodesJs, 'const RETRY_CODES', 'const TX_HASH
 const extCode = (body) => (typeof body.code === 'string' && EXT.SUBMIT_CODES.has(body.code) ? body.code
   : EXT.SUBMIT_TEXTS.find(([re]) => re.test(typeof body.error === 'string' ? body.error : ''))?.[1] ?? null);
 
-test('C7: every code the node answers is one the site and the extension know, with the same retry set', () => {
+test('every code the node answers is one the site and the extension know, with the same retry set', () => {
   assert.equal(NODE_CODES.size, 10);
   assert.equal(NODE_CODES.get('WalletHasNode'), 'wallet_has_node');
-  // H-4: a v2 owner bind the network does not take yet is a retry, never a refusal of the burn.
+  // A v2 owner bind the network does not take yet is a retry, never a refusal of the burn.
   assert.equal(NODE_CODES.get('BindV2Pending'), 'bind_v2_pending');
   assert.ok(NODE_RETRY.includes('bind_v2_pending'));
   assert.deepEqual([...EXT.SUBMIT_CODES].sort(), [...NODE_CODES.values()].sort());
@@ -49,7 +46,7 @@ test('C7: every code the node answers is one the site and the extension know, wi
   }
 });
 
-test('C6, C7: the one-node refusal reads as wallet_has_node on both clients, with its code or by its text alone', () => {
+test('the one-node refusal reads as wallet_has_node on both clients, with its code or by its text alone', () => {
   assert.ok(WALLET_HAS_NODE_TEXT, 'registration_door.rs WALLET_HAS_NODE_TEXT');
   // Never read as the node's own registration being on chain already.
   assert.doesNotMatch(WALLET_HAS_NODE_TEXT, /node already registered/i);

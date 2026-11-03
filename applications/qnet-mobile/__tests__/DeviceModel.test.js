@@ -257,26 +257,32 @@ describe('the model the network names', () => {
     }
   });
 
-  it('the Node tab names no device model and no platform, for this device or another (owner, 11.10)', () => {
+  it('the Node tab names no device model and no platform for this device; for another device its model only', () => {
     const status = (device, over = {}) => ({
       reachable: true, onChain: true, registrationPending: false, deviceBound: true, deviceBoundAgreed: true, answered: null,
       needsReactivation: false, counted: null, device, deviceTags: [], features: [], signed: null, keyOurs: null,
       bindingSeqAgreed: null, ...over,
     });
     const dev = { platform: 'android', model: 'Acme Phone 7', linkedSince: 1790035200, lastAnswerEpoch: 7, state: 'online' };
+    // Unmounted once read: a status line's reduce-motion read lands later and must find no tree to draw after the file ends.
     const render = (light) => {
       let tree;
       act(() => {
         tree = renderer.create(<NodeTab t={t} light={{ nodeId: NODE, local: null, pending: null, answeredAt: null, balanceNano: 0, ...light }}
           onMove={() => {}} onUse={() => {}} onCopy={() => {}} nodeTitle={() => ''} height={2241840} />);
       });
-      return tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
+      const shown = tree.root.findAllByType(Text).map((n) => [].concat(n.props.children).join('')).join('\n');
+      act(() => { tree.unmount(); });
+      return shown;
     };
     const here = render({ status: status(dev, { bindingSeqAgreed: SEQ }), local: { nodeId: NODE, seq: SEQ, pushType: 'fcm', hw: true } });
     expect(here).toContain(t('node_status_online'));
+    // This device's own node: neither (the site's node cabinet shows both).
     expect(here).not.toMatch(/Acme Phone 7|Android|Device/);
-    // Bound to another device: not shown at all (owner, 11.10), so neither is its model.
-    expect(render({ status: status(dev) })).not.toMatch(/Acme Phone 7|Android/);
+    // Bound to another device: the card says which device runs it by its model, never its platform.
+    const other = render({ status: status(dev) });
+    expect(other).toContain(t('node_runs_on', { model: 'Acme Phone 7' }));
+    expect(other).not.toMatch(/Android/);
   });
 
   it('no language of the app keeps the label of the row that went', () => {

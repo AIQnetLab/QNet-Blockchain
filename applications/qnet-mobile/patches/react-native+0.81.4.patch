@@ -134,3 +134,100 @@ index 377f41e..a91266a 100644
  #pragma mark - Layout
  
  - (CGSize)contentSize
+diff --git a/node_modules/react-native/React/CoreModules/RCTWebSocketModule.mm b/node_modules/react-native/React/CoreModules/RCTWebSocketModule.mm
+index 3fd7238..d770b39 100644
+--- a/node_modules/react-native/React/CoreModules/RCTWebSocketModule.mm
++++ b/node_modules/react-native/React/CoreModules/RCTWebSocketModule.mm
+@@ -34,9 +34,15 @@
+ 
+ @end
+ 
++// QNet: every open socket is pinged this often (AppNetwork.PING_MS on Android); one whose ping got no pong by the next
++// fails, as OkHttp fails it on Android, so a socket gone silent (a VPN turned off) ends and its JS opens a new one.
++static const NSTimeInterval RCTQNetPingInterval = 15;
++
+ @implementation RCTWebSocketModule {
+   NSMutableDictionary<NSNumber *, SRWebSocket *> *_sockets;
+   NSMutableDictionary<NSNumber *, id<RCTWebSocketContentHandler>> *_contentHandlers;
++  NSMutableSet<NSNumber *> *_awaitingPong;
++  NSTimer *_pingTimer;
+ }
+ 
+ RCT_EXPORT_MODULE()
+@@ -55,6 +61,8 @@ RCT_EXPORT_MODULE()
+ {
+   [super invalidate];
+ 
++  [_pingTimer invalidate];
++  _pingTimer = nil;
+   _contentHandlers = nil;
+   for (SRWebSocket *socket in _sockets.allValues) {
+     socket.delegate = nil;
+@@ -135,6 +143,59 @@ RCT_EXPORT_METHOD(close : (double)code reason : (NSString *)reason socketID : (d
+   _contentHandlers[socketID] = handler;
+ }
+ 
++#pragma mark - QNet: liveness of the open sockets
++
++- (void)qnetStartPinging
++{
++  if (_pingTimer) {
++    return;
++  }
++  __weak RCTWebSocketModule *weakSelf = self;
++  _pingTimer = [NSTimer timerWithTimeInterval:RCTQNetPingInterval
++                                      repeats:YES
++                                        block:^(__unused NSTimer *timer) {
++                                          [weakSelf qnetPingOpenSockets];
++                                        }];
++  [[NSRunLoop mainRunLoop] addTimer:_pingTimer forMode:NSRunLoopCommonModes];
++}
++
++// A socket still waiting for the pong of the ping before fails as one that failed by itself; every other open one is
++// pinged. The timer stops once no socket is left.
++- (void)qnetPingOpenSockets
++{
++  if (!_awaitingPong) {
++    _awaitingPong = [NSMutableSet new];
++  }
++  [_awaitingPong intersectSet:[NSSet setWithArray:_sockets.allKeys ?: @[]]];
++  for (NSNumber *socketID in _sockets.allKeys) {
++    SRWebSocket *socket = _sockets[socketID];
++    if (socket.readyState != SR_OPEN) {
++      continue;
++    }
++    if ([_awaitingPong containsObject:socketID]) {
++      [_awaitingPong removeObject:socketID];
++      socket.delegate = nil;
++      [socket close];
++      NSError *silent = [NSError errorWithDomain:@"RCTWebSocketModule"
++                                            code:0
++                                        userInfo:@{NSLocalizedDescriptionKey : @"sent ping but didn't receive pong"}];
++      [self webSocket:socket didFailWithError:silent];
++      continue;
++    }
++    [_awaitingPong addObject:socketID];
++    [socket sendPing:nil error:nil];
++  }
++  if (_sockets.count == 0) {
++    [_pingTimer invalidate];
++    _pingTimer = nil;
++  }
++}
++
++- (void)webSocket:(SRWebSocket *)webSocket didReceivePong:(NSData *)pongData
++{
++  [_awaitingPong removeObject:webSocket.reactTag];
++}
++
+ #pragma mark - RCTSRWebSocketDelegate methods
+ 
+ - (void)webSocket:(SRWebSocket *)webSocket didReceiveMessage:(id)message
+@@ -159,6 +220,7 @@ RCT_EXPORT_METHOD(close : (double)code reason : (NSString *)reason socketID : (d
+ 
+ - (void)webSocketDidOpen:(SRWebSocket *)webSocket
+ {
++  [self qnetStartPinging];
+   [self sendEventWithName:@"websocketOpen"
+                      body:@{@"id" : webSocket.reactTag, @"protocol" : webSocket.protocol ? webSocket.protocol : @""}];
+ }

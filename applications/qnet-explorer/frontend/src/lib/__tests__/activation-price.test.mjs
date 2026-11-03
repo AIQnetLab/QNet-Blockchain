@@ -75,7 +75,7 @@ test('no node, no price', async () => {
   assert.equal(await quoteFromNodes('light', huge), null);
 });
 
-// SITE-R3-03: a node that streams an endless body (compromised, misrouted) must cost the site at most the
+// A node that streams an endless body (compromised, misrouted) must cost the site at most the
 // 8 KiB cap: the stream is read chunk by chunk and cancelled once past it, never buffered whole.
 const NODE = ['https://node1.aiqnet.io'];
 

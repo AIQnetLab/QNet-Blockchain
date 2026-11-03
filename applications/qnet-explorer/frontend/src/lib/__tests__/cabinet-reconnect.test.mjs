@@ -10,10 +10,7 @@ import {
   DISCONNECTED_KEY, WALLET_KEY, awaitsExtension, extensionReconnect, loadChoice, loadDisconnected, saveChoice, saveDisconnected, shownWallet,
 } from '../cabinet/wallet-choice.ts';
 import { isEonAddress, readAccounts } from '../qnet-provider.ts';
-
-const SRC = new URL('../../', import.meta.url);
-const code = (path) => readFileSync(new URL(path, SRC), 'utf8').replace(/\r\n/g, '\n')
-  .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+import { code } from './source.mjs';
 
 const EON = 'd9fa370374e24333242eon847d1d354dcd87fe873823e';
 const OTHER = '60b4f3e026e24dcc7d8eonfda2b095a258ab95c1db2c0';
@@ -178,7 +175,7 @@ test('the cabinet: Disconnect sets the mark, a tap lifts it, a view and the reco
   // same render (no earlier wallet for a moment). None while an address is viewed.
   assert.match(cabinet, /const \{ taken, connected, current, viewOnly \} = useMemo\(\s*\(\) => shownWallet\(choice, viewing, loaded \? channel : null, accounts, disconnected\),\s*\[choice, viewing, loaded, channel, accounts, disconnected\],\s*\);\s*useEffect\(\(\) => \{\s*if \(taken\) keep\(taken\);\s*\}, \[taken, keep\]\);/);
   assert.match(cabinet, /ready, choice: current, nodeId: cv\?\.nodeId \?\? null, walletHash: cv\?\.walletHash \?\? null, viewOnly, phoneFlows,/);
-  // A Disconnect or another wallet in another tab reaches this tab's pages too (SITE-F11).
+  // A Disconnect or another wallet in another tab reaches this tab's pages too.
   assert.match(cabinet, /if \(event\.key !== null && event\.key !== WALLET_KEY && event\.key !== DISCONNECTED_KEY && event\.key !== ACTIVATIONS_KEY\) return;\s*heldHere = null;/);
   assert.match(cabinet, /window\.addEventListener\('storage', onStorage\);/);
   // No connect screen or earlier wallet for a moment while the extension answers (a view waits for nothing).

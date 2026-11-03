@@ -80,8 +80,8 @@ describe('the flows', () => {
     for (const [file, tab] of [['wallet.yaml', 'assets'], ['history.yaml', 'history'], ['node.yaml', 'node'], ['settings.yaml', 'settings']]) {
       expect([file, bottomTabs.includes(tab), flow(file).includes(`id: "tab-${tab}"`)]).toEqual([file, true, true]);
     }
-    // Send and Receive open from Assets, and each returns there.
-    expect(flow('send.yaml')).toMatch(/id: "assets-send"[\s\S]*shot\/02-send[\s\S]*tapOn: "\(\?i\)\.\*Back"\s*$/);
+    // Send and Receive open from Assets, and each returns there; Send through the token picker, QNC chosen.
+    expect(flow('send.yaml')).toMatch(/id: "assets-send"\n[^\n]*\n- tapOn:\n {4}id: "pick-QNC"[\s\S]*shot\/02-send[\s\S]*tapOn: "\(\?i\)\.\*Back"\s*$/);
     expect(flow('receive.yaml')).toMatch(/tapOn: "Receive"[\s\S]*shot\/03-receive[\s\S]*tapOn: "\(\?i\)\.\*Back"\s*$/);
     // Settings captures the language list open.
     expect(flow('settings.yaml')).toMatch(/tapOn: "English"[\s\S]*visible: "Русский"[\s\S]*shot\/06-settings/);
@@ -159,11 +159,14 @@ describe('the flows', () => {
     expect(['QNC 0', 'QNC 42,578.81988', '0'].map((s) => figure.test(s))).toEqual([true, true, true]);
     expect(['QNC —', 'QNC'].map((s) => figure.test(s))).toEqual([false, false]);
     // Element ids: the bottom bar's tabs and testIDs the screens set.
-    const sources = ['screens/WalletScreen.js', 'screens/HistoryTab.js'].map((f) => read(ROOT, 'src', f)).join('\n');
+    const sources = ['screens/WalletScreen.js', 'screens/HistoryTab.js', 'screens/TokenScreens.js'].map((f) => read(ROOT, 'src', f)).join('\n');
+    const { pickId } = require('../src/screens/TokenScreens');
     for (const id of new Set([...allFlows.matchAll(/id: "([^"]+)"/g)].map((m) => m[1]))) {
-      // An id set on an element, or on an action of a pair (components/ui/Action ActionPair takes its props as an object).
+      // An id set on an element, or on an action of a pair (components/ui/Action ActionPair takes its props as an object);
+      // a token picker's row by the asset it offers (QNC: its symbol).
       const found = id.startsWith('tab-') ? bottomTabs.includes(id.slice(4))
-        : sources.includes(`testID="${id}"`) || sources.includes(`testID: '${id}'`);
+        : sources.includes(`testID="${id}"`) || sources.includes(`testID: '${id}'`)
+          || (id === `pick-${pickId({ symbol: 'QNC', contract: null })}` && sources.includes('testID={`pick-${pickId(item)}`}'));
       expect([id, found]).toEqual([id, true]);
     }
   });

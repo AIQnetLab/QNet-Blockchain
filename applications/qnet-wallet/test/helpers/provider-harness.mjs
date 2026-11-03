@@ -169,7 +169,7 @@ export function createWorld(options = {}) {
   const log = {
     windows: [], removed: [], views: [], signCalls: [], sendCalls: [], unlockAttempts: [], recipientChecks: [], maxOpen: 0,
     siteViews: [], activations: [], contractReads: [], recipientReads: [], callPreviews: [], callSends: [], statusReads: [], claimViews: 0,
-    claims: 0, claimNodeIds: [], siteActivations: 0, unlinkViews: 0, unlinks: 0, solanaQuotes: [], solanaSends: [],
+    claims: 0, claimNodeIds: [], claimOptions: [], siteActivations: 0, unlinkViews: 0, unlinks: 0, solanaQuotes: [], solanaSends: [],
   };
   const openWindows = new Set();
   const timers = [];
@@ -326,7 +326,7 @@ export function createWorld(options = {}) {
 
   // What nodes.js would answer: a claim view of the node the site named (this wallet's light or super node, else
   // WALLET_MISMATCH) at state.claimBalance unless the test sets state.claimView, a submitted move of it unless it sets
-  // state.claimOutcome, and state.registration.
+  // state.claimOutcome (the options each move was given kept in log.claimOptions), and state.registration.
   const nodeTypeOf = (nodeId) => (nodeId === NODE_ID ? 'light' : nodeId === SUPER_NODE_ID ? 'super' : null);
   const nodes = {
     claimView: async (nodeId) => {
@@ -340,9 +340,10 @@ export function createWorld(options = {}) {
         : { mode: 'claim', reason: null, nodeId, nodeType, amountNano: state.claimBalance };
       return { ...base, ...(state.claimView ?? {}) };
     },
-    claimForSite: async (nodeId) => {
+    claimForSite: async (nodeId, options) => {
       log.claims += 1;
       log.claimNodeIds.push(nodeId);
+      log.claimOptions.push(options);
       if (!state.unlocked) throw new WalletError('LOCKED');
       if (state.claimError) throw state.claimError;
       return state.claimOutcome ?? {

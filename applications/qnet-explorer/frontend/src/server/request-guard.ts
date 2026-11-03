@@ -4,7 +4,7 @@
 // curl, a server) or this site's own leaves another page no POST it can send with a visitor's IP address.
 // A GET that another page makes with <img>, <script>, <link> or a frame carries no Origin, but a browser
 // names where every request came from in Sec-Fetch-Site (Fetch Metadata): such a request is refused on
-// that header, before any per-IP limit counts it (R4-SRA-01).
+// that header, before any per-IP limit counts it.
 
 import { readCappedBytes } from '../lib/capped-body.ts';
 import { SITE_ORIGIN } from '../lib/hosts.ts';
@@ -34,7 +34,7 @@ export function originAllowed(request: Request, devOrigins: boolean = DEV_ORIGIN
   return devOrigins || LOCAL_HOST_RE.test(request.headers.get('host') ?? '');
 }
 
-// The activation routes (/api/cabinet/activation/*, shared contract C3.0) also take the QNet extension's own calls: an
+// The activation routes (/api/cabinet/activation/*) also take the QNet extension's own calls: an
 // Origin of chrome-extension://<its 32-letter id>, and Sec-Fetch-Site `none`, which a browser extension's request
 // carries. Anything else a browser names is another site's page, refused before any limit counts it.
 const EXTENSION_ORIGIN_RE = /^chrome-extension:\/\/[a-p]{32}$/;

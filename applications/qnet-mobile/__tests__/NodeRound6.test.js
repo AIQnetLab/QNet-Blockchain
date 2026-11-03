@@ -542,9 +542,9 @@ describe('MN-R4-05: an unknown outcome of a QNet Link request is never said as d
   });
 
   it('a claim with no answer carries `unknown` to the screen', async () => {
+    const walletManager = { claimRewards: async () => { throw Object.assign(new Error('no answer'), { unknown: true }); } };
     const actions = nodeLinkActions({
-      walletManager: { claimRewards: async () => { throw Object.assign(new Error('no answer'), { unknown: true }); } },
-      credential: 'c',
+      walletManager, credential: 'c', ...require('../test-support/moveRun').sheetMove(walletManager, { walletAddress: WALLET }),
     });
     const r = await actions.claim({ nodeId: NODE, qnet: WALLET, amountNano: '2000000000' });
     expect(r).toEqual({ status: 'error', error: 'NETWORK', unknown: true });
@@ -668,5 +668,116 @@ describe('MN-R4-09: a refresh token Google Play can fix gets its dialog from the
     expect(await E.refreshIfDue(NODE, { now, interactive: true })).toBe(false);
     expect(calls).toHaveLength(0);
     expect(E.REFRESH_DIALOG_MS).toBe(3600000);
+  });
+});
+
+describe('a confirmed binding acts on the status the screen read: only an agreed "not on the chain" or the node refuses it', () => {
+  // A read that never answers: it ends only when the caller's own limit aborts it.
+  const silent = (opts) => new Promise((_, reject) => {
+    if (opts && opts.signal) opts.signal.addEventListener('abort', () => reject(new Error('aborted')));
+  });
+  // An answer that comes `ms` later (a slow upload), unless the caller's limit aborts it first.
+  const late = (ms, value, opts) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(value), ms);
+    if (opts && opts.signal) opts.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); });
+  });
+  const SHEET = { onChain: true, features: ['status_signed', 'bind_v2'] };
+  const binds = () => calls.filter((c) => c.url.endsWith('/light-node/bind'));
+  const publicReads = () => calls.filter((c) => c.url.includes('/light-node/status?'));
+  const bindAs = (known) => onFakeClock(() => Push.bindThisDevice({ signer: signer(), credential: {}, nodeId: NODE, epoch: E0, known }));
+  const taken = (body) => ({ success: true, bound: true, seq: body.seq });
+
+  it('no owner answers after Confirm: the binding goes on the sheet\'s status, at this second\'s sequence, and the node takes it', async () => {
+    answers = (url, body, opts) => {
+      if (url.includes('/light-node/status')) return silent(opts);
+      if (url.endsWith('/light-node/bind')) return taken(body);
+      return { success: true };
+    };
+    const start = Math.floor(Date.now() / 1000);
+    const r = await bindAs(SHEET);
+    expect(r).toEqual({ ok: true, seq: binds()[0].body.seq });
+    expect(binds()).toHaveLength(1);
+    expect(r.seq).toBeGreaterThanOrEqual(start);
+    // The status the sheet read is not asked again; only the binding's sequence is (signed), within FIRST_CONTACT_MS.
+    expect(publicReads()).toHaveLength(0);
+    expect(await info()).toMatchObject({ nodeId: NODE, seq: r.seq });
+  });
+
+  it('the sheet\'s request on the screen hands that status to the binding', async () => {
+    const offer = { kind: 'link', mode: 'device', nodeId: NODE, qnet: WALLET, device: DEVICE, features: SHEET.features };
+    const useDevice = jest.fn(async () => ({ ok: true, seq: 7 }));
+    expect(await performIntent({ intent: 'link' }, offer, { node: { useDevice } })).toMatchObject({ status: 'linked', seq: '7' });
+    expect(useDevice).toHaveBeenCalledWith({ nodeId: NODE, device: DEVICE, known: SHEET });
+    // The whole way: the sheet's actions bind on it while the owners stay silent.
+    answers = (url, body, opts) => {
+      if (url.includes('/light-node/status')) return silent(opts);
+      if (url.endsWith('/light-node/bind')) return taken(body);
+      return { success: true };
+    };
+    const node = nodeLinkActions({ walletManager: signer(), credential: {} });
+    const a = await onFakeClock(() => performIntent({ intent: 'link' }, offer, { node }));
+    expect(a).toEqual({ status: 'linked', qnet: WALLET, nodeId: NODE, seq: String(binds()[0].body.seq) });
+  });
+
+  it('two owners say the node is not on the chain: refused, nothing sent; one owner alone refuses nothing', async () => {
+    const owners = lightShardOwnerUrls(NODE);
+    let refusing = 3;
+    answers = (url, body) => {
+      if (url.includes('/light-node/status') && !body) return pub({ onchain_registered: false, device_bound: false });
+      if (url.endsWith('/light-node/status')) {
+        return owners.findIndex((u) => url.startsWith(u)) < refusing
+          ? { success: false, reason: 'not_registered' } : { ...signedPub(), binding_seq: SEQ };
+      }
+      if (url.endsWith('/light-node/bind')) return taken(body);
+      return { success: true };
+    };
+    expect(await bindAs(SHEET)).toEqual({ ok: false, reason: 'not_registered' });
+    expect(await bindAs(null)).toEqual({ ok: false, reason: 'not_registered' });
+    expect(binds()).toHaveLength(0);
+    refusing = 1;
+    expect((await bindAs(SHEET)).ok).toBe(true);
+  });
+
+  it('a newer binding made meanwhile: one retry above the sequence the owners name then, and no more', async () => {
+    const held = Math.floor(Date.now() / 1000) + 5000;
+    let refuse = 1;
+    answers = (url, body, opts) => {
+      if (url.includes('/light-node/status') && !body) return silent(opts);
+      if (url.endsWith('/light-node/status')) return { ...signedPub(), binding_seq: binds().length ? held : SEQ, device_state: 'active' };
+      if (url.endsWith('/light-node/bind')) return binds().length <= refuse ? { success: false, reason: 'stale_seq' } : taken(body);
+      return { success: true };
+    };
+    expect(await bindAs(SHEET)).toEqual({ ok: true, seq: held + 1 });
+    expect(binds().map((c) => c.body.seq)).toEqual([expect.any(Number), held + 1]);
+    calls.length = 0;
+    refuse = 2;
+    expect(await bindAs(SHEET)).toMatchObject({ ok: false, reason: 'stale_seq' });
+    expect(binds()).toHaveLength(2);
+    expect(publicReads()).toHaveLength(0);
+  });
+
+  it('a signed status that takes 10 s to arrive (a slow upload) still names the binding the new one goes above', async () => {
+    const held = Math.floor(Date.now() / 1000) + 5000;
+    answers = (url, body, opts) => {
+      if (url.includes('/light-node/status') && !body) return pub({ features: ['status_signed', 'bind_v2'] });
+      if (url.endsWith('/light-node/status')) return late(10000, { ...signedPub(), binding_seq: held, device_state: 'active' }, opts);
+      if (url.endsWith('/light-node/bind')) return taken(body);
+      return { success: true };
+    };
+    expect(await bindAs(null)).toEqual({ ok: true, seq: held + 1 });
+  });
+
+  it('the wallet\'s unlink waits for a signed status that takes 10 s, as long as a first contact', async () => {
+    answers = (url, body, opts) => {
+      if (url.includes('/light-node/status') && !body) return pub({ features: ['status_signed', 'unbind_wallet'] });
+      if (url.endsWith('/light-node/status')) return late(10000, { ...signedPub(), binding_seq: SEQ }, opts);
+      if (url.endsWith('/light-node/unbind')) return { success: true, unbound: true };
+      return { success: true };
+    };
+    const node = nodeLinkActions({
+      walletManager: { ...signer(), signNodeUnbind: async () => ({ sig: 'us', identityPublicKey: 'id' }) }, credential: {},
+    });
+    expect(await onFakeClock(() => node.unlinkByWallet(NODE))).toEqual({ status: 'ok', unbound: true });
+    expect(calls.filter((c) => c.url.endsWith('/light-node/unbind')).map((c) => c.body.seq)).toEqual([SEQ]);
   });
 });

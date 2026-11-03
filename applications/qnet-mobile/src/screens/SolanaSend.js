@@ -1,7 +1,8 @@
 /**
  * The Solana Send screen: SOL or a Solana token the wallet lists, from the wallet's Solana address, laid out like the
- * QNet Send screen. The token, the recipient and the amount are the wallet screen's state (a QR scan fills them in from
- * outside this form); the form checks nothing the network decides. Send runs runSolanaSend: the quote read now
+ * QNet Send screen. The token (chosen before the form opens: the token picker, a token's own screen, a link), the
+ * recipient and the amount are the wallet screen's state (a QR scan fills them in from outside this form); the form
+ * checks nothing the network decides. Send runs runSolanaSend: the quote read now
  * (services/SolanaSend), the review of everything the send does (components/SendReview: token, amount, recipient,
  * network fee, the SOL a new token account takes, a request's memo, the total), the fresh check of whoever holds the
  * device that every send asks for (the recipient on the prompt), then the signature and the submit. The wallet screen
@@ -14,8 +15,6 @@ import { InfoRow } from '../components/InfoRow';
 import Action from '../components/ui/Action';
 import Field from '../components/ui/Field';
 import Head from '../components/ui/Head';
-import Tabs from '../components/ui/Tabs';
-import TokenIcon from '../components/TokenIcons';
 import { looksLikeKnownAddress } from '../browser/DappSheet';
 import { errorText } from '../i18n';
 import { decodeKey, fromBaseUnits, toBaseUnits } from '../crypto/SolanaTx';
@@ -25,27 +24,44 @@ import {
 } from '../services/SolanaSend';
 import { amountInput } from '../utils/sendAmount';
 import { amountText } from '../utils/amountFormat';
+import { masked } from '../utils/privacy';
+
+// The figures a refusal names (what the send needs, the fee, a new token account's rent, a balance, what would stay,
+// the least an account keeps): masked while amounts are hidden, as every figure of a QNet refusal is; its words stay.
+const REFUSAL_FIGURES = new Set(['need', 'fee', 'account', 'balance', 'left', 'min']);
+
+/** What a refused send says (errorText), each figure it names masked while `hideAmounts`. */
+export function refusalText(t, error, hideAmounts) {
+  const params = error && error.params;
+  if (!hideAmounts || !params) return errorText(t, error, 'tx_failed');
+  const shown = Object.fromEntries(Object.entries(params).map(([k, v]) => [k, masked(v, REFUSAL_FIGURES.has(k))]));
+  return errorText(t, { code: error.code, message: error.message, params: shown }, 'tx_failed');
+}
 
 /**
  * One send, from the form's values to its outcome: { outcome: 'cancelled' } (the review or the fresh check declined),
  * { outcome: 'refused', error } (nothing was sent: the error carries its code), or { outcome: 'sent' | 'unknown',
  * entry } with the History entry of the submitted transfer ('unknown': no endpoint answered the submit, so it may or may
  * not have reached the network; its signature tells). `request` is a scanned payment request's { address, references,
- * memo }: it counts only while the recipient is still the address it was for.
+ * memo }: it counts only while the recipient is still the address it was for. `formOpen()`: whether the send's form is
+ * still open; one closed while the quote was read is 'cancelled', its refusal unsaid.
  */
 export async function runSolanaSend({
   t, from, to, symbol, amount, request = null, known = [], reviewSend, confirmFresh, sign,
-  quote = quoteSolanaSend, submit = submitSolanaSend, now = Date.now,
+  quote = quoteSolanaSend, submit = submitSolanaSend, now = Date.now, formOpen = () => true,
 }) {
   const recipient = String(to || '').trim();
   if (!decodeKey(recipient)) return { outcome: 'refused', error: { code: 'SOL_ADDRESS' } };
   const forRecipient = request && request.address === recipient ? request : null;
-  let q;
+  let q = null;
+  let refusal = null;
   try {
     q = await quote({ from, to: recipient, symbol, amount, request: forRecipient });
   } catch (error) {
-    return { outcome: 'refused', error };
+    refusal = error;
   }
+  if (!formOpen()) return { outcome: 'cancelled' };
+  if (refusal) return { outcome: 'refused', error: refusal };
   const fee = BigInt(q.feeLamports);
   const rent = BigInt(q.rentLamports);
   // The warnings of the QNet review, from the recipients this wallet paid on Solana from this device.
@@ -154,17 +170,22 @@ export function cleanAmountInput(text, decimals, kept = '') {
 }
 
 /**
- * The form. `balances`: the figures on the Assets list by symbol (null while unknown), canonical; `mask` writes one as
- * the screen shows it (WalletScreen: the figure, or the mask while balances are hidden). `fromLink`: a transfer request
- * from a link filled it in (WalletScreen openTransferLink), which a line over the form says.
+ * The form. `balances`: the figures on the Assets list by symbol (null while unknown), canonical; `hideAmounts`:
+ * balances are hidden (utils/privacy), so the balance and every figure of a refusal show masked. `fromLink`: a
+ * transfer request from a link filled it in (WalletScreen openTransferLink), which a line over the form says. `busy` /
+ * `onBusy(busy)`: whether a send is being made, held by the wallet screen, so it outlives this form (a lock takes the
+ * form away while the send goes on) and a request from a link waits for it rather than taking the form's place.
+ * `formOpen()`: whether this form is still the one open (runSolanaSend).
  */
 export default function SolanaSendForm({
-  t, owner, symbol, onSymbol, address, onAddress, amount, onAmount, request, balances, mask = (s) => amountText(s),
-  fromLink = false, onBack, onScan, known, reviewSend, confirmFresh, sign, onResult, onSent,
+  t, owner, symbol, address, onAddress, amount, onAmount, request, balances, hideAmounts = false,
+  fromLink = false, onBack, onScan, known, reviewSend, formOpen, confirmFresh, sign, onResult, onSent, busy = false,
+  onBusy = () => {},
 }) {
-  const [busy, setBusy] = useState(false);
   const alive = useRef(true);
   useEffect(() => () => { alive.current = false; }, []);
+  // A second tap before the screen's busy state reaches this form.
+  const inFlight = useRef(false);
   const token = solanaToken(symbol) || SOLANA_TOKENS[0];
   const balance = balances ? balances[token.symbol] : null;
 
@@ -181,25 +202,27 @@ export default function SolanaSendForm({
   };
 
   const send = async () => {
-    if (busy || !address || !amount) return;
+    if (busy || inFlight.current || !address || !amount) return;
     Keyboard.dismiss();
-    setBusy(true);
+    inFlight.current = true;
+    onBusy(true);
     try {
       const out = await runSolanaSend({
-        t, from: owner, to: address, symbol: token.symbol, amount, request, known, reviewSend, confirmFresh, sign,
+        t, from: owner, to: address, symbol: token.symbol, amount, request, known, reviewSend, confirmFresh, sign, formOpen,
       });
       if (out.outcome === 'refused') {
         const code = out.error && out.error.code;
         onResult({
           success: false,
           title: t(out.submitted && code === 'SOL_REFUSED' ? 'tx_failed_title' : 'send_cannot_title'),
-          error: errorText(t, out.error, 'tx_failed'),
+          error: refusalText(t, out.error, hideAmounts),
         });
       } else if (out.outcome !== 'cancelled') {
         onSent(out.entry, out.outcome);
       }
     } finally {
-      if (alive.current) setBusy(false);
+      inFlight.current = false;
+      onBusy(false);
     }
   };
 
@@ -215,21 +238,11 @@ export default function SolanaSendForm({
 
         {fromLink ? <Text style={styles.sendFromLink} testID="solana-send-from-link">{t('send_from_link')}</Text> : null}
 
-        {/* The token sent: SOL or a token the Assets list shows. */}
-        <Tabs
-          items={SOLANA_TOKENS.map((tk) => ({
-            key: tk.symbol, label: tk.symbol, testID: `solana-token-${tk.symbol}`,
-            icon: <TokenIcon network="solana" symbol={tk.symbol} size={20} />,
-          }))}
-          value={token.symbol}
-          onChange={onSymbol}
-        />
-
         {/* The balance beside its label, as every figure (components/InfoRow). */}
         <View style={styles.sendBalanceInfo}>
           <InfoRow
             label={t('send_available')}
-            value={`${mask(balance === null || balance === undefined ? '—' : String(balance))} ${token.symbol}`}
+            value={`${masked(amountText(balance == null ? '—' : String(balance)), hideAmounts)} ${token.symbol}`}
             tone="accent"
             ltr
             fit

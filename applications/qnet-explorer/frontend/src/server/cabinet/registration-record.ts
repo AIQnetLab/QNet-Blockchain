@@ -9,7 +9,7 @@
 //
 // Whose burn a light registration's is: the wallet's row in the activation registry that holds this burn names it (a
 // payment address's, or the extension's from the wallet's own Solana address). Without one, no payment key of this site
-// made it, since every payment address's burn is announced in the registry before it leaves (shared contract C4); it is
+// made it, since every payment address's burn is announced in the registry before it leaves; it is
 // the burner's own once Solana holds it final and valid with the archive's burner as its fee payer and burn authority
 // (burn-scan.ts checkBurn): a burn of the QNet extension from before the registry, of an earlier QNet Wallet, or one QNet
 // Wallet registered with its owner bind v1. Once known it is kept (a registration's burn never changes), and so is a burn

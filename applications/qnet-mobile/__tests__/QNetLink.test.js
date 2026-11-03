@@ -11,7 +11,7 @@ const AsyncStorage = require('@react-native-async-storage/async-storage');
 const {
   LINK, parseLink, decodeB64url, encodeB64url, contributoryKey, sealAnswer, openAnswer, sessionKey, checkNumber,
   groupCheckNumber, requestText, reqHashOf, walletHashOf, buildPlaintext, plaintextProblem, openSession, deliverAnswer,
-  markHandled, wasHandled, LinkRefusal, prepareOffer, performIntent, readOffer,
+  markHandled, wasHandled, LinkRefusal, prepareOffer, performIntent, readOffer, otherNodeHint,
 } = require('../src/services/QNetLink');
 const { FIRST_CONTACT_MS } = require('../src/config/nodes');
 // A clock that only the waits move: `sleep` advances it, and `waits` records each wait.
@@ -364,6 +364,26 @@ describe('the relay session', () => {
     expect(once).toHaveBeenCalledTimes(1);
   });
 
+  // The screen says it is still trying once a try got no answer (QNetLinkScreen link_loading_slow).
+  it('tells of each try that got no answer and is followed by another, for the session and for the offer', async () => {
+    relay = () => Promise.reject(new TypeError('Network request failed'));
+    const clock = fakeClock();
+    const onRetry = jest.fn();
+    await expect(openSession(linkOf(byName('claim-light-ok')), { ...clock, onRetry })).rejects.toMatchObject({ reason: 'network' });
+    expect(onRetry.mock.calls.length).toBeGreaterThan(0);
+    expect(onRetry).toHaveBeenCalledTimes(clock.waits.length);
+    const NET = { kind: 'unavailable', error: 'NETWORK' };
+    const OFFER = { kind: 'reserve', qnet: W.address, nodeId: 'n', burner: 'b' };
+    const heard = jest.fn();
+    const prepare = jest.fn().mockResolvedValueOnce(NET).mockResolvedValue(OFFER);
+    expect(await readOffer(prepare, { expiresAt: Date.now() + 200000 }, { ...fakeClock(), onRetry: heard })).toEqual(OFFER);
+    expect(heard).toHaveBeenCalledTimes(1);
+    // An answer at once: nothing to tell.
+    const quiet = jest.fn();
+    expect(await readOffer(async () => OFFER, { expiresAt: Date.now() + 200000 }, { ...fakeClock(), onRetry: quiet })).toEqual(OFFER);
+    expect(quiet).not.toHaveBeenCalled();
+  });
+
   it('a session this device already decided on is refused without asking the relay; the id itself is not stored', async () => {
     const c = byName('connect-ok');
     await markHandled(c.sessionId);
@@ -424,6 +444,64 @@ describe('the answer delivery', () => {
     relay = () => (++n < 3 ? Promise.reject(new TypeError('Network request failed')) : reply(201, { ok: true }));
     expect(await deliverAnswer(linkOf(c), live(), { status: 'rejected' }, { sleep: async () => {} })).toBe('delivered');
     expect(new Set(calls.map((x) => x.body)).size).toBe(1);
+  });
+
+  // Its 2 s back-off (doubling to 30 s) has nothing left to wait for once the network is back (services/NetworkWake).
+  it('a back-off after a network failure ends at once when the network comes back or the app comes to the front', async () => {
+    const { wakeRetries } = require('../src/utils/pause');
+    const c = byName('connect-ok');
+    let n = 0;
+    relay = () => (++n < 2 ? Promise.reject(new TypeError('Network request failed')) : reply(201, { ok: true }));
+    const outcome = deliverAnswer(linkOf(c), live(), { status: 'rejected' });
+    for (let i = 0; i < 200 && calls.length < 2; i += 1) {
+      wakeRetries();
+      await new Promise((r) => { setImmediate(r); });
+    }
+    expect(calls).toHaveLength(2);
+    expect(await outcome).toBe('delivered');
+  });
+
+  // Through the native inbox, which writes them in every build (LinkInboxTest.kt noteLine), never the JS logger.
+  it('says in the log each answer delivered, its status and time, and one that was not and why; never the session, its key or an address', async () => {
+    const c = byName('connect-ok');
+    const { NativeModules } = require('react-native');
+    const note = jest.fn();
+    NativeModules.QNetLinkInbox = { note };
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let t = 1_000_000;
+    const now = () => t;
+    try {
+      relay = () => { t += 842; return reply(201, {}); };
+      await deliverAnswer(linkOf(c), live(), { status: 'rejected' }, { now });
+      relay = () => { t += 120; return reply(404, {}); };
+      await deliverAnswer(linkOf(c), live(), { status: 'rejected' }, { now });
+      relay = () => Promise.reject(new Error('offline'));
+      await deliverAnswer(linkOf(c), { expiresAt: 0, request: null }, { status: 'rejected' }, { now });
+      expect(note.mock.calls).toEqual([
+        ['answer_delivered', { intent: 'connect', status: 201, ms: 842 }],
+        ['answer_not_delivered', { intent: 'connect', status: 404, ms: 120, outcome: 'expired' }],
+        ['answer_not_delivered', { intent: 'connect', status: 'none', ms: 0, outcome: 'failed' }],
+      ]);
+      const said = JSON.stringify(note.mock.calls);
+      for (const secret of [c.sessionId, linkOf(c).sitePub]) expect(said).not.toContain(secret);
+      expect([...info.mock.calls, ...warn.mock.calls].join('\n')).not.toContain('[LINK]');
+    } finally {
+      delete NativeModules.QNetLinkInbox;
+      info.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('after a wake its back-off starts again from 2 s: a delivery that failed again then waits 2 s, not the 30 s it reached', async () => {
+    const { wakeRetries } = require('../src/utils/pause');
+    const c = byName('connect-ok');
+    let n = 0;
+    relay = () => (++n < 8 ? Promise.reject(new TypeError('Network request failed')) : reply(201, { ok: true }));
+    const waits = [];
+    const sleep = async (ms) => { waits.push(ms); if (waits.length === 5) wakeRetries(); };
+    expect(await deliverAnswer(linkOf(c), live(), { status: 'rejected' }, { sleep })).toBe('delivered');
+    expect(waits).toEqual([2000, 4000, 8000, 16000, 30000, 2000, 4000]);
   });
 
   it('an answer the wallet could not build goes out as INTERNAL, never malformed', async () => {
@@ -579,20 +657,30 @@ describe('what each intent offers before anything is signed', () => {
     expect(read('src/screens/WalletScreen.js')).toMatch(/height: \(\) => fetchCachedBlockHeight\(\)\.then\(\(\) => estimatedHeight\(heightRead\(\)\)\),/);
   });
 
-  // R6, one wallet one node: the consent to a light registration is never given for a wallet the network holds a super
-  // or genesis node for, even one no device of this install linked; without two genesis nodes' answer, none either.
-  it('link: no consent while the network holds a super node for the wallet, or cannot say', async () => {
+  // R6, one wallet one node: the consent sheet shows on the light node's status alone, and whether the network holds a
+  // super or genesis node for the wallet is a hint read after it (otherNodeHint): two genesis nodes saying so turn it
+  // into that refusal; no answer holds nothing up, since aiqnet.io and the chain refuse a second node anyway.
+  it('link: the consent shows at once; a super node the network holds for the wallet is a hint that refuses it', async () => {
     const fresh = (otherNode) => node({ status: async () => ({ onChain: false, features: ['bind_v2', 'pending_bind'] }), otherNode });
     const ask = (n) => prepareOffer(link, { wallet: WALLET, session: session({ burnTx, walletHash: null, check: true }), node: n });
+    // Two genesis nodes that never answer hold the sheet up no more.
+    const silent = fresh(jest.fn(() => new Promise(() => {})));
+    const consent = await ask(silent);
+    expect(consent).toMatchObject({ kind: 'link', mode: 'consent', burnTx });
+    expect(silent.otherNode).not.toHaveBeenCalled();
     const other = jest.fn(async () => true);
-    expect(await ask(fresh(other))).toEqual({ kind: 'unavailable', error: 'NODE_OTHER' });
+    expect(await otherNodeHint(consent, fresh(other))).toBe('NODE_OTHER');
     expect(other).toHaveBeenCalledWith(W.address);
-    expect(await ask(fresh(async () => null))).toEqual({ kind: 'unavailable', error: 'NETWORK' });
-    expect(await ask(fresh(async () => false))).toMatchObject({ kind: 'link', mode: 'consent', burnTx });
+    for (const answer of [null, false]) expect(await otherNodeHint(consent, fresh(async () => answer))).toBe(null);
+    expect(await otherNodeHint(consent, fresh(async () => { throw new Error('down'); }))).toBe(null);
+    // The first source that says so decides; the other may still be out.
+    expect(await otherNodeHint(consent, node({ otherNode: () => new Promise(() => {}), record: async () => ({ state: 'recorded', nodeType: 'super' }) })))
+      .toBe('NODE_OTHER');
     // A node already on the chain is this wallet's light node: linking it asks nothing more.
     const onChain = node({ otherNode: jest.fn(async () => true) });
-    expect(await prepareOffer(link, { wallet: WALLET, session: session({ burnTx: null, walletHash: null, check: false }), node: onChain }))
-      .toMatchObject({ kind: 'link', mode: 'device' });
+    const device = await prepareOffer(link, { wallet: WALLET, session: session({ burnTx: null, walletHash: null, check: false }), node: onChain });
+    expect(device).toMatchObject({ kind: 'link', mode: 'device' });
+    expect(await otherNodeHint(device, onChain)).toBe(null);
     expect(onChain.otherNode).not.toHaveBeenCalled();
     // The actions ask two genesis nodes by the wallet (verify-activation), a super node counting.
     const { nodeLinkActions } = require('../src/services/NodeLinkActions');
@@ -604,27 +692,29 @@ describe('what each intent offers before anything is signed', () => {
   });
 
   // R6, one node type per wallet, chosen once: aiqnet.io's record of a super node's burn the network does not list yet
-  // refuses the light consent too, in every state it can hold one; a record it cannot read gives no consent.
-  it('link: no consent while aiqnet.io holds a super node\'s burn for the wallet, or its record cannot be read', async () => {
+  // is the same hint, in every state it can hold one; a record it cannot read says nothing.
+  it('link: aiqnet.io holding a super node\'s burn for the wallet is a hint that refuses the consent; no record says nothing', async () => {
     const fresh = (over) => node({ status: async () => ({ onChain: false, features: ['bind_v2', 'pending_bind'] }), ...over });
-    const ask = (n) => prepareOffer(link, { wallet: WALLET, session: session({ burnTx, walletHash: null, check: true }), node: n });
+    const consent = await prepareOffer(link, { wallet: WALLET, session: session({ burnTx, walletHash: null, check: true }), node: fresh() });
+    expect(consent).toMatchObject({ kind: 'link', mode: 'consent', burnTx });
     for (const state of ['reserved', 'sending', 'recorded']) {
       const record = jest.fn(async () => ({ state, nodeType: 'super' }));
-      expect([state, await ask(fresh({ record }))]).toEqual([state, { kind: 'unavailable', error: 'NODE_OTHER' }]);
+      expect([state, await otherNodeHint(consent, fresh({ record }))]).toEqual([state, 'NODE_OTHER']);
       expect(record).toHaveBeenCalledWith(W.address);
     }
     // A super burn on record is said as such even while the genesis nodes cannot answer.
-    expect(await ask(fresh({ otherNode: async () => null, record: async () => ({ state: 'recorded', nodeType: 'super' }) })))
-      .toEqual({ kind: 'unavailable', error: 'NODE_OTHER' });
-    expect(await ask(fresh({ record: async () => null }))).toEqual({ kind: 'unavailable', error: 'NETWORK' });
+    expect(await otherNodeHint(consent, fresh({ otherNode: async () => null, record: async () => ({ state: 'recorded', nodeType: 'super' }) })))
+      .toBe('NODE_OTHER');
+    expect(await otherNodeHint(consent, fresh({ record: async () => null }))).toBe(null);
     // The light burn the site holds for the wallet is the one this consent is for.
     for (const state of ['none', 'reserved', 'sending', 'recorded']) {
       const record = async () => ({ state, nodeType: state === 'none' ? null : 'light' });
-      expect([state, await ask(fresh({ record }))]).toEqual([state, expect.objectContaining({ kind: 'link', mode: 'consent', burnTx })]);
+      expect([state, await otherNodeHint(consent, fresh({ record }))]).toEqual([state, null]);
     }
-    // Without both checks there is no consent at all.
-    expect(await ask(fresh({ record: undefined }))).toEqual({ kind: 'unavailable', error: 'INTERNAL' });
-    expect(await ask(fresh({ otherNode: undefined }))).toEqual({ kind: 'unavailable', error: 'INTERNAL' });
+    // Without its sources the hint says nothing; the offer stands.
+    expect(await otherNodeHint(consent, fresh({ record: undefined }))).toBe(null);
+    expect(await otherNodeHint(consent, fresh({ otherNode: undefined }))).toBe(null);
+    expect(await otherNodeHint(consent, null)).toBe(null);
   });
 
   it('the actions read aiqnet.io\'s record of the wallet with no credentials; a failed read is null', async () => {
@@ -740,7 +830,7 @@ describe('what a confirmed request answers', () => {
     const n = node();
     expect(await performIntent({ intent: 'claim' }, offer, { node: n }))
       .toEqual({ status: 'ok', qnet: W.address, nodeId: W.nodeId, amountNano: '12500000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null });
-    expect(n.claim).toHaveBeenCalledWith({ nodeId: W.nodeId, qnet: W.address, amountNano: 12500000000 });
+    expect(n.claim).toHaveBeenCalledWith({ nodeId: W.nodeId, qnet: W.address, amountNano: 12500000000, until: null, onPart: expect.any(Function) });
     expect(await performIntent({ intent: 'claim' }, offer, { node: node({ claim: async () => ({ status: 'ok', amountNano: '5', txHash: 'x', stoppedAtEpoch: 160 }) }) }))
       .toMatchObject({ stoppedAtEpoch: '160' });
     expect(await performIntent({ intent: 'claim' }, offer, { node: node({ claim: async () => ({ status: 'error', error: 'CLAIM_REFUSED' }) }) }))
@@ -755,12 +845,29 @@ describe('what a confirmed request answers', () => {
     const n = node({ claim: jest.fn(async () => ({ status: 'ok', amountNano: '48000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null })) });
     const a = await performIntent({ intent: 'claim' }, offer, { node: n });
     expect(a).toEqual({ status: 'ok', qnet: W.address, nodeId: S, amountNano: '48000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: null });
-    expect(n.claim).toHaveBeenCalledWith({ nodeId: S, qnet: W.address, amountNano: 48000000000 });
+    expect(n.claim).toHaveBeenCalledWith({ nodeId: S, qnet: W.address, amountNano: 48000000000, until: null, onPart: expect.any(Function) });
     const view = { intent: 'claim', request: { walletHash: W.walletHash, nodeId: S } };
     expect(plaintextProblem(buildPlaintext(view, a), view)).toBe(null);
     // The same answer for a request that named the light node is not sent.
     expect(() => buildPlaintext({ intent: 'claim', request: { walletHash: W.walletHash, nodeId: W.nodeId } }, a)).toThrow(/nodeId/);
     expect(await performIntent({ intent: 'claim' }, { ...offer, kind: 'claim_empty' }, { node: n })).toEqual({ status: 'empty', qnet: W.address, nodeId: S });
+  });
+
+  // The sheet runs the Node tab's move in parts and answers once, inside the session: a next part only while
+  // CLAIM_ANSWER_MARGIN_S of it is left. The run goes to this device's screen; the plaintext keeps the row's keys alone.
+  it('claim: the run is bound to the session, each part is heard, and the answer is the run\'s total', async () => {
+    expect(LINK.CLAIM_ANSWER_MARGIN_S).toBe(150);
+    const offer = { kind: 'claim', nodeId: W.nodeId, nodeType: 'light', qnet: W.address, amountNano: 9000000000 };
+    const run = { parts: [{ txHash: 'aa'.repeat(32), amountNano: '3000000000' }, { txHash: 'ab'.repeat(32), amountNano: '3000000000' }], more: false, stop: { ended: true } };
+    const n = node({ claim: jest.fn(async () => ({ status: 'ok', amountNano: '6000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: 1125, run })) });
+    const onProgress = jest.fn();
+    const at = { expiresAt: 1_800_000_600_000, request: { walletHash: W.walletHash, nodeId: W.nodeId } };
+    const a = await performIntent({ intent: 'claim' }, offer, { node: n, session: at, onProgress });
+    expect(n.claim).toHaveBeenCalledWith({ nodeId: W.nodeId, qnet: W.address, amountNano: 9000000000, until: 1_800_000_450_000, onPart: onProgress });
+    expect(a).toEqual({ status: 'ok', qnet: W.address, nodeId: W.nodeId, amountNano: '6000000000', txHash: 'ab'.repeat(32), stoppedAtEpoch: '1125', run });
+    const sent = JSON.parse(buildPlaintext({ intent: 'claim', request: at.request }, a));
+    expect(sent).toEqual({ v: 1, intent: 'claim', status: 'ok', qnet: W.address, nodeId: W.nodeId, amountNano: '6000000000',
+      txHash: 'ab'.repeat(32), stoppedAtEpoch: '1125' });
   });
 });
 
@@ -825,23 +932,28 @@ describe('the reserve request', () => {
     }
   });
 
-  it('offers the sheet only for the open wallet, and never for a wallet with a server node or a super node\'s burn', async () => {
+  // The sheet shows on the wallet's own knowledge at once; a server node two genesis nodes list, or a super node's burn
+  // aiqnet.io holds, is the hint read after it (otherNodeHint), and aiqnet.io's reserve refuses such a wallet anyway.
+  it('offers the sheet at once for the open wallet; a server node or a super node\'s burn is a hint that refuses it', async () => {
     const link = parseLink(reserveLink());
     const ask = (n, request = REQUEST, wallet = KWALLET) => prepareOffer(link, { wallet, session: session(request), node: n });
-    const n = node({ reserve: jest.fn() });
-    expect(await ask(n)).toEqual({ kind: 'reserve', qnet: KAT.eon_address, nodeId: LN.wallets[0].nodeId, burner: PAYER });
+    const OFFER = { kind: 'reserve', qnet: KAT.eon_address, nodeId: LN.wallets[0].nodeId, burner: PAYER };
+    const n = node({ reserve: jest.fn(), otherNode: jest.fn(() => new Promise(() => {})), record: jest.fn(() => new Promise(() => {})) });
+    expect(await ask(n)).toEqual(OFFER);
     expect(n.status).not.toHaveBeenCalled(); // the network's view of the light node is the site's to check
+    expect(n.otherNode).not.toHaveBeenCalled(); // genesis nodes that never answer hold nothing up
     expect(n.reserve).not.toHaveBeenCalled(); // nothing is signed before Confirm
     expect(await ask(n, REQUEST, null)).toEqual({ kind: 'unavailable', error: 'NO_WALLET' });
     expect(await ask(n, { ...REQUEST, walletHash: walletHashOf(LN.wallets[1].address) })).toEqual({ kind: 'unavailable', error: 'WALLET_MISMATCH' });
+    // The wallet's own server node, which it knows without asking, refuses it before the sheet.
     expect(await ask(node({ reserve: jest.fn(), serverNode: true }))).toEqual({ kind: 'unavailable', error: 'NODE_OTHER' });
-    expect(await ask(node({ reserve: jest.fn(), otherNode: async () => true }))).toEqual({ kind: 'unavailable', error: 'NODE_OTHER' });
+    expect(await otherNodeHint(OFFER, node({ otherNode: async () => true }))).toBe('NODE_OTHER');
     for (const state of ['reserved', 'sending', 'recorded']) {
-      expect([state, await ask(node({ reserve: jest.fn(), record: async () => ({ state, nodeType: 'super' }) }))])
-        .toEqual([state, { kind: 'unavailable', error: 'NODE_OTHER' }]);
+      expect([state, await otherNodeHint(OFFER, node({ record: async () => ({ state, nodeType: 'super' }) }))]).toEqual([state, 'NODE_OTHER']);
     }
-    expect(await ask(node({ reserve: jest.fn(), otherNode: async () => null }))).toEqual({ kind: 'unavailable', error: 'NETWORK' });
-    expect(await ask(node({ reserve: jest.fn(), record: async () => null }))).toEqual({ kind: 'unavailable', error: 'NETWORK' });
+    expect(await otherNodeHint(OFFER, node({ otherNode: async () => null }))).toBe(null);
+    expect(await otherNodeHint(OFFER, node({ record: async () => null }))).toBe(null);
+    expect(await otherNodeHint(OFFER, node())).toBe(null);
     expect(await ask(node())).toEqual({ kind: 'unavailable', error: 'INTERNAL' }); // no signer for it
     expect(await prepareOffer(link, { wallet: KWALLET, session: session(REQUEST), node: null })).toEqual({ kind: 'unavailable', error: 'INTERNAL' });
   });
@@ -1029,9 +1141,11 @@ describe('the unlink request', () => {
   it('the Node side of the wallet form: the binding two owners name, the wallet key\'s unbind, a stale_seq read again', async () => {
     jest.resetModules();
     const statuses = [];
+    // Each read the user waits on: settled on two owners' agreement, within a first contact's time.
     const light = {
-      readNodeStatus: jest.fn(async (id, opts) => {
+      readAgreedNodeStatus: jest.fn(async (id, opts) => {
         expect(opts.signStatus).toEqual(expect.any(Function));
+        expect(opts.timeoutMs).toBe(20000);
         return statuses.shift();
       }),
       postUnbind: jest.fn(async () => ({ ok: true, answer: { success: true, unbound: true, binding_seq: 1790000500 } })),
@@ -1107,7 +1221,10 @@ describe('the unlink request', () => {
     };
     const statuses = [];
     const light = {
-      readNodeStatus: jest.fn(async () => statuses.shift()),
+      readAgreedNodeStatus: jest.fn(async (id, opts) => {
+        expect(opts.timeoutMs).toBe(20000);
+        return statuses.shift();
+      }),
       postUnbind: jest.fn(async () => ({ ok: true, answer: { success: true, unbound: true } })),
     };
     jest.doMock('../src/services/PushService', () => push);
@@ -1125,7 +1242,7 @@ describe('the unlink request', () => {
     expect(await actions.unlink(W.nodeId)).toEqual({ unbound: true });
     expect(push.stopLightNode).toHaveBeenCalledTimes(1);
     expect(onUnlinked).toHaveBeenCalledTimes(1);
-    expect(light.readNodeStatus).not.toHaveBeenCalled();
+    expect(light.readAgreedNodeStatus).not.toHaveBeenCalled();
     push.localBinding.mockResolvedValueOnce(null);
     expect(await actions.unlink(W.nodeId)).toEqual({ unbound: false });
     expect(push.stopLightNode).toHaveBeenCalledTimes(1);
@@ -1192,11 +1309,24 @@ describe('only a verified link reaches the app', () => {
 
   it('Android: an activity restored or relaunched from recents does not hand its old link over again', () => {
     const activity = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
-    expect(activity).toMatch(/FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY/);
-    expect(activity).toMatch(/intent\.data = null\s*\}\s*super\.onCreate/);
+    const inbox = read('android/app/src/main/java/com/qnetmobile/LinkInbox.kt');
+    // The inbox takes only a fresh VIEW intent's link (LinkInboxTest.kt); the stale one is cleared before React Native.
+    expect(inbox).toMatch(/if \(restored \|\| \(flags and Intent\.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY\) != 0\) return null/);
+    expect(activity).toMatch(/if \(!LinkInbox\.receive\(this, intent, restored = savedInstanceState != null\)\) \{\s*intent\.data = null\s*\}\s*super\.onCreate/);
   });
 
-  it('iOS: Universal Links for link.aiqnet.io only, forwarded by the scene to Linking, at launch too; no custom URL scheme', () => {
+  it('Android: a link for the running or a remade activity waits in the inbox first, and the activity keeps the newest intent', () => {
+    const activity = read('android/app/src/main/java/com/qnetmobile/MainActivity.kt');
+    expect(activity).toMatch(/override fun onNewIntent\(intent: Intent\) \{\s*LinkInbox\.receive\(this, intent, restored = false\)\s*super\.onNewIntent\(intent\)\s*setIntent\(intent\)\s*\}/);
+    expect(read('android/app/src/main/java/com/qnetmobile/DilithiumPackage.kt')).toMatch(/LinkInboxModule\(reactContext\)/);
+    const inbox = read('android/app/src/main/java/com/qnetmobile/LinkInbox.kt');
+    expect(inbox).toMatch(/override fun getName\(\): String = "QNetLinkInbox"/);
+    // The one native module the JS reads links from; React Native's own getInitialURL is read by nothing.
+    const src = read('src/services/LinkInbox.js');
+    expect(src).toMatch(/NativeModules\.QNetLinkInbox/);
+  });
+
+  it('iOS: Universal Links for link.aiqnet.io only, put in the link inbox by the scene, at launch too; no custom URL scheme', () => {
     const entitlements = read('ios/QNetMobile/QNetMobile.entitlements');
     const domains = /<key>com\.apple\.developer\.associated-domains<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(entitlements)[1];
     expect([...domains.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1])).toEqual(['applinks:link.aiqnet.io']);
@@ -1207,24 +1337,55 @@ describe('only a verified link reaches the app', () => {
     expect(app).not.toMatch(/continue userActivity|open url|RCTLinkingManager/);
     const scene = read('ios/QNetMobile/SceneDelegate.swift');
     expect(scene).toMatch(/func scene\(_ scene: UIScene, continue userActivity: NSUserActivity\) \{\s*continueLink\(userActivity\)/);
-    expect(scene).toMatch(/private func continueLink\(_ activity: NSUserActivity\) \{\s*guard activity\.activityType == NSUserActivityTypeBrowsingWeb else \{ return \}\s*_ = RCTLinkingManager\.application\(UIApplication\.shared, continue: activity,/);
-    expect(scene).not.toMatch(/openURLContexts|urlContexts|solana/i);
+    // Every link goes to the inbox first; Linking's event only tells a screen that is up to look there.
+    expect(scene).toMatch(/private func continueLink\(_ activity: NSUserActivity\) \{\s*guard activity\.activityType == NSUserActivityTypeBrowsingWeb, let url = activity\.webpageURL else \{ return \}\s*QNetLinkInbox\.offer\(url\.absoluteString\)\s*_ = RCTLinkingManager\.application\(UIApplication\.shared, continue: activity,/);
+    expect(scene).not.toMatch(/openURLContexts|urlContexts|solana|launchOptions/i);
     expect(scene.match(/RCTLinkingManager\.application\(/g)).toHaveLength(1);
-    // The link that launches the app goes where Linking's getInitialURL reads it: the activity dictionary under the
-    // keys React Native reads.
-    const linking = read('node_modules/react-native/Libraries/LinkingIOS/RCTLinkingManager.mm');
-    expect(linking).toMatch(/userActivityDictionary\[@"UIApplicationLaunchOptionsUserActivityKey"\]/);
-    expect(scene).toMatch(/UIApplication\.LaunchOptionsKey\.userActivityType\.rawValue: NSUserActivityTypeBrowsingWeb,\s*"UIApplicationLaunchOptionsUserActivityKey": activity,/);
-    expect(scene).toMatch(/return \[\.userActivityDictionary: entry\]/);
+    // The link that launches the app waits in the inbox before React Native starts; none goes in its launch options.
+    expect(scene).toMatch(/connectionOptions\.userActivities\.forEach \{ continueLink\(\$0\) \}\s*let created = UIWindow\(windowScene: windowScene\)\s*self\.window = created\s*app\.runReactNative\(in: created\)/);
+    expect(app).toMatch(/startReactNative\(withModuleName: "QNetMobile", in: window, launchOptions: nil\)/);
     // A scene connecting while React Native already runs hands its link over as one that comes while the app runs.
     expect(scene).toMatch(/self\.window = running\s*connectionOptions\.userActivities\.forEach \{ continueLink\(\$0\) \}\s*return/);
+    // The module the JS reads, under Android's name and shape, built into the app.
+    const inbox = read('ios/QNetMobile/LinkInbox.swift');
+    expect(inbox).toMatch(/@objc\(QNetLinkInbox\)\s*class QNetLinkInbox: NSObject \{/);
+    expect(inbox).toMatch(/@objc\(pending:rejecter:\)/);
+    expect(inbox).toMatch(/@objc\(done:\)\s*func done\(_ entry: NSNumber\)/);
+    // Kept in UserDefaults, read once per process (a lazy static), a link back within 600 s of its arrival, older ones
+    // dropped and logged; every change written at once, so a done link never comes back (LinkInboxTest.kt for Android).
+    expect(inbox).toMatch(/private static var links: \[\(id: Int, url: String, at: Double\)\] = restore\(\)/);
+    expect(inbox).toMatch(/private static let life: Double = 600_000/);
+    expect(inbox).toMatch(/if age < 0 \|\| age > life \{\s*NSLog\("\[INFO\]\[LINK\] link_dropped reason=stale age_s=/);
+    expect(inbox).toMatch(/links\.append\(\(id: next, url: url, at: nowMs\(\)\)\)\s*next \+= 1\s*save\(links\)/);
+    expect(inbox).toMatch(/if QNetLinkInbox\.links\.count != before \{ QNetLinkInbox\.save\(QNetLinkInbox\.links\) \}/);
+    expect(inbox).toMatch(/NSLog\("\[WARN\]\[LINK\] link_dropped reason=full waiting=%ld", links\.count\)\s*return/);
+    const m = read('ios/QNetMobile/QNetLinkInbox.m');
+    expect(m).toMatch(/@interface RCT_EXTERN_MODULE\(QNetLinkInbox, NSObject\)/);
+    expect(m).toMatch(/RCT_EXTERN_METHOD\(pending:\(RCTPromiseResolveBlock\)resolve\s*rejecter:\(RCTPromiseRejectBlock\)reject\)/);
+    expect(m).toMatch(/RCT_EXTERN_METHOD\(done:\(nonnull NSNumber \*\)entry\)/);
+    const pbx = read('ios/QNetMobile.xcodeproj/project.pbxproj');
+    for (const f of ['LinkInbox.swift', 'QNetLinkInbox.m']) {
+      expect([f, pbx.includes(`/* ${f} in Sources */,`), pbx.includes(`path = QNetMobile/${f};`)]).toEqual([f, true, true]);
+    }
   });
 
-  it('the screen takes links only from the OS, through the parser', () => {
+  it('the screen takes links only from the link inbox, through the parser', () => {
     const screen = read('src/screens/WalletScreen.js');
+    // A request starts only from the inbox; the others close it, mark it decided or give its outcome, and a transfer link
+    // that opens closes a decided one.
     expect([...screen.matchAll(/setLinkRequest\(/g)].length).toBe(5);
+    expect([...screen.matchAll(/settled: false/g)].length).toBe(1);
     // A link the in-app browser handed over is refused first; then a transfer link (services/transferLink), then QNet Link.
-    expect(screen).toMatch(/LINK_FROM_OUTSIDE_MS\)\) \{[^}]*\}\s*if \(openTransferLink\(url\)\) return;\s*const link = parseLink\(url\);\s*if \(!link\) \{/);
-    expect(screen).toMatch(/takeInitialUrl\(Linking\)\.then\(receive\)/);
+    expect(screen).toMatch(/LINK_FROM_OUTSIDE_MS\);[\s\S]{0,500}if \(fromBrowser\) \{[^}]*\}\s*if \(openTransferLink\(url, release, waited\)\) return;\s*const link = parseLink\(url\);\s*if \(!link\) \{/);
+    expect(screen).toMatch(/useEffect\(\(\) => watchLinks\(\(url, release, \{ waited \}\) => \{/);
+    // Nothing in the app reads links another way: no launch URL, no event payload, no second keeper.
+    const src = path.join(__dirname, '..', 'src');
+    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true })
+      .flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
+    for (const f of [...walk(src), path.join(__dirname, '..', 'App.tsx'), path.join(__dirname, '..', 'index.js')]) {
+      const text = fs.readFileSync(f, 'utf8');
+      expect([f, /getInitialURL|takeInitialUrl|EarlyLink/.test(text)]).toEqual([f, false]);
+    }
+    expect(fs.existsSync(path.join(src, 'services', 'EarlyLink.js'))).toBe(false);
   });
 });

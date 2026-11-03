@@ -1,5 +1,5 @@
 // The activation on aiqnet.io/node/activate (src/lib/cabinet/flow.ts, activation.ts, payment-store.ts,
-// payment-key.ts; shared contracts C1 and C4): every stage move, QNet Wallet's signed reservation before the payment
+// payment-key.ts): every stage move, QNet Wallet's signed reservation before the payment
 // address shows, the request and the beneficiary rule (a check number only for a QR code when the page neither holds the
 // wallet nor has its signed reservation), the burn only under that wallet's reservation and bound to its light node by
 // the payment key's v2 owner bind before it is sent, the registration with the wallet's consent alone (from any
@@ -17,11 +17,11 @@ import {
   mayCancel, mayReturnLeftovers, receiptCode, refundDestination, withDropped,
 } from '../cabinet/flow.ts';
 import { checkRecord, listRecords, pruneReceipts, saveNew, updateRecord, RECEIPTS_KEPT } from '../cabinet/payment-store.ts';
-import { createPaymentKey, signOwnerBindV2 } from '../cabinet/payment-key.ts';
+import { createPaymentKey, paymentKeySupported, signOwnerBindV2 } from '../cabinet/payment-key.ts';
 import * as act from '../cabinet/activation.ts';
 import { consentBodyOf, postConsent } from '../cabinet/consent-submit.ts';
 import { activationCode, consentMessage, consentProof, encodeB64url, lightNodeId, walletHash } from '../qnet-link.ts';
-import { OWNER_BIND_V2_FEATURE, RETRY_CODES, ownerBindMessageV2, submitOutcome } from '../cabinet/registration.ts';
+import { ADMIT_HOLD_MS, OWNER_BIND_V2_FEATURE, RETRY_CODES, ownerBindMessageV2, submitOutcome } from '../cabinet/registration.ts';
 import { verifyConsent } from '../cabinet/consent-verify.ts';
 import { parseLegacyTransaction, signaturesValid } from '../solana-message.ts';
 import { SIGNATURE_FEE_LAMPORTS, TOKEN_ACCOUNT_RENT_LAMPORTS, classifyCabinetTx, refundShortfall } from '../cabinet/burn-tx.ts';
@@ -31,9 +31,12 @@ import { createNodeProxy } from '../../server/cabinet/node-proxy.ts';
 import { createActivationRegistry, createMemoryStore } from '../../server/cabinet/activation-registry.ts';
 import { createActivationApi } from '../../server/cabinet/activation-api.ts';
 import { checkBurn } from '../../server/cabinet/burn-scan.ts';
-import { OFFCHAIN_CONTEXT, SETTLE_AFTER_MS, burnRecordEnvelope, reservationMessage } from '../cabinet/burn-record.ts';
+import {
+  DROP_SETTLE_MS, OFFCHAIN_CONTEXT, RESERVATION_TTL_MS, SETTLE_AFTER_MS, SIGN_MARGIN_MS, burnRecordEnvelope, reservationMessage,
+} from '../cabinet/burn-record.ts';
 import { RpcError } from '../../server/solana-rpc.ts';
-import { TEXTS } from '../texts.ts';
+import { TEXTS } from './texts-helper.mjs';
+import { read } from './source.mjs';
 
 const V = JSON.parse(readFileSync(new URL('../../../../../../docs/protocols/light-node.vectors.json', import.meta.url), 'utf8'));
 const KAT = V.wallets.find((w) => w.name === 'kat-12');
@@ -60,6 +63,10 @@ const base = (over = {}) => ({
   burn: null, link: null, answer: null, submit: null, refund: null, ...over,
 });
 const BURN = { tx: V.node[0].burnTx, lastValidBlockHeight: 500, amount: 1500 };
+// The KAT wallet's own Solana address as the page holds it, which the server searches before it holds the wallet; and
+// the page's burn as the Activate page calls it, for the connected wallet with that address.
+const KAT_SOLANA = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk';
+const burnFor = (record, price, deps, wallet, solana = KAT_SOLANA) => act.burn(record, price, deps, wallet, solana);
 
 const { secretKey: KAT_SECRET, publicKey: KAT_PUB } = ml_dsa65.keygen(Uint8Array.from(Buffer.from(KAT.xi, 'hex')));
 const { secretKey: OTHER_SECRET, publicKey: OTHER_PUB } = ml_dsa65.keygen(Uint8Array.from(Buffer.from(OTHER.xi, 'hex')));
@@ -108,7 +115,7 @@ test('the stage machine: every move of the table and nothing else', () => {
   assert.deepEqual(TRANSITIONS.done, {});
   assert.deepEqual(TRANSITIONS.closing, {});
   assert.deepEqual(STAGES.filter((s) => mayCancel({ stage: s })), ['walletConfirm', 'funding', 'funded', 'burnFailed']);
-  // SITE-1: after 24 hours only an activation that burned nothing ends by itself (one still waiting for QNet Wallet is
+  // After 24 hours only an activation that burned nothing ends by itself (one still waiting for QNet Wallet is
   // deleted). A burn is the wallet's for good, so no stage with a burn has an expiry.
   assert.equal(KEY_LIFETIME_MS, 86_400_000);
   const expiring = STAGES.filter((s) => isExpired({ stage: s, createdAt: 0 }, KEY_LIFETIME_MS));
@@ -116,7 +123,7 @@ test('the stage machine: every move of the table and nothing else', () => {
   for (const s of expiring.slice(1)) assert.equal(TRANSITIONS[s].expire, 'closing', s);
   for (const s of STAGES.filter((x) => !expiring.includes(x) || x === 'walletConfirm')) assert.equal(TRANSITIONS[s].expire, undefined, s);
   assert.equal(isExpired({ stage: 'funded', createdAt: 0 }, KEY_LIFETIME_MS - 1), false);
-  // A2: after a final burn the user may send what is left back at once, whatever the time: the burn stays the wallet's
+  // After a final burn the user may send what is left back at once, whatever the time: the burn stays the wallet's
   // activation, and nothing gives a burn up any more.
   const giving = ['burnFinal', 'mismatch', 'consentStale', 'nodeExists', 'refused', 'otherBurn'];
   assert.deepEqual(STAGES.filter((s) => mayReturnLeftovers({ stage: s })), giving);
@@ -165,7 +172,7 @@ test('the beneficiary rule; the code names the wallet that signed the reservatio
   assert.equal(consentFresh(1000, 1000 + 86_400, true), true);
   assert.equal(consentFresh(1000, 1000 + 86_401, true), false);
   assert.equal(consentFresh(1301, 1000, true), false, 'no more than five minutes ahead');
-  // The code names the wallet the burn is for, never the payment address (owner rule, 26.09): the one that signed the
+  // The code names the wallet the burn is for, never the payment address: the one that signed the
   // reservation, so it shows as soon as the burn is final, and stays while what is left goes back.
   const code = activationCode('light', KAT.address, BURN.tx, 1500);
   assert.equal(receiptCode({ burn: BURN, submit: null }), null, 'a record from before, bound to no wallet');
@@ -227,13 +234,13 @@ test('the store: one record per address, moved in one step, receipts only withou
   assert.equal(checkRecord({ ...f, hold: { ...f.hold, pk: 'x' } }), null);
   assert.equal(checkRecord({ ...f, hold: { ...f.hold, time: '5' } }), null);
   assert.equal(checkRecord({ ...f, wallet: 'x' }), null);
-  // Dropped burns (SITE-11): absent in a record from before, else well formed and bounded.
+  // Dropped burns: absent in a record from before, else well formed and bounded.
   assert.ok(checkRecord({ ...f, dropped: [BURN] }));
   assert.equal(checkRecord({ ...f, dropped: [{ ...BURN, tx: 'x' }] }), null);
   assert.equal(checkRecord({ ...f, dropped: BURN }), null);
   assert.equal(checkRecord({ ...f, dropped: Array.from({ length: DROPPED_KEPT + 1 }, () => BURN) }), null);
   assert.deepEqual(withDropped({}, BURN, 5), [{ ...BURN, droppedAt: 5 }]);
-  // SITE-R3-01, SITE-R3-02: a read pass of its form, a drop time, and a receipt only in a finished activation.
+  // A read pass of its form, a drop time, and a receipt only in a finished activation.
   const PASS = 'A'.repeat(21) + '_';
   assert.ok(checkRecord({ ...f, stage: 'burnSent', burn: { ...BURN, pass: PASS } }));
   assert.equal(checkRecord({ ...f, stage: 'burnSent', burn: { ...BURN, pass: 'short' } }), null);
@@ -264,6 +271,38 @@ test('the store: one record per address, moved in one step, receipts only withou
   const blocked = { all: async () => { throw new Error('x'); }, update: async () => { throw new Error('x'); } };
   assert.deepEqual(await listRecords(blocked), []);
   assert.equal(await createPaymentKey({ wallet: KAT.address, area: blocked }), null);
+});
+
+// A phone browser without WebCrypto Ed25519 cannot keep the payment key: the payment step says so where its Start would
+// be, and no payment address is made, so nothing can be sent to one.
+test('without WebCrypto Ed25519 the payment step says the browser cannot keep the key, and no payment address is made', async () => {
+  const noEd25519 = {
+    generateKey: async (algorithm) => { throw new DOMException(`Unrecognized name: ${algorithm.name}`, 'NotSupportedError'); },
+    exportKey: async () => { throw new DOMException('No key', 'InvalidAccessError'); },
+  };
+  // Storage is there (IndexedDB in a secure context): only the key is missing.
+  const kept = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB');
+  globalThis.indexedDB = {};
+  try {
+    assert.equal(await paymentKeySupported(noEd25519), false);
+    assert.equal(await paymentKeySupported(subtle), true, 'the same browser with Ed25519 keeps one');
+  } finally {
+    if (kept) Object.defineProperty(globalThis, 'indexedDB', kept);
+    else delete globalThis.indexedDB;
+  }
+  const area = mapArea();
+  assert.equal(await createPaymentKey({ wallet: KAT.address, subtle: noEd25519, area }), null);
+  assert.equal(area.m.size, 0, 'no payment address is kept');
+  // The page shows nothing before the check answers; without the key the step says so in place of Start, the one way to a
+  // payment address.
+  const page = read('components/cabinet/NodeActivate.tsx');
+  assert.match(page, /void paymentKeySupported\(\)\.then\(setSupported\);/);
+  assert.match(page, /if \(!ready \|\| record === undefined \|\| supported === null\) \{\n\s*body = null;/);
+  assert.match(page, /\{!supported \? \(\n\s*<Failed>\{t\('act_unsupported'\)\}<\/Failed>\n\s*\) : setup\.phase === 'loading' \? \([\s\S]*?onClick=\{\(\) => void start\(\)\}/);
+  assert.equal(page.match(/void start\(\)/g).length, 1);
+  assert.equal(page.match(/createPaymentKey\(/g).length, 1);
+  assert.match(page, /const start = async \(\) => \{[\s\S]*?const created = await createPaymentKey\(\{ wallet: choice\.qnet \}\);/);
+  assert.equal(TEXTS.act_unsupported, 'This browser cannot keep a payment key safely. Update it or use another browser.');
 });
 
 // ---------------------------------------------------------------- the whole flow against the site's routes
@@ -396,7 +435,7 @@ async function fundedAt(now, network = 'testnet') {
   const s = site({ now });
   const deps = { fetchFn: s.fetchFn, area, subtle, now };
   const created = await createPaymentKey({ wallet: KAT.address, area, now: now() });
-  // A devnet release makes testnet records only (SITE-R3-01); a mainnet release's record is written as one.
+  // A devnet release makes testnet records only; a mainnet release's record is written as one.
   if (network !== created.network) await updateRecord(created.pub, (c) => ({ ...c, network }), area);
   const stored = async () => (await listRecords(area))[0] ?? null;
   await confirm(await stored(), deps);
@@ -410,7 +449,7 @@ async function fundedAt(now, network = 'testnet') {
 // The same, burned and final: the site's record holds the burn as the wallet's.
 async function burnedAt(now, network = 'testnet') {
   const s = await fundedAt(now, network);
-  const sent = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const sent = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(sent.outcome, 'sent');
   s.chain.statuses.set(sent.record.burn.tx, { err: null, confirmationStatus: 'finalized' });
   const r = await act.settleBurn(await s.stored(), s.deps);
@@ -420,7 +459,7 @@ async function burnedAt(now, network = 'testnet') {
 const burnOf = (chain) => classifyCabinetTx(parseLegacyTransaction(Uint8Array.from(Buffer.from(chain.sent.at(-1), 'base64'))));
 const recordOf = async (s, wallet = KAT.address) => (await s.chain.activation.get(new Request(`https://aiqnet.io/api/cabinet/activation/${wallet}`, { headers: { host: 'aiqnet.io' } }), wallet)).json();
 
-// A1 (owner, 29.09): the payment address exists for the wallet QNet Wallet confirms, and only its signed reservation
+// The payment address exists for the wallet QNet Wallet confirms, and only its signed reservation
 // holds the wallet at the site; a decline, an error, another wallet's answer or an expired request deletes the record,
 // whose address was never shown.
 test('QNet Wallet confirms the wallet first: its signed reservation is the hold; anything else deletes the record', async () => {
@@ -501,7 +540,7 @@ test('flow: confirmed, funded, burned under the reservation with the v2 bind, it
   assert.equal(r.stage, 'funded');
 
   // Two tabs press Burn: one burn is sent, the other tab is told the step is taken.
-  const [x, y] = await Promise.all([act.burn(await stored(), 1500, deps, KAT.address), act.burn(await stored(), 1500, deps, KAT.address)]);
+  const [x, y] = await Promise.all([burnFor(await stored(), 1500, deps, KAT.address), burnFor(await stored(), 1500, deps, KAT.address)]);
   assert.deepEqual([x.outcome, y.outcome].sort(), ['busy', 'sent']);
   assert.equal(chain.sent.length, 1);
   const tx = parseLegacyTransaction(Uint8Array.from(Buffer.from(chain.sent[0], 'base64')));
@@ -562,7 +601,7 @@ test('flow: confirmed, funded, burned under the reservation with the v2 bind, it
   assert.equal(r.stage, 'submitted', 'waits for the chain');
   chain.registered.add(KAT.nodeId);
   r = await act.followRegistration(await stored(), deps);
-  assert.equal(r.stage, 'submitted', 'SITE-10: listed, but the archive does not show whose burn yet');
+  assert.equal(r.stage, 'submitted', 'listed, but the archive does not show whose burn yet');
   assert.ok(r.key);
   chain.archive.set(KAT.address, r.burn.tx);
   r = await act.followRegistration(await stored(), deps);
@@ -574,7 +613,7 @@ test('flow: confirmed, funded, burned under the reservation with the v2 bind, it
   assert.equal(receiptCode(await stored()), code);
 });
 
-// A2 (owner, 29.09): after the burn the payment key only sends back what is left; the registration is finished from any
+// After the burn the payment key only sends back what is left; the registration is finished from any
 // browser or device with a fresh consent from QNet Wallet, and the site completes it from its record.
 test('what is left goes back at once; another browser, with no payment key, finishes the registration with the consent alone', async () => {
   let t = 1_790_000_000_000;
@@ -614,7 +653,11 @@ test('what is left goes back at once; another browser, with no payment key, fini
   const otherConsent = appAnswer(burnTx, ts, OTHER, OTHER_SECRET, OTHER_PUB).consent;
   assert.deepEqual(await postConsent(consentBodyOf(OTHER.address, otherConsent, burnTx, 1500), other), { result: 'refused', code: 'no_record' });
   assert.equal(s.chain.submitted.length, before);
+  // The same consent again while its admission holds: that admission, nothing relayed (QNet Wallet sent it too).
+  assert.deepEqual(await postConsent(body, other), { result: 'admitted', txHash: 'ab'.repeat(32) });
+  assert.equal(s.chain.submitted.length, before);
   // The network's one-node rule: refused for good.
+  t += ADMIT_HOLD_MS;
   s.chain.nodeAnswer = { success: false, code: 'wallet_has_node', error: 'This wallet already has a node on the QNet network: one wallet, one node' };
   assert.deepEqual(await postConsent(body, other), { result: 'refused', code: 'wallet_has_node' });
 });
@@ -649,10 +692,12 @@ test('flow A: the button on this device needs no check; the other paths keep the
   r = await act.reviewConsent(await act.takeAnswer(r, appAnswer(r.burn.tx, Math.floor(t / 1000)), 1, r.link.request, s.deps), s.deps);
   assert.equal(r.stage, 'beneficiaryConfirmed');
 
-  // The numbers differ: stop, and a new request is opened for the same burn.
+  // The numbers differ: stop, and a new request is opened for the same burn. A consent that waits for the user's check
+  // is not looked at while the page is hidden (act.runsHidden).
   s = await legacy();
   r = await act.openLink(await s.stored(), true, null, s.deps);
   r = await act.takeAnswer(r, appAnswer(r.burn.tx, Math.floor(t / 1000)), 1, r.link.request, s.deps);
+  assert.deepEqual([r.stage, r.link.request.check, act.runsHidden(r)], ['consentVerified', true, false]);
   r = await act.answerCheck(await act.reviewConsent(r, s.deps), false, s.deps);
   assert.equal(r.stage, 'mismatch');
   r = await act.relink(r, s.deps);
@@ -732,7 +777,60 @@ test('flow A: the button on this device needs no check; the other paths keep the
   assert.equal(r.submit.txHash, 'ab'.repeat(32));
 });
 
-// SITE-R1-04: for a QR request naming a held wallet, the check number was skipped on the 64-bit hash match alone. The
+// A user who consents in QNet Wallet may stay there: the registration's own steps run while the page's tab is hidden,
+// the steps that wait on Solana or the chain do not, and the same consent QNet Wallet sends itself reaches no node twice.
+test('an answer read while the tab is hidden is submitted at once; QNet Wallet\'s own submit of the same consent is one registration', async () => {
+  let t = 1_790_000_000_000;
+  const now = () => t;
+  // What a hidden tab's driver runs (NodeActivate.tsx gates each step on act.runsHidden).
+  const hidden = async (s, r) => {
+    for (let i = 0; i < 6 && act.runsHidden(r); i += 1) {
+      if (r.stage === 'consentVerified') r = await act.reviewConsent(r, s.deps);
+      else if (r.stage === 'beneficiaryConfirmed') r = await act.register(r, s.deps);
+      else r = await act.followRegistration(r, s.deps);
+    }
+    return r;
+  };
+  const answered = async (s) => {
+    const r = await act.openLink(await s.stored(), false, null, s.deps);
+    assert.equal(act.runsHidden(r), false, 'the answer itself is read by the relay poll, which runs hidden anyway');
+    return { r, answer: appAnswer(r.burn.tx, Math.floor(t / 1000)) };
+  };
+
+  // The page alone (a QNet Wallet that does not submit): submitted while hidden; once admitted it follows the chain
+  // only while shown.
+  let s = await burnedAt(now);
+  let { r, answer } = await answered(s);
+  r = await hidden(s, await act.takeAnswer(r, answer, 1, r.link.request, s.deps));
+  assert.deepEqual([r.stage, r.submit.txHash, s.chain.submitted.length], ['submitted', 'ab'.repeat(32), 1]);
+  assert.equal(act.runsHidden(r), false);
+
+  // QNet Wallet submitted the consent first: the page's submit of it is answered with that admission, no second submit.
+  s = await burnedAt(now);
+  ({ r, answer } = await answered(s));
+  assert.deepEqual(await postConsent(consentBodyOf(KAT.address, answer.consent, r.burn.tx, 1500), { fetchFn: s.fetchFn }), { result: 'admitted', txHash: 'ab'.repeat(32) });
+  r = await hidden(s, await act.takeAnswer(r, answer, 1, r.link.request, s.deps));
+  assert.deepEqual([r.stage, r.submit.txHash, s.chain.submitted.length], ['submitted', 'ab'.repeat(32), 1]);
+
+  // A retry is still the submit step: the hidden tab submits again after the delay, until a node admits it.
+  s = await burnedAt(now);
+  ({ r, answer } = await answered(s));
+  s.chain.nodeAnswer = { success: false, error: 'burn-attestation quorum not yet reached; retry shortly' };
+  r = await hidden(s, await act.takeAnswer(r, answer, 1, r.link.request, s.deps));
+  assert.deepEqual([r.stage, r.submit.lastCode, act.runsHidden(r)], ['submitted', 'quorum_pending', true]);
+  t += act.retryDelayMs(r.submit.attempts) + 1;
+  s.chain.nodeAnswer = null;
+  r = await hidden(s, await s.stored());
+  assert.deepEqual([r.submit.txHash, s.chain.submitted.length, act.runsHidden(r)], ['ab'.repeat(32), 2, false]);
+
+  // Every step that waits on Solana, the chain or the user runs only while the page is shown.
+  for (const stage of ['walletConfirm', 'funding', 'funded', 'burnSent', 'burnUnknown', 'burnFinal', 'linkOpen', 'mismatch', 'consentStale', 'refused', 'onChain', 'leftovers', 'closing', 'done']) {
+    assert.equal(act.runsHidden({ stage, submit: null }), false, stage);
+  }
+  assert.match(read('components/cabinet/NodeActivate.tsx'), /const run = \(\) => \{\s*if \(document\.visibilityState === 'hidden' && !act\.runsHidden\(record\)\) return;/);
+});
+
+// For a QR request naming a held wallet, the check number was skipped on the 64-bit hash match alone. The
 // answer's wallet must now be the named one by its full address, or nothing is submitted.
 test('a named wallet is confirmed by its full address, never by the hash alone', async () => {
   const t = 1_790_000_000_000;
@@ -771,7 +869,7 @@ test('a named wallet is confirmed by its full address, never by the hash alone',
   assert.equal(r.link.named, KAT.address, 'the new request names the burn\'s wallet only');
 });
 
-// SITE-R1-05: a wallet whose light node is being recorded: the page waits and submits nothing; once the network lists
+// A wallet whose light node is being recorded: the page waits and submits nothing; once the network lists
 // the node, the archive says whose burn registered it.
 test('a node being recorded: the page waits and submits nothing; listed with this burn, it is recorded', async () => {
   let t = 1_790_000_000_000;
@@ -801,7 +899,7 @@ test('a node being recorded: the page waits and submits nothing; listed with thi
   assert.equal(s.chain.submitted.length, 0);
 });
 
-// SITE-R4-01, through the steps: the wallet has a light node, and the only genesis nodes the cabinet reaches are behind
+// Through the steps: the wallet has a light node, and the only genesis nodes the cabinet reaches are behind
 // the network (`authoritative: false`) and answer "not registered". Nothing is known until nodes at the network's
 // height answer: the page submits nothing meanwhile, then sees the node.
 test('genesis nodes behind the network never clear a wallet: nothing is submitted until nodes at its height answer', async () => {
@@ -843,7 +941,7 @@ test('genesis nodes behind the network never clear a wallet: nothing is submitte
   assert.equal(s.chain.submitted.length, 0);
 });
 
-// SITE-R1-06: the page asks the browser to keep its storage at the key, the burn and its finality, and never waits for
+// The page asks the browser to keep its storage at the key, the burn and its finality, and never waits for
 // the answer; its text says a browser may delete a site's data after a week unvisited.
 test('the page asks the browser to keep its storage at the key, the burn and its finality, and never waits for it', async () => {
   let t = 1_790_000_000_000;
@@ -863,7 +961,7 @@ test('the page asks the browser to keep its storage at the key, the burn and its
   s.chain.balances.set(created.pub, { sol: 2_000_000, oneDev: 1_500_000_000 });
   await act.checkFunding(await stored(), 1500, deps);
   t += 1000;
-  const burned = await act.burn(await stored(), 1500, deps, KAT.address);
+  const burned = await burnFor(await stored(), 1500, deps, KAT.address);
   assert.equal(burned.outcome, 'sent');
   await Promise.resolve();
   assert.equal(asked.length, 2, 'asked again once the burn is recorded as sent');
@@ -891,32 +989,35 @@ test('a burn that never landed goes back to funded; a refused send too; a failed
   const { deps, stored } = s;
   // Solana refuses the burn before it is forwarded: back to funded, nothing burned.
   s.chain.refuseSend = true;
-  const refused = await act.burn(await stored(), 1500, deps, KAT.address);
+  const refused = await burnFor(await stored(), 1500, deps, KAT.address);
   assert.equal(refused.outcome, 'refused');
   assert.equal(refused.record.stage, 'funded');
   assert.equal(refused.record.burn, null);
   s.chain.refuseSend = false;
   // A layer in front of the endpoint may have forwarded it all the same: nothing new is signed until it is proven never
-  // landed (SITE-R3-02), past its last valid block and DROP_SETTLE_MS after it was dropped.
-  assert.equal((await act.burn(await stored(), 1500, deps, KAT.address)).outcome, 'checking');
+  // landed, past its last valid block and DROP_SETTLE_MS after it was dropped.
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'checking');
   assert.equal(s.chain.sent.length, 0);
   s.chain.height = 501;
-  assert.equal((await act.burn(await stored(), 1500, deps, KAT.address)).outcome, 'checking', 'expired, but read too soon after the drop');
-  t += act.DROP_SETTLE_MS;
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'checking', 'expired, but read too soon after the drop');
+  t += DROP_SETTLE_MS;
   s.chain.height = 400;
-  assert.equal((await act.burn(await stored(), 1500, deps, KAT.address)).outcome, 'checking', 'not past its last valid block');
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'checking', 'not past its last valid block');
   s.chain.height = 501;
   t += 3000;
   // Proven here, but the site's registry still holds the wallet for the burn it announced until it can no longer land
-  // (SETTLE_AFTER_MS after the announce): the old reservation no longer signs, and a new one is refused meanwhile.
-  const lost = await act.burn(await stored(), 1500, deps, KAT.address);
+  // (SETTLE_AFTER_MS after the announce) and two of its reads DROP_SETTLE_MS apart find it nowhere: the old reservation
+  // no longer signs, and a new one is refused meanwhile.
+  const lost = await burnFor(await stored(), 1500, deps, KAT.address);
   assert.equal(lost.outcome, 'reservation');
   assert.deepEqual(lost.record.dropped, [], 'forgotten once proven');
   assert.equal(lost.record.reservation, undefined);
-  assert.equal((await act.burn(await stored(), 1500, deps, KAT.address)).outcome, 'reserved');
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'reserved');
   assert.equal(s.chain.sent.length, 0);
   t += SETTLE_AFTER_MS;
-  let r = (await act.burn(await stored(), 1500, deps, KAT.address)).record;
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'reserved', 'one read that finds it nowhere');
+  t += DROP_SETTLE_MS;
+  let r = (await burnFor(await stored(), 1500, deps, KAT.address)).record;
   assert.equal(r.stage, 'burnSent');
   assert.equal(s.chain.sent.length, 1);
   s.chain.height = 400;
@@ -925,10 +1026,12 @@ test('a burn that never landed goes back to funded; a refused send too; a failed
   r = await act.settleBurn(await stored(), deps);
   assert.equal(r.stage, 'funded');
   assert.equal(r.burn, null);
-  assert.equal(r.dropped.length, 1, 'kept aside for a second look (SITE-11)');
-  assert.equal((await act.burn(await stored(), 1500, deps, KAT.address)).outcome, 'checking');
+  assert.equal(r.dropped.length, 1, 'kept aside for a second look');
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'checking');
   t += SETTLE_AFTER_MS;
-  r = (await act.burn(await stored(), 1500, deps, KAT.address)).record;
+  assert.equal((await burnFor(await stored(), 1500, deps, KAT.address)).outcome, 'reserved', 'the registry\'s first read that finds it nowhere');
+  t += DROP_SETTLE_MS;
+  r = (await burnFor(await stored(), 1500, deps, KAT.address)).record;
   assert.equal(r.stage, 'burnSent');
   s.chain.statuses.set(r.burn.tx, { err: { InstructionError: [2, 'x'] }, confirmationStatus: 'confirmed' });
   // The same key, blockhash and amount sign the same burn again: its status read a moment ago is kept TX_CACHE_MS.
@@ -944,7 +1047,7 @@ test('a burn that never landed goes back to funded; a refused send too; a failed
   assert.deepEqual(await listRecords(deps.area), []);
 });
 
-// SITE-R2-04: a JSON-RPC error means the endpoint did not take the burn, but a layer in front of it may have forwarded
+// A JSON-RPC error means the endpoint did not take the burn, but a layer in front of it may have forwarded
 // it. It is kept aside like a burn that expired unseen, and taken back if it lands, instead of being forgotten while the
 // page offers the burn again.
 test('a burn refused with a JSON-RPC error is kept aside and taken back when it lands after all', async () => {
@@ -952,7 +1055,7 @@ test('a burn refused with a JSON-RPC error is kept aside and taken back when it 
   const now = () => t;
   const s = await fundedAt(now);
   s.chain.refuseSend = true;
-  const refused = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const refused = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(refused.outcome, 'refused');
   assert.equal(refused.record.stage, 'funded');
   assert.equal(refused.record.burn, null);
@@ -969,13 +1072,13 @@ test('a burn refused with a JSON-RPC error is kept aside and taken back when it 
   // The site's own check (400) forwarded nothing: nothing is kept aside for it.
   const own = await fundedAt(now);
   const deps400 = { ...own.deps, fetchFn: async (url, init) => (url === '/api/cabinet/send' ? new Response('{"error":"invalid_request"}', { status: 400 }) : own.fetchFn(url, init)) };
-  const rejected = await act.burn(await own.stored(), 1500, deps400, KAT.address);
+  const rejected = await burnFor(await own.stored(), 1500, deps400, KAT.address);
   assert.equal(rejected.outcome, 'refused');
   assert.equal(rejected.record.stage, 'funded');
   assert.equal((rejected.record.dropped ?? []).length, 0);
 });
 
-// SITE-R2-05: the price is read again just before the burn signs; the page burns only what the network asks now.
+// The price is read again just before the burn signs; the page burns only what the network asks now.
 test('the burn reads the price again and signs nothing when the network asks another amount', async () => {
   let t = 1_790_000_000_000;
   const now = () => t;
@@ -983,22 +1086,22 @@ test('the burn reads the price again and signs nothing when the network asks ano
   // The price stepped down while the tab stood open (past the site's 15 s cache of it).
   s.chain.quote = { phase: 1, cost: 1350 };
   t += 15_000;
-  const changed = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const changed = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(changed.outcome, 'price_changed');
   assert.deepEqual(changed.quote, { phase: 1, cost: 1350 });
   assert.equal(changed.record.stage, 'funded');
   assert.equal(s.chain.sent.length, 0, 'nothing signed or sent');
   // At the amount the network asks it burns that, the rest going back later as leftovers.
-  const burned = await act.burn(await s.stored(), 1350, s.deps, KAT.address);
+  const burned = await burnFor(await s.stored(), 1350, s.deps, KAT.address);
   assert.equal(burned.outcome, 'sent');
   assert.deepEqual(burnOf(s.chain), { kind: 'burn', payer: s.created.pub, whole: 1350 });
   // Phase 2 has no burn; an unreadable price burns nothing either.
   const p2 = await fundedAt(now);
   p2.chain.quote = { phase: 2 };
-  assert.equal((await act.burn(await p2.stored(), 1500, p2.deps, KAT.address)).outcome, 'price_changed');
+  assert.equal((await burnFor(await p2.stored(), 1500, p2.deps, KAT.address)).outcome, 'price_changed');
   const none = await fundedAt(now);
   none.chain.quote = null;
-  assert.equal((await act.burn(await none.stored(), 1500, none.deps, KAT.address)).outcome, 'price_unavailable');
+  assert.equal((await burnFor(await none.stored(), 1500, none.deps, KAT.address)).outcome, 'price_unavailable');
   assert.equal(p2.chain.sent.length + none.chain.sent.length, 0);
   // The page shows the new amount before the user burns again, and reads the price whenever it is shown again.
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
@@ -1007,7 +1110,7 @@ test('the burn reads the price again and signs nothing when the network asks ano
   assert.equal(TEXTS.act_price_changed, 'QNet Blockchain now asks another amount for an activation. Nothing was burned: check the new amount, then press Burn again.');
 });
 
-// SITE-R2-10 and A1: the burn is for the wallet that signed the reservation, only while it is the connected one, and
+// The burn is for the wallet that signed the reservation, only while it is the connected one, and
 // only while the site finds no node, no burn and no check that did not answer for it.
 test('no burn for another wallet than the one that signed, for a wallet with a node, or without a signed reservation', async () => {
   let t = 1_790_000_000_000;
@@ -1016,41 +1119,57 @@ test('no burn for another wallet than the one that signed, for a wallet with a n
   s.chain.registered.add(KAT.nodeId);
   assert.equal(await act.walletHasNode(KAT.address, s.deps), true);
   assert.equal(await act.walletHasNode(OTHER.address, s.deps), false);
-  const refused = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const refused = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(refused.outcome, 'has_node');
   assert.equal(refused.record.stage, 'funded');
   assert.equal(s.chain.sent.length, 0);
-  // Another connected wallet than the one that signed, or none: nothing (A1).
-  assert.equal((await act.burn(await s.stored(), 1500, s.deps, OTHER.address)).outcome, 'no_wallet');
-  assert.equal((await act.burn(await s.stored(), 1500, s.deps, null)).outcome, 'no_wallet');
+  // Another connected wallet than the one that signed, or none: nothing.
+  assert.equal((await burnFor(await s.stored(), 1500, s.deps, OTHER.address)).outcome, 'no_wallet');
+  assert.equal((await burnFor(await s.stored(), 1500, s.deps, null)).outcome, 'no_wallet');
+  // Without the wallet's own Solana address, which may hold its burn already, nothing is reserved: the page asks for
+  // none, and the server refuses one.
+  const bare = await fundedAt(now);
+  const lines = [];
+  const log = console.log;
+  console.log = (...line) => lines.push(line.join(' '));
+  try {
+    assert.equal((await act.burn(await bare.stored(), 1500, bare.deps, KAT.address)).outcome, 'no_solana');
+    assert.deepEqual(lines, [], 'the page asks for no reservation');
+    assert.equal((await recordOf(bare)).state, 'none', 'nothing held');
+    assert.deepEqual(await act.reserveWallet(KAT.address, (await bare.stored()).pub, 1500, null, (await bare.stored()).hold, bare.deps), { ok: false, outcome: 'no_solana' });
+    assert.deepEqual(lines, ['[INFO][CABINET] reserve_refused reason=no_solana'], 'a request without it is the server\'s refusal');
+  } finally {
+    console.log = log;
+  }
+  assert.equal((await recordOf(bare)).state, 'none');
   // A super node of the wallet counts too (one wallet, one node).
   const sup = await fundedAt(now);
   sup.chain.superOf = new Map([[KAT.address, 'super_node_0123456789abcdef']]);
-  assert.equal((await act.burn(await sup.stored(), 1500, sup.deps, KAT.address)).outcome, 'has_node');
+  assert.equal((await burnFor(await sup.stored(), 1500, sup.deps, KAT.address)).outcome, 'has_node');
   // A funded record from before, with no signed reservation: QNet Wallet is asked first.
   const old = await fundedAt(now);
   await updateRecord(old.created.pub, (c) => ({ ...c, hold: undefined }), old.deps.area);
-  assert.equal((await act.burn(await old.stored(), 1500, old.deps, KAT.address)).outcome, 'reconfirm');
+  assert.equal((await burnFor(await old.stored(), 1500, old.deps, KAT.address)).outcome, 'reconfirm');
   // A network that cannot say whether the wallet has a node: nothing is burned (no fail-open any more).
   const blind = await fundedAt(now);
   blind.chain.walletNode = null;
-  assert.equal((await act.burn(await blind.stored(), 1500, blind.deps, KAT.address)).outcome, 'check_unavailable');
+  assert.equal((await burnFor(await blind.stored(), 1500, blind.deps, KAT.address)).outcome, 'check_unavailable');
   // The wallet has its burn already (the site's record, or a burn found on its Solana address): nothing more.
   const found = await fundedAt(now);
   found.chain.scan = { complete: true, unusable: false, burns: [{ burnTx: BURN.tx, nodeType: 'super', burnAmount: 1500 }] };
-  assert.equal((await act.burn(await found.stored(), 1500, found.deps, KAT.address, V.burner.address)).outcome, 'has_burn');
+  assert.equal((await burnFor(await found.stored(), 1500, found.deps, KAT.address, V.burner.address)).outcome, 'has_burn');
   assert.equal(blind.chain.sent.length + found.chain.sent.length + old.chain.sent.length + sup.chain.sent.length, 0);
   // The signed reservation too old for the server (a day and more): QNet Wallet is asked again, the address stays, and
   // the new hold burns.
   const late = await fundedAt(now);
   t += 87_001_000;
-  const stale = await act.burn(await late.stored(), 1500, late.deps, KAT.address);
+  const stale = await burnFor(await late.stored(), 1500, late.deps, KAT.address);
   assert.equal(stale.outcome, 'reconfirm');
   assert.equal(stale.record.stage, 'funded');
   assert.equal(late.chain.sent.length, 0);
   const renewed = await act.takeHold(await late.stored(), reserveAnswer(late.created.pub, Math.floor(t / 1000)), act.reserveRequest(late.created), late.deps);
   assert.equal(renewed.outcome, 'confirmed');
-  assert.equal((await act.burn(await late.stored(), 1500, late.deps, KAT.address)).outcome, 'sent');
+  assert.equal((await burnFor(await late.stored(), 1500, late.deps, KAT.address)).outcome, 'sent');
   // The page burns for the chosen wallet, with its Solana address for the server's search, only while every source of
   // it says none, and makes an address for it only then.
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
@@ -1061,7 +1180,7 @@ test('no burn for another wallet than the one that signed, for a wallet with a n
   assert.match(TEXTS.act_wallet_has_node, /^The chosen wallet already has a node, or one being recorded\. One wallet, one node of either type/);
 });
 
-// H-4 (06.10): the payment key signs only the owner bind v2, which the nodes take from the one-wallet-one-node gate on;
+// The payment key signs only the owner bind v2, which the nodes take from the one-wallet-one-node gate on;
 // before, a burn would end in a refused registration. No address is made and no burn signed until both settling genesis
 // nodes list `owner_bind_v2`; a node that answers `bind_v2_pending` is a calm retry, never a refusal.
 test('payment activation opens only once both settling genesis nodes list owner_bind_v2; bind_v2_pending is a retry', async () => {
@@ -1073,7 +1192,7 @@ test('payment activation opens only once both settling genesis nodes list owner_
   // Before the gate the nodes do not list it: nothing is reserved, signed or sent, the record stays funded.
   s.chain.features = ['consent_24h', 'bind_v2'];
   assert.equal(await act.paymentOpen(KAT.address, s.deps), false);
-  const closed = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const closed = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(closed.outcome, 'not_open');
   assert.equal(closed.record.stage, 'funded');
   assert.equal(closed.record.reservation, undefined, 'no reservation was taken');
@@ -1084,11 +1203,11 @@ test('payment activation opens only once both settling genesis nodes list owner_
   const fetchFn = blind.deps.fetchFn;
   const deps = { ...blind.deps, fetchFn: (url, init) => (String(url).startsWith('/api/cabinet/node/') ? Promise.resolve(new Response('{}', { status: 503 })) : fetchFn(url, init)) };
   assert.equal(await act.paymentOpen(KAT.address, deps), null);
-  assert.equal((await act.burn(await blind.stored(), 1500, deps, KAT.address)).outcome, 'check_unavailable');
+  assert.equal((await burnFor(await blind.stored(), 1500, deps, KAT.address)).outcome, 'check_unavailable');
   assert.equal(blind.chain.sent.length, 0);
   // Once listed, the same record burns.
   s.chain.features = ['consent_24h', 'owner_bind_v2'];
-  assert.equal((await act.burn(await s.stored(), 1500, s.deps, KAT.address)).outcome, 'sent');
+  assert.equal((await burnFor(await s.stored(), 1500, s.deps, KAT.address)).outcome, 'sent');
   // The node's answer before the gate is a retry with a calm note, never the terminal refusal.
   assert.ok(RETRY_CODES.includes('bind_v2_pending'));
   assert.deepEqual(submitOutcome(200, { success: false, code: 'bind_v2_pending', error: 'owner bind v2 not active yet' }), { result: 'retry', code: 'bind_v2_pending' });
@@ -1106,15 +1225,15 @@ test('payment activation opens only once both settling genesis nodes list owner_
   const page = readFileSync(new URL('../../components/cabinet/NodeActivate.tsx', import.meta.url), 'utf8');
   assert.match(page, /not_open: 'act_payment_not_open',/);
   assert.match(page, /const paymentClosed = lightStatus\.state\.phase === 'ok' && !lightStatus\.state\.value\.features\.includes\(OWNER_BIND_V2_FEATURE\);/);
-  assert.match(page, /\) : paymentClosed \? \(\s*<p className="note">\{t\('act_payment_not_open'\)\}<\/p>\s*\) : \(/);
+  assert.match(page, /\) : paymentClosed \? \(\s*<p className="note">\{say\('act_payment_not_open'\)\}<\/p>\s*\) : \(/);
   assert.match(page, /disabled=\{working \|\| paymentClosed\}>\{t\('act_burn'\)\}/);
-  assert.match(page, /\{stage === 'submitted' && record\.submit\?\.lastCode === 'bind_v2_pending' && <p className="note">\{t\('act_bind_v2_pending'\)\}<\/p>\}/);
+  assert.match(page, /\{stage === 'submitted' && record\.submit\?\.lastCode === 'bind_v2_pending' && <p className="note">\{say\('act_bind_v2_pending'\)\}<\/p>\}/);
   const finish = readFileSync(new URL('../../components/cabinet/NextSteps.tsx', import.meta.url), 'utf8');
   assert.match(finish, /if \(outcome\.code === 'bind_v2_pending'\) return null;/);
-  assert.match(finish, /\{outcome\?\.result === 'retry' && outcome\.code === 'bind_v2_pending' && <p className="note">\{t\('act_bind_v2_pending'\)\}<\/p>\}/);
+  assert.match(finish, /\{outcome\?\.result === 'retry' && outcome\.code === 'bind_v2_pending' && <p className="note">\{say\('act_bind_v2_pending'\)\}<\/p>\}/);
 });
 
-// SITE-R2-02: a refund that cannot pay for itself is never signed (Solana would refuse it at every try); the page learns
+// A refund that cannot pay for itself is never signed (Solana would refuse it at every try); the page learns
 // what the payment address lacks, shows the address and that amount, and offers no "Leave it" while 1DEV would stay.
 test('what is left that cannot pay for its own refund: nothing is signed, the page learns the SOL it lacks', async () => {
   let t = 1_790_000_000_000;
@@ -1168,7 +1287,7 @@ test('what is left that cannot pay for its own refund: nothing is signed, the pa
   // address short of SOL is sent to by itself once the SOL arrives.
   const steps = readFileSync(new URL('../../components/cabinet/ActivateSteps.tsx', import.meta.url), 'utf8');
   assert.match(steps, /<figure className="cab-pay-qr"><QrCode text=\{pub\} label=\{t\('act_address_qr'\)\} size=\{196\} \/><\/figure>\s*<div className="cab-manual-t">\s*<p className="rq-failed">\{t\(ACTIVATION_NETWORK === 'testnet' \? 'act_refund_short_testnet' : 'act_refund_short', \{ sol: formatUnits\(short, SOL_DECIMALS\) \}\)\}<\/p>/);
-  // Test SOL comes from the faucet or the user's wallet, never "from any wallet or exchange" (XC-10).
+  // Test SOL comes from the faucet or the user's wallet, never "from any wallet or exchange".
   assert.doesNotMatch(TEXTS.act_refund_short_testnet, /exchange/);
   assert.match(TEXTS.act_refund_short_testnet, /Send \{sol\} test SOL more to it from your wallet \(the Testnet page's faucet gives test SOL\)/);
   assert.match(steps, /const mayLeave = !\(lacking && \(balance === null \|\| balance\.oneDev > 0n\)\);\s*if \(leaving && mayLeave\) \{/);
@@ -1202,7 +1321,7 @@ test('the key lives 24 hours before a burn; after it, only until what is left ha
     return act.settleLeftovers(await s.stored(), DEST, s.deps);
   };
 
-  // SITE-1: a burn never ends by the clock. Every stage after it keeps its key past 24 hours.
+  // A burn never ends by the clock. Every stage after it keeps its key past 24 hours.
   for (const stage of ['burnFinal', 'linkOpen', 'consentVerified', 'mismatch', 'consentStale', 'nodeExists', 'beneficiaryConfirmed', 'refused']) {
     const k = await setup('testnet', { stage, burn: BURN });
     t += KEY_LIFETIME_MS + 1;
@@ -1283,7 +1402,7 @@ test('the key lives 24 hours before a burn; after it, only until what is left ha
   assert.equal(got.outcome, 'final');
   assert.equal(got.record.stage, 'done');
   assert.equal(got.record.key, null);
-  assert.equal(got.record.refund, null, 'the receipt keeps no refund (SITE-R3-03)');
+  assert.equal(got.record.refund, null, 'the receipt keeps no refund');
   assert.deepEqual(got.record.receipt, { qnet: KAT.address, nodeId: KAT.nodeId });
   assert.equal(receiptCode(await s.stored()), activationCode('light', KAT.address, BURN.tx, 1500));
   // "Leave it", confirmed: the key goes all the same.
@@ -1292,7 +1411,7 @@ test('the key lives 24 hours before a burn; after it, only until what is left ha
   assert.equal(r.stage, 'done');
   assert.equal(r.key, null);
 
-  // SITE-1: a mainnet address with nothing on it at 24 hours keeps its key: an exchange's transfer may still be on
+  // A mainnet address with nothing on it at 24 hours keeps its key: an exchange's transfer may still be on
   // its way. It goes back once it lands; only the user deletes the key of an empty address.
   s = await setup('mainnet', { stage: 'funding' });
   s.chain.balances.set(s.created.pub, { sol: 0, oneDev: null });
@@ -1319,7 +1438,7 @@ test('the key lives 24 hours before a burn; after it, only until what is left ha
   t += KEY_LIFETIME_MS;
   assert.deepEqual(await act.settleLeftovers(await act.expire(await s.stored(), s.deps), DEST, s.deps), { outcome: 'nothing', record: null });
 
-  // SITE-3: the page asks before "Leave it" or "Delete the payment address" deletes a key, naming what is lost; sending
+  // The page asks before "Leave it" or "Delete the payment address" deletes a key, naming what is lost; sending
   // what is left back after a burn loses nothing and says so.
   const steps = readFileSync(new URL('../../components/cabinet/ActivateSteps.tsx', import.meta.url), 'utf8');
   assert.match(steps, /const warning = empty \|\| !amounts \? t\('act_closing_delete_warn'\) : t\('act_refund_leave_warn', amounts\);\s*return <ConfirmLoss warning=\{warning\} confirm=\{t\('act_delete_key'\)\} busy=\{busy\} onConfirm=\{onLeave\} onBack=\{\(\) => setLeaving\(false\)\} \/>;/);
@@ -1333,7 +1452,7 @@ test('the key lives 24 hours before a burn; after it, only until what is left ha
   assert.doesNotMatch(TEXTS.act_leftovers, /go back/, 'no promise the page does not keep');
 });
 
-test('SITE-10: a node the network lists with another burn is not this burn\'s registration; only what is left goes back', async () => {
+test('a node the network lists with another burn is not this burn\'s registration; only what is left goes back', async () => {
   let t = 1_790_000_000_000;
   const now = () => t;
   const s = await burnedAt(now);
@@ -1365,12 +1484,12 @@ test('SITE-10: a node the network lists with another burn is not this burn\'s re
   assert.equal(q.stage, 'onChain');
 });
 
-test('SITE-11: a burn dropped as never landed is looked at again and taken back when it landed after all', async () => {
+test('a burn dropped as never landed is looked at again and taken back when it landed after all', async () => {
   let t = 1_790_000_000_000;
   const now = () => t;
   const s = await fundedAt(now);
   const { deps, stored, created } = s;
-  let r = (await act.burn(await stored(), 1500, deps, KAT.address)).record;
+  let r = (await burnFor(await stored(), 1500, deps, KAT.address)).record;
   const tx = r.burn.tx;
   // Two reads past its last valid block found nothing (a lagging backend): dropped, back to funded, kept aside.
   await updateRecord(r.pub, (c) => ({ ...c, burn: { ...c.burn, lastValidBlockHeight: 300 } }), deps.area);
@@ -1378,7 +1497,7 @@ test('SITE-11: a burn dropped as never landed is looked at again and taken back 
   assert.equal(r.stage, 'funded');
   assert.equal(r.burn, null);
   assert.deepEqual(r.dropped.map((b) => b.tx), [tx]);
-  // The 1DEV is still there: it is looked at (SITE-R3-02) and kept, not yet proven never landed.
+  // The 1DEV is still there: it is looked at and kept, not yet proven never landed.
   r = (await act.checkFunding(await stored(), 1500, deps)).record;
   assert.equal(r.stage, 'funded');
   // It landed after all: the 1DEV is gone, and the burn is final and this address's.
@@ -1410,7 +1529,7 @@ test('SITE-11: a burn dropped as never landed is looked at again and taken back 
   assert.deepEqual((await act.checkFunding((await listRecords(farea))[0], 1500, fdeps)).record.dropped, []);
 });
 
-// SITE-R3-02: an answer to another activation's request is never taken into this record; and the payment key's owner
+// An answer to another activation's request is never taken into this record; and the payment key's owner
 // bind names only the wallet that signed the reservation, for the burn about to be sent.
 test('an answer to another activation\'s request is never taken; the v2 bind only for the reserved wallet\'s own burn', async () => {
   const t = 1_790_000_000_000;
@@ -1475,14 +1594,14 @@ test('an answer to another activation\'s request is never taken; the v2 bind onl
   assert.match(hook, /follow\(kept\.session, kept\.expiresAt, keptSlot, 0\);\s*\}\);\s*return \(\) => \{\s*attempt\.current \+= 1;\s*detach\(\);\s*setState\(\{ phase: 'idle' \}\);\s*\};\s*\}, \[keptSlot, follow, detach\]\);/);
 });
 
-// SITE-R3-02: a burn the page dropped as never landed was looked at again only while the payment address lacked the 1DEV
+// A burn the page dropped as never landed was looked at again only while the payment address lacked the 1DEV
 // it would have burned, and the Burn button signed a new burn beside it. Now no new burn while one may have landed.
-test('SITE-R3-02: no new burn while a dropped burn may have landed; a landed one is taken back, whatever the balance', async () => {
+test('no new burn while a dropped burn may have landed; a landed one is taken back, whatever the balance', async () => {
   let t = 1_790_000_000_000;
   const now = () => t;
   const s = await fundedAt(now);
   s.chain.balances.set(s.created.pub, { sol: 2_000_000, oneDev: 3_000_000_000 });
-  const a = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const a = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(a.outcome, 'sent');
   const tx = a.record.burn.tx;
   // A landed, but a lagging backend finds it nowhere past its last valid block, twice: dropped, back to funded.
@@ -1502,7 +1621,7 @@ test('SITE-R3-02: no new burn while a dropped burn may have landed; a landed one
   assert.equal(reads(), before + 1, 'looked at with the 1DEV still there');
   // The Burn button signs nothing while it is not proven never landed, and the page says why.
   t += 3000;
-  const refused = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const refused = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(refused.outcome, 'checking');
   assert.equal(s.chain.sent.length, 1, 'no second burn');
   assert.match(TEXTS.act_burn_checking, /nothing new was burned/);
@@ -1526,25 +1645,52 @@ test('SITE-R3-02: no new burn while a dropped burn may have landed; a landed one
   const b = await fundedAt(now);
   await updateRecord(b.created.pub, (c) => ({ ...c, dropped: [{ tx, lastValidBlockHeight: 300, amount: 1500, droppedAt: t }] }), b.deps.area);
   b.chain.statuses.set(tx, { err: null, confirmationStatus: 'finalized' });
-  const found = await act.burn(await b.stored(), 1500, b.deps, KAT.address);
+  const found = await burnFor(await b.stored(), 1500, b.deps, KAT.address);
   assert.equal(found.outcome, 'found');
   assert.equal(found.record.stage, 'burnFinal');
   assert.equal(b.chain.sent.length, 0);
 });
 
-test('SITE-R3-02: another tab\'s dropped burn stops this tab\'s burn; a final burn keeps the dropped ones not yet proven', async () => {
+// The site answers the same signed reservation with the reservation it made: the page signs only under one with
+// SIGN_MARGIN_MS left, and a tab that lost the step to another tab leaves the reservation that tab burns under.
+test('the same signed reservation sent again: one near its end is renewed; a tab that lost the step keeps the other tab\'s', async () => {
+  let t = 1_790_000_000_000;
+  const now = () => t;
+  const s = await fundedAt(now);
+  const r0 = await s.stored();
+  // An answer the page gave up on: the site made the reservation, the record never kept it.
+  const lost = await act.reserveWallet(KAT.address, r0.pub, 1500, KAT_SOLANA, r0.hold, s.deps);
+  assert.equal(lost.ok, true);
+  t += RESERVATION_TTL_MS - SIGN_MARGIN_MS + 1000;
+  const sent = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
+  assert.equal(sent.outcome, 'sent');
+  assert.notEqual(sent.record.reservation.id, lost.reservation);
+  assert.equal(sent.record.reservation.until, t + RESERVATION_TTL_MS, 'signed under a fresh reservation');
+
+  // Another tab moved the record on under the reservation both tabs were answered with; this tab's step finds it taken.
+  const f = await fundedAt(now);
+  const stale = await f.stored();
+  const shared = await act.reserveWallet(KAT.address, stale.pub, 1500, KAT_SOLANA, stale.hold, f.deps);
+  const facts = { id: shared.reservation, wallet: KAT.address, until: shared.until, amount: 1500 };
+  await updateRecord(stale.pub, (c) => ({ ...c, stage: 'burnSent', reservation: facts, burn: BURN }), f.deps.area);
+  assert.equal((await burnFor(stale, 1500, f.deps, KAT.address)).outcome, 'busy');
+  const view = await recordOf(f);
+  assert.deepEqual([view.state, view.until], ['reserved', shared.until], 'the other tab\'s reservation stays');
+});
+
+test('another tab\'s dropped burn stops this tab\'s burn; a final burn keeps the dropped ones not yet proven', async () => {
   const t = 1_790_000_000_000;
   const now = () => t;
   const s = await fundedAt(now);
   const stale = await s.stored();
   const other = { tx: BURN.tx, lastValidBlockHeight: 500, amount: 1500, droppedAt: t };
   await updateRecord(stale.pub, (c) => ({ ...c, dropped: [other] }), s.deps.area);
-  const got = await act.burn(stale, 1500, s.deps, KAT.address);
+  const got = await burnFor(stale, 1500, s.deps, KAT.address);
   assert.equal(got.outcome, 'busy', 'the record this tab held had no dropped burn; the stored one has');
   assert.equal(s.chain.sent.length, 0);
   // A burn final while a dropped one is still unproven (a record from before): the dropped one stays.
   const f = await fundedAt(now);
-  const burnTx = (await act.burn(await f.stored(), 1500, f.deps, KAT.address)).record.burn.tx;
+  const burnTx = (await burnFor(await f.stored(), 1500, f.deps, KAT.address)).record.burn.tx;
   await updateRecord(f.created.pub, (c) => ({ ...c, dropped: [other] }), f.deps.area);
   f.chain.statuses.set(burnTx, { err: null, confirmationStatus: 'finalized' });
   const r = await act.settleBurn(await f.stored(), f.deps);
@@ -1552,15 +1698,15 @@ test('SITE-R3-02: another tab\'s dropped burn stops this tab\'s burn; a final bu
   assert.deepEqual(r.dropped, [other]);
 });
 
-// SITE-R3-01: the server answers each send it forwarded with a read pass, the page keeps it with the transaction and
+// The server answers each send it forwarded with a read pass, the page keeps it with the transaction and
 // shows it on every read, and a read the site cannot answer still lets the page say after 90 s that the outcome is not
 // known yet.
-test('SITE-R3-01: the page keeps the read pass of its burn and refund and reads with it; an unreadable burn times out', async () => {
+test('the page keeps the read pass of its burn and refund and reads with it; an unreadable burn times out', async () => {
   let t = 1_790_000_000_000;
   const now = () => t;
   const { READ_PASS_RE } = await import('../cabinet/burn-tx.ts');
   const s = await fundedAt(now);
-  const sent = await act.burn(await s.stored(), 1500, s.deps, KAT.address);
+  const sent = await burnFor(await s.stored(), 1500, s.deps, KAT.address);
   assert.equal(sent.outcome, 'sent');
   const pass = (await s.stored()).burn.pass;
   assert.match(pass, READ_PASS_RE);
@@ -1575,7 +1721,7 @@ test('SITE-R3-01: the page keeps the read pass of its burn and refund and reads 
   // A refused burn earns no pass.
   const r = await fundedAt(now);
   r.chain.refuseSend = true;
-  assert.equal((await act.burn(await r.stored(), 1500, r.deps, KAT.address)).record.dropped[0].pass, undefined);
+  assert.equal((await burnFor(await r.stored(), 1500, r.deps, KAT.address)).record.dropped[0].pass, undefined);
   // The refund of an address a reservation named (its burn went out): its pass is kept and shown when the page follows it.
   const c = await burnedAt(now);
   await updateRecord(c.created.pub, (cur) => ({ ...cur, stage: 'leftovers' }), c.deps.area);
@@ -1587,7 +1733,7 @@ test('SITE-R3-01: the page keeps the read pass of its burn and refund and reads 
   t += 3000;
   assert.equal((await act.settleLeftovers(await c.stored(), DEST, c.deps)).outcome, 'unknown');
   assert.deepEqual(c.chain.txReads.at(-1), { sig: (await c.stored()).refund.tx, pass: refundPass });
-  // SITE M-14: a refund from an address no reservation named (here cancelled before its burn; any funded key could send
+  // A refund from an address no reservation named (here cancelled before its burn; any funded key could send
   // one) earns no pass: the page reads it on the shared budget, like any other signature.
   const early = await fundedAt(now);
   const closing = await act.cancel(await early.stored(), early.deps);
@@ -1599,9 +1745,9 @@ test('SITE-R3-01: the page keeps the read pass of its burn and refund and reads 
   assert.deepEqual(early.chain.txReads.at(-1), { sig: (await early.stored()).refund.tx, pass: null });
 });
 
-// SITE-R3-03: a finished activation keeps only its receipt: the payment address, the burn, its amount, the node and the
+// A finished activation keeps only its receipt: the payment address, the burn, its amount, the node and the
 // wallet's address; the signed reservation, the answer, the refund and the key go.
-test('SITE-R3-03: a finished activation keeps only its receipt: payment address, burn, amount, node and wallet', async () => {
+test('a finished activation keeps only its receipt: payment address, burn, amount, node and wallet', async () => {
   const t = 1_790_000_000_000;
   const now = () => t;
   const area = mapArea();
@@ -1638,7 +1784,7 @@ test('SITE-R3-03: a finished activation keeps only its receipt: payment address,
   }
 });
 
-// Owner, 29.09: a consent too old at record time is asked for again at the same step: the burn, its code and its wallet
+// A consent too old at record time is asked for again at the same step: the burn, its code and its wallet
 // stay, whichever way the wallet is connected now.
 test('a consent too old at record time: QNet Wallet is asked again for the same burn, the code and the wallet kept', async () => {
   let t = 1_790_000_000_000;
@@ -1692,7 +1838,7 @@ test('a consent too old at record time: QNet Wallet is asked again for the same 
   assert.match(TEXTS.act_stale, /Ask QNet Wallet again: the burn and its code stay\.$/);
 });
 
-// R6: one wallet, one burn, whichever browser burns first. Two browsers (each its own payment address and key, each
+// One wallet, one burn, whichever browser burns first. Two browsers (each its own payment address and key, each
 // confirmed by the wallet) against the one site: while the first one's burn is on its way the second is refused, and
 // once it is final it is the wallet's record for good.
 test('two browsers for one wallet: the first one\'s burn holds the wallet; the second never burns', async () => {
@@ -1708,7 +1854,7 @@ test('two browsers for one wallet: the first one\'s burn holds the wallet; the s
   first.chain.balances.set(created.pub, { sol: 2_000_000, oneDev: 1_500_000_000 });
   await act.checkFunding(await second(), 1500, deps);
   // Both press Burn at once: exactly one burn is sent.
-  const [a, b] = await Promise.all([act.burn(await first.stored(), 1500, first.deps, KAT.address), act.burn(await second(), 1500, deps, KAT.address)]);
+  const [a, b] = await Promise.all([burnFor(await first.stored(), 1500, first.deps, KAT.address), burnFor(await second(), 1500, deps, KAT.address)]);
   assert.deepEqual([a.outcome, b.outcome].sort(), ['reserved', 'sent']);
   assert.equal(first.chain.sent.length, 1);
   const winner = a.outcome === 'sent' ? { stored: first.stored, deps: first.deps } : { stored: second, deps };
@@ -1716,15 +1862,15 @@ test('two browsers for one wallet: the first one\'s burn holds the wallet; the s
   const burnTx = (await winner.stored()).burn.tx;
   // On its way: held; final on Solana: the wallet's record, refused for good, of either way.
   t += 60_000;
-  assert.equal((await act.burn(await loser.stored(), 1500, loser.deps, KAT.address)).outcome, 'reserved');
+  assert.equal((await burnFor(await loser.stored(), 1500, loser.deps, KAT.address)).outcome, 'reserved');
   first.chain.burner = (await winner.stored()).pub;
   first.chain.statuses.set(burnTx, { err: null, confirmationStatus: 'finalized' });
   assert.equal((await act.settleBurn(await winner.stored(), winner.deps)).stage, 'burnFinal');
-  assert.equal((await act.burn(await loser.stored(), 1500, loser.deps, KAT.address)).outcome, 'has_burn');
+  assert.equal((await burnFor(await loser.stored(), 1500, loser.deps, KAT.address)).outcome, 'has_burn');
   t += SETTLE_AFTER_MS * 10 + 3 * 86_400_000;
   // Days later, a fresh confirmation: still the wallet's burn.
   await act.takeHold(await loser.stored(), reserveAnswer((await loser.stored()).pub, Math.floor(t / 1000)), act.reserveRequest(await loser.stored()), loser.deps);
-  assert.equal((await act.burn(await loser.stored(), 1500, loser.deps, KAT.address)).outcome, 'has_burn');
+  assert.equal((await burnFor(await loser.stored(), 1500, loser.deps, KAT.address)).outcome, 'has_burn');
   assert.equal(first.chain.sent.length, 1, 'one burn in all');
   // The loser gives up without a burn: its reservation, if any, is released, and what arrived goes back.
   const ended = await act.cancel(await loser.stored(), loser.deps);
