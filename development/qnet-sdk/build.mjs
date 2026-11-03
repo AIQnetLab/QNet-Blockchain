@@ -33,6 +33,8 @@ const SHARED = new Set([
     'utils/boundedFetch.js',
     'utils/strictJson.js',
     'utils/solanaFormat.js',
+    'utils/userHold.js',
+    'utils/pause.js',
   ].map((p) => path.join(MOBILE_SRC, p)),
   ...['wallet.js', 'signing.js', 'mnemonic.js', 'lightclient.js', 'tx.js', 'bytes.js', 'errors.js', 'shims/DilithiumCrypto.js']
     .map((p) => path.join(WALLET_CORE, p)),

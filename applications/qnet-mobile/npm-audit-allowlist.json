@@ -60,6 +60,54 @@
       "package": "stream-json",
       "path": "@solana/web3.js > jayson > stream-json",
       "why": "Node only, as above: the Assembler is never loaded by the app; RPC answers are parsed by the app's own strict JSON parser."
+    },
+    {
+      "id": "GHSA-27r3-jxmh-p828",
+      "package": "body-parser",
+      "path": "react-native > @react-native-community/cli-server-api > body-parser",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. The DoS needs a crafted compressed request to the development server, which listens only while a developer runs it."
+    },
+    {
+      "id": "GHSA-6pq8-jhm2-2vcw",
+      "package": "qs",
+      "path": "react-native > @react-native-community/cli-server-api > body-parser > qs",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. qs parses only the development server's own requests."
+    },
+    {
+      "id": "GHSA-698v-4r3x-3vcv",
+      "package": "launch-editor",
+      "path": "react-native > @react-native-community/cli-tools > launch-editor",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. launch-editor opens the developer's own editor at a stack frame from the development server."
+    },
+    {
+      "id": "GHSA-r825-w8mm-5pxw",
+      "package": "launch-editor",
+      "path": "react-native > @react-native-community/cli-tools > launch-editor",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. launch-editor opens the developer's own editor at a stack frame from the development server."
+    },
+    {
+      "id": "GHSA-587h-7wmj-h5pm",
+      "package": "launch-editor",
+      "path": "react-native > @react-native-community/cli-tools > launch-editor",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. launch-editor opens the developer's own editor at a stack frame from the development server."
+    },
+    {
+      "id": "GHSA-4528-x5fx-h6hg",
+      "package": "joi",
+      "path": "react-native > @react-native-community/cli-config > joi",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. joi checks the project's own react-native.config.js; no e-mail list is ever parsed."
+    },
+    {
+      "id": "GHSA-gcqx-w48m-w2h4",
+      "package": "deepmerge",
+      "path": "react-native > @react-native-community/cli, cli-config, cli-doctor > deepmerge",
+      "why": "Developer tool only: the React Native command-line tool and its development server run on the developer's machine and in CI to build and serve the bundle; no code in the app requires it and it is not in the JS bundle or the APK/IPA. deepmerge merges the project's own configuration objects."
+    },
+    {
+      "id": "GHSA-g3hv-75wg-m249",
+      "package": "minimatch",
+      "path": "glob, test-exclude > minimatch",
+      "why": "Build and test tools only: glob and the test coverage tools match the repository's own file names with it on the developer's machine and in CI; no code in the app requires it and it is not in the JS bundle or the APK/IPA. The fix is minimatch 11.0.1 only, which none of those tools takes yet."
     }
   ]
 }
